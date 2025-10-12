@@ -1,5 +1,8 @@
-use dioxus::prelude::*;
-use shared::musicbrainz::{Album, AlbumWithTracks, Track};
+use dioxus::{logger::tracing::info, prelude::*};
+use shared::{
+    download::DownloadQuery,
+    musicbrainz::{Album, AlbumWithTracks, Track},
+};
 use std::collections::HashSet;
 
 use crate::{
@@ -19,7 +22,8 @@ pub struct Props {
     // The album and its tracks to display
     pub data: AlbumWithTracks,
     // Callback for when the user confirms their selection
-    pub on_select: EventHandler<Vec<Track>>,
+    #[props(into)]
+    pub on_select: EventHandler<DownloadQuery>,
 }
 
 #[component]
@@ -62,13 +66,23 @@ pub fn Album(props: Props) -> Element {
             is_selection_empty: selected_tracks.read().is_empty(),
             on_select: move |_| {
                 let selected_ids = selected_tracks.read();
-                let selected: Vec<Track> = tracks
+                let tracks: Vec<Track> = tracks
                     .read()
                     .iter()
                     .filter(|t| selected_ids.contains(&t.id))
                     .cloned()
                     .collect();
-                props.on_select.call(selected);
+                let album = props.data.album.clone();
+                if props.data.tracks.len() == tracks.len() {
+                    props.on_select.call(DownloadQuery::Album { album });
+                } else {
+                    props
+                        .on_select
+                        .call(DownloadQuery::Track {
+                            album,
+                            tracks,
+                        });
+                }
             },
         }
     }

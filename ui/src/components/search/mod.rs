@@ -3,6 +3,7 @@ pub mod track;
 
 use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
+use shared::download::DownloadQuery;
 use shared::musicbrainz::{AlbumWithTracks, SearchResult, Track};
 
 use track::TrackResult;
@@ -17,6 +18,10 @@ pub fn Search() -> Element {
     let mut artist = use_signal::<Option<String>>(|| None);
     let mut loading = use_signal(|| false);
     let mut viewing_album = use_signal::<Option<AlbumWithTracks>>(|| None);
+
+    let download = move |query: DownloadQuery| async move {
+        api::download(query).await;
+    };
 
     let search_track = move || async move {
         loading.set(true);
@@ -63,17 +68,13 @@ pub fn Search() -> Element {
           },
           Album {
             data,
-            on_select: move |tracks_to_download: Vec<Track>| {
-                info!("User selected {} tracks to download:", tracks_to_download.len());
-                for track in tracks_to_download {
-                    info!("- {} | {:?} | {}", track.title, track.album_title, track.artist);
-                }
+            on_select: move |data: DownloadQuery| async move {
+                download(data).await;
                 viewing_album.set(None);
             },
           }
         }
       }
-
 
       div { class: "bg-gray-800 text-white p-6 sm:p-8 rounded-lg shadow-xl max-w-2xl mx-auto my-10 font-sans",
 

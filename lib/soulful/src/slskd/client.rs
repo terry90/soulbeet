@@ -76,7 +76,7 @@ impl SoulseekClientBuilder {
 
     pub fn build(self) -> Result<SoulseekClient> {
         let base_url_str = self.base_url.ok_or(SoulseekError::NotConfigured)?;
-        let base_url = Url::parse(&base_url_str.trim_end_matches('/'))?;
+        let base_url = Url::parse(base_url_str.trim_end_matches('/'))?;
 
         let download_path = self
             .download_path
@@ -102,7 +102,7 @@ impl SoulseekClient {
         endpoint: &str,
         body: Option<B>,
     ) -> Result<T> {
-        let url = self.base_url.join(&format!("api/v0/{}", endpoint))?;
+        let url = self.base_url.join(&format!("api/v0/{endpoint}"))?;
         debug!("Request: {} {}", method, url);
 
         let mut request = self.client.request(method, url);
@@ -126,18 +126,18 @@ impl SoulseekClient {
             if text.trim().is_empty() {
                 // For 204 No Content, deserialize from a JSON null
                 serde_json::from_str("null").map_err(|e| {
-                    error!("Deserialization error for empty body: {}", e);
+                    error!("Deserialization error for empty body: {e}");
                     SoulseekError::Api {
                         status: status.as_u16(),
-                        message: format!("JSON parse error: {}", e),
+                        message: format!("JSON parse error: {e}"),
                     }
                 })
             } else {
                 serde_json::from_str(&text).map_err(|e| {
-                    error!("Deserialization error: {} for text: {}", e, text);
+                    error!("Deserialization error: {e} for text: {text}");
                     SoulseekError::Api {
                         status: status.as_u16(),
-                        message: format!("JSON parse error: {}", e),
+                        message: format!("JSON parse error: {e}"),
                     }
                 })
             }
@@ -146,7 +146,7 @@ impl SoulseekClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Could not read error body".to_string());
-            error!("API Error: {} - {}", status, text);
+            error!("API Error: {status} - {text}");
             Err(SoulseekError::Api {
                 status: status.as_u16(),
                 message: text,
@@ -219,7 +219,7 @@ impl SoulseekClient {
         let search_id = search_id_resp.id;
         self.active_searches.lock().await.insert(search_id.clone());
 
-        info!("Search initiated with ID: {}", search_id);
+        info!("Search initiated with ID: {search_id}");
 
         let start_time = Utc::now();
         let poll_interval = Duration::seconds(1);
@@ -227,11 +227,11 @@ impl SoulseekClient {
 
         while (Utc::now() - start_time) < timeout {
             if !self.active_searches.lock().await.contains(&search_id) {
-                info!("Search {} was cancelled, stopping.", search_id);
+                info!("Search {search_id} was cancelled, stopping.");
                 break;
             }
 
-            let endpoint = format!("searches/{}/responses", search_id);
+            let endpoint = format!("searches/{search_id}/responses");
             match self
                 .make_request::<Vec<SearchResponse>, ()>(Method::GET, &endpoint, None)
                 .await
@@ -416,7 +416,7 @@ impl SoulseekClient {
     }
 
     fn extract_year(&self, album_path: &str, album_title: &str) -> Option<String> {
-        let text_to_search = format!("{} {}", album_path, album_title);
+        let text_to_search = format!("{album_path} {album_title}");
         let re = Regex::new(r"\((\d{4})\)|\[(\d{4})\]|(\d{4})").unwrap();
         re.captures(&text_to_search)
             .and_then(|caps| (1..=3).find_map(|i| caps.get(i).map(|m| m.as_str().to_string())))
@@ -433,7 +433,7 @@ impl SoulseekClient {
             path: download_path_str,
         }];
 
-        let endpoint = format!("transfers/downloads/{}", username);
+        let endpoint = format!("transfers/downloads/{username}");
 
         #[derive(Deserialize)]
         struct DownloadResponse {
@@ -443,7 +443,7 @@ impl SoulseekClient {
         // slskd sometimes returns an array, sometimes a single object
         let resp_text = self
             .client
-            .post(self.base_url.join(&format!("api/v0/{}", endpoint))?)
+            .post(self.base_url.join(&format!("api/v0/{endpoint}"))?)
             .header("X-API-Key", self.api_key.as_deref().unwrap_or(""))
             .json(&payload)
             .send()
@@ -477,10 +477,7 @@ impl SoulseekClient {
         download_id: &str,
         remove: bool,
     ) -> Result<()> {
-        let endpoint = format!(
-            "transfers/downloads/{}/{}?remove={}",
-            username, download_id, remove
-        );
+        let endpoint = format!("transfers/downloads/{username}/{download_id}?remove={remove}");
         info!("Cancelling download: {}", download_id);
         self.make_request(Method::DELETE, &endpoint, None::<()>)
             .await
@@ -497,7 +494,7 @@ impl SoulseekClient {
     }
 
     pub async fn delete_search(&self, search_id: &str) -> Result<()> {
-        let endpoint = format!("searches/{}", search_id);
+        let endpoint = format!("searches/{search_id}");
         debug!("Deleting search {}", search_id);
         match self
             .make_request::<(), ()>(Method::DELETE, &endpoint, None)

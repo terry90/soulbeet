@@ -4,6 +4,7 @@ use chrono::Duration;
 use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
+use shared::download::DownloadQuery;
 use shared::musicbrainz::{AlbumWithTracks, SearchResult};
 #[cfg(feature = "server")]
 use soulful::musicbrainz;
@@ -23,15 +24,19 @@ async fn slskd_search(input: &str) -> String {
     let search = client.search(&input, Duration::seconds(30)).await;
 
     let mut tracks = vec![];
+    let mut albums = vec![];
 
     for result in search.iter() {
         for track in &result.0 {
-            tracks.push(track.base.filename.clone());
+            tracks.push(track);
+        }
+        for album in &result.0 {
+            albums.push(album);
         }
     }
 
     info!("{search:?}");
-    format!("Connection: {health}\nSearch: {}", tracks.join(" | "))
+    format!("Connection: {health}\nSearch: {:?}\n{:?}", tracks, albums)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,4 +76,24 @@ pub async fn find_album(id: String) -> Result<AlbumWithTracks, ServerFnError> {
     let results = musicbrainz::find_album(&id).await?;
 
     Ok(results)
+}
+
+#[server]
+pub async fn download(data: DownloadQuery) -> Result<(), ServerFnError> {
+    info!("{data:?}");
+
+    match data {
+        DownloadQuery::Album { album } => {
+            info!("{album:?}");
+
+            let res = slskd_search(&format!("{} {}", album.artist, album.title)).await;
+
+            println!("{res}");
+        }
+        DownloadQuery::Track { album, tracks } => {
+            info!("{tracks:?}")
+        }
+    }
+
+    Ok(())
 }
