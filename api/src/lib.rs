@@ -6,13 +6,22 @@ use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use shared::download::DownloadQuery;
 use shared::musicbrainz::{AlbumWithTracks, SearchResult};
+
+#[cfg(feature = "server")]
+use shared::musicbrainz::Track;
 #[cfg(feature = "server")]
 use soulful::musicbrainz;
 #[cfg(feature = "server")]
-use soulful::slskd::SoulseekClientBuilder;
+use soulful::slskd::{AlbumResult, SoulseekClientBuilder};
 
 #[cfg(feature = "server")]
-async fn slskd_search(input: &str) -> String {
+async fn slskd_search(
+    artist: String,
+    album: String,
+    tracks: Option<Vec<Track>>,
+) -> Result<Vec<AlbumResult>, ServerFnError> {
+    use dioxus::prelude::server_fn::error::NoCustomError;
+
     let client = SoulseekClientBuilder::new()
         .api_key("BOVeIS961OlDWlUeEjF6DsIZKzf857ijKBGFWWw4N9Scj1xwoq2C3VbjMBU=")
         .base_url("http://192.168.1.105:5030/")
@@ -21,22 +30,27 @@ async fn slskd_search(input: &str) -> String {
         .unwrap();
 
     let health = client.check_connection().await;
-    let search = client.search(&input, Duration::seconds(30)).await;
+    let mut search = client
+        .search(artist, album, tracks, Duration::seconds(30))
+        .await
+        .map_err(|e| ServerFnError::<NoCustomError>::ServerError(e.to_string()))?;
+    search.sort_by(|a, b| b.score.total_cmp(&a.score));
 
-    let mut tracks = vec![];
-    let mut albums = vec![];
+    for album in search.iter().take(10) {
+        println!("Album: {}", album.album_title);
+        println!("Score: {}", album.score);
+        println!("Quality: {}", album.dominant_quality);
 
-    for result in search.iter() {
-        for track in &result.0 {
-            tracks.push(track);
-        }
-        for album in &result.0 {
-            albums.push(album);
+        for track in album.tracks.iter() {
+            println!("  Filename: {:?}", track.base.filename);
+            println!("  Title: {:?}", track.title);
+            println!("  Artist: {:?}", track.artist);
+            println!("  Album: {:?}", track.album);
+            println!("  Format: {:?}", track.base.quality());
         }
     }
 
-    info!("{search:?}");
-    format!("Connection: {health}\nSearch: {:?}\n{:?}", tracks, albums)
+    Ok(search)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,12 +100,12 @@ pub async fn download(data: DownloadQuery) -> Result<(), ServerFnError> {
         DownloadQuery::Album { album } => {
             info!("{album:?}");
 
-            let res = slskd_search(&format!("{} {}", album.artist, album.title)).await;
-
-            println!("{res}");
+            slskd_search(album.artist, album.title, None).await?;
         }
         DownloadQuery::Track { album, tracks } => {
-            info!("{tracks:?}")
+            info!("{tracks:?}");
+
+            slskd_search(album.artist, album.title, Some(tracks)).await?;
         }
     }
 

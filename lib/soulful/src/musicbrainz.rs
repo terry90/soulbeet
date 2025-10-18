@@ -8,8 +8,7 @@ use musicbrainz_rs::{
     Fetch, MusicBrainzClient, Search,
 };
 use shared::musicbrainz::{Album, AlbumWithTracks, SearchResult, Track};
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::{collections::HashSet, sync::OnceLock};
 
 // This ensures the client is initialized only once with a proper user agent.
 fn musicbrainz_client() -> &'static MusicBrainzClient {
@@ -43,7 +42,7 @@ fn format_duration(duration_ms: &Option<u32>) -> Option<String> {
         let total_seconds = ms / 1000;
         let minutes = total_seconds / 60;
         let seconds = total_seconds % 60;
-        format!("{:02}:{:02}", minutes, seconds)
+        format!("{minutes:02}:{seconds:02}")
     })
 }
 
@@ -72,12 +71,12 @@ pub async fn search(
             let search_query = recording_query.recording(query).build();
 
             let search_results = Recording::search(search_query)
-                .limit(limit.into())
+                .limit(limit)
                 .with_releases()
                 .execute_with_client(client)
                 .await?;
 
-            let mut unique_tracks = HashMap::new();
+            let mut unique_tracks = HashSet::new();
 
             for recording in search_results.entities {
                 let artist_name = format_artist_credit(&recording.artist_credit);
@@ -95,7 +94,7 @@ pub async fn search(
                     album_title.to_lowercase(),
                 );
 
-                if !unique_tracks.contains_key(&key) {
+                if !unique_tracks.contains(&key) {
                     let first_release = recording.releases.as_ref().and_then(|r| r.first());
                     let track = Track {
                         id: recording.id,
@@ -106,7 +105,7 @@ pub async fn search(
                         release_date: first_release.and_then(|r| r.date.clone().map(|d| d.0)),
                         duration: format_duration(&recording.length),
                     };
-                    unique_tracks.insert(key, ());
+                    unique_tracks.insert(key);
                     results.push(SearchResult::Track(track));
                 }
             }
@@ -119,7 +118,7 @@ pub async fn search(
             let search_query = album_query.release_group(query).build();
 
             let search_results = ReleaseGroup::search(search_query)
-                .limit(limit.into())
+                .limit(limit)
                 .with_releases()
                 .execute_with_client(client)
                 .await?;
