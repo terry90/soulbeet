@@ -13,9 +13,6 @@ use tokio::sync::OnceCell;
 #[cfg(feature = "server")]
 use uuid::Uuid;
 
-// #[cfg(feature = "server")]
-// static POOL: OnceLock<Pool<Sqlite>> = OnceLock::new();
-
 #[cfg(feature = "server")]
 static POOL: OnceCell<Pool<Sqlite>> = OnceCell::const_new();
 

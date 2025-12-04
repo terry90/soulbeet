@@ -93,16 +93,6 @@ where
         .collect())
 }
 
-#[derive(Deserialize)]
-struct Directory {
-    files: Vec<FileEntry>,
-}
-
-#[derive(Deserialize)]
-struct User {
-    directories: Vec<Directory>,
-}
-
 // Custom deserializer that flattens everything into Vec<FileEntry>
 fn deserialize_flattened_files<'de, D>(deserializer: D) -> Result<Vec<FileEntry>, D::Error>
 where
@@ -149,9 +139,6 @@ impl<'de> Deserialize<'de> for FlattenedFiles {
         deserialize_flattened_files(deserializer).map(FlattenedFiles)
     }
 }
-
-// Alias for backward compatibility if needed, or update usages
-pub type DownloadStatus = FileEntry;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MatchResult {

@@ -5,18 +5,12 @@ use std::sync::LazyLock;
 
 use auth::{AuthResponse, Claims};
 use chrono::Duration;
-use dioxus::{
-    logger::tracing::info,
-    prelude::{
-        server_fn::{codec::Json, error::NoCustomError},
-        *,
-    },
-};
+use dioxus::{logger::tracing::info, prelude::*};
 use serde::{Deserialize, Serialize};
 use shared::{
     download::DownloadQuery,
     musicbrainz::{AlbumWithTracks, SearchResult},
-    slskd::{AlbumResult, DownloadResponse, DownloadState, DownloadStatus, TrackResult},
+    slskd::{AlbumResult, DownloadResponse, DownloadState, FileEntry, TrackResult},
 };
 
 #[cfg(feature = "server")]
@@ -43,15 +37,16 @@ static SLSKD_CLIENT: LazyLock<SoulseekClient> = LazyLock::new(|| {
         .expect("Failed to create Soulseek client")
 });
 
-fn server_error<E: std::fmt::Display>(e: E) -> ServerFnError<NoCustomError> {
-    ServerFnError::ServerError(e.to_string())
+fn server_error<E: std::fmt::Display>(e: E) -> ServerFnError {
+    ServerFnError::ServerError {
+        message: e.to_string(),
+        code: 500,
+        details: None,
+    }
 }
 
 #[server]
-pub async fn register(
-    username: String,
-    password: String,
-) -> Result<(), ServerFnError<NoCustomError>> {
+pub async fn register(username: String, password: String) -> Result<(), ServerFnError> {
     db::User::create(&username, &password)
         .await
         .map_err(server_error)
@@ -59,10 +54,7 @@ pub async fn register(
 }
 
 #[server]
-pub async fn login(
-    username: String,
-    password: String,
-) -> Result<AuthResponse, ServerFnError<NoCustomError>> {
+pub async fn login(username: String, password: String) -> Result<AuthResponse, ServerFnError> {
     let user = match db::User::verify(&username, &password).await {
         Ok(user) => user,
         Err(e) => return Err(server_error(e)),
@@ -72,10 +64,8 @@ pub async fn login(
 }
 
 #[server]
-pub async fn refresh_token(
-    refresh_token: String,
-) -> Result<AuthResponse, ServerFnError<NoCustomError>> {
-    let claims = match auth::verify_token(&refresh_token, "refresh") {
+pub async fn refresh_token(token: String) -> Result<AuthResponse, ServerFnError> {
+    let claims = match auth::verify_token(&token, "refresh") {
         Ok(c) => c,
         Err(e) => return Err(server_error(e)),
     };
@@ -86,9 +76,7 @@ pub async fn refresh_token(
 }
 
 #[server]
-pub async fn get_user_folders(
-    token: String,
-) -> Result<Vec<db::Folder>, ServerFnError<NoCustomError>> {
+pub async fn get_user_folders(token: String) -> Result<Vec<db::Folder>, ServerFnError> {
     let claims = match auth::verify_token(&token, "access") {
         Ok(c) => c,
         Err(e) => return Err(server_error(e)),
@@ -104,7 +92,7 @@ pub async fn create_user_folder(
     token: String,
     name: String,
     path: String,
-) -> Result<db::Folder, ServerFnError<NoCustomError>> {
+) -> Result<db::Folder, ServerFnError> {
     let claims = match auth::verify_token(&token, "access") {
         Ok(c) => c,
         Err(e) => return Err(server_error(e)),
@@ -124,7 +112,7 @@ async fn slskd_search(
     artist: String,
     album: String,
     tracks: Vec<Track>,
-) -> Result<Vec<AlbumResult>, ServerFnError<NoCustomError>> {
+) -> Result<Vec<AlbumResult>, ServerFnError> {
     let mut search = match SLSKD_CLIENT
         .search(artist, album, tracks, Duration::seconds(45))
         .await
@@ -136,16 +124,16 @@ async fn slskd_search(
     search.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     for album in search.iter().take(10) {
-        println!("Album: {}", album.album_title);
-        println!("Score: {}", album.score);
-        println!("Quality: {}", album.dominant_quality);
+        info!("Album: {}", album.album_title);
+        info!("Score: {}", album.score);
+        info!("Quality: {}", album.dominant_quality);
 
         for track in album.tracks.iter() {
-            println!("  Filename: {:?}", track.base.filename);
-            println!("  Title: {:?}", track.title);
-            println!("  Artist: {:?}", track.artist);
-            println!("  Album: {:?}", track.album);
-            println!("  Format: {:?}", track.base.quality());
+            info!("  Filename: {:?}", track.base.filename);
+            info!("  Title: {:?}", track.title);
+            info!("  Artist: {:?}", track.artist);
+            info!("  Album: {:?}", track.album);
+            info!("  Format: {:?}", track.base.quality());
         }
     }
 
@@ -153,9 +141,7 @@ async fn slskd_search(
 }
 
 #[cfg(feature = "server")]
-async fn slskd_download(
-    tracks: Vec<TrackResult>,
-) -> Result<Vec<DownloadResponse>, ServerFnError<NoCustomError>> {
+async fn slskd_download(tracks: Vec<TrackResult>) -> Result<Vec<DownloadResponse>, ServerFnError> {
     SLSKD_CLIENT.download(tracks).await.map_err(server_error)
 }
 
@@ -166,9 +152,7 @@ pub struct SearchQuery {
 }
 
 #[server]
-pub async fn search_album(
-    input: SearchQuery,
-) -> Result<Vec<SearchResult>, ServerFnError<NoCustomError>> {
+pub async fn search_album(input: SearchQuery) -> Result<Vec<SearchResult>, ServerFnError> {
     musicbrainz::search(
         &input.artist,
         &input.query,
@@ -180,9 +164,7 @@ pub async fn search_album(
 }
 
 #[server]
-pub async fn search_track(
-    input: SearchQuery,
-) -> Result<Vec<SearchResult>, ServerFnError<NoCustomError>> {
+pub async fn search_track(input: SearchQuery) -> Result<Vec<SearchResult>, ServerFnError> {
     musicbrainz::search(
         &input.artist,
         &input.query,
@@ -194,22 +176,20 @@ pub async fn search_track(
 }
 
 #[server]
-pub async fn find_album(id: String) -> Result<AlbumWithTracks, ServerFnError<NoCustomError>> {
+pub async fn find_album(id: String) -> Result<AlbumWithTracks, ServerFnError> {
     musicbrainz::find_album(&id).await.map_err(server_error)
 }
 
 #[server]
-pub async fn search_downloads(
-    data: DownloadQuery,
-) -> Result<Vec<AlbumResult>, ServerFnError<NoCustomError>> {
+pub async fn search_downloads(data: DownloadQuery) -> Result<Vec<AlbumResult>, ServerFnError> {
     slskd_search(data.album.artist, data.album.title, data.tracks).await
 }
 
-#[server(input = Json)]
+#[server]
 pub async fn download(
     tracks: Vec<TrackResult>,
     target_folder: String,
-) -> Result<Vec<DownloadResponse>, ServerFnError<NoCustomError>> {
+) -> Result<Vec<DownloadResponse>, ServerFnError> {
     let target_path_buf = std::path::Path::new(&target_folder).to_path_buf();
     if let Err(e) = tokio::fs::create_dir_all(&target_path_buf).await {
         return Err(server_error(format!(

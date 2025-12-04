@@ -9,7 +9,9 @@ soulful = { workspace = true, optional = true }
 shared = { workspace = true }
 chrono = { version = "0.4.42", features = ["wasm-bindgen"] }
 serde = { version = "1.0.226", features = ["derive"] }
-jsonwebtoken = { version = "9.3.0", optional = true }
+jsonwebtoken = { version = "10.2.0", features = [
+  "rust_crypto",
+], optional = true }
 sqlx = { version = "0.8.6", features = [
   "runtime-tokio-rustls",
   "sqlite",

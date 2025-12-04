@@ -1,5 +1,5 @@
 # Build Stage
-FROM rust as builder
+FROM rust:1.91-bookworm as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -32,31 +32,32 @@ RUN npm install
 
 # Build the Tailwind CSS
 RUN npx @tailwindcss/cli -i ./web/assets/input.css -o ./web/assets/tailwind.css
+ENV IP=0.0.0.0
 
 # Build the application
-RUN dx build --platform web --release
+RUN dx bundle --package web --release
 
 # Runtime Stage
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 # Install runtime dependencies: openssl, python/pip for beets
 RUN apt-get update && apt-get install -y \
-  libssl1.1 \
+  openssl \
   ca-certificates \
   python3 \
   python3-pip \
+  pipx \
   ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
 # Install beets
-RUN pip3 install beets
+RUN pipx install beets
 
 # Working directory
 WORKDIR /app
 
 # Copy artifacts from builder
 COPY --from=builder /app/target/dx/web/release/web /app/server
-COPY --from=builder /app/target/dx/web/release/assets /app/assets
 COPY beets_config.yaml /app/beets_config.yaml
 
 # Create data directory for SQLite
@@ -71,4 +72,4 @@ ENV IP=0.0.0.0
 EXPOSE 9765
 
 # Run the server
-CMD ["/app/server"]
+CMD ["/app/server/web"]

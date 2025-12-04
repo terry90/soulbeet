@@ -47,7 +47,7 @@ fn AuthGuard() -> Element {
     use_effect(move || {
         let is_logged_in = auth.is_logged_in();
 
-        // If not logged in AND we're not already on /login → go to login
+        // If not logged in AND we're not already on /login -> go to login
         if !is_logged_in && !matches!(current, Route::Login {}) {
             nav.replace(Route::Login {});
         }

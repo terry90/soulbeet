@@ -3,7 +3,7 @@ resolver = "2"
 members = ["ui", "web", "desktop", "mobile", "api", "lib/soulful"]
 
 [workspace.dependencies]
-dioxus = { version = "0.6.3" }
+dioxus = { version = "0.7.1" }
 
 # workspace
 ui = { path = "ui" }

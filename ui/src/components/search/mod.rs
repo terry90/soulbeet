@@ -158,15 +158,17 @@ pub fn Search() -> Element {
                 h5 { class: "text-xl font-semibold mb-4 border-b border-gray-600 pb-2", "Results" }
                 ul { class: "list-none p-0 space-y-4",
                   for item in items.iter() {
-                    li { key: item.id,
-                      match item {
-                          SearchResult::Track(ref track) => rsx! {
+                    match item {
+                        SearchResult::Track(ref track) => rsx! {
+                          li { key: "{track.id}",
                             TrackResult { on_album_click: move |id| view_full_album(id), track: track.clone() }
-                          },
-                          SearchResult::Album(album) => rsx! {
+                          }
+                        },
+                        SearchResult::Album(album) => rsx! {
+                          li { key: "{album.id}",
                             AlbumResult { on_click: move |id| view_full_album(id), album: album.clone() }
-                          },
-                      }
+                          }
+                        },
                     }
                   }
                 }

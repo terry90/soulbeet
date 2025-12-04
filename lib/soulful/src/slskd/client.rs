@@ -11,7 +11,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
     musicbrainz::Track,
     slskd::{
-        AlbumResult, DownloadResponse, DownloadStatus, FlattenedFiles, MatchResult, SearchResult,
+        AlbumResult, DownloadResponse, FileEntry, FlattenedFiles, MatchResult, SearchResult,
         TrackResult,
     },
 };
@@ -28,7 +28,7 @@ use url::Url;
 pub struct SoulseekClient {
     base_url: Url,
     api_key: Option<String>,
-    download_path: PathBuf,
+    // download_path: PathBuf,
     client: Client,
     search_timestamps: Arc<Mutex<Vec<DateTime<Utc>>>>,
     active_searches: Arc<Mutex<HashSet<String>>>,
@@ -82,13 +82,13 @@ impl SoulseekClientBuilder {
     pub fn build(self) -> Result<SoulseekClient> {
         let base_url_str = self.base_url.ok_or(SoulseekError::NotConfigured)?;
         let base_url = Url::parse(base_url_str.trim_end_matches('/'))?;
-        let download_path = self
-            .download_path
-            .unwrap_or_else(|| PathBuf::from("./downloads"));
+        // let download_path = self
+        //     .download_path
+        //     .unwrap_or_else(|| PathBuf::from("./downloads"));
         Ok(SoulseekClient {
             base_url,
             api_key: self.api_key,
-            download_path,
+            // download_path,
             client: Client::new(),
             search_timestamps: Arc::new(Mutex::new(Vec::new())),
             active_searches: Arc::new(Mutex::new(HashSet::new())),
@@ -508,7 +508,7 @@ impl SoulseekClient {
         Ok(res)
     }
 
-    pub async fn get_all_downloads(&self) -> Result<Vec<DownloadStatus>> {
+    pub async fn get_all_downloads(&self) -> Result<Vec<FileEntry>> {
         let flattened: FlattenedFiles = self
             .make_request(Method::GET, "transfers/downloads", None::<()>)
             .await?;

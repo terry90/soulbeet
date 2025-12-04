@@ -30,7 +30,7 @@ pub fn TrackList(props: Props) -> Element {
         }
         for track in props.tracks.read().iter() {
           TrackItem {
-            key: track.id,
+            key: "{track.id}",
             track: track.clone(),
             is_selected: props.selected_tracks.read().contains(&track.id),
             on_toggle: props.on_track_toggle.clone(),
