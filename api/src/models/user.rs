@@ -83,6 +83,18 @@ impl User {
             .map_err(|e| e.to_string())
     }
 
+    pub async fn get_by_id(id: &str) -> Result<User, String> {
+        let pool = get_pool().await;
+        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("User not found")?;
+
+        Ok(user)
+    }
+
     pub async fn update_password(id: &str, password: &str) -> Result<(), String> {
         let pool = get_pool().await;
         let salt = SaltString::generate(&mut OsRng);

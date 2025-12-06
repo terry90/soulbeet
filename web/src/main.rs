@@ -1,10 +1,11 @@
 use auth::{use_auth, AuthProvider};
 use dioxus::prelude::*;
 
-use ui::Navbar;
+use ui::{Downloads, Navbar};
 use views::{Home, Login, Settings};
 
 mod auth;
+mod storage;
 mod views;
 
 #[derive(Debug, Clone, Routable, PartialEq)]
@@ -52,7 +53,7 @@ fn AuthGuard() -> Element {
             nav.replace(Route::Login {});
         }
 
-        // If logged in and on /login → go to home
+        // If logged in and on /login -> go to home
         if is_logged_in && matches!(current, Route::Login {}) {
             nav.replace(Route::Home {});
         }
@@ -67,6 +68,7 @@ fn AuthGuard() -> Element {
 fn WebNavbar() -> Element {
     let mut auth = use_auth();
     let nav = use_navigator();
+    let mut downloads_open = use_signal(|| false);
 
     let logout = move |_| {
         auth.logout();
@@ -86,6 +88,11 @@ fn WebNavbar() -> Element {
                 "Settings"
             }
             button {
+                class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors ml-4",
+                onclick: move |_| downloads_open.set(!downloads_open()),
+                "Downloads"
+            }
+            button {
                 class: "text-gray-300 hover:text-white hover:bg-red-500/20 px-3 py-2 rounded-md text-sm font-medium transition-colors ml-4",
                 onclick: logout,
                 "Logout"
@@ -95,5 +102,6 @@ fn WebNavbar() -> Element {
         main { class: "pt-24 pb-12 min-h-screen bg-gray-900",
             div { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8", Outlet::<Route> {} }
         }
+        Downloads { is_open: downloads_open }
     }
 }

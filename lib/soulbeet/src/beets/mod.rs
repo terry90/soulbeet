@@ -1,11 +1,14 @@
-use std::{
-    io::{Error, Result},
-    path::Path,
-};
+use std::{io::Result, path::Path};
 use tokio::process::Command;
 use tracing::info;
 
-pub async fn import(sources: Vec<String>, target: &Path) -> Result<()> {
+pub enum ImportResult {
+    Success,
+    Skipped,
+    Failed,
+}
+
+pub async fn import(sources: Vec<String>, target: &Path) -> Result<ImportResult> {
     let config_path =
         std::env::var("BEETS_CONFIG").unwrap_or_else(|_| "beets_config.yaml".to_string());
 
@@ -29,12 +32,20 @@ pub async fn import(sources: Vec<String>, target: &Path) -> Result<()> {
         cmd.arg(source);
     }
 
-    let status = cmd.status().await?;
+    let output = cmd.output().await?;
 
-    if status.success() {
-        info!("Beet import successful");
-        Ok(())
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("Skipping") {
+            info!("Beet import skipped items");
+            Ok(ImportResult::Skipped)
+        } else {
+            info!("Beet import successful");
+            Ok(ImportResult::Success)
+        }
     } else {
-        Err(Error::other("Beet import failed"))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        info!("Beet import failed: {}", stderr);
+        Ok(ImportResult::Failed)
     }
 }

@@ -38,5 +38,3 @@ pub async fn get_pool() -> &'static Pool<Sqlite> {
     })
     .await
 }
-
-// User and Folder models moved to api/src/models/

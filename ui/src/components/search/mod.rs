@@ -10,13 +10,14 @@ use shared::slskd::{AlbumResult as SlskdAlbumResult, TrackResult as SlskdTrackRe
 use track::TrackResult;
 
 use crate::search::album::AlbumResult;
-use crate::{Album, AlbumHeader, Button, Modal};
+use crate::{use_auth, Album, AlbumHeader, Button, Modal};
 
 mod download_results;
 use download_results::DownloadResults;
 
 #[component]
 pub fn Search() -> Element {
+    let auth = use_auth();
     let mut response = use_signal::<Option<Vec<SearchResult>>>(|| None);
     let mut search = use_signal(String::new);
     let mut artist = use_signal::<Option<String>>(|| None);
@@ -24,10 +25,17 @@ pub fn Search() -> Element {
     let mut viewing_album = use_signal::<Option<AlbumWithTracks>>(|| None);
     let mut download_options = use_signal::<Option<Vec<SlskdAlbumResult>>>(|| None);
 
+    let token = use_signal(|| auth.token().unwrap_or_default());
+
+    if auth.token().is_none() {
+        info!("User not logged in");
+        return rsx! {};
+    }
+
     let download = move |query: DownloadQuery| async move {
         loading.set(true);
         viewing_album.set(None);
-        if let Ok(results) = api::search_downloads(query).await {
+        if let Ok(results) = api::search_downloads(token.read().clone(), query).await {
             download_options.set(Some(results));
         }
         loading.set(false);
@@ -36,8 +44,7 @@ pub fn Search() -> Element {
     let download_tracks = move |(tracks, folder): (Vec<SlskdTrackResult>, String)| async move {
         loading.set(true);
         download_options.set(None);
-        if let Ok(_res) = api::download(tracks, folder).await {
-            // TODO: Show download progress
+        if let Ok(_res) = api::download(token.read().clone(), tracks, folder).await {
             info!("Downloads started");
         }
         loading.set(false);
@@ -45,10 +52,13 @@ pub fn Search() -> Element {
 
     let search_track = move || async move {
         loading.set(true);
-        if let Ok(data) = api::search_track(api::SearchQuery {
-            artist: artist(),
-            query: search(),
-        })
+        if let Ok(data) = api::search_track(
+            token.read().clone(),
+            api::SearchQuery {
+                artist: artist(),
+                query: search(),
+            },
+        )
         .await
         {
             response.set(Some(data));
@@ -58,10 +68,13 @@ pub fn Search() -> Element {
 
     let search_album = move || async move {
         loading.set(true);
-        if let Ok(data) = api::search_album(api::SearchQuery {
-            artist: artist(),
-            query: search(),
-        })
+        if let Ok(data) = api::search_album(
+            token.read().clone(),
+            api::SearchQuery {
+                artist: artist(),
+                query: search(),
+            },
+        )
         .await
         {
             response.set(Some(data));
@@ -71,7 +84,7 @@ pub fn Search() -> Element {
 
     let view_full_album = move |album_id: String| async move {
         loading.set(true);
-        if let Ok(album_data) = api::find_album(album_id.clone()).await {
+        if let Ok(album_data) = api::find_album(token.read().clone(), album_id.clone()).await {
             viewing_album.set(Some(album_data));
         } else {
             info!("Failed to fetch album details for {}", album_id);

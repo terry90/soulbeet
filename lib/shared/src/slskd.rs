@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use std::fmt;
+
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -26,6 +29,10 @@ pub enum DownloadState {
     Aborted,
     Cancelled,
     Errored,
+    Importing,
+    Imported,
+    ImportSkipped,
+    ImportFailed,
     Unknown(String),
 }
 
@@ -39,13 +46,17 @@ impl From<String> for DownloadState {
             "Aborted" => DownloadState::Aborted,
             "Cancelled" => DownloadState::Cancelled,
             "Errored" => DownloadState::Errored,
+            "Importing" => DownloadState::Importing,
+            "Imported" => DownloadState::Imported,
+            "ImportSkipped" => DownloadState::ImportSkipped,
+            "ImportFailed" => DownloadState::ImportFailed,
             _ => DownloadState::Unknown(s),
         }
     }
 }
 
 // The exact structure of a single file entry
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
     pub id: String,
@@ -59,7 +70,7 @@ pub struct FileEntry {
     pub state: Vec<DownloadState>,
     pub state_description: String,
     pub requested_at: String,
-    pub enqueued_at: String,
+    pub enqueued_at: Option<String>,
     #[serde(default)]
     pub started_at: Option<String>,
     #[serde(default)]
@@ -87,10 +98,38 @@ fn deserialize_download_state<'de, D>(deserializer: D) -> Result<Vec<DownloadSta
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    Ok(s.split(',')
-        .map(|part| DownloadState::from(part.trim().to_string()))
-        .collect())
+    struct StateVisitor;
+
+    impl<'de> Visitor<'de> for StateVisitor {
+        type Value = Vec<DownloadState>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a comma-separated string or a sequence of DownloadStates")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value
+                .split(',')
+                .map(|part| DownloadState::from(part.trim().to_string()))
+                .collect())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element()? {
+                vec.push(elem);
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_any(StateVisitor)
 }
 
 // Custom deserializer that flattens everything into Vec<FileEntry>

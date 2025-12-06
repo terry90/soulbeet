@@ -96,6 +96,7 @@ dependencies = [
  "chrono",
  "dioxus",
  "dotenvy",
+ "futures",
  "jsonwebtoken",
  "rand 0.9.2",
  "serde",
@@ -6454,6 +6455,8 @@ version = "0.1.0"
 dependencies = [
  "api",
  "dioxus",
+ "futures",
+ "gloo-timers",
  "serde_json",
  "shared",
  "web-sys",
