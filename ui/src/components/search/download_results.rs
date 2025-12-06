@@ -70,8 +70,11 @@ pub fn DownloadResults(props: Props) -> Element {
             if let Ok(user_folders) = api::get_user_folders(token).await {
                 info!("Fetched {} user folders", user_folders.len());
 
-                if let Some(first) = user_folders.first() {
-                    selected_folder.set(first.path.clone());
+                // Only select if the user has exactly one folder
+                // It could be error prone to auto-select if there are multiple folders
+                // (I failed multiple times because of this)
+                if user_folders.len() == 1 {
+                    selected_folder.set(user_folders[0].path.clone());
                 }
                 folders.set(user_folders);
             }
