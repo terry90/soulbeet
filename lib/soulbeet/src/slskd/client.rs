@@ -5,6 +5,7 @@ use crate::{
     slskd::models::{DownloadRequestFile, SearchResponse},
 };
 use chrono::{DateTime, Duration, Utc};
+use futures::stream::{self, Stream, StreamExt};
 use itertools::Itertools;
 use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -177,11 +178,10 @@ impl SoulseekClient {
         album: String,
         tracks: Vec<Track>,
         timeout: Duration,
-    ) -> Result<Vec<AlbumResult>> {
+    ) -> Result<impl Stream<Item = Result<Vec<AlbumResult>>>> {
         self.wait_for_rate_limit().await?;
 
-        let track_titles: Vec<&str> = tracks.iter().map(|t| t.title.as_str()).collect();
-
+        let track_titles: Vec<String> = tracks.iter().map(|t| t.title.clone()).collect();
         let query = format!("{} {}", artist.trim(), album.trim());
         info!("Starting search for: '{}'", query);
 
@@ -209,56 +209,119 @@ impl SoulseekClient {
         self.active_searches.lock().await.insert(search_id.clone());
         info!("Search initiated with ID: {search_id}");
 
-        let start_time = Utc::now();
-        let poll_interval = Duration::seconds(1);
-        let mut all_responses: Vec<SearchResponse> = Vec::new();
+        let client = self.clone();
+        let search_id_clone = search_id.clone();
+        let artist_clone = artist.clone();
+        let album_clone = album.clone();
 
-        while (Utc::now() - start_time) < timeout {
-            if !self.active_searches.lock().await.contains(&search_id) {
-                info!("Search {search_id} was cancelled, stopping.");
-                break;
-            }
-            let endpoint = format!("searches/{search_id}/responses");
-            match self
-                .make_request::<Vec<SearchResponse>, ()>(Method::GET, &endpoint, None)
-                .await
-            {
-                Ok(current_responses) => {
-                    if current_responses.len() > all_responses.len() {
-                        info!(
-                            "Found {} new responses ({} total)",
-                            current_responses.len() - all_responses.len(),
-                            current_responses.len()
-                        );
-                        all_responses = current_responses;
-                    }
+        let stream = stream::unfold(
+            (
+                client,
+                search_id_clone,
+                artist_clone,
+                album_clone,
+                track_titles,
+                Utc::now(),
+                timeout,
+                0, // seen_responses_count
+            ),
+            move |(
+                client,
+                search_id,
+                artist,
+                album,
+                track_titles,
+                start_time,
+                timeout,
+                mut seen_responses_count,
+            )| async move {
+                if (Utc::now() - start_time) >= timeout {
+                    info!("Search timeout reached");
+                    // Cleanup
+                    client.active_searches.lock().await.remove(&search_id);
+                    let _ = client.delete_search(&search_id).await;
+                    return None;
                 }
-                Err(SoulseekError::Api { status: 404, .. }) => break,
-                Err(e) => warn!("Error polling for search results: {:?}", e),
+
+                if !client.active_searches.lock().await.contains(&search_id) {
+                    info!("Search {search_id} was cancelled, stopping.");
+                    return None;
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+                let endpoint = format!("searches/{search_id}/responses");
+                let new_results = match client
+                    .make_request::<Vec<SearchResponse>, ()>(Method::GET, &endpoint, None)
+                    .await
+                {
+                    Ok(current_responses) => {
+                        let total_len = current_responses.len();
+                        if total_len > seen_responses_count {
+                            info!(
+                                "Found {} new responses ({} total)",
+                                total_len - seen_responses_count,
+                                total_len
+                            );
+
+                            let track_titles_ref: Vec<&str> =
+                                track_titles.iter().map(|s| s.as_str()).collect();
+                            let mut albums = client.process_search_responses(
+                                &current_responses,
+                                &artist,
+                                &album,
+                                &track_titles_ref,
+                            );
+
+                            albums.sort_by(|a, b| {
+                                b.score
+                                    .partial_cmp(&a.score)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+
+                            seen_responses_count = total_len;
+                            Some(Ok(albums))
+                        } else {
+                            Some(Ok(vec![]))
+                        }
+                    }
+                    Err(SoulseekError::Api { status: 404, .. }) => {
+                        // Search deleted or not found
+                        client.active_searches.lock().await.remove(&search_id);
+                        None // Stop stream
+                    }
+                    Err(e) => {
+                        warn!("Error polling for search results: {:?}", e);
+                        Some(Err(e))
+                    }
+                };
+
+                new_results.map(|result| {
+                    (
+                        result,
+                        (
+                            client,
+                            search_id,
+                            artist,
+                            album,
+                            track_titles,
+                            start_time,
+                            timeout,
+                            seen_responses_count,
+                        ),
+                    )
+                })
+            },
+        );
+
+        let stream = stream.filter_map(|res| async move {
+            match res {
+                Ok(albums) if albums.is_empty() => None,
+                x => Some(x),
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                poll_interval.num_milliseconds() as u64,
-            ))
-            .await;
-        }
-
-        self.active_searches.lock().await.remove(&search_id);
-        let _ = self.delete_search(&search_id).await;
-
-        let mut albums =
-            self.process_search_responses(&all_responses, &artist, &album, &track_titles);
-
-        albums.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        info!(
-            "Search completed. Final results: {} albums/tracks",
-            albums.len()
-        );
-        Ok(albums)
+        Ok(stream)
     }
 
     fn process_search_responses(

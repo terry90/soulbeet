@@ -1,6 +1,8 @@
 use chrono::Duration;
+use dioxus::fullstack::{CborEncoding, Streaming};
 use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use shared::{
     download::DownloadQuery,
@@ -21,38 +23,7 @@ use crate::AuthSession;
 #[cfg(feature = "server")]
 use crate::globals::SLSKD_CLIENT;
 
-#[cfg(feature = "server")]
-async fn slskd_search(
-    artist: String,
-    album: String,
-    tracks: Vec<Track>,
-) -> Result<Vec<AlbumResult>, ServerFnError> {
-    let mut search = match SLSKD_CLIENT
-        .search(artist, album, tracks, Duration::seconds(45))
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => return Err(server_error(e)),
-    };
-
-    search.sort_by(|a, b| b.score.total_cmp(&a.score));
-
-    for album in search.iter().take(10) {
-        info!("Album: {}", album.album_title);
-        info!("Score: {}", album.score);
-        info!("Quality: {}", album.dominant_quality);
-
-        for track in album.tracks.iter() {
-            info!("  Filename: {:?}", track.base.filename);
-            info!("  Title: {:?}", track.title);
-            info!("  Artist: {:?}", track.artist);
-            info!("  Album: {:?}", track.album);
-            info!("  Format: {:?}", track.base.quality());
-        }
-    }
-
-    Ok(search)
-}
+static SLSKD_MAX_SEARCH_DURATION: i64 = 120; // seconds
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchQuery {
@@ -90,6 +61,38 @@ pub async fn find_album(id: String) -> Result<AlbumWithTracks, ServerFnError> {
 }
 
 #[post("/api/slskd/search", _: AuthSession)]
-pub async fn search_downloads(data: DownloadQuery) -> Result<Vec<AlbumResult>, ServerFnError> {
-    slskd_search(data.album.artist, data.album.title, data.tracks).await
+pub async fn search_downloads(
+    data: DownloadQuery,
+) -> Result<Streaming<Vec<AlbumResult>, CborEncoding>, ServerFnError> {
+    let artist = data.album.artist;
+    let album = data.album.title;
+    let tracks = data.tracks;
+
+    let stream = SLSKD_CLIENT
+        .search(
+            artist,
+            album,
+            tracks,
+            Duration::seconds(SLSKD_MAX_SEARCH_DURATION),
+        )
+        .await
+        .map_err(server_error)?;
+
+    let mut stream = Box::pin(stream);
+
+    Ok(Streaming::spawn(|tx| async move {
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(albums) => {
+                    if tx.unbounded_send(albums).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    info!("Error in search stream: {:?}", e);
+                    break;
+                }
+            }
+        }
+    }))
 }

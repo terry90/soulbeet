@@ -33,8 +33,12 @@ pub fn Search() -> Element {
     let download = move |query: DownloadQuery| async move {
         loading.set(true);
         viewing_album.set(None);
-        if let Ok(results) = auth.call(api::search_downloads(query)).await {
-            download_options.set(Some(results));
+        download_options.set(Some(vec![]));
+
+        if let Ok(mut stream) = auth.call(api::search_downloads(query)).await {
+            while let Some(Ok(results)) = stream.next().await {
+                download_options.set(Some(results));
+            }
         }
         loading.set(false);
     };
@@ -93,6 +97,7 @@ pub fn Search() -> Element {
         return rsx! {
           DownloadResults {
             results,
+            is_searching: loading(),
             on_download: move |data| {
                 spawn(download_tracks(data));
             },
@@ -159,8 +164,11 @@ pub fn Search() -> Element {
         }
 
         if loading() {
-          div { class: "flex justify-center items-center py-10",
-            div { class: "animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-teal-500" }
+          div { class: "flex flex-col justify-center items-center py-10",
+            div { class: "animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-teal-500 mb-4" }
+            p { class: "text-gray-400 animate-pulse text-center max-w-md",
+              "Searching... The rarer your track is, the longer the search can take."
+            }
           }
         } else {
           match *response.read() {

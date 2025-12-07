@@ -8,6 +8,7 @@ use crate::{use_auth, Checkbox};
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
     pub results: Vec<AlbumResult>,
+    pub is_searching: bool,
     #[props(into)]
     pub on_download: EventHandler<(Vec<TrackResult>, String)>,
 }
@@ -138,7 +139,17 @@ pub fn DownloadResults(props: Props) -> Element {
             }
             // }
 
-            div { class: "space-y-4 mb-20",
+            div { class: "space-y-4",
+                if props.is_searching {
+                    div { class: "flex flex-col items-center justify-center p-4 bg-gray-700/50 rounded-lg mb-4",
+                        div { class: "animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-teal-500 mb-2" }
+                        p { class: "text-sm text-gray-300 animate-pulse text-center",
+                            "Searching... The rarer your track is, the longer the search can take."
+                        }
+                    }
+                } else if results.is_empty() {
+                    div { class: "text-center text-gray-500 py-8", "No results found" }
+                }
                 for album in results {
                     AlbumResultItem {
                         album,
