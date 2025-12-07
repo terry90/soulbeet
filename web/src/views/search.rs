@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use ui::Search;
 
 #[component]
-pub fn Home() -> Element {
+pub fn SearchPage() -> Element {
     rsx! {
         Search {}
     }

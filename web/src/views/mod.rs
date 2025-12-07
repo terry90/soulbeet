@@ -1,7 +1,7 @@
-mod home;
 mod login;
+mod search;
 mod settings;
 
-pub use home::Home;
-pub use login::Login;
-pub use settings::Settings;
+pub use login::LoginPage;
+pub use search::SearchPage;
+pub use settings::SettingsPage;

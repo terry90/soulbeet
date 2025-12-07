@@ -2,7 +2,7 @@ use auth::{use_auth, AuthProvider};
 use dioxus::prelude::*;
 
 use ui::{Downloads, Navbar};
-use views::{Home, Login, Settings};
+use views::{LoginPage, SearchPage, SettingsPage};
 
 mod auth;
 mod views;
@@ -12,13 +12,13 @@ mod views;
 pub enum Route {
     #[layout(AuthGuard)]
         #[route("/login")]
-        Login {},
+        LoginPage {},
 
         #[layout(WebNavbar)]
             #[route("/")]
-            Home {},
+            SearchPage {},
             #[route("/settings")]
-            Settings {},
+            SettingsPage {},
 }
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -59,13 +59,13 @@ fn AuthGuard() -> Element {
         let is_logged_in = auth.is_logged_in();
 
         // If not logged in AND we're not already on /login -> go to login
-        if !is_logged_in && !matches!(current, Route::Login {}) {
-            nav.replace(Route::Login {});
+        if !is_logged_in && !matches!(current, Route::LoginPage {}) {
+            nav.replace(Route::LoginPage {});
         }
 
         // If logged in and on /login -> go to home
-        if is_logged_in && matches!(current, Route::Login {}) {
-            nav.replace(Route::Home {});
+        if is_logged_in && matches!(current, Route::LoginPage {}) {
+            nav.replace(Route::SearchPage {});
         }
     });
 
@@ -89,12 +89,12 @@ fn WebNavbar() -> Element {
         Navbar {
             Link {
                 class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors",
-                to: Route::Home {},
+                to: Route::SearchPage {},
                 "Home"
             }
             Link {
                 class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors",
-                to: Route::Settings {},
+                to: Route::SettingsPage {},
                 "Settings"
             }
             button {

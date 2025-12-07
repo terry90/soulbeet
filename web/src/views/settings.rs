@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use ui::settings::{FolderManager, UserManager};
 
 #[component]
-pub fn Settings() -> Element {
+pub fn SettingsPage() -> Element {
     rsx! {
         div { class: "space-y-8 text-white",
             div {

@@ -40,7 +40,7 @@ fn MobileNavbar() -> Element {
             Link {
                 class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors",
                 to: Route::Home {},
-                "Home"
+                "Search"
             }
         }
 
