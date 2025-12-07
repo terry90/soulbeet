@@ -5,19 +5,19 @@ use crate::models;
 use crate::AuthSession;
 use dioxus::prelude::*;
 
-#[get("/api/users", auth: AuthSession)]
+#[get("/api/users", _: AuthSession)]
 pub async fn get_users() -> Result<Vec<models::user::User>, ServerFnError> {
     models::user::User::get_all().await.map_err(server_error)
 }
 
-#[post("/api/users/password", auth: AuthSession)]
+#[post("/api/users/password", _: AuthSession)]
 pub async fn update_user_password(user_id: String, password: String) -> Result<(), ServerFnError> {
     models::user::User::update_password(&user_id, &password)
         .await
         .map_err(server_error)
 }
 
-#[delete("/api/users/delete", auth: AuthSession)]
+#[delete("/api/users/delete", _: AuthSession)]
 pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
     models::user::User::delete(&user_id)
         .await

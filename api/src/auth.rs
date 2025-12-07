@@ -2,16 +2,16 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthResponse {
-    pub token: String,
     pub username: String,
     pub user_id: String,
-    pub expires_at: i64, // Absolute timestamp (seconds)
 }
 
 #[cfg(feature = "server")]
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 #[cfg(feature = "server")]
 use std::env;
+
+pub static EXPIRATION_DAYS: i64 = 30;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
@@ -22,7 +22,7 @@ pub struct Claims {
 }
 
 #[cfg(feature = "server")]
-pub fn create_token(user_id: String, username: String) -> Result<AuthResponse, String> {
+pub fn create_token(user_id: String, username: String) -> Result<String, String> {
     let secret = env::var("SECRET_KEY").unwrap_or_else(|_| "secret".to_string());
     let encoding_key = EncodingKey::from_secret(secret.as_bytes());
     let now = chrono::Utc::now();
@@ -30,7 +30,7 @@ pub fn create_token(user_id: String, username: String) -> Result<AuthResponse, S
 
     // Token (7 days)
     let exp = now
-        .checked_add_signed(chrono::Duration::days(7))
+        .checked_add_signed(chrono::Duration::days(EXPIRATION_DAYS))
         .expect("valid timestamp")
         .timestamp();
 
@@ -43,12 +43,7 @@ pub fn create_token(user_id: String, username: String) -> Result<AuthResponse, S
 
     let token = encode(&Header::default(), &claims, &encoding_key).map_err(|e| e.to_string())?;
 
-    Ok(AuthResponse {
-        token,
-        username,
-        user_id,
-        expires_at: exp,
-    })
+    Ok(token)
 }
 
 #[cfg(feature = "server")]

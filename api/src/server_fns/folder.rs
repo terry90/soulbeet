@@ -32,7 +32,7 @@ pub async fn create_user_folder(
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-#[put("/api/folders/update", auth: AuthSession)]
+#[put("/api/folders/update", _: AuthSession)]
 pub async fn update_folder(
     folder_id: String,
     name: String,
@@ -43,10 +43,8 @@ pub async fn update_folder(
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-#[delete("/api/folders/delete", auth: AuthSession)]
+#[delete("/api/folders/delete", _: AuthSession)]
 pub async fn delete_folder(folder_id: String) -> Result<(), ServerFnError> {
-    let _ = auth;
-
     models::folder::Folder::delete(&folder_id)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))

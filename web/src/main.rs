@@ -10,10 +10,10 @@ mod views;
 #[derive(Debug, Clone, Routable, PartialEq)]
 #[rustfmt::skip]
 pub enum Route {
-    #[route("/login")]
-    Login {},
-
     #[layout(AuthGuard)]
+        #[route("/login")]
+        Login {},
+
         #[layout(WebNavbar)]
             #[route("/")]
             Home {},
@@ -77,7 +77,6 @@ fn AuthGuard() -> Element {
 #[component]
 fn WebNavbar() -> Element {
     let mut auth = use_auth();
-    let nav = use_navigator();
     let mut downloads_open = use_signal(|| false);
 
     let logout = move |_| {

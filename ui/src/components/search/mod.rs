@@ -25,7 +25,7 @@ pub fn Search() -> Element {
     let mut viewing_album = use_signal::<Option<AlbumWithTracks>>(|| None);
     let mut download_options = use_signal::<Option<Vec<SlskdAlbumResult>>>(|| None);
 
-    if auth.token().is_none() {
+    if !auth.is_logged_in() {
         info!("User not logged in");
         return rsx! {};
     }

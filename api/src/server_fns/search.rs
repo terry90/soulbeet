@@ -60,7 +60,7 @@ pub struct SearchQuery {
     pub query: String,
 }
 
-#[post("/api/musicbrainz/search/album", auth: AuthSession)]
+#[post("/api/musicbrainz/search/album", _: AuthSession)]
 pub async fn search_album(input: SearchQuery) -> Result<Vec<SearchResult>, ServerFnError> {
     musicbrainz::search(
         &input.artist,
@@ -72,7 +72,7 @@ pub async fn search_album(input: SearchQuery) -> Result<Vec<SearchResult>, Serve
     .map_err(server_error)
 }
 
-#[post("/api/musicbrainz/search/track", auth: AuthSession)]
+#[post("/api/musicbrainz/search/track", _: AuthSession)]
 pub async fn search_track(input: SearchQuery) -> Result<Vec<SearchResult>, ServerFnError> {
     musicbrainz::search(
         &input.artist,
@@ -84,12 +84,12 @@ pub async fn search_track(input: SearchQuery) -> Result<Vec<SearchResult>, Serve
     .map_err(server_error)
 }
 
-#[get("/api/musicbrainz/album/:id", auth: AuthSession)]
+#[get("/api/musicbrainz/album/:id", _: AuthSession)]
 pub async fn find_album(id: String) -> Result<AlbumWithTracks, ServerFnError> {
     musicbrainz::find_album(&id).await.map_err(server_error)
 }
 
-#[post("/api/slskd/search", auth: AuthSession)]
+#[post("/api/slskd/search", _: AuthSession)]
 pub async fn search_downloads(data: DownloadQuery) -> Result<Vec<AlbumResult>, ServerFnError> {
     slskd_search(data.album.artist, data.album.title, data.tracks).await
 }

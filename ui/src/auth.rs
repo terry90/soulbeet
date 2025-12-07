@@ -45,10 +45,6 @@ impl Auth {
         }
     }
 
-    pub fn token(&self) -> Option<String> {
-        self.state.read().as_ref().map(|a| a.token.clone())
-    }
-
     pub fn user_id(&self) -> Option<String> {
         self.state.read().as_ref().map(|a| a.user_id.clone())
     }
