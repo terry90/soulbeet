@@ -5,7 +5,6 @@ use ui::{Downloads, Navbar};
 use views::{Home, Login, Settings};
 
 mod auth;
-mod storage;
 mod views;
 
 #[derive(Debug, Clone, Routable, PartialEq)]
@@ -26,6 +25,16 @@ const FAVICON: Asset = asset!("/assets/favicon.ico");
 const MAIN_CSS: Asset = asset!("/assets/tailwind.css");
 
 fn main() {
+    #[cfg(feature = "server")]
+    {
+        use tower_cookies::CookieManagerLayer;
+
+        dioxus::serve(|| async move {
+            Ok(dioxus::server::router(App).layer(CookieManagerLayer::new()))
+        });
+    }
+
+    #[cfg(not(feature = "server"))]
     dioxus::launch(App);
 }
 
@@ -72,8 +81,9 @@ fn WebNavbar() -> Element {
     let mut downloads_open = use_signal(|| false);
 
     let logout = move |_| {
-        auth.logout();
-        nav.replace(Route::Login {});
+        spawn(async move {
+            auth.logout().await;
+        });
     };
 
     rsx! {

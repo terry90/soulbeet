@@ -1,5 +1,7 @@
 #[cfg(feature = "server")]
-use crate::db::get_pool;
+use super::folder::Folder;
+#[cfg(feature = "server")]
+use crate::db::DB;
 #[cfg(feature = "server")]
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -10,9 +12,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 #[cfg(feature = "server")]
 use uuid::Uuid;
-
-#[cfg(feature = "server")]
-use super::folder::Folder;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
@@ -26,7 +25,6 @@ pub struct User {
 #[cfg(feature = "server")]
 impl User {
     pub async fn create(username: &str, password: &str) -> Result<User, String> {
-        let pool = get_pool().await;
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
         let password_hash = argon2
@@ -42,7 +40,7 @@ impl User {
         .bind(&id)
         .bind(username)
         .bind(password_hash)
-        .fetch_one(pool)
+        .fetch_one(&*DB)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -50,10 +48,9 @@ impl User {
     }
 
     pub async fn verify(username: &str, password: &str) -> Result<User, String> {
-        let pool = get_pool().await;
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
             .bind(username)
-            .fetch_optional(pool)
+            .fetch_optional(&*DB)
             .await
             .map_err(|e| e.to_string())?
             .ok_or("User not found")?;
@@ -67,27 +64,24 @@ impl User {
     }
 
     pub async fn get_folders(&self) -> Result<Vec<Folder>, String> {
-        let pool = get_pool().await;
         sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE user_id = ?")
             .bind(&self.id)
-            .fetch_all(pool)
+            .fetch_all(&*DB)
             .await
             .map_err(|e| e.to_string())
     }
 
     pub async fn get_all() -> Result<Vec<User>, String> {
-        let pool = get_pool().await;
         sqlx::query_as::<_, User>("SELECT * FROM users")
-            .fetch_all(pool)
+            .fetch_all(&*DB)
             .await
             .map_err(|e| e.to_string())
     }
 
     pub async fn get_by_id(id: &str) -> Result<User, String> {
-        let pool = get_pool().await;
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
             .bind(id)
-            .fetch_optional(pool)
+            .fetch_optional(&*DB)
             .await
             .map_err(|e| e.to_string())?
             .ok_or("User not found")?;
@@ -96,7 +90,6 @@ impl User {
     }
 
     pub async fn update_password(id: &str, password: &str) -> Result<(), String> {
-        let pool = get_pool().await;
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
         let password_hash = argon2
@@ -107,17 +100,16 @@ impl User {
         sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
             .bind(password_hash)
             .bind(id)
-            .execute(pool)
+            .execute(&*DB)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub async fn delete(id: &str) -> Result<(), String> {
-        let pool = get_pool().await;
         sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(id)
-            .execute(pool)
+            .execute(&*DB)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())

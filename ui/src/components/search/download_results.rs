@@ -66,18 +66,16 @@ pub fn DownloadResults(props: Props) -> Element {
     let auth = use_auth();
 
     use_future(move || async move {
-        if let Some(token) = auth.token() {
-            if let Ok(user_folders) = api::get_user_folders(token).await {
-                info!("Fetched {} user folders", user_folders.len());
+        if let Ok(user_folders) = auth.call(api::get_user_folders()).await {
+            info!("Fetched {} user folders", user_folders.len());
 
-                // Only select if the user has exactly one folder
-                // It could be error prone to auto-select if there are multiple folders
-                // (I failed multiple times because of this)
-                if user_folders.len() == 1 {
-                    selected_folder.set(user_folders[0].path.clone());
-                }
-                folders.set(user_folders);
+            // Only select if the user has exactly one folder
+            // It could be error prone to auto-select if there are multiple folders
+            // (I failed multiple times because of this)
+            if user_folders.len() == 1 {
+                selected_folder.set(user_folders[0].path.clone());
             }
+            folders.set(user_folders);
         }
     });
 

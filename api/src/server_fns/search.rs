@@ -14,8 +14,10 @@ use shared::musicbrainz::Track;
 use soulbeet::musicbrainz;
 
 use super::server_error;
+
 #[cfg(feature = "server")]
-use crate::auth;
+use crate::AuthSession;
+
 #[cfg(feature = "server")]
 use crate::globals::SLSKD_CLIENT;
 
@@ -58,16 +60,8 @@ pub struct SearchQuery {
     pub query: String,
 }
 
-#[server]
-pub async fn search_album(
-    token: String,
-    input: SearchQuery,
-) -> Result<Vec<SearchResult>, ServerFnError> {
-    let _claims = match auth::verify_token(&token, "access") {
-        Ok(c) => c,
-        Err(e) => return Err(server_error(e)),
-    };
-
+#[post("/api/musicbrainz/search/album", auth: AuthSession)]
+pub async fn search_album(input: SearchQuery) -> Result<Vec<SearchResult>, ServerFnError> {
     musicbrainz::search(
         &input.artist,
         &input.query,
@@ -78,16 +72,8 @@ pub async fn search_album(
     .map_err(server_error)
 }
 
-#[server]
-pub async fn search_track(
-    token: String,
-    input: SearchQuery,
-) -> Result<Vec<SearchResult>, ServerFnError> {
-    let _claims = match auth::verify_token(&token, "access") {
-        Ok(c) => c,
-        Err(e) => return Err(server_error(e)),
-    };
-
+#[post("/api/musicbrainz/search/track", auth: AuthSession)]
+pub async fn search_track(input: SearchQuery) -> Result<Vec<SearchResult>, ServerFnError> {
     musicbrainz::search(
         &input.artist,
         &input.query,
@@ -98,25 +84,12 @@ pub async fn search_track(
     .map_err(server_error)
 }
 
-#[server]
-pub async fn find_album(token: String, id: String) -> Result<AlbumWithTracks, ServerFnError> {
-    let _claims = match auth::verify_token(&token, "access") {
-        Ok(c) => c,
-        Err(e) => return Err(server_error(e)),
-    };
-
+#[get("/api/musicbrainz/album/:id", auth: AuthSession)]
+pub async fn find_album(id: String) -> Result<AlbumWithTracks, ServerFnError> {
     musicbrainz::find_album(&id).await.map_err(server_error)
 }
 
-#[server]
-pub async fn search_downloads(
-    token: String,
-    data: DownloadQuery,
-) -> Result<Vec<AlbumResult>, ServerFnError> {
-    let _claims = match auth::verify_token(&token, "access") {
-        Ok(c) => c,
-        Err(e) => return Err(server_error(e)),
-    };
-
+#[post("/api/slskd/search", auth: AuthSession)]
+pub async fn search_downloads(data: DownloadQuery) -> Result<Vec<AlbumResult>, ServerFnError> {
     slskd_search(data.album.artist, data.album.title, data.tracks).await
 }

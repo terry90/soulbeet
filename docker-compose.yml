@@ -11,6 +11,7 @@ services:
       - SLSKD_API_KEY=your_slskd_api_key_here
       # This path must match the volume mapping for downloads inside the container
       - SLSKD_DOWNLOAD_PATH=/downloads
+      - SECRET_KEY=a_secret_key # Change this to a secure random key
     volumes:
       - soulbeet_data:/data
       # Map the download folder.

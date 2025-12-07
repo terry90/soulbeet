@@ -17,11 +17,9 @@ pub fn UserManager() -> Element {
     let auth = use_auth();
 
     let fetch_users = move || async move {
-        if let Some(token) = auth.token() {
-            match get_users(token).await {
-                Ok(fetched_users) => users.set(fetched_users),
-                Err(e) => error.set(format!("Failed to fetch users: {e}")),
-            }
+        match auth.call(get_users()).await {
+            Ok(fetched_users) => users.set(fetched_users),
+            Err(e) => error.set(format!("Failed to fetch users: {e}")),
         }
     };
 
@@ -38,7 +36,7 @@ pub fn UserManager() -> Element {
             return;
         }
 
-        match register(new_username(), new_password()).await {
+        match auth.call(register(new_username(), new_password())).await {
             Ok(_) => {
                 success_msg.set(format!("User '{}' created successfully", new_username()));
                 new_username.set("".to_string());
@@ -50,32 +48,31 @@ pub fn UserManager() -> Element {
     };
 
     let handle_delete_user = move |id: String| async move {
-        if let Some(token) = auth.token() {
-            match delete_user(token, id).await {
-                Ok(_) => {
-                    success_msg.set("User deleted successfully".to_string());
-                    fetch_users().await;
-                }
-                Err(e) => error.set(format!("Failed to delete user: {e}")),
+        match auth.call(delete_user(id)).await {
+            Ok(_) => {
+                success_msg.set("User deleted successfully".to_string());
+                fetch_users().await;
             }
+            Err(e) => error.set(format!("Failed to delete user: {e}")),
         }
     };
 
     let handle_update_user = move |id: String| async move {
-        if let Some(token) = auth.token() {
-            if edit_user_password().is_empty() {
-                error.set("Password cannot be empty".to_string());
-                return;
+        if edit_user_password().is_empty() {
+            error.set("Password cannot be empty".to_string());
+            return;
+        }
+        match auth
+            .call(update_user_password(id, edit_user_password()))
+            .await
+        {
+            Ok(_) => {
+                success_msg.set("User updated successfully".to_string());
+                editing_user_id.set(None);
+                edit_user_password.set("".to_string());
+                fetch_users().await;
             }
-            match update_user_password(token, id, edit_user_password()).await {
-                Ok(_) => {
-                    success_msg.set("User updated successfully".to_string());
-                    editing_user_id.set(None);
-                    edit_user_password.set("".to_string());
-                    fetch_users().await;
-                }
-                Err(e) => error.set(format!("Failed to update user: {e}")),
-            }
+            Err(e) => error.set(format!("Failed to update user: {e}")),
         }
     };
 

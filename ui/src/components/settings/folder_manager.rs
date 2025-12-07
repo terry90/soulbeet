@@ -18,11 +18,9 @@ pub fn FolderManager() -> Element {
     let auth = use_auth();
 
     let fetch_folders = move || async move {
-        if let Some(token) = auth.token() {
-            match get_user_folders(token).await {
-                Ok(fetched_folders) => folders.set(fetched_folders),
-                Err(e) => error.set(format!("Failed to fetch folders: {e}")),
-            }
+        match auth.call(get_user_folders()).await {
+            Ok(fetched_folders) => folders.set(fetched_folders),
+            Err(e) => error.set(format!("Failed to fetch folders: {e}")),
         }
     };
 
@@ -34,48 +32,46 @@ pub fn FolderManager() -> Element {
         error.set("".to_string());
         success_msg.set("".to_string());
 
-        if let Some(token) = auth.token() {
-            if folder_name().is_empty() || folder_path().is_empty() {
-                error.set("Name and Path are required".to_string());
-                return;
-            }
+        if folder_name().is_empty() || folder_path().is_empty() {
+            error.set("Name and Path are required".to_string());
+            return;
+        }
 
-            match create_user_folder(token, folder_name(), folder_path()).await {
-                Ok(_) => {
-                    success_msg.set("Folder added successfully".to_string());
-                    folder_name.set("".to_string());
-                    folder_path.set("".to_string());
-                    fetch_folders().await;
-                }
-                Err(e) => error.set(format!("Failed to add folder: {e}")),
+        match auth
+            .call(create_user_folder(folder_name(), folder_path()))
+            .await
+        {
+            Ok(_) => {
+                success_msg.set("Folder added successfully".to_string());
+                folder_name.set("".to_string());
+                folder_path.set("".to_string());
+                fetch_folders().await;
             }
-        } else {
-            error.set("User not logged in".to_string());
+            Err(e) => error.set(format!("Failed to add folder: {e}")),
         }
     };
 
     let handle_delete_folder = move |id: String| async move {
-        if let Some(token) = auth.token() {
-            match delete_folder(token, id).await {
-                Ok(_) => {
-                    success_msg.set("Folder deleted successfully".to_string());
-                    fetch_folders().await;
-                }
-                Err(e) => error.set(format!("Failed to delete folder: {e}")),
+        match auth.call(delete_folder(id)).await {
+            Ok(_) => {
+                success_msg.set("Folder deleted successfully".to_string());
+                fetch_folders().await;
             }
+            Err(e) => error.set(format!("Failed to delete folder: {e}")),
         }
     };
 
     let handle_update_folder = move |id: String| async move {
-        if let Some(token) = auth.token() {
-            match update_folder(token, id, edit_folder_name(), edit_folder_path()).await {
-                Ok(_) => {
-                    success_msg.set("Folder updated successfully".to_string());
-                    editing_folder_id.set(None);
-                    fetch_folders().await;
-                }
-                Err(e) => error.set(format!("Failed to update folder: {e}")),
+        match auth
+            .call(update_folder(id, edit_folder_name(), edit_folder_path()))
+            .await
+        {
+            Ok(_) => {
+                success_msg.set("Folder updated successfully".to_string());
+                editing_folder_id.set(None);
+                fetch_folders().await;
             }
+            Err(e) => error.set(format!("Failed to update folder: {e}")),
         }
     };
 

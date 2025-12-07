@@ -1,5 +1,5 @@
 #[cfg(feature = "server")]
-use crate::db::get_pool;
+use crate::db::DB;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
 use uuid::Uuid;
@@ -16,7 +16,6 @@ pub struct Folder {
 #[cfg(feature = "server")]
 impl Folder {
     pub async fn create(user_id: &str, name: &str, path: &str) -> Result<Folder, String> {
-        let pool = get_pool().await;
         let id = Uuid::new_v4().to_string();
 
         let folder = sqlx::query_as::<_, Folder>(
@@ -26,7 +25,7 @@ impl Folder {
         .bind(user_id)
         .bind(name)
         .bind(path)
-        .fetch_one(pool)
+        .fetch_one(&*DB)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -34,31 +33,28 @@ impl Folder {
     }
 
     pub async fn get_all_by_user(user_id: &str) -> Result<Vec<Folder>, String> {
-        let pool = get_pool().await;
         sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE user_id = ?")
             .bind(user_id)
-            .fetch_all(pool)
+            .fetch_all(&*DB)
             .await
             .map_err(|e| e.to_string())
     }
 
     pub async fn update(id: &str, name: &str, path: &str) -> Result<(), String> {
-        let pool = get_pool().await;
         sqlx::query("UPDATE folders SET name = ?, path = ? WHERE id = ?")
             .bind(name)
             .bind(path)
             .bind(id)
-            .execute(pool)
+            .execute(&*DB)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub async fn delete(id: &str) -> Result<(), String> {
-        let pool = get_pool().await;
         sqlx::query("DELETE FROM folders WHERE id = ?")
             .bind(id)
-            .execute(pool)
+            .execute(&*DB)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())

@@ -1,8 +1,5 @@
 use api::auth::AuthResponse;
 use dioxus::prelude::*;
-use web_sys::window;
-
-pub const AUTH_SESSION_KEY: &str = "auth_session";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Auth {
@@ -15,19 +12,37 @@ impl Auth {
     }
 
     pub fn login(&mut self, response: AuthResponse) {
-        if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-            if let Ok(json) = serde_json::to_string(&response) {
-                let _ = storage.set_item(AUTH_SESSION_KEY, &json);
-            }
-        }
         self.state.set(Some(response));
     }
 
-    pub fn logout(&mut self) {
-        if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-            let _ = storage.remove_item(AUTH_SESSION_KEY);
-        }
+    pub async fn logout(&mut self) {
+        let _ = api::logout().await;
         self.state.set(None);
+    }
+
+    /// Check if a server error is an authentication error.
+    /// If it is, logs the user out locally.
+    /// Returns true if the error was handled (user logged out), false otherwise.
+    pub fn handle_error(&mut self, error: &ServerFnError) -> bool {
+        if let ServerFnError::ServerError { code: 401, .. } = error {
+            self.state.set(None);
+            return true;
+        }
+        false
+    }
+
+    /// Wraps a server function call to automatically handle authentication errors.
+    pub async fn call<T>(
+        mut self,
+        fut: impl std::future::Future<Output = Result<T, ServerFnError>>,
+    ) -> Result<T, ServerFnError> {
+        match fut.await {
+            Ok(val) => Ok(val),
+            Err(e) => {
+                self.handle_error(&e);
+                Err(e)
+            }
+        }
     }
 
     pub fn token(&self) -> Option<String> {

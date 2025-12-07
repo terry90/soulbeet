@@ -10,7 +10,11 @@ use tokio::sync::broadcast;
 use soulbeet::beets;
 
 use super::server_error;
-use crate::auth;
+
+// Import the extractor we created in the previous step
+#[cfg(feature = "server")]
+use crate::AuthSession;
+
 #[cfg(feature = "server")]
 use crate::globals::{SLSKD_CLIENT, USER_CHANNELS};
 
@@ -19,12 +23,10 @@ async fn slskd_download(tracks: Vec<TrackResult>) -> Result<Vec<DownloadResponse
     SLSKD_CLIENT.download(tracks).await.map_err(server_error)
 }
 
-#[server(output = CborEncoding)]
+#[get("/api/downloads/updates", auth: AuthSession)]
 pub async fn download_updates_stream(
-    token: String,
 ) -> Result<Streaming<Vec<FileEntry>, CborEncoding>, ServerFnError> {
-    let claims = auth::verify_token(&token, "access").map_err(server_error)?;
-    let username = claims.username;
+    let username = auth.0.username;
 
     let rx = {
         let mut map = USER_CHANNELS.write().await;
@@ -53,14 +55,12 @@ pub async fn download_updates_stream(
     }))
 }
 
-#[server]
+#[post("/api/downloads/queue", auth: AuthSession)]
 pub async fn download(
-    token: String,
     tracks: Vec<TrackResult>,
     target_folder: String,
 ) -> Result<Vec<DownloadResponse>, ServerFnError> {
-    let claims = auth::verify_token(&token, "access").map_err(server_error)?;
-    let username = claims.username;
+    let username = auth.0.username;
 
     let target_path_buf = std::path::Path::new(&target_folder).to_path_buf();
     if let Err(e) = tokio::fs::create_dir_all(&target_path_buf).await {
