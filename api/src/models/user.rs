@@ -9,8 +9,6 @@ use argon2::{
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
-use sqlx::Row;
-#[cfg(feature = "server")]
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

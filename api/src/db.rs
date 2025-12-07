@@ -2,8 +2,6 @@
 use dioxus::fullstack::Lazy;
 #[cfg(feature = "server")]
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
-#[cfg(feature = "server")]
-use tokio::sync::OnceCell;
 
 #[cfg(feature = "server")]
 pub static DB: Lazy<SqlitePool> = Lazy::new(|| async move {

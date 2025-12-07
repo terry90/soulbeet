@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use shared::musicbrainz::{Album, Track};
+use shared::musicbrainz::Album;
 
 use crate::CoverArt;
 

@@ -1,14 +1,11 @@
 use dioxus::{logger::tracing::info, prelude::*};
 use shared::{
     download::DownloadQuery,
-    musicbrainz::{Album, AlbumWithTracks, Track},
+    musicbrainz::{AlbumWithTracks, Track},
 };
 use std::collections::HashSet;
 
-use crate::{
-    album::{footer::AlbumFooter, track_list::TrackList},
-    Button, CoverArt,
-};
+use crate::album::{footer::AlbumFooter, track_list::TrackList};
 
 mod footer;
 mod header;
@@ -19,9 +16,9 @@ pub use header::AlbumHeader;
 
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
-    // The album and its tracks to display
+    /// The album and its tracks to display
     pub data: AlbumWithTracks,
-    // Callback for when the user confirms their selection
+    /// Callback for when the user confirms their selection
     #[props(into)]
     pub on_select: EventHandler<DownloadQuery>,
 }

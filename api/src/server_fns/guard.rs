@@ -1,11 +1,7 @@
 use crate::auth::{self, Claims};
-use dioxus::prelude::ServerFnError;
 
 #[cfg(feature = "server")]
-use axum::{
-    extract::{FromRequest, FromRequestParts, Request},
-    http::StatusCode,
-};
+use axum::{extract::FromRequestParts, http::StatusCode};
 
 pub struct AuthSession(pub Claims);
 
@@ -18,7 +14,7 @@ where
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        state: &S,
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
         let cookies = parts
             .extensions

@@ -27,7 +27,7 @@ pub fn Login() -> Element {
       div { class: "flex flex-col items-center justify-center min-h-screen bg-gray-900 text-white",
         div { class: "p-8 bg-gray-800 rounded-lg shadow-xl w-full max-w-md",
           h1 { class: "text-2xl font-bold mb-6 text-center text-teal-400",
-            "Soulbeet Login"
+            "SoulBeet Login"
           }
           div { class: "mb-4",
             label { class: "block text-sm font-medium mb-1", "Username" }

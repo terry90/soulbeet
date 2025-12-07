@@ -6,7 +6,7 @@ pub mod search;
 pub mod settings;
 pub mod simple;
 
-pub use album::*;
+pub use album::{Album, AlbumHeader};
 pub use cover_art::*;
 pub use downloads::*;
 pub use modal::*;
