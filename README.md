@@ -125,4 +125,6 @@ Default `beet import` flags used:
 - Find a way to avoid album dups ? e.g `Clair Obscur_ Expedition 33 (Original Soundtrack)` & `Clair Obscur_ Expedition 33_ Original Soundtrack` - Rare but annoying
 - Reduce final container image size
 - Add play preview on album track list
-- Add a way to search singles on slskd
+- Improve slskd search. Currently:
+  - Single track search, query: "{artist} {track_title}" -> more resilient
+  - Multiple tracks search, query: "{artist} {album}" -> best for metadata and grouping tracks by album

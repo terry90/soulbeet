@@ -84,7 +84,9 @@ pub async fn search_downloads(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(albums) => {
-                    for chunk in albums.chunks(10) {
+                    // Trial and error to find a good chunk size, too large make a Decoding error in the client
+                    // Not sure why yet.
+                    for chunk in albums.chunks(5) {
                         let batch = chunk.to_vec();
                         info!("Sending batch of {} albums", batch.len());
                         if let Err(err) = tx.unbounded_send(batch) {
