@@ -250,7 +250,6 @@ impl SoulseekClient {
             )| async move {
                 if (Utc::now() - start_time) >= timeout {
                     info!("Search timeout reached");
-                    // Cleanup
                     client.active_searches.lock().await.remove(&search_id);
                     let _ = client.delete_search(&search_id).await;
                     return None;
@@ -261,7 +260,6 @@ impl SoulseekClient {
                         "Reached maximum search results limit of {}, stopping.",
                         MAX_SEARCH_RESULTS
                     );
-                    // Cleanup
                     client.active_searches.lock().await.remove(&search_id);
                     let _ = client.delete_search(&search_id).await;
                     return None;
@@ -275,12 +273,13 @@ impl SoulseekClient {
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
                 let endpoint = format!("searches/{search_id}/responses");
-                let new_results = match client
+                let result = match client
                     .make_request::<Vec<SearchResponse>, ()>(Method::GET, &endpoint, None)
                     .await
                 {
                     Ok(current_responses) => {
                         let total_len = current_responses.len();
+
                         if total_len > seen_responses_count {
                             info!(
                                 "Found {} new responses ({} total)",
@@ -303,30 +302,29 @@ impl SoulseekClient {
                                     .unwrap_or(std::cmp::Ordering::Equal)
                             });
 
-                            if albums.len() > MAX_SEARCH_RESULTS {
-                                albums.truncate(MAX_SEARCH_RESULTS);
-                            }
-
                             seen_responses_count = total_len;
                             Some(Ok(albums))
                         } else {
+                            // No new results, keep stream alive
                             Some(Ok(vec![]))
                         }
                     }
                     Err(SoulseekError::Api { status: 404, .. }) => {
-                        // Search deleted or not found
                         client.active_searches.lock().await.remove(&search_id);
-                        None // Stop stream
+                        None
                     }
                     Err(e) => {
-                        warn!("Error polling for search results: {:?}", e);
-                        Some(Err(e))
+                        warn!(
+                            "Transient error polling search results (will retry): {:?}",
+                            e
+                        );
+                        Some(Ok(vec![]))
                     }
                 };
 
-                new_results.map(|result| {
+                result.map(|res| {
                     (
-                        result,
+                        res,
                         (
                             client,
                             search_id,
