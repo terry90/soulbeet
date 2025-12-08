@@ -9,6 +9,7 @@ use musicbrainz_rs::{
 };
 use shared::musicbrainz::{Album, AlbumWithTracks, SearchResult, Track};
 use std::{collections::HashSet, sync::OnceLock};
+use tracing::info;
 
 // This ensures the client is initialized only once with a proper user agent.
 fn musicbrainz_client() -> &'static MusicBrainzClient {
@@ -47,6 +48,7 @@ fn format_duration(duration_ms: &Option<u32>) -> Option<String> {
 }
 
 /// An enumeration to specify the type of search.
+#[derive(Debug)]
 pub enum SearchType {
     Track,
     Album,
@@ -61,6 +63,11 @@ pub async fn search(
 ) -> Result<Vec<SearchResult>, musicbrainz_rs::Error> {
     let client = musicbrainz_client();
     let mut results = Vec::new();
+
+    info!(
+        "Starting {:?} search for query: '{}', artist: '{:?}'",
+        search_type, query, artist
+    );
 
     match search_type {
         SearchType::Track => {

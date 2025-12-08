@@ -125,7 +125,6 @@ pub fn DownloadResults(props: Props) -> Element {
     rsx! {
         div { class: "bg-gray-800 text-white p-6 sm:p-8 rounded-lg shadow-xl max-w-2xl mx-auto my-10 font-sans relative",
             h3 { class: "text-2xl font-bold mb-6 text-center text-teal-400", "Download Options" }
-            // if !folders.read().is_empty() {
             div { class: "mb-4",
                 label { class: "block text-sm font-medium mb-1", "Select Target Folder" }
                 select {
@@ -137,11 +136,10 @@ pub fn DownloadResults(props: Props) -> Element {
                     }
                 }
             }
-            // }
 
             div { class: "space-y-4",
                 if props.is_searching {
-                    div { class: "flex flex-col items-center justify-center p-4 bg-gray-700/50 rounded-lg mb-4",
+                    div { class: "flex flex-col items-center justify-center p-4 bg-gray-700/50 rounded-lg",
                         div { class: "animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-teal-500 mb-2" }
                         p { class: "text-sm text-gray-300 animate-pulse text-center",
                             "Searching... The rarer your track is, the longer the search can take."

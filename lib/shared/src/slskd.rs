@@ -16,7 +16,6 @@ pub struct DownloadRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct DownloadResponse {
-    pub id: String,
     pub filename: String,
 }
 

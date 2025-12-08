@@ -25,6 +25,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use url::Url;
 
+const MAX_SEARCH_RESULTS: usize = 50;
+
 #[derive(Debug, Clone)]
 pub struct SoulseekClient {
     base_url: Url,
@@ -183,7 +185,11 @@ impl SoulseekClient {
 
         let track_titles: Vec<String> = tracks.iter().map(|t| t.title.clone()).collect();
         let query = format!("{} {}", artist.trim(), album.trim());
-        info!("Starting search for: '{}'", query);
+        info!(
+            "Starting search for: '{}' with timeout {}ms",
+            query,
+            timeout.num_milliseconds()
+        );
 
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -191,11 +197,13 @@ impl SoulseekClient {
             search_text: &'a str,
             timeout: i64,
             filter_responses: bool,
+            minimum_peer_upload_speed: u32,
         }
         let request_body = SearchRequest {
             search_text: &query,
             timeout: timeout.num_milliseconds(),
             filter_responses: true,
+            minimum_peer_upload_speed: 10,
         };
 
         #[derive(Deserialize)]
@@ -243,6 +251,17 @@ impl SoulseekClient {
                     return None;
                 }
 
+                if seen_responses_count >= MAX_SEARCH_RESULTS {
+                    info!(
+                        "Reached maximum search results limit of {}, stopping.",
+                        MAX_SEARCH_RESULTS
+                    );
+                    // Cleanup
+                    client.active_searches.lock().await.remove(&search_id);
+                    let _ = client.delete_search(&search_id).await;
+                    return None;
+                }
+
                 if !client.active_searches.lock().await.contains(&search_id) {
                     info!("Search {search_id} was cancelled, stopping.");
                     return None;
@@ -278,6 +297,10 @@ impl SoulseekClient {
                                     .partial_cmp(&a.score)
                                     .unwrap_or(std::cmp::Ordering::Equal)
                             });
+
+                            if albums.len() > MAX_SEARCH_RESULTS {
+                                albums.truncate(MAX_SEARCH_RESULTS);
+                            }
 
                             seen_responses_count = total_len;
                             Some(Ok(albums))
@@ -425,12 +448,14 @@ impl SoulseekClient {
                 }
 
                 // If we didn't find a file for every track we were looking for, this album is incomplete.
-                if best_files_for_album.len() != expected_tracks.len() {
-                    return None;
-                }
+                // We allow partial matches now
+                // if best_files_for_album.len() != expected_tracks.len() {
+                //     return None;
+                // }
 
-                let final_tracks: Vec<_> = best_files_for_album
-                    .values()
+                let final_tracks: Vec<_> = expected_tracks
+                    .iter()
+                    .filter_map(|t| best_files_for_album.get(*t))
                     .map(|(mr, sr)| TrackResult::new(sr.clone(), mr.clone()))
                     .collect();
 
@@ -441,7 +466,7 @@ impl SoulseekClient {
                 let completeness = if !expected_tracks.is_empty() {
                     final_tracks.len() as f64 / expected_tracks.len() as f64
                 } else {
-                    1.0 // Generic searches are considered "complete" by definition.
+                    1.0
                 };
 
                 let total_size: i64 = final_tracks.iter().map(|t| t.base.size).sum();
@@ -492,7 +517,6 @@ impl SoulseekClient {
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
         struct SlskdDownloadResponse {
-            id: String,
             filename: String,
         }
 
@@ -545,7 +569,6 @@ impl SoulseekClient {
                 info!("Slskd returned empty success response. Assuming files queued.");
                 for req_file in &file_requests {
                     res.push(DownloadResponse {
-                        id: "pending".to_string(),
                         filename: req_file.filename.clone(),
                     });
                 }
@@ -553,14 +576,12 @@ impl SoulseekClient {
             } else if let Ok(single_res) = serde_json::from_str::<SlskdDownloadResponse>(&resp_text)
             {
                 res.push(DownloadResponse {
-                    id: single_res.id,
                     filename: single_res.filename,
                 });
             } else if let Ok(multi_res) =
                 serde_json::from_str::<Vec<SlskdDownloadResponse>>(&resp_text)
             {
                 res.extend(multi_res.into_iter().map(|d| DownloadResponse {
-                    id: d.id,
                     filename: d.filename,
                 }));
             } else {

@@ -36,9 +36,39 @@ pub fn Search() -> Element {
         download_options.set(Some(vec![]));
 
         if let Ok(mut stream) = auth.call(api::search_downloads(query)).await {
-            while let Some(Ok(results)) = stream.next().await {
-                download_options.set(Some(results));
+            while let Some(res) = stream.next().await {
+                match res {
+                    Ok(new_results) => {
+                        download_options.with_mut(|current| {
+                            if let Some(list) = current {
+                                for new_album in new_results {
+                                    if let Some(pos) = list.iter().position(|x| {
+                                        x.username == new_album.username
+                                            && x.album_path == new_album.album_path
+                                    }) {
+                                        // Safeguard against incomplete albums
+                                        list[pos] = new_album;
+                                    } else {
+                                        list.push(new_album);
+                                    }
+                                }
+
+                                // Resort new results by score
+                                list.sort_by(|a, b| {
+                                    b.score
+                                        .partial_cmp(&a.score)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        info!("Stream error: {:?}", e);
+                    }
+                }
             }
+        } else {
+            info!("Failed to start download search stream");
         }
         loading.set(false);
     };
@@ -165,10 +195,7 @@ pub fn Search() -> Element {
 
         if loading() {
           div { class: "flex flex-col justify-center items-center py-10",
-            div { class: "animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-teal-500 mb-4" }
-            p { class: "text-gray-400 animate-pulse text-center max-w-md",
-              "Searching... The rarer your track is, the longer the search can take."
-            }
+            div { class: "animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-teal-500" }
           }
         } else {
           match *response.read() {

@@ -13,7 +13,7 @@ pub fn AlbumHeader(props: Props) -> Element {
     rsx! {
       div { class: "flex items-start gap-4 p-4 border-b border-gray-700",
         CoverArt {
-          src: format!("https://coverartarchive.org/release/{}/front", props.album.id),
+          src: format!("https://coverartarchive.org/release/{}/front-250", props.album.id),
           alt: format!("Cover for {}", props.album.title),
         }
         div { class: "flex-grow",
