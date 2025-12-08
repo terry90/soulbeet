@@ -77,7 +77,7 @@ pub async fn logout() -> Result<(), ServerFnError> {
     Ok(())
 }
 
-#[get("/api/auth/me", auth: AuthSession, cookies: Cookies)]
+#[get("/api/auth/me", auth: AuthSession)]
 pub async fn get_current_user() -> Result<Option<AuthResponse>, ServerFnError> {
     let claims = auth.0;
 

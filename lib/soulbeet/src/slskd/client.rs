@@ -184,7 +184,12 @@ impl SoulseekClient {
         self.wait_for_rate_limit().await?;
 
         let track_titles: Vec<String> = tracks.iter().map(|t| t.title.clone()).collect();
-        let query = format!("{} {}", artist.trim(), album.trim());
+
+        let query = match tracks.len() {
+            1 => format!("{} {}", artist.trim(), tracks[0].title.trim()),
+            _ => format!("{} {}", artist.trim(), album.trim()),
+        };
+
         info!(
             "Starting search for: '{}' with timeout {}ms",
             query,

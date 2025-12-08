@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use ui::Navbar;
+use ui::{Navbar, SearchReset};
 use views::Home;
 
 mod views;
@@ -35,11 +35,16 @@ fn App() -> Element {
 /// which allows us to use the mobile-specific `Route` enum.
 #[component]
 fn MobileNavbar() -> Element {
+    let mut search_reset = use_signal(|| 0);
+
+    use_context_provider(|| SearchReset(search_reset));
+
     rsx! {
         Navbar {
             Link {
                 class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors",
                 to: Route::Home {},
+                onclick: move |_| search_reset += 1,
                 "Search"
             }
         }

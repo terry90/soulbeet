@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use ui::{Downloads, Navbar};
+use ui::{Downloads, Navbar, SearchReset};
 use views::Home;
 
 mod views;
@@ -36,12 +36,15 @@ fn App() -> Element {
 #[component]
 fn DesktopNavbar() -> Element {
     let mut downloads_open = use_signal(|| false);
+    let mut search_reset = use_signal(|| 0);
+    use_context_provider(|| SearchReset(search_reset));
 
     rsx! {
         Navbar {
             Link {
                 class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors",
                 to: Route::Home {},
+                onclick: move |_| search_reset += 1,
                 "Home"
             }
             button {

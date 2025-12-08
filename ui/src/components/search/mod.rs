@@ -1,5 +1,8 @@
 pub mod album;
+pub mod context;
 pub mod track;
+
+pub use context::SearchReset;
 
 use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
@@ -24,6 +27,19 @@ pub fn Search() -> Element {
     let mut loading = use_signal(|| false);
     let mut viewing_album = use_signal::<Option<AlbumWithTracks>>(|| None);
     let mut download_options = use_signal::<Option<Vec<SlskdAlbumResult>>>(|| None);
+    let search_reset = try_use_context::<SearchReset>();
+
+    use_effect(move || {
+        if let Some(reset) = search_reset {
+            if reset.0() > 0 {
+                response.set(None);
+                search.set(String::new());
+                artist.set(None);
+                viewing_album.set(None);
+                download_options.set(None);
+            }
+        }
+    });
 
     if !auth.is_logged_in() {
         info!("User not logged in");
@@ -160,11 +176,13 @@ pub fn Search() -> Element {
         div { class: "flex flex-col sm:flex-row gap-4 mb-4",
 
           input {
+            value: "{search}",
             class: "flex-grow bg-gray-700 text-white placeholder-gray-400 px-4 py-2 rounded-md border border-gray-600 focus:outline-none focus:ring-2 focus:ring-teal-500 transition-shadow",
             placeholder: "Search an album or track...",
             oninput: move |event| search.set(event.value()),
           }
           input {
+            value: artist.read().as_ref().map_or("", |v| v),
             class: "flex-grow bg-gray-700 text-white placeholder-gray-400 px-4 py-2 rounded-md border border-gray-600 focus:outline-none focus:ring-2 focus:ring-teal-500 transition-shadow",
             placeholder: "Artist (optional)",
             oninput: move |event| {

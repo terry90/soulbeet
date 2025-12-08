@@ -1,7 +1,7 @@
 use auth::{use_auth, AuthProvider};
 use dioxus::prelude::*;
 
-use ui::{Downloads, Navbar};
+use ui::{Downloads, Navbar, SearchReset};
 use views::{LoginPage, SearchPage, SettingsPage};
 
 mod auth;
@@ -78,6 +78,9 @@ fn AuthGuard() -> Element {
 fn WebNavbar() -> Element {
     let mut auth = use_auth();
     let mut downloads_open = use_signal(|| false);
+    let mut search_reset = use_signal(|| 0);
+
+    use_context_provider(|| SearchReset(search_reset));
 
     let logout = move |_| {
         spawn(async move {
@@ -90,7 +93,8 @@ fn WebNavbar() -> Element {
             Link {
                 class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors",
                 to: Route::SearchPage {},
-                "Home"
+                onclick: move |_| search_reset += 1,
+                "Search"
             }
             Link {
                 class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors",
