@@ -1,13 +1,10 @@
 use chrono::Duration;
-use dioxus::fullstack::{CborEncoding, Streaming};
-use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
-use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use shared::{
     download::DownloadQuery,
     musicbrainz::{AlbumWithTracks, SearchResult},
-    slskd::AlbumResult,
+    slskd::SearchResponse,
 };
 
 #[cfg(feature = "server")]
@@ -58,46 +55,35 @@ pub async fn find_album(id: String) -> Result<AlbumWithTracks, ServerFnError> {
     musicbrainz::find_album(&id).await.map_err(server_error)
 }
 
-#[post("/api/slskd/search", _: AuthSession)]
-pub async fn search_downloads(
-    data: DownloadQuery,
-) -> Result<Streaming<AlbumResult, CborEncoding>, ServerFnError> {
+#[post("/api/slskd/search/start", _: AuthSession)]
+pub async fn start_download_search(data: DownloadQuery) -> Result<String, ServerFnError> {
     let artist = data.album.artist;
     let album = data.album.title;
     let tracks = data.tracks;
 
-    let stream = SLSKD_CLIENT
-        .search(
+    SLSKD_CLIENT
+        .start_search(
             artist,
             album,
             tracks,
             Duration::seconds(SLSKD_MAX_SEARCH_DURATION),
         )
         .await
+        .map_err(server_error)
+}
+
+#[post("/api/slskd/search/poll", _: AuthSession)]
+pub async fn poll_download_search(search_id: String) -> Result<SearchResponse, ServerFnError> {
+    let (results, has_more, state) = SLSKD_CLIENT
+        .poll_search(search_id.clone())
+        .await
         .map_err(server_error)?;
 
-    let mut stream = Box::pin(stream);
-
-    Ok(Streaming::spawn(|tx| async move {
-        while let result = stream.try_next().await {
-            match result {
-                Ok(Some(albums)) => {
-                    for album in albums {
-                        if let Err(err) = tx.unbounded_send(album) {
-                            info!("Client disconnected, stopping stream: {:?}", err);
-                            return;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    info!("Search completed, no more results.");
-                    break;
-                }
-                Err(e) => {
-                    info!("Error in search stream: {:?}", e);
-                    break;
-                }
-            }
-        }
-    }))
+    Ok(SearchResponse {
+        search_id,
+        total_results: results.len(),
+        results,
+        has_more,
+        state,
+    })
 }

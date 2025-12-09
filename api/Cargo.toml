@@ -27,7 +27,6 @@ tokio = { version = "1.48.0", features = [
   "rt-multi-thread",
   "fs",
 ], optional = true }
-futures = "0.3.31"
 tracing = "0.1.41"
 axum = { version = "0.8.7", optional = true }
 

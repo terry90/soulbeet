@@ -8,7 +8,9 @@ use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
 use shared::download::DownloadQuery;
 use shared::musicbrainz::{AlbumWithTracks, SearchResult};
-use shared::slskd::{AlbumResult as SlskdAlbumResult, TrackResult as SlskdTrackResult};
+use shared::slskd::{
+    AlbumResult as SlskdAlbumResult, SearchState, TrackResult as SlskdTrackResult,
+};
 
 use track::TrackResult;
 
@@ -51,12 +53,24 @@ pub fn Search() -> Element {
         viewing_album.set(None);
         download_options.set(Some(vec![]));
 
-        if let Ok(mut stream) = auth.call(api::search_downloads(query)).await {
-            while let Some(res) = stream.next().await {
-                match res {
-                    Ok(new_album) => {
-                        download_options.with_mut(|current| {
-                            if let Some(list) = current {
+        let search_id = match auth.call(api::start_download_search(query)).await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("Failed to start download search: {:?}", e);
+                loading.set(false);
+                return;
+            }
+        };
+
+        loop {
+            match auth
+                .call(api::poll_download_search(search_id.clone()))
+                .await
+            {
+                Ok(response) => {
+                    download_options.with_mut(|current| {
+                        if let Some(list) = current {
+                            for new_album in response.results {
                                 if let Some(pos) = list.iter().position(|x| {
                                     x.username == new_album.username
                                         && x.album_path == new_album.album_path
@@ -66,23 +80,26 @@ pub fn Search() -> Element {
                                 } else {
                                     list.push(new_album);
                                 }
-
-                                // Resort new results by score
-                                list.sort_by(|a, b| {
-                                    b.score
-                                        .partial_cmp(&a.score)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                });
                             }
-                        });
-                    }
-                    Err(e) => {
-                        info!("Stream error: {:?}", e);
+
+                            // Resort new results by score
+                            list.sort_by(|a, b| {
+                                b.score
+                                    .partial_cmp(&a.score)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                        }
+                    });
+
+                    if response.state != SearchState::InProgress {
+                        break;
                     }
                 }
+                Err(e) => {
+                    info!("Failed to poll search: {:?}", e);
+                    break;
+                }
             }
-        } else {
-            info!("Failed to start download search stream");
         }
         loading.set(false);
     };

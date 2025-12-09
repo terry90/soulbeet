@@ -305,3 +305,20 @@ impl AlbumResult {
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SearchState {
+    InProgress,
+    Completed,
+    NotFound,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub search_id: String,
+    pub results: Vec<AlbumResult>,
+    pub has_more: bool,
+    pub total_results: usize,
+    pub state: SearchState,
+}
