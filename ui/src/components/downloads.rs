@@ -15,11 +15,21 @@ pub fn Downloads(props: DownloadsProps) -> Element {
     let mut downloads_map = use_signal::<HashMap<String, FileEntry>>(HashMap::new);
 
     use_future(move || async move {
-        if let Ok(mut stream) = auth.call(api::download_updates_stream()).await {
-            while let Some(Ok(data)) = stream.next().await {
-                let mut map = downloads_map.write();
-                for file in data {
-                    map.insert(file.id.clone(), file);
+        loop {
+            let mut stream = auth.call(api::download_updates_stream()).await;
+
+            match stream {
+                Ok(ref mut s) => {
+                    while let Some(Ok(data)) = s.next().await {
+                        let mut map = downloads_map.write();
+                        for file in data {
+                            map.insert(file.id.clone(), file);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to connect to download updates stream: {:?}", e);
+                    gloo_timers::future::TimeoutFuture::new(1_000).await;
                 }
             }
         }
