@@ -14,9 +14,12 @@ pub struct DownloadRequest {
     pub file_size: i64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DownloadResponse {
+    pub username: String,
     pub filename: String,
+    pub size: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

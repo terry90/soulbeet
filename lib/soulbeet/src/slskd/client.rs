@@ -578,6 +578,14 @@ impl SoulseekClient {
                     status,
                     resp_text
                 );
+                for req_file in &file_requests {
+                    res.push(DownloadResponse {
+                        username: username.clone(),
+                        filename: req_file.filename.clone(),
+                        size: req_file.size as u64,
+                        error: Some(resp_text.clone()),
+                    });
+                }
                 continue;
             }
 
@@ -585,20 +593,41 @@ impl SoulseekClient {
                 info!("Slskd returned empty success response. Assuming files queued.");
                 for req_file in &file_requests {
                     res.push(DownloadResponse {
+                        username: username.clone(),
                         filename: req_file.filename.clone(),
+                        size: req_file.size as u64,
+                        error: None,
                     });
                 }
                 // TODO: Check slskd response
             } else if let Ok(single_res) = serde_json::from_str::<SlskdDownloadResponse>(&resp_text)
             {
+                let size = file_requests
+                    .iter()
+                    .find(|f| f.filename == single_res.filename)
+                    .map(|f| f.size)
+                    .unwrap_or(0);
                 res.push(DownloadResponse {
+                    username: username.clone(),
                     filename: single_res.filename,
+                    size: size as u64,
+                    error: None,
                 });
             } else if let Ok(multi_res) =
                 serde_json::from_str::<Vec<SlskdDownloadResponse>>(&resp_text)
             {
-                res.extend(multi_res.into_iter().map(|d| DownloadResponse {
-                    filename: d.filename,
+                res.extend(multi_res.into_iter().map(|d| {
+                    let size = file_requests
+                        .iter()
+                        .find(|f| f.filename == d.filename)
+                        .map(|f| f.size)
+                        .unwrap_or(0);
+                    DownloadResponse {
+                        username: username.clone(),
+                        filename: d.filename,
+                        size: size as u64,
+                        error: None,
+                    }
                 }));
             } else {
                 tracing::error!("Failed to parse response from slskd: '{}'", resp_text);

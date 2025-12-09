@@ -121,9 +121,14 @@ fn DownloadItem(file: FileEntry) -> Element {
               span { "{format_size(file.size)}" }
             }
           }
-          span { class: "text-xs font-medium px-2 py-0.5 rounded bg-gray-800 {status_color}",
+          span {
+            class: "text-xs font-medium px-2 py-0.5 rounded bg-gray-800 {status_color}",
+            title: "{file.state_description}",
             "{status_text}"
           }
+        }
+        if matches!(state, DownloadState::Errored) {
+          div { class: "text-xs text-red-400 mt-1 break-words", "{file.state_description}" }
         }
         if matches!(state, DownloadState::InProgress) {
           div { class: "w-full bg-gray-800 rounded-full h-1.5 mt-2 overflow-hidden",

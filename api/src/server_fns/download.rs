@@ -19,6 +19,12 @@ use crate::AuthSession;
 use crate::globals::{SLSKD_CLIENT, USER_CHANNELS};
 
 #[cfg(feature = "server")]
+use chrono::Utc;
+
+#[cfg(feature = "server")]
+use uuid::Uuid;
+
+#[cfg(feature = "server")]
 async fn slskd_download(tracks: Vec<TrackResult>) -> Result<Vec<DownloadResponse>, ServerFnError> {
     SLSKD_CLIENT.download(tracks).await.map_err(server_error)
 }
@@ -71,20 +77,57 @@ pub async fn download(
     }
 
     let res = slskd_download(tracks).await?;
-    let download_filenames: Vec<String> = res.iter().map(|d| d.filename.clone()).collect();
-    let target_path = target_path_buf;
 
-    info!("Started monitoring downloads: {:?}", download_filenames);
+    let (failed, successful): (Vec<_>, Vec<_>) =
+        res.iter().cloned().partition(|d| d.error.is_some());
 
     let tx = {
         let mut map = USER_CHANNELS.write().await;
-        map.entry(username)
+        map.entry(username.clone())
             .or_insert_with(|| {
                 let (tx, _) = broadcast::channel(100);
                 tx
             })
             .clone()
     };
+
+    if !failed.is_empty() {
+        let failed_entries: Vec<FileEntry> = failed
+            .iter()
+            .map(|d| FileEntry {
+                id: Uuid::new_v4().to_string(),
+                username: d.username.clone(),
+                direction: "Download".to_string(),
+                filename: d.filename.clone(),
+                size: d.size,
+                start_offset: 0,
+                state: vec![DownloadState::Errored],
+                state_description: d.error.clone().unwrap_or_default(),
+                requested_at: Utc::now().to_rfc3339(),
+                enqueued_at: None,
+                started_at: None,
+                ended_at: None,
+                bytes_transferred: 0,
+                average_speed: 0.0,
+                bytes_remaining: d.size,
+                elapsed_time: None,
+                percent_complete: 0.0,
+                remaining_time: None,
+                exception: d.error.clone(),
+            })
+            .collect();
+
+        let _ = tx.send(failed_entries);
+    }
+
+    let download_filenames: Vec<String> = successful.iter().map(|d| d.filename.clone()).collect();
+    let target_path = target_path_buf;
+
+    if download_filenames.is_empty() {
+        return Ok(res);
+    }
+
+    info!("Started monitoring downloads: {:?}", download_filenames);
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
