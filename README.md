@@ -45,6 +45,7 @@ services:
       - SLSKD_DOWNLOAD_PATH=/downloads
       # Optional: Beets configuration
       - BEETS_CONFIG=/config/config.yaml
+      - SECRET_KEY=secret
     volumes:
       # Data persistence (DB)
       - ./data:/data
