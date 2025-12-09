@@ -2,6 +2,8 @@
 
 Soulbeet is a modern, self-hosted music downloader and manager. It bridges the gap between Soulseek (via `slskd`) and your music library (managed by `beets`), providing a seamless flow from search to streaming-ready library.
 
+Screenshots: [here](./screenshots)
+
 ## Features
 
 -   **Unified Search**: Search for albums and tracks using MusicBrainz metadata and find sources on Soulseek.
