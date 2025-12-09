@@ -28,7 +28,6 @@ pub fn create_token(user_id: String, username: String) -> Result<String, String>
     let now = chrono::Utc::now();
     let iat = now.timestamp() as usize;
 
-    // Token (7 days)
     let exp = now
         .checked_add_signed(chrono::Duration::days(EXPIRATION_DAYS))
         .expect("valid timestamp")
