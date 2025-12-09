@@ -35,7 +35,7 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
                     }
                 }
                 button {
-                    class: "bg-teal-600 hover:bg-teal-700 text-white font-semibold py-1 px-3 rounded-md text-sm transition-colors duration-300",
+                    class: "bg-teal-600 hover:bg-teal-700 text-nowrap text-white font-semibold py-1 px-3 rounded-md text-sm transition-colors duration-300",
                     onclick: move |_| props.on_album_select_all.call(album.clone()),
                     "Select All"
                 }
