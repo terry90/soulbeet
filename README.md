@@ -98,6 +98,7 @@ docker-compose up -d --build
 | `SLSKD_API_KEY` | API Key for Slskd | |
 | `SLSKD_DOWNLOAD_PATH` | Path where Slskd downloads files | |
 | `BEETS_CONFIG` | Path to custom beets config file | `beets_config.yaml` |
+| `SECRET_KEY` | Used to encrypt tokens | |
 
 ### Beets Configuration
 
