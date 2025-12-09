@@ -2,7 +2,7 @@ use chrono::Duration;
 use dioxus::fullstack::{CborEncoding, Streaming};
 use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
-use futures::StreamExt;
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use shared::{
     download::DownloadQuery,
@@ -79,13 +79,17 @@ pub async fn search_downloads(
     let mut stream = Box::pin(stream);
 
     Ok(Streaming::spawn(|tx| async move {
-        while let Some(result) = stream.next().await {
+        while let result = stream.try_next().await {
             match result {
-                Ok(albums) => {
+                Ok(Some(albums)) => {
                     if let Err(err) = tx.unbounded_send(albums) {
                         info!("Client disconnected, stopping stream: {:?}", err);
                         break;
                     }
+                }
+                Ok(None) => {
+                    info!("Search completed, no more results.");
+                    break;
                 }
                 Err(e) => {
                     info!("Error in search stream: {:?}", e);
