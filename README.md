@@ -120,7 +120,7 @@ Default `beet import` flags used:
     ```bash
     dx serve --platform web
 
-## TODO
+## TODO & Ideas
 
 - Mobile app (nothing much to do honestly)
 - Better scoring
@@ -133,3 +133,4 @@ Default `beet import` flags used:
   - Multiple tracks search, query: "{artist} {album}" -> best for metadata and grouping tracks by album
 - Listenbrainz integration to autodownload suggestions
 - Complete library manager, removal of tracks
+- Synchronize a playlist (Spotify or other)
