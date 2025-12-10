@@ -1,54 +1,53 @@
 use std::collections::HashMap;
 
-use crate::use_auth;
 use dioxus::prelude::*;
 use shared::slskd::{DownloadState, FileEntry};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct DownloadsProps {
     pub is_open: Signal<bool>,
+    pub downloads: Signal<HashMap<String, FileEntry>>,
 }
 
 #[component]
-pub fn Downloads(props: DownloadsProps) -> Element {
-    let auth = use_auth();
-    let mut downloads_map = use_signal::<HashMap<String, FileEntry>>(HashMap::new);
-
-    use_future(move || async move {
-        loop {
-            let mut stream = auth.call(api::download_updates_stream()).await;
-
-            match stream {
-                Ok(ref mut s) => {
-                    while let Some(Ok(data)) = s.next().await {
-                        let mut map = downloads_map.write();
-                        for file in data {
-                            map.insert(file.id.clone(), file);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to connect to download updates stream: {:?}", e);
-                    gloo_timers::future::TimeoutFuture::new(1_000).await;
-                }
-            }
-        }
-    });
-
-    let mut active_downloads: Vec<FileEntry> = downloads_map.read().values().cloned().collect();
+pub fn Downloads(mut props: DownloadsProps) -> Element {
+    let mut active_downloads: Vec<FileEntry> = props.downloads.read().values().cloned().collect();
     active_downloads.sort_by(|a, b| b.enqueued_at.cmp(&a.enqueued_at));
 
     if !(*props.is_open)() {
         return rsx! {};
     }
 
+    let clear_finished = move |_| {
+        let mut map = props.downloads.write();
+        map.retain(|_, file| {
+            let state = file
+                .state
+                .first()
+                .cloned()
+                .unwrap_or(DownloadState::Unknown("Unknown".into()));
+
+            matches!(
+                state,
+                DownloadState::Queued | DownloadState::InProgress | DownloadState::Importing
+            )
+        });
+    };
+
     rsx! {
       div { class: "fixed top-20 right-6 z-50 flex flex-col items-end gap-2",
         div { class: "bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-96 max-h-[32rem] overflow-hidden flex flex-col mb-2",
           div { class: "p-4 border-b border-gray-700 bg-gray-800/50 backdrop-blur sticky top-0 flex justify-between items-center",
             h3 { class: "font-semibold text-white", "Downloads" }
-            span { class: "text-xs text-gray-400 bg-gray-700 px-2 py-1 rounded-full",
-              "{active_downloads.len()} items"
+            div { class: "flex items-center gap-3",
+              span { class: "text-xs text-gray-400 bg-gray-700 px-2 py-1 rounded-full",
+                "{active_downloads.len()} items"
+              }
+              button {
+                class: "text-xs hover:text-red-200 hover:bg-red-500/20 px-2 py-1 rounded transition-colors font-bold tracking-wider",
+                onclick: clear_finished,
+                "Clear finished"
+              }
             }
           }
           div { class: "overflow-y-auto p-2 space-y-2 flex-1",

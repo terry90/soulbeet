@@ -7,6 +7,8 @@ edition = "2021"
 dioxus = { workspace = true, features = ["router", "fullstack"] }
 ui = { workspace = true }
 api = { workspace = true }
+shared = { workspace = true }
+futures = "0.3.31"
 web-sys = { version = "0.3.83", features = ["Storage", "Window", "Location"] }
 url = "2.5.7"
 serde = { version = "1.0.228", features = ["derive"] }
