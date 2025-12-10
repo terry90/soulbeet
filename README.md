@@ -112,7 +112,7 @@ Default `beet import` flags used:
 
 ## Development
 
-1.  Install Rust and `cargo-dx`.
+1.  Install Rust and `dioxus_cli`.
 2.  Run the tailwind watcher:
     ```bash
     ./css.sh
