@@ -31,6 +31,8 @@ services:
       #   container_name: slskd
       #   environment:
       #     - SLSKD_REMOTE_CONFIGURATION=true
+      #     - SLSKD_SLSK_USERNAME=xxx
+      #     - SLSKD_SLSK_PASSWORD=xxx
       #   volumes:
       #     - /path/to/your/slskd_data:/app
       #     - /path/to/your/downloads:/app/downloads
