@@ -126,11 +126,17 @@ pub fn DownloadResults(props: Props) -> Element {
         div { class: "bg-gray-800 text-white p-6 sm:p-8 rounded-lg shadow-xl max-w-2xl mx-auto my-10 font-sans relative",
             h3 { class: "text-2xl font-bold mb-6 text-center text-teal-400", "Download Options" }
             div { class: "mb-4",
-                label { class: "block text-sm font-medium mb-1", "Select Target Folder" }
+                label {
+                    r#for: "dl_folder",
+                    class: "block text-sm font-medium mb-1",
+                    "Select Target Folder"
+                }
                 select {
+                    name: "dl_folder",
                     class: "w-full p-2 rounded bg-gray-700 border border-gray-600 focus:border-teal-500 focus:outline-none",
                     value: "{selected_folder}",
                     onchange: move |e| selected_folder.set(e.value()),
+                    option { value: "", disabled: true, "Select a folder" }
                     for folder in folders.read().iter() {
                         option { value: "{folder.path}", "{folder.name}" }
                     }

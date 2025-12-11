@@ -506,6 +506,13 @@ impl SoulseekClient {
             filename: String,
         }
 
+        #[derive(Deserialize, Debug)]
+        struct SlskdBatchResponse {
+            enqueued: Vec<SlskdDownloadResponse>,
+            #[serde(default)]
+            failed: Vec<serde_json::Value>,
+        }
+
         info!("Attempting to download: {} files...", req.len());
         for req in req {
             let list = requests_by_username.entry(req.base.username).or_default();
@@ -599,6 +606,48 @@ impl SoulseekClient {
                         error: None,
                     }
                 }));
+            } else if let Ok(batch_res) = serde_json::from_str::<SlskdBatchResponse>(&resp_text) {
+                res.extend(batch_res.enqueued.into_iter().map(|d| {
+                    let size = file_requests
+                        .iter()
+                        .find(|f| f.filename == d.filename)
+                        .map(|f| f.size)
+                        .unwrap_or(0);
+                    DownloadResponse {
+                        username: username.clone(),
+                        filename: d.filename,
+                        size: size as u64,
+                        error: None,
+                    }
+                }));
+                for failed_item in batch_res.failed {
+                    let (filename_opt, error_msg) = if let Some(s) = failed_item.as_str() {
+                        (Some(s.to_string()), "Download failed".to_string())
+                    } else {
+                        tracing::warn!("Slskd reported failed is not a string: {}", failed_item);
+                        continue;
+                    };
+
+                    if let Some(filename) = filename_opt {
+                        let size = file_requests
+                            .iter()
+                            .find(|f| f.filename == filename)
+                            .map(|f| f.size)
+                            .unwrap_or(0);
+
+                        res.push(DownloadResponse {
+                            username: username.clone(),
+                            filename,
+                            size: size as u64,
+                            error: Some(error_msg),
+                        });
+                    } else {
+                        tracing::warn!(
+                            "Slskd reported failed download without filename: {}",
+                            failed_item
+                        );
+                    }
+                }
             } else {
                 tracing::error!("Failed to parse response from slskd: '{}'", resp_text);
             }
