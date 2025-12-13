@@ -29,7 +29,10 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
 
             matches!(
                 state,
-                DownloadState::Queued | DownloadState::InProgress | DownloadState::Importing
+                DownloadState::Queued
+                    | DownloadState::InProgress
+                    | DownloadState::Importing
+                    | DownloadState::Completed // Downloads that are completed but not yet imported
             )
         });
     };
@@ -74,9 +77,7 @@ fn DownloadItem(file: FileEntry) -> Element {
     let status_color = match state {
         DownloadState::Queued => "text-yellow-400",
         DownloadState::InProgress => "text-blue-400",
-        DownloadState::Succeeded | DownloadState::Completed | DownloadState::Imported => {
-            "text-green-400"
-        }
+        DownloadState::Completed | DownloadState::Imported => "text-green-400",
         DownloadState::Aborted
         | DownloadState::Cancelled
         | DownloadState::Errored
@@ -89,7 +90,6 @@ fn DownloadItem(file: FileEntry) -> Element {
     let status_text = match &state {
         DownloadState::Queued => "Queued".to_string(),
         DownloadState::InProgress => "Downloading".to_string(),
-        DownloadState::Succeeded => "Succeeded".to_string(),
         DownloadState::Completed => "Completed".to_string(),
         DownloadState::Aborted => "Aborted".to_string(),
         DownloadState::Cancelled => "Cancelled".to_string(),

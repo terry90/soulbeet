@@ -26,7 +26,6 @@ pub struct DownloadResponse {
 pub enum DownloadState {
     Queued,
     InProgress,
-    Succeeded,
     Completed,
     Aborted,
     Cancelled,
@@ -43,7 +42,6 @@ impl From<String> for DownloadState {
         match s.as_str() {
             "Queued" => DownloadState::Queued,
             "InProgress" => DownloadState::InProgress,
-            "Succeeded" => DownloadState::Succeeded,
             "Completed" => DownloadState::Completed,
             "Aborted" => DownloadState::Aborted,
             "Cancelled" => DownloadState::Cancelled,
