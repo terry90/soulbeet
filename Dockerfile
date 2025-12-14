@@ -1,5 +1,5 @@
 # Build Stage
-FROM rust:1.91-bookworm as builder
+FROM rust:1.91-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -40,7 +40,7 @@ RUN dx bundle --package web --release
 RUN mkdir -p /empty_data
 
 # Beets Build Stage
-FROM python:3.11-slim-bookworm as beets-builder
+FROM python:3.11-slim-bookworm AS beets-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
