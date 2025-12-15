@@ -127,7 +127,7 @@ pub fn DownloadResults(props: Props) -> Element {
     };
 
     rsx! {
-        div { class: "bg-beet-panel border border-white/10 text-white p-6 sm:p-8 rounded-lg shadow-2xl max-w-2xl mx-auto my-10 font-display relative",
+        div { class: "bg-beet-panel border border-white/10 text-white p-6 sm:p-8 rounded-lg shadow-2xl w-full max-w-2xl mx-auto my-10 font-display relative",
             h3 { class: "text-2xl font-bold mb-6 text-center text-beet-accent", "Download Options" }
             div { class: "mb-4",
                 label {
