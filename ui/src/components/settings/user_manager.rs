@@ -77,17 +77,19 @@ pub fn UserManager() -> Element {
     };
 
     rsx! {
-      div { class: "bg-gray-800 p-6 rounded-lg shadow-lg",
-        h2 { class: "text-xl font-semibold mb-4 text-indigo-300", "User Management" }
+      div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
+        h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display",
+          "User Management"
+        }
 
         // Local Messages
         if !error().is_empty() {
-          div { class: "mb-4 p-4 bg-red-900/50 border border-red-500 rounded text-red-200",
+          div { class: "mb-4 p-4 bg-red-900/20 border border-red-500/50 rounded text-red-400 font-mono text-sm",
             "{error}"
           }
         }
         if !success_msg().is_empty() {
-          div { class: "mb-4 p-4 bg-green-900/50 border border-green-500 rounded text-green-200",
+          div { class: "mb-4 p-4 bg-green-900/20 border border-green-500/50 rounded text-green-400 font-mono text-sm",
             "{success_msg}"
           }
         }
@@ -95,9 +97,11 @@ pub fn UserManager() -> Element {
         // Create User
         div { class: "grid grid-cols-1 md:grid-cols-2 gap-4 mb-4",
           div {
-            label { class: "block text-sm font-medium mb-1", "New Username" }
+            label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+              "New Username"
+            }
             input {
-              class: "w-full p-2 rounded bg-gray-700 border border-gray-600 focus:border-teal-500 focus:outline-none",
+              class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
               value: "{new_username}",
               oninput: move |e| new_username.set(e.value()),
               placeholder: "Username",
@@ -105,9 +109,11 @@ pub fn UserManager() -> Element {
             }
           }
           div {
-            label { class: "block text-sm font-medium mb-1", "New Password" }
+            label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+              "New Password"
+            }
             input {
-              class: "w-full p-2 rounded bg-gray-700 border border-gray-600 focus:border-teal-500 focus:outline-none",
+              class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
               value: "{new_password}",
               oninput: move |e| new_password.set(e.value()),
               placeholder: "Password",
@@ -116,15 +122,17 @@ pub fn UserManager() -> Element {
           }
         }
         button {
-          class: "bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded transition-colors mb-6",
+          class: "retro-btn mb-6 rounded",
           onclick: handle_create_user,
           "Create User"
         }
 
         // User List
-        h3 { class: "text-lg font-semibold mb-2 text-indigo-200", "Existing Users" }
+        h3 { class: "text-lg font-bold mb-2 text-white font-display border-b border-white/10 pb-2",
+          "Existing Users"
+        }
         if users.read().is_empty() {
-          p { class: "text-gray-400", "No users found." }
+          p { class: "text-gray-500 font-mono italic", "No users found." }
         } else {
           ul { class: "space-y-2",
             {
@@ -137,12 +145,12 @@ pub fn UserManager() -> Element {
                         let id_edit = user.id.clone();
                         let id_delete = user.id.clone();
                         rsx! {
-                          li { class: "bg-gray-700 p-3 rounded",
+                          li { class: "bg-white/5 border border-white/5 p-3 rounded hover:border-beet-accent/30 transition-colors",
                             if editing_user_id() == Some(user.id.clone()) {
                               div { class: "flex flex-col gap-2",
-                                div { class: "font-medium text-teal-200", "{user.username}" }
+                                div { class: "font-bold text-white font-display", "{user.username}" }
                                 input {
-                                  class: "p-2 rounded bg-gray-600 border border-gray-500 focus:border-teal-500",
+                                  class: "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
                                   value: "{edit_user_password}",
                                   oninput: move |e| edit_user_password.set(e.value()),
                                   placeholder: "New Password",
@@ -150,23 +158,23 @@ pub fn UserManager() -> Element {
                                 }
                                 div { class: "flex gap-2 mt-2",
                                   button {
-                                    class: "bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded text-sm",
+                                    class: "text-xs uppercase tracking-wider font-bold text-beet-leaf hover:text-white transition-colors",
                                     onclick: move |_| handle_update_user(id_update.clone()),
-                                    "Save"
+                                    "[ Save ]"
                                   }
                                   button {
-                                    class: "bg-gray-500 hover:bg-gray-600 text-white px-3 py-1 rounded text-sm",
+                                    class: "text-xs uppercase tracking-wider font-bold text-gray-500 hover:text-white transition-colors",
                                     onclick: move |_| editing_user_id.set(None),
-                                    "Cancel"
+                                    "[ Cancel ]"
                                   }
                                 }
                               }
                             } else {
                               div { class: "flex justify-between items-center",
-                                span { class: "font-medium text-teal-200", "{user.username}" }
-                                div { class: "flex gap-2",
+                                span { class: "font-bold text-white font-display", "{user.username}" }
+                                div { class: "flex gap-3",
                                   button {
-                                    class: "text-blue-400 hover:text-blue-300",
+                                    class: "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted",
                                     onclick: move |_| {
                                         editing_user_id.set(Some(id_edit.clone()));
                                         edit_user_password.set("".to_string());
@@ -174,7 +182,7 @@ pub fn UserManager() -> Element {
                                     "Change Password"
                                   }
                                   button {
-                                    class: "text-red-400 hover:text-red-300",
+                                    class: "text-xs font-mono text-gray-400 hover:text-red-400 transition-colors underline decoration-dotted",
                                     onclick: move |_| handle_delete_user(id_delete.clone()),
                                     "Delete"
                                   }

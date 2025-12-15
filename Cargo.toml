@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["ui", "web", "desktop", "mobile", "api", "lib/soulbeet"]
+members = [
+  "ui",
+  "web",
+  # "desktop",
+  # "mobile",
+  "api",
+  "lib/soulbeet",
+]
 
 [workspace.dependencies]
 dioxus = { version = "0.7.2" }

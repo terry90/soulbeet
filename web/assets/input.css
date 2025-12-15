@@ -1,33 +1,70 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;500;700&display=swap');
 @import "tailwindcss";
-@source "./src/**/*.{rs,html,css}";
+@source "../src/**/*.{rs,html,css}";
+@source "../../ui/src/**/*.{rs,html,css}";
 
+@theme {
+    /* Soulbeet Color Palette */
+    --color-beet-dark: #0f0518;
+    --color-beet-panel: #1a0b2e;
+    --color-beet-accent: #ff00ff; /* Neon Pink */
+    --color-beet-leaf: #00ff9d;   /* Cyber Green */
+    --color-beet-dim: #4a2b6b;
+    
+    /* Fonts */
+    --font-mono: "JetBrains Mono", monospace;
+    --font-display: "Space Grotesk", sans-serif;
+
+    /* Custom Animations */
+    --animate-glow: glow 2s ease-in-out infinite alternate;
+    --animate-scanline: scanline 8s linear infinite;
+
+    @keyframes glow {
+        from { box-shadow: 0 0 5px var(--color-beet-accent), 0 0 10px var(--color-beet-accent); }
+        to { box-shadow: 0 0 2px var(--color-beet-accent), 0 0 5px var(--color-beet-accent); }
+    }
+    @keyframes scanline {
+        0% { background-position: 0% 0%; }
+        100% { background-position: 0% 100%; }
+    }
+}
+
+/* Custom Utilities */
+@layer utilities {
+    .glass-panel {
+        @apply bg-beet-panel/80 backdrop-blur-md border border-white/10 shadow-xl;
+    }
+    
+    .retro-btn {
+        @apply font-mono uppercase text-xs tracking-widest px-6 py-3 border border-beet-leaf/30 text-beet-leaf 
+               transition-all duration-200 hover:bg-beet-leaf hover:text-beet-dark hover:shadow-[0_0_15px_rgba(0,255,157,0.6)] cursor-pointer;
+    }
+
+    .nav-link {
+        @apply font-display text-sm text-gray-400 hover:text-white hover:scale-105 transition-transform duration-200;
+    }
+
+    .crt-overlay {
+        background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+        background-size: 100% 2px, 3px 100%;
+        pointer-events: none;
+    }
+
+    .no-scrollbar::-webkit-scrollbar {
+        display: none;
+    }
+    
+    .no-scrollbar {
+        -ms-overflow-style: none;
+        scrollbar-width: none;
+    }
+}
+
+/* Base Styles */
 body {
-  background-color: #0f1116;
-  color: #ffffff;
-  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-  margin: 0;
-}
-
-.scrollbar::-webkit-scrollbar:vertical {
-  @apply w-1.5;
-}
-
-.scrollbar::-webkit-scrollbar-track {
-  @apply bg-gray-500 rounded-sm;
-}
-
-.scrollbar::-webkit-scrollbar-track:hover {
-  @apply bg-gray-400;
-}
-
-.scrollbar::-webkit-scrollbar-track:active {
-  @apply bg-gray-400;
-}
-
-.scrollbar::-webkit-scrollbar-thumb {
-  @apply bg-gray-700 rounded-sm;
-}
-
-.scrollbar::-webkit-scrollbar {
-  @apply bg-transparent;
+    @apply bg-beet-dark text-white min-h-screen overflow-hidden font-display;
+    background-image: 
+        linear-gradient(rgba(26, 11, 46, 0.5) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(26, 11, 46, 0.5) 1px, transparent 1px);
+    background-size: 40px 40px;
 }

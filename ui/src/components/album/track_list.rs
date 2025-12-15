@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use dioxus::prelude::*;
 use shared::musicbrainz::Track;
 
-use crate::album::track_item::TrackItem;
+use crate::{album::track_item::TrackItem, Checkbox};
 
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
@@ -19,21 +19,17 @@ pub fn TrackList(props: Props) -> Element {
     rsx! {
       ul { class: "list-none p-4 space-y-2 overflow-y-auto",
         li {
-          class: "flex items-center gap-3 p-2 rounded-md cursor-pointer hover:bg-gray-700",
+          class: "flex items-center gap-3 p-2 rounded-md cursor-pointer hover:bg-white/10 transition-colors",
           onclick: move |_| props.on_toggle_select_all.call(()),
-          div { class: if props.all_selected { "w-5 h-5 border-2 rounded flex items-center justify-center border-teal-400 bg-teal-500" } else { "w-5 h-5 border-2 rounded flex items-center justify-center border-gray-500" },
-            if props.all_selected {
-              "✓"
-            }
-          }
-          span { class: "font-bold", "Select / Deselect All" }
+          Checkbox { is_selected: props.all_selected }
+          span { class: "font-bold text-white font-mono text-sm", "Select / Deselect All" }
         }
         for track in props.tracks.read().iter() {
           TrackItem {
             key: "{track.id}",
             track: track.clone(),
             is_selected: props.selected_tracks.read().contains(&track.id),
-            on_toggle: props.on_track_toggle.clone(),
+            on_toggle: props.on_track_toggle,
           }
         }
       }

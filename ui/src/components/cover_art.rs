@@ -13,17 +13,17 @@ pub fn CoverArt(props: CoverArtProps) -> Element {
     let mut has_error = use_signal(|| false);
 
     rsx! {
-      div { class: "w-20 h-20 flex-shrink-0 bg-gray-600 rounded-md flex items-center justify-center",
+      div { class: "w-20 h-20 flex-shrink-0 bg-beet-panel border border-white/5 rounded-md flex items-center justify-center overflow-hidden",
         if !has_error() {
           img {
             src: "{props.src}",
             alt: "{props.alt}",
-            class: "w-full h-full object-cover rounded-md",
+            class: "w-full h-full object-cover",
             onerror: move |_| has_error.set(true),
           }
         } else {
           svg {
-            class: "w-8 h-8 text-gray-400",
+            class: "w-8 h-8 text-white/20",
             xmlns: "http://www.w3.org/2000/svg",
             fill: "none",
             "viewBox": "0 0 24 24",

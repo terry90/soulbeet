@@ -25,7 +25,7 @@ pub struct Props {
 
 #[component]
 pub fn Album(props: Props) -> Element {
-    let mut selected_tracks = use_signal(|| HashSet::<String>::new());
+    let mut selected_tracks = use_signal(HashSet::<String>::new);
     let tracks = use_signal(|| props.data.tracks.clone());
 
     let all_selected =

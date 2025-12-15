@@ -5,6 +5,7 @@ pub mod download;
 pub mod folder;
 pub mod guard;
 pub mod search;
+pub mod system;
 pub mod user;
 
 pub use auth::*;
@@ -12,6 +13,7 @@ pub use download::*;
 pub use folder::*;
 pub use guard::*;
 pub use search::*;
+pub use system::*;
 pub use user::*;
 
 pub fn server_error<E: std::fmt::Display>(e: E) -> ServerFnError {

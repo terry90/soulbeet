@@ -10,8 +10,9 @@ pub enum ButtonVariant {
 impl ButtonVariant {
     fn get_classes(&self) -> &'static str {
         match self {
-            ButtonVariant::Primary => "bg-teal-500 hover:bg-teal-600",
-            ButtonVariant::Secondary => "bg-indigo-500 hover:bg-indigo-600",
+            ButtonVariant::Primary => "retro-btn",
+            // Keep secondary distinctive or map to same if unused? Let's make it a outlined version or just dimmer
+            ButtonVariant::Secondary => "font-mono uppercase text-xs tracking-widest px-6 py-3 border border-white/10 text-gray-400 transition-all duration-200 hover:bg-white/5 hover:text-white cursor-pointer",
         }
     }
 }
@@ -25,17 +26,28 @@ pub struct Props {
     variant: ButtonVariant,
     #[props(optional, default)]
     disabled: bool,
+    #[props(optional, into)]
+    class: String,
 }
 
 #[component]
 pub fn Button(props: Props) -> Element {
-    let common_classes = "text-white font-bold py-2 px-4 rounded-md transition-colors duration-300 disabled:bg-gray-600 disabled:cursor-not-allowed";
     let variant_classes = props.variant.get_classes();
+    let disabled_classes = if props.disabled {
+        "opacity-30 cursor-not-allowed grayscale pointer-events-none"
+    } else {
+        ""
+    };
+    let additional_classes = props.class;
 
     rsx! {
         button {
-            class: "{common_classes} {variant_classes}",
-            onclick: move |evt| props.onclick.call(evt),
+            class: "{variant_classes} {disabled_classes} {additional_classes} rounded",
+            onclick: move |evt| {
+                if !props.disabled {
+                    props.onclick.call(evt)
+                }
+            },
             disabled: props.disabled,
             {props.children}
         }

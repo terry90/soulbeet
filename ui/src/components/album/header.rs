@@ -11,16 +11,18 @@ pub struct Props {
 #[component]
 pub fn AlbumHeader(props: Props) -> Element {
     rsx! {
-      div { class: "flex items-start gap-4 p-4 border-b border-gray-700",
+      div { class: "flex items-start gap-4 p-4 border-b border-white/10",
         CoverArt {
           src: format!("https://coverartarchive.org/release/{}/front-250", props.album.id),
           alt: format!("Cover for {}", props.album.title),
         }
         div { class: "flex-grow",
-          h3 { class: "text-2xl font-bold text-indigo-300", "{props.album.title}" }
-          p { class: "text-lg text-gray-300", "{props.album.artist}" }
+          h3 { class: "text-2xl font-bold text-beet-accent font-display",
+            "{props.album.title}"
+          }
+          p { class: "text-lg text-white font-mono", "{props.album.artist}" }
           if let Some(date) = &props.album.release_date {
-            p { class: "text-sm text-gray-500", "{date}" }
+            p { class: "text-sm text-gray-400 font-mono", "{date}" }
           }
         }
       }

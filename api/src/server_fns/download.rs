@@ -83,12 +83,14 @@ async fn import_track(
                 info!("Beet import failed item");
                 let mut failed_entry = entry.clone();
                 failed_entry.state = vec![DownloadState::ImportFailed];
+                failed_entry.state_description = "Beet import failed".to_string();
                 let _ = tx.send(vec![failed_entry]);
             }
             Err(e) => {
                 info!("Beet import failed or returned unknown status: {e}");
                 let mut failed_entry = entry.clone();
                 failed_entry.state = vec![DownloadState::ImportFailed];
+                failed_entry.state_description = format!("Import error: {}", e);
                 let _ = tx.send(vec![failed_entry]);
             }
         }
@@ -96,6 +98,7 @@ async fn import_track(
         warn!("Could not resolve path for file: {}", entry.filename);
         let mut failed_entry = entry.clone();
         failed_entry.state = vec![DownloadState::ImportFailed];
+        failed_entry.state_description = "Could not resolve file path".to_string();
         let _ = tx.send(vec![failed_entry]);
     }
 }

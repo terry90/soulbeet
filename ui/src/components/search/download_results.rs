@@ -26,16 +26,18 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
     let album = props.album.clone();
 
     rsx! {
-        div { key: "{album.album_path}", class: "bg-gray-700 p-4 rounded-md",
+        div {
+            key: "{album.album_path}",
+            class: "bg-white/5 border border-white/5 p-4 rounded-md",
             div { class: "flex justify-between items-center mb-2",
                 div { class: "flex-grow",
-                    h4 { class: "text-md font-bold", "{album.album_title}" }
-                    p { class: "text-sm text-gray-400",
+                    h4 { class: "text-md font-bold text-beet-leaf", "{album.album_title}" }
+                    p { class: "text-sm text-gray-400 font-mono",
                         "{album.artist.clone().unwrap_or_default()} - Quality: {album.dominant_quality}, Score: {album.score:.2}"
                     }
                 }
                 button {
-                    class: "bg-teal-600 hover:bg-teal-700 text-nowrap text-white font-semibold py-1 px-3 rounded-md text-sm transition-colors duration-300",
+                    class: "font-mono uppercase text-[10px] tracking-widest px-3 py-1 border border-beet-leaf/30 text-beet-leaf hover:bg-beet-leaf hover:text-beet-dark transition-colors cursor-pointer rounded",
                     onclick: move |_| props.on_album_select_all.call(album.clone()),
                     "Select All"
                 }
@@ -44,12 +46,14 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
                 for TrackResult { base , title , .. } in props.album.tracks {
                     li {
                         key: "{base.filename}",
-                        class: "flex items-center gap-2 p-1 rounded-md hover:bg-gray-600 cursor-pointer",
+                        class: "flex items-center gap-2 p-1 rounded-md hover:bg-white/10 cursor-pointer",
                         onclick: move |_| props.on_track_toggle.call(base.filename.clone()),
 
                         Checkbox { is_selected: props.selected_tracks.read().contains(&base.filename) }
 
-                        label { class: "cursor-pointer", "{title}" }
+                        label { class: "cursor-pointer text-gray-300 font-mono text-sm",
+                            "{title}"
+                        }
                     }
                 }
             }
@@ -123,17 +127,17 @@ pub fn DownloadResults(props: Props) -> Element {
     };
 
     rsx! {
-        div { class: "bg-gray-800 text-white p-6 sm:p-8 rounded-lg shadow-xl max-w-2xl mx-auto my-10 font-sans relative",
-            h3 { class: "text-2xl font-bold mb-6 text-center text-teal-400", "Download Options" }
+        div { class: "bg-beet-panel border border-white/10 text-white p-6 sm:p-8 rounded-lg shadow-2xl max-w-2xl mx-auto my-10 font-display relative",
+            h3 { class: "text-2xl font-bold mb-6 text-center text-beet-accent", "Download Options" }
             div { class: "mb-4",
                 label {
                     r#for: "dl_folder",
-                    class: "block text-sm font-medium mb-1",
+                    class: "block text-sm font-medium mb-1 text-gray-400 font-mono",
                     "Select Target Folder"
                 }
                 select {
                     name: "dl_folder",
-                    class: "w-full p-2 rounded bg-gray-700 border border-gray-600 focus:border-teal-500 focus:outline-none",
+                    class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
                     value: "{selected_folder}",
                     onchange: move |e| selected_folder.set(e.value()),
                     option { value: "", disabled: true, "Select a folder" }
@@ -145,14 +149,14 @@ pub fn DownloadResults(props: Props) -> Element {
 
             div { class: "space-y-4",
                 if props.is_searching {
-                    div { class: "flex flex-col items-center justify-center p-4 bg-gray-700/50 rounded-lg",
-                        div { class: "animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-teal-500 mb-2" }
-                        p { class: "text-sm text-gray-300 animate-pulse text-center",
+                    div { class: "flex flex-col items-center justify-center p-4 bg-white/5 rounded-lg",
+                        div { class: "animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-beet-accent mb-2" }
+                        p { class: "text-sm text-gray-300 animate-pulse text-center font-mono",
                             "Searching... The rarer your track is, the longer the search can take."
                         }
                     }
                 } else if results.is_empty() {
-                    div { class: "text-center text-gray-500 py-8", "No results found" }
+                    div { class: "text-center text-gray-500 py-8 font-mono", "No results found" }
                 }
                 for album in results {
                     AlbumResultItem {
@@ -165,7 +169,7 @@ pub fn DownloadResults(props: Props) -> Element {
             }
             div { class: "fixed bottom-8 right-8",
                 button {
-                    class: "bg-teal-600 hover:bg-teal-700 text-white font-bold p-4 rounded-full shadow-lg transition-transform hover:scale-105 disabled:bg-gray-600 disabled:cursor-not-allowed flex items-center justify-center",
+                    class: "bg-beet-accent hover:bg-fuchsia-400 text-white font-bold p-4 rounded-full shadow-[0_0_15px_rgba(255,0,255,0.5)] transition-transform hover:scale-105 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:shadow-none flex items-center justify-center cursor-pointer",
                     disabled: selected_tracks.read().is_empty() || selected_folder.read().is_empty(),
                     onclick: handle_download,
                     svg {

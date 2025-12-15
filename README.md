@@ -127,7 +127,6 @@ Default `beet import` flags used:
 - Better scoring
 - Enhance the default beets configuration
 - Find a way to avoid album dups ? e.g `Clair Obscur_ Expedition 33 (Original Soundtrack)` & `Clair Obscur_ Expedition 33_ Original Soundtrack` - Rare but annoying
-- Reduce final container image size
 - Add play preview on album track list
 - Improve slskd search. Currently:
   - Single track search, query: "{artist} {track_title}" -> more resilient

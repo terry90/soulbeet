@@ -1,11 +1,10 @@
 use auth::{use_auth, AuthProvider};
 use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
-use futures::StreamExt;
 use shared::slskd::FileEntry;
 use std::collections::HashMap;
 
-use ui::{Downloads, Navbar, SearchReset};
+use ui::{Downloads, Layout, Navbar, SearchReset};
 use views::{LoginPage, SearchPage, SettingsPage};
 
 mod auth;
@@ -115,39 +114,61 @@ fn WebNavbar() -> Element {
     };
 
     rsx! {
-        Navbar {
-            Link {
-                class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors",
-                to: Route::SearchPage {},
-                onclick: move |_| search_reset += 1,
-                "Search"
-            }
-            Link {
-                class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors",
-                to: Route::SettingsPage {},
-                "Settings"
-            }
-            button {
-                class: "text-gray-300 hover:text-teal-400 hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors ml-4 relative",
-                onclick: move |_| downloads_open.set(!downloads_open()),
-                "Downloads"
-                if !downloads.read().is_empty() {
-                    span { class: "absolute top-0 right-0 -mt-1 -mr-1 flex h-3 w-3",
-                        span { class: "animate-ping absolute inline-flex h-full w-full rounded-full bg-teal-400 opacity-75" }
-                        span { class: "relative inline-flex rounded-full h-3 w-3 bg-teal-500" }
+        Layout {
+            Navbar {
+                Link {
+                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent pb-0.5",
+                    active_class: "border-beet-accent",
+                    to: Route::SearchPage {},
+                    onclick: move |_| search_reset += 1,
+                    "Search"
+                }
+                Link {
+                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent pb-0.5",
+                    active_class: "border-beet-accent",
+                    to: Route::SettingsPage {},
+                    "Settings"
+                }
+
+                // Separator
+                div { class: "h-4 w-px bg-white/10" }
+
+                // Downloads Toggle
+                button {
+                    class: "relative group p-2 hover:bg-white/5 rounded-lg transition-colors focus:outline-none cursor-pointer",
+                    onclick: move |_| downloads_open.set(!downloads_open()),
+                    svg {
+                        class: "w-5 h-5 text-gray-300 group-hover:text-beet-leaf transition-colors",
+                        fill: "none",
+                        stroke: "currentColor",
+                        view_box: "0 0 24 24",
+                        path {
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            stroke_width: "2",
+                            d: "M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4",
+                        }
+                    }
+
+                    if !downloads.read().is_empty() {
+                        span { class: "absolute top-1.5 right-1.5 flex h-2.5 w-2.5",
+                            span { class: "animate-ping absolute inline-flex h-full w-full rounded-full bg-beet-accent opacity-75" }
+                            span { class: "relative inline-flex rounded-full h-2.5 w-2.5 bg-beet-accent" }
+                        }
                     }
                 }
-            }
-            button {
-                class: "text-gray-300 hover:text-white hover:bg-red-500/20 px-3 py-2 rounded-md text-sm font-medium transition-colors ml-4",
-                onclick: logout,
-                "Logout"
-            }
-        }
 
-        main { class: "pt-24 pb-12 min-h-screen bg-gray-900",
-            div { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8", Outlet::<Route> {} }
+                button {
+                    class: "nav-link text-red-400 hover:text-red-300 text-xs uppercase tracking-widest font-mono cursor-pointer",
+                    onclick: logout,
+                    "Logout"
+                }
+            }
+
+            main { class: "flex-grow flex flex-col relative overflow-y-auto w-full py-8 no-scrollbar",
+                Outlet::<Route> {}
+            }
+            Downloads { is_open: downloads_open, downloads }
         }
-        Downloads { is_open: downloads_open, downloads }
     }
 }
