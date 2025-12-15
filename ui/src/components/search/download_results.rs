@@ -21,6 +21,34 @@ struct AlbumResultItemProps {
     on_track_toggle: EventHandler<String>,
 }
 
+#[derive(Props, Clone, PartialEq)]
+struct TrackItemProps {
+    track: TrackResult,
+    is_selected: bool,
+    on_toggle: EventHandler<String>,
+}
+
+fn get_track_id(track: &TrackResult) -> String {
+    format!("{}{}", track.base.filename, track.base.username)
+}
+
+#[component]
+fn TrackItem(props: TrackItemProps) -> Element {
+    let unique_id = get_track_id(&props.track);
+
+    rsx! {
+        li {
+            key: "{unique_id}",
+            class: "flex items-center gap-2 p-1 rounded-md hover:bg-white/10 cursor-pointer",
+            onclick: move |_| props.on_toggle.call(unique_id.clone()),
+
+            Checkbox { is_selected: props.is_selected }
+
+            label { class: "cursor-pointer text-gray-300 font-mono text-sm", "{props.track.title}" }
+        }
+    }
+}
+
 #[component]
 fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
     let album = props.album.clone();
@@ -37,25 +65,20 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
                     }
                 }
                 button {
-                    class: "font-mono uppercase text-[10px] tracking-widest px-3 py-1 border border-beet-leaf/30 text-beet-leaf hover:bg-beet-leaf hover:text-beet-dark transition-colors cursor-pointer rounded",
+                    class: "font-mono uppercase text-[10px] whitespace-nowrap tracking-widest px-3 py-1 border border-beet-leaf/30 text-beet-leaf hover:bg-beet-leaf hover:text-beet-dark transition-colors cursor-pointer rounded",
                     onclick: move |_| props.on_album_select_all.call(album.clone()),
                     "Select All"
                 }
             }
             ul { class: "space-y-1",
-                for TrackResult { base , title , .. } in props.album.tracks {
-                    li {
-                        key: "{base.filename}{base.username}",
-                        class: "flex items-center gap-2 p-1 rounded-md hover:bg-white/10 cursor-pointer",
-                        onclick: move |_| props.on_track_toggle.call(base.filename.clone()),
-
-                        Checkbox { is_selected: props.selected_tracks.read().contains(&base.filename) }
-
-                        label { class: "cursor-pointer text-gray-300 font-mono text-sm",
-                            "{title}"
-                        }
+                for track in props.album.tracks {
+                    TrackItem {
+                        is_selected: props.selected_tracks.read().contains(&get_track_id(&track)),
+                        track,
+                        on_toggle: props.on_track_toggle,
                     }
                 }
+
             }
         }
     }
@@ -89,15 +112,15 @@ pub fn DownloadResults(props: Props) -> Element {
         let all_selected = album_result
             .tracks
             .iter()
-            .all(|t| selected.contains(&t.base.filename));
+            .all(|t| selected.contains(&get_track_id(t)));
 
         if all_selected {
             for track in &album_result.tracks {
-                selected.remove(&track.base.filename);
+                selected.remove(&get_track_id(track));
             }
         } else {
             for track in &album_result.tracks {
-                selected.insert(track.base.filename.clone());
+                selected.insert(get_track_id(track));
             }
         }
     };
@@ -113,12 +136,13 @@ pub fn DownloadResults(props: Props) -> Element {
     };
 
     let handle_download = move |_| {
-        let selected_filenames = selected_tracks.read();
+        let selected_ids = selected_tracks.read();
+
         let tracks_to_download: Vec<TrackResult> = props
             .results
             .iter()
             .flat_map(|album_result| album_result.tracks.iter())
-            .filter(|track| selected_filenames.contains(&track.base.filename))
+            .filter(|track| selected_ids.contains(&get_track_id(track)))
             .cloned()
             .collect();
         props
