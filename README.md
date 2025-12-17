@@ -40,7 +40,7 @@ The recommended way to run Soulbeet is via Docker Compose. This ensures all depe
 ```yaml
 services:
   soulbeet:
-    image: docker.io/docccccc/soulbeet:master
+    image: docker.io/docccccc/soulbeet:latest
     restart: unless-stopped
     ports:
       - 9765:9765
