@@ -24,9 +24,11 @@ pub fn AuthProvider(children: Element) -> Element {
 
     if !*initialized.read() {
         return rsx! {
-            div { class: "flex flex-col items-center justify-center h-screen bg-gray-900",
-                div { class: "animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-teal-500 mb-6" }
-                h1 { class: "text-2xl font-bold text-teal-500 animate-pulse", "SoulBeet" }
+            div { class: "flex flex-col items-center justify-center h-screen",
+                div { class: "animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-beet-accent mb-6" }
+                h1 { class: "text-2xl font-bold tracking-tighter uppercase text-transparent bg-clip-text bg-gradient-to-r from-white to-gray-400",
+                    "SoulBeet"
+                }
             }
         };
     }

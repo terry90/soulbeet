@@ -54,6 +54,6 @@ jobs:
     with:
       ref: v${{ needs.bump-version.outputs.new_version }}
       tags: |
-        type=raw,value=latest
         type=raw,value=${{ needs.bump-version.outputs.new_version }}
+        type=raw,value=latest
     secrets: inherit
