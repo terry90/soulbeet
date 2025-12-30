@@ -84,7 +84,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "api"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "argon2",
  "axum",
@@ -3785,7 +3785,7 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3894,7 +3894,7 @@ dependencies = [
 
 [[package]]
 name = "soulbeet"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4683,7 +4683,7 @@ checksum = "1dccffe3ce07af9386bfd29e80c0ab1a8205a2fc34e4bcd40364df902cfa8f3f"
 
 [[package]]
 name = "ui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "api",
  "dioxus",
@@ -4943,7 +4943,7 @@ dependencies = [
 
 [[package]]
 name = "web"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "api",
  "axum",
