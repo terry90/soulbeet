@@ -77,7 +77,7 @@ jobs:
           TAGS="${{ needs.metadata.outputs.tags }}"
           SUFFIX="${{ matrix.suffix }}"
           SUFFIXED_TAGS=""
-          IFS=','
+          IFS=$'\n'
           for tag in $TAGS; do
             SHORT_TAG="${tag#${{ env.IMAGE_NAME }}:}"
             SUFFIXED_TAGS="${SUFFIXED_TAGS},${{ env.IMAGE_NAME }}:${SHORT_TAG}-${SUFFIX}"
@@ -117,7 +117,7 @@ jobs:
         shell: bash
         run: |
           TAGS="${{ needs.metadata.outputs.tags }}"
-          IFS=','
+          IFS=$'\n'
           for tag in $TAGS; do
             SHORT_TAG="${tag#${{ env.IMAGE_NAME }}:}"
             docker buildx imagetools create -t $tag \
