@@ -339,10 +339,13 @@ impl SoulseekClient {
         info!("Attempting to download: {} files...", req.len());
         for req in req {
             let list = requests_by_username.entry(req.base.username).or_default();
-            list.push(DownloadRequestFile {
-                filename: req.base.filename,
-                size: req.base.size,
-            });
+            // Check for duplicates before adding
+            if !list.iter().any(|f| f.filename == req.base.filename) {
+                list.push(DownloadRequestFile {
+                    filename: req.base.filename,
+                    size: req.base.size,
+                });
+            }
         }
 
         let mut res = vec![];
