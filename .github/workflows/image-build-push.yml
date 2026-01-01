@@ -41,7 +41,6 @@ jobs:
             ${{ inputs.tags }}
             type=semver,pattern={{version}}
             type=ref,event=branch
-            type=sha
 
   build:
     needs: metadata
@@ -50,11 +49,11 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
+            suffix: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+            suffix: arm64
     runs-on: ${{ matrix.runner }}
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -71,18 +70,33 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build and push by digest
-        id: build
+      - name: Generate platform-specific tags
+        id: platform-tags
+        shell: bash
+        run: |
+          TAGS="${{ needs.metadata.outputs.tags }}"
+          SUFFIX="${{ matrix.suffix }}"
+          SUFFIXED_TAGS=""
+          IFS=','
+          for tag in $TAGS; do
+            SHORT_TAG="${tag#${{ env.IMAGE_NAME }}:}"
+            SUFFIXED_TAGS="${SUFFIXED_TAGS},${{ env.IMAGE_NAME }}:${SHORT_TAG}-${SUFFIX}"
+          done
+          unset IFS
+          SUFFIXED_TAGS="${SUFFIXED_TAGS#,}"
+          echo "tags=$SUFFIXED_TAGS" >> $GITHUB_OUTPUT
+          echo "Generated tags: $SUFFIXED_TAGS"
+
+      - name: Build and push platform-specific
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ env.IMAGE_NAME }}:temp
+          tags: ${{ steps.platform-tags.outputs.tags }}
           labels: ${{ needs.metadata.outputs.labels }}
           cache-from: type=gha,scope=${{ github.workflow }}-${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ matrix.platform }}
-          outputs: type=registry,push-by-digest=true,name-canonical=true
 
   merge:
     needs: [metadata, build]
@@ -96,12 +110,18 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Create multi-arch manifest
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push multi-arch manifests
+        shell: bash
         run: |
-          AMD64_DIGEST=$(echo '${{ toJson(needs.build) }}' | jq -r '.result | fromjson | .["linux/amd64"].digest')
-          ARM64_DIGEST=$(echo '${{ toJson(needs.build) }}' | jq -r '.result | fromjson | .["linux/arm64"].digest')
-          for tag in ${{ needs.metadata.outputs.tags }}; do
+          TAGS="${{ needs.metadata.outputs.tags }}"
+          IFS=','
+          for tag in $TAGS; do
+            SHORT_TAG="${tag#${{ env.IMAGE_NAME }}:}"
             docker buildx imagetools create -t $tag \
-              ${{ env.IMAGE_NAME }}@$AMD64_DIGEST \
-              ${{ env.IMAGE_NAME }}@$ARM64_DIGEST
+              ${{ env.IMAGE_NAME }}:${SHORT_TAG}-amd64 \
+              ${{ env.IMAGE_NAME }}:${SHORT_TAG}-arm64
           done
+          unset IFS
