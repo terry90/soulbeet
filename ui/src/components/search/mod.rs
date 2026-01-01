@@ -154,11 +154,10 @@ pub fn Search() -> Element {
     let view_full_album = move |album_id: String| async move {
         loading.set(true);
 
-        if let Ok(album_data) = auth.call(api::find_album(album_id.clone())).await {
-            viewing_album.set(Some(album_data));
-        } else {
-            info!("Failed to fetch album details for {}", album_id);
-        }
+        match auth.call(api::find_album(album_id.clone())).await {
+            Ok(album_data) => viewing_album.set(Some(album_data)),
+            Err(e) => info!("Failed to fetch album details for {}: {:?}", album_id, e),
+        };
         loading.set(false);
     };
 
