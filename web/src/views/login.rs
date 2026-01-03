@@ -23,13 +23,13 @@ pub fn LoginPage() -> Element {
                     navigator.push(Route::SearchPage {});
                     Ok(())
                 }
-                Err(e) => Err(e.to_string()),
+                _ => Err("Invalid username or password".to_string()),
             }
         })
     });
 
 
     rsx! {
-      Login { login }
+        Login { login }
     }
 }

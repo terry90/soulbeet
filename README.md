@@ -109,6 +109,7 @@ docker-compose up -d --build
 | `SLSKD_API_KEY` | API Key for Slskd | |
 | `SLSKD_DOWNLOAD_PATH` | Path where Slskd downloads files | |
 | `BEETS_CONFIG` | Path to custom beets config file | `beets_config.yaml` |
+| `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
 | `SECRET_KEY` | Used to encrypt tokens | |
 
 ### Beets Configuration
@@ -117,8 +118,36 @@ Soulbeet uses `beets` to import music. You can mount a custom `config.yaml` to `
 
 Default `beet import` flags used:
 -   `-q`: Quiet mode (no user interaction)
--   `-s`: Singleton mode (Works best at the moment, may change in the future)
--   `-d [target_path]`: Import to the specific folder selected in the UI.
+-   `-s`: Singleton mode (Default behavior unless `BEETS_ALBUM_MODE` is set)
+-   `-d [target_path]`: Import to the specific folder selected in the web UI.
+
+#### Album Mode (`BEETS_ALBUM_MODE`)
+
+By setting `BEETS_ALBUM_MODE=true`, Soulbeet will attempt to group downloaded files by their parent directory and import them as an album instead of singletons.
+
+This flag is only needed when you want album tags on your tracks. E.g: `albumartist` `mb_albumid` and so on..
+
+**Important for Album Mode:**
+Since `beets` is run in quiet mode (`-q`), it will skip any imports that require user intervention (e.g., if the metadata doesn't match confidently). To ensure partial albums or less popular releases are imported correctly, you **must** configure your `beets_config.yaml` to be more permissive.
+
+Recommended additions to your `beets_config.yaml` for Album Mode:
+
+```yaml
+import:
+  # quiet_fallback: asis # Optional: If no strong match, import with existing tags instead of skipping
+  timid: no
+
+match:
+  strong_rec_thresh: 0.10  # Lower threshold to accept less confident matches
+  max_rec:
+    missing_tracks: strong
+    unmatched_tracks: strong
+  distance_weights:
+    missing_tracks: 0.1  # Reduce weight (I think default is 0.9) to penalize less for missing tracks, improving the overall score.
+    # unmatched_tracks: 0.2  # Optional: Similar for extra tracks.
+```
+
+*Note: Tweaking `strong_rec_thresh` and other matching parameters increases the risk of incorrect tags, but is necessary for fully automated imports of obscure or partial albums.*
 
 ## Development
 

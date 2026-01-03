@@ -33,9 +33,15 @@ where
         match token {
             Some(token) => match auth::verify_token(&token) {
                 Ok(claims) => Ok(AuthSession(claims)),
-                Err(e) => Err((StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))),
+                Err(e) => {
+                    tracing::error!("Auth failure: Invalid token {}: {}", token, e);
+                    Err((StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e)))
+                }
             },
-            None => Err((StatusCode::UNAUTHORIZED, "No auth token found".to_string())),
+            None => {
+                tracing::warn!("Auth failure: No auth token found in request cookies");
+                Err((StatusCode::UNAUTHORIZED, "No auth token found".to_string()))
+            }
         }
     }
 }
