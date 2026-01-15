@@ -88,23 +88,44 @@ fn WebNavbar() -> Element {
     use_context_provider(|| SearchReset(search_reset));
 
     use_future(move || async move {
+        let mut backoff_ms: u32 = 1_000;
+        const MAX_BACKOFF_MS: u32 = 30_000;
+
         loop {
             let stream = auth.call(api::download_updates_stream()).await;
 
             match stream {
                 Ok(mut s) => {
-                    while let Some(Ok(data)) = s.next().await {
-                        let mut map = downloads.write();
-                        for file in data {
-                            // Use filename as key for consistent deduplication
-                            // (initial queued entries and slskd responses share the same filename)
-                            map.insert(file.filename.clone(), file);
+                    // Reset backoff on successful connection
+                    backoff_ms = 1_000;
+
+                    while let Some(result) = s.next().await {
+                        match result {
+                            Ok(data) => {
+                                let mut map = downloads.write();
+                                for file in data {
+                                    // Use filename as key for consistent deduplication
+                                    // (initial queued entries and slskd responses share the same filename)
+                                    map.insert(file.filename.clone(), file);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Error receiving download update: {:?}", e);
+                                // Don't break - try to continue receiving
+                            }
                         }
                     }
+                    // Stream ended normally, wait before reconnecting
+                    gloo_timers::future::TimeoutFuture::new(backoff_ms).await;
                 }
                 Err(e) => {
-                    warn!("Failed to connect to download updates stream: {:?}", e);
-                    gloo_timers::future::TimeoutFuture::new(1_000).await;
+                    warn!(
+                        "Failed to connect to download updates stream: {:?}, retrying in {}ms",
+                        e, backoff_ms
+                    );
+                    gloo_timers::future::TimeoutFuture::new(backoff_ms).await;
+                    // Exponential backoff with cap
+                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 }
             }
         }

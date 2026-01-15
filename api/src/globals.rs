@@ -21,8 +21,8 @@ pub static SLSKD_CLIENT: LazyLock<SoulseekClient> = LazyLock::new(|| {
         .download_config(DownloadConfig {
             batch_size: 3,
             batch_delay_ms: 3000,
-            max_retries: 5,
-            retry_base_delay_ms: 2000,
+            max_retries: 3,
+            retry_base_delay_ms: 1000,
         })
         .build()
         .expect("Failed to create Soulseek client")

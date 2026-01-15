@@ -56,12 +56,24 @@ pub async fn download_updates_stream(
             match rx.recv().await {
                 Ok(downloads) => {
                     if tx_stream.unbounded_send(downloads).is_err() {
+                        // Client disconnected
+                        info!("Download updates stream closed (client disconnected)");
                         break;
                     }
                 }
-                Err(e) => {
-                    // unexpected error or lag
-                    warn!("Broadcast receive error: {}", e);
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Client couldn't keep up, some messages were dropped
+                    // This is recoverable - just continue receiving
+                    warn!(
+                        "Download updates stream lagged, skipped {} messages",
+                        skipped
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    // All senders have been dropped - channel is closed
+                    // This shouldn't normally happen since we keep senders in USER_CHANNELS
+                    info!("Download updates broadcast channel closed");
+                    break;
                 }
             }
         }
@@ -200,8 +212,11 @@ pub async fn download(
                         .cloned()
                         .collect();
 
+                    info!("batch_status has {} items", batch_status.len());
+
                     if !batch_status.is_empty() {
-                        let _ = tx.send(batch_status.clone());
+                        let send_result = tx.send(batch_status.clone());
+                        info!("tx.send result: {:?} (receiver count)", send_result);
                         consecutive_empty = 0; // Reset counter when we find downloads
                     }
 
