@@ -35,7 +35,6 @@ jobs:
         id: bump
         run: |
           ./scripts/bump_version.sh ${{ inputs.bump_type }}
-          cargo check || true
 
       - name: Commit and Push
         run: |

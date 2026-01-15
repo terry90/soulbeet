@@ -8,15 +8,16 @@ pub enum ImportResult {
     Failed(String),
 }
 
-pub async fn import(sources: Vec<String>, target: &Path) -> Result<ImportResult> {
+pub async fn import(sources: Vec<String>, target: &Path, as_album: bool) -> Result<ImportResult> {
     let config_path =
         std::env::var("BEETS_CONFIG").unwrap_or_else(|_| "beets_config.yaml".to_string());
 
     info!(
-        "Starting beet import for {} items to {:?} using config {}",
+        "Starting beet import for {} items to {:?} using config {} (album mode: {})",
         sources.len(),
         target,
-        config_path
+        config_path,
+        as_album
     );
 
     let mut cmd = Command::new("beet");
@@ -25,8 +26,11 @@ pub async fn import(sources: Vec<String>, target: &Path) -> Result<ImportResult>
         .arg("-d") // destination directory
         .arg(target)
         .arg("import")
-        .arg("-s") // singleton mode
         .arg("-q"); // quiet mode: do not ask for confirmation
+
+    if !as_album {
+        cmd.arg("-s"); // singleton mode
+    }
 
     for source in sources {
         cmd.arg(source);
