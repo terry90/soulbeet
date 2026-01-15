@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 #[cfg(feature = "server")]
 use shared::slskd::FileEntry;
 #[cfg(feature = "server")]
-use soulbeet::slskd::{SoulseekClient, SoulseekClientBuilder};
+use soulbeet::slskd::{SoulseekClient, DownloadConfig, SoulseekClientBuilder};
 #[cfg(feature = "server")]
 use tokio::sync::{broadcast, RwLock};
 
@@ -18,6 +18,12 @@ pub static SLSKD_CLIENT: LazyLock<SoulseekClient> = LazyLock::new(|| {
     SoulseekClientBuilder::new()
         .api_key(&api_key)
         .base_url(&base_url)
+        .download_config(DownloadConfig {
+            batch_size: 3,
+            batch_delay_ms: 3000,
+            max_retries: 5,
+            retry_base_delay_ms: 2000,
+        })
         .build()
         .expect("Failed to create Soulseek client")
 });

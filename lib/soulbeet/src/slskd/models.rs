@@ -20,7 +20,7 @@ pub(crate) struct SearchResponse {
     pub queue_length: i32,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DownloadRequestFile {
     pub filename: String,
     pub size: i64,

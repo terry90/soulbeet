@@ -12,10 +12,34 @@ use shared::{
 };
 use std::{collections::HashMap, path::Path, sync::Arc};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 const MAX_SEARCH_RESULTS: usize = 50;
+
+/// Configuration for download batching to avoid overwhelming the slskd API.
+#[derive(Debug, Clone)]
+pub struct DownloadConfig {
+    /// Maximum number of files to send in a single request per user.
+    pub batch_size: usize,
+    /// Delay between batches in milliseconds.
+    pub batch_delay_ms: u64,
+    /// Maximum number of retries for failed batches.
+    pub max_retries: usize,
+    /// Base delay for exponential backoff in milliseconds.
+    pub retry_base_delay_ms: u64,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 3,
+            batch_delay_ms: 1000,
+            max_retries: 3,
+            retry_base_delay_ms: 2000,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SearchContext {
@@ -36,6 +60,7 @@ pub struct SoulseekClient {
     active_searches: Arc<Mutex<HashMap<String, SearchContext>>>,
     max_searches_per_window: usize,
     rate_limit_window: Duration,
+    download_config: DownloadConfig,
 }
 
 #[derive(Default)]
@@ -44,6 +69,7 @@ pub struct SoulseekClientBuilder {
     api_key: Option<String>,
     max_searches_per_window: Option<usize>,
     rate_limit_window_seconds: Option<i64>,
+    download_config: Option<DownloadConfig>,
 }
 
 impl SoulseekClientBuilder {
@@ -75,6 +101,11 @@ impl SoulseekClientBuilder {
         self
     }
 
+    pub fn download_config(mut self, config: DownloadConfig) -> Self {
+        self.download_config = Some(config);
+        self
+    }
+
     pub fn build(self) -> Result<SoulseekClient> {
         let base_url_str = self.base_url.ok_or(SoulseekError::NotConfigured)?;
         let base_url = Url::parse(base_url_str.trim_end_matches('/'))?;
@@ -87,6 +118,7 @@ impl SoulseekClientBuilder {
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             max_searches_per_window: self.max_searches_per_window.unwrap_or(35),
             rate_limit_window: Duration::seconds(self.rate_limit_window_seconds.unwrap_or(220)),
+            download_config: self.download_config.unwrap_or_default(),
         })
     }
 }
@@ -323,6 +355,139 @@ impl SoulseekClient {
     pub async fn download(&self, req: Vec<TrackResult>) -> Result<Vec<DownloadResponse>> {
         let mut requests_by_username: HashMap<String, Vec<DownloadRequestFile>> = HashMap::new();
 
+        info!("Attempting to download: {} files...", req.len());
+
+        for req in req {
+            let list = requests_by_username.entry(req.base.username).or_default();
+            if !list.iter().any(|f| f.filename == req.base.filename) {
+                list.push(DownloadRequestFile {
+                    filename: req.base.filename,
+                    size: req.base.size,
+                });
+            }
+        }
+
+        let mut results = Vec::new();
+        let config = &self.download_config;
+
+        for (username, file_requests) in requests_by_username {
+            let batches: Vec<_> = file_requests
+                .chunks(config.batch_size)
+                .map(|c| c.to_vec())
+                .collect();
+
+            info!(
+                "Downloading {} files from '{}' in {} batches (batch size: {})",
+                file_requests.len(),
+                username,
+                batches.len(),
+                config.batch_size
+            );
+
+            for (batch_idx, batch) in batches.into_iter().enumerate() {
+                if batch_idx > 0 {
+                    debug!("Waiting {}ms before next batch", config.batch_delay_ms);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(config.batch_delay_ms))
+                        .await;
+                }
+
+                let batch_results = self
+                    .download_batch_with_retry(&username, batch, batch_idx)
+                    .await;
+                results.extend(batch_results);
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn download_batch_with_retry(
+        &self,
+        username: &str,
+        batch: Vec<DownloadRequestFile>,
+        batch_idx: usize,
+    ) -> Vec<DownloadResponse> {
+        let config = &self.download_config;
+
+        for attempt in 0..=config.max_retries {
+            if attempt > 0 {
+                let delay = config.retry_base_delay_ms * (1 << (attempt - 1));
+                warn!(
+                    "Retrying batch {} for '{}' (attempt {}/{}), waiting {}ms",
+                    batch_idx, username, attempt, config.max_retries, delay
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+            }
+
+            match self.send_download_batch(username, &batch, batch_idx).await {
+                Ok(responses) => return responses,
+                Err(e) => {
+                    if attempt == config.max_retries {
+                        warn!(
+                            "Batch {} for '{}' failed after {} retries: {}",
+                            batch_idx, username, config.max_retries, e
+                        );
+                        return batch
+                            .iter()
+                            .map(|f| DownloadResponse {
+                                username: username.to_string(),
+                                filename: f.filename.clone(),
+                                size: f.size as u64,
+                                error: Some(format!("Failed after {} retries: {}", config.max_retries, e)),
+                            })
+                            .collect();
+                    }
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    async fn send_download_batch(
+        &self,
+        username: &str,
+        batch: &[DownloadRequestFile],
+        batch_idx: usize,
+    ) -> Result<Vec<DownloadResponse>> {
+        let endpoint = format!("transfers/downloads/{username}");
+        let url = self.base_url.join(&format!("api/v0/{endpoint}"))?;
+
+        info!(
+            "Sending batch {} to '{}': {} files",
+            batch_idx,
+            username,
+            batch.len()
+        );
+        debug!("Batch payload: {:?}", batch);
+
+        let response = self
+            .client
+            .post(url)
+            .header("X-API-Key", self.api_key.as_deref().unwrap_or(""))
+            .json(&batch)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let resp_text = response.text().await?;
+
+        if !status.is_success() {
+            return Err(SoulseekError::Api {
+                status: status.as_u16(),
+                message: resp_text,
+            });
+        }
+
+        Ok(self.parse_download_response(username, batch, &resp_text))
+    }
+
+    fn parse_download_response(
+        &self,
+        username: &str,
+        batch: &[DownloadRequestFile],
+        resp_text: &str,
+    ) -> Vec<DownloadResponse> {
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
         struct SlskdDownloadResponse {
@@ -336,150 +501,86 @@ impl SoulseekClient {
             failed: Vec<serde_json::Value>,
         }
 
-        info!("Attempting to download: {} files...", req.len());
-        for req in req {
-            let list = requests_by_username.entry(req.base.username).or_default();
-            // Check for duplicates before adding
-            if !list.iter().any(|f| f.filename == req.base.filename) {
-                list.push(DownloadRequestFile {
-                    filename: req.base.filename,
-                    size: req.base.size,
-                });
-            }
-        }
+        let find_size = |filename: &str| -> u64 {
+            batch
+                .iter()
+                .find(|f| f.filename == filename)
+                .map(|f| f.size as u64)
+                .unwrap_or(0)
+        };
 
-        let mut res = vec![];
-
-        for (username, file_requests) in requests_by_username.into_iter() {
-            let endpoint = format!("transfers/downloads/{username}");
-            let url = self.base_url.join(&format!("api/v0/{endpoint}"))?;
-
-            info!(
-                "Sending download request to {} with {} files",
-                url,
-                file_requests.len()
-            );
-            debug!(
-                "Payload: {:?}",
-                serde_json::to_string(&file_requests).unwrap_or_default()
-            );
-
-            let response = self
-                .client
-                .post(url)
-                .header("X-API-Key", self.api_key.as_deref().unwrap_or(""))
-                .json(&file_requests)
-                .send()
-                .await?;
-
-            let status = response.status();
-            let resp_text = response.text().await?;
-
-            if !status.is_success() {
-                tracing::error!(
-                    "Slskd returned error status: {} - Body: {}",
-                    status,
-                    resp_text
-                );
-                for req_file in &file_requests {
-                    res.push(DownloadResponse {
-                        username: username.clone(),
-                        filename: req_file.filename.clone(),
-                        size: req_file.size as u64,
-                        error: Some(resp_text.clone()),
-                    });
-                }
-                continue;
-            }
-
-            if resp_text.trim().is_empty() {
-                info!("Slskd returned empty success response. Assuming files queued.");
-                for req_file in &file_requests {
-                    res.push(DownloadResponse {
-                        username: username.clone(),
-                        filename: req_file.filename.clone(),
-                        size: req_file.size as u64,
-                        error: None,
-                    });
-                }
-                // TODO: Check slskd response
-            } else if let Ok(single_res) = serde_json::from_str::<SlskdDownloadResponse>(&resp_text)
-            {
-                let size = file_requests
-                    .iter()
-                    .find(|f| f.filename == single_res.filename)
-                    .map(|f| f.size)
-                    .unwrap_or(0);
-                res.push(DownloadResponse {
-                    username: username.clone(),
-                    filename: single_res.filename,
-                    size: size as u64,
+        if resp_text.trim().is_empty() {
+            info!("Empty success response, assuming files queued");
+            return batch
+                .iter()
+                .map(|f| DownloadResponse {
+                    username: username.to_string(),
+                    filename: f.filename.clone(),
+                    size: f.size as u64,
                     error: None,
-                });
-            } else if let Ok(multi_res) =
-                serde_json::from_str::<Vec<SlskdDownloadResponse>>(&resp_text)
-            {
-                res.extend(multi_res.into_iter().map(|d| {
-                    let size = file_requests
-                        .iter()
-                        .find(|f| f.filename == d.filename)
-                        .map(|f| f.size)
-                        .unwrap_or(0);
-                    DownloadResponse {
-                        username: username.clone(),
-                        filename: d.filename,
-                        size: size as u64,
-                        error: None,
-                    }
-                }));
-            } else if let Ok(batch_res) = serde_json::from_str::<SlskdBatchResponse>(&resp_text) {
-                res.extend(batch_res.enqueued.into_iter().map(|d| {
-                    let size = file_requests
-                        .iter()
-                        .find(|f| f.filename == d.filename)
-                        .map(|f| f.size)
-                        .unwrap_or(0);
-                    DownloadResponse {
-                        username: username.clone(),
-                        filename: d.filename,
-                        size: size as u64,
-                        error: None,
-                    }
-                }));
-                for failed_item in batch_res.failed {
-                    let (filename_opt, error_msg) = if let Some(s) = failed_item.as_str() {
-                        (Some(s.to_string()), "Download failed".to_string())
-                    } else {
-                        tracing::warn!("Slskd reported failed is not a string: {}", failed_item);
-                        continue;
-                    };
-
-                    if let Some(filename) = filename_opt {
-                        let size = file_requests
-                            .iter()
-                            .find(|f| f.filename == filename)
-                            .map(|f| f.size)
-                            .unwrap_or(0);
-
-                        res.push(DownloadResponse {
-                            username: username.clone(),
-                            filename,
-                            size: size as u64,
-                            error: Some(error_msg),
-                        });
-                    } else {
-                        tracing::warn!(
-                            "Slskd reported failed download without filename: {}",
-                            failed_item
-                        );
-                    }
-                }
-            } else {
-                tracing::error!("Failed to parse response from slskd: '{}'", resp_text);
-            }
+                })
+                .collect();
         }
 
-        Ok(res)
+        if let Ok(single) = serde_json::from_str::<SlskdDownloadResponse>(resp_text) {
+            return vec![DownloadResponse {
+                username: username.to_string(),
+                filename: single.filename.clone(),
+                size: find_size(&single.filename),
+                error: None,
+            }];
+        }
+
+        if let Ok(multi) = serde_json::from_str::<Vec<SlskdDownloadResponse>>(resp_text) {
+            return multi
+                .into_iter()
+                .map(|d| DownloadResponse {
+                    username: username.to_string(),
+                    filename: d.filename.clone(),
+                    size: find_size(&d.filename),
+                    error: None,
+                })
+                .collect();
+        }
+
+        if let Ok(batch_resp) = serde_json::from_str::<SlskdBatchResponse>(resp_text) {
+            let mut results: Vec<_> = batch_resp
+                .enqueued
+                .into_iter()
+                .map(|d| DownloadResponse {
+                    username: username.to_string(),
+                    filename: d.filename.clone(),
+                    size: find_size(&d.filename),
+                    error: None,
+                })
+                .collect();
+
+            for failed in batch_resp.failed {
+                if let Some(filename) = failed.as_str() {
+                    results.push(DownloadResponse {
+                        username: username.to_string(),
+                        filename: filename.to_string(),
+                        size: find_size(filename),
+                        error: Some("Download failed".to_string()),
+                    });
+                } else {
+                    warn!("Unexpected failed item format: {}", failed);
+                }
+            }
+
+            return results;
+        }
+
+        warn!("Failed to parse slskd response: '{}'", resp_text);
+        batch
+            .iter()
+            .map(|f| DownloadResponse {
+                username: username.to_string(),
+                filename: f.filename.clone(),
+                size: f.size as u64,
+                error: Some("Failed to parse server response".to_string()),
+            })
+            .collect()
     }
 
     pub async fn get_all_downloads(&self) -> Result<Vec<FileEntry>> {
