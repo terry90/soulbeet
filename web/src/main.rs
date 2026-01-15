@@ -110,12 +110,13 @@ fn WebNavbar() -> Element {
                                 }
                             }
                             Err(e) => {
-                                warn!("Error receiving download update: {:?}", e);
-                                // Don't break - try to continue receiving
+                                warn!("Error receiving download update: {:?}, reconnecting", e);
+                                // Stream is corrupted, break and reconnect
+                                break;
                             }
                         }
                     }
-                    // Stream ended normally, wait before reconnecting
+                    // Stream ended or errored, wait before reconnecting
                     gloo_timers::future::TimeoutFuture::new(backoff_ms).await;
                 }
                 Err(e) => {
