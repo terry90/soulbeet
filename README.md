@@ -50,6 +50,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:/data/soulbeet.db
       - SLSKD_URL=http://slskd:5030
+      # This part is important, get your API from slskd config file or add one: https://github.com/slskd/slskd/blob/master/docs/config.md#yaml-24
       - SLSKD_API_KEY=your_slskd_api_key_here
       # The path where slskd saves files (INSIDE the soulbeet container)
       - SLSKD_DOWNLOAD_PATH=/downloads
