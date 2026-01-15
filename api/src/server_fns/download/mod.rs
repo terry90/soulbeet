@@ -1,4 +1,4 @@
-use dioxus::fullstack::{CborEncoding, Streaming};
+use dioxus::fullstack::{JsonEncoding, Streaming};
 use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::*;
 use shared::slskd::{DownloadResponse, DownloadState, FileEntry, TrackResult};
@@ -38,7 +38,7 @@ async fn slskd_download(tracks: Vec<TrackResult>) -> Result<Vec<DownloadResponse
 
 #[get("/api/downloads/updates", auth: AuthSession)]
 pub async fn download_updates_stream(
-) -> Result<Streaming<Vec<FileEntry>, CborEncoding>, ServerFnError> {
+) -> Result<Streaming<Vec<FileEntry>, JsonEncoding>, ServerFnError> {
     let username = auth.0.username;
 
     let rx = {
