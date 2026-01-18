@@ -9,7 +9,7 @@ pub struct AuthResponse {
 #[cfg(feature = "server")]
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 #[cfg(feature = "server")]
-use std::env;
+use crate::config::CONFIG;
 
 pub static EXPIRATION_DAYS: i64 = 30;
 
@@ -23,8 +23,7 @@ pub struct Claims {
 
 #[cfg(feature = "server")]
 pub fn create_token(user_id: String, username: String) -> Result<String, String> {
-    let secret = env::var("SECRET_KEY").unwrap_or_else(|_| "secret".to_string());
-    let encoding_key = EncodingKey::from_secret(secret.as_bytes());
+    let encoding_key = EncodingKey::from_secret(CONFIG.secret_key().as_bytes());
     let now = chrono::Utc::now();
     let iat = now.timestamp() as usize;
 
@@ -47,11 +46,9 @@ pub fn create_token(user_id: String, username: String) -> Result<String, String>
 
 #[cfg(feature = "server")]
 pub fn verify_token(token: &str) -> Result<Claims, String> {
-    let secret = env::var("SECRET_KEY").unwrap_or_else(|_| "secret".to_string());
-
     let token_data = decode::<Claims>(
         token,
-        &DecodingKey::from_secret(secret.as_bytes()),
+        &DecodingKey::from_secret(CONFIG.secret_key().as_bytes()),
         &Validation::default(),
     )
     .map_err(|e| e.to_string())?;

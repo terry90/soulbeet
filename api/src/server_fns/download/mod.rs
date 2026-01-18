@@ -19,16 +19,14 @@ use crate::server_fns::server_error;
 use crate::AuthSession;
 
 #[cfg(feature = "server")]
+use crate::config::CONFIG;
+#[cfg(feature = "server")]
 use crate::globals::{
     cleanup_stale_channels, get_or_create_user_channel, register_user_task, unregister_user_task,
     SLSKD_CLIENT, USER_CHANNELS,
 };
 
-#[cfg(feature = "server")]
-use chrono::Utc;
 
-#[cfg(feature = "server")]
-use uuid::Uuid;
 
 #[cfg(feature = "server")]
 struct TrackState {
@@ -213,31 +211,7 @@ pub async fn download(
     let (tx, _) = get_or_create_user_channel(&username).await;
 
     if !failed.is_empty() {
-        let failed_entries: Vec<FileEntry> = failed
-            .iter()
-            .map(|d| FileEntry {
-                id: Uuid::new_v4().to_string(),
-                username: d.username.clone(),
-                direction: "Download".to_string(),
-                filename: d.filename.clone(),
-                size: d.size,
-                start_offset: 0,
-                state: vec![DownloadState::Errored],
-                state_description: d.error.clone().unwrap_or_default(),
-                requested_at: Utc::now().to_rfc3339(),
-                enqueued_at: None,
-                started_at: None,
-                ended_at: None,
-                bytes_transferred: 0,
-                average_speed: 0.0,
-                bytes_remaining: d.size,
-                elapsed_time: None,
-                percent_complete: 0.0,
-                remaining_time: None,
-                exception: d.error.clone(),
-            })
-            .collect();
-
+        let failed_entries: Vec<FileEntry> = failed.iter().map(FileEntry::errored).collect();
         let _ = tx.send(failed_entries);
     }
 
@@ -249,31 +223,7 @@ pub async fn download(
     }
 
     // Send initial "Queued" state immediately so UI shows the downloads right away
-    let queued_entries: Vec<FileEntry> = successful
-        .iter()
-        .map(|d| FileEntry {
-            id: Uuid::new_v4().to_string(),
-            username: d.username.clone(),
-            direction: "Download".to_string(),
-            filename: d.filename.clone(),
-            size: d.size,
-            start_offset: 0,
-            state: vec![DownloadState::Queued],
-            state_description: "Queued for download".to_string(),
-            requested_at: Utc::now().to_rfc3339(),
-            enqueued_at: Some(Utc::now().to_rfc3339()),
-            started_at: None,
-            ended_at: None,
-            bytes_transferred: 0,
-            average_speed: 0.0,
-            bytes_remaining: d.size,
-            elapsed_time: None,
-            percent_complete: 0.0,
-            remaining_time: None,
-            exception: None,
-        })
-        .collect();
-
+    let queued_entries: Vec<FileEntry> = successful.iter().map(FileEntry::queued).collect();
     let _ = tx.send(queued_entries);
 
     info!("Started monitoring downloads: {:?}", download_filenames);
@@ -295,7 +245,7 @@ pub async fn download(
             .map(|f| (f.clone(), TrackState { first_seen: None, processed: false }))
             .collect();
 
-        let album_mode = std::env::var("BEETS_ALBUM_MODE").is_ok();
+        let album_mode = CONFIG.is_album_mode();
         let mut poll_count = 0;
 
         // Poll immediately on first iteration, then wait for interval
@@ -402,29 +352,7 @@ pub async fn download(
                             if let Some(first_seen) = state.first_seen {
                                 if first_seen.elapsed() > PER_TRACK_TIMEOUT && !is_terminal_state(&download.state) {
                                     warn!("Track timed out after {} minutes: {}", first_seen.elapsed().as_secs() / 60, download.filename);
-                                    // Send timeout for the track
-                                    let timeout_entry = FileEntry {
-                                        id: download.id.clone(),
-                                        username: download.username.clone(),
-                                        direction: "Download".to_string(),
-                                        filename: download.filename.clone(),
-                                        size: download.size,
-                                        start_offset: 0,
-                                        state: vec![DownloadState::Errored],
-                                        state_description: "Download timed out after 1 hour".to_string(),
-                                        requested_at: download.requested_at.clone(),
-                                        enqueued_at: download.enqueued_at.clone(),
-                                        started_at: download.started_at.clone(),
-                                        ended_at: Some(Utc::now().to_rfc3339()),
-                                        bytes_transferred: download.bytes_transferred,
-                                        average_speed: download.average_speed,
-                                        bytes_remaining: download.bytes_remaining,
-                                        elapsed_time: download.elapsed_time.clone(),
-                                        percent_complete: download.percent_complete,
-                                        remaining_time: None,
-                                        exception: Some("Per-track timeout".to_string()),
-                                    };
-                                    let _ = tx.send(vec![timeout_entry]);
+                                    let _ = tx.send(vec![download.as_timeout()]);
                                     state.processed = true;
                                     continue;
                                 }

@@ -3788,8 +3788,10 @@ dependencies = [
 name = "shared"
 version = "0.2.3"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

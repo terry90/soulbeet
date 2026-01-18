@@ -4,9 +4,11 @@ use dioxus::fullstack::Lazy;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 
 #[cfg(feature = "server")]
+use crate::config::CONFIG;
+
+#[cfg(feature = "server")]
 pub static DB: Lazy<SqlitePool> = Lazy::new(|| async move {
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:soulbeet.db".to_string());
+    let database_url = CONFIG.database_url();
 
     if database_url.starts_with("sqlite:") {
         let path_str = database_url.trim_start_matches("sqlite:");
@@ -21,7 +23,7 @@ pub static DB: Lazy<SqlitePool> = Lazy::new(|| async move {
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&database_url)
+        .connect(database_url)
         .await
         .expect("Failed to connect to database");
 

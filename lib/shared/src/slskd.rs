@@ -93,6 +93,90 @@ impl FileEntry {
     pub fn get_state(&self) -> Vec<DownloadState> {
         self.state.clone()
     }
+
+    /// Create a new FileEntry from a DownloadResponse with a specified state.
+    ///
+    /// This is the primary factory method for creating FileEntry objects,
+    /// reducing code duplication in the download module.
+    pub fn from_download_response(
+        response: &DownloadResponse,
+        state: DownloadState,
+        state_description: String,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: response.username.clone(),
+            direction: "Download".to_string(),
+            filename: response.filename.clone(),
+            size: response.size,
+            start_offset: 0,
+            state: vec![state],
+            state_description,
+            requested_at: chrono::Utc::now().to_rfc3339(),
+            enqueued_at: None,
+            started_at: None,
+            ended_at: None,
+            bytes_transferred: 0,
+            average_speed: 0.0,
+            bytes_remaining: response.size,
+            elapsed_time: None,
+            percent_complete: 0.0,
+            remaining_time: None,
+            exception: response.error.clone(),
+        }
+    }
+
+    /// Create a queued FileEntry from a DownloadResponse.
+    pub fn queued(response: &DownloadResponse) -> Self {
+        let mut entry = Self::from_download_response(
+            response,
+            DownloadState::Queued,
+            "Queued for download".to_string(),
+        );
+        entry.enqueued_at = Some(chrono::Utc::now().to_rfc3339());
+        entry
+    }
+
+    /// Create an errored FileEntry from a DownloadResponse.
+    pub fn errored(response: &DownloadResponse) -> Self {
+        Self::from_download_response(
+            response,
+            DownloadState::Errored,
+            response.error.clone().unwrap_or_default(),
+        )
+    }
+
+    /// Create a new FileEntry with a different state, preserving other fields.
+    pub fn with_state(mut self, state: DownloadState, description: String) -> Self {
+        self.state = vec![state];
+        self.state_description = description;
+        self
+    }
+
+    /// Create a timeout error entry from an existing FileEntry.
+    pub fn as_timeout(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            username: self.username.clone(),
+            direction: "Download".to_string(),
+            filename: self.filename.clone(),
+            size: self.size,
+            start_offset: 0,
+            state: vec![DownloadState::Errored],
+            state_description: "Download timed out after 1 hour".to_string(),
+            requested_at: self.requested_at.clone(),
+            enqueued_at: self.enqueued_at.clone(),
+            started_at: self.started_at.clone(),
+            ended_at: Some(chrono::Utc::now().to_rfc3339()),
+            bytes_transferred: self.bytes_transferred,
+            average_speed: self.average_speed,
+            bytes_remaining: self.bytes_remaining,
+            elapsed_time: self.elapsed_time.clone(),
+            percent_complete: self.percent_complete,
+            remaining_time: None,
+            exception: Some("Per-track timeout".to_string()),
+        }
+    }
 }
 
 fn deserialize_download_state<'de, D>(deserializer: D) -> Result<Vec<DownloadState>, D::Error>
