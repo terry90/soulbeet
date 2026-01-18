@@ -66,13 +66,13 @@ impl Default for UserChannel {
 }
 
 #[cfg(feature = "server")]
-pub static SLSKD_CLIENT: LazyLock<SoulseekClient> = LazyLock::new(|| {
-    let api_key = std::env::var("SLSKD_API_KEY").expect("Missing SLSKD_API_KEY env var");
-    let base_url = std::env::var("SLSKD_URL").expect("Missing SLSKD_URL env var");
+use crate::config::CONFIG;
 
+#[cfg(feature = "server")]
+pub static SLSKD_CLIENT: LazyLock<SoulseekClient> = LazyLock::new(|| {
     SoulseekClientBuilder::new()
-        .api_key(&api_key)
-        .base_url(&base_url)
+        .api_key(CONFIG.slskd_api_key())
+        .base_url(CONFIG.slskd_url())
         .download_config(DownloadConfig {
             batch_size: 3,
             batch_delay_ms: 3000,

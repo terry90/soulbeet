@@ -11,6 +11,8 @@ use tokio::sync::broadcast;
 use super::import::import_group;
 #[cfg(feature = "server")]
 use super::utils::resolve_download_path;
+#[cfg(feature = "server")]
+use crate::config::CONFIG;
 
 #[cfg(feature = "server")]
 pub async fn process_downloads(
@@ -25,10 +27,8 @@ pub async fn process_downloads(
             target_path
         );
 
-        let download_path_base =
-            std::env::var("SLSKD_DOWNLOAD_PATH").unwrap_or_else(|_| "/downloads".to_string());
-        let download_path_buf = std::path::PathBuf::from(&download_path_base);
-        let album_mode = std::env::var("BEETS_ALBUM_MODE").is_ok();
+        let download_path_buf = CONFIG.slskd_download_path().clone();
+        let album_mode = CONFIG.is_album_mode();
 
         if album_mode {
             let mut pending_imports: HashMap<String, Vec<FileEntry>> = HashMap::new();
