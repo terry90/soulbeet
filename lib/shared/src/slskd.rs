@@ -22,6 +22,7 @@ pub struct DownloadResponse {
     pub error: Option<String>,
 }
 
+/// Download states ordered by display priority (active first, errors last)
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum DownloadState {
     InProgress,
@@ -29,12 +30,12 @@ pub enum DownloadState {
     Queued,
     Downloaded,
     Imported,
-    Unknown(String),
+    ImportSkipped,
+    Errored,
+    ImportFailed,
     Aborted,
     Cancelled,
-    Errored,
-    ImportSkipped,
-    ImportFailed,
+    Unknown(String),
 }
 
 impl From<String> for DownloadState {

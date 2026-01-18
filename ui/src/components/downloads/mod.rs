@@ -15,21 +15,13 @@ pub struct DownloadsProps {
 #[component]
 pub fn Downloads(mut props: DownloadsProps) -> Element {
     let mut active_downloads: Vec<FileEntry> = props.downloads.read().values().cloned().collect();
-    active_downloads.sort_by(|a, b| b.enqueued_at.cmp(&a.enqueued_at));
     active_downloads.sort_by(|a, b| {
-        let a_state = a
-            .state
-            .first()
-            .cloned()
-            .unwrap_or(DownloadState::Unknown("".into()));
-        let b_state = b
-            .state
-            .first()
-            .cloned()
-            .unwrap_or(DownloadState::Unknown("".into()));
-        b_state
-            .partial_cmp(&a_state)
+        let a_state = a.state.first().cloned().unwrap_or(DownloadState::Unknown("".into()));
+        let b_state = b.state.first().cloned().unwrap_or(DownloadState::Unknown("".into()));
+        a_state
+            .partial_cmp(&b_state)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.enqueued_at.cmp(&a.enqueued_at))
     });
 
     // Count specific states for the header summary
