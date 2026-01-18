@@ -27,6 +27,7 @@ tokio = { version = "1.48.0", features = [
   "rt-multi-thread",
   "fs",
 ], optional = true }
+tokio-util = { version = "0.7", optional = true }
 tracing = "0.1.41"
 axum = { version = "0.8.7", optional = true }
 
@@ -39,6 +40,7 @@ server = [
   "dep:soulbeet",
   "dep:sqlx",
   "dep:tokio",
+  "dep:tokio-util",
   "dep:uuid",
   "dep:argon2",
   "dep:rand",

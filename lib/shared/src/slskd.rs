@@ -142,19 +142,50 @@ where
 
     let mut files = Vec::new();
 
-    if let Value::Array(users) = v {
-        for user in users {
-            if let Some(directories) = user.get("directories").and_then(|d| d.as_array()) {
-                for dir in directories {
-                    if let Some(dir_files) = dir.get("files").and_then(|f| f.as_array()) {
-                        for file in dir_files {
-                            let file_entry: FileEntry = serde_json::from_value(file.clone())
-                                .map_err(serde::de::Error::custom)?;
-                            files.push(file_entry);
+    match &v {
+        Value::Array(users) => {
+            for user in users {
+                // The slskd API returns: [ { "username": "...", "directories": [...] }, ... ]
+                if let Some(directories) = user.get("directories").and_then(|d| d.as_array()) {
+                    for dir in directories {
+                        if let Some(dir_files) = dir.get("files").and_then(|f| f.as_array()) {
+                            for file in dir_files {
+                                match serde_json::from_value::<FileEntry>(file.clone()) {
+                                    Ok(file_entry) => files.push(file_entry),
+                                    Err(e) => {
+                                        // Log but don't fail - skip malformed entries
+                                        #[cfg(feature = "tracing")]
+                                        tracing::warn!(
+                                            "Failed to parse file entry: {} - {:?}",
+                                            e,
+                                            file
+                                        );
+                                        // Continue processing other files
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
+        }
+        Value::Object(obj) => {
+            // Handle case where response is a single object instead of array
+            if let Some(directories) = obj.get("directories").and_then(|d| d.as_array()) {
+                for dir in directories {
+                    if let Some(dir_files) = dir.get("files").and_then(|f| f.as_array()) {
+                        for file in dir_files {
+                            match serde_json::from_value::<FileEntry>(file.clone()) {
+                                Ok(file_entry) => files.push(file_entry),
+                                Err(_) => continue,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            // Unexpected format - return empty
         }
     }
 

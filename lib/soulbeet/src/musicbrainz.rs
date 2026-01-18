@@ -12,6 +12,18 @@ use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+/// Timeout for individual MusicBrainz requests (15 seconds)
+const REQUEST_TIMEOUT_SECS: u64 = 15;
+
+/// Maximum retries for transient errors
+const MAX_RETRIES: u32 = 3;
+
+/// Base delay for exponential backoff (milliseconds)
+const BASE_DELAY_MS: u64 = 500;
+
+/// Maximum backoff delay cap (milliseconds)
+const MAX_BACKOFF_MS: u64 = 5000;
+
 // This ensures the client is initialized only once with a proper user agent.
 fn musicbrainz_client() -> &'static MusicBrainzClient {
     static CLIENT: OnceLock<MusicBrainzClient> = OnceLock::new();
@@ -20,7 +32,7 @@ fn musicbrainz_client() -> &'static MusicBrainzClient {
         MusicBrainzClient::new(&format!(
             "Soulbeet/{version} ( https://github.com/terry90/soulbeet )"
         ))
-        .unwrap()
+        .expect("Failed to create MusicBrainz client - invalid user agent format")
     })
 }
 
@@ -48,41 +60,121 @@ fn format_duration(duration_ms: &Option<u32>) -> Option<String> {
     })
 }
 
-const MAX_RETRIES: u32 = 3;
-const BASE_DELAY_MS: u64 = 500;
+/// Check if an error is retryable (transient network/server issues)
+fn is_retryable_error(error: &musicbrainz_rs::Error) -> bool {
+    let error_str = format!("{:?}", error);
+    let error_lower = error_str.to_lowercase();
 
-/// Retries an async operation with exponential backoff.
-/// Starts with 500ms delay, doubling each retry (500ms, 1000ms, 2000ms).
-async fn with_retry<T, E, F, Fut>(operation_name: &str, mut operation: F) -> Result<T, E>
+    // Retry on timeout, connection, and 5xx server errors
+    if error_lower.contains("timeout")
+        || error_lower.contains("connection")
+        || error_lower.contains("timed out")
+        || error_lower.contains("503")
+        || error_lower.contains("502")
+        || error_lower.contains("500")
+        || error_lower.contains("429") // Rate limited - should retry after backoff
+        || error_lower.contains("service unavailable")
+    {
+        return true;
+    }
+
+    // Don't retry client errors (4xx except 429)
+    if error_lower.contains("400")
+        || error_lower.contains("401")
+        || error_lower.contains("403")
+        || error_lower.contains("404")
+        || error_lower.contains("bad request")
+        || error_lower.contains("not found")
+        || error_lower.contains("unauthorized")
+    {
+        return false;
+    }
+
+    // Default to retrying for unknown errors (network issues, etc.)
+    true
+}
+
+/// Retries an async operation with exponential backoff and request timeout.
+/// Only retries transient errors (network issues, timeouts, 5xx responses).
+/// Does NOT retry client errors (4xx) or permanent failures.
+async fn with_retry<T, F, Fut>(operation_name: &str, mut operation: F) -> Result<T, musicbrainz_rs::Error>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
+    Fut: Future<Output = Result<T, musicbrainz_rs::Error>>,
 {
     let mut last_error = None;
 
     for attempt in 0..MAX_RETRIES {
-        match operation().await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
+        // Apply timeout to each request
+        let result = tokio::time::timeout(
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            operation()
+        ).await;
+
+        match result {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(e)) => {
+                // Check if this error is retryable
+                if !is_retryable_error(&e) {
+                    warn!(
+                        "{} failed with non-retryable error: {:?}",
+                        operation_name, e
+                    );
+                    return Err(e);
+                }
+
                 last_error = Some(e);
                 if attempt < MAX_RETRIES - 1 {
-                    let delay = Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempt));
+                    let delay = std::cmp::min(
+                        BASE_DELAY_MS * 2u64.pow(attempt),
+                        MAX_BACKOFF_MS
+                    );
                     warn!(
-                        "{} failed (attempt {}/{}), retrying in {:?}: {:?}",
+                        "{} failed (attempt {}/{}), retrying in {}ms: {:?}",
                         operation_name,
                         attempt + 1,
                         MAX_RETRIES,
                         delay,
                         last_error
                     );
-                    sleep(delay).await;
+                    sleep(Duration::from_millis(delay)).await;
+                }
+            }
+            Err(_timeout) => {
+                // Request timed out
+                warn!(
+                    "{} timed out after {}s (attempt {}/{})",
+                    operation_name,
+                    REQUEST_TIMEOUT_SECS,
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                // Create a timeout error - we'll retry
+                if attempt < MAX_RETRIES - 1 {
+                    let delay = std::cmp::min(
+                        BASE_DELAY_MS * 2u64.pow(attempt),
+                        MAX_BACKOFF_MS
+                    );
+                    sleep(Duration::from_millis(delay)).await;
                 }
             }
         }
     }
 
-    Err(last_error.unwrap())
+    // Return the last error or panic (should never happen since we always set last_error on timeout)
+    // If we somehow have no error, create a synthetic one
+    match last_error {
+        Some(e) => Err(e),
+        None => {
+            warn!(
+                "{} failed after {} retries with no recorded error (likely all timeouts)",
+                operation_name, MAX_RETRIES
+            );
+            // Re-run the operation one more time to get an error to return
+            // This is a fallback - shouldn't normally happen
+            operation().await
+        }
+    }
 }
 
 /// An enumeration to specify the type of search.

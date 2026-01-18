@@ -98,6 +98,7 @@ dependencies = [
  "soulbeet",
  "sqlx",
  "tokio",
+ "tokio-util",
  "tower-cookies",
  "tracing",
  "uuid",
