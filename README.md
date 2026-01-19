@@ -120,7 +120,36 @@ Soulbeet uses `beets` to import music. You can mount a custom `config.yaml` to `
 Default `beet import` flags used:
 -   `-q`: Quiet mode (no user interaction)
 -   `-s`: Singleton mode (Default behavior unless `BEETS_ALBUM_MODE` is set)
+-   `-l [library_path]`: Library database path (per-folder)
 -   `-d [target_path]`: Import to the specific folder selected in the web UI.
+
+### Library Management
+
+**Important**: Each music folder you configure in Soulbeet has its own beets database (`.beets_library.db`) stored at the root of that folder. This enables:
+
+- Per-folder duplicate detection
+- Independent library management for each user/folder
+- Cross-library duplicate detection
+
+#### Interacting with Your Library
+
+In soulbeet each user can have multiple libraries. Each library is a folder that contains music files and a `.beets_library.db` file. This database is used to avoid duplicate tracks within the same library.
+
+Since we use different databases, we can't directly compare tracks across libraries. However, we can use the `beets` CLI to interact with each library individually. This way you can add tracks outside of soulbeet but keep them in sync with your library.
+
+To manually interact with a library (list tracks, modify tags, remove items, etc.), use the `beet` CLI with the `-l` flag pointing to the folder's database:
+
+```bash
+# List all tracks in a library
+beet -l /music/Person1/.beets_library.db ls
+```
+
+If using Docker, run these commands inside the container:
+```bash
+docker exec -it <container_name> beet -l /music/Person1/.beets_library.db ls
+```
+
+For more beets commands, see the [beets documentation](https://beets.readthedocs.io/en/stable/reference/cli.html).
 
 #### Album Mode (`BEETS_ALBUM_MODE`)
 
