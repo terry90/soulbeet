@@ -34,6 +34,7 @@ pub fn Search() -> Element {
     let mut loading = use_signal(|| false);
     let mut viewing_album = use_signal::<Option<AlbumWithTracks>>(|| None);
     let mut download_options = use_signal::<Option<Vec<SlskdAlbumResult>>>(|| None);
+    let mut is_downloading = use_signal(|| false);
     let search_reset = try_use_context::<SearchReset>();
 
     let mut system_status = use_signal(SystemHealth::default);
@@ -122,9 +123,11 @@ pub fn Search() -> Element {
     };
 
     let download_tracks = move |(tracks, folder): (Vec<SlskdTrackResult>, String)| async move {
-        if let Ok(_res) = auth.call(api::download(tracks, folder)).await {
-            info!("Downloads started");
+        match auth.call(api::download(tracks, folder)).await {
+            Ok(_res) => info!("Downloads started"),
+            Err(e) => warn!("Failed to start downloads: {:?}", e),
         }
+        is_downloading.set(false);
     };
 
     let perform_search = move || async move {
@@ -289,6 +292,7 @@ pub fn Search() -> Element {
           DownloadResults {
             results,
             is_searching: loading(),
+            is_downloading,
             on_download: move |data| {
                 spawn(download_tracks(data));
             },

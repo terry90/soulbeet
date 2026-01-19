@@ -9,6 +9,7 @@ use crate::{use_auth, Checkbox};
 pub struct Props {
     pub results: Vec<AlbumResult>,
     pub is_searching: bool,
+    pub is_downloading: Signal<bool>,
     #[props(into)]
     pub on_download: EventHandler<(Vec<TrackResult>, String)>,
     #[props(into)]
@@ -93,7 +94,7 @@ pub fn DownloadResults(props: Props) -> Element {
     let results = props.results.clone();
     let mut folders = use_signal(std::vec::Vec::new);
     let mut selected_folder = use_signal(|| "".to_string());
-    let mut is_downloading = use_signal(|| false);
+    let mut is_downloading = props.is_downloading;
     let auth = use_auth();
 
     use_future(move || async move {
