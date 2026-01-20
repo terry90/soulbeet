@@ -1,15 +1,16 @@
 use auth::{use_auth, AuthProvider};
-use dioxus::fullstack::{use_websocket, WebSocketOptions};
-use dioxus::logger::tracing::{info, warn};
+use dioxus::fullstack::WebSocketOptions;
 use dioxus::prelude::*;
 use shared::slskd::FileEntry;
 use std::collections::HashMap;
+use websocket::use_resilient_websocket;
 
 use ui::{Downloads, Layout, Navbar, SearchReset};
 use views::{LoginPage, SearchPage, SettingsPage};
 
 mod auth;
 mod views;
+mod websocket;
 
 #[derive(Debug, Clone, Routable, PartialEq)]
 #[rustfmt::skip]
@@ -88,27 +89,15 @@ fn WebNavbar() -> Element {
 
     use_context_provider(|| SearchReset(search_reset));
 
-    let mut socket = use_websocket(|| api::download_updates_ws(WebSocketOptions::new()));
-
-    // Listen for download updates
-    use_future(move || async move {
-        info!("Starting WebSocket listener for download updates");
-        loop {
-            match socket.recv().await {
-                Ok(data) => {
-                    let mut map = downloads.write();
-                    for file in data {
-                        // Use filename as key for consistent deduplication
-                        map.insert(file.filename.clone(), file);
-                    }
-                }
-                Err(e) => {
-                    warn!("WebSocket error: {:?}", e);
-                    gloo_timers::future::TimeoutFuture::new(1_000).await;
-                }
+    use_resilient_websocket(
+        || api::download_updates_ws(WebSocketOptions::new()),
+        move |data: Vec<FileEntry>| {
+            let mut map = downloads.write();
+            for file in data {
+                map.insert(file.filename.clone(), file);
             }
-        }
-    });
+        },
+    );
 
     let logout = move |_| {
         spawn(async move {
