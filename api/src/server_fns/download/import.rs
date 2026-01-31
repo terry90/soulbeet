@@ -1,7 +1,7 @@
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
 #[cfg(feature = "server")]
-use shared::slskd::{DownloadState, FileEntry};
+use shared::download::{DownloadProgress, DownloadState};
 #[cfg(feature = "server")]
 use soulbeet::beets;
 #[cfg(feature = "server")]
@@ -47,10 +47,10 @@ async fn cleanup_empty_parent_dir(file_path: &str) {
 
 #[cfg(feature = "server")]
 pub async fn import_group(
-    entries: Vec<FileEntry>,
+    entries: Vec<DownloadProgress>,
     source_path: String,
     target_path: std::path::PathBuf,
-    tx: broadcast::Sender<Vec<FileEntry>>,
+    tx: broadcast::Sender<Vec<DownloadProgress>>,
     as_album: bool,
 ) {
     info!(
@@ -59,77 +59,95 @@ pub async fn import_group(
     );
 
     // Notify Importing
-    let mut importing_entries = entries.clone();
-    for e in &mut importing_entries {
-        e.state = vec![DownloadState::Importing];
-    }
-    let _ = tx.send(importing_entries.clone());
+    let importing_entries: Vec<_> = entries
+        .iter()
+        .map(|e| DownloadProgress {
+            state: DownloadState::Importing,
+            ..e.clone()
+        })
+        .collect();
+    let _ = tx.send(importing_entries);
 
     match beets::import(vec![source_path.clone()], &target_path, as_album).await {
         Ok(beets::ImportResult::Success) => {
             info!("Beet import successful");
-            let mut imported_entries = entries.clone();
-            for e in &mut imported_entries {
-                e.state = vec![DownloadState::Imported];
-            }
+            let imported_entries: Vec<_> = entries
+                .iter()
+                .map(|e| DownloadProgress {
+                    state: DownloadState::Imported,
+                    ..e.clone()
+                })
+                .collect();
             let _ = tx.send(imported_entries);
         }
         Ok(beets::ImportResult::Skipped) => {
             info!("Beet import skipped items");
-            let mut skipped_entries = entries.clone();
-            for e in &mut skipped_entries {
-                e.state = vec![DownloadState::ImportSkipped];
-            }
+            let skipped_entries: Vec<_> = entries
+                .iter()
+                .map(|e| DownloadProgress {
+                    state: DownloadState::ImportSkipped,
+                    ..e.clone()
+                })
+                .collect();
             let _ = tx.send(skipped_entries);
 
             // Clean up skipped files to prevent accumulation
             for entry in &entries {
-                cleanup_failed_file(&entry.filename).await;
+                cleanup_failed_file(&entry.item).await;
             }
             cleanup_empty_parent_dir(&source_path).await;
         }
         Ok(beets::ImportResult::Failed(err)) => {
             info!("Beet import failed: {}", err);
-            let mut failed_entries = entries.clone();
-            for e in &mut failed_entries {
-                e.state = vec![DownloadState::ImportFailed];
-                e.state_description = format!("Beet import failed: {err}");
-            }
+            let failed_entries: Vec<_> = entries
+                .iter()
+                .map(|e| DownloadProgress {
+                    state: DownloadState::Failed(format!("Beet import failed: {err}")),
+                    error: Some(format!("Beet import failed: {err}")),
+                    ..e.clone()
+                })
+                .collect();
             let _ = tx.send(failed_entries);
 
             // Clean up failed files
             for entry in &entries {
-                cleanup_failed_file(&entry.filename).await;
+                cleanup_failed_file(&entry.item).await;
             }
             cleanup_empty_parent_dir(&source_path).await;
         }
         Ok(beets::ImportResult::TimedOut) => {
             warn!("Beet import timed out for: {}", source_path);
-            let mut failed_entries = entries.clone();
-            for e in &mut failed_entries {
-                e.state = vec![DownloadState::ImportFailed];
-                e.state_description = "Import timed out - beets process took too long".to_string();
-            }
+            let failed_entries: Vec<_> = entries
+                .iter()
+                .map(|e| DownloadProgress {
+                    state: DownloadState::Failed("Import timed out - beets process took too long".into()),
+                    error: Some("Import timed out".into()),
+                    ..e.clone()
+                })
+                .collect();
             let _ = tx.send(failed_entries);
 
             // Clean up timed out files
             for entry in &entries {
-                cleanup_failed_file(&entry.filename).await;
+                cleanup_failed_file(&entry.item).await;
             }
             cleanup_empty_parent_dir(&source_path).await;
         }
         Err(e) => {
             warn!("Beet import error for {}: {}", source_path, e);
-            let mut failed_entries = entries.clone();
-            for failed in &mut failed_entries {
-                failed.state = vec![DownloadState::ImportFailed];
-                failed.state_description = format!("Import error: {}", e);
-            }
+            let failed_entries: Vec<_> = entries
+                .iter()
+                .map(|entry| DownloadProgress {
+                    state: DownloadState::Failed(format!("Import error: {e}")),
+                    error: Some(format!("Import error: {e}")),
+                    ..entry.clone()
+                })
+                .collect();
             let _ = tx.send(failed_entries);
 
             // Clean up on error
             for entry in &entries {
-                cleanup_failed_file(&entry.filename).await;
+                cleanup_failed_file(&entry.item).await;
             }
             cleanup_empty_parent_dir(&source_path).await;
         }

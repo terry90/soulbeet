@@ -6,24 +6,51 @@
 #[cfg(feature = "server")]
 use std::path::PathBuf;
 
+#[cfg(feature = "server")]
+const DEFAULT_SECRET_KEY: &str = "secret";
+
+/// Parse a boolean from an environment variable.
+///
+/// Accepts: "true", "1", "yes" (case-insensitive) as true.
+/// Accepts: "false", "0", "no" (case-insensitive) as false.
+/// Returns the default for missing or invalid values.
+#[cfg(feature = "server")]
+fn parse_bool_env(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .map(|v| match v.to_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            _ => {
+                tracing::warn!(
+                    "Invalid boolean value '{}' for {}, using default: {}",
+                    v,
+                    key,
+                    default
+                );
+                default
+            }
+        })
+        .unwrap_or(default)
+}
+
 /// Application configuration loaded from environment variables.
 #[cfg(feature = "server")]
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     /// SQLite database URL (default: "sqlite:soulbeet.db")
-    pub database_url: String,
-    /// JWT signing secret (default: "secret" - CHANGE IN PRODUCTION)
-    pub secret_key: String,
+    database_url: String,
+    /// JWT signing secret (MUST be set in production)
+    secret_key: String,
     /// slskd API base URL (required)
-    pub slskd_url: String,
+    slskd_url: String,
     /// slskd API authentication key (required)
-    pub slskd_api_key: String,
+    slskd_api_key: String,
     /// Directory where slskd downloads files (default: "/downloads")
-    pub slskd_download_path: PathBuf,
+    slskd_download_path: PathBuf,
     /// Path to beets configuration file (default: "beets_config.yaml")
-    pub beets_config: PathBuf,
+    beets_config: PathBuf,
     /// Enable album mode for beets import (groups tracks by folder)
-    pub beets_album_mode: bool,
+    beets_album_mode: bool,
     /// HTTP server port (default: 9765)
     pub port: u16,
     /// HTTP server bind address (default: "0.0.0.0")
@@ -37,10 +64,28 @@ impl AppConfig {
     /// # Panics
     /// Panics if required environment variables (SLSKD_URL, SLSKD_API_KEY) are missing.
     pub fn from_env() -> Self {
+        let secret_key = std::env::var("SECRET_KEY").unwrap_or_else(|_| {
+            tracing::error!(
+                "SECRET_KEY environment variable is not set! \
+                 Using insecure default. This is a security risk in production. \
+                 Set SECRET_KEY to a random, secure value."
+            );
+            DEFAULT_SECRET_KEY.to_string()
+        });
+
+        if secret_key == DEFAULT_SECRET_KEY {
+            tracing::error!(
+                "SECRET_KEY is set to the default value '{}'. \
+                 This is insecure for production use. \
+                 Please set a unique, random SECRET_KEY.",
+                DEFAULT_SECRET_KEY
+            );
+        }
+
         Self {
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite:soulbeet.db".to_string()),
-            secret_key: std::env::var("SECRET_KEY").unwrap_or_else(|_| "secret".to_string()),
+            secret_key,
             slskd_url: std::env::var("SLSKD_URL").expect("Missing required SLSKD_URL env var"),
             slskd_api_key: std::env::var("SLSKD_API_KEY")
                 .expect("Missing required SLSKD_API_KEY env var"),
@@ -50,7 +95,7 @@ impl AppConfig {
             beets_config: PathBuf::from(
                 std::env::var("BEETS_CONFIG").unwrap_or_else(|_| "beets_config.yaml".to_string()),
             ),
-            beets_album_mode: std::env::var("BEETS_ALBUM_MODE").is_ok(),
+            beets_album_mode: parse_bool_env("BEETS_ALBUM_MODE", false),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())

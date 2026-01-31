@@ -118,31 +118,82 @@ pub async fn import(
         cmd.arg(source);
     }
 
-    // Execute with timeout to prevent hanging
-    let output = match tokio::time::timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS), cmd.output())
-        .await
-    {
-        Ok(result) => result?,
+    // Spawn child process so we can kill it on timeout
+    // We need stdout/stderr capture, so configure that
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    // Wait with timeout, killing the process if it takes too long
+    let wait_result = tokio::time::timeout(
+        Duration::from_secs(IMPORT_TIMEOUT_SECS),
+        child.wait(),
+    )
+    .await;
+
+    match wait_result {
+        Ok(Ok(status)) => {
+            // Process completed - read captured output
+            let stdout = read_child_stdout(child.stdout.take()).await;
+            let stderr = read_child_stderr(child.stderr.take()).await;
+            process_beets_output(status, &stdout, &stderr, &sources)
+        }
+        Ok(Err(e)) => Err(ImportError::Io(e)),
         Err(_) => {
+            // Timeout reached - kill the child process to prevent orphans
+            if let Err(e) = child.kill().await {
+                warn!("Failed to kill timed-out beet process: {}", e);
+            }
+            // Wait for the killed process to clean up
+            let _ = child.wait().await;
             warn!(
                 "Beet import timed out after {}s for sources: {:?}",
                 IMPORT_TIMEOUT_SECS, sources
             );
-            return Ok(ImportResult::TimedOut);
+            Ok(ImportResult::TimedOut)
         }
-    };
+    }
+}
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+/// Read stdout from a child process pipe
+async fn read_child_stdout(pipe: Option<tokio::process::ChildStdout>) -> String {
+    use tokio::io::AsyncReadExt;
+    match pipe {
+        Some(mut stdout) => {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).to_string()
+        }
+        None => String::new(),
+    }
+}
 
+/// Read stderr from a child process pipe
+async fn read_child_stderr(pipe: Option<tokio::process::ChildStderr>) -> String {
+    use tokio::io::AsyncReadExt;
+    match pipe {
+        Some(mut stderr) => {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// Process beets command output and determine result
+fn process_beets_output(
+    status: std::process::ExitStatus,
+    stdout: &str,
+    stderr: &str,
+    _sources: &[String],
+) -> Result<ImportResult, ImportError> {
+    if status.success() {
         // Check both stdout and stderr for skip indicators
         // Beets may output to either depending on version/config
-        let output_combined = format!("{}{}", stdout, stderr);
+        let output_combined = format!("{}{}", stdout, stderr).to_lowercase();
 
-        if output_combined.to_lowercase().contains("skipping")
-            || output_combined.to_lowercase().contains("skip")
-        {
+        if output_combined.contains("skipping") || output_combined.contains("skip") {
             info!("Beet import skipped items");
             Ok(ImportResult::Skipped)
         } else {
@@ -150,13 +201,10 @@ pub async fn import(
             Ok(ImportResult::Success)
         }
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
         // Combine both streams for error reporting since beets can be inconsistent
         let error_msg = if stderr.is_empty() {
             if stdout.is_empty() {
-                format!("Beet import failed with exit code: {:?}", output.status.code())
+                format!("Beet import failed with exit code: {:?}", status.code())
             } else {
                 stdout.to_string()
             }
@@ -295,4 +343,76 @@ pub async fn find_duplicates_across_libraries(
         total_duplicate_tracks,
         libraries_scanned,
     })
+}
+
+pub struct BeetsImporter {
+    #[allow(dead_code)] // will be used when we pass config to import()
+    config_path: std::path::PathBuf,
+}
+
+impl BeetsImporter {
+    pub fn new(config_path: std::path::PathBuf) -> Self {
+        Self { config_path }
+    }
+
+    pub fn from_env() -> Self {
+        let config_path = std::env::var("BEETS_CONFIG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("beets_config.yaml"));
+        Self::new(config_path)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::MusicImporter for BeetsImporter {
+    fn id(&self) -> &'static str {
+        "beets"
+    }
+
+    fn name(&self) -> &'static str {
+        "Beets"
+    }
+
+    async fn import(
+        &self,
+        sources: &[&Path],
+        target: &Path,
+        as_album: bool,
+    ) -> crate::error::Result<crate::ImportResult> {
+        let sources_str: Vec<String> = sources.iter().map(|p| p.to_string_lossy().to_string()).collect();
+
+        match import(sources_str, target, as_album).await {
+            Ok(result) => Ok(match result {
+                ImportResult::Success => crate::ImportResult::Success,
+                ImportResult::Skipped => crate::ImportResult::Skipped,
+                ImportResult::Failed(msg) => crate::ImportResult::Failed(msg),
+                ImportResult::TimedOut => crate::ImportResult::TimedOut,
+            }),
+            Err(e) => Err(crate::error::SoulseekError::Api {
+                status: 500,
+                message: e.to_string(),
+            }),
+        }
+    }
+
+    async fn find_duplicates(
+        &self,
+        libraries: &[&Path],
+    ) -> crate::error::Result<DuplicateReport> {
+        find_duplicates_across_libraries(libraries.to_vec())
+            .await
+            .map_err(|e| crate::error::SoulseekError::Api {
+                status: 500,
+                message: e,
+            })
+    }
+
+    async fn health_check(&self) -> bool {
+        Command::new("beet")
+            .arg("--version")
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
 }

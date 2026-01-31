@@ -70,21 +70,12 @@ pub fn Album(props: Props) -> Element {
                     .cloned()
                     .collect();
                 let album = props.data.album.clone();
-                if props.data.tracks.len() == tracks.len() {
-                    props
-                        .on_select
-                        .call(DownloadQuery {
-                            album: Some(album),
-                            tracks: props.data.tracks.clone(),
-                        });
+                let tracks = if props.data.tracks.len() == tracks.len() {
+                    props.data.tracks.clone()
                 } else {
-                    props
-                        .on_select
-                        .call(DownloadQuery {
-                            album: Some(album),
-                            tracks,
-                        });
-                }
+                    tracks
+                };
+                props.on_select.call(DownloadQuery::new(tracks).album(album));
             },
         }
     }

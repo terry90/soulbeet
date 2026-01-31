@@ -1,38 +1,38 @@
 use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
-use shared::slskd::{AlbumResult, TrackResult};
+use shared::download::{DownloadableGroup, DownloadableItem};
 use std::collections::HashSet;
 
 use crate::{use_auth, Checkbox};
 
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
-    pub results: Vec<AlbumResult>,
+    pub results: Vec<DownloadableGroup>,
     pub is_searching: bool,
     pub is_downloading: Signal<bool>,
     #[props(into)]
-    pub on_download: EventHandler<(Vec<TrackResult>, String)>,
+    pub on_download: EventHandler<(Vec<DownloadableItem>, String)>,
     #[props(into)]
     pub on_back: EventHandler<()>,
 }
 
 #[derive(Props, Clone, PartialEq)]
 struct AlbumResultItemProps {
-    album: AlbumResult,
+    album: DownloadableGroup,
     selected_tracks: Signal<HashSet<String>>,
-    on_album_select_all: EventHandler<AlbumResult>,
+    on_album_select_all: EventHandler<DownloadableGroup>,
     on_track_toggle: EventHandler<String>,
 }
 
 #[derive(Props, Clone, PartialEq)]
 struct TrackItemProps {
-    track: TrackResult,
+    track: DownloadableItem,
     is_selected: bool,
     on_toggle: EventHandler<String>,
 }
 
-fn get_track_id(track: &TrackResult) -> String {
-    format!("{}{}", track.base.filename, track.base.username)
+fn get_track_id(track: &DownloadableItem) -> String {
+    format!("{}{}", track.id, track.source)
 }
 
 #[component]
@@ -58,13 +58,13 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
 
     rsx! {
         div {
-            key: "{album.album_path}",
+            key: "{album.group_id}",
             class: "bg-white/5 border border-white/5 p-4 rounded-md",
             div { class: "flex justify-between items-center mb-2",
                 div { class: "flex-grow",
-                    h4 { class: "text-md font-bold text-beet-leaf", "{album.album_title}" }
+                    h4 { class: "text-md font-bold text-beet-leaf", "{album.title}" }
                     p { class: "text-sm text-gray-400 font-mono",
-                        "{album.artist.clone().unwrap_or_default()} - Quality: {album.dominant_quality}, Score: {album.score:.2}"
+                        "{album.artist.clone().unwrap_or_default()} - Quality: {album.quality}, Score: {album.score:.2}"
                     }
                 }
                 button {
@@ -74,7 +74,7 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
                 }
             }
             ul { class: "space-y-1",
-                for track in props.album.tracks {
+                for track in props.album.items {
                     TrackItem {
                         is_selected: props.selected_tracks.read().contains(&get_track_id(&track)),
                         track,
@@ -111,20 +111,20 @@ pub fn DownloadResults(props: Props) -> Element {
         }
     });
 
-    let handle_album_select_all = move |album_result: AlbumResult| {
+    let handle_album_select_all = move |group: DownloadableGroup| {
         let mut selected = selected_tracks.write();
-        let all_selected = album_result
-            .tracks
+        let all_selected = group
+            .items
             .iter()
             .all(|t| selected.contains(&get_track_id(t)));
 
         if all_selected {
-            for track in &album_result.tracks {
-                selected.remove(&get_track_id(track));
+            for item in &group.items {
+                selected.remove(&get_track_id(item));
             }
         } else {
-            for track in &album_result.tracks {
-                selected.insert(get_track_id(track));
+            for item in &group.items {
+                selected.insert(get_track_id(item));
             }
         }
     };
@@ -148,15 +148,15 @@ pub fn DownloadResults(props: Props) -> Element {
 
         let selected_ids = selected_tracks.read();
 
-        let tracks_to_download: Vec<TrackResult> = props
+        let items_to_download: Vec<DownloadableItem> = props
             .results
             .iter()
-            .flat_map(|album_result| album_result.tracks.iter())
-            .filter(|track| selected_ids.contains(&get_track_id(track)))
+            .flat_map(|group| group.items.iter())
+            .filter(|item| selected_ids.contains(&get_track_id(item)))
             .cloned()
             .collect();
 
-        if tracks_to_download.is_empty() {
+        if items_to_download.is_empty() {
             return;
         }
 
@@ -165,7 +165,7 @@ pub fn DownloadResults(props: Props) -> Element {
 
         props
             .on_download
-            .call((tracks_to_download, selected_folder()));
+            .call((items_to_download, selected_folder()));
     };
 
     rsx! {

@@ -6,11 +6,10 @@ pub use context::SearchReset;
 
 use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::*;
-use shared::download::DownloadQuery;
-use shared::musicbrainz::{AlbumWithTracks, SearchResult};
-use shared::slskd::{
-    AlbumResult as SlskdAlbumResult, SearchState, TrackResult as SlskdTrackResult,
+use shared::download::{
+    DownloadQuery, DownloadableGroup, DownloadableItem, SearchState as DownloadSearchState,
 };
+use shared::musicbrainz::{AlbumWithTracks, SearchResult};
 use shared::system::SystemHealth;
 
 use track::TrackResult;
@@ -33,7 +32,7 @@ pub fn Search() -> Element {
     let mut search_type = use_signal(|| SearchType::Album);
     let mut loading = use_signal(|| false);
     let mut viewing_album = use_signal::<Option<AlbumWithTracks>>(|| None);
-    let mut download_options = use_signal::<Option<Vec<SlskdAlbumResult>>>(|| None);
+    let mut download_options = use_signal::<Option<Vec<DownloadableGroup>>>(|| None);
     let mut is_downloading = use_signal(|| false);
     let search_reset = try_use_context::<SearchReset>();
 
@@ -82,21 +81,24 @@ pub fn Search() -> Element {
 
         loop {
             match auth
-                .call(api::poll_download_search(search_id.clone()))
+                .call(api::poll_download_search(api::PollQuery {
+                    search_id: search_id.clone(),
+                    backend: None,
+                }))
                 .await
             {
                 Ok(response) => {
                     download_options.with_mut(|current| {
                         if let Some(list) = current {
-                            for new_album in response.results {
+                            for new_group in response.groups {
                                 if let Some(pos) = list.iter().position(|x| {
-                                    x.username == new_album.username
-                                        && x.album_path == new_album.album_path
+                                    x.source == new_group.source
+                                        && x.group_id == new_group.group_id
                                 }) {
                                     // Safeguard against incomplete albums
-                                    list[pos] = new_album;
+                                    list[pos] = new_group;
                                 } else {
-                                    list.push(new_album);
+                                    list.push(new_group);
                                 }
                             }
 
@@ -109,7 +111,7 @@ pub fn Search() -> Element {
                         }
                     });
 
-                    if response.state != SearchState::InProgress {
+                    if response.state != DownloadSearchState::InProgress {
                         break;
                     }
                 }
@@ -122,8 +124,15 @@ pub fn Search() -> Element {
         loading.set(false);
     };
 
-    let download_tracks = move |(tracks, folder): (Vec<SlskdTrackResult>, String)| async move {
-        match auth.call(api::download(tracks, folder)).await {
+    let download_tracks = move |(items, folder): (Vec<DownloadableItem>, String)| async move {
+        match auth
+            .call(api::download(api::DownloadRequest {
+                items,
+                target_folder: folder,
+                backend: None,
+            }))
+            .await
+        {
             Ok(_res) => info!("Downloads started"),
             Err(e) => warn!("Failed to start downloads: {:?}", e),
         }
@@ -137,6 +146,7 @@ pub fn Search() -> Element {
         let query_data = api::SearchQuery {
             artist: artist(),
             query: search(),
+            provider: None,
         };
 
         let result = match search_type() {
@@ -153,7 +163,13 @@ pub fn Search() -> Element {
     let view_full_album = move |album_id: String| async move {
         loading.set(true);
 
-        match auth.call(api::find_album(album_id.clone())).await {
+        match auth
+            .call(api::find_album(api::AlbumQuery {
+                id: album_id.clone(),
+                provider: None,
+            }))
+            .await
+        {
             Ok(album_data) => viewing_album.set(Some(album_data)),
             Err(e) => info!("Failed to fetch album details for {}: {:?}", album_id, e),
         };

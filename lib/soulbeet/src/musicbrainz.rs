@@ -344,8 +344,69 @@ pub async fn find_album(release_id: &str) -> Result<AlbumWithTracks, musicbrainz
         release_date: release.date.map(|d| d.0),
     };
 
-    // Then, package it into the new struct along with the tracks.
     let album_with_tracks = AlbumWithTracks { album, tracks };
 
     Ok(album_with_tracks)
+}
+
+pub struct MusicBrainzProvider;
+
+impl MusicBrainzProvider {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for MusicBrainzProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::MetadataProvider for MusicBrainzProvider {
+    fn id(&self) -> &'static str {
+        "musicbrainz"
+    }
+
+    fn name(&self) -> &'static str {
+        "MusicBrainz"
+    }
+
+    async fn search_albums(
+        &self,
+        artist: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> crate::error::Result<Vec<SearchResult>> {
+        let artist_opt = artist.map(String::from);
+        search(&artist_opt, query, SearchType::Album, limit as u8)
+            .await
+            .map_err(|e| crate::error::SoulseekError::Api {
+                status: 500,
+                message: e.to_string(),
+            })
+    }
+
+    async fn search_tracks(
+        &self,
+        artist: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> crate::error::Result<Vec<SearchResult>> {
+        let artist_opt = artist.map(String::from);
+        search(&artist_opt, query, SearchType::Track, limit as u8)
+            .await
+            .map_err(|e| crate::error::SoulseekError::Api {
+                status: 500,
+                message: e.to_string(),
+            })
+    }
+
+    async fn get_album(&self, id: &str) -> crate::error::Result<AlbumWithTracks> {
+        find_album(id).await.map_err(|e| crate::error::SoulseekError::Api {
+            status: 500,
+            message: e.to_string(),
+        })
+    }
 }

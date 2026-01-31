@@ -1,7 +1,7 @@
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::info;
 #[cfg(feature = "server")]
-use shared::slskd::{DownloadState, FileEntry};
+use shared::download::{DownloadProgress, DownloadState};
 #[cfg(feature = "server")]
 use std::collections::HashMap;
 #[cfg(feature = "server")]
@@ -16,9 +16,9 @@ use crate::config::CONFIG;
 
 #[cfg(feature = "server")]
 pub async fn process_downloads(
-    successful_downloads: Vec<FileEntry>,
+    successful_downloads: Vec<DownloadProgress>,
     target_path: std::path::PathBuf,
-    tx: broadcast::Sender<Vec<FileEntry>>,
+    tx: broadcast::Sender<Vec<DownloadProgress>>,
 ) {
     if !successful_downloads.is_empty() {
         info!(
@@ -31,12 +31,12 @@ pub async fn process_downloads(
         let album_mode = CONFIG.is_album_mode();
 
         if album_mode {
-            let mut pending_imports: HashMap<String, Vec<FileEntry>> = HashMap::new();
+            let mut pending_imports: HashMap<String, Vec<DownloadProgress>> = HashMap::new();
             // safety net for single files not in an album folder
-            let mut singletons: Vec<FileEntry> = Vec::new();
+            let mut singletons: Vec<DownloadProgress> = Vec::new();
 
             for download in successful_downloads {
-                if let Some(path) = resolve_download_path(&download.filename, &download_path_buf) {
+                if let Some(path) = resolve_download_path(&download.item, &download_path_buf) {
                     let p = std::path::Path::new(&path);
                     // group by parent directory (album or release)
                     if let Some(parent) = p.parent() {
@@ -54,9 +54,11 @@ pub async fn process_downloads(
                     }
                 } else {
                     // Handle resolution error
-                    let mut failed_entry = download.clone();
-                    failed_entry.state = vec![DownloadState::ImportFailed];
-                    failed_entry.state_description = "Could not resolve file path".to_string();
+                    let failed_entry = DownloadProgress {
+                        state: DownloadState::Failed("Could not resolve file path".into()),
+                        error: Some("Could not resolve file path".into()),
+                        ..download
+                    };
                     let _ = tx.send(vec![failed_entry]);
                 }
             }
@@ -66,7 +68,7 @@ pub async fn process_downloads(
             }
 
             for download in singletons {
-                if let Some(path) = resolve_download_path(&download.filename, &download_path_buf) {
+                if let Some(path) = resolve_download_path(&download.item, &download_path_buf) {
                     import_group(vec![download], path, target_path.clone(), tx.clone(), false)
                         .await;
                 }
@@ -74,13 +76,15 @@ pub async fn process_downloads(
         } else {
             // singleton mode
             for download in successful_downloads {
-                if let Some(path) = resolve_download_path(&download.filename, &download_path_buf) {
+                if let Some(path) = resolve_download_path(&download.item, &download_path_buf) {
                     import_group(vec![download], path, target_path.clone(), tx.clone(), false)
                         .await;
                 } else {
-                    let mut failed_entry = download.clone();
-                    failed_entry.state = vec![DownloadState::ImportFailed];
-                    failed_entry.state_description = "Could not resolve file path".to_string();
+                    let failed_entry = DownloadProgress {
+                        state: DownloadState::Failed("Could not resolve file path".into()),
+                        error: Some("Could not resolve file path".into()),
+                        ..download
+                    };
                     let _ = tx.send(vec![failed_entry]);
                 }
             }

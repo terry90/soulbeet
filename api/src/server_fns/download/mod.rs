@@ -1,6 +1,7 @@
 use dioxus::fullstack::{WebSocketOptions, Websocket};
 use dioxus::prelude::*;
-use shared::slskd::{DownloadResponse, FileEntry, TrackResult};
+use serde::{Deserialize, Serialize};
+use shared::download::{DownloadProgress, DownloadableItem, QueuedDownload};
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
@@ -13,7 +14,7 @@ use crate::{server_fns::server_error, AuthSession};
 #[cfg(feature = "server")]
 use crate::globals::{
     cleanup_stale_channels, get_or_create_user_channel, register_user_task, unregister_user_task,
-    SLSKD_CLIENT, USER_CHANNELS,
+    SERVICES, USER_CHANNELS,
 };
 
 // Local modules
@@ -30,8 +31,15 @@ pub mod utils;
 use self::monitor::DownloadMonitor;
 
 #[cfg(feature = "server")]
-async fn slskd_download(tracks: Vec<TrackResult>) -> Result<Vec<DownloadResponse>, ServerFnError> {
-    SLSKD_CLIENT.download(tracks).await.map_err(server_error)
+async fn do_download(
+    items: Vec<DownloadableItem>,
+    backend_id: Option<&str>,
+) -> Result<Vec<QueuedDownload>, ServerFnError> {
+    let backend = SERVICES
+        .download(backend_id)
+        .ok_or_else(|| server_error("download backend not found"))?;
+
+    backend.download(items).await.map_err(server_error)
 }
 
 /// WebSocket endpoint for real-time download updates.
@@ -39,7 +47,7 @@ async fn slskd_download(tracks: Vec<TrackResult>) -> Result<Vec<DownloadResponse
 #[get("/api/downloads/updates", auth: AuthSession)]
 pub async fn download_updates_ws(
     options: WebSocketOptions,
-) -> Result<Websocket<(), Vec<FileEntry>>, ServerFnError> {
+) -> Result<Websocket<(), Vec<DownloadProgress>>, ServerFnError> {
     let username = auth.0.username;
 
     let rx = {
@@ -100,14 +108,19 @@ pub async fn download_updates_ws(
     }))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadRequest {
+    pub items: Vec<DownloadableItem>,
+    pub target_folder: String,
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
 #[post("/api/downloads/queue", auth: AuthSession)]
-pub async fn download(
-    tracks: Vec<TrackResult>,
-    target_folder: String,
-) -> Result<Vec<DownloadResponse>, ServerFnError> {
+pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, ServerFnError> {
     let username = auth.0.username;
 
-    let target_path_buf = std::path::Path::new(&target_folder).to_path_buf();
+    let target_path_buf = std::path::Path::new(&req.target_folder).to_path_buf();
     if let Err(e) = tokio::fs::create_dir_all(&target_path_buf).await {
         return Err(server_error(format!(
             "Failed to create target directory: {}",
@@ -115,7 +128,7 @@ pub async fn download(
         )));
     }
 
-    let res = slskd_download(tracks).await?;
+    let res = do_download(req.items, req.backend.as_deref()).await?;
 
     let (failed, successful): (Vec<_>, Vec<_>) =
         res.iter().cloned().partition(|d| d.error.is_some());
@@ -123,11 +136,14 @@ pub async fn download(
     let (tx, _) = get_or_create_user_channel(&username).await;
 
     if !failed.is_empty() {
-        let failed_entries: Vec<FileEntry> = failed.iter().map(FileEntry::errored).collect();
+        let failed_entries: Vec<DownloadProgress> = failed
+            .iter()
+            .map(|d| DownloadProgress::failed(d.id.clone(), d.source.clone(), d.item.clone(), d.error.clone().unwrap_or_default()))
+            .collect();
         let _ = tx.send(failed_entries);
     }
 
-    let download_filenames: Vec<String> = successful.iter().map(|d| d.filename.clone()).collect();
+    let download_filenames: Vec<String> = successful.iter().map(|d| d.item.clone()).collect();
     let target_path = target_path_buf;
 
     if download_filenames.is_empty() {
@@ -135,7 +151,10 @@ pub async fn download(
     }
 
     // Send initial "Queued" state immediately so UI shows the downloads right away
-    let queued_entries: Vec<FileEntry> = successful.iter().map(FileEntry::queued).collect();
+    let queued_entries: Vec<DownloadProgress> = successful
+        .iter()
+        .map(|d| DownloadProgress::queued(d.id.clone(), d.source.clone(), d.item.clone(), d.size))
+        .collect();
     let _ = tx.send(queued_entries);
 
     info!("Started monitoring downloads: {:?}", download_filenames);

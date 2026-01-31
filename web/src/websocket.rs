@@ -1,3 +1,7 @@
+//! Resilient WebSocket client with automatic reconnection.
+//!
+//! This module is only compiled when the `web` feature is enabled (browser environment).
+
 use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
@@ -42,7 +46,6 @@ where
     C: Fn() -> Fut + 'static,
     Fut: Future<Output = Result<dioxus::fullstack::Websocket<(), T>, ServerFnError>> + 'static,
 {
-    #[cfg(feature = "web")]
     use_resilient_websocket_with_config(connect, on_message, ReconnectConfig::default())
 }
 
@@ -50,8 +53,7 @@ pub fn use_resilient_websocket_with_config<T, F, Fut, C>(
     connect: C,
     on_message: F,
     config: ReconnectConfig,
-)
-where
+) where
     T: DeserializeOwned + 'static,
     F: FnMut(T) + 'static,
     C: Fn() -> Fut + 'static,

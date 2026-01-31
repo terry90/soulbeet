@@ -4,7 +4,7 @@
 //! handles per-track timeouts, and triggers processing when downloads complete.
 
 use dioxus::logger::tracing::{debug, info, warn};
-use shared::slskd::{DownloadState, FileEntry};
+use shared::download::{DownloadProgress, DownloadState};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::process::process_downloads;
 use crate::config::CONFIG;
-use crate::globals::SLSKD_CLIENT;
+use crate::globals::SERVICES;
 
 /// Poll interval for checking download status (2 seconds).
 const POLL_INTERVAL_SECS: u64 = 2;
@@ -40,7 +40,7 @@ pub struct DownloadMonitor {
     /// Target directory for imports.
     target_path: PathBuf,
     /// Broadcast sender for UI updates.
-    tx: broadcast::Sender<Vec<FileEntry>>,
+    tx: broadcast::Sender<Vec<DownloadProgress>>,
     /// Per-track state tracking.
     track_states: HashMap<String, TrackState>,
     /// Whether album mode is enabled.
@@ -56,7 +56,7 @@ impl DownloadMonitor {
     pub fn new(
         filenames: Vec<String>,
         target_path: PathBuf,
-        tx: broadcast::Sender<Vec<FileEntry>>,
+        tx: broadcast::Sender<Vec<DownloadProgress>>,
         cancellation_token: CancellationToken,
         username: String,
     ) -> Self {
@@ -104,7 +104,11 @@ impl DownloadMonitor {
 
             poll_count += 1;
 
-            match SLSKD_CLIENT.get_all_downloads().await {
+            let Some(backend) = SERVICES.download(None) else {
+                warn!("No download backend available for monitoring");
+                break;
+            };
+            match backend.get_downloads().await {
                 Ok(downloads) => {
                     let should_break = self
                         .process_poll_result(downloads, &mut consecutive_empty, poll_count)
@@ -132,14 +136,14 @@ impl DownloadMonitor {
     /// Returns true if monitoring should stop.
     async fn process_poll_result(
         &mut self,
-        downloads: Vec<FileEntry>,
+        downloads: Vec<DownloadProgress>,
         consecutive_empty: &mut usize,
         poll_count: u32,
     ) -> bool {
         // Debug logging for first few polls
         if poll_count <= 3 {
             debug!("Looking for filenames: {:?}", self.filenames);
-            let slskd_filenames: Vec<_> = downloads.iter().map(|f| &f.filename).collect();
+            let slskd_filenames: Vec<_> = downloads.iter().map(|f| &f.item).collect();
             debug!(
                 "slskd returned {} downloads: {:?}",
                 downloads.len(),
@@ -198,11 +202,11 @@ impl DownloadMonitor {
     }
 
     /// Find downloads matching our tracked filenames.
-    fn find_matching_downloads(&self, downloads: &[FileEntry]) -> Vec<FileEntry> {
+    fn find_matching_downloads(&self, downloads: &[DownloadProgress]) -> Vec<DownloadProgress> {
         let mut matched = Vec::new();
         for download in downloads {
             for target in &self.filenames {
-                if filenames_match(&download.filename, target) {
+                if filenames_match(&download.item, target) {
                     matched.push(download.clone());
                     break;
                 }
@@ -212,12 +216,12 @@ impl DownloadMonitor {
     }
 
     /// Log any unmatched files for debugging.
-    fn log_unmatched_files(&self, downloads: &[FileEntry], batch_status: &[FileEntry]) {
+    fn log_unmatched_files(&self, downloads: &[DownloadProgress], batch_status: &[DownloadProgress]) {
         if batch_status.len() < self.filenames.len() {
             for target in &self.filenames {
                 let found = downloads
                     .iter()
-                    .any(|d| filenames_match(&d.filename, target));
+                    .any(|d| filenames_match(&d.item, target));
                 if !found {
                     debug!("Unmatched file: {}", target);
                 }
@@ -226,7 +230,7 @@ impl DownloadMonitor {
     }
 
     /// Send status update to UI via broadcast channel.
-    fn send_status_update(&self, batch_status: &[FileEntry]) {
+    fn send_status_update(&self, batch_status: &[DownloadProgress]) {
         if let Err(e) = self.tx.send(batch_status.to_vec()) {
             if self.tx.receiver_count() == 0 {
                 info!("No receivers for download updates, but continuing monitoring");
@@ -237,12 +241,12 @@ impl DownloadMonitor {
     }
 
     /// Process each track, handling timeouts and completions.
-    async fn process_tracks(&mut self, batch_status: &[FileEntry]) {
+    async fn process_tracks(&mut self, batch_status: &[DownloadProgress]) {
         for download in batch_status {
             let matching_key = self
                 .track_states
                 .keys()
-                .find(|k| filenames_match(k, &download.filename))
+                .find(|k| filenames_match(k, &download.item))
                 .cloned();
 
             if let Some(key) = matching_key {
@@ -262,19 +266,24 @@ impl DownloadMonitor {
                         warn!(
                             "Track timed out after {} minutes: {}",
                             first_seen.elapsed().as_secs() / 60,
-                            download.filename
+                            download.item
                         );
-                        let _ = self.tx.send(vec![download.as_timeout()]);
+                        let timeout_entry = DownloadProgress {
+                            state: DownloadState::Failed("Download timed out after 1 hour".into()),
+                            error: Some("Per-track timeout".into()),
+                            ..download.clone()
+                        };
+                        let _ = self.tx.send(vec![timeout_entry]);
                         self.track_states.get_mut(&key).unwrap().processed = true;
                         continue;
                     }
                 }
 
                 // Singleton mode: process completed tracks immediately
-                if !self.album_mode && is_downloaded(&download.state) {
+                if !self.album_mode && is_completed(&download.state) {
                     info!(
                         "Track completed, processing immediately (singleton mode): {}",
-                        download.filename
+                        download.item
                     );
                     self.track_states.get_mut(&key).unwrap().processed = true;
                     let dl = download.clone();
@@ -286,7 +295,7 @@ impl DownloadMonitor {
                 }
 
                 // Mark terminal states (errored/cancelled/aborted) as processed
-                if is_terminal_state(&download.state) && !is_downloaded(&download.state) {
+                if is_terminal_state(&download.state) && !is_completed(&download.state) {
                     self.track_states.get_mut(&key).unwrap().processed = true;
                 }
             }
@@ -294,12 +303,12 @@ impl DownloadMonitor {
     }
 
     /// Check if all downloads are complete. Returns true if monitoring should stop.
-    async fn check_completion(&mut self, batch_status: &[FileEntry]) -> bool {
+    async fn check_completion(&mut self, batch_status: &[DownloadProgress]) -> bool {
         let all_processed = self.track_states.values().all(|s| s.processed);
         let all_terminal = self.filenames.iter().all(|fname| {
             batch_status
                 .iter()
-                .find(|d| filenames_match(&d.filename, fname))
+                .find(|d| filenames_match(&d.item, fname))
                 .map(|d| is_terminal_state(&d.state))
                 .unwrap_or(false)
         });
@@ -316,15 +325,15 @@ impl DownloadMonitor {
     }
 
     /// Process all successful downloads together in album mode.
-    async fn process_album_mode(&mut self, batch_status: &[FileEntry]) {
+    async fn process_album_mode(&mut self, batch_status: &[DownloadProgress]) {
         let successful: Vec<_> = batch_status
             .iter()
             .filter(|d| {
-                is_downloaded(&d.state)
+                is_completed(&d.state)
                     && self
                         .track_states
                         .keys()
-                        .find(|k| filenames_match(k, &d.filename))
+                        .find(|k| filenames_match(k, &d.item))
                         .and_then(|k| self.track_states.get(k))
                         .map(|s| !s.processed)
                         .unwrap_or(false)
@@ -345,21 +354,20 @@ impl DownloadMonitor {
 }
 
 /// Check if a download state indicates a terminal state (complete or failed).
-fn is_terminal_state(state: &[DownloadState]) -> bool {
-    state.iter().any(|s| {
-        matches!(
-            s,
-            DownloadState::Downloaded
-                | DownloadState::Aborted
-                | DownloadState::Cancelled
-                | DownloadState::Errored
-        )
-    })
+fn is_terminal_state(state: &DownloadState) -> bool {
+    matches!(
+        state,
+        DownloadState::Completed
+            | DownloadState::Imported
+            | DownloadState::ImportSkipped
+            | DownloadState::Failed(_)
+            | DownloadState::Cancelled
+    )
 }
 
 /// Check if a download state indicates successful download.
-fn is_downloaded(state: &[DownloadState]) -> bool {
-    state.iter().any(|s| matches!(s, DownloadState::Downloaded))
+fn is_completed(state: &DownloadState) -> bool {
+    matches!(state, DownloadState::Completed)
 }
 
 /// Normalize a filename for comparison purposes.

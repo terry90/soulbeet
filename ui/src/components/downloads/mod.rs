@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use dioxus::prelude::*;
-use shared::slskd::{DownloadState, FileEntry};
+use shared::download::{DownloadProgress, DownloadState};
 
 mod item;
 use item::DownloadItem;
@@ -9,36 +9,28 @@ use item::DownloadItem;
 #[derive(Props, Clone, PartialEq)]
 pub struct DownloadsProps {
     pub is_open: Signal<bool>,
-    pub downloads: Signal<HashMap<String, FileEntry>>,
+    pub downloads: Signal<HashMap<String, DownloadProgress>>,
 }
 
 #[component]
 pub fn Downloads(mut props: DownloadsProps) -> Element {
-    let mut active_downloads: Vec<FileEntry> = props.downloads.read().values().cloned().collect();
+    let mut active_downloads: Vec<DownloadProgress> = props.downloads.read().values().cloned().collect();
     active_downloads.sort_by(|a, b| {
-        let a_state = a.state.first().cloned().unwrap_or(DownloadState::Unknown("".into()));
-        let b_state = b.state.first().cloned().unwrap_or(DownloadState::Unknown("".into()));
-        a_state
-            .partial_cmp(&b_state)
+        a.state
+            .partial_cmp(&b.state)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.enqueued_at.cmp(&a.enqueued_at))
     });
 
     // Count specific states for the header summary
     let processing_count = active_downloads
         .iter()
         .filter(|f| {
-            let state = f
-                .state
-                .first()
-                .cloned()
-                .unwrap_or(DownloadState::Unknown("".into()));
             matches!(
-                state,
+                f.state,
                 DownloadState::Queued
                     | DownloadState::InProgress
                     | DownloadState::Importing
-                    | DownloadState::Downloaded // Still needs to be imported
+                    | DownloadState::Completed // Still needs to be imported
             )
         })
         .count();
@@ -46,17 +38,10 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
     let errored_count = active_downloads
         .iter()
         .filter(|f| {
-            let state = f
-                .state
-                .first()
-                .cloned()
-                .unwrap_or(DownloadState::Unknown("".into()));
             matches!(
-                state,
-                DownloadState::Errored
-                    | DownloadState::Aborted
+                f.state,
+                DownloadState::Failed(_)
                     | DownloadState::Cancelled
-                    | DownloadState::ImportFailed
             )
         })
         .count();
@@ -64,18 +49,12 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
     let clear_finished = move |_| {
         let mut map = props.downloads.write();
         map.retain(|_, file| {
-            let state = file
-                .state
-                .first()
-                .cloned()
-                .unwrap_or(DownloadState::Unknown("Unknown".into()));
-
             matches!(
-                state,
+                file.state,
                 DownloadState::Queued
                     | DownloadState::InProgress
                     | DownloadState::Importing
-                    | DownloadState::Downloaded // Downloads that are completed but not yet imported
+                    | DownloadState::Completed // Downloads that are completed but not yet imported
             )
         });
     };

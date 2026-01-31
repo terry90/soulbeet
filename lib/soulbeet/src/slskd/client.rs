@@ -13,10 +13,7 @@ use shared::{
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration as StdDuration,
 };
 use tokio::sync::Mutex;
@@ -33,20 +30,29 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u64 = 5;
 const CIRCUIT_BREAKER_RESET_TIMEOUT_SECS: u64 = 60;
 
-/// Circuit breaker state for protecting against cascading failures
+/// Circuit breaker state for protecting against cascading failures.
+///
+/// Uses a single mutex to ensure atomic state transitions and prevent race conditions.
 #[derive(Debug)]
 pub struct CircuitBreaker {
-    failure_count: AtomicU64,
-    last_failure_time: Mutex<Option<DateTime<Utc>>>,
+    state: Mutex<CircuitBreakerState>,
     failure_threshold: u64,
     reset_timeout: Duration,
+}
+
+#[derive(Debug)]
+struct CircuitBreakerState {
+    failure_count: u64,
+    last_failure_time: Option<DateTime<Utc>>,
 }
 
 impl Default for CircuitBreaker {
     fn default() -> Self {
         Self {
-            failure_count: AtomicU64::new(0),
-            last_failure_time: Mutex::new(None),
+            state: Mutex::new(CircuitBreakerState {
+                failure_count: 0,
+                last_failure_time: None,
+            }),
             failure_threshold: CIRCUIT_BREAKER_FAILURE_THRESHOLD,
             reset_timeout: Duration::seconds(CIRCUIT_BREAKER_RESET_TIMEOUT_SECS as i64),
         }
@@ -54,20 +60,20 @@ impl Default for CircuitBreaker {
 }
 
 impl CircuitBreaker {
-    /// Check if the circuit breaker is open (blocking requests)
+    /// Check if the circuit breaker is open (blocking requests).
+    ///
+    /// If the reset timeout has passed, atomically resets the breaker and returns false.
     pub async fn is_open(&self) -> bool {
-        let failures = self.failure_count.load(Ordering::Relaxed);
-        if failures < self.failure_threshold {
+        let mut state = self.state.lock().await;
+
+        if state.failure_count < self.failure_threshold {
             return false;
         }
 
-        // Check if reset timeout has passed
-        let last_failure = self.last_failure_time.lock().await;
-        if let Some(last_time) = *last_failure {
+        if let Some(last_time) = state.last_failure_time {
             if Utc::now() - last_time > self.reset_timeout {
-                // Reset the circuit breaker
-                drop(last_failure);
-                self.reset().await;
+                state.failure_count = 0;
+                state.last_failure_time = None;
                 return false;
             }
         }
@@ -76,27 +82,20 @@ impl CircuitBreaker {
     }
 
     /// Record a successful request
-    pub fn record_success(&self) {
-        self.failure_count.store(0, Ordering::Relaxed);
+    pub async fn record_success(&self) {
+        let mut state = self.state.lock().await;
+        state.failure_count = 0;
     }
 
     /// Record a failed request
     pub async fn record_failure(&self) {
-        self.failure_count.fetch_add(1, Ordering::Relaxed);
-        let mut last_failure = self.last_failure_time.lock().await;
-        *last_failure = Some(Utc::now());
+        let mut state = self.state.lock().await;
+        state.failure_count += 1;
+        state.last_failure_time = Some(Utc::now());
     }
 
-    /// Reset the circuit breaker
-    pub async fn reset(&self) {
-        self.failure_count.store(0, Ordering::Relaxed);
-        let mut last_failure = self.last_failure_time.lock().await;
-        *last_failure = None;
-    }
-
-    /// Get current failure count
-    pub fn failure_count(&self) -> u64 {
-        self.failure_count.load(Ordering::Relaxed)
+    pub async fn failure_count(&self) -> u64 {
+        self.state.lock().await.failure_count
     }
 }
 
@@ -230,7 +229,7 @@ impl SoulseekClient {
         if self.circuit_breaker.is_open().await {
             warn!(
                 "Circuit breaker is open ({} consecutive failures), rejecting request to {}",
-                self.circuit_breaker.failure_count(),
+                self.circuit_breaker.failure_count().await,
                 endpoint
             );
             return Err(SoulseekError::Api {
@@ -251,7 +250,7 @@ impl SoulseekClient {
 
         let response = match request.send().await {
             Ok(resp) => {
-                self.circuit_breaker.record_success();
+                self.circuit_breaker.record_success().await;
                 resp
             }
             Err(e) => {
@@ -950,5 +949,51 @@ impl SoulseekClient {
         self.make_request::<serde_json::Value, ()>(Method::GET, "session", None)
             .await
             .is_ok()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::DownloadBackend for SoulseekClient {
+    fn id(&self) -> &'static str {
+        "soulseek"
+    }
+
+    fn name(&self) -> &'static str {
+        "Soulseek"
+    }
+
+    async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String> {
+        let timeout = Duration::seconds(120);
+        self.start_search(album.cloned(), tracks.to_vec(), timeout)
+            .await
+    }
+
+    async fn poll_search(&self, search_id: &str) -> Result<shared::download::SearchResult> {
+        let (results, has_more, state) = self.poll_search(search_id.to_string()).await?;
+        Ok(shared::download::SearchResult {
+            search_id: search_id.to_string(),
+            groups: results.into_iter().map(Into::into).collect(),
+            has_more,
+            state: state.into(),
+        })
+    }
+
+    async fn download(&self, items: Vec<shared::download::DownloadableItem>) -> Result<Vec<shared::download::QueuedDownload>> {
+        let tracks: Vec<TrackResult> = items
+            .into_iter()
+            .filter_map(|item| item.to_slskd_track())
+            .collect();
+
+        let responses = self.download(tracks).await?;
+        Ok(responses.into_iter().map(Into::into).collect())
+    }
+
+    async fn get_downloads(&self) -> Result<Vec<shared::download::DownloadProgress>> {
+        let entries = self.get_all_downloads().await?;
+        Ok(entries.into_iter().map(Into::into).collect())
+    }
+
+    async fn health_check(&self) -> bool {
+        self.check_connection().await
     }
 }

@@ -1,8 +1,11 @@
 use auth::{use_auth, AuthProvider};
-use dioxus::fullstack::WebSocketOptions;
 use dioxus::prelude::*;
-use shared::slskd::FileEntry;
+use shared::download::DownloadProgress;
 use std::collections::HashMap;
+
+#[cfg(feature = "web")]
+use dioxus::fullstack::WebSocketOptions;
+#[cfg(feature = "web")]
 use websocket::use_resilient_websocket;
 
 use ui::{Downloads, Layout, Navbar, SearchReset};
@@ -10,6 +13,7 @@ use views::{LoginPage, SearchPage, SettingsPage};
 
 mod auth;
 mod views;
+#[cfg(feature = "web")]
 mod websocket;
 
 #[derive(Debug, Clone, Routable, PartialEq)]
@@ -33,6 +37,9 @@ fn main() {
     #[cfg(feature = "server")]
     {
         use tower_cookies::CookieManagerLayer;
+
+        // Start background cleanup task for user channels
+        api::globals::start_channel_cleanup_task();
 
         dioxus::serve(|| async move {
             Ok(dioxus::server::router(App).layer(CookieManagerLayer::new()))
@@ -85,16 +92,18 @@ fn WebNavbar() -> Element {
     let mut auth = use_auth();
     let mut downloads_open = use_signal(|| false);
     let mut search_reset = use_signal(|| 0);
-    let mut downloads = use_signal::<HashMap<String, FileEntry>>(HashMap::new);
+    #[allow(unused_mut)] // mutated in websocket callback (web feature only)
+    let mut downloads = use_signal::<HashMap<String, DownloadProgress>>(HashMap::new);
 
     use_context_provider(|| SearchReset(search_reset));
 
+    #[cfg(feature = "web")]
     use_resilient_websocket(
         || api::download_updates_ws(WebSocketOptions::new()),
-        move |data: Vec<FileEntry>| {
+        move |data: Vec<DownloadProgress>| {
             let mut map = downloads.write();
             for file in data {
-                map.insert(file.filename.clone(), file);
+                map.insert(file.item.clone(), file);
             }
         },
     );
