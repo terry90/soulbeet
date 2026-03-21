@@ -10,6 +10,16 @@ pub async fn get_users() -> Result<Vec<models::user::User>, ServerFnError> {
     models::user::User::get_all().await.map_err(server_error)
 }
 
+#[post("/api/users/username", auth: AuthSession)]
+pub async fn update_username(new_username: String) -> Result<(), ServerFnError> {
+    if new_username.trim().is_empty() {
+        return Err(server_error("Username cannot be empty"));
+    }
+    models::user::User::update_username(&auth.0.sub, new_username.trim())
+        .await
+        .map_err(server_error)
+}
+
 #[post("/api/users/password", _: AuthSession)]
 pub async fn update_user_password(user_id: String, password: String) -> Result<(), ServerFnError> {
     models::user::User::update_password(&user_id, &password)

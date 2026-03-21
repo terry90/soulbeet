@@ -107,6 +107,16 @@ impl User {
         Ok(())
     }
 
+    pub async fn update_username(id: &str, new_username: &str) -> Result<(), String> {
+        sqlx::query("UPDATE users SET username = ? WHERE id = ?")
+            .bind(new_username)
+            .bind(id)
+            .execute(&*DB)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub async fn delete(id: &str) -> Result<(), String> {
         sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(id)

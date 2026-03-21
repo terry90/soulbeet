@@ -1,7 +1,13 @@
-use api::{delete_user, get_users, register, update_user_password};
+use api::{delete_user, get_users, register, update_user_password, update_username};
 use dioxus::prelude::*;
 
 use crate::auth::use_auth;
+
+#[derive(Clone, PartialEq)]
+enum EditMode {
+    Password,
+    Username,
+}
 
 #[component]
 pub fn UserManager() -> Element {
@@ -10,7 +16,9 @@ pub fn UserManager() -> Element {
     let mut users = use_signal(Vec::new);
 
     let mut editing_user_id = use_signal(|| None::<String>);
+    let mut edit_mode = use_signal(|| EditMode::Password);
     let mut edit_user_password = use_signal(|| "".to_string());
+    let mut edit_user_username = use_signal(|| "".to_string());
 
     let mut error = use_signal(|| "".to_string());
     let mut success_msg = use_signal(|| "".to_string());
@@ -57,7 +65,7 @@ pub fn UserManager() -> Element {
         }
     };
 
-    let handle_update_user = move |id: String| async move {
+    let handle_update_password = move |id: String| async move {
         if edit_user_password().is_empty() {
             error.set("Password cannot be empty".to_string());
             return;
@@ -67,12 +75,31 @@ pub fn UserManager() -> Element {
             .await
         {
             Ok(_) => {
-                success_msg.set("User updated successfully".to_string());
+                success_msg.set("Password updated".to_string());
                 editing_user_id.set(None);
                 edit_user_password.set("".to_string());
                 fetch_users().await;
             }
-            Err(e) => error.set(format!("Failed to update user: {e}")),
+            Err(e) => error.set(format!("Failed to update password: {e}")),
+        }
+    };
+
+    let handle_update_username = move |_id: String| async move {
+        if edit_user_username().trim().is_empty() {
+            error.set("Username cannot be empty".to_string());
+            return;
+        }
+        match auth
+            .call(update_username(edit_user_username()))
+            .await
+        {
+            Ok(_) => {
+                success_msg.set("Username updated".to_string());
+                editing_user_id.set(None);
+                edit_user_username.set("".to_string());
+                fetch_users().await;
+            }
+            Err(e) => error.set(format!("Failed to update username: {e}")),
         }
     };
 
@@ -141,48 +168,82 @@ pub fn UserManager() -> Element {
                     .clone()
                     .into_iter()
                     .map(|user| {
-                        let id_update = user.id.clone();
-                        let id_edit = user.id.clone();
+                        let id_pw = user.id.clone();
+                        let id_un = user.id.clone();
+                        let id_edit_pw = user.id.clone();
+                        let id_edit_un = user.id.clone();
                         let id_delete = user.id.clone();
                         rsx! {
                           li { class: "bg-white/5 border border-white/5 p-3 rounded hover:border-beet-accent/30 transition-colors",
                             if editing_user_id() == Some(user.id.clone()) {
                               div { class: "flex flex-col gap-2",
                                 div { class: "font-bold text-white font-display", "{user.username}" }
-                                input {
-                                  class: "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
-                                  value: "{edit_user_password}",
-                                  oninput: move |e| edit_user_password.set(e.value()),
-                                  placeholder: "New Password",
-                                  "type": "password",
-                                }
-                                div { class: "flex gap-2 mt-2",
-                                  button {
-                                    class: "text-xs uppercase tracking-wider font-bold text-beet-leaf hover:text-white transition-colors",
-                                    onclick: move |_| handle_update_user(id_update.clone()),
-                                    "[ Save ]"
+                                if edit_mode() == EditMode::Password {
+                                  input {
+                                    class: "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
+                                    value: "{edit_user_password}",
+                                    oninput: move |e| edit_user_password.set(e.value()),
+                                    placeholder: "New password",
+                                    "type": "password",
                                   }
-                                  button {
-                                    class: "text-xs uppercase tracking-wider font-bold text-gray-500 hover:text-white transition-colors",
-                                    onclick: move |_| editing_user_id.set(None),
-                                    "[ Cancel ]"
+                                  div { class: "flex gap-2 mt-1",
+                                    button {
+                                      class: "text-xs uppercase tracking-wider font-bold text-beet-leaf hover:text-white transition-colors cursor-pointer",
+                                      onclick: move |_| handle_update_password(id_pw.clone()),
+                                      "[ Save ]"
+                                    }
+                                    button {
+                                      class: "text-xs uppercase tracking-wider font-bold text-gray-500 hover:text-white transition-colors cursor-pointer",
+                                      onclick: move |_| editing_user_id.set(None),
+                                      "[ Cancel ]"
+                                    }
+                                  }
+                                } else {
+                                  input {
+                                    class: "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
+                                    value: "{edit_user_username}",
+                                    oninput: move |e| edit_user_username.set(e.value()),
+                                    placeholder: "New username",
+                                    "type": "text",
+                                  }
+                                  div { class: "flex gap-2 mt-1",
+                                    button {
+                                      class: "text-xs uppercase tracking-wider font-bold text-beet-leaf hover:text-white transition-colors cursor-pointer",
+                                      onclick: move |_| handle_update_username(id_un.clone()),
+                                      "[ Save ]"
+                                    }
+                                    button {
+                                      class: "text-xs uppercase tracking-wider font-bold text-gray-500 hover:text-white transition-colors cursor-pointer",
+                                      onclick: move |_| editing_user_id.set(None),
+                                      "[ Cancel ]"
+                                    }
                                   }
                                 }
                               }
                             } else {
-                              div { class: "flex justify-between items-center",
+                              div { class: "flex justify-between items-center flex-wrap gap-2",
                                 span { class: "font-bold text-white font-display", "{user.username}" }
                                 div { class: "flex gap-3",
                                   button {
-                                    class: "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted",
+                                    class: "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer",
                                     onclick: move |_| {
-                                        editing_user_id.set(Some(id_edit.clone()));
-                                        edit_user_password.set("".to_string());
+                                        editing_user_id.set(Some(id_edit_un.clone()));
+                                        edit_mode.set(EditMode::Username);
+                                        edit_user_username.set("".to_string());
                                     },
-                                    "Change Password"
+                                    "Rename"
                                   }
                                   button {
-                                    class: "text-xs font-mono text-gray-400 hover:text-red-400 transition-colors underline decoration-dotted",
+                                    class: "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer",
+                                    onclick: move |_| {
+                                        editing_user_id.set(Some(id_edit_pw.clone()));
+                                        edit_mode.set(EditMode::Password);
+                                        edit_user_password.set("".to_string());
+                                    },
+                                    "Password"
+                                  }
+                                  button {
+                                    class: "text-xs font-mono text-gray-400 hover:text-red-400 transition-colors underline decoration-dotted cursor-pointer",
                                     onclick: move |_| handle_delete_user(id_delete.clone()),
                                     "Delete"
                                   }
