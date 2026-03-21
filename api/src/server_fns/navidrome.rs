@@ -134,45 +134,56 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
 
         // Check discovery track promotion/removal
         if let Some(user_rating) = song.user_rating {
-            // Find matching discovery track by song_id or path
+            // Match by song_id first (exact), then by filename (fuzzy).
+            // song_id is authoritative when set by reconciliation.
             let matching_track = pending_discovery_tracks.iter().find(|dt| {
-                dt.song_id.as_deref() == Some(&song.id)
-                    || song
-                        .path
-                        .as_ref()
-                        .map(|p| p.ends_with(&dt.path) || dt.path.ends_with(p))
-                        .unwrap_or(false)
+                if let Some(ref dt_song_id) = dt.song_id {
+                    return dt_song_id == &song.id;
+                }
+                // Fallback: match by filename when song_id isn't set yet
+                if let Some(ref song_path) = song.path {
+                    let song_fn = std::path::Path::new(song_path)
+                        .file_name()
+                        .map(|f| f.to_ascii_lowercase());
+                    let dt_fn = std::path::Path::new(&dt.path)
+                        .file_name()
+                        .map(|f| f.to_ascii_lowercase());
+                    return song_fn.is_some() && song_fn == dt_fn;
+                }
+                false
             });
 
             if let Some(track) = matching_track {
                 if user_rating >= promote_threshold {
-                    // Promote: move file from Discovery/ to parent folder
                     if let Err(e) = promote_discovery_track_internal(&track.id).await {
                         warn!("Failed to promote track {}: {}", track.title, e);
                     } else {
-                        DiscoveryHistoryRow::update_outcome(
+                        info!("Promoted discovery track: {} - {} (rating {})", track.artist, track.title, user_rating);
+                        if let Err(e) = DiscoveryHistoryRow::update_outcome(
                             user_id,
                             &track.artist,
                             &track.title,
                             "promoted",
                         )
-                        .await
-                        .ok();
+                        .await {
+                            warn!("Failed to update history for promoted track '{}': {}", track.title, e);
+                        }
                         promoted_tracks += 1;
                     }
                 } else if user_rating == 1 {
-                    // Remove: delete the file
                     if let Err(e) = remove_discovery_track_internal(&track.id).await {
                         warn!("Failed to remove track {}: {}", track.title, e);
                     } else {
-                        DiscoveryHistoryRow::update_outcome(
+                        info!("Removed discovery track: {} - {} (rating 1)", track.artist, track.title);
+                        if let Err(e) = DiscoveryHistoryRow::update_outcome(
                             user_id,
                             &track.artist,
                             &track.title,
                             "removed",
                         )
-                        .await
-                        .ok();
+                        .await {
+                            warn!("Failed to update history for removed track '{}': {}", track.title, e);
+                        }
                         removed_tracks += 1;
                     }
                 }

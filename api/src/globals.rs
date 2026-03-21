@@ -286,15 +286,21 @@ async fn run_automation() {
                             for track in pending {
                                 let path = std::path::Path::new(&track.path);
                                 if path.exists() {
-                                    let _ = tokio::fs::remove_file(path).await;
+                                    if let Err(e) = tokio::fs::remove_file(path).await {
+                                        info!("Automation: failed to delete expired track file {}: {}", track.path, e);
+                                    }
                                 }
-                                let _ = crate::models::discovery_playlist::DiscoveryTrackRow::update_status(
+                                if let Err(e) = crate::models::discovery_playlist::DiscoveryTrackRow::update_status(
                                     &track.id,
                                     &shared::navidrome::DiscoveryStatus::Removed,
-                                ).await;
-                                crate::models::discovery_history::DiscoveryHistoryRow::update_outcome(
+                                ).await {
+                                    info!("Automation: failed to update status for expired track {}: {}", track.title, e);
+                                }
+                                if let Err(e) = crate::models::discovery_history::DiscoveryHistoryRow::update_outcome(
                                     user_id, &track.artist, &track.title, "expired"
-                                ).await.ok();
+                                ).await {
+                                    info!("Automation: failed to update history for expired track {}: {}", track.title, e);
+                                }
                             }
                         }
                         Err(e) => info!("Automation: failed to clean up pending tracks for user {}: {}", user_id, e),

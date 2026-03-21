@@ -83,9 +83,10 @@ impl DiscoveryTrackRow {
 
     pub async fn get_pending_by_folder(folder_id: &str) -> Result<Vec<DiscoveryTrack>, String> {
         let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
-            "SELECT * FROM discovery_tracks WHERE folder_id = ? AND status = 'Pending' ORDER BY created_at"
+            "SELECT * FROM discovery_tracks WHERE folder_id = ? AND status = ? ORDER BY created_at",
         )
         .bind(folder_id)
+        .bind(DiscoveryStatus::Pending.to_string())
         .fetch_all(&*DB)
         .await
         .map_err(|e| e.to_string())?;
@@ -97,10 +98,11 @@ impl DiscoveryTrackRow {
         profile: &str,
     ) -> Result<Vec<DiscoveryTrack>, String> {
         let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
-            "SELECT * FROM discovery_tracks WHERE folder_id = ? AND profile = ? AND status = 'Pending' ORDER BY created_at"
+            "SELECT * FROM discovery_tracks WHERE folder_id = ? AND profile = ? AND status = ? ORDER BY created_at",
         )
         .bind(folder_id)
         .bind(profile)
+        .bind(DiscoveryStatus::Pending.to_string())
         .fetch_all(&*DB)
         .await
         .map_err(|e| e.to_string())?;
@@ -168,8 +170,9 @@ impl DiscoveryTrackRow {
 
     pub async fn get_all_pending() -> Result<Vec<DiscoveryTrack>, String> {
         let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
-            "SELECT * FROM discovery_tracks WHERE status = 'Pending'",
+            "SELECT * FROM discovery_tracks WHERE status = ?",
         )
+        .bind(DiscoveryStatus::Pending.to_string())
         .fetch_all(&*DB)
         .await
         .map_err(|e| e.to_string())?;

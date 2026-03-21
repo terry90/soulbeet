@@ -123,9 +123,9 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
         .await
         .map_err(server_error)?;
 
-    DiscoveryHistoryRow::update_outcome(&auth.0.sub, &track.artist, &track.title, "promoted")
-        .await
-        .ok();
+    if let Err(e) = DiscoveryHistoryRow::update_outcome(&auth.0.sub, &track.artist, &track.title, "promoted").await {
+        warn!("Failed to update history for promoted track '{}': {}", track.title, e);
+    }
 
     info!("Promoted: {} -> {}", track.title, dest.display());
     Ok(())
@@ -161,9 +161,9 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
         .await
         .map_err(server_error)?;
 
-    DiscoveryHistoryRow::update_outcome(&auth.0.sub, &track.artist, &track.title, "removed")
-        .await
-        .ok();
+    if let Err(e) = DiscoveryHistoryRow::update_outcome(&auth.0.sub, &track.artist, &track.title, "removed").await {
+        warn!("Failed to update history for removed track '{}': {}", track.title, e);
+    }
 
     info!("Removed discovery track: {}", track.title);
     Ok(())
@@ -305,27 +305,34 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<u32, 
 
             let search_id = match backend.start_search(None, &search_tracks).await {
                 Ok(id) => id,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!("Search failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
+                    continue;
+                }
             };
 
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             let search_result = match backend.poll_search(&search_id).await {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!("Poll failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
+                    continue;
+                }
             };
 
-            if search_result.groups.is_empty() {
+            if search_result.groups.is_empty() || search_result.groups[0].items.is_empty() {
+                info!("No results for '{}' - {}, skipping", candidate.artist, candidate.track);
                 continue;
             }
             let group = &search_result.groups[0];
-            if group.items.is_empty() {
-                continue;
-            }
 
             let item = &group.items[0];
             let download_results = match backend.download(vec![item.clone()]).await {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!("Download failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
+                    continue;
+                }
             };
 
             for dl in &download_results {
@@ -418,34 +425,40 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
 
     let mut matched = 0u32;
     for track in &unlinked {
-        // Match by filename: compare the filename portion of both paths
-        let track_filename = std::path::Path::new(&track.path)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_lowercase());
+        let track_path = std::path::Path::new(&track.path);
+        let track_suffix = path_suffix(track_path);
 
-        if let Some(ref track_fn) = track_filename {
-            for song in &songs {
-                if let Some(ref song_path) = song.path {
-                    let song_fn = std::path::Path::new(song_path)
-                        .file_name()
-                        .map(|f| f.to_string_lossy().to_lowercase());
-                    if song_fn.as_deref() == Some(track_fn.as_ref()) {
-                        DiscoveryTrackRow::update_song_id(&track.id, &song.id).await?;
-                        matched += 1;
-                        break;
-                    }
+        let mut found = false;
+        for song in &songs {
+            if let Some(ref song_path_str) = song.path {
+                let song_path = std::path::Path::new(song_path_str);
+                // Match by path suffix (parent dir + filename) for accuracy,
+                // fall back to filename-only if suffix doesn't match
+                let song_suffix = path_suffix(song_path);
+                let is_match = track_suffix == song_suffix
+                    || track_path.file_name().map(|f| f.to_ascii_lowercase())
+                        == song_path.file_name().map(|f| f.to_ascii_lowercase());
+                if is_match {
+                    DiscoveryTrackRow::update_song_id(&track.id, &song.id).await?;
+                    matched += 1;
+                    found = true;
+                    break;
                 }
             }
         }
+        if !found {
+            info!(
+                "Reconciliation: no Navidrome match for '{}' - {} ({})",
+                track.artist, track.title, track.path
+            );
+        }
     }
 
-    if matched > 0 {
-        info!(
-            "Discovery playlist reconciliation: linked {} of {} unlinked tracks",
-            matched,
-            unlinked.len()
-        );
-    }
+    info!(
+        "Discovery playlist reconciliation: linked {} of {} unlinked tracks",
+        matched,
+        unlinked.len()
+    );
 
     ensure_playlists(user_id, &settings, &folder_id, &navi).await
 }
@@ -474,22 +487,24 @@ async fn ensure_playlists(
             &profile_name,
         );
 
-        // Check if existing playlist needs updating
-        let existing_id = UserSettings::get_playlist_id_for_profile(
+        let old_id = UserSettings::get_playlist_id_for_profile(
             &settings.discovery_navidrome_playlist_id,
             &profile_name,
         );
 
-        if let Some(old_id) = &existing_id {
-            // Playlist exists, update its songs
-            let _ = navi.delete_playlist(old_id).await;
-        }
-
+        // Create new playlist first, then delete old one only on success.
+        // This avoids losing the old playlist if creation fails.
         match navi.create_playlist(&playlist_name, &song_ids).await {
             Ok(pl) => {
-                let _ =
-                    UserSettings::update_discovery_playlist_id(user_id, &profile_name, &pl.id)
-                        .await;
+                if let Err(e) = UserSettings::update_discovery_playlist_id(user_id, &profile_name, &pl.id).await {
+                    warn!("Failed to save playlist ID for '{}': {}", profile_name, e);
+                }
+                // Now safe to delete the old one
+                if let Some(ref old) = old_id {
+                    if let Err(e) = navi.delete_playlist(old).await {
+                        warn!("Failed to delete old playlist '{}': {}", old, e);
+                    }
+                }
                 info!(
                     "Created Navidrome playlist '{}' with {} tracks",
                     playlist_name,
@@ -513,6 +528,19 @@ pub async fn generate_recommendations() -> Result<u32, ServerFnError> {
     generate_recommendations_internal(&auth.0.sub)
         .await
         .map_err(server_error)
+}
+
+/// Extract the last 2 path components (parent/filename) as a lowercase string
+/// for fuzzy path matching between Navidrome and local paths.
+#[cfg(feature = "server")]
+fn path_suffix(p: &std::path::Path) -> String {
+    let components: Vec<_> = p.components().rev().take(2).collect();
+    components
+        .into_iter()
+        .rev()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(feature = "server")]
