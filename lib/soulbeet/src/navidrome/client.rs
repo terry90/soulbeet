@@ -506,4 +506,153 @@ impl NavidromeClient {
             album: vec![],
         }))
     }
+
+    // --- Navidrome Native API (for smart playlists) ---
+
+    /// Get a JWT token from Navidrome's native auth endpoint.
+    async fn native_login(&self) -> Result<String> {
+        let url = self
+            .base_url
+            .join("auth/login")
+            .map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("URL error: {}", e),
+            })?;
+
+        #[derive(serde::Serialize)]
+        struct LoginReq {
+            username: String,
+            password: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct LoginResp {
+            token: String,
+        }
+
+        let resp = self
+            .client
+            .post(url)
+            .json(&LoginReq {
+                username: self.username.clone(),
+                password: self.password.clone(),
+            })
+            .send()
+            .await
+            .map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("Native login failed: {}", e),
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(SoulseekError::Api {
+                status: resp.status().as_u16(),
+                message: "Navidrome native login failed".to_string(),
+            });
+        }
+
+        let login: LoginResp = resp.json().await.map_err(|e| SoulseekError::Api {
+            status: 0,
+            message: format!("Failed to parse login response: {}", e),
+        })?;
+        Ok(login.token)
+    }
+
+    /// Create or update a smart playlist via Navidrome's native API.
+    /// The playlist is owned by the authenticated user.
+    /// `filepath_contains` is the path filter for the smart playlist rule.
+    pub async fn create_smart_playlist(
+        &self,
+        name: &str,
+        comment: &str,
+        filepath_contains: &str,
+    ) -> Result<String> {
+        let token = self.native_login().await?;
+
+        let url = self
+            .base_url
+            .join("api/playlist")
+            .map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("URL error: {}", e),
+            })?;
+
+        let body = serde_json::json!({
+            "name": name,
+            "comment": comment,
+            "public": false,
+            "rules": {
+                "all": [
+                    { "contains": { "filepath": filepath_contains } }
+                ],
+                "sort": "-dateAdded",
+                "order": "desc"
+            }
+        });
+
+        let resp = self
+            .client
+            .post(url)
+            .header("x-nd-authorization", format!("Bearer {}", token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("Create smart playlist failed: {}", e),
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SoulseekError::Api {
+                status,
+                message: format!("Create smart playlist failed ({}): {}", status, body),
+            });
+        }
+
+        #[derive(serde::Deserialize)]
+        struct PlaylistResp {
+            id: String,
+        }
+
+        let pl: PlaylistResp = resp.json().await.map_err(|e| SoulseekError::Api {
+            status: 0,
+            message: format!("Failed to parse playlist response: {}", e),
+        })?;
+        Ok(pl.id)
+    }
+
+    /// Delete a smart playlist via Navidrome's native API.
+    pub async fn delete_smart_playlist(&self, playlist_id: &str) -> Result<()> {
+        let token = self.native_login().await?;
+
+        let url = self
+            .base_url
+            .join(&format!("api/playlist/{}", playlist_id))
+            .map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("URL error: {}", e),
+            })?;
+
+        let resp = self
+            .client
+            .delete(url)
+            .header("x-nd-authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("Delete smart playlist failed: {}", e),
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(SoulseekError::Api {
+                status,
+                message: format!("Delete smart playlist failed ({})", status),
+            });
+        }
+
+        Ok(())
+    }
 }

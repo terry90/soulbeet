@@ -592,11 +592,11 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<u32, 
     Ok(total_downloads)
 }
 
-/// Create or update Navidrome playlists for discovery tracks via the Subsonic API.
+/// Create or update smart playlists in Navidrome for each discovery profile.
 ///
-/// For each active profile, finds all pending discovery tracks that have a valid
-/// path, searches Navidrome for matching songs, and creates a user-owned playlist.
-/// Requires Navidrome to have already scanned the Discovery/ directories.
+/// Uses Navidrome's native API to create smart playlists with a filepath rule
+/// that matches the Discovery/{profile}/ directory. The playlist auto-updates
+/// as Navidrome scans new files. Owned by the authenticated user.
 #[cfg(feature = "server")]
 pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> {
     let settings = UserSettings::get(user_id).await?;
@@ -607,6 +607,9 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         Some(id) => id.clone(),
         None => return Ok(()),
     };
+    let folder = Folder::get_by_id(&folder_id)
+        .await?
+        .ok_or("Discovery folder not found")?;
 
     let navi = match crate::services::navidrome_client_for_user(user_id).await {
         Ok(c) => c,
@@ -616,68 +619,18 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         }
     };
 
-    // Wait for any ongoing scan to finish (up to 60s)
-    for _ in 0..12 {
-        match navi.get_scan_status().await {
-            Ok(true) => {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-            _ => break,
-        }
-    }
-
-    // Get all Navidrome songs to match against discovery tracks
-    let songs = navi
-        .get_all_songs_with_ratings()
-        .await
-        .map_err(|e| e.to_string())?;
-
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
-        let tracks =
-            DiscoveryTrackRow::get_pending_by_folder_and_profile(&folder_id, &profile_name)
-                .await?;
 
-        if tracks.is_empty() {
-            continue;
-        }
-
-        // Match discovery tracks to Navidrome songs by filename.
-        // The discovery track path is the actual filesystem path (set after beets import).
-        // Navidrome's path may differ (fake or different mount), so match by filename.
-        let mut song_ids = Vec::new();
-        for track in &tracks {
-            let track_fn = std::path::Path::new(&track.path)
-                .file_name()
-                .map(|f| f.to_string_lossy().to_lowercase());
-            let Some(ref tfn) = track_fn else {
-                continue;
-            };
-
-            for song in &songs {
-                if let Some(ref song_path) = song.path {
-                    let song_fn = std::path::Path::new(song_path)
-                        .file_name()
-                        .map(|f| f.to_string_lossy().to_lowercase());
-                    if song_fn.as_deref() == Some(tfn.as_ref()) {
-                        song_ids.push(song.id.clone());
-                        // Also update song_id in our DB for rating sync matching
-                        let _ = DiscoveryTrackRow::update_song_id(&track.id, &song.id).await;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if song_ids.is_empty() {
-            info!(
-                "Playlist reconciliation: no Navidrome matches for {} ({} tracks not yet scanned?)",
-                profile_name,
-                tracks.len()
-            );
-            continue;
+        // Check if we already have a playlist for this profile
+        let existing_id = UserSettings::get_playlist_id_for_profile(
+            &settings.discovery_navidrome_playlist_id,
+            &profile_name,
+        );
+        if existing_id.is_some() {
+            continue; // Smart playlist already exists, it auto-updates
         }
 
         let playlist_name = UserSettings::get_playlist_name_for_profile(
@@ -685,34 +638,34 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
             &profile_name,
         );
 
-        // Create new playlist first, then delete old one
-        match navi.create_playlist(&playlist_name, &song_ids).await {
-            Ok(pl) => {
-                // Delete old playlist if it exists
-                if let Some(old_id) = UserSettings::get_playlist_id_for_profile(
-                    &settings.discovery_navidrome_playlist_id,
-                    &profile_name,
-                ) {
-                    let _ = navi.delete_playlist(&old_id).await;
-                }
+        // The filepath rule must use the path as Navidrome sees it.
+        // If NAVIDROME_MUSIC_PATH is set, we need to reverse the prefix mapping:
+        // local /music/terry/Discovery/Balanced -> Navidrome /media/music/terry/Discovery/Balanced
+        let local_profile_path = folder.discovery_profile_path(&profile_name);
+        let profile_path = to_navidrome_path(&local_profile_path);
+        let comment = format!("Soulbeet discovery ({})", profile_name);
+
+        match navi
+            .create_smart_playlist(&playlist_name, &comment, &profile_path)
+            .await
+        {
+            Ok(playlist_id) => {
                 if let Err(e) = UserSettings::update_discovery_playlist_id(
                     user_id,
                     &profile_name,
-                    &pl.id,
+                    &playlist_id,
                 )
                 .await
                 {
                     warn!("Failed to save playlist ID for '{}': {}", profile_name, e);
                 }
                 info!(
-                    "Created playlist '{}' with {} tracks for user {}",
-                    playlist_name,
-                    song_ids.len(),
-                    user_id
+                    "Created smart playlist '{}' (path filter: {}) for user {}",
+                    playlist_name, profile_path, user_id
                 );
             }
             Err(e) => {
-                warn!("Failed to create playlist '{}': {}", playlist_name, e);
+                warn!("Failed to create smart playlist '{}': {}", playlist_name, e);
             }
         }
     }
@@ -776,6 +729,58 @@ async fn cleanup_empty_parent(dir: &std::path::Path) -> Result<(), std::io::Erro
         }
     }
     Ok(())
+}
+
+/// Convert a local filesystem path to the path as Navidrome sees it.
+/// Reverses the NAVIDROME_MUSIC_PATH prefix mapping.
+/// e.g. local /music/terry/Discovery/Balanced -> /media/music/terry/Discovery/Balanced
+#[cfg(feature = "server")]
+fn to_navidrome_path(local_path: &str) -> String {
+    let navidrome_prefix = std::env::var("NAVIDROME_MUSIC_PATH").ok().filter(|s| !s.is_empty());
+    let Some(nd_prefix) = navidrome_prefix else {
+        return local_path.to_string(); // Same mount, no mapping needed
+    };
+
+    // Find the user's folder paths to determine the local mount point.
+    // e.g. if folder is /music/terry, local mount is /music
+    // We strip /music from the local path and prepend the Navidrome prefix.
+    // local_path: /music/terry/Discovery/Balanced
+    // We need to find what local prefix to replace.
+    // The folder parent (e.g. /music) is the local mount.
+    // Since we don't have folders here, infer from the path structure:
+    // NAVIDROME_MUSIC_PATH maps to the same directory as the local mount.
+    // Just replace the first path components that differ.
+
+    // Simple approach: find the common suffix between local_path and nd_prefix.
+    // If local is /music/terry/Discovery and nd_prefix is /media/music,
+    // then /music is the local mount root. Strip /music, prepend /media/music.
+    // We detect the local root by finding which prefix of local_path, when replaced
+    // with nd_prefix, would make sense.
+
+    // Pragmatic: walk up the local path until we find a component that matches
+    // the last component of the nd_prefix.
+    let nd_trimmed = nd_prefix.trim_end_matches('/');
+    let nd_last = std::path::Path::new(nd_trimmed)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Find the local mount point by matching the nd_prefix last component
+    let local = std::path::Path::new(local_path);
+    for ancestor in local.ancestors() {
+        let name = ancestor
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name == nd_last {
+            // This ancestor is the local mount of what Navidrome sees at nd_prefix
+            let relative = local.strip_prefix(ancestor).unwrap_or(local);
+            return format!("{}/{}", nd_trimmed, relative.display());
+        }
+    }
+
+    // Fallback: no matching component, return as-is
+    local_path.to_string()
 }
 
 #[cfg(feature = "server")]
