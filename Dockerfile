@@ -27,8 +27,8 @@ COPY lib/soulbeet/Cargo.toml lib/soulbeet/
 # Copy source code
 COPY . .
 
-# Install Tailwind dependencies
-RUN npm install
+# Install Tailwind dependencies (clean install to avoid npm optional dep bug on arm64)
+RUN rm -rf node_modules package-lock.json && npm install
 
 # Build the Tailwind CSS
 RUN npx @tailwindcss/cli -i ./web/assets/input.css -o ./web/assets/tailwind.css
