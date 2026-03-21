@@ -209,9 +209,89 @@ pub async fn cached_mbid_lookup(client: &Client, artist: &str) -> Result<Option<
         }
     });
 
-    // Cache the result
-    MBID_CACHE.lock().await.insert(key, result.clone());
-    Ok(result)
+    if result.is_some() {
+        MBID_CACHE.lock().await.insert(key, result.clone());
+        return Ok(result);
+    }
+
+    // Full name didn't match. Try the primary artist from compound names
+    // like "A, B, C" or "A featuring B" or "A & B".
+    if let Some(primary) = extract_primary_artist(artist) {
+        let primary_key = primary.to_lowercase();
+        // Check if we already have the primary cached
+        {
+            let cache = MBID_CACHE.lock().await;
+            if let Some(cached) = cache.get(&primary_key) {
+                let result = cached.clone();
+                // Also cache under the full compound name
+                drop(cache);
+                MBID_CACHE.lock().await.insert(key, result.clone());
+                return Ok(result);
+            }
+        }
+
+        mb_rate_limit().await;
+        let quoted = format!("\"{}\"", primary.replace('"', "\\\""));
+        let url = format!(
+            "https://musicbrainz.org/ws/2/artist/?query=artist:{}&fmt=json&limit=1",
+            url::form_urlencoded::byte_serialize(quoted.as_bytes()).collect::<String>()
+        );
+
+        let client_clone = client.clone();
+        let url_clone = url.clone();
+        if let Ok(resp) = resilient_send(
+            || client_clone.get(&url_clone),
+            &format!("MB lookup (primary) {}", primary),
+        )
+        .await
+        {
+            if resp.status().is_success() {
+                if let Ok(data) = resp.json::<MbResponse>().await {
+                    let fallback = data.artists.into_iter().next().and_then(|a| {
+                        if a.score.unwrap_or(0) >= 90 {
+                            Some(a.id)
+                        } else {
+                            None
+                        }
+                    });
+                    if fallback.is_some() {
+                        MBID_CACHE.lock().await.insert(primary_key, fallback.clone());
+                        MBID_CACHE.lock().await.insert(key, fallback.clone());
+                        return Ok(fallback);
+                    }
+                }
+            }
+        }
+    }
+
+    // Cache the miss
+    MBID_CACHE.lock().await.insert(key, None);
+    Ok(None)
+}
+
+/// Extract the primary artist from compound names.
+/// Returns None if the name doesn't look compound.
+fn extract_primary_artist(artist: &str) -> Option<&str> {
+    // Order matters: check longer patterns first
+    let separators = [
+        " featuring ",
+        " feat. ",
+        " feat ",
+        " ft. ",
+        " ft ",
+        ", ",
+        " & ",
+        " x ",
+    ];
+    for sep in separators {
+        if let Some(idx) = artist.to_lowercase().find(sep) {
+            let primary = artist[..idx].trim();
+            if !primary.is_empty() && primary != artist {
+                return Some(primary);
+            }
+        }
+    }
+    None
 }
 
 // --- Recording metadata cache (resolves MBIDs to artist + track + year) ---
