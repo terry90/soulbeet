@@ -336,7 +336,7 @@ pub fn Search() -> Element {
           }
         }
 
-        SystemStatus { health: system_status.read().clone() }
+        SystemStatus { health: system_status.read().clone(), navidrome_status: auth.navidrome_status() }
 
         // Results
         if let Some(results) = download_options.read().clone() {

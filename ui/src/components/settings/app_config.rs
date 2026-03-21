@@ -1,6 +1,8 @@
 use dioxus::prelude::*;
+use shared::system::NavidromeStatus;
 
 use crate::settings_context::use_settings;
+use crate::use_auth;
 
 #[component]
 pub fn AppConfigManager() -> Element {
@@ -93,6 +95,21 @@ pub fn AppConfigManager() -> Element {
                 // Navidrome note
                 div {
                     h3 { class: "text-sm font-semibold text-white mb-3", "Navidrome" }
+                    {
+                        let auth = use_auth();
+                        let (dot_color, status_text) = match auth.navidrome_status() {
+                            NavidromeStatus::Connected => ("bg-blue-400", "Connected"),
+                            NavidromeStatus::InvalidCredentials => ("bg-beet-accent", "User not found in Navidrome"),
+                            NavidromeStatus::Offline => ("bg-gray-500", "Server unreachable"),
+                            NavidromeStatus::Unknown => ("bg-gray-500", "Not configured"),
+                        };
+                        rsx! {
+                            div { class: "flex items-center gap-2 mb-2",
+                                span { class: format!("w-2 h-2 rounded-full {dot_color}") }
+                                span { class: "text-xs font-mono text-gray-300", "{status_text}" }
+                            }
+                        }
+                    }
                     p { class: "text-xs text-gray-400 font-mono",
                         "Navidrome credentials are managed per-user through the login flow. "
                         "Set the NAVIDROME_URL environment variable on the server."

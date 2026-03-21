@@ -138,7 +138,7 @@ pub async fn recommend(
     for generator in generators {
         // Per-pipeline timeout: 2 minutes max
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(3600),
             generator.generate_candidates(profile, config),
         )
         .await;
@@ -146,7 +146,7 @@ pub async fn recommend(
         let result = match result {
             Ok(r) => r,
             Err(_) => {
-                warn!("Generator '{}' timed out after 120s", generator.name());
+                warn!("Generator '{}' timed out after 1h", generator.name());
                 report.pipeline_reports.push(PipelineReport {
                     name: format!("{} (TIMEOUT)", generator.name()),
                     signals: vec![],
@@ -248,10 +248,7 @@ pub async fn build_and_recommend(
                 profile_sources.push(provider.name().to_string());
             }
             Ok(_) => {
-                info!(
-                    "{} returned empty profile, skipping",
-                    provider.name()
-                );
+                info!("{} returned empty profile, skipping", provider.name());
             }
             Err(e) => {
                 warn!(
@@ -297,7 +294,11 @@ fn merge_profile(primary: &mut UserMusicProfile, secondary: &UserMusicProfile) {
                 weight: w / total,
             })
             .collect();
-        tags.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        tags.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         primary.genre_distribution = tags;
     }
 
@@ -315,13 +316,11 @@ fn merge_profile(primary: &mut UserMusicProfile, secondary: &UserMusicProfile) {
     primary.momentum_artists.truncate(15);
 
     // Merge known artists/tracks (union)
-    let mut known_artists: HashSet<String> =
-        primary.known_artist_names.iter().cloned().collect();
+    let mut known_artists: HashSet<String> = primary.known_artist_names.iter().cloned().collect();
     known_artists.extend(secondary.known_artist_names.iter().cloned());
     primary.known_artist_names = known_artists.into_iter().collect();
 
-    let mut known_tracks: HashSet<String> =
-        primary.known_track_keys.iter().cloned().collect();
+    let mut known_tracks: HashSet<String> = primary.known_track_keys.iter().cloned().collect();
     known_tracks.extend(secondary.known_track_keys.iter().cloned());
     primary.known_track_keys = known_tracks.into_iter().collect();
 }

@@ -1,5 +1,8 @@
 use dioxus::prelude::*;
 use shared::navidrome::DiscoveryStatus;
+use shared::system::NavidromeStatus;
+
+use crate::use_auth;
 
 fn profile_badge_class(profile: &str) -> &'static str {
     match profile {
@@ -37,9 +40,18 @@ pub fn DiscoveryOverview() -> Element {
         generating.set(false);
     };
 
+    let auth = use_auth();
+    let nav_status = auth.navidrome_status();
+
     rsx! {
         div { class: "space-y-4",
             h3 { class: "text-sm font-semibold text-white", "Discovery" }
+
+            if matches!(nav_status, NavidromeStatus::InvalidCredentials | NavidromeStatus::Unknown) {
+                p { class: "text-xs font-mono text-beet-accent",
+                    "Your username is not linked to Navidrome. Discovery playlists and rating sync require a matching Navidrome account."
+                }
+            }
 
             match info {
                 None => rsx! {
