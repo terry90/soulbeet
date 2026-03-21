@@ -474,16 +474,17 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<u32, 
                 }
             };
 
-            // Run beets import to tag and organize the file into Discovery/
+            // Snapshot files before import so we can detect what beets added
+            let before = collect_files(&discovery_target);
+
             let src = std::path::Path::new(&src_path);
             if let Ok(ref imp) = importer {
                 match imp.import(&[src], &discovery_target, false).await {
                     Ok(soulbeet::ImportResult::Success) => {
-                        info!("Imported '{}' - {} into Discovery/", qt.artist, qt.track);
+                        info!("Imported '{}' - {} into Discovery/{}", qt.artist, qt.track, profile_name);
                     }
                     Ok(soulbeet::ImportResult::Skipped) => {
                         warn!("Beets skipped '{}' - {} (duplicate?)", qt.artist, qt.track);
-                        // Clean up the source file since beets didn't want it
                         let _ = tokio::fs::remove_file(src).await;
                         continue;
                     }
@@ -523,19 +524,16 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<u32, 
                 }
             }
 
-            // Find the imported file in Discovery/ to get the actual path
-            // (beets may have renamed it during import)
-            let actual_path = find_newest_file(&discovery_target).await;
-            let track_path = match actual_path {
+            // Find the imported file by diffing before/after snapshots
+            let after = collect_files(&discovery_target);
+            let track_path = match find_new_file(&before, &after) {
                 Some(p) => p,
                 None => {
-                    // Fallback: assume original filename
-                    let filename = src
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    format!("{}/{}", profile_path, filename)
+                    warn!(
+                        "Could not find imported file for '{}' - {} in {}",
+                        qt.artist, qt.track, profile_path
+                    );
+                    continue;
                 }
             };
 
@@ -605,7 +603,7 @@ async fn write_nsp_if_missing(
 
     let nsp_content = serde_json::json!({
         "name": playlist_name,
-        "comment": format!("Auto-managed by Soulful discovery ({})", profile),
+        "comment": format!("Auto-managed by Soulbeet discovery ({})", profile),
         "all": [
             { "contains": { "filepath": rel } }
         ],
@@ -628,40 +626,42 @@ pub async fn generate_recommendations() -> Result<u32, ServerFnError> {
         .map_err(server_error)
 }
 
-/// Find the most recently modified file under a directory (recursive).
-/// Used after beets import to find the file beets placed (it may have been
-/// renamed and moved into an Artist/Album/ subdirectory).
+/// Collect all music file paths under a directory (recursive).
+/// Used to snapshot before/after beets import to find what was added.
 #[cfg(feature = "server")]
-async fn find_newest_file(dir: &std::path::Path) -> Option<String> {
-    fn walk(dir: &std::path::Path) -> Option<(std::path::PathBuf, std::time::SystemTime)> {
-        let mut newest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
-        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+fn collect_files(dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+    let mut files = std::collections::HashSet::new();
+    fn walk(dir: &std::path::Path, files: &mut std::collections::HashSet<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Skip the .nsp file's directory marker
-                if let Some(result) = walk(&path) {
-                    if newest.as_ref().map_or(true, |(_, t)| result.1 > *t) {
-                        newest = Some(result);
-                    }
-                }
+                walk(&path, files);
             } else if path.is_file() {
-                // Skip .nsp and .db files
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext == "nsp" || ext == "db" {
-                    continue;
-                }
-                if let Ok(meta) = path.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        if newest.as_ref().map_or(true, |(_, t)| modified > *t) {
-                            newest = Some((path, modified));
-                        }
-                    }
+                if ext != "nsp" && ext != "db" {
+                    files.insert(path);
                 }
             }
         }
-        newest
     }
-    walk(dir).map(|(p, _)| p.to_string_lossy().to_string())
+    walk(dir, &mut files);
+    files
+}
+
+/// Find the file that was added after a beets import by comparing before/after snapshots.
+#[cfg(feature = "server")]
+fn find_new_file(
+    before: &std::collections::HashSet<std::path::PathBuf>,
+    after: &std::collections::HashSet<std::path::PathBuf>,
+) -> Option<String> {
+    let new_files: Vec<_> = after.difference(before).collect();
+    new_files
+        .first()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 /// Remove a directory if it's empty, then try its parent too.
