@@ -427,7 +427,10 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<u32, 
             );
         }
 
-        // Phase 3: Move completed files to Discovery/ and record in DB
+        // Phase 3: Import completed files into Discovery/ via beets and record in DB
+        let importer = crate::services::music_importer(None).await;
+        let discovery_target = std::path::PathBuf::from(&discovery_path);
+
         for qt in &queued {
             if remaining_filenames.contains(&qt.slskd_filename) {
                 warn!(
@@ -437,7 +440,6 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<u32, 
                 continue;
             }
 
-            // Find the downloaded file using the same resolution logic as the import pipeline
             let resolved = crate::server_fns::download::utils::resolve_download_path(
                 &qt.slskd_filename,
                 &download_base,
@@ -453,56 +455,86 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<u32, 
                 }
             };
 
-            // Move to Discovery folder
-            let filename = std::path::Path::new(&src_path)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            if filename.is_empty() {
-                continue;
-            }
-            let dest = format!("{}/{}", discovery_path, filename);
-            let dest_path = std::path::Path::new(&dest);
-
-            if let Err(e) = tokio::fs::rename(&src_path, &dest).await {
-                // Fall back to copy+delete for cross-filesystem moves
-                if e.raw_os_error() == Some(18) {
-                    if let Err(e) = tokio::fs::copy(&src_path, &dest).await {
-                        warn!("Failed to copy to Discovery/: {}", e);
+            // Run beets import to tag and organize the file into Discovery/
+            let src = std::path::Path::new(&src_path);
+            if let Ok(ref imp) = importer {
+                match imp.import(&[src], &discovery_target, false).await {
+                    Ok(soulbeet::ImportResult::Success) => {
+                        info!("Imported '{}' - {} into Discovery/", qt.artist, qt.track);
+                    }
+                    Ok(soulbeet::ImportResult::Skipped) => {
+                        warn!("Beets skipped '{}' - {} (duplicate?)", qt.artist, qt.track);
+                        // Clean up the source file since beets didn't want it
+                        let _ = tokio::fs::remove_file(src).await;
                         continue;
                     }
-                    let _ = tokio::fs::remove_file(&src_path).await;
-                } else {
-                    warn!("Failed to move to Discovery/: {}", e);
+                    Ok(other) => {
+                        warn!("Beets import issue for '{}' - {}: {:?}", qt.artist, qt.track, other);
+                        let _ = tokio::fs::remove_file(src).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Beets import failed for '{}' - {}: {}", qt.artist, qt.track, e);
+                        let _ = tokio::fs::remove_file(src).await;
+                        continue;
+                    }
+                }
+            } else {
+                // No importer available - fall back to raw move
+                let filename = src
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if filename.is_empty() {
                     continue;
                 }
-            }
-
-            // Clean up empty parent dirs left after moving
-            if let Some(parent) = std::path::Path::new(&src_path).parent() {
-                if parent != download_base.as_path() {
-                    let _ = cleanup_empty_parent(parent).await;
+                let dest = format!("{}/{}", discovery_path, filename);
+                if let Err(e) = tokio::fs::rename(&src_path, &dest).await {
+                    if e.raw_os_error() == Some(18) {
+                        if let Err(e) = tokio::fs::copy(&src_path, &dest).await {
+                            warn!("Failed to copy to Discovery/: {}", e);
+                            continue;
+                        }
+                        let _ = tokio::fs::remove_file(&src_path).await;
+                    } else {
+                        warn!("Failed to move to Discovery/: {}", e);
+                        continue;
+                    }
                 }
             }
 
-            if dest_path.exists() {
-                DiscoveryTrackRow::create(
-                    None,
-                    &qt.track,
-                    &qt.artist,
-                    qt.album.as_deref().unwrap_or(""),
-                    &dest,
-                    folder_id,
-                    &profile_name,
-                )
-                .await?;
-                profile_downloads += 1;
-            }
+            // Find the imported file in Discovery/ to get the actual path
+            // (beets may have renamed it during import)
+            let actual_path = find_newest_file(&discovery_target).await;
+            let track_path = match actual_path {
+                Some(p) => p,
+                None => {
+                    // Fallback: assume original filename
+                    let filename = src
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    format!("{}/{}", discovery_path, filename)
+                }
+            };
+
+            DiscoveryTrackRow::create(
+                None,
+                &qt.track,
+                &qt.artist,
+                qt.album.as_deref().unwrap_or(""),
+                &track_path,
+                folder_id,
+                &profile_name,
+            )
+            .await?;
+            profile_downloads += 1;
         }
 
         info!(
-            "{}: {} tracks moved to Discovery/",
+            "{}: {} tracks imported to Discovery/",
             profile_name, profile_downloads
         );
 
@@ -660,6 +692,28 @@ pub async fn generate_recommendations() -> Result<u32, ServerFnError> {
     generate_recommendations_internal(&auth.0.sub)
         .await
         .map_err(server_error)
+}
+
+/// Find the most recently modified file in a directory (non-recursive).
+/// Used after beets import to find the file beets placed (it may have been renamed).
+#[cfg(feature = "server")]
+async fn find_newest_file(dir: &std::path::Path) -> Option<String> {
+    let mut newest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Ok(meta) = path.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if newest.as_ref().map_or(true, |(_, t)| modified > *t) {
+                    newest = Some((path, modified));
+                }
+            }
+        }
+    }
+    newest.map(|(p, _)| p.to_string_lossy().to_string())
 }
 
 /// Remove a directory if it's empty, then try its parent too.
