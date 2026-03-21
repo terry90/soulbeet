@@ -247,11 +247,15 @@ fn resolve_song_path(
     None
 }
 
+/// Remove a directory if empty, then recurse up to its parent.
 #[cfg(feature = "server")]
 async fn cleanup_empty_dirs(dir: &std::path::Path) -> Result<(), std::io::Error> {
     let mut read_dir = tokio::fs::read_dir(dir).await?;
     if read_dir.next_entry().await?.is_none() {
         tokio::fs::remove_dir(dir).await?;
+        if let Some(parent) = dir.parent() {
+            Box::pin(cleanup_empty_dirs(parent)).await?;
+        }
     }
     Ok(())
 }
@@ -380,6 +384,9 @@ async fn remove_discovery_track_internal(track_id: &str) -> Result<(), String> {
         tokio::fs::remove_file(path)
             .await
             .map_err(|e| format!("Failed to delete file: {}", e))?;
+        if let Some(parent) = path.parent() {
+            let _ = cleanup_empty_dirs(parent).await;
+        }
     }
 
     DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Removed).await?;

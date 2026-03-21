@@ -167,6 +167,10 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
         tokio::fs::remove_file(path)
             .await
             .map_err(|e| server_error(format!("Failed to delete: {}", e)))?;
+        // Clean up empty Artist/Album/ dirs left by beets
+        if let Some(parent) = path.parent() {
+            let _ = cleanup_empty_parent(parent).await;
+        }
     }
 
     DiscoveryTrackRow::update_status(&req.track_id, &DiscoveryStatus::Removed)

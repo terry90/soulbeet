@@ -268,7 +268,7 @@ async fn run_automation() {
                     user_id
                 );
 
-                // Clean up remaining pending tracks (delete files, mark as Removed)
+                // Clean up remaining pending tracks and Discovery/ profile directories
                 if let Some(ref folder_id) = user_settings.discovery_folder_id {
                     match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(folder_id).await {
                         Ok(pending) => {
@@ -293,6 +293,18 @@ async fn run_automation() {
                             }
                         }
                         Err(e) => info!("Automation: failed to clean up pending tracks for user {}: {}", user_id, e),
+                    }
+
+                    // Remove Discovery/ profile subdirectories (beets creates subdirs inside)
+                    if let Ok(Some(folder)) = crate::models::folder::Folder::get_by_id(folder_id).await {
+                        let discovery_dir = std::path::Path::new(&folder.path).join("Discovery");
+                        if discovery_dir.exists() {
+                            if let Err(e) = tokio::fs::remove_dir_all(&discovery_dir).await {
+                                info!("Automation: failed to clean Discovery/ dir: {}", e);
+                            } else {
+                                info!("Automation: cleaned up Discovery/ for expired batch");
+                            }
+                        }
                     }
                 }
 

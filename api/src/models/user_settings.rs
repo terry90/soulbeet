@@ -177,43 +177,6 @@ impl UserSettings {
         Self::get(user_id).await
     }
 
-    /// Update a Navidrome playlist ID for a specific discovery profile.
-    /// IDs are stored as JSON: {"Conservative":"id1","Balanced":"id2","Adventurous":"id3"}
-    pub async fn update_discovery_playlist_id(
-        user_id: &str,
-        profile: &str,
-        playlist_id: &str,
-    ) -> Result<(), String> {
-        let current = Self::get(user_id).await?;
-        let mut ids: std::collections::HashMap<String, String> = current
-            .discovery_navidrome_playlist_id
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        ids.insert(profile.to_string(), playlist_id.to_string());
-        let json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
-        sqlx::query(
-            "UPDATE user_settings SET discovery_navidrome_playlist_id = ? WHERE user_id = ?",
-        )
-        .bind(&json)
-        .bind(user_id)
-        .execute(&*DB)
-        .await
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// Get the Navidrome playlist ID for a specific profile
-    pub fn get_playlist_id_for_profile(
-        playlist_ids_json: &Option<String>,
-        profile: &str,
-    ) -> Option<String> {
-        playlist_ids_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok())
-            .and_then(|m| m.get(profile).cloned())
-    }
-
     /// Get the playlist name for a specific profile
     pub fn get_playlist_name_for_profile(names_json: &str, profile: &str) -> String {
         serde_json::from_str::<std::collections::HashMap<String, String>>(names_json)
