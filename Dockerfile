@@ -1,12 +1,14 @@
 # Build Stage
 FROM rust:1.91-bookworm AS builder
 
-# Install build dependencies
+# Install build dependencies + Node 22 (distro Node 18 is too old for Tailwind v4 oxide)
 RUN apt-get update && apt-get install -y \
   pkg-config \
   libssl-dev \
-  nodejs \
-  npm
+  curl \
+  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+  && apt-get install -y nodejs \
+  && rm -rf /var/lib/apt/lists/*
 
 # Install Dioxus CLI
 RUN cargo install dioxus-cli
