@@ -368,44 +368,144 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<u32, 
         }
 
         total_downloads += profile_downloads;
+    }
 
-        // Create Navidrome playlist for THIS profile with only THIS profile's tracks
-        if profile_downloads > 0 {
-            if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
-                let tracks =
-                    DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name)
-                        .await?;
-                let song_ids: Vec<String> =
-                    tracks.iter().filter_map(|t| t.song_id.clone()).collect();
-                if !song_ids.is_empty() {
-                    let playlist_name = UserSettings::get_playlist_name_for_profile(
-                        &settings.discovery_playlist_name,
-                        &profile_name,
-                    );
+    UserSettings::update_discovery_last_generated(user_id).await?;
 
-                    // Delete old playlist for this profile if it exists
-                    if let Some(old_id) = UserSettings::get_playlist_id_for_profile(
-                        &settings.discovery_navidrome_playlist_id,
-                        &profile_name,
-                    ) {
-                        let _ = navi.delete_playlist(&old_id).await;
-                    }
+    // Playlist creation is deferred: files are still downloading at this point.
+    // reconcile_discovery_playlists() runs during automation to match tracks
+    // with Navidrome once they're indexed.
 
-                    if let Ok(pl) = navi.create_playlist(&playlist_name, &song_ids).await {
-                        let _ = UserSettings::update_discovery_playlist_id(
-                            user_id,
-                            &profile_name,
-                            &pl.id,
-                        )
-                        .await;
+    Ok(total_downloads)
+}
+
+/// Match pending discovery tracks to Navidrome songs and create/update playlists.
+///
+/// Downloads are async (slskd), so at generation time the files aren't indexed
+/// by Navidrome yet. This function runs later (during automation) to:
+/// 1. Match discovery tracks to Navidrome songs by path
+/// 2. Update song_ids in the database
+/// 3. Create or refresh Navidrome playlists per profile
+#[cfg(feature = "server")]
+pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> {
+    let settings = UserSettings::get(user_id).await?;
+    if !settings.discovery_enabled {
+        return Ok(());
+    }
+    let folder_id = match settings.discovery_folder_id.as_ref() {
+        Some(id) => id.clone(),
+        None => return Ok(()),
+    };
+
+    let navi = match crate::services::navidrome_client_for_user(user_id).await {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+
+    // Get all Navidrome songs to match against discovery tracks
+    let songs = navi
+        .get_all_songs_with_ratings()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Get pending discovery tracks missing a song_id
+    let pending = DiscoveryTrackRow::get_pending_by_folder(&folder_id).await?;
+    let unlinked: Vec<_> = pending.iter().filter(|t| t.song_id.is_none()).collect();
+    if unlinked.is_empty() {
+        // All tracks already linked, just ensure playlists exist
+        return ensure_playlists(user_id, &settings, &folder_id, &navi).await;
+    }
+
+    let mut matched = 0u32;
+    for track in &unlinked {
+        // Match by filename: compare the filename portion of both paths
+        let track_filename = std::path::Path::new(&track.path)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_lowercase());
+
+        if let Some(ref track_fn) = track_filename {
+            for song in &songs {
+                if let Some(ref song_path) = song.path {
+                    let song_fn = std::path::Path::new(song_path)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_lowercase());
+                    if song_fn.as_deref() == Some(track_fn.as_ref()) {
+                        DiscoveryTrackRow::update_song_id(&track.id, &song.id).await?;
+                        matched += 1;
+                        break;
                     }
                 }
             }
         }
     }
 
-    UserSettings::update_discovery_last_generated(user_id).await?;
-    Ok(total_downloads)
+    if matched > 0 {
+        info!(
+            "Discovery playlist reconciliation: linked {} of {} unlinked tracks",
+            matched,
+            unlinked.len()
+        );
+    }
+
+    ensure_playlists(user_id, &settings, &folder_id, &navi).await
+}
+
+#[cfg(feature = "server")]
+async fn ensure_playlists(
+    user_id: &str,
+    settings: &UserSettings,
+    folder_id: &str,
+    navi: &soulbeet::NavidromeClient,
+) -> Result<(), String> {
+    let selected_profiles = parse_profiles(&settings.discovery_profiles);
+
+    for profile in &selected_profiles {
+        let profile_name = profile.to_string();
+        let tracks =
+            DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name).await?;
+        let song_ids: Vec<String> = tracks.iter().filter_map(|t| t.song_id.clone()).collect();
+
+        if song_ids.is_empty() {
+            continue;
+        }
+
+        let playlist_name = UserSettings::get_playlist_name_for_profile(
+            &settings.discovery_playlist_name,
+            &profile_name,
+        );
+
+        // Check if existing playlist needs updating
+        let existing_id = UserSettings::get_playlist_id_for_profile(
+            &settings.discovery_navidrome_playlist_id,
+            &profile_name,
+        );
+
+        if let Some(old_id) = &existing_id {
+            // Playlist exists, update its songs
+            let _ = navi.delete_playlist(old_id).await;
+        }
+
+        match navi.create_playlist(&playlist_name, &song_ids).await {
+            Ok(pl) => {
+                let _ =
+                    UserSettings::update_discovery_playlist_id(user_id, &profile_name, &pl.id)
+                        .await;
+                info!(
+                    "Created Navidrome playlist '{}' with {} tracks",
+                    playlist_name,
+                    song_ids.len()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to create Navidrome playlist '{}': {}",
+                    playlist_name, e
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[post("/api/discovery/generate-recommendations", auth: AuthSession)]
