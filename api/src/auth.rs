@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
+use shared::system::NavidromeStatus;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthResponse {
     pub username: String,
     pub user_id: String,
+    #[serde(default)]
+    pub navidrome_status: NavidromeStatus,
 }
 
 #[cfg(feature = "server")]

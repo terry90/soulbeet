@@ -93,6 +93,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
     use crate::crypto;
     use crate::services::evict_navidrome_client;
     use models::user::User;
+    use shared::system::NavidromeStatus;
 
     match try_navidrome_auth(&username, &password).await {
         NavidromeAuthResult::Success => {
@@ -109,7 +110,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
 
             // Encrypt the Navidrome password and store it
             let encrypted = crypto::encrypt(&password).map_err(server_error)?;
-            User::update_navidrome_token(&user.id, Some(&encrypted), "connected")
+            User::update_navidrome_token(&user.id, Some(&encrypted), NavidromeStatus::Connected.as_str())
                 .await
                 .map_err(server_error)?;
 
@@ -117,6 +118,9 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             User::update_password(&user.id, &password)
                 .await
                 .map_err(server_error)?;
+
+            // Reset the dismissed banner so it can reappear if credentials break again
+            let _ = models::user_settings::UserSettings::reset_navidrome_banner(&user.id).await;
 
             // Evict any cached client so it picks up the new token
             evict_navidrome_client(&user.id).await;
@@ -128,6 +132,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             Ok(AuthResponse {
                 username: user.username,
                 user_id: user.id,
+                navidrome_status: NavidromeStatus::Connected,
             })
         }
         NavidromeAuthResult::AuthFailed => {
@@ -146,7 +151,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             User::update_navidrome_token(
                 &user.id,
                 user.navidrome_token.as_deref(),
-                "invalid_credentials",
+                NavidromeStatus::InvalidCredentials.as_str(),
             )
             .await
             .map_err(server_error)?;
@@ -161,6 +166,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             Ok(AuthResponse {
                 username: user.username,
                 user_id: user.id,
+                navidrome_status: NavidromeStatus::InvalidCredentials,
             })
         }
         NavidromeAuthResult::Unreachable => {
@@ -170,7 +176,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
                 .map_err(|_| server_error("Invalid username or password"))?;
 
             // Mark Navidrome status as offline (keep existing token)
-            User::update_navidrome_token(&user.id, user.navidrome_token.as_deref(), "offline")
+            User::update_navidrome_token(&user.id, user.navidrome_token.as_deref(), NavidromeStatus::Offline.as_str())
                 .await
                 .map_err(server_error)?;
 
@@ -181,6 +187,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             Ok(AuthResponse {
                 username: user.username,
                 user_id: user.id,
+                navidrome_status: NavidromeStatus::Offline,
             })
         }
     }
@@ -215,8 +222,14 @@ pub async fn logout() -> Result<(), ServerFnError> {
 pub async fn get_current_user() -> Result<Option<AuthResponse>, ServerFnError> {
     let claims = auth.0;
 
+    let status = models::user::User::get_by_id(&claims.sub)
+        .await
+        .map(|u| shared::system::NavidromeStatus::from(u.navidrome_status))
+        .unwrap_or_default();
+
     Ok(Some(AuthResponse {
         username: claims.username,
         user_id: claims.sub,
+        navidrome_status: status,
     }))
 }

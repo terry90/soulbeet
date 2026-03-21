@@ -1,6 +1,7 @@
 use auth::{use_auth, AuthProvider};
 use dioxus::prelude::*;
 use shared::download::DownloadProgress;
+use shared::system::NavidromeStatus;
 use std::collections::HashMap;
 
 #[cfg(feature = "web")]
@@ -222,10 +223,77 @@ fn WebNavbar() -> Element {
                 }
             }
 
+            NavidromeBanner {}
+
             main { class: "px-4 sm:px-6 lg:px-8 flex-grow flex flex-col relative overflow-y-auto w-full py-8 no-scrollbar",
                 Outlet::<Route> {}
             }
             Downloads { is_open: downloads_open, downloads }
+        }
+    }
+}
+
+#[component]
+fn NavidromeBanner() -> Element {
+    let auth = use_auth();
+    let mut settings = ui::use_settings();
+    let status = auth.navidrome_status();
+
+    let dismissed = settings
+        .get()
+        .map(|s| s.navidrome_banner_dismissed)
+        .unwrap_or(false);
+
+    if dismissed || matches!(status, NavidromeStatus::Connected | NavidromeStatus::Unknown) {
+        return rsx! {};
+    }
+
+    let (dot_color, label, message) = match status {
+        NavidromeStatus::InvalidCredentials => (
+            "bg-beet-accent",
+            "NAVIDROME",
+            "Credentials mismatch. Log in with your Navidrome password to reconnect.",
+        ),
+        NavidromeStatus::Offline => (
+            "bg-gray-500",
+            "NAVIDROME",
+            "Unreachable. Discovery and rating sync paused.",
+        ),
+        _ => return rsx! {},
+    };
+
+    let dismiss = move |_| {
+        spawn(async move {
+            let _ = settings
+                .update(api::UpdateUserSettings {
+                    navidrome_banner_dismissed: Some(true),
+                    ..Default::default()
+                })
+                .await;
+        });
+    };
+
+    rsx! {
+        div { class: "mx-4 sm:mx-6 lg:mx-8 mt-2 px-3 py-2 bg-beet-panel border border-white/10 rounded flex items-center gap-3 text-xs font-mono",
+            span { class: format!("w-1.5 h-1.5 rounded-full {} shrink-0", dot_color) }
+            span { class: "text-gray-500 uppercase tracking-widest shrink-0 hidden sm:inline", "{label}" }
+            span { class: "text-gray-400 flex-1 min-w-0 truncate", "{message}" }
+            button {
+                class: "shrink-0 text-gray-600 hover:text-gray-300 transition-colors cursor-pointer p-2 -mr-1",
+                onclick: dismiss,
+                svg {
+                    class: "w-3.5 h-3.5",
+                    fill: "none",
+                    stroke: "currentColor",
+                    view_box: "0 0 24 24",
+                    path {
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                        stroke_width: "2",
+                        d: "M6 18L18 6M6 6l12 12",
+                    }
+                }
+            }
         }
     }
 }

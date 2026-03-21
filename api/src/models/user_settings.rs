@@ -242,6 +242,17 @@ impl UserSettings {
         Ok(())
     }
 
+    pub async fn reset_navidrome_banner(user_id: &str) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE user_settings SET navidrome_banner_dismissed = 0 WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .execute(&*DB)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Get users with expired discovery playlists that need regeneration
     pub async fn get_expired_discoveries() -> Result<Vec<UserSettings>, String> {
         let rows = sqlx::query_as::<_, UserSettings>(

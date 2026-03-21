@@ -56,6 +56,14 @@ impl Auth {
     pub fn is_logged_in(&self) -> bool {
         self.state.read().is_some()
     }
+
+    pub fn navidrome_status(&self) -> shared::system::NavidromeStatus {
+        self.state
+            .read()
+            .as_ref()
+            .map(|a| a.navidrome_status)
+            .unwrap_or_default()
+    }
 }
 
 pub fn use_auth() -> Auth {

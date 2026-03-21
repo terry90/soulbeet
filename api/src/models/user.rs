@@ -35,11 +35,12 @@ impl User {
         let id = Uuid::new_v4().to_string();
 
         let user = sqlx::query_as::<_, User>(
-            "INSERT INTO users (id, username, password_hash, navidrome_status) VALUES (?, ?, ?, 'unknown') RETURNING *"
+            "INSERT INTO users (id, username, password_hash, navidrome_status) VALUES (?, ?, ?, ?) RETURNING *"
         )
         .bind(&id)
         .bind(username)
         .bind(password_hash)
+        .bind(shared::system::NavidromeStatus::Unknown.as_str())
         .fetch_one(&*DB)
         .await
         .map_err(|e| e.to_string())?;
@@ -139,7 +140,8 @@ impl User {
     }
 
     pub async fn get_connected_users() -> Result<Vec<User>, String> {
-        sqlx::query_as::<_, User>("SELECT * FROM users WHERE navidrome_status = 'connected'")
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE navidrome_status = ?")
+            .bind(shared::system::NavidromeStatus::Connected.as_str())
             .fetch_all(&*DB)
             .await
             .map_err(|e| e.to_string())
