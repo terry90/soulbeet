@@ -233,7 +233,20 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
-        let tracks_per_profile = track_counts.get(&profile_name).copied().unwrap_or(10) as usize;
+        let target = track_counts.get(&profile_name).copied().unwrap_or(10) as usize;
+
+        // Account for tracks already in the playlist so regeneration fills gaps
+        let existing = DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let tracks_per_profile = target.saturating_sub(existing);
+        if tracks_per_profile == 0 {
+            info!("{}: already at target ({} pending tracks)", profile_name, existing);
+            continue;
+        }
+        info!("{}: need {} more tracks ({} existing, {} target)", profile_name, tracks_per_profile, existing, target);
+
         let mut profile_downloads = 0u32;
         let mut stats = ProfileGenerationStats {
             profile: profile_name.clone(),
