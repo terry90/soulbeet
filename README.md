@@ -117,7 +117,6 @@ docker-compose up -d
 | `NAVIDROME_URL` | Your Navidrome server URL | |
 | `BEETS_CONFIG` | Path to custom beets config file | `beets_config.yaml` |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
-| `NAVIDROME_MUSIC_PATH` | Navidrome's music folder path (see Discovery setup) | |
 
 **Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. Scrobble credentials (Last.fm API key, ListenBrainz token) are configured per-user in Settings > Library.
 
@@ -193,36 +192,7 @@ Discovery generates personalized playlists from your scrobble history and pushes
 
 #### Navidrome Configuration
 
-Two settings are required on the Navidrome side:
-
-1. **Enable ReportRealPath** so Navidrome returns actual filesystem paths instead of metadata-derived ones.
-Go to Navidrome admin UI > Settings > Players > find the Soulbeet player > enable "Report Real Path"
-
-2. **Set `NAVIDROME_MUSIC_PATH`** in Soulbeet's environment if Navidrome and Soulbeet see the music directory at different paths. This tells Soulbeet how to map between the two.
-
-   Example: if your host has music at `/media/music` and your docker-compose looks like:
-   ```yaml
-   soulbeet:
-     volumes:
-       - /media/music:/music    # Soulbeet sees /music
-   navidrome:
-     volumes:
-       - /media/music:/music    # Navidrome sees /music
-   ```
-   No `NAVIDROME_MUSIC_PATH` is needed (same path in both containers).
-
-   But if Navidrome mounts differently:
-   ```yaml
-   soulbeet:
-     volumes:
-       - /media/music:/music           # Soulbeet sees /music
-   navidrome:
-     environment:
-       - ND_MUSICFOLDER=/media/music
-     volumes:
-       - /media/music:/media/music     # Navidrome sees /media/music
-   ```
-   Then set `NAVIDROME_MUSIC_PATH=/media/music` in Soulbeet so it can translate paths.
+Your Soulbeet folder paths must point to the same physical directories that Navidrome's music library uses. Navidrome stores file paths relative to its library root, and Soulbeet resolves them by checking each configured folder. Both services need to see the same files at the same local paths.
 
 #### Soulbeet Configuration
 
