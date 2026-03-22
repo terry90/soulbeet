@@ -335,7 +335,8 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
 
                 // Poll until we get results or the search times out (slskd search has 120s timeout).
                 // Each poll_search call long-polls for up to 10s internally.
-                let mut found_item = None;
+                // Collect up to 3 ranked items so we can fall back if a download fails.
+                let mut ranked_items: Vec<shared::download::DownloadableItem> = Vec::new();
                 for _ in 0..12 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     let search_result = match backend.poll_search(&search_id).await {
@@ -346,39 +347,46 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                         }
                     };
 
-                    if !search_result.groups.is_empty() && !search_result.groups[0].items.is_empty() {
-                        found_item = Some(search_result.groups[0].items[0].clone());
+                    if !search_result.groups.is_empty() {
+                        for group in &search_result.groups {
+                            for item in &group.items {
+                                ranked_items.push(item.clone());
+                            }
+                        }
                         break;
                     }
 
-                    // Search completed with no results
                     if !search_result.has_more {
                         break;
                     }
                 }
 
-                let item = match found_item {
-                    Some(item) => item,
-                    None => {
-                        info!("No results for '{}' - {}, skipping", candidate.artist, candidate.track);
-                        stats.search_misses += 1;
-                        seen.insert(key.clone());
-                        continue;
-                    }
-                };
-                let download_results = match backend.download(vec![item]).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("Download failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
-                        stats.downloads_failed += 1;
-                        seen.insert(key.clone());
-                        continue;
-                    }
-                };
-
+                if ranked_items.is_empty() {
+                    info!("No results for '{}' - {}, skipping", candidate.artist, candidate.track);
+                    stats.search_misses += 1;
+                    seen.insert(key.clone());
+                    continue;
+                }
                 stats.search_hits += 1;
-                for dl in &download_results {
-                    if dl.error.is_none() {
+
+                // Try up to 3 sources, falling back on download failure
+                ranked_items.truncate(3);
+                let mut downloaded = false;
+                for (attempt_idx, item) in ranked_items.iter().enumerate() {
+                    let download_results = match backend.download(vec![item.clone()]).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if attempt_idx < 2 {
+                                info!("Download source {} failed for '{}' - {}, trying next: {}", attempt_idx + 1, candidate.artist, candidate.track, e);
+                            } else {
+                                warn!("Download failed for '{}' - {} (all sources exhausted): {}", candidate.artist, candidate.track, e);
+                            }
+                            stats.downloads_failed += 1;
+                            continue;
+                        }
+                    };
+
+                    if let Some(dl) = download_results.iter().find(|dl| dl.error.is_none()) {
                         stats.downloads_queued += 1;
                         seen.insert(key.clone());
                         queued.push(QueuedTrack {
@@ -401,8 +409,17 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                             &profile_name,
                         )
                         .await?;
+                        downloaded = true;
                         break;
                     }
+                    // This source returned an error in the response
+                    stats.downloads_failed += 1;
+                    if attempt_idx < 2 {
+                        info!("Download source {} errored for '{}' - {}, trying next", attempt_idx + 1, candidate.artist, candidate.track);
+                    }
+                }
+                if !downloaded {
+                    seen.insert(key.clone());
                 }
             }
 
