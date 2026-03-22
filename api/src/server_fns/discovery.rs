@@ -137,7 +137,7 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
             .map_err(|e| server_error(format!("Failed to delete: {}", e)))?;
         // Clean up empty Artist/Album/ dirs left by beets
         if let Some(parent) = path.parent() {
-            let _ = cleanup_empty_parent(parent).await;
+            let _ = super::cleanup_empty_ancestors(parent).await;
         }
     }
 
@@ -842,26 +842,6 @@ pub async fn import_or_move(src: &std::path::Path, target: &std::path::Path) -> 
     }
 }
 
-/// Remove a directory if it's empty, then try its parent too.
-/// Stops at profile directories (Conservative/Balanced/Adventurous) and folder roots.
-#[cfg(feature = "server")]
-async fn cleanup_empty_parent(dir: &std::path::Path) -> Result<(), std::io::Error> {
-    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if matches!(dir_name, "Discovery" | "Conservative" | "Balanced" | "Adventurous")
-        || dir.join(".beets_library.db").exists()
-    {
-        return Ok(());
-    }
-
-    let mut read_dir = tokio::fs::read_dir(dir).await?;
-    if read_dir.next_entry().await?.is_none() {
-        tokio::fs::remove_dir(dir).await?;
-        if let Some(parent) = dir.parent() {
-            let _ = Box::pin(cleanup_empty_parent(parent)).await;
-        }
-    }
-    Ok(())
-}
 
 #[cfg(feature = "server")]
 fn parse_profiles(s: &str) -> Vec<shared::recommendation::DiscoveryProfile> {
