@@ -117,6 +117,7 @@ docker-compose up -d
 | `NAVIDROME_URL` | Your Navidrome server URL | |
 | `BEETS_CONFIG` | Path to custom beets config file | `beets_config.yaml` |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
+| `NAVIDROME_MUSIC_PATH` | Navidrome's music folder path (see Discovery setup) | |
 
 **Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. Scrobble credentials (Last.fm API key, ListenBrainz token) are configured per-user in Settings > Library.
 
@@ -185,6 +186,62 @@ match:
 ```
 
 *Note: Tweaking `strong_rec_thresh` and other matching parameters increases the risk of incorrect tags, but is necessary for fully automated imports of obscure or partial albums.*
+
+### Discovery Setup
+
+Discovery generates personalized playlists from your scrobble history and pushes them to Navidrome. Here's how to set it up.
+
+#### Navidrome Configuration
+
+Two settings are required on the Navidrome side:
+
+1. **Enable ReportRealPath** so Navidrome returns actual filesystem paths instead of metadata-derived ones.
+Go to Navidrome admin UI > Settings > Players > find the Soulbeet player > enable "Report Real Path"
+
+2. **Set `NAVIDROME_MUSIC_PATH`** in Soulbeet's environment if Navidrome and Soulbeet see the music directory at different paths. This tells Soulbeet how to map between the two.
+
+   Example: if your host has music at `/media/music` and your docker-compose looks like:
+   ```yaml
+   soulbeet:
+     volumes:
+       - /media/music:/music    # Soulbeet sees /music
+   navidrome:
+     volumes:
+       - /media/music:/music    # Navidrome sees /music
+   ```
+   No `NAVIDROME_MUSIC_PATH` is needed (same path in both containers).
+
+   But if Navidrome mounts differently:
+   ```yaml
+   soulbeet:
+     volumes:
+       - /media/music:/music           # Soulbeet sees /music
+   navidrome:
+     environment:
+       - ND_MUSICFOLDER=/media/music
+     volumes:
+       - /media/music:/media/music     # Navidrome sees /media/music
+   ```
+   Then set `NAVIDROME_MUSIC_PATH=/media/music` in Soulbeet so it can translate paths.
+
+#### Soulbeet Configuration
+
+1. Go to **Settings > Library** in the Soulbeet web UI
+2. Add your **Last.fm API key** and/or **ListenBrainz username + token**
+3. **Enable Discovery** on a folder and pick your profiles (Conservative, Balanced, Adventurous)
+4. Optionally customize playlist names for each profile
+5. Hit **Generate** to run the first batch
+
+#### How It Works
+
+- Discovery creates a `Discovery/` directory inside your chosen folder, with subdirectories per profile (e.g., `Discovery/Balanced/`, `Discovery/Adventurous/`).
+- Tracks are downloaded from Soulseek, imported via beets into the profile subdirectory, and tagged properly.
+- A smart playlist is created in Navidrome (via the native API) for each profile, filtered by the folder path. The playlist auto-updates as Navidrome scans new files.
+- Every 6 hours, an automation task syncs ratings, creates playlists if missing, and regenerates expired discovery batches.
+
+#### Auto-Delete
+
+When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from disk during rating sync. This requires ReportRealPath to be enabled in Navidrome so Soulbeet receives the actual file path. For shared folders (multiple users), a track is only deleted if the average rating across all users is 1 or below.
 
 ## Development
 

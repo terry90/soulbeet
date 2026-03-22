@@ -719,8 +719,16 @@ fn find_new_file(
 }
 
 /// Remove a directory if it's empty, then try its parent too.
+/// Stops at profile directories (Conservative/Balanced/Adventurous) and folder roots.
 #[cfg(feature = "server")]
 async fn cleanup_empty_parent(dir: &std::path::Path) -> Result<(), std::io::Error> {
+    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if matches!(dir_name, "Discovery" | "Conservative" | "Balanced" | "Adventurous")
+        || dir.join(".beets_library.db").exists()
+    {
+        return Ok(());
+    }
+
     let mut read_dir = tokio::fs::read_dir(dir).await?;
     if read_dir.next_entry().await?.is_none() {
         tokio::fs::remove_dir(dir).await?;

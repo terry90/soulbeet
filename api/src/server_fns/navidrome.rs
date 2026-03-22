@@ -81,6 +81,19 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                         );
                         skipped_veto += 1;
                     } else if let Some(ref path_str) = song.path {
+                        // Skip auto-delete for pending discovery tracks (handled separately below)
+                        let is_discovery = pending_discovery_tracks.iter().any(|dt| {
+                            dt.song_id.as_deref() == Some(&song.id)
+                                || std::path::Path::new(&dt.path)
+                                    .file_name()
+                                    .map(|f| f.to_ascii_lowercase())
+                                    == std::path::Path::new(path_str)
+                                        .file_name()
+                                        .map(|f| f.to_ascii_lowercase())
+                        });
+                        if is_discovery {
+                            continue;
+                        }
                         // ReportRealPath gives absolute paths from Navidrome's filesystem.
                         // Apply prefix substitution if Navidrome's mount differs from ours.
                         let local_path = resolve_navidrome_path(path_str, &navidrome_prefix, &folders);
@@ -264,8 +277,16 @@ fn resolve_navidrome_path(
 }
 
 /// Remove a directory if empty, then recurse up to its parent.
+/// Stops at directories named "Discovery" or that contain a `.beets_library.db`
+/// to avoid removing folder roots.
 #[cfg(feature = "server")]
 async fn cleanup_empty_dirs(dir: &std::path::Path) -> Result<(), std::io::Error> {
+    // Don't remove folder roots or the Discovery directory itself
+    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if dir_name == "Discovery" || dir.join(".beets_library.db").exists() {
+        return Ok(());
+    }
+
     let mut read_dir = tokio::fs::read_dir(dir).await?;
     if read_dir.next_entry().await?.is_none() {
         tokio::fs::remove_dir(dir).await?;
