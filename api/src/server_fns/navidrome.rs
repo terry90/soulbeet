@@ -99,7 +99,7 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                                 warn!("Auto-delete failed for {}: {}", path.display(), e);
                             } else {
                                 if let Some(parent) = path.parent() {
-                                    let _ = cleanup_empty_dirs(parent).await;
+                                    let _ = super::cleanup_empty_ancestors(parent).await;
                                 }
                                 DeletionReviewRow::upsert(
                                     &song.id,
@@ -244,33 +244,6 @@ fn resolve_navidrome_path(
     None
 }
 
-/// Remove a directory if empty, then recurse up to its parent.
-/// Stops at directories named "Discovery" or that contain a `.beets_library.db`
-/// to avoid removing folder roots.
-#[cfg(feature = "server")]
-pub async fn cleanup_empty_dirs_pub(dir: &std::path::Path) -> Result<(), std::io::Error> {
-    cleanup_empty_dirs(dir).await
-}
-
-#[cfg(feature = "server")]
-async fn cleanup_empty_dirs(dir: &std::path::Path) -> Result<(), std::io::Error> {
-    // Don't remove folder roots or the Discovery directory itself
-    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if matches!(dir_name, "Discovery" | "Conservative" | "Balanced" | "Adventurous")
-        || dir.join(".beets_library.db").exists()
-    {
-        return Ok(());
-    }
-
-    let mut read_dir = tokio::fs::read_dir(dir).await?;
-    if read_dir.next_entry().await?.is_none() {
-        tokio::fs::remove_dir(dir).await?;
-        if let Some(parent) = dir.parent() {
-            Box::pin(cleanup_empty_dirs(parent)).await?;
-        }
-    }
-    Ok(())
-}
 
 #[get("/api/navidrome/library-stats", auth: AuthSession)]
 pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
@@ -368,7 +341,7 @@ async fn remove_discovery_track_internal(track_id: &str) -> Result<(), String> {
             .await
             .map_err(|e| format!("Failed to delete file: {}", e))?;
         if let Some(parent) = path.parent() {
-            let _ = cleanup_empty_dirs(parent).await;
+            let _ = super::cleanup_empty_ancestors(parent).await;
         }
     }
 

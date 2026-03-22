@@ -24,29 +24,6 @@ async fn cleanup_failed_file(file_path: &str) {
     }
 }
 
-/// Attempt to clean up a directory if it's empty after cleanup
-#[cfg(feature = "server")]
-async fn cleanup_empty_parent_dir(file_path: &str) {
-    let path = Path::new(file_path);
-    if let Some(parent) = path.parent() {
-        if parent.exists() {
-            // Only remove if directory is empty
-            match tokio::fs::read_dir(parent).await {
-                Ok(mut entries) => {
-                    if entries.next_entry().await.ok().flatten().is_none() {
-                        match tokio::fs::remove_dir(parent).await {
-                            Ok(_) => info!("Cleaned up empty directory: {:?}", parent),
-                            Err(e) => {
-                                warn!("Failed to clean up empty directory {:?}: {}", parent, e)
-                            }
-                        }
-                    }
-                }
-                Err(e) => warn!("Failed to check directory {:?}: {}", parent, e),
-            }
-        }
-    }
-}
 
 #[cfg(feature = "server")]
 pub async fn import_group(
@@ -114,7 +91,9 @@ pub async fn import_group(
             for entry in &entries {
                 cleanup_failed_file(&entry.item).await;
             }
-            cleanup_empty_parent_dir(&source_path).await;
+            if let Some(parent) = std::path::Path::new(&source_path).parent() {
+                let _ = crate::server_fns::cleanup_empty_ancestors(parent).await;
+            }
         }
         Ok(ImportResult::Failed(err)) => {
             info!("Import failed: {}", err);
@@ -131,7 +110,9 @@ pub async fn import_group(
             for entry in &entries {
                 cleanup_failed_file(&entry.item).await;
             }
-            cleanup_empty_parent_dir(&source_path).await;
+            if let Some(parent) = std::path::Path::new(&source_path).parent() {
+                let _ = crate::server_fns::cleanup_empty_ancestors(parent).await;
+            }
         }
         Ok(ImportResult::TimedOut) => {
             warn!("Import timed out for: {}", source_path);
@@ -148,7 +129,9 @@ pub async fn import_group(
             for entry in &entries {
                 cleanup_failed_file(&entry.item).await;
             }
-            cleanup_empty_parent_dir(&source_path).await;
+            if let Some(parent) = std::path::Path::new(&source_path).parent() {
+                let _ = crate::server_fns::cleanup_empty_ancestors(parent).await;
+            }
         }
         Err(e) => {
             warn!("Import error for {}: {}", source_path, e);
@@ -165,7 +148,9 @@ pub async fn import_group(
             for entry in &entries {
                 cleanup_failed_file(&entry.item).await;
             }
-            cleanup_empty_parent_dir(&source_path).await;
+            if let Some(parent) = std::path::Path::new(&source_path).parent() {
+                let _ = crate::server_fns::cleanup_empty_ancestors(parent).await;
+            }
         }
     }
 }

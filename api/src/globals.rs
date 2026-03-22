@@ -304,7 +304,7 @@ async fn run_automation() {
             if path.exists() {
                 let _ = tokio::fs::remove_file(path).await;
                 if let Some(parent) = path.parent() {
-                    let _ = crate::server_fns::navidrome::cleanup_empty_dirs_pub(parent).await;
+                    let _ = crate::server_fns::cleanup_empty_ancestors(parent).await;
                 }
             }
             let _ = crate::models::discovery_playlist::DiscoveryTrackRow::update_status(
