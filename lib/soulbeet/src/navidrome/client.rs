@@ -511,14 +511,18 @@ impl NavidromeClient {
 
     // --- Navidrome Native API (for smart playlists) ---
 
-    /// Get a JWT token from Navidrome's native auth endpoint.
-    /// Caches the token so repeated calls don't hit the login endpoint.
-    async fn native_login(&self) -> Result<String> {
-        let mut cached = self.native_token.lock().await;
+    /// Get a cached JWT token, or fetch a fresh one from Navidrome.
+    async fn native_token(&self) -> Result<String> {
+        let cached = self.native_token.lock().await;
         if let Some(ref token) = *cached {
             return Ok(token.clone());
         }
+        drop(cached);
+        self.native_login_fresh().await
+    }
 
+    /// Fetch a fresh JWT token from Navidrome, replacing any cached value.
+    async fn native_login_fresh(&self) -> Result<String> {
         let url = self
             .base_url
             .join("auth/login")
@@ -562,21 +566,50 @@ impl NavidromeClient {
             status: 0,
             message: format!("Failed to parse login response: {}", e),
         })?;
-        *cached = Some(login.token.clone());
+        *self.native_token.lock().await = Some(login.token.clone());
         Ok(login.token)
     }
 
-    /// Create or update a smart playlist via Navidrome's native API.
-    /// The playlist is owned by the authenticated user.
-    /// `filepath_contains` is the path filter for the smart playlist rule.
+    /// Send an authenticated native API request. Retries once with a fresh
+    /// token if the first attempt gets a 401.
+    async fn native_request(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let send = |r: reqwest::RequestBuilder, token: &str| {
+            r.header("x-nd-authorization", format!("Bearer {}", token))
+        };
+
+        let token = self.native_token().await?;
+        let retry_req = req.try_clone();
+        let resp = send(req, &token)
+            .send()
+            .await
+            .map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("Native API request failed: {}", e),
+            })?;
+
+        if resp.status().as_u16() == 401 {
+            if let Some(retry_req) = retry_req {
+                let token = self.native_login_fresh().await?;
+                return send(retry_req, &token)
+                    .send()
+                    .await
+                    .map_err(|e| SoulseekError::Api {
+                        status: 0,
+                        message: format!("Native API request failed: {}", e),
+                    });
+            }
+        }
+
+        Ok(resp)
+    }
+
+    /// Create a smart playlist via Navidrome's native API.
     pub async fn create_smart_playlist(
         &self,
         name: &str,
         comment: &str,
         filepath_contains: &str,
     ) -> Result<String> {
-        let token = self.native_login().await?;
-
         let url = self
             .base_url
             .join("api/playlist")
@@ -598,17 +631,7 @@ impl NavidromeClient {
             }
         });
 
-        let resp = self
-            .client
-            .post(url)
-            .header("x-nd-authorization", format!("Bearer {}", token))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("Create smart playlist failed: {}", e),
-            })?;
+        let resp = self.native_request(self.client.post(url).json(&body)).await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -633,8 +656,6 @@ impl NavidromeClient {
 
     /// Delete a smart playlist via Navidrome's native API.
     pub async fn delete_smart_playlist(&self, playlist_id: &str) -> Result<()> {
-        let token = self.native_login().await?;
-
         let url = self
             .base_url
             .join(&format!("api/playlist/{}", playlist_id))
@@ -643,16 +664,7 @@ impl NavidromeClient {
                 message: format!("URL error: {}", e),
             })?;
 
-        let resp = self
-            .client
-            .delete(url)
-            .header("x-nd-authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("Delete smart playlist failed: {}", e),
-            })?;
+        let resp = self.native_request(self.client.delete(url)).await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
