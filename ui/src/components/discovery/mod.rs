@@ -4,6 +4,21 @@ use shared::system::NavidromeStatus;
 
 use crate::use_auth;
 
+fn format_relative_time(rfc3339: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return rfc3339.to_string();
+    };
+    let delta = chrono::Utc::now().signed_duration_since(parsed);
+    let mins = delta.num_minutes();
+    if mins < 1 { return "just now".to_string(); }
+    if mins < 60 { return format!("{}m ago", mins); }
+    let hours = delta.num_hours();
+    if hours < 24 { return format!("{}h ago", hours); }
+    let days = delta.num_days();
+    if days < 30 { return format!("{}d ago", days); }
+    format!("{}d ago", days)
+}
+
 fn profile_badge_class(profile: &str) -> &'static str {
     match profile {
         "Conservative" => "bg-blue-600/30 text-blue-300 border-blue-500/40",
@@ -100,8 +115,13 @@ pub fn DiscoveryOverview() -> Element {
                                             }
                                         }
                                         if let Some(ref ts) = cfg.last_generated_at {
-                                            p { class: "text-gray-500 text-xs font-mono mt-1",
-                                                "Last generated: {ts}"
+                                            {
+                                                let ago = format_relative_time(ts);
+                                                rsx! {
+                                                    p { class: "text-gray-500 text-xs font-mono mt-1",
+                                                        "Last generated: {ago}"
+                                                    }
+                                                }
                                             }
                                         }
                                     }
