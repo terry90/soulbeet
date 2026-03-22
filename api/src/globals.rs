@@ -279,6 +279,26 @@ async fn run_automation() {
                     user_id
                 );
 
+                // Delete old Navidrome smart playlists before wiping Discovery/
+                let old_playlist_ids: std::collections::HashMap<String, String> = user_settings
+                    .discovery_navidrome_playlist_id
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                if !old_playlist_ids.is_empty() {
+                    if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
+                        for (profile, pid) in &old_playlist_ids {
+                            if let Err(e) = navi.delete_smart_playlist(pid).await {
+                                info!("Automation: failed to delete playlist '{}': {}", profile, e);
+                            }
+                        }
+                    }
+                    // Clear stored IDs so reconcile creates fresh playlists
+                    let _ = sqlx::query(
+                        "UPDATE user_settings SET discovery_navidrome_playlist_id = NULL WHERE user_id = ?"
+                    ).bind(user_id).execute(&*crate::db::DB).await;
+                }
+
                 // Clean up remaining pending tracks and Discovery/ profile directories
                 if let Some(ref folder_id) = user_settings.discovery_folder_id {
                     match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(folder_id).await {
@@ -323,10 +343,16 @@ async fn run_automation() {
                 match crate::server_fns::discovery::generate_discovery_playlist_internal(user_id)
                     .await
                 {
-                    Ok(count) => info!(
-                        "Automation: regenerated discovery for user {} with {} tracks",
-                        user_id, count
-                    ),
+                    Ok(count) => {
+                        info!(
+                            "Automation: regenerated discovery for user {} with {} tracks",
+                            user_id, count
+                        );
+                        // Create fresh playlists for the new batch
+                        if let Err(e) = crate::server_fns::discovery::reconcile_discovery_playlists(user_id).await {
+                            info!("Automation: post-expiry playlist reconciliation failed for {}: {}", user_id, e);
+                        }
+                    }
                     Err(e) => info!(
                         "Automation: discovery regeneration failed for user {}: {}",
                         user_id, e

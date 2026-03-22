@@ -61,7 +61,11 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
     let mut skipped_veto = 0u32;
     let mut skipped_not_found = 0u32;
 
-    let pending_discovery_tracks = DiscoveryTrackRow::get_all_pending().await?;
+    let pending_discovery_tracks = if let Some(ref fid) = user_settings.discovery_folder_id {
+        DiscoveryTrackRow::get_pending_by_folder(fid).await?
+    } else {
+        vec![]
+    };
 
     for song in &songs {
         // Auto-delete 1-star tracks (when enabled)
@@ -257,7 +261,7 @@ fn resolve_navidrome_path(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if stripped.starts_with(&folder_name) {
+        if stripped == folder_name || stripped.starts_with(&format!("{}/", folder_name)) {
             let folder_parent = std::path::Path::new(&folder.path)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
@@ -283,7 +287,9 @@ fn resolve_navidrome_path(
 async fn cleanup_empty_dirs(dir: &std::path::Path) -> Result<(), std::io::Error> {
     // Don't remove folder roots or the Discovery directory itself
     let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if dir_name == "Discovery" || dir.join(".beets_library.db").exists() {
+    if matches!(dir_name, "Discovery" | "Conservative" | "Balanced" | "Adventurous")
+        || dir.join(".beets_library.db").exists()
+    {
         return Ok(());
     }
 
@@ -373,37 +379,8 @@ async fn promote_discovery_track_internal(track_id: &str) -> Result<(), String> 
         return Err(format!("Source file not found: {}", track.path));
     }
 
-    // Import into parent library folder via beets for proper tagging
     let target = std::path::PathBuf::from(&folder.path);
-    match crate::services::music_importer(None).await {
-        Ok(imp) => {
-            match imp.import(&[src.as_path()], &target, false).await {
-                Ok(soulbeet::ImportResult::Success) => {}
-                Ok(soulbeet::ImportResult::Skipped) => {
-                    return Err("Beets skipped track (duplicate?)".to_string());
-                }
-                Ok(other) => {
-                    return Err(format!("Import issue: {:?}", other));
-                }
-                Err(e) => {
-                    return Err(format!("Import failed: {}", e));
-                }
-            }
-        }
-        Err(_) => {
-            // Fallback: raw move
-            let filename = src.file_name().ok_or("Invalid filename")?.to_string_lossy().to_string();
-            let dest = target.join(&filename);
-            if let Err(e) = tokio::fs::rename(&src, &dest).await {
-                if e.raw_os_error() == Some(18) {
-                    tokio::fs::copy(&src, &dest).await.map_err(|e| format!("Failed to copy: {}", e))?;
-                    let _ = tokio::fs::remove_file(&src).await;
-                } else {
-                    return Err(format!("Failed to move: {}", e));
-                }
-            }
-        }
-    }
+    crate::server_fns::discovery::import_or_move(&src, &target).await?;
 
     DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Promoted).await?;
     info!("Promoted discovery track: {} -> {}", track.title, folder.path);

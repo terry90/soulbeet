@@ -168,14 +168,4 @@ impl DiscoveryTrackRow {
         Ok(())
     }
 
-    pub async fn get_all_pending() -> Result<Vec<DiscoveryTrack>, String> {
-        let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
-            "SELECT * FROM discovery_tracks WHERE status = ?",
-        )
-        .bind(DiscoveryStatus::Pending.to_string())
-        .fetch_all(&*DB)
-        .await
-        .map_err(|e| e.to_string())?;
-        Ok(rows.into_iter().map(Into::into).collect())
-    }
 }

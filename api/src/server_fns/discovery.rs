@@ -93,43 +93,8 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
         return Err(server_error(format!("File not found: {}", track.path)));
     }
 
-    // Import into the parent library folder via beets for proper tagging/organization
     let target = std::path::PathBuf::from(&folder.path);
-    match crate::services::music_importer(None).await {
-        Ok(imp) => {
-            match imp.import(&[src.as_path()], &target, false).await {
-                Ok(soulbeet::ImportResult::Success) => {}
-                Ok(soulbeet::ImportResult::Skipped) => {
-                    return Err(server_error("Beets skipped this track (duplicate?)"));
-                }
-                Ok(other) => {
-                    return Err(server_error(format!("Import issue: {:?}", other)));
-                }
-                Err(e) => {
-                    return Err(server_error(format!("Import failed: {}", e)));
-                }
-            }
-        }
-        Err(_) => {
-            // Fallback: raw move if no importer
-            let filename = src
-                .file_name()
-                .ok_or_else(|| server_error("Invalid filename"))?
-                .to_string_lossy()
-                .to_string();
-            let dest = target.join(&filename);
-            if let Err(e) = tokio::fs::rename(&src, &dest).await {
-                if e.raw_os_error() == Some(18) {
-                    tokio::fs::copy(&src, &dest)
-                        .await
-                        .map_err(|e| server_error(format!("Failed to copy: {}", e)))?;
-                    let _ = tokio::fs::remove_file(&src).await;
-                } else {
-                    return Err(server_error(format!("Failed to move: {}", e)));
-                }
-            }
-        }
-    }
+    import_or_move(&src, &target).await.map_err(server_error)?;
 
     DiscoveryTrackRow::update_status(&req.track_id, &DiscoveryStatus::Promoted)
         .await
@@ -642,7 +607,7 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         // If NAVIDROME_MUSIC_PATH is set, we need to reverse the prefix mapping:
         // local /music/terry/Discovery/Balanced -> Navidrome /media/music/terry/Discovery/Balanced
         let local_profile_path = folder.discovery_profile_path(&profile_name);
-        let profile_path = to_navidrome_path(&local_profile_path);
+        let profile_path = to_navidrome_path(&local_profile_path, &folder.path);
         let comment = format!("Soulbeet discovery ({})", profile_name);
 
         match navi
@@ -718,6 +683,40 @@ fn find_new_file(
         .map(|p| p.to_string_lossy().to_string())
 }
 
+/// Import a file into a target directory via beets, with raw-move fallback.
+#[cfg(feature = "server")]
+pub async fn import_or_move(src: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    match crate::services::music_importer(None).await {
+        Ok(imp) => match imp.import(&[src], target, false).await {
+            Ok(soulbeet::ImportResult::Success) => Ok(()),
+            Ok(soulbeet::ImportResult::Skipped) => {
+                Err("Beets skipped track (duplicate?)".to_string())
+            }
+            Ok(other) => Err(format!("Import issue: {:?}", other)),
+            Err(e) => Err(format!("Import failed: {}", e)),
+        },
+        Err(_) => {
+            let filename = src
+                .file_name()
+                .ok_or("Invalid filename")?
+                .to_string_lossy()
+                .to_string();
+            let dest = target.join(&filename);
+            if let Err(e) = tokio::fs::rename(src, &dest).await {
+                if e.raw_os_error() == Some(18) {
+                    tokio::fs::copy(src, &dest)
+                        .await
+                        .map_err(|e| format!("Failed to copy: {}", e))?;
+                    let _ = tokio::fs::remove_file(src).await;
+                } else {
+                    return Err(format!("Failed to move: {}", e));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Remove a directory if it's empty, then try its parent too.
 /// Stops at profile directories (Conservative/Balanced/Adventurous) and folder roots.
 #[cfg(feature = "server")]
@@ -740,55 +739,39 @@ async fn cleanup_empty_parent(dir: &std::path::Path) -> Result<(), std::io::Erro
 }
 
 /// Convert a local filesystem path to the path as Navidrome sees it.
-/// Reverses the NAVIDROME_MUSIC_PATH prefix mapping.
-/// e.g. local /music/terry/Discovery/Balanced -> /media/music/terry/Discovery/Balanced
+/// Uses the folder's parent as the local mount point and substitutes
+/// with NAVIDROME_MUSIC_PATH.
+///
+/// e.g. folder_path = /music/terry, local_path = /music/terry/Discovery/Balanced
+///      NAVIDROME_MUSIC_PATH = /media/music
+///      local mount = /music (folder parent)
+///      result = /media/music/terry/Discovery/Balanced
 #[cfg(feature = "server")]
-fn to_navidrome_path(local_path: &str) -> String {
+fn to_navidrome_path(local_path: &str, folder_path: &str) -> String {
     let navidrome_prefix = std::env::var("NAVIDROME_MUSIC_PATH").ok().filter(|s| !s.is_empty());
     let Some(nd_prefix) = navidrome_prefix else {
-        return local_path.to_string(); // Same mount, no mapping needed
+        return local_path.to_string();
     };
 
-    // Find the user's folder paths to determine the local mount point.
-    // e.g. if folder is /music/terry, local mount is /music
-    // We strip /music from the local path and prepend the Navidrome prefix.
-    // local_path: /music/terry/Discovery/Balanced
-    // We need to find what local prefix to replace.
-    // The folder parent (e.g. /music) is the local mount.
-    // Since we don't have folders here, infer from the path structure:
-    // NAVIDROME_MUSIC_PATH maps to the same directory as the local mount.
-    // Just replace the first path components that differ.
-
-    // Simple approach: find the common suffix between local_path and nd_prefix.
-    // If local is /music/terry/Discovery and nd_prefix is /media/music,
-    // then /music is the local mount root. Strip /music, prepend /media/music.
-    // We detect the local root by finding which prefix of local_path, when replaced
-    // with nd_prefix, would make sense.
-
-    // Pragmatic: walk up the local path until we find a component that matches
-    // the last component of the nd_prefix.
-    let nd_trimmed = nd_prefix.trim_end_matches('/');
-    let nd_last = std::path::Path::new(nd_trimmed)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
+    // The folder parent is the local mount point (e.g. /music from /music/terry)
+    let local_mount = std::path::Path::new(folder_path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    // Find the local mount point by matching the nd_prefix last component
-    let local = std::path::Path::new(local_path);
-    for ancestor in local.ancestors() {
-        let name = ancestor
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if name == nd_last {
-            // This ancestor is the local mount of what Navidrome sees at nd_prefix
-            let relative = local.strip_prefix(ancestor).unwrap_or(local);
-            return format!("{}/{}", nd_trimmed, relative.display());
-        }
+    if local_mount.is_empty() {
+        return local_path.to_string();
     }
 
-    // Fallback: no matching component, return as-is
-    local_path.to_string()
+    let nd_trimmed = nd_prefix.trim_end_matches('/');
+
+    match local_path.strip_prefix(&local_mount) {
+        Some(relative) => {
+            let relative = relative.trim_start_matches('/');
+            format!("{}/{}", nd_trimmed, relative)
+        }
+        None => local_path.to_string(),
+    }
 }
 
 #[cfg(feature = "server")]

@@ -21,9 +21,100 @@ pub async fn get_user_settings() -> Result<UserSettings, ServerFnError> {
 pub async fn update_user_settings(
     update: UpdateUserSettings,
 ) -> Result<UserSettings, ServerFnError> {
-    UserSettings::upsert(&auth.0.sub, update)
-        .await
-        .map_err(server_error)
+    #[cfg(feature = "server")]
+    {
+        let old = UserSettings::get(&auth.0.sub).await.map_err(server_error)?;
+        let result = UserSettings::upsert(&auth.0.sub, update.clone())
+            .await
+            .map_err(server_error)?;
+        cleanup_stale_discovery_playlists(&auth.0.sub, &old, &update).await;
+        return Ok(result);
+    }
+    #[cfg(not(feature = "server"))]
+    {
+        let _ = update;
+        unreachable!()
+    }
+}
+
+/// Delete Navidrome smart playlists that are no longer valid because
+/// discovery was disabled, the folder changed, or profiles were removed.
+#[cfg(feature = "server")]
+async fn cleanup_stale_discovery_playlists(
+    user_id: &str,
+    old: &UserSettings,
+    update: &UpdateUserSettings,
+) {
+    use dioxus::logger::tracing::{info, warn};
+
+    let discovery_disabled = update.discovery_enabled == Some(false) && old.discovery_enabled;
+    let folder_changed = update.discovery_folder_id.is_some()
+        && update.discovery_folder_id != old.discovery_folder_id;
+    let profiles_changed = update.discovery_profiles.is_some()
+        && update.discovery_profiles.as_deref() != Some(&old.discovery_profiles);
+
+    if !discovery_disabled && !folder_changed && !profiles_changed {
+        return;
+    }
+
+    let old_ids: std::collections::HashMap<String, String> = old
+        .discovery_navidrome_playlist_id
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    if old_ids.is_empty() {
+        return;
+    }
+
+    let navi = match crate::services::navidrome_client_for_user(user_id).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Determine which profile playlists to delete
+    let profiles_to_delete: Vec<String> = if discovery_disabled || folder_changed {
+        // All playlists are stale
+        old_ids.keys().cloned().collect()
+    } else {
+        // Only profiles that were removed
+        let new_profiles = update.discovery_profiles.as_deref().unwrap_or("");
+        let new_set: std::collections::HashSet<&str> =
+            new_profiles.split(',').map(|s| s.trim()).collect();
+        old_ids
+            .keys()
+            .filter(|p| !new_set.contains(p.as_str()))
+            .cloned()
+            .collect()
+    };
+
+    for profile in &profiles_to_delete {
+        if let Some(playlist_id) = old_ids.get(profile) {
+            if let Err(e) = navi.delete_smart_playlist(playlist_id).await {
+                warn!("Failed to delete playlist '{}' ({}): {}", profile, playlist_id, e);
+            } else {
+                info!("Deleted stale discovery playlist '{}' ({})", profile, playlist_id);
+            }
+        }
+    }
+
+    // Clear stale IDs from user_settings
+    let remaining: std::collections::HashMap<String, String> = old_ids
+        .into_iter()
+        .filter(|(k, _)| !profiles_to_delete.contains(k))
+        .collect();
+    let new_json = if remaining.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&remaining).unwrap_or_default())
+    };
+    let _ = sqlx::query(
+        "UPDATE user_settings SET discovery_navidrome_playlist_id = ? WHERE user_id = ?",
+    )
+    .bind(&new_json)
+    .bind(user_id)
+    .execute(&*crate::db::DB)
+    .await;
 }
 
 /// Get list of available metadata providers
