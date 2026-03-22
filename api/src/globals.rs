@@ -287,7 +287,12 @@ async fn run_automation() {
         let mut expired_count = 0u32;
         for track in &pending {
             let lifetime_days = lifetime_map.get(&track.profile).copied().unwrap_or(7) as i64;
-            let created = match chrono::DateTime::parse_from_rfc3339(&track.created_at) {
+            let created = match chrono::DateTime::parse_from_rfc3339(&track.created_at)
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(&track.created_at, "%Y-%m-%d %H:%M:%S")
+                        .map(|naive| naive.and_utc().fixed_offset())
+                })
+            {
                 Ok(dt) => dt,
                 Err(_) => continue,
             };

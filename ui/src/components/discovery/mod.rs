@@ -4,9 +4,14 @@ use shared::system::NavidromeStatus;
 
 use crate::use_auth;
 
-fn format_relative_time(rfc3339: &str) -> String {
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
-        return rfc3339.to_string();
+fn format_relative_time(ts: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts)
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                .map(|naive| naive.and_utc().fixed_offset())
+        })
+    else {
+        return ts.to_string();
     };
     let delta = chrono::Utc::now().signed_duration_since(parsed);
     let mins = delta.num_minutes();
