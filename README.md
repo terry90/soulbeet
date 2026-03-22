@@ -192,7 +192,9 @@ Discovery generates personalized playlists from your scrobble history and pushes
 
 #### Navidrome Configuration
 
-Your Soulbeet folder paths must point to the same physical directories that Navidrome's music library uses. Navidrome stores file paths relative to its library root, and Soulbeet resolves them by checking each configured folder. Both services need to see the same files at the same local paths.
+1. **Enable ReportRealPath** for the Soulbeet player. Go to your Navidrome instance > Settings > Players (e.g. `https://your-navidrome/app/#/player`), find the Soulbeet player entry, and enable "Report Real Path". Without this, rating sync and auto-delete cannot resolve file paths.
+
+2. Your Soulbeet folder paths must point to the same physical directories that Navidrome's music library uses. The mount paths inside each container can differ (e.g. Soulbeet at `/music`, Navidrome at `/media/music`), as long as they map to the same files on the host.
 
 #### Soulbeet Configuration
 
