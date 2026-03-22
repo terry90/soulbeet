@@ -285,21 +285,4 @@ impl UserSettings {
         self.parse_track_counts().get(profile).copied().unwrap_or(10) as usize
     }
 
-    /// Get users with expired discovery playlists that need regeneration
-    pub async fn get_expired_discoveries() -> Result<Vec<UserSettings>, String> {
-        let rows = sqlx::query_as::<_, UserSettings>(
-            "SELECT * FROM user_settings
-             WHERE discovery_enabled = 1
-               AND (discovery_last_generated_at IS NULL
-                    OR datetime(discovery_last_generated_at, '+' || min(
-                        COALESCE(json_extract(discovery_lifetime_days, '$.Conservative'), 7),
-                        COALESCE(json_extract(discovery_lifetime_days, '$.Balanced'), 7),
-                        COALESCE(json_extract(discovery_lifetime_days, '$.Adventurous'), 7)
-                    ) || ' days') < datetime('now'))"
-        )
-        .fetch_all(&*DB)
-        .await
-        .map_err(|e| e.to_string())?;
-        Ok(rows)
-    }
 }

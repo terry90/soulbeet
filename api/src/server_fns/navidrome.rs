@@ -248,6 +248,11 @@ fn resolve_navidrome_path(
 /// Stops at directories named "Discovery" or that contain a `.beets_library.db`
 /// to avoid removing folder roots.
 #[cfg(feature = "server")]
+pub async fn cleanup_empty_dirs_pub(dir: &std::path::Path) -> Result<(), std::io::Error> {
+    cleanup_empty_dirs(dir).await
+}
+
+#[cfg(feature = "server")]
 async fn cleanup_empty_dirs(dir: &std::path::Path) -> Result<(), std::io::Error> {
     // Don't remove folder roots or the Discovery directory itself
     let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");

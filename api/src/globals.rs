@@ -268,98 +268,59 @@ async fn run_automation() {
         }
     }
 
-    // 4. Regenerate expired discovery playlists (per-user)
-    info!("Automation: checking for expired discovery playlists...");
-    match crate::models::user_settings::UserSettings::get_expired_discoveries().await {
-        Ok(expired_users) => {
-            for user_settings in expired_users {
-                let user_id = &user_settings.user_id;
-                info!(
-                    "Automation: discovery for user {} expired, regenerating...",
-                    user_id
-                );
+    // 4. Expire old discovery tracks per-profile and refill gaps
+    for user in &connected_users {
+        let user_id = &user.id;
+        let settings = match crate::models::user_settings::UserSettings::get(user_id).await {
+            Ok(s) if s.discovery_enabled => s,
+            _ => continue,
+        };
+        let Some(ref folder_id) = settings.discovery_folder_id else { continue };
+        let lifetime_map = settings.parse_lifetime_days();
+        let now = chrono::Utc::now();
 
-                // Delete old Navidrome smart playlists before wiping Discovery/
-                let old_playlist_ids: std::collections::HashMap<String, String> = user_settings
-                    .discovery_navidrome_playlist_id
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_default();
-                if !old_playlist_ids.is_empty() {
-                    if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
-                        for (profile, pid) in &old_playlist_ids {
-                            if let Err(e) = navi.delete_smart_playlist(pid).await {
-                                info!("Automation: failed to delete playlist '{}': {}", profile, e);
-                            }
-                        }
-                    }
-                    // Clear stored IDs so reconcile creates fresh playlists
-                    let _ = sqlx::query(
-                        "UPDATE user_settings SET discovery_navidrome_playlist_id = NULL WHERE user_id = ?"
-                    ).bind(user_id).execute(&*crate::db::DB).await;
-                }
-
-                // Clean up remaining pending tracks and Discovery/ profile directories
-                if let Some(ref folder_id) = user_settings.discovery_folder_id {
-                    match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(folder_id).await {
-                        Ok(pending) => {
-                            for track in pending {
-                                let path = std::path::Path::new(&track.path);
-                                if path.exists() {
-                                    if let Err(e) = tokio::fs::remove_file(path).await {
-                                        info!("Automation: failed to delete expired track file {}: {}", track.path, e);
-                                    }
-                                }
-                                if let Err(e) = crate::models::discovery_playlist::DiscoveryTrackRow::update_status(
-                                    &track.id,
-                                    &shared::navidrome::DiscoveryStatus::Removed,
-                                ).await {
-                                    info!("Automation: failed to update status for expired track {}: {}", track.title, e);
-                                }
-                                if let Err(e) = crate::models::discovery_history::DiscoveryHistoryRow::update_outcome(
-                                    user_id, &track.artist, &track.title, "expired"
-                                ).await {
-                                    info!("Automation: failed to update history for expired track {}: {}", track.title, e);
-                                }
-                            }
-                        }
-                        Err(e) => info!("Automation: failed to clean up pending tracks for user {}: {}", user_id, e),
-                    }
-
-                    // Remove Discovery/ profile subdirectories (beets creates subdirs inside)
-                    if let Ok(Some(folder)) = crate::models::folder::Folder::get_by_id(folder_id).await {
-                        let discovery_dir = std::path::Path::new(&folder.path).join("Discovery");
-                        if discovery_dir.exists() {
-                            if let Err(e) = tokio::fs::remove_dir_all(&discovery_dir).await {
-                                info!("Automation: failed to clean Discovery/ dir: {}", e);
-                            } else {
-                                info!("Automation: cleaned up Discovery/ for expired batch");
-                            }
-                        }
-                    }
-                }
-
-                // Generate new discovery playlist
-                match crate::server_fns::discovery::generate_discovery_playlist_internal(user_id)
-                    .await
-                {
-                    Ok(result) => {
-                        info!(
-                            "Automation: regenerated discovery for user {} with {} tracks",
-                            user_id, result.total_imported
-                        );
-                        // Create fresh playlists for the new batch
-                        if let Err(e) = crate::server_fns::discovery::reconcile_discovery_playlists(user_id).await {
-                            info!("Automation: post-expiry playlist reconciliation failed for {}: {}", user_id, e);
-                        }
-                    }
-                    Err(e) => info!(
-                        "Automation: discovery regeneration failed for user {}: {}",
-                        user_id, e
-                    ),
+        // Check each profile's pending tracks and expire those past their lifetime
+        let pending = match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(folder_id).await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let mut expired_count = 0u32;
+        for track in &pending {
+            let lifetime_days = lifetime_map.get(&track.profile).copied().unwrap_or(7) as i64;
+            let created = match chrono::DateTime::parse_from_rfc3339(&track.created_at) {
+                Ok(dt) => dt,
+                Err(_) => continue,
+            };
+            if now.signed_duration_since(created).num_days() < lifetime_days {
+                continue;
+            }
+            // This track has expired
+            let path = std::path::Path::new(&track.path);
+            if path.exists() {
+                let _ = tokio::fs::remove_file(path).await;
+                if let Some(parent) = path.parent() {
+                    let _ = crate::server_fns::navidrome::cleanup_empty_dirs_pub(parent).await;
                 }
             }
+            let _ = crate::models::discovery_playlist::DiscoveryTrackRow::update_status(
+                &track.id, &shared::navidrome::DiscoveryStatus::Removed,
+            ).await;
+            let _ = crate::models::discovery_history::DiscoveryHistoryRow::update_outcome(
+                user_id, &track.artist, &track.title, "expired",
+            ).await;
+            expired_count += 1;
         }
-        Err(e) => info!("Automation: failed to check expired discoveries: {}", e),
+        if expired_count > 0 {
+            info!("Automation: expired {} tracks for user {}", expired_count, user.username);
+        }
+
+        // Refill any gaps (generate_discovery_playlist_internal accounts for existing tracks)
+        match crate::server_fns::discovery::generate_discovery_playlist_internal(user_id).await {
+            Ok(result) if result.total_imported > 0 => {
+                info!("Automation: refilled {} tracks for user {}", result.total_imported, user.username);
+            }
+            Ok(_) => {}
+            Err(e) => info!("Automation: refill failed for {}: {}", user.username, e),
+        }
     }
 }
