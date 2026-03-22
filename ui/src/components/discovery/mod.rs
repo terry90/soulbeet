@@ -243,6 +243,7 @@ fn EngineReportView() -> Element {
 #[component]
 fn DiscoveryTrackList() -> Element {
     let mut tracks = use_resource(|| async { api::get_discovery_tracks().await });
+    let mut show_history = use_signal(|| false);
 
     let items = match &*tracks.read() {
         Some(Ok(items)) => items.clone(),
@@ -261,81 +262,114 @@ fn DiscoveryTrackList() -> Element {
         tracks.restart();
     };
 
-    if items.is_empty() {
+    // Split into active (pending) and history (promoted/removed)
+    let mut active: std::collections::BTreeMap<String, Vec<shared::navidrome::DiscoveryTrack>> =
+        std::collections::BTreeMap::new();
+    let mut history: Vec<shared::navidrome::DiscoveryTrack> = Vec::new();
+
+    for track in items {
+        match track.status {
+            DiscoveryStatus::Pending => {
+                active.entry(track.profile.clone()).or_default().push(track);
+            }
+            _ => history.push(track),
+        }
+    }
+
+    if active.is_empty() && history.is_empty() {
         return rsx! {
             p { class: "text-gray-500 font-mono text-sm", "No discovery tracks" }
         };
     }
 
-    // Group tracks by profile
-    let mut grouped: std::collections::BTreeMap<String, Vec<shared::navidrome::DiscoveryTrack>> =
-        std::collections::BTreeMap::new();
-    for track in items {
-        grouped
-            .entry(track.profile.clone())
-            .or_default()
-            .push(track);
-    }
-
     rsx! {
         div { class: "space-y-4",
-            for (profile, profile_tracks) in grouped {
+            // Active tracks per profile
+            for (profile, profile_tracks) in &active {
                 {
-                    let badge_class = profile_badge_class(&profile);
+                    let badge_class = profile_badge_class(profile);
+                    let count = profile_tracks.len();
                     rsx! {
-                        div { class: "space-y-2",
+                        div { class: "space-y-1.5",
                             div { class: "flex items-center gap-2",
                                 span {
                                     class: "text-xs font-mono px-1.5 py-0.5 rounded border {badge_class}",
                                     "{profile}"
                                 }
                                 span { class: "text-xs font-mono text-gray-500",
-                                    "{profile_tracks.len()} tracks"
+                                    "{count} tracks"
                                 }
                             }
                             for track in profile_tracks {
                                 {
                                     let id_promote = track.id.clone();
                                     let id_remove = track.id.clone();
-                                    let status_class = match track.status {
-                                        DiscoveryStatus::Pending => "text-blue-400",
-                                        DiscoveryStatus::Promoted => "text-green-400",
-                                        DiscoveryStatus::Removed => "text-red-400",
-                                    };
                                     rsx! {
                                         div { class: "flex items-center justify-between p-2 bg-beet-panel border border-white/10 rounded text-sm",
                                             div { class: "flex-1 min-w-0",
                                                 span { class: "text-white truncate", "{track.title}" }
                                                 span { class: "text-gray-400 mx-2", "-" }
                                                 span { class: "text-gray-400 truncate", "{track.artist}" }
-                                                span { class: "{status_class} text-xs font-mono ml-2",
-                                                    "{track.status}"
-                                                }
                                                 if let Some(r) = track.rating {
                                                     span { class: "text-yellow-500 text-xs font-mono ml-2",
                                                         "({r})"
                                                     }
                                                 }
                                             }
-                                            if track.status == DiscoveryStatus::Pending {
-                                                div { class: "flex gap-1 ml-2",
-                                                    button {
-                                                        class: "px-2 py-0.5 text-xs rounded bg-green-900/50 text-green-400 hover:bg-green-800/50 cursor-pointer",
-                                                        onclick: move |_| {
-                                                            let id = id_promote.clone();
-                                                            async move { handle_promote(id).await }
-                                                        },
-                                                        "Promote"
-                                                    }
-                                                    button {
-                                                        class: "px-2 py-0.5 text-xs rounded bg-red-900/50 text-red-400 hover:bg-red-800/50 cursor-pointer",
-                                                        onclick: move |_| {
-                                                            let id = id_remove.clone();
-                                                            async move { handle_remove(id).await }
-                                                        },
-                                                        "Remove"
-                                                    }
+                                            div { class: "flex gap-1 ml-2",
+                                                button {
+                                                    class: "px-2 py-0.5 text-xs rounded bg-green-900/50 text-green-400 hover:bg-green-800/50 cursor-pointer",
+                                                    onclick: move |_| {
+                                                        let id = id_promote.clone();
+                                                        async move { handle_promote(id).await }
+                                                    },
+                                                    "Keep"
                                                 }
+                                                button {
+                                                    class: "px-2 py-0.5 text-xs rounded bg-red-900/50 text-red-400 hover:bg-red-800/50 cursor-pointer",
+                                                    onclick: move |_| {
+                                                        let id = id_remove.clone();
+                                                        async move { handle_remove(id).await }
+                                                    },
+                                                    "Drop"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Collapsed history for promoted/removed
+            if !history.is_empty() {
+                div { class: "mt-2",
+                    button {
+                        class: "text-xs font-mono text-gray-500 hover:text-gray-300 cursor-pointer underline decoration-dotted",
+                        onclick: move |_| show_history.set(!show_history()),
+                        if show_history() {
+                            "Hide history ({history.len()})"
+                        } else {
+                            "Show history ({history.len()})"
+                        }
+                    }
+                    if show_history() {
+                        div { class: "mt-2 space-y-1",
+                            for track in &history {
+                                {
+                                    let (icon, color) = match track.status {
+                                        DiscoveryStatus::Promoted => ("\u{2713}", "text-green-600"),
+                                        DiscoveryStatus::Removed => ("\u{2717}", "text-red-600"),
+                                        _ => ("", "text-gray-600"),
+                                    };
+                                    rsx! {
+                                        div { class: "flex items-center gap-2 px-2 py-1 text-xs font-mono text-gray-600",
+                                            span { class: "{color}", "{icon}" }
+                                            span { "{track.artist} - {track.title}" }
+                                            span { class: "text-gray-700 ml-auto",
+                                                "{track.profile}"
                                             }
                                         }
                                     }
