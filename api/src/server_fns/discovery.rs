@@ -229,307 +229,335 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<u32, 
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
+        let mut profile_downloads = 0u32;
 
-        // Get unused candidates for this specific profile
-        let mut candidates = DiscoveryCandidateRow::get_unused(
-            user_id,
-            &profile_name,
-            (tracks_per_profile as f64 * 1.5) as u32,
-        )
-        .await?;
-
-        if candidates.is_empty() {
-            // Generate for this profile only
-            info!("No candidates for {}, running engine", profile_name);
-            match generate_recommendations_for_user(user_id, *profile).await {
-                Ok(count) => info!("Generated {} candidates for {}", count, profile_name),
-                Err(e) => {
-                    warn!("{} engine failed: {}", profile_name, e);
-                    continue;
-                }
-            }
-            candidates = DiscoveryCandidateRow::get_unused(
-                user_id,
-                &profile_name,
-                (tracks_per_profile as f64 * 1.5) as u32,
-            )
-            .await?;
-            if candidates.is_empty() {
-                continue;
-            }
-        }
-
-        // Phase 1: Search and queue downloads (fast, parallel on slskd)
-        struct QueuedTrack {
-            artist: String,
-            track: String,
-            album: Option<String>,
-            slskd_filename: String,
-        }
-        let mut queued: Vec<QueuedTrack> = Vec::new();
-
-        for candidate in &candidates {
-            if queued.len() >= tracks_per_profile {
+        // Retry loop: keep pulling new candidates until target is met or pool is dry.
+        // Each attempt searches Soulseek, downloads, and imports. Tracks that fail
+        // at any stage are added to `seen` so the next attempt skips them.
+        for _attempt in 0..3u32 {
+            let remaining = tracks_per_profile.saturating_sub(profile_downloads as usize);
+            if remaining == 0 {
                 break;
             }
 
-            let key = format!(
-                "{}:{}",
-                candidate.artist.to_lowercase(),
-                candidate.track.to_lowercase()
-            );
-            if seen.contains(&key) {
-                continue;
+            // Over-fetch candidates (3x) to survive search/download/import attrition
+            let fetch_count = (remaining as f64 * 3.0).ceil() as u32;
+            let mut candidates = DiscoveryCandidateRow::get_unused(
+                user_id,
+                &profile_name,
+                fetch_count,
+            )
+            .await?;
+
+            if candidates.is_empty() {
+                if _attempt == 0 {
+                    info!("No candidates for {}, running engine", profile_name);
+                    match generate_recommendations_for_user(user_id, *profile).await {
+                        Ok(count) => info!("Generated {} candidates for {}", count, profile_name),
+                        Err(e) => {
+                            warn!("{} engine failed: {}", profile_name, e);
+                            break;
+                        }
+                    }
+                    candidates = DiscoveryCandidateRow::get_unused(
+                        user_id,
+                        &profile_name,
+                        fetch_count,
+                    )
+                    .await?;
+                }
+                if candidates.is_empty() {
+                    info!("{}: no more candidates available", profile_name);
+                    break;
+                }
             }
 
-            let search_tracks = vec![shared::metadata::Track {
-                id: String::new(),
-                title: candidate.track.clone(),
-                artist: candidate.artist.clone(),
-                album_id: None,
-                album_title: candidate.album.clone(),
-                release_date: None,
-                duration: None,
-                mbid: None,
-                release_mbid: None,
-            }];
+            // Phase 1: Search and queue downloads
+            struct QueuedTrack {
+                artist: String,
+                track: String,
+                album: Option<String>,
+                slskd_filename: String,
+            }
+            let mut queued: Vec<QueuedTrack> = Vec::new();
 
-            let search_id = match backend.start_search(None, &search_tracks).await {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!("Search failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
+            // Over-queue by 50% to absorb import failures without another retry round
+            let queue_target = remaining + (remaining + 1) / 2;
+
+            for candidate in &candidates {
+                if queued.len() >= queue_target {
+                    break;
+                }
+
+                let key = format!(
+                    "{}:{}",
+                    candidate.artist.to_lowercase(),
+                    candidate.track.to_lowercase()
+                );
+                if seen.contains(&key) {
                     continue;
                 }
-            };
 
-            // Poll until we get results or the search times out (slskd search has 120s timeout).
-            // Each poll_search call long-polls for up to 10s internally.
-            let mut found_item = None;
-            for _ in 0..12 {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                let search_result = match backend.poll_search(&search_id).await {
-                    Ok(r) => r,
+                let search_tracks = vec![shared::metadata::Track {
+                    id: String::new(),
+                    title: candidate.track.clone(),
+                    artist: candidate.artist.clone(),
+                    album_id: None,
+                    album_title: candidate.album.clone(),
+                    release_date: None,
+                    duration: None,
+                    mbid: None,
+                    release_mbid: None,
+                }];
+
+                let search_id = match backend.start_search(None, &search_tracks).await {
+                    Ok(id) => id,
                     Err(e) => {
-                        warn!("Poll failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
-                        break;
+                        warn!("Search failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
+                        seen.insert(key.clone());
+                        continue;
                     }
                 };
 
-                if !search_result.groups.is_empty() && !search_result.groups[0].items.is_empty() {
-                    found_item = Some(search_result.groups[0].items[0].clone());
-                    break;
-                }
+                // Poll until we get results or the search times out (slskd search has 120s timeout).
+                // Each poll_search call long-polls for up to 10s internally.
+                let mut found_item = None;
+                for _ in 0..12 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    let search_result = match backend.poll_search(&search_id).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("Poll failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
+                            break;
+                        }
+                    };
 
-                // Search completed with no results
-                if !search_result.has_more {
-                    break;
-                }
-            }
+                    if !search_result.groups.is_empty() && !search_result.groups[0].items.is_empty() {
+                        found_item = Some(search_result.groups[0].items[0].clone());
+                        break;
+                    }
 
-            let item = match found_item {
-                Some(item) => item,
-                None => {
-                    info!("No results for '{}' - {}, skipping", candidate.artist, candidate.track);
-                    continue;
-                }
-            };
-            let download_results = match backend.download(vec![item]).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("Download failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
-                    continue;
-                }
-            };
-
-            for dl in &download_results {
-                if dl.error.is_none() {
-                    seen.insert(key.clone());
-                    queued.push(QueuedTrack {
-                        artist: candidate.artist.clone(),
-                        track: candidate.track.clone(),
-                        album: candidate.album.clone(),
-                        slskd_filename: dl.item.clone(),
-                    });
-                    DiscoveryCandidateRow::mark_used(
-                        user_id,
-                        &profile_name,
-                        &candidate.artist,
-                        &candidate.track,
-                    )
-                    .await?;
-                    DiscoveryHistoryRow::record(
-                        user_id,
-                        &candidate.artist,
-                        &candidate.track,
-                        &profile_name,
-                    )
-                    .await?;
-                    break;
-                }
-            }
-        }
-
-        if queued.is_empty() {
-            continue;
-        }
-
-        // Phase 2: Wait for downloads to complete, then move to Discovery/
-        info!(
-            "{}: {} downloads queued, waiting for completion...",
-            profile_name,
-            queued.len()
-        );
-        let download_base = crate::config::CONFIG.download_path().clone();
-        let mut profile_downloads = 0u32;
-
-        // Poll slskd until all queued downloads are complete (or timeout after 10 min)
-        let wait_start = tokio::time::Instant::now();
-        let max_wait = tokio::time::Duration::from_secs(600);
-        let mut remaining_filenames: std::collections::HashSet<String> =
-            queued.iter().map(|q| q.slskd_filename.clone()).collect();
-
-        while !remaining_filenames.is_empty() && wait_start.elapsed() < max_wait {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-            let downloads = match backend.get_downloads().await {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-
-            let mut newly_done = Vec::new();
-            for fname in remaining_filenames.iter() {
-                let matched = downloads.iter().find(|d| {
-                    crate::server_fns::download::monitor::filenames_match(&d.item, fname)
-                });
-                if let Some(dl) = matched {
-                    let done = matches!(
-                        dl.state,
-                        shared::download::DownloadState::Completed
-                            | shared::download::DownloadState::Failed(_)
-                            | shared::download::DownloadState::Cancelled
-                    );
-                    if done {
-                        newly_done.push(fname.clone());
+                    // Search completed with no results
+                    if !search_result.has_more {
+                        break;
                     }
                 }
-            }
-            for fname in &newly_done {
-                remaining_filenames.remove(fname);
-            }
-        }
 
-        if !remaining_filenames.is_empty() {
-            warn!(
-                "{}: {} downloads didn't complete within timeout",
-                profile_name,
-                remaining_filenames.len()
-            );
-        }
-
-        // Phase 3: Import completed files into Discovery/{profile}/ via beets and record in DB
-        let importer = crate::services::music_importer(None).await;
-        let profile_path = folder.discovery_profile_path(&profile_name);
-        let discovery_target = std::path::PathBuf::from(&profile_path);
-
-        for qt in &queued {
-            if remaining_filenames.contains(&qt.slskd_filename) {
-                warn!(
-                    "Skipping '{}' - {} (download timed out)",
-                    qt.artist, qt.track
-                );
-                continue;
-            }
-
-            let resolved = crate::server_fns::download::utils::resolve_download_path(
-                &qt.slskd_filename,
-                &download_base,
-            );
-            let src_path = match resolved {
-                Some(p) => p,
-                None => {
-                    warn!(
-                        "Could not find downloaded file for '{}' - {} (slskd: {})",
-                        qt.artist, qt.track, qt.slskd_filename
-                    );
-                    continue;
-                }
-            };
-
-            // Snapshot files before import so we can detect what beets added
-            let before = collect_files(&discovery_target);
-
-            let src = std::path::Path::new(&src_path);
-            if let Ok(ref imp) = importer {
-                match imp.import(&[src], &discovery_target, false).await {
-                    Ok(soulbeet::ImportResult::Success) => {
-                        info!("Imported '{}' - {} into Discovery/{}", qt.artist, qt.track, profile_name);
-                    }
-                    Ok(soulbeet::ImportResult::Skipped) => {
-                        warn!("Beets skipped '{}' - {} (duplicate?)", qt.artist, qt.track);
-                        let _ = tokio::fs::remove_file(src).await;
+                let item = match found_item {
+                    Some(item) => item,
+                    None => {
+                        info!("No results for '{}' - {}, skipping", candidate.artist, candidate.track);
+                        seen.insert(key.clone());
                         continue;
                     }
-                    Ok(other) => {
-                        warn!("Beets import issue for '{}' - {}: {:?}", qt.artist, qt.track, other);
-                        let _ = tokio::fs::remove_file(src).await;
-                        continue;
-                    }
+                };
+                let download_results = match backend.download(vec![item]).await {
+                    Ok(r) => r,
                     Err(e) => {
-                        warn!("Beets import failed for '{}' - {}: {}", qt.artist, qt.track, e);
-                        let _ = tokio::fs::remove_file(src).await;
+                        warn!("Download failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
+                        seen.insert(key.clone());
                         continue;
                     }
+                };
+
+                for dl in &download_results {
+                    if dl.error.is_none() {
+                        seen.insert(key.clone());
+                        queued.push(QueuedTrack {
+                            artist: candidate.artist.clone(),
+                            track: candidate.track.clone(),
+                            album: candidate.album.clone(),
+                            slskd_filename: dl.item.clone(),
+                        });
+                        DiscoveryCandidateRow::mark_used(
+                            user_id,
+                            &profile_name,
+                            &candidate.artist,
+                            &candidate.track,
+                        )
+                        .await?;
+                        DiscoveryHistoryRow::record(
+                            user_id,
+                            &candidate.artist,
+                            &candidate.track,
+                            &profile_name,
+                        )
+                        .await?;
+                        break;
+                    }
                 }
-            } else {
-                // No importer available - fall back to raw move
-                let filename = src
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                if filename.is_empty() {
+            }
+
+            if queued.is_empty() {
+                break;
+            }
+
+            // Phase 2: Wait for downloads to complete, then move to Discovery/
+            info!(
+                "{}: {} downloads queued, waiting for completion (attempt {})...",
+                profile_name,
+                queued.len(),
+                _attempt + 1,
+            );
+            let download_base = crate::config::CONFIG.download_path().clone();
+
+            // Poll slskd until all queued downloads are complete (or timeout after 10 min)
+            let wait_start = tokio::time::Instant::now();
+            let max_wait = tokio::time::Duration::from_secs(600);
+            let mut remaining_filenames: std::collections::HashSet<String> =
+                queued.iter().map(|q| q.slskd_filename.clone()).collect();
+
+            while !remaining_filenames.is_empty() && wait_start.elapsed() < max_wait {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                let downloads = match backend.get_downloads().await {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+
+                let mut newly_done = Vec::new();
+                for fname in remaining_filenames.iter() {
+                    let matched = downloads.iter().find(|d| {
+                        crate::server_fns::download::monitor::filenames_match(&d.item, fname)
+                    });
+                    if let Some(dl) = matched {
+                        let done = matches!(
+                            dl.state,
+                            shared::download::DownloadState::Completed
+                                | shared::download::DownloadState::Failed(_)
+                                | shared::download::DownloadState::Cancelled
+                        );
+                        if done {
+                            newly_done.push(fname.clone());
+                        }
+                    }
+                }
+                for fname in &newly_done {
+                    remaining_filenames.remove(fname);
+                }
+            }
+
+            if !remaining_filenames.is_empty() {
+                warn!(
+                    "{}: {} downloads didn't complete within timeout",
+                    profile_name,
+                    remaining_filenames.len()
+                );
+            }
+
+            // Phase 3: Import completed files into Discovery/{profile}/ via beets and record in DB
+            let importer = crate::services::music_importer(None).await;
+            let profile_path = folder.discovery_profile_path(&profile_name);
+            let discovery_target = std::path::PathBuf::from(&profile_path);
+
+            for qt in &queued {
+                if remaining_filenames.contains(&qt.slskd_filename) {
+                    warn!(
+                        "Skipping '{}' - {} (download timed out)",
+                        qt.artist, qt.track
+                    );
                     continue;
                 }
-                let dest = format!("{}/{}", profile_path, filename);
-                if let Err(e) = tokio::fs::rename(&src_path, &dest).await {
-                    if e.raw_os_error() == Some(18) {
-                        if let Err(e) = tokio::fs::copy(&src_path, &dest).await {
-                            warn!("Failed to copy to Discovery/: {}", e);
+
+                let resolved = crate::server_fns::download::utils::resolve_download_path(
+                    &qt.slskd_filename,
+                    &download_base,
+                );
+                let src_path = match resolved {
+                    Some(p) => p,
+                    None => {
+                        warn!(
+                            "Could not find downloaded file for '{}' - {} (slskd: {})",
+                            qt.artist, qt.track, qt.slskd_filename
+                        );
+                        continue;
+                    }
+                };
+
+                // Snapshot files before import so we can detect what beets added
+                let before = collect_files(&discovery_target);
+
+                let src = std::path::Path::new(&src_path);
+                if let Ok(ref imp) = importer {
+                    match imp.import(&[src], &discovery_target, false).await {
+                        Ok(soulbeet::ImportResult::Success) => {
+                            info!("Imported '{}' - {} into Discovery/{}", qt.artist, qt.track, profile_name);
+                        }
+                        Ok(soulbeet::ImportResult::Skipped) => {
+                            warn!("Beets skipped '{}' - {} (duplicate?)", qt.artist, qt.track);
+                            let _ = tokio::fs::remove_file(src).await;
                             continue;
                         }
-                        let _ = tokio::fs::remove_file(&src_path).await;
-                    } else {
-                        warn!("Failed to move to Discovery/: {}", e);
+                        Ok(other) => {
+                            warn!("Beets import issue for '{}' - {}: {:?}", qt.artist, qt.track, other);
+                            let _ = tokio::fs::remove_file(src).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!("Beets import failed for '{}' - {}: {}", qt.artist, qt.track, e);
+                            let _ = tokio::fs::remove_file(src).await;
+                            continue;
+                        }
+                    }
+                } else {
+                    // No importer available - fall back to raw move
+                    let filename = src
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if filename.is_empty() {
                         continue;
                     }
+                    let dest = format!("{}/{}", profile_path, filename);
+                    if let Err(e) = tokio::fs::rename(&src_path, &dest).await {
+                        if e.raw_os_error() == Some(18) {
+                            if let Err(e) = tokio::fs::copy(&src_path, &dest).await {
+                                warn!("Failed to copy to Discovery/: {}", e);
+                                continue;
+                            }
+                            let _ = tokio::fs::remove_file(&src_path).await;
+                        } else {
+                            warn!("Failed to move to Discovery/: {}", e);
+                            continue;
+                        }
+                    }
                 }
+
+                // Find the imported file by diffing before/after snapshots
+                let after = collect_files(&discovery_target);
+                let track_path = match find_new_file(&before, &after) {
+                    Some(p) => p,
+                    None => {
+                        warn!(
+                            "Could not find imported file for '{}' - {} in {}",
+                            qt.artist, qt.track, profile_path
+                        );
+                        continue;
+                    }
+                };
+
+                DiscoveryTrackRow::create(
+                    None,
+                    &qt.track,
+                    &qt.artist,
+                    qt.album.as_deref().unwrap_or(""),
+                    &track_path,
+                    folder_id,
+                    &profile_name,
+                )
+                .await?;
+                profile_downloads += 1;
             }
 
-            // Find the imported file by diffing before/after snapshots
-            let after = collect_files(&discovery_target);
-            let track_path = match find_new_file(&before, &after) {
-                Some(p) => p,
-                None => {
-                    warn!(
-                        "Could not find imported file for '{}' - {} in {}",
-                        qt.artist, qt.track, profile_path
-                    );
-                    continue;
-                }
-            };
-
-            DiscoveryTrackRow::create(
-                None,
-                &qt.track,
-                &qt.artist,
-                qt.album.as_deref().unwrap_or(""),
-                &track_path,
-                folder_id,
-                &profile_name,
-            )
-            .await?;
-            profile_downloads += 1;
-        }
+            if (profile_downloads as usize) >= tracks_per_profile {
+                break;
+            }
+            info!(
+                "{}: {}/{} tracks after attempt {}, retrying with more candidates...",
+                profile_name, profile_downloads, tracks_per_profile, _attempt + 1
+            );
+        } // end retry loop
 
         info!(
             "{}: {} tracks imported to Discovery/",
