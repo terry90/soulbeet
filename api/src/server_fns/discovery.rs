@@ -442,10 +442,12 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
             // Poll slskd until all queued downloads are complete (or timeout after 10 min)
             let wait_start = tokio::time::Instant::now();
             let max_wait = tokio::time::Duration::from_secs(600);
-            let mut remaining_filenames: std::collections::HashSet<String> =
+            let mut pending_filenames: std::collections::HashSet<String> =
                 queued.iter().map(|q| q.slskd_filename.clone()).collect();
+            let mut failed_filenames: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
-            while !remaining_filenames.is_empty() && wait_start.elapsed() < max_wait {
+            while !pending_filenames.is_empty() && wait_start.elapsed() < max_wait {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
                 let downloads = match backend.get_downloads().await {
@@ -454,34 +456,46 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                 };
 
                 let mut newly_done = Vec::new();
-                for fname in remaining_filenames.iter() {
+                for fname in pending_filenames.iter() {
                     let matched = downloads.iter().find(|d| {
                         crate::server_fns::download::monitor::filenames_match(&d.item, fname)
                     });
                     if let Some(dl) = matched {
-                        let done = matches!(
-                            dl.state,
-                            shared::download::DownloadState::Completed
-                                | shared::download::DownloadState::Failed(_)
-                                | shared::download::DownloadState::Cancelled
-                        );
-                        if done {
-                            newly_done.push(fname.clone());
+                        match &dl.state {
+                            shared::download::DownloadState::Completed => {
+                                newly_done.push((fname.clone(), true));
+                            }
+                            shared::download::DownloadState::Failed(_)
+                            | shared::download::DownloadState::Cancelled => {
+                                newly_done.push((fname.clone(), false));
+                            }
+                            _ => {}
                         }
                     }
                 }
-                for fname in &newly_done {
-                    remaining_filenames.remove(fname);
+                for (fname, succeeded) in &newly_done {
+                    pending_filenames.remove(fname);
+                    if !succeeded {
+                        failed_filenames.insert(fname.clone());
+                    }
                 }
             }
 
-            stats.downloads_timed_out += remaining_filenames.len() as u32;
-            stats.downloads_completed += (stats.downloads_queued - stats.downloads_timed_out - stats.downloads_failed).max(0);
-            if !remaining_filenames.is_empty() {
+            stats.downloads_timed_out += pending_filenames.len() as u32;
+            stats.downloads_failed += failed_filenames.len() as u32;
+            stats.downloads_completed += (queued.len() - pending_filenames.len() - failed_filenames.len()) as u32;
+            if !pending_filenames.is_empty() {
                 warn!(
                     "{}: {} downloads didn't complete within timeout",
                     profile_name,
-                    remaining_filenames.len()
+                    pending_filenames.len()
+                );
+            }
+            if !failed_filenames.is_empty() {
+                warn!(
+                    "{}: {} downloads failed in slskd",
+                    profile_name,
+                    failed_filenames.len()
                 );
             }
 
@@ -490,12 +504,12 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
             let profile_path = folder.discovery_profile_path(&profile_name);
             let discovery_target = std::path::PathBuf::from(&profile_path);
 
+            // Skip both timed-out and slskd-failed downloads
+            let skip_filenames: std::collections::HashSet<&String> =
+                pending_filenames.iter().chain(failed_filenames.iter()).collect();
+
             for qt in &queued {
-                if remaining_filenames.contains(&qt.slskd_filename) {
-                    warn!(
-                        "Skipping '{}' - {} (download timed out)",
-                        qt.artist, qt.track
-                    );
+                if skip_filenames.contains(&qt.slskd_filename) {
                     continue;
                 }
 
