@@ -475,7 +475,9 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                     });
                     if let Some(dl) = matched {
                         match &dl.state {
-                            shared::download::DownloadState::Completed => {
+                            shared::download::DownloadState::Completed
+                            | shared::download::DownloadState::Imported
+                            | shared::download::DownloadState::ImportSkipped => {
                                 newly_done.push((fname.clone(), true));
                             }
                             shared::download::DownloadState::Failed(_)
@@ -791,9 +793,18 @@ fn find_new_file(
     before: &std::collections::HashSet<std::path::PathBuf>,
     after: &std::collections::HashSet<std::path::PathBuf>,
 ) -> Option<String> {
+    let audio_ext = ["flac", "mp3", "m4a", "ogg", "aac", "wav", "wma", "opus"];
     let new_files: Vec<_> = after.difference(before).collect();
+    // Prefer audio files over cover art or other non-audio files
     new_files
-        .first()
+        .iter()
+        .find(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| audio_ext.contains(&e.to_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .or(new_files.first())
         .map(|p| p.to_string_lossy().to_string())
 }
 
