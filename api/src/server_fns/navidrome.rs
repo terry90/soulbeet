@@ -216,6 +216,16 @@ pub async fn get_deletion_history() -> Result<Vec<DeletionReview>, ServerFnError
         .map_err(server_error)
 }
 
+/// Check if the Soulbeet player in Navidrome has ReportRealPath enabled.
+/// Returns Some(true) if enabled, Some(false) if disabled, None if player not found yet.
+#[cfg(feature = "server")]
+pub async fn check_report_real_path(user_id: &str) -> Result<Option<bool>, String> {
+    let client = navidrome_client_for_user(user_id).await?;
+    let players = client.get_players().await.map_err(|e| e.to_string())?;
+    let soulbeet = players.iter().find(|p| p.client == "Soulbeet");
+    Ok(soulbeet.map(|p| p.report_real_path))
+}
+
 /// Resolve a Navidrome relative path to a local absolute path.
 ///
 /// Navidrome stores paths relative to its library root (e.g.
