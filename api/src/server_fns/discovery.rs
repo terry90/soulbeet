@@ -532,7 +532,7 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                 };
 
                 // Snapshot files before import so we can detect what beets added
-                let before = collect_files(&discovery_target);
+                let before = collect_files(&discovery_target).await;
 
                 let src = std::path::Path::new(&src_path);
                 if let Ok(ref imp) = importer {
@@ -584,30 +584,29 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                     }
                 }
 
-                // Find the imported file by diffing before/after snapshots
-                let after = collect_files(&discovery_target);
-                let track_path = match find_new_file(&before, &after) {
-                    Some(p) => p,
-                    None => {
-                        warn!(
-                            "Could not find imported file for '{}' - {} in {}",
-                            qt.artist, qt.track, profile_path
-                        );
-                        stats.imports_file_missing += 1;
-                        continue;
-                    }
-                };
-
-                DiscoveryTrackRow::create(
-                    None,
-                    &qt.track,
-                    &qt.artist,
-                    qt.album.as_deref().unwrap_or(""),
-                    &track_path,
-                    folder_id,
-                    &profile_name,
-                )
-                .await?;
+                // Find imported files by diffing before/after snapshots
+                let after = collect_files(&discovery_target).await;
+                let new_files = find_new_files(&before, &after);
+                if new_files.is_empty() {
+                    warn!(
+                        "Could not find imported file for '{}' - {} in {}",
+                        qt.artist, qt.track, profile_path
+                    );
+                    stats.imports_file_missing += 1;
+                    continue;
+                }
+                for track_path in &new_files {
+                    DiscoveryTrackRow::create(
+                        None,
+                        &qt.track,
+                        &qt.artist,
+                        qt.album.as_deref().unwrap_or(""),
+                        track_path,
+                        folder_id,
+                        &profile_name,
+                    )
+                    .await?;
+                }
                 stats.imports_succeeded += 1;
                 profile_downloads += 1;
             }
@@ -772,20 +771,21 @@ pub async fn generate_recommendations() -> Result<u32, ServerFnError> {
         .map_err(server_error)
 }
 
-/// Collect all music file paths under a directory (recursive).
+/// Collect all file paths under a directory (recursive, async).
 /// Used to snapshot before/after beets import to find what was added.
 #[cfg(feature = "server")]
-fn collect_files(dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+async fn collect_files(dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
     let mut files = std::collections::HashSet::new();
-    fn walk(dir: &std::path::Path, files: &mut std::collections::HashSet<std::path::PathBuf>) {
-        let entries = match std::fs::read_dir(dir) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&current).await {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => continue,
         };
-        for entry in entries.flatten() {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.is_dir() {
-                walk(&path, files);
+                stack.push(path);
             } else if path.is_file() {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ext != "nsp" && ext != "db" {
@@ -794,29 +794,33 @@ fn collect_files(dir: &std::path::Path) -> std::collections::HashSet<std::path::
             }
         }
     }
-    walk(dir, &mut files);
     files
 }
 
-/// Find the file that was added after a beets import by comparing before/after snapshots.
+/// Find all files added after a beets import by comparing before/after snapshots.
+/// Returns only audio files when possible, falls back to any new file.
 #[cfg(feature = "server")]
-fn find_new_file(
+fn find_new_files(
     before: &std::collections::HashSet<std::path::PathBuf>,
     after: &std::collections::HashSet<std::path::PathBuf>,
-) -> Option<String> {
+) -> Vec<String> {
     let audio_ext = ["flac", "mp3", "m4a", "ogg", "aac", "wav", "wma", "opus"];
     let new_files: Vec<_> = after.difference(before).collect();
-    // Prefer audio files over cover art or other non-audio files
-    new_files
+    let audio_files: Vec<String> = new_files
         .iter()
-        .find(|p| {
+        .filter(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
                 .map(|e| audio_ext.contains(&e.to_lowercase().as_str()))
                 .unwrap_or(false)
         })
-        .or(new_files.first())
         .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    if audio_files.is_empty() {
+        new_files.iter().map(|p| p.to_string_lossy().to_string()).collect()
+    } else {
+        audio_files
+    }
 }
 
 /// Import a file into a target directory via beets, with raw-move fallback.
