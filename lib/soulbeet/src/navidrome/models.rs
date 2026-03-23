@@ -181,3 +181,13 @@ pub struct SubsonicPlaylistDetail {
     #[serde(default)]
     pub entry: Vec<SubsonicSong>,
 }
+
+/// A player registered with Navidrome (native API: GET /api/player).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerInfo {
+    pub id: String,
+    pub name: String,
+    pub client: String,
+    pub report_real_path: bool,
+}
