@@ -35,6 +35,7 @@ pub enum DownloadState {
     ImportFailed,
     Aborted,
     Cancelled,
+    Rejected,
     Unknown(String),
 }
 
@@ -46,6 +47,7 @@ impl From<String> for DownloadState {
             "Completed" => DownloadState::Downloaded,
             "Aborted" => DownloadState::Aborted,
             "Cancelled" => DownloadState::Cancelled,
+            "Rejected" => DownloadState::Rejected,
             "Errored" => DownloadState::Errored,
             "Importing" => DownloadState::Importing,
             "Imported" => DownloadState::Imported,
@@ -179,6 +181,56 @@ impl FileEntry {
     }
 }
 
+/// Map slskd's TransferStates bitfield to a DownloadState.
+///
+/// TransferStates is a flags enum: Completed=16, Succeeded=32,
+/// Cancelled=64, TimedOut=128, Errored=256, Rejected=512,
+/// Aborted=1024. Queued=2, InProgress=8. Locally=2048, Remotely=4096.
+///
+/// Check terminal reasons first (Completed + reason flag), then active states.
+fn bitfield_to_download_state(value: u64) -> DownloadState {
+    const COMPLETED: u64 = 16;
+    const SUCCEEDED: u64 = 32;
+    const CANCELLED: u64 = 64;
+    const TIMED_OUT: u64 = 128;
+    const ERRORED: u64 = 256;
+    const REJECTED: u64 = 512;
+    const ABORTED: u64 = 1024;
+    const QUEUED: u64 = 2;
+    const IN_PROGRESS: u64 = 8;
+
+    if value & COMPLETED != 0 {
+        if value & SUCCEEDED != 0 {
+            return DownloadState::Downloaded;
+        }
+        if value & REJECTED != 0 {
+            return DownloadState::Rejected;
+        }
+        if value & CANCELLED != 0 {
+            return DownloadState::Cancelled;
+        }
+        if value & TIMED_OUT != 0 {
+            return DownloadState::Errored;
+        }
+        if value & ERRORED != 0 {
+            return DownloadState::Errored;
+        }
+        if value & ABORTED != 0 {
+            return DownloadState::Aborted;
+        }
+        return DownloadState::Downloaded;
+    }
+
+    if value & IN_PROGRESS != 0 {
+        return DownloadState::InProgress;
+    }
+    if value & QUEUED != 0 {
+        return DownloadState::Queued;
+    }
+
+    DownloadState::Unknown(format!("bitfield:{}", value))
+}
+
 fn deserialize_download_state<'de, D>(deserializer: D) -> Result<Vec<DownloadState>, D::Error>
 where
     D: Deserializer<'de>,
@@ -190,6 +242,20 @@ where
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
             formatter.write_str("a comma-separated string or a sequence of DownloadStates")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![bitfield_to_download_state(value)])
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_u64(value as u64)
         }
 
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -476,11 +542,27 @@ impl From<AlbumResult> for crate::download::DownloadableGroup {
 
 impl From<FileEntry> for crate::download::DownloadProgress {
     fn from(entry: FileEntry) -> Self {
-        let state = entry
-            .state
-            .first()
-            .cloned()
-            .unwrap_or(DownloadState::Unknown("unknown".into()));
+        // Check all state elements, preferring error/rejection states over success.
+        // This prevents "Completed, Rejected" from being treated as Downloaded
+        // when only the first element is checked.
+        let state = if let Some(priority_state) = entry.state.iter().find(|s| {
+            matches!(
+                s,
+                DownloadState::Rejected
+                    | DownloadState::Errored
+                    | DownloadState::Aborted
+                    | DownloadState::Cancelled
+                    | DownloadState::ImportFailed
+            )
+        }) {
+            priority_state.clone()
+        } else {
+            entry
+                .state
+                .first()
+                .cloned()
+                .unwrap_or(DownloadState::Unknown("unknown".into()))
+        };
         Self {
             id: entry.id,
             source: entry.username,
@@ -509,6 +591,7 @@ impl From<DownloadState> for crate::download::DownloadState {
             DownloadState::ImportFailed => DS::Failed("Import failed".into()),
             DownloadState::Aborted => DS::Failed("Aborted".into()),
             DownloadState::Cancelled => DS::Cancelled,
+            DownloadState::Rejected => DS::Failed("Transfer rejected by peer".into()),
             DownloadState::Unknown(s) => DS::Failed(format!("Unknown state: {s}")),
         }
     }
