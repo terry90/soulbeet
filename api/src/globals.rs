@@ -230,6 +230,13 @@ async fn run_automation() {
         return;
     }
 
+    // Reset any tracks stuck in Promoting from a previous crash
+    if let Ok(reset_count) = crate::models::discovery_playlist::DiscoveryTrackRow::reset_stale_promoting().await {
+        if reset_count > 0 {
+            info!("Automation: reset {} stale Promoting tracks", reset_count);
+        }
+    }
+
     // 0. Check ReportRealPath configuration for each user
     for user in &connected_users {
         match crate::server_fns::navidrome::check_report_real_path(&user.id).await {

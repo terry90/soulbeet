@@ -74,9 +74,6 @@ pub struct TrackActionRequest {
 
 #[post("/api/discovery/promote", auth: AuthSession)]
 pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    #[cfg(feature = "server")]
-    use crate::models::discovery_history::DiscoveryHistoryRow;
-
     let track = DiscoveryTrackRow::get_by_id(&req.track_id)
         .await
         .map_err(server_error)?
@@ -91,24 +88,9 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
         return Err(server_error("Not authorized to modify this track"));
     }
 
-    let src = std::path::PathBuf::from(&track.path);
-    if !src.exists() {
-        return Err(server_error(format!("File not found: {}", track.path)));
-    }
-
-    let target = std::path::PathBuf::from(&folder.path);
-    import_or_move(&src, &target).await.map_err(server_error)?;
-
-    DiscoveryTrackRow::update_status(&req.track_id, &DiscoveryStatus::Promoted)
+    super::navidrome::promote_discovery_track_internal(&req.track_id, &auth.0.sub)
         .await
-        .map_err(server_error)?;
-
-    if let Err(e) = DiscoveryHistoryRow::update_outcome(&auth.0.sub, &track.artist, &track.title, "promoted").await {
-        warn!("Failed to update history for promoted track '{}': {}", track.title, e);
-    }
-
-    info!("Promoted: {} -> {}", track.title, folder.path);
-    Ok(())
+        .map_err(server_error)
 }
 
 #[post("/api/discovery/remove", auth: AuthSession)]
@@ -452,7 +434,12 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
             );
             let download_base = crate::config::CONFIG.download_path().clone();
 
-            // Poll slskd until all queued downloads are complete (or timeout after 10 min)
+            // Poll slskd until all queued downloads are complete (or timeout after 10 min).
+            // Note: This 10-minute timeout starts from enqueue, not from transfer start.
+            // A slow peer (3 min queue wait + 8 min transfer) could exceed it. This is
+            // acceptable because: (1) discovery tracks are single songs, not albums,
+            // (2) most Soulseek transfers start quickly, and (3) timed-out tracks are
+            // recorded in stats with no data loss -- they can be rediscovered later.
             let wait_start = tokio::time::Instant::now();
             let max_wait = tokio::time::Duration::from_secs(600);
             let mut pending_filenames: std::collections::HashSet<String> =

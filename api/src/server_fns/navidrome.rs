@@ -145,19 +145,9 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
 
             if let Some(track) = matching_track {
                 if user_rating >= promote_threshold {
-                    if let Err(e) = promote_discovery_track_internal(&track.id).await {
+                    if let Err(e) = promote_discovery_track_internal(&track.id, user_id).await {
                         warn!("Failed to promote track {}: {}", track.title, e);
                     } else {
-                        info!("Promoted discovery track: {} - {} (rating {})", track.artist, track.title, user_rating);
-                        if let Err(e) = DiscoveryHistoryRow::update_outcome(
-                            user_id,
-                            &track.artist,
-                            &track.title,
-                            "promoted",
-                        )
-                        .await {
-                            warn!("Failed to update history for promoted track '{}': {}", track.title, e);
-                        }
                         promoted_tracks += 1;
                     }
                 } else if user_rating == 1 {
@@ -348,8 +338,14 @@ pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
 }
 
 #[cfg(feature = "server")]
-async fn promote_discovery_track_internal(track_id: &str) -> Result<(), String> {
+pub(crate) async fn promote_discovery_track_internal(track_id: &str, user_id: &str) -> Result<(), String> {
+    use crate::models::discovery_history::DiscoveryHistoryRow;
     use crate::models::folder::Folder;
+
+    // CAS guard: only one caller can promote a given track
+    if !DiscoveryTrackRow::try_set_promoting(track_id).await? {
+        return Err("Track is no longer pending (already promoted, removed, or being promoted)".to_string());
+    }
 
     let track = DiscoveryTrackRow::get_by_id(track_id)
         .await?
@@ -361,13 +357,24 @@ async fn promote_discovery_track_internal(track_id: &str) -> Result<(), String> 
 
     let src = std::path::PathBuf::from(&track.path);
     if !src.exists() {
+        // File missing -- revert to Pending so expiry can handle it
+        let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
         return Err(format!("Source file not found: {}", track.path));
     }
 
     let target = std::path::PathBuf::from(&folder.path);
-    crate::server_fns::discovery::import_or_move(&src, &target).await?;
+    if let Err(e) = crate::server_fns::discovery::import_or_move(&src, &target).await {
+        // Import failed -- revert to Pending
+        let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
+        return Err(e);
+    }
 
     DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Promoted).await?;
+
+    if let Err(e) = DiscoveryHistoryRow::update_outcome(user_id, &track.artist, &track.title, "promoted").await {
+        warn!("Failed to update history for promoted track '{}': {}", track.title, e);
+    }
+
     info!("Promoted discovery track: {} -> {}", track.title, folder.path);
     Ok(())
 }
