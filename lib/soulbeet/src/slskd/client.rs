@@ -947,10 +947,63 @@ impl SoulseekClient {
         }
     }
 
-    pub async fn check_connection(&self) -> bool {
-        self.make_request::<serde_json::Value, ()>(Method::GET, "session", None)
+    /// Check both slskd connectivity and Soulseek network connection.
+    ///
+    /// Returns Ok(()) if slskd is reachable and connected to Soulseek.
+    /// Returns Err with a descriptive message if either check fails.
+    pub async fn check_connection(&self) -> std::result::Result<(), String> {
+        // First verify slskd is reachable (session endpoint)
+        if self
+            .make_request::<serde_json::Value, ()>(Method::GET, "session", None)
             .await
-            .is_ok()
+            .is_err()
+        {
+            return Err("Cannot reach slskd (session endpoint failed)".to_string());
+        }
+
+        // Then verify Soulseek network connection via application state
+        #[derive(Deserialize)]
+        struct ServerState {
+            #[serde(rename = "isConnected")]
+            is_connected: bool,
+            #[serde(rename = "isLoggedIn")]
+            is_logged_in: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct AppState {
+            server: ServerState,
+        }
+
+        match self
+            .make_request::<AppState, ()>(Method::GET, "application", None)
+            .await
+        {
+            Ok(app_state) => {
+                if !app_state.server.is_connected {
+                    return Err(
+                        "slskd is running but not connected to the Soulseek network. \
+                         Check slskd's connection settings or restart slskd."
+                            .to_string(),
+                    );
+                }
+                if !app_state.server.is_logged_in {
+                    return Err(
+                        "slskd is connected to Soulseek but not logged in. \
+                         Check slskd's Soulseek username and password."
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to check slskd application state: {}", e);
+                // If we can reach the session endpoint but not the application endpoint,
+                // slskd is reachable but something is off. Return Ok since the basic
+                // connectivity is there -- avoids false negatives on older slskd versions.
+                Ok(())
+            }
+        }
     }
 }
 
@@ -999,6 +1052,12 @@ impl crate::DownloadBackend for SoulseekClient {
     }
 
     async fn health_check(&self) -> bool {
-        self.check_connection().await
+        match self.check_connection().await {
+            Ok(()) => true,
+            Err(msg) => {
+                warn!("Health check failed: {}", msg);
+                false
+            }
+        }
     }
 }
