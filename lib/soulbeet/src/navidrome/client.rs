@@ -504,6 +504,46 @@ impl NavidromeClient {
         Ok(())
     }
 
+    /// Query songs via the native API, filtered to a specific path prefix.
+    /// Returns up to `limit` songs whose path contains the given prefix.
+    /// The native API returns raw `media_file.path` values (relative to library root).
+    pub async fn get_songs_by_path_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<NativeSong>> {
+        let url = self.base_url.join("api/song")
+            .map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("URL error: {}", e),
+            })?;
+
+        let resp = self.native_request(
+            self.client.get(url)
+                .query(&[
+                    ("_start", "0".to_string()),
+                    ("_end", limit.to_string()),
+                    ("_sort", "path".to_string()),
+                    ("_order", "ASC".to_string()),
+                ])
+        ).await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(SoulseekError::Api {
+                status,
+                message: format!("Get songs failed ({})", status),
+            });
+        }
+
+        let songs: Vec<NativeSong> = resp.json().await.map_err(|e| SoulseekError::Api {
+            status: 0,
+            message: format!("Failed to parse songs response: {}", e),
+        })?;
+
+        Ok(songs.into_iter().filter(|s| s.path.contains(prefix)).collect())
+    }
+
     /// List all players visible to the authenticated user via Navidrome's native API.
     /// Non-admin users only see their own players.
     pub async fn get_players(&self) -> Result<Vec<PlayerInfo>> {

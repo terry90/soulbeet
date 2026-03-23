@@ -720,10 +720,34 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
             &profile_name,
         );
 
-        // Navidrome stores paths relative to the music library root,
-        // e.g. "Discovery/Balanced/Artist/Album/track.flac".
-        // The filepath rule just needs the relative directory prefix.
-        let profile_path = format!("Discovery/{}", profile_name);
+        // Derive the Navidrome-relative path prefix by sampling a song from this profile's folder.
+        // The native API returns the raw media_file.path (relative to library root), which is what
+        // the filepath smart playlist operator matches against.
+        let profile_path = match navi.get_songs_by_path_prefix(&profile_name, 50).await {
+            Ok(songs) if !songs.is_empty() => {
+                // Extract the directory prefix from the first song's path.
+                // Song path looks like "Discovery/Balanced/Artist/Album/track.flac"
+                // or "staging/Discovery/Balanced/Artist/Album/track.flac"
+                // We want everything up to and including the profile name.
+                let song_path = &songs[0].path;
+                if let Some(idx) = song_path.find(&format!("{}/", profile_name)) {
+                    let end = idx + profile_name.len();
+                    song_path[..end].to_string()
+                } else {
+                    // Song matched but path doesn't contain profile name as a directory
+                    warn!(
+                        "Could not extract profile prefix from song path '{}', falling back to Discovery/{}",
+                        song_path, profile_name
+                    );
+                    format!("Discovery/{}", profile_name)
+                }
+            }
+            _ => {
+                // No songs imported yet (first run) or API error: use hardcoded default.
+                // This is correct because on first run the folder structure matches the default.
+                format!("Discovery/{}", profile_name)
+            }
+        };
         let comment = format!("Soulbeet discovery ({})", profile_name);
 
         match navi
