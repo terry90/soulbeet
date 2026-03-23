@@ -168,4 +168,29 @@ impl DiscoveryTrackRow {
         Ok(())
     }
 
+    /// Atomically set status to Promoting if currently Pending.
+    /// Returns Ok(true) if the CAS succeeded (this caller owns the promote),
+    /// Ok(false) if another caller already changed the status.
+    pub async fn try_set_promoting(id: &str) -> Result<bool, String> {
+        let result = sqlx::query(
+            "UPDATE discovery_tracks SET status = 'Promoting' WHERE id = ? AND status = 'Pending'",
+        )
+        .bind(id)
+        .execute(&*DB)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Reset any tracks stuck in Promoting back to Pending.
+    /// Called at automation loop start to handle server crashes mid-promote.
+    pub async fn reset_stale_promoting() -> Result<u64, String> {
+        let result = sqlx::query(
+            "UPDATE discovery_tracks SET status = 'Pending' WHERE status = 'Promoting'",
+        )
+        .execute(&*DB)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(result.rows_affected())
+    }
 }

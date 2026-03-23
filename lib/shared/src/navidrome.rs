@@ -57,6 +57,7 @@ pub struct DiscoveryTrack {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DiscoveryStatus {
     Pending,
+    Promoting,
     Promoted,
     Removed,
 }
@@ -65,6 +66,7 @@ impl std::fmt::Display for DiscoveryStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DiscoveryStatus::Pending => write!(f, "Pending"),
+            DiscoveryStatus::Promoting => write!(f, "Promoting"),
             DiscoveryStatus::Promoted => write!(f, "Promoted"),
             DiscoveryStatus::Removed => write!(f, "Removed"),
         }
@@ -76,6 +78,7 @@ impl std::str::FromStr for DiscoveryStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "Pending" => Ok(DiscoveryStatus::Pending),
+            "Promoting" => Ok(DiscoveryStatus::Promoting),
             "Promoted" => Ok(DiscoveryStatus::Promoted),
             "Removed" => Ok(DiscoveryStatus::Removed),
             _ => Err(format!("Unknown discovery status: {}", s)),
