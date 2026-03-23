@@ -248,24 +248,7 @@ impl NavidromeClient {
     }
 
     pub async fn get_all_songs_with_ratings(&self) -> Result<Vec<SubsonicSong>> {
-        let albums = self.get_all_albums().await?;
-        let mut all_songs = Vec::new();
-
-        for album in &albums {
-            match self.get_album(&album.id).await {
-                Ok(detail) => all_songs.extend(detail.song),
-                Err(e) => {
-                    warn!("Failed to get album {}: {}", album.display_name(), e);
-                }
-            }
-        }
-
-        info!(
-            "Fetched {} songs from {} albums",
-            all_songs.len(),
-            albums.len()
-        );
-        Ok(all_songs)
+        self.search_all_songs().await
     }
 
     pub async fn set_rating(&self, id: &str, rating: u8) -> Result<()> {
@@ -334,6 +317,43 @@ impl NavidromeClient {
             song: vec![],
             album: vec![],
         }))
+    }
+
+    /// Fetch all songs from Navidrome using paginated search3 requests.
+    /// Uses an empty query which matches everything in Navidrome's search implementation.
+    /// Returns songs with userRating and path fields populated.
+    pub async fn search_all_songs(&self) -> Result<Vec<SubsonicSong>> {
+        let mut all_songs = Vec::new();
+        let mut offset = 0u32;
+        let page_size = 5000u32;
+        loop {
+            let offset_str = offset.to_string();
+            let size_str = page_size.to_string();
+            let body: SearchResult3Body = self
+                .get(
+                    "search3",
+                    &[
+                        ("query", ""),
+                        ("artistCount", "0"),
+                        ("albumCount", "0"),
+                        ("songCount", &size_str),
+                        ("songOffset", &offset_str),
+                    ],
+                )
+                .await?;
+            let songs = body
+                .search_result
+                .map(|r| r.song)
+                .unwrap_or_default();
+            let count = songs.len() as u32;
+            all_songs.extend(songs);
+            if count < page_size {
+                break;
+            }
+            offset += page_size;
+        }
+        info!("Fetched {} songs via search3", all_songs.len());
+        Ok(all_songs)
     }
 
     // --- Navidrome Native API (for smart playlists) ---
