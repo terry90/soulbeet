@@ -781,15 +781,33 @@ impl SoulseekClient {
                     return all_error("All files failed to enqueue");
                 }
 
-                // Partial success - we can't know which files failed without detailed response
-                // Mark all as success but log the partial failure
+                // Partial success -- mark enqueued files as success, remaining as failed.
+                // We cannot determine which specific files failed from a count-only response,
+                // so we mark the first `enqueued` files as success and the rest as failed.
                 if enqueued > 0 && failed > 0 {
                     warn!(
-                        "Partial enqueue: {} succeeded, {} failed. Cannot determine which files failed.",
-                        enqueued, failed
+                        "Partial enqueue: {} succeeded, {} failed out of {} files. \
+                         Cannot determine which specific files failed from count-based response.",
+                        enqueued, failed, batch.len()
                     );
-                    // Return success for all since we can't distinguish
-                    return all_success();
+                    let mut results = Vec::with_capacity(batch.len());
+                    for (i, f) in batch.iter().enumerate() {
+                        results.push(DownloadResponse {
+                            username: username.to_string(),
+                            filename: f.filename.clone(),
+                            size: f.size as u64,
+                            error: if i < enqueued {
+                                None
+                            } else {
+                                Some(format!(
+                                    "Enqueue failed (count-based response: {} of {} failed)",
+                                    failed,
+                                    batch.len()
+                                ))
+                            },
+                        });
+                    }
+                    return results;
                 }
 
                 // Some were enqueued
