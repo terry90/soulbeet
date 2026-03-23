@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, RwLock};
 #[cfg(feature = "server")]
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "server")]
-use tracing::info;
+use tracing::{info, warn};
 
 /// Interval for cleaning up stale user channels (5 minutes).
 #[cfg(feature = "server")]
@@ -228,6 +228,45 @@ async fn run_automation() {
     if connected_users.is_empty() {
         info!("Automation: no connected Navidrome users, skipping");
         return;
+    }
+
+    // 0. Check ReportRealPath configuration for each user
+    for user in &connected_users {
+        match crate::server_fns::navidrome::check_report_real_path(&user.id).await {
+            Ok(Some(true)) => {
+                // ReportRealPath is enabled. If status was MissingReportRealPath, restore to Connected.
+                if user.navidrome_status == shared::system::NavidromeStatus::MissingReportRealPath.as_str() {
+                    let _ = crate::models::user::User::update_navidrome_token(
+                        &user.id,
+                        user.navidrome_token.as_deref(),
+                        shared::system::NavidromeStatus::Connected.as_str(),
+                    ).await;
+                    let _ = crate::models::user_settings::UserSettings::reset_navidrome_banner(&user.id).await;
+                    info!("Automation: ReportRealPath now enabled for user {}", user.username);
+                }
+            }
+            Ok(Some(false)) => {
+                warn!(
+                    "ReportRealPath is not enabled on the Soulbeet player for user {}. \
+                     Enable it in Navidrome Settings > Players > Soulbeet > ReportRealPath.",
+                    user.username
+                );
+                if user.navidrome_status != shared::system::NavidromeStatus::MissingReportRealPath.as_str() {
+                    let _ = crate::models::user::User::update_navidrome_token(
+                        &user.id,
+                        user.navidrome_token.as_deref(),
+                        shared::system::NavidromeStatus::MissingReportRealPath.as_str(),
+                    ).await;
+                    let _ = crate::models::user_settings::UserSettings::reset_navidrome_banner(&user.id).await;
+                }
+            }
+            Ok(None) => {
+                // Soulbeet player not registered yet -- skip, it gets created on first API call
+            }
+            Err(e) => {
+                info!("Automation: ReportRealPath check failed for {}: {}", user.username, e);
+            }
+        }
     }
 
     // 1. Sync ratings for each connected user

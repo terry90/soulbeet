@@ -99,6 +99,7 @@ pub fn AppConfigManager() -> Element {
                         let auth = use_auth();
                         let (dot_color, status_text) = match auth.navidrome_status() {
                             NavidromeStatus::Connected => ("bg-blue-400", "Connected"),
+                            NavidromeStatus::MissingReportRealPath => ("bg-yellow-500", "ReportRealPath not enabled"),
                             NavidromeStatus::InvalidCredentials => ("bg-beet-accent", "User not found in Navidrome"),
                             NavidromeStatus::Offline => ("bg-gray-500", "Server unreachable"),
                             NavidromeStatus::Unknown => ("bg-gray-500", "Not configured"),

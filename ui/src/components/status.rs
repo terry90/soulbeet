@@ -4,7 +4,7 @@ use shared::system::{NavidromeStatus, SystemHealth};
 #[component]
 pub fn SystemStatus(health: SystemHealth, navidrome_status: NavidromeStatus) -> Element {
     let nav_hint = match navidrome_status {
-        NavidromeStatus::Connected => None,
+        NavidromeStatus::Connected | NavidromeStatus::MissingReportRealPath => None,
         NavidromeStatus::InvalidCredentials => Some("Your username was not found in Navidrome"),
         NavidromeStatus::Unknown => Some("Navidrome credentials not configured"),
         NavidromeStatus::Offline => None,
