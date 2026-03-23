@@ -231,6 +231,10 @@ pub async fn check_report_real_path(user_id: &str) -> Result<Option<bool>, Strin
 /// Navidrome stores paths relative to its library root (e.g.
 /// "Artist/Album/track.flac"). We try prepending each user folder
 /// path and return the first one that exists on disk.
+///
+/// When direct resolution fails and NAVIDROME_MUSIC_PATH is set,
+/// falls back to prefix substitution for Docker deployments where
+/// Navidrome sees different mount points than Soulful.
 #[cfg(feature = "server")]
 fn resolve_navidrome_path(
     navidrome_path: &str,
@@ -248,6 +252,35 @@ fn resolve_navidrome_path(
         let candidate = std::path::PathBuf::from(&folder.path).join(rel);
         if candidate.exists() {
             return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    // Fallback: NAVIDROME_MUSIC_PATH prefix substitution for Docker setups.
+    // When Navidrome sees "/data/Music/Artist/Album/track.flac" but Soulful
+    // sees "/music/Artist/Album/track.flac", strip the Navidrome prefix and
+    // prepend each local folder path.
+    if let Ok(navidrome_prefix) = std::env::var("NAVIDROME_MUSIC_PATH") {
+        let navidrome_prefix = navidrome_prefix.trim_end_matches('/');
+
+        let relative = if navidrome_path.starts_with(navidrome_prefix) {
+            let rest = &navidrome_path[navidrome_prefix.len()..];
+            // Boundary check: next char must be '/' or exact match (prevents
+            // /data/music matching /data/music-archives/...)
+            if rest.is_empty() || rest.starts_with('/') {
+                rest.trim_start_matches('/')
+            } else {
+                return None;
+            }
+        } else {
+            // Path doesn't have the Navidrome prefix, try it as-is (already relative)
+            navidrome_path
+        };
+
+        for folder in folders {
+            let candidate = std::path::PathBuf::from(&folder.path).join(relative);
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
         }
     }
 
