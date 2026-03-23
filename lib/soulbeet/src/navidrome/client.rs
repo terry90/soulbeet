@@ -1,6 +1,5 @@
 use reqwest::Client;
 use std::time::Duration as StdDuration;
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -503,5 +502,32 @@ impl NavidromeClient {
         }
 
         Ok(())
+    }
+
+    /// List all players visible to the authenticated user via Navidrome's native API.
+    /// Non-admin users only see their own players.
+    pub async fn get_players(&self) -> Result<Vec<PlayerInfo>> {
+        let url = self
+            .base_url
+            .join("api/player")
+            .map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("URL error: {}", e),
+            })?;
+
+        let resp = self.native_request(self.client.get(url)).await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(SoulseekError::Api {
+                status,
+                message: format!("Get players failed ({})", status),
+            });
+        }
+
+        resp.json().await.map_err(|e| SoulseekError::Api {
+            status: 0,
+            message: format!("Failed to parse players response: {}", e),
+        })
     }
 }
