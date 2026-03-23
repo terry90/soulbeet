@@ -191,3 +191,14 @@ pub struct PlayerInfo {
     pub client: String,
     pub report_real_path: bool,
 }
+
+/// A song from Navidrome's native API (GET /api/song).
+/// The `path` field is the raw `media_file.path` from the database,
+/// relative to the library root (not transformed by ReportRealPath).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSong {
+    pub id: String,
+    pub path: String,
+    pub title: String,
+}
