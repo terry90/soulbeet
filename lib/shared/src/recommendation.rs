@@ -193,6 +193,21 @@ pub struct CandidateSet {
     pub candidates: std::collections::HashMap<String, Candidate>,
 }
 
+/// Normalize a string for cross-source matching.
+/// Lowercases, strips non-alphanumeric characters (keeps whitespace),
+/// then collapses whitespace. Handles cases like "don't" vs "dont",
+/// "AC/DC" vs "ACDC", and whitespace differences between Last.fm
+/// and MusicBrainz names.
+fn normalize_for_matching(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl CandidateSet {
     pub fn new() -> Self {
         Self {
@@ -202,7 +217,11 @@ impl CandidateSet {
 
     /// Generate a key for deduplication
     pub fn key(artist: &str, track: &str) -> String {
-        format!("{}:{}", artist.to_lowercase(), track.to_lowercase())
+        format!(
+            "{}:{}",
+            normalize_for_matching(artist),
+            normalize_for_matching(track)
+        )
     }
 
     /// Insert or update a candidate, merging signals and accumulating score
