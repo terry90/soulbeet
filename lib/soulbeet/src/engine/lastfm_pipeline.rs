@@ -415,7 +415,7 @@ impl CandidateGenerator for LastFmPipeline {
         &self,
         profile: &UserMusicProfile,
         config: &ProfileConfig,
-    ) -> Result<(CandidateSet, Vec<SignalReport>)> {
+    ) -> Result<(CandidateSet, Vec<SignalReport>, usize)> {
         info!("Running Last.fm candidate generation pipeline");
         let mut combined = CandidateSet::new();
         let mut cache = ArtistCache::new();
@@ -453,7 +453,7 @@ impl CandidateGenerator for LastFmPipeline {
             combined.len(),
             cache.popularity.len() + cache.genre.len(),
         );
-        Ok((combined, signal_reports))
+        Ok((combined, signal_reports, 0))
     }
 }
 

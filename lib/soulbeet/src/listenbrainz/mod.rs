@@ -1,6 +1,8 @@
 pub mod client;
 pub mod models;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -14,18 +16,25 @@ use shared::recommendation::{
 
 pub struct ListenBrainzProvider {
     client: ListenBrainzClient,
+    mbid_failures: AtomicUsize,
 }
 
 impl ListenBrainzProvider {
     pub fn new(username: impl Into<String>, token: Option<String>) -> Self {
         Self {
             client: ListenBrainzClient::new(username, token),
+            mbid_failures: AtomicUsize::new(0),
         }
     }
 
     /// Access the underlying client for direct API calls (used by the engine).
     pub fn client(&self) -> &ListenBrainzClient {
         &self.client
+    }
+
+    /// Reset the MBID failure counter and return the accumulated count.
+    pub fn take_mbid_failures(&self) -> usize {
+        self.mbid_failures.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -88,6 +97,7 @@ impl ScrobbleProvider for ListenBrainzProvider {
         let mbid = match self.client.lookup_artist_mbid(artist).await? {
             Some(id) => id,
             None => {
+                self.mbid_failures.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "Could not resolve MBID for artist '{}', returning no tags",
                     artist
@@ -126,6 +136,7 @@ impl ScrobbleProvider for ListenBrainzProvider {
         let mbid = match self.client.lookup_artist_mbid(artist).await? {
             Some(id) => id,
             None => {
+                self.mbid_failures.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "Could not resolve MBID for artist '{}', returning default popularity",
                     artist
@@ -167,6 +178,7 @@ impl ScrobbleProvider for ListenBrainzProvider {
         let mbid = match self.client.lookup_artist_mbid(artist).await? {
             Some(id) => id,
             None => {
+                self.mbid_failures.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "Could not resolve MBID for artist '{}', returning no similar artists",
                     artist
@@ -215,6 +227,7 @@ impl ScrobbleProvider for ListenBrainzProvider {
         let mbid = match self.client.lookup_artist_mbid(artist).await? {
             Some(id) => id,
             None => {
+                self.mbid_failures.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "Could not resolve MBID for artist '{}', returning no similar tracks",
                     artist
@@ -301,6 +314,7 @@ impl ScrobbleProvider for ListenBrainzProvider {
         let mbid = match self.client.lookup_artist_mbid(artist).await? {
             Some(id) => id,
             None => {
+                self.mbid_failures.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "Could not resolve MBID for artist '{}', returning no top tracks",
                     artist

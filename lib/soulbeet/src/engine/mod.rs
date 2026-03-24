@@ -109,27 +109,27 @@ pub async fn recommend(
         target_count
     );
 
-    let mut report = EngineReport::default();
-
-    // Populate profile summary
-    report.profile_summary = ProfileSummary {
-        genre_count: profile.genre_distribution.len(),
-        top_genres: profile
-            .genre_distribution
-            .iter()
-            .take(5)
-            .map(|t| t.name.clone())
-            .collect(),
-        obscurity_score: profile.obscurity_score,
-        repeat_ratio: profile.repeat_ratio,
-        freshness_half_life_days: profile.freshness_half_life_days,
-        momentum_artists: profile
-            .momentum_artists
-            .iter()
-            .map(|a| a.name.clone())
-            .collect(),
-        comfort_tags: profile.tag_comfort_zone.len(),
-        exploration_tags: profile.tag_exploration_zone.len(),
+    let mut report = EngineReport {
+        profile_summary: ProfileSummary {
+            genre_count: profile.genre_distribution.len(),
+            top_genres: profile
+                .genre_distribution
+                .iter()
+                .take(5)
+                .map(|t| t.name.clone())
+                .collect(),
+            obscurity_score: profile.obscurity_score,
+            repeat_ratio: profile.repeat_ratio,
+            freshness_half_life_days: profile.freshness_half_life_days,
+            momentum_artists: profile
+                .momentum_artists
+                .iter()
+                .map(|a| a.name.clone())
+                .collect(),
+            comfort_tags: profile.tag_comfort_zone.len(),
+            exploration_tags: profile.tag_exploration_zone.len(),
+        },
+        ..Default::default()
     };
 
     // Step 1: Generate candidates from each pipeline.
@@ -151,13 +151,14 @@ pub async fn recommend(
                     name: format!("{} (TIMEOUT)", generator.name()),
                     signals: vec![],
                     total_candidates: 0,
+                    mbid_failures: 0,
                 });
                 continue;
             }
         };
 
         match result {
-            Ok((set, signal_reports)) => {
+            Ok((set, signal_reports, mbid_failures)) => {
                 info!(
                     "Generator '{}' produced {} candidates",
                     generator.name(),
@@ -167,6 +168,7 @@ pub async fn recommend(
                     name: generator.name().to_string(),
                     signals: signal_reports,
                     total_candidates: set.len(),
+                    mbid_failures,
                 });
                 source_sets.push((generator.name(), set));
             }
@@ -176,6 +178,7 @@ pub async fn recommend(
                     name: format!("{} (ERROR: {})", generator.name(), e),
                     signals: vec![],
                     total_candidates: 0,
+                    mbid_failures: 0,
                 });
             }
         }

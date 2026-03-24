@@ -184,5 +184,5 @@ pub trait CandidateGenerator: Send + Sync {
         &self,
         profile: &UserMusicProfile,
         config: &ProfileConfig,
-    ) -> Result<(CandidateSet, Vec<SignalReport>)>;
+    ) -> Result<(CandidateSet, Vec<SignalReport>, usize)>;
 }

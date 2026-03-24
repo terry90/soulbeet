@@ -332,11 +332,14 @@ impl CandidateGenerator for ListenBrainzPipeline {
         &self,
         profile: &UserMusicProfile,
         config: &ProfileConfig,
-    ) -> Result<(CandidateSet, Vec<SignalReport>)> {
+    ) -> Result<(CandidateSet, Vec<SignalReport>, usize)> {
         info!("Running ListenBrainz candidate generation pipeline");
         let mut combined = CandidateSet::new();
         let mut cache = ArtistCache::new();
         let mut signal_reports = Vec::new();
+
+        // Discard any stale MBID failure count from prior runs or profile building
+        self.provider.take_mbid_failures();
 
         // The cache accumulates across signals within this pipeline run.
         let collab = self.signal_collab_filter(profile, config, &mut cache).await;
@@ -363,12 +366,14 @@ impl CandidateGenerator for ListenBrainzPipeline {
             combined.insert(c);
         }
 
+        let mbid_failures = self.provider.take_mbid_failures();
         info!(
-            "ListenBrainz pipeline total: {} unique candidates ({} artists cached)",
+            "ListenBrainz pipeline total: {} unique candidates ({} artists cached, {} MBID failures)",
             combined.len(),
             cache.popularity.len() + cache.genre.len(),
+            mbid_failures,
         );
-        Ok((combined, signal_reports))
+        Ok((combined, signal_reports, mbid_failures))
     }
 }
 
