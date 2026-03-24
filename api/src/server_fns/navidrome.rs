@@ -93,6 +93,15 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                         }
                         // Navidrome stores relative paths from its library root.
                         // Resolve to a local absolute path by trying each user folder.
+                        if real_path_failures == 0 {
+                            warn!(
+                                "Auto-delete debug: navidrome_path={:?}, folder_count={}, folder_paths={:?}, NAVIDROME_MUSIC_PATH={:?}",
+                                path_str,
+                                folders.len(),
+                                folders.iter().map(|f| &f.path).collect::<Vec<_>>(),
+                                std::env::var("NAVIDROME_MUSIC_PATH").ok()
+                            );
+                        }
                         if let Some(local_path) = resolve_navidrome_path(path_str, &folders) {
                             let path = std::path::Path::new(&local_path);
                             if let Err(e) = tokio::fs::remove_file(path).await {
