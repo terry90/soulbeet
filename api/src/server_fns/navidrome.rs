@@ -93,15 +93,6 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                         }
                         // Navidrome stores relative paths from its library root.
                         // Resolve to a local absolute path by trying each user folder.
-                        if real_path_failures == 0 {
-                            warn!(
-                                "Auto-delete debug: navidrome_path={:?}, folder_count={}, folder_paths={:?}, NAVIDROME_MUSIC_PATH={:?}",
-                                path_str,
-                                folders.len(),
-                                folders.iter().map(|f| &f.path).collect::<Vec<_>>(),
-                                std::env::var("NAVIDROME_MUSIC_PATH").ok()
-                            );
-                        }
                         if let Some(local_path) = resolve_navidrome_path(path_str, &folders) {
                             let path = std::path::Path::new(&local_path);
                             if let Err(e) = tokio::fs::remove_file(path).await {
@@ -276,6 +267,25 @@ fn resolve_navidrome_path(
         };
 
         for folder in folders {
+            let folder_path = std::path::Path::new(&folder.path);
+
+            // If the relative path starts with this folder's basename, strip it
+            // to avoid doubling. Example: folder="/music/common", relative="common/Artist/track.flac"
+            // -> join as "/music/common/Artist/track.flac", not "/music/common/common/Artist/track.flac"
+            if let Some(folder_name) = folder_path.file_name().and_then(|n| n.to_str()) {
+                if relative.starts_with(folder_name) {
+                    let after = &relative[folder_name.len()..];
+                    if after.is_empty() || after.starts_with('/') {
+                        let sub = after.trim_start_matches('/');
+                        let candidate = folder_path.join(sub);
+                        if candidate.exists() {
+                            return Some(candidate.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+
+            // Also try full relative path (for flat library layouts)
             let candidate = std::path::PathBuf::from(&folder.path).join(relative);
             if candidate.exists() {
                 return Some(candidate.to_string_lossy().to_string());
