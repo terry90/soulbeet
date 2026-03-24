@@ -232,65 +232,42 @@ fn resolve_navidrome_path(
 ) -> Option<String> {
     let rel = std::path::Path::new(navidrome_path);
 
-    // Already absolute and exists (e.g. ReportRealPath enabled with same mount)
+    // 1. Path exists as-is (same machine, same mounts)
     if rel.is_absolute() && rel.exists() {
         return Some(navidrome_path.to_string());
     }
 
-    // Try each folder as the library root
-    for folder in folders {
-        let candidate = std::path::PathBuf::from(&folder.path).join(rel);
-        if candidate.exists() {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-    }
-
-    // Fallback: NAVIDROME_MUSIC_PATH prefix substitution for Docker setups.
-    // When Navidrome sees "/data/Music/Artist/Album/track.flac" but Soulful
-    // sees "/music/Artist/Album/track.flac", strip the Navidrome prefix and
-    // prepend each local folder path.
-    if let Ok(navidrome_prefix) = std::env::var("NAVIDROME_MUSIC_PATH") {
-        let navidrome_prefix = navidrome_prefix.trim_end_matches('/');
-
-        let relative = if navidrome_path.starts_with(navidrome_prefix) {
-            let rest = &navidrome_path[navidrome_prefix.len()..];
-            // Boundary check: next char must be '/' or exact match (prevents
-            // /data/music matching /data/music-archives/...)
-            if rest.is_empty() || rest.starts_with('/') {
-                rest.trim_start_matches('/')
-            } else {
-                return None;
-            }
-        } else {
-            // Path doesn't have the Navidrome prefix, try it as-is (already relative)
-            navidrome_path
-        };
-
+    // 2. Relative path -- prepend each folder root
+    if !rel.is_absolute() {
         for folder in folders {
-            let folder_path = std::path::Path::new(&folder.path);
-
-            // If the relative path starts with this folder's basename, strip it
-            // to avoid doubling. Example: folder="/music/common", relative="common/Artist/track.flac"
-            // -> join as "/music/common/Artist/track.flac", not "/music/common/common/Artist/track.flac"
-            if let Some(folder_name) = folder_path.file_name().and_then(|n| n.to_str()) {
-                if relative.starts_with(folder_name) {
-                    let after = &relative[folder_name.len()..];
-                    if after.is_empty() || after.starts_with('/') {
-                        let sub = after.trim_start_matches('/');
-                        let candidate = folder_path.join(sub);
-                        if candidate.exists() {
-                            return Some(candidate.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
-
-            // Also try full relative path (for flat library layouts)
-            let candidate = std::path::PathBuf::from(&folder.path).join(relative);
+            let candidate = std::path::PathBuf::from(&folder.path).join(rel);
             if candidate.exists() {
                 return Some(candidate.to_string_lossy().to_string());
             }
         }
+    }
+
+    // 3. Docker prefix swap: Navidrome sees /media/music, Soulful sees /music.
+    //    Replace the Navidrome prefix with the local root (parent of folder paths).
+    let navi_prefix = std::env::var("NAVIDROME_MUSIC_PATH").ok()?;
+    let navi_prefix = navi_prefix.trim_end_matches('/');
+
+    if !navidrome_path.starts_with(navi_prefix) {
+        return None;
+    }
+    let rest = &navidrome_path[navi_prefix.len()..];
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+
+    let local_root = folders
+        .first()
+        .and_then(|f| std::path::Path::new(&f.path).parent())
+        .map(|p| p.to_string_lossy().to_string())?;
+
+    let resolved = format!("{}{}", local_root, rest);
+    if std::path::Path::new(&resolved).exists() {
+        return Some(resolved);
     }
 
     None
