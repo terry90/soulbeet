@@ -1,6 +1,7 @@
 pub mod album;
 pub mod confirm_modal;
 pub mod cover_art;
+pub mod error_display;
 pub mod dashboard;
 pub mod discovery;
 pub mod downloads;
@@ -16,6 +17,7 @@ pub use album::{Album, AlbumHeader};
 pub use confirm_modal::*;
 pub use cover_art::*;
 pub use downloads::*;
+pub use error_display::*;
 pub use footer::Footer;
 pub use login::Login;
 pub use modal::*;
