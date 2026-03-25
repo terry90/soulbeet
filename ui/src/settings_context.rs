@@ -1,3 +1,4 @@
+use crate::use_auth;
 use api::{ProviderInfo, UpdateUserSettings, UserSettings};
 use dioxus::prelude::*;
 
@@ -128,20 +129,37 @@ pub fn use_settings() -> Settings {
 }
 
 /// Provider component that loads settings and makes them available via context.
+/// Uses use_resource with auth dependency so settings refetch on login/logout.
 #[component]
 pub fn SettingsProvider(children: Element) -> Element {
-    let settings_future = use_server_future(|| async move {
+    let auth = use_auth();
+
+    let settings_resource = use_resource(move || async move {
+        let logged_in = auth.is_logged_in();
+        if !logged_in {
+            return Ok::<_, ServerFnError>((None, vec![]));
+        }
         let (settings_result, providers_result) =
-            futures::join!(api::get_user_settings(), api::get_metadata_providers(),);
-        (settings_result.ok(), providers_result.unwrap_or_default())
-    })?;
+            futures::join!(api::get_user_settings(), api::get_metadata_providers());
+        Ok((settings_result.ok(), providers_result.unwrap_or_default()))
+    });
 
-    let (settings, providers) = settings_future.read().clone().unwrap_or_default();
-    let settings_state = use_signal(|| settings);
-    let providers_state = use_signal(|| providers);
-    let loaded = use_signal(|| true);
+    let mut settings_state = use_signal(|| None::<UserSettings>);
+    let mut providers_state = use_signal(|| Vec::<ProviderInfo>::new());
+    let mut loaded_signal = use_signal(|| false);
 
-    use_context_provider(|| Settings::new(settings_state, providers_state, loaded));
+    use_effect(move || {
+        let (s, p, l) = match &*settings_resource.read() {
+            Some(Ok((s, p))) => (s.clone(), p.clone(), true),
+            Some(Err(_)) => (None, vec![], true),
+            None => return,
+        };
+        settings_state.set(s);
+        providers_state.set(p);
+        loaded_signal.set(l);
+    });
+
+    use_context_provider(|| Settings::new(settings_state, providers_state, loaded_signal));
 
     rsx! { {children} }
 }
