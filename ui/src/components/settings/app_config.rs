@@ -1,26 +1,45 @@
 use dioxus::prelude::*;
 use shared::system::NavidromeStatus;
 
+use crate::friendly_error;
 use crate::settings_context::use_settings;
 use crate::use_auth;
 
 #[component]
 pub fn AppConfigManager() -> Element {
     let mut settings = use_settings();
-    let mut slskd_url = use_signal(String::new);
-    let mut slskd_api_key = use_signal(String::new);
+    let mut config_resource = use_resource(|| async { api::get_app_config().await });
+
+    let config = match &*config_resource.read() {
+        None => {
+            return rsx! {
+                div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
+                    div { class: "animate-pulse text-gray-400 font-mono", "Loading..." }
+                }
+            };
+        }
+        Some(Err(e)) => {
+            let msg = friendly_error(e);
+            return rsx! {
+                div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
+                    h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Connections" }
+                    div { class: "text-red-400 text-sm font-mono mb-3", "{msg}" }
+                    button {
+                        class: "text-xs font-mono text-gray-400 hover:text-white underline decoration-dotted cursor-pointer",
+                        onclick: move |_| config_resource.restart(),
+                        "Retry"
+                    }
+                }
+            };
+        }
+        Some(Ok(data)) => data.clone(),
+    };
+
+    let mut slskd_url = use_signal(|| config.slskd_url.unwrap_or_default());
+    let mut slskd_api_key = use_signal(|| config.slskd_api_key.unwrap_or_default());
     let mut error = use_signal(String::new);
     let mut success_msg = use_signal(String::new);
     let mut saving = use_signal(|| false);
-    let mut loaded = use_signal(|| false);
-
-    use_future(move || async move {
-        if let Ok(config) = api::get_app_config().await {
-            slskd_url.set(config.slskd_url.unwrap_or_default());
-            slskd_api_key.set(config.slskd_api_key.unwrap_or_default());
-            loaded.set(true);
-        }
-    });
 
     let handle_save = move |_| async move {
         error.set(String::new());
@@ -37,18 +56,10 @@ pub fn AppConfigManager() -> Element {
                 let _ = settings.refresh_providers().await;
                 success_msg.set("Configuration saved".to_string());
             }
-            Err(e) => error.set(format!("Failed to save: {e}")),
+            Err(e) => error.set(friendly_error(&e)),
         }
         saving.set(false);
     };
-
-    if !loaded() {
-        return rsx! {
-            div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
-                div { class: "animate-pulse text-gray-400 font-mono", "Loading..." }
-            }
-        };
-    }
 
     rsx! {
         div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
