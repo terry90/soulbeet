@@ -1,7 +1,8 @@
 use dioxus::prelude::*;
-use shared::navidrome::DiscoveryStatus;
+use shared::navidrome::{DiscoveryProgress, DiscoveryStatus, GenerationStatus, ProfilePhase};
 use shared::system::NavidromeStatus;
 
+use crate::friendly_error;
 use crate::use_auth;
 use crate::ConfirmModal;
 
@@ -43,23 +44,65 @@ pub fn DiscoveryOverview() -> Element {
         _ => None,
     };
 
-    let mut generating = use_signal(|| false);
-    let mut error = use_signal(String::new);
-    let mut success_lines: Signal<Vec<String>> = use_signal(Vec::new);
+    // Poll tick drives progress refetch
+    let mut poll_tick = use_signal(|| 0u32);
+
+    let progress = use_resource(move || {
+        let _ = poll_tick();
+        async move { api::get_discovery_progress().await.ok().flatten() }
+    });
+
+    // Derive generating state from server progress (survives page reload per DISC-03)
+    let is_generating = progress
+        .read()
+        .as_ref()
+        .and_then(|p| p.as_ref())
+        .map(|p| p.status == GenerationStatus::Running)
+        .unwrap_or(false);
+
+    // Poll every 2.5s while generation is active
+    use_future(move || async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(2500).await;
+            let is_active = progress
+                .read()
+                .as_ref()
+                .and_then(|p| p.as_ref())
+                .map(|p| p.status == GenerationStatus::Running)
+                .unwrap_or(false);
+            if is_active {
+                poll_tick += 1;
+            }
+        }
+    });
+
+    // Refresh track list when generation completes
+    use_effect(move || {
+        let status = progress
+            .read()
+            .as_ref()
+            .and_then(|p| p.as_ref())
+            .map(|p| p.status.clone());
+        if matches!(status, Some(GenerationStatus::Complete)) {
+            config.restart();
+        }
+    });
+
+    let mut start_error = use_signal(String::new);
 
     let handle_generate = move |_| async move {
-        generating.set(true);
-        error.set(String::new());
-        success_lines.set(vec![]);
+        start_error.set(String::new());
         match api::start_discovery_generation().await {
             Ok(()) => {
-                success_lines.set(vec!["Generation started in background".to_string()]);
-                config.restart();
+                poll_tick += 1;
             }
-            Err(e) => error.set(format!("{e}")),
+            Err(e) => {
+                start_error.set(friendly_error(&e));
+            }
         }
-        generating.set(false);
     };
+
+    let current_progress = progress.read().as_ref().and_then(|p| p.clone()).clone();
 
     let auth = use_auth();
     let nav_status = auth.navidrome_status();
@@ -121,16 +164,18 @@ pub fn DiscoveryOverview() -> Element {
                                     div { class: "flex flex-col items-end gap-2",
                                         button {
                                             class: "retro-btn rounded text-xs",
-                                            disabled: generating(),
+                                            disabled: is_generating,
                                             onclick: handle_generate,
-                                            if generating() { "Generating..." } else { "Generate" }
+                                            if is_generating { "Generating..." } else { "Generate" }
                                         }
-                                        if !error().is_empty() {
-                                            span { class: "text-xs font-mono text-red-400", "{error}" }
+                                        if !start_error().is_empty() {
+                                            span { class: "text-xs font-mono text-red-400", "{start_error}" }
                                         }
-                                        for line in success_lines().iter() {
-                                            span { class: "text-xs font-mono text-green-400 block text-right", "{line}" }
-                                        }
+                                    }
+                                }
+                                if let Some(ref p) = current_progress {
+                                    if p.status != GenerationStatus::Idle {
+                                        ProgressPanel { progress: p.clone() }
                                     }
                                 }
                             }
@@ -142,6 +187,101 @@ pub fn DiscoveryOverview() -> Element {
             }
 
             EngineReportView {}
+        }
+    }
+}
+
+#[component]
+fn ProgressPanel(progress: DiscoveryProgress) -> Element {
+    match progress.status {
+        GenerationStatus::Running => {
+            rsx! {
+                div { class: "mt-4 bg-beet-dark/50 border border-white/10 rounded-lg p-4",
+                    p { class: "text-xs font-mono font-semibold text-white mb-3 uppercase tracking-wider",
+                        "Generating Discovery"
+                    }
+                    div { class: "space-y-2",
+                        for pp in &progress.profiles {
+                            { render_profile_row(pp) }
+                        }
+                    }
+                }
+            }
+        }
+        GenerationStatus::Complete => {
+            let total = progress.result.as_ref().map(|r| r.total_imported).unwrap_or(0);
+            let detail = progress
+                .result
+                .as_ref()
+                .map(|r| {
+                    r.profiles
+                        .iter()
+                        .map(|ps| format!("{}: {}", ps.profile, ps.imports_succeeded))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            rsx! {
+                div { class: "mt-4 bg-beet-dark/50 border border-white/10 rounded-lg p-4",
+                    p { class: "text-xs font-mono text-beet-leaf", "{total} tracks imported" }
+                    if !detail.is_empty() {
+                        p { class: "text-xs font-mono text-gray-400 mt-1", "{detail}" }
+                    }
+                }
+            }
+        }
+        GenerationStatus::Error => {
+            let msg = progress.error.as_deref().unwrap_or("Unknown error");
+            rsx! {
+                div { class: "mt-4 bg-beet-dark/50 border border-white/10 rounded-lg p-4",
+                    p { class: "text-xs font-mono text-red-400", "{msg}" }
+                }
+            }
+        }
+        GenerationStatus::Idle => rsx! {},
+    }
+}
+
+fn render_profile_row(pp: &shared::navidrome::ProfileProgress) -> Element {
+    let badge_class = profile_badge_class(&pp.profile);
+    let phase_color = match pp.phase {
+        ProfilePhase::Waiting => "text-gray-500",
+        ProfilePhase::Done => "text-beet-leaf",
+        ProfilePhase::Skipped => "text-gray-600",
+        _ => "text-white",
+    };
+    let phase_text = pp.phase.to_string();
+    let show_bar = !matches!(
+        pp.phase,
+        ProfilePhase::Waiting | ProfilePhase::Done | ProfilePhase::Skipped
+    ) && pp.total > 0;
+    let percent = if pp.total > 0 {
+        (pp.current as f64 / pp.total as f64 * 100.0) as u32
+    } else {
+        0
+    };
+
+    rsx! {
+        div { class: "flex items-center gap-3",
+            span {
+                class: "text-xs font-mono px-1.5 py-0.5 rounded border {badge_class} w-24 text-center shrink-0",
+                "{pp.profile}"
+            }
+            span { class: "text-xs font-mono {phase_color} flex-1", "{phase_text}" }
+            if show_bar {
+                div { class: "h-1.5 w-24 bg-gray-800 rounded-full overflow-hidden relative shrink-0",
+                    div {
+                        class: "h-full bg-beet-accent absolute top-0 left-0 transition-all duration-300",
+                        style: "width: {percent}%",
+                    }
+                }
+                span { class: "text-xs font-mono text-gray-400 w-12 text-right shrink-0",
+                    "{pp.current}/{pp.total}"
+                }
+            }
+            if pp.phase == ProfilePhase::Done {
+                span { class: "text-xs font-mono text-beet-leaf shrink-0", "100%" }
+            }
         }
     }
 }

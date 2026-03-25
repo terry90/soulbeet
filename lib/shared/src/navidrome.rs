@@ -98,13 +98,13 @@ pub struct DiscoveryConfig {
     pub last_generated_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct GenerationResult {
     pub total_imported: u32,
     pub profiles: Vec<ProfileGenerationStats>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ProfileGenerationStats {
     pub profile: String,
     pub target: u32,
@@ -169,7 +169,7 @@ impl std::fmt::Display for ProfilePhase {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ProfileProgress {
     pub profile: String,
     pub phase: ProfilePhase,
@@ -177,7 +177,7 @@ pub struct ProfileProgress {
     pub total: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct DiscoveryProgress {
     pub status: GenerationStatus,
     pub profiles: Vec<ProfileProgress>,

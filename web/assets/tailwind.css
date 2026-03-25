@@ -591,6 +591,9 @@
   .w-20 {
     width: calc(var(--spacing) * 20);
   }
+  .w-24 {
+    width: calc(var(--spacing) * 24);
+  }
   .w-64 {
     width: calc(var(--spacing) * 64);
   }
@@ -1045,6 +1048,12 @@
   }
   .bg-beet-dark {
     background-color: var(--color-beet-dark);
+  }
+  .bg-beet-dark\/50 {
+    background-color: color-mix(in srgb, #0f0518 50%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-beet-dark) 50%, transparent);
+    }
   }
   .bg-beet-leaf {
     background-color: var(--color-beet-leaf);
