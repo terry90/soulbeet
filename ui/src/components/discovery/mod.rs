@@ -51,22 +51,9 @@ pub fn DiscoveryOverview() -> Element {
         generating.set(true);
         error.set(String::new());
         success_lines.set(vec![]);
-        match api::generate_discovery_playlist().await {
-            Ok(result) => {
-                let mut lines = vec![format!("{} tracks imported", result.total_imported)];
-                for ps in &result.profiles {
-                    lines.push(format!(
-                        "  {} {}/{} (searched {}, found {}, queued {}, imported {})",
-                        ps.profile,
-                        ps.imports_succeeded,
-                        ps.target,
-                        ps.candidates_tried,
-                        ps.search_hits,
-                        ps.downloads_queued,
-                        ps.imports_succeeded,
-                    ));
-                }
-                success_lines.set(lines);
+        match api::start_discovery_generation().await {
+            Ok(()) => {
+                success_lines.set(vec!["Generation started in background".to_string()]);
                 config.restart();
             }
             Err(e) => error.set(format!("{e}")),

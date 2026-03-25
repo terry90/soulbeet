@@ -19,6 +19,18 @@ static GENERATION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(feature = "server")]
+async fn update_progress(user_id: &str, profile: &str, phase: shared::navidrome::ProfilePhase, current: u32, total: u32) {
+    let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+    if let Some(progress) = map.get_mut(user_id) {
+        if let Some(pp) = progress.profiles.iter_mut().find(|p| p.profile == profile) {
+            pp.phase = phase;
+            pp.current = current;
+            pp.total = total;
+        }
+    }
+}
+
+#[cfg(feature = "server")]
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 #[cfg(feature = "server")]
 use crate::models::folder::Folder;
@@ -135,11 +147,116 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
     Ok(())
 }
 
-#[post("/api/discovery/generate", auth: AuthSession)]
-pub async fn generate_discovery_playlist() -> Result<shared::navidrome::GenerationResult, ServerFnError> {
-    generate_discovery_playlist_internal(&auth.0.sub)
-        .await
-        .map_err(server_error)
+#[post("/api/discovery/start-generation", auth: AuthSession)]
+pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
+    use shared::navidrome::{DiscoveryProgress, GenerationStatus, ProfileProgress, ProfilePhase};
+
+    let user_id = auth.0.sub.clone();
+
+    // Check if already running
+    {
+        let progress = crate::globals::DISCOVERY_PROGRESS.read().await;
+        if let Some(p) = progress.get(&user_id) {
+            if !p.is_terminal() {
+                return Err(server_error("Discovery generation already in progress"));
+            }
+        }
+    }
+
+    // Read settings to get profile list for initial progress state
+    let settings = UserSettings::get(&user_id).await.map_err(server_error)?;
+    if !settings.discovery_enabled {
+        return Err(server_error("Discovery is not enabled"));
+    }
+    let selected_profiles = parse_profiles(&settings.discovery_profiles);
+    let track_counts = settings.parse_track_counts();
+    let folder_id = settings.discovery_folder_id.as_ref()
+        .ok_or_else(|| server_error("No download folder configured for discovery"))?;
+
+    // Determine which profiles need tracks (skip those already at target)
+    let mut profile_entries = Vec::new();
+    for profile in &selected_profiles {
+        let profile_name = profile.to_string();
+        let target = track_counts.get(&profile_name).copied().unwrap_or(10) as usize;
+        let existing = DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let phase = if target.saturating_sub(existing) == 0 {
+            ProfilePhase::Skipped
+        } else {
+            ProfilePhase::Waiting
+        };
+        profile_entries.push(ProfileProgress {
+            profile: profile_name,
+            phase,
+            current: 0,
+            total: 0,
+        });
+    }
+
+    // Write initial progress BEFORE spawn (prevents race with first poll)
+    {
+        let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+        map.insert(user_id.clone(), DiscoveryProgress {
+            status: GenerationStatus::Running,
+            profiles: profile_entries,
+            started_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
+        });
+    }
+
+    // Spawn background task
+    let uid = user_id.clone();
+    tokio::spawn(async move {
+        match generate_discovery_playlist_internal(&uid).await {
+            Ok(result) => {
+                let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+                if let Some(p) = map.get_mut(&uid) {
+                    p.status = GenerationStatus::Complete;
+                    p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    for pp in &mut p.profiles {
+                        if pp.phase != ProfilePhase::Skipped {
+                            pp.phase = ProfilePhase::Done;
+                            pp.current = pp.total;
+                        }
+                    }
+                    p.result = Some(result);
+                }
+            }
+            Err(e) => {
+                let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+                if let Some(p) = map.get_mut(&uid) {
+                    p.status = GenerationStatus::Error;
+                    p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    p.error = Some(e.to_string());
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[get("/api/discovery/progress", auth: AuthSession)]
+pub async fn get_discovery_progress() -> Result<Option<shared::navidrome::DiscoveryProgress>, ServerFnError> {
+    let progress = crate::globals::DISCOVERY_PROGRESS.read().await;
+    match progress.get(&auth.0.sub) {
+        Some(p) => {
+            // Return None for terminal states older than 5 minutes
+            if p.is_terminal() {
+                if let Some(ref completed_at) = p.completed_at {
+                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(completed_at) {
+                        if chrono::Utc::now().signed_duration_since(ts).num_minutes() > 5 {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+            Ok(Some(p.clone()))
+        }
+        None => Ok(None),
+    }
 }
 
 #[cfg(feature = "server")]
@@ -224,9 +341,11 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
             .unwrap_or(0);
         let tracks_per_profile = target.saturating_sub(existing);
         if tracks_per_profile == 0 {
+            update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::Skipped, 0, 0).await;
             info!("{}: already at target ({} pending tracks)", profile_name, existing);
             continue;
         }
+        update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::PullingCandidates, 0, 0).await;
         info!("{}: need {} more tracks ({} existing, {} target)", profile_name, tracks_per_profile, existing, target);
 
         let mut profile_downloads = 0u32;
@@ -257,6 +376,7 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
 
             if candidates.is_empty() {
                 if _attempt == 0 {
+                    update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::GeneratingRecommendations, 0, 0).await;
                     info!("No candidates for {}, running engine", profile_name);
                     match generate_recommendations_for_user(user_id, *profile).await {
                         Ok(count) => info!("Generated {} candidates for {}", count, profile_name),
@@ -305,6 +425,7 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                     continue;
                 }
                 stats.candidates_tried += 1;
+                update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::SearchingSoulseek, stats.candidates_tried, candidates.len() as u32).await;
 
                 let search_tracks = vec![shared::metadata::Track {
                     id: String::new(),
@@ -449,6 +570,8 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
 
             while !pending_filenames.is_empty() && wait_start.elapsed() < max_wait {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                let completed = (queued.len() as u32).saturating_sub(pending_filenames.len() as u32 + failed_filenames.len() as u32);
+                update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::Downloading, completed, queued.len() as u32).await;
 
                 let downloads = match backend.get_downloads().await {
                     Ok(d) => d,
@@ -510,10 +633,14 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
             let skip_filenames: std::collections::HashSet<&String> =
                 pending_filenames.iter().chain(failed_filenames.iter()).collect();
 
+            let importable_count = queued.iter().filter(|q| !skip_filenames.contains(&q.slskd_filename)).count() as u32;
+            let mut import_idx = 0u32;
             for qt in &queued {
                 if skip_filenames.contains(&qt.slskd_filename) {
                     continue;
                 }
+                import_idx += 1;
+                update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::Importing, import_idx, importable_count).await;
 
                 let resolved = crate::server_fns::download::utils::resolve_download_path(
                     &qt.slskd_filename,
