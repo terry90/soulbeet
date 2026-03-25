@@ -1,4 +1,5 @@
 pub mod album;
+pub mod confirm_modal;
 pub mod cover_art;
 pub mod dashboard;
 pub mod discovery;
@@ -12,6 +13,7 @@ pub mod simple;
 pub mod status;
 
 pub use album::{Album, AlbumHeader};
+pub use confirm_modal::*;
 pub use cover_art::*;
 pub use downloads::*;
 pub use footer::Footer;
