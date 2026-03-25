@@ -131,3 +131,64 @@ pub struct SyncResult {
     pub removed_tracks: u32,
     pub total_songs_scanned: u32,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub enum GenerationStatus {
+    #[default]
+    Idle,
+    Running,
+    Complete,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub enum ProfilePhase {
+    #[default]
+    Waiting,
+    PullingCandidates,
+    GeneratingRecommendations,
+    SearchingSoulseek,
+    Downloading,
+    Importing,
+    Done,
+    Skipped,
+}
+
+impl std::fmt::Display for ProfilePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProfilePhase::Waiting => write!(f, "Waiting"),
+            ProfilePhase::PullingCandidates => write!(f, "Pulling candidates"),
+            ProfilePhase::GeneratingRecommendations => write!(f, "Generating recs"),
+            ProfilePhase::SearchingSoulseek => write!(f, "Searching Soulseek"),
+            ProfilePhase::Downloading => write!(f, "Downloading"),
+            ProfilePhase::Importing => write!(f, "Importing"),
+            ProfilePhase::Done => write!(f, "Done"),
+            ProfilePhase::Skipped => write!(f, "Skipped"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProfileProgress {
+    pub profile: String,
+    pub phase: ProfilePhase,
+    pub current: u32,
+    pub total: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiscoveryProgress {
+    pub status: GenerationStatus,
+    pub profiles: Vec<ProfileProgress>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub result: Option<GenerationResult>,
+    pub error: Option<String>,
+}
+
+impl DiscoveryProgress {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status, GenerationStatus::Complete | GenerationStatus::Error)
+    }
+}

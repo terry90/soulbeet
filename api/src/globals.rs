@@ -106,6 +106,10 @@ impl Default for UserChannel {
 pub static USER_CHANNELS: LazyLock<RwLock<HashMap<String, UserChannel>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+#[cfg(feature = "server")]
+pub static DISCOVERY_PROGRESS: LazyLock<RwLock<HashMap<String, shared::navidrome::DiscoveryProgress>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
 /// Get or create a user channel, returning the sender and cancellation token
 #[cfg(feature = "server")]
 pub async fn get_or_create_user_channel(
@@ -158,6 +162,35 @@ pub async fn unregister_user_task(username: &str) {
     }
 }
 
+/// Remove stale discovery progress entries (terminal > 30 min, stuck running > 1 hour)
+#[cfg(feature = "server")]
+pub async fn cleanup_stale_progress() {
+    let mut map = DISCOVERY_PROGRESS.write().await;
+    let stale: Vec<String> = map
+        .iter()
+        .filter(|(_, p)| {
+            if !p.is_terminal() {
+                if let Some(ref started) = p.started_at {
+                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(started) {
+                        return chrono::Utc::now().signed_duration_since(ts).num_minutes() > 60;
+                    }
+                }
+                return false;
+            }
+            if let Some(ref completed) = p.completed_at {
+                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(completed) {
+                    return chrono::Utc::now().signed_duration_since(ts).num_minutes() > 30;
+                }
+            }
+            false
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in stale {
+        map.remove(&key);
+    }
+}
+
 /// Clean up stale user channels that have no active tasks or receivers
 #[cfg(feature = "server")]
 pub async fn cleanup_stale_channels() {
@@ -191,6 +224,7 @@ pub fn start_channel_cleanup_task() {
             loop {
                 interval.tick().await;
                 cleanup_stale_channels().await;
+                cleanup_stale_progress().await;
             }
         });
         info!(
