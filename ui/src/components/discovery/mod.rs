@@ -3,6 +3,7 @@ use shared::navidrome::DiscoveryStatus;
 use shared::system::NavidromeStatus;
 
 use crate::use_auth;
+use crate::ConfirmModal;
 
 fn format_relative_time(ts: &str) -> String {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts)
@@ -245,10 +246,18 @@ fn EngineReportView() -> Element {
     }
 }
 
+#[derive(Clone)]
+struct PendingDrop {
+    track_id: String,
+    title: String,
+    artist: String,
+}
+
 #[component]
 fn DiscoveryTrackList() -> Element {
     let mut tracks = use_resource(|| async { api::get_discovery_tracks().await });
     let mut show_history = use_signal(|| false);
+    let mut pending_drop: Signal<Option<PendingDrop>> = use_signal(|| None);
 
     let items = match &*tracks.read() {
         Some(Ok(items)) => items.clone(),
@@ -309,6 +318,8 @@ fn DiscoveryTrackList() -> Element {
                                 {
                                     let id_promote = track.id.clone();
                                     let id_remove = track.id.clone();
+                                    let title_remove = track.title.clone();
+                                    let artist_remove = track.artist.clone();
                                     rsx! {
                                         div { class: "flex items-center justify-between p-2 bg-beet-panel border border-white/10 rounded text-sm",
                                             div { class: "flex-1 min-w-0",
@@ -333,8 +344,11 @@ fn DiscoveryTrackList() -> Element {
                                                 button {
                                                     class: "px-2 py-0.5 text-xs rounded bg-red-900/50 text-red-400 hover:bg-red-800/50 cursor-pointer",
                                                     onclick: move |_| {
-                                                        let id = id_remove.clone();
-                                                        async move { handle_remove(id).await }
+                                                        pending_drop.set(Some(PendingDrop {
+                                                            track_id: id_remove.clone(),
+                                                            title: title_remove.clone(),
+                                                            artist: artist_remove.clone(),
+                                                        }));
                                                     },
                                                     "Drop"
                                                 }
@@ -382,6 +396,21 @@ fn DiscoveryTrackList() -> Element {
                             }
                         }
                     }
+                }
+            }
+
+            // Confirmation modal for drop action
+            if let Some(pending) = pending_drop() {
+                ConfirmModal {
+                    message: format!("Drop '{}' by {}? This removes the file from disk.", pending.title, pending.artist),
+                    confirm_label: "Drop",
+                    danger: true,
+                    on_confirm: move |_| {
+                        let id = pending.track_id.clone();
+                        pending_drop.set(None);
+                        spawn(async move { handle_remove(id).await });
+                    },
+                    on_cancel: move |_| pending_drop.set(None),
                 }
             }
         }
