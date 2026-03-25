@@ -2,6 +2,7 @@ use api::{create_user_folder, delete_folder, get_user_folders, update_folder};
 use dioxus::prelude::*;
 
 use crate::auth::use_auth;
+use crate::friendly_error;
 
 #[component]
 pub fn FolderManager() -> Element {
@@ -24,7 +25,6 @@ pub fn FolderManager() -> Element {
     let mut lastfm_username = use_signal(String::new);
     let mut lb_username = use_signal(String::new);
     let mut lb_token = use_signal(String::new);
-    let mut settings_loaded = use_signal(|| false);
 
     // Discovery settings state
     let mut discovery_enabled = use_signal(|| false);
@@ -41,17 +41,19 @@ pub fn FolderManager() -> Element {
     let mut lt_mix = use_signal(|| "7".to_string());
     let mut lt_wild = use_signal(|| "7".to_string());
 
-    use_future(move || async move {
-        if let Ok(user_settings) = api::get_user_settings().await {
+    let mut settings_resource = use_resource(|| async { api::get_user_settings().await });
+
+    use_effect(move || {
+        if let Some(Ok(user_settings)) = &*settings_resource.read() {
             auto_delete_enabled.set(user_settings.auto_delete_enabled);
             discovery_promote_threshold.set(user_settings.discovery_promote_threshold.to_string());
-            lastfm_api_key.set(user_settings.lastfm_api_key.unwrap_or_default());
-            lastfm_username.set(user_settings.lastfm_username.unwrap_or_default());
-            lb_username.set(user_settings.listenbrainz_username.unwrap_or_default());
-            lb_token.set(user_settings.listenbrainz_token.unwrap_or_default());
+            lastfm_api_key.set(user_settings.lastfm_api_key.clone().unwrap_or_default());
+            lastfm_username.set(user_settings.lastfm_username.clone().unwrap_or_default());
+            lb_username.set(user_settings.listenbrainz_username.clone().unwrap_or_default());
+            lb_token.set(user_settings.listenbrainz_token.clone().unwrap_or_default());
             discovery_enabled.set(user_settings.discovery_enabled);
-            discovery_folder_id.set(user_settings.discovery_folder_id.unwrap_or_default());
-            discovery_profiles.set(user_settings.discovery_profiles);
+            discovery_folder_id.set(user_settings.discovery_folder_id.clone().unwrap_or_default());
+            discovery_profiles.set(user_settings.discovery_profiles.clone());
             // Parse per-profile playlist names from JSON
             if let Ok(names) = serde_json::from_str::<std::collections::HashMap<String, String>>(
                 &user_settings.discovery_playlist_name,
@@ -76,14 +78,13 @@ pub fn FolderManager() -> Element {
                 if let Some(n) = days.get("Balanced") { lt_mix.set(n.to_string()); }
                 if let Some(n) = days.get("Adventurous") { lt_wild.set(n.to_string()); }
             }
-            settings_loaded.set(true);
         }
     });
 
     let fetch_folders = move || async move {
         match auth.call(get_user_folders()).await {
             Ok(fetched_folders) => folders.set(fetched_folders),
-            Err(e) => error.set(format!("Failed to fetch folders: {e}")),
+            Err(e) => error.set(friendly_error(&e)),
         }
     };
 
@@ -110,7 +111,7 @@ pub fn FolderManager() -> Element {
                 folder_path.set("".to_string());
                 fetch_folders().await;
             }
-            Err(e) => error.set(format!("Failed to add folder: {e}")),
+            Err(e) => error.set(friendly_error(&e)),
         }
     };
 
@@ -120,7 +121,7 @@ pub fn FolderManager() -> Element {
                 success_msg.set("Folder deleted successfully".to_string());
                 fetch_folders().await;
             }
-            Err(e) => error.set(format!("Failed to delete folder: {e}")),
+            Err(e) => error.set(friendly_error(&e)),
         }
     };
 
@@ -134,7 +135,7 @@ pub fn FolderManager() -> Element {
                 editing_folder_id.set(None);
                 fetch_folders().await;
             }
-            Err(e) => error.set(format!("Failed to update folder: {e}")),
+            Err(e) => error.set(friendly_error(&e)),
         }
     };
 
@@ -266,9 +267,22 @@ pub fn FolderManager() -> Element {
         div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10 mt-6",
             h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Library Settings" }
 
-            if !settings_loaded() {
-                div { class: "animate-pulse text-gray-400 font-mono", "Loading..." }
-            } else {
+            match &*settings_resource.read() {
+                None => rsx! {
+                    div { class: "animate-pulse text-gray-400 font-mono", "Loading..." }
+                },
+                Some(Err(e)) => {
+                    let msg = friendly_error(e);
+                    rsx! {
+                        div { class: "text-red-400 text-sm font-mono mb-3", "{msg}" }
+                        button {
+                            class: "text-xs font-mono text-gray-400 hover:text-white underline decoration-dotted cursor-pointer",
+                            onclick: move |_| settings_resource.restart(),
+                            "Retry"
+                        }
+                    }
+                },
+                Some(Ok(_)) => rsx! {
                 div { class: "space-y-4",
                     // Discovery (user-level)
                     div {
@@ -626,6 +640,7 @@ pub fn FolderManager() -> Element {
                         }
                     }
                 }
+                },
             }
         }
         }

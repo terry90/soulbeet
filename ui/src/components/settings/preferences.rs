@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 
+use crate::friendly_error;
 use crate::settings_context::use_settings;
 
 #[component]
@@ -56,7 +57,7 @@ pub fn PreferencesManager() -> Element {
             Ok(_) => {
                 success_msg.set("Settings saved successfully".to_string());
             }
-            Err(e) => error.set(format!("Failed to save settings: {e}")),
+            Err(e) => error.set(friendly_error(&e)),
         }
         saving.set(false);
     };
