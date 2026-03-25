@@ -5,6 +5,40 @@ use std::collections::HashSet;
 
 use crate::{use_auth, Checkbox};
 
+fn quality_badge(item: &DownloadableItem) -> Element {
+    let quality = item.quality.as_str();
+
+    let label = if quality == "mp3" {
+        let bitrate = item
+            .backend_data
+            .as_ref()
+            .and_then(|data| serde_json::from_str::<shared::slskd::SearchResult>(data).ok())
+            .and_then(|sr| sr.bitrate);
+        match bitrate {
+            Some(br) if br >= 320 => "320k".to_string(),
+            Some(br) if br >= 256 => "256k".to_string(),
+            Some(br) if br >= 192 => "192k".to_string(),
+            Some(br) if br > 0 => format!("{}k", br),
+            _ => "MP3".to_string(),
+        }
+    } else {
+        quality.to_uppercase()
+    };
+
+    let color = match quality {
+        "flac" | "wav" => "bg-blue-600/30 text-blue-300 border-blue-500/40",
+        "m4a" | "aac" | "ogg" => "bg-green-600/30 text-green-300 border-green-500/40",
+        _ => "bg-gray-600/30 text-gray-300 border-gray-500/40",
+    };
+
+    rsx! {
+        span {
+            class: "text-[10px] font-mono px-1.5 py-0.5 rounded border {color} uppercase shrink-0",
+            "{label}"
+        }
+    }
+}
+
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
     pub results: Vec<DownloadableGroup>,
@@ -47,7 +81,11 @@ fn TrackItem(props: TrackItemProps) -> Element {
 
             Checkbox { is_selected: props.is_selected }
 
-            label { class: "cursor-pointer text-gray-300 font-mono text-sm", "{props.track.title}" }
+            label { class: "cursor-pointer text-gray-300 font-mono text-sm flex-1 min-w-0 truncate",
+                "{props.track.title}"
+            }
+
+            {quality_badge(&props.track)}
         }
     }
 }
