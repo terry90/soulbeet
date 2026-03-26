@@ -3,9 +3,56 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 jobs:
+  bump-version:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: v${{ steps.bump.outputs.new_version }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+
+      - name: Bump Version
+        id: bump
+        run: |
+          ./scripts/bump_version.sh ${{ inputs.bump_type }}
+
+      - name: Commit and Push
+        run: |
+          git add .
+          git commit -m "bump version to ${{ steps.bump.outputs.new_version }}"
+          git push
+
+      - name: Create and Push Tag
+        run: |
+          git tag v${{ steps.bump.outputs.new_version }}
+          git push origin v${{ steps.bump.outputs.new_version }}
+
   create-release:
+    needs: bump-version
+    if: always() && (needs.bump-version.result == 'success' || github.event_name == 'push')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -13,22 +60,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ needs.bump-version.outputs.tag || github.ref }}
 
       - name: Create GitHub Release
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
+          TAG="${{ needs.bump-version.outputs.tag || github.ref_name }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
             --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-and-push:
+    needs: bump-version
+    if: always() && (needs.bump-version.result == 'success' || github.event_name == 'push')
     uses: ./.github/workflows/image-build-push.yml
     with:
-      ref: ${{ github.ref_name }}
+      ref: ${{ needs.bump-version.outputs.tag || github.ref_name }}
       tags: |
-        type=raw,value=${{ github.ref_name }}
+        type=raw,value=${{ needs.bump-version.outputs.tag || github.ref_name }}
         type=raw,value=latest
         type=raw,value=master
     secrets: inherit
