@@ -236,5 +236,4 @@ When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from 
 - Improve slskd search. Currently:
   - Single track search, query: "{artist} {track_title}" -> more resilient
   - Multiple tracks search, query: "{artist} {album}" -> best for metadata and grouping tracks by album
-- Complete library manager, removal of tracks
 - Synchronize a playlist (Spotify or other)
