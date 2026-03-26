@@ -341,10 +341,7 @@ impl NavidromeClient {
                     ],
                 )
                 .await?;
-            let songs = body
-                .search_result
-                .map(|r| r.song)
-                .unwrap_or_default();
+            let songs = body.search_result.map(|r| r.song).unwrap_or_default();
             let count = songs.len() as u32;
             all_songs.extend(songs);
             if count < page_size {
@@ -478,7 +475,9 @@ impl NavidromeClient {
             }
         });
 
-        let resp = self.native_request(self.client.post(url).json(&body)).await?;
+        let resp = self
+            .native_request(self.client.post(url).json(&body))
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -532,21 +531,22 @@ impl NavidromeClient {
         prefix: &str,
         limit: u32,
     ) -> Result<Vec<NativeSong>> {
-        let url = self.base_url.join("api/song")
+        let url = self
+            .base_url
+            .join("api/song")
             .map_err(|e| SoulseekError::Api {
                 status: 0,
                 message: format!("URL error: {}", e),
             })?;
 
-        let resp = self.native_request(
-            self.client.get(url)
-                .query(&[
-                    ("_start", "0".to_string()),
-                    ("_end", limit.to_string()),
-                    ("_sort", "path".to_string()),
-                    ("_order", "ASC".to_string()),
-                ])
-        ).await?;
+        let resp = self
+            .native_request(self.client.get(url).query(&[
+                ("_start", "0".to_string()),
+                ("_end", limit.to_string()),
+                ("_sort", "path".to_string()),
+                ("_order", "ASC".to_string()),
+            ]))
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -561,7 +561,10 @@ impl NavidromeClient {
             message: format!("Failed to parse songs response: {}", e),
         })?;
 
-        Ok(songs.into_iter().filter(|s| s.path.contains(prefix)).collect())
+        Ok(songs
+            .into_iter()
+            .filter(|s| s.path.contains(prefix))
+            .collect())
     }
 
     /// List all players visible to the authenticated user via Navidrome's native API.

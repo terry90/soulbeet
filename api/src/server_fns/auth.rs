@@ -110,9 +110,13 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
 
             // Encrypt the Navidrome password and store it
             let encrypted = crypto::encrypt(&password).map_err(server_error)?;
-            User::update_navidrome_token(&user.id, Some(&encrypted), NavidromeStatus::Connected.as_str())
-                .await
-                .map_err(server_error)?;
+            User::update_navidrome_token(
+                &user.id,
+                Some(&encrypted),
+                NavidromeStatus::Connected.as_str(),
+            )
+            .await
+            .map_err(server_error)?;
 
             // Keep local password hash current
             User::update_password(&user.id, &password)
@@ -176,9 +180,13 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
                 .map_err(|_| server_error("Invalid username or password"))?;
 
             // Mark Navidrome status as offline (keep existing token)
-            User::update_navidrome_token(&user.id, user.navidrome_token.as_deref(), NavidromeStatus::Offline.as_str())
-                .await
-                .map_err(server_error)?;
+            User::update_navidrome_token(
+                &user.id,
+                user.navidrome_token.as_deref(),
+                NavidromeStatus::Offline.as_str(),
+            )
+            .await
+            .map_err(server_error)?;
 
             let token =
                 auth::create_token(user.id.clone(), user.username.clone()).map_err(server_error)?;

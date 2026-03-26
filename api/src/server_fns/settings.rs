@@ -28,7 +28,8 @@ pub async fn update_user_settings(
             .await
             .map_err(server_error)?;
         cleanup_stale_discovery_playlists(&auth.0.sub, &old, &update).await;
-        return Ok(result);
+
+        Ok(result)
     }
     #[cfg(not(feature = "server"))]
     {
@@ -91,9 +92,15 @@ async fn cleanup_stale_discovery_playlists(
     for profile in &profiles_to_delete {
         if let Some(playlist_id) = old_ids.get(profile) {
             if let Err(e) = navi.delete_smart_playlist(playlist_id).await {
-                warn!("Failed to delete playlist '{}' ({}): {}", profile, playlist_id, e);
+                warn!(
+                    "Failed to delete playlist '{}' ({}): {}",
+                    profile, playlist_id, e
+                );
             } else {
-                info!("Deleted stale discovery playlist '{}' ({})", profile, playlist_id);
+                info!(
+                    "Deleted stale discovery playlist '{}' ({})",
+                    profile, playlist_id
+                );
             }
         }
     }

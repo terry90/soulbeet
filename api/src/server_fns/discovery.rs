@@ -19,7 +19,13 @@ static GENERATION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(feature = "server")]
-async fn update_progress(user_id: &str, profile: &str, phase: shared::navidrome::ProfilePhase, current: u32, total: u32) {
+async fn update_progress(
+    user_id: &str,
+    profile: &str,
+    phase: shared::navidrome::ProfilePhase,
+    current: u32,
+    total: u32,
+) {
     let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
     if let Some(progress) = map.get_mut(user_id) {
         if let Some(pp) = progress.profiles.iter_mut().find(|p| p.profile == profile) {
@@ -53,7 +59,8 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
     };
     let track_counts = settings.parse_track_counts();
     let lifetime_days = settings.parse_lifetime_days();
-    let playlist_names = serde_json::from_str(&settings.discovery_playlist_name).unwrap_or_default();
+    let playlist_names =
+        serde_json::from_str(&settings.discovery_playlist_name).unwrap_or_default();
     Ok(DiscoveryConfig {
         enabled: settings.discovery_enabled,
         folder_id: settings.discovery_folder_id,
@@ -139,8 +146,14 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
         .await
         .map_err(server_error)?;
 
-    if let Err(e) = DiscoveryHistoryRow::update_outcome(&auth.0.sub, &track.artist, &track.title, "removed").await {
-        warn!("Failed to update history for removed track '{}': {}", track.title, e);
+    if let Err(e) =
+        DiscoveryHistoryRow::update_outcome(&auth.0.sub, &track.artist, &track.title, "removed")
+            .await
+    {
+        warn!(
+            "Failed to update history for removed track '{}': {}",
+            track.title, e
+        );
     }
 
     info!("Removed discovery track: {}", track.title);
@@ -149,7 +162,7 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
 
 #[post("/api/discovery/start-generation", auth: AuthSession)]
 pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
-    use shared::navidrome::{DiscoveryProgress, GenerationStatus, ProfileProgress, ProfilePhase};
+    use shared::navidrome::{DiscoveryProgress, GenerationStatus, ProfilePhase, ProfileProgress};
 
     let user_id = auth.0.sub.clone();
 
@@ -170,7 +183,9 @@ pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
     }
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
     let track_counts = settings.parse_track_counts();
-    let folder_id = settings.discovery_folder_id.as_ref()
+    let folder_id = settings
+        .discovery_folder_id
+        .as_ref()
         .ok_or_else(|| server_error("No download folder configured for discovery"))?;
 
     // Determine which profiles need tracks (skip those already at target)
@@ -178,10 +193,11 @@ pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
         let target = track_counts.get(&profile_name).copied().unwrap_or(10) as usize;
-        let existing = DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name)
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let existing =
+            DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name)
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0);
         let phase = if target.saturating_sub(existing) == 0 {
             ProfilePhase::Skipped
         } else {
@@ -198,12 +214,15 @@ pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
     // Write initial progress BEFORE spawn (prevents race with first poll)
     {
         let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
-        map.insert(user_id.clone(), DiscoveryProgress {
-            status: GenerationStatus::Running,
-            profiles: profile_entries,
-            started_at: Some(chrono::Utc::now().to_rfc3339()),
-            ..Default::default()
-        });
+        map.insert(
+            user_id.clone(),
+            DiscoveryProgress {
+                status: GenerationStatus::Running,
+                profiles: profile_entries,
+                started_at: Some(chrono::Utc::now().to_rfc3339()),
+                ..Default::default()
+            },
+        );
     }
 
     // Spawn background task
@@ -239,7 +258,8 @@ pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
 }
 
 #[get("/api/discovery/progress", auth: AuthSession)]
-pub async fn get_discovery_progress() -> Result<Option<shared::navidrome::DiscoveryProgress>, ServerFnError> {
+pub async fn get_discovery_progress(
+) -> Result<Option<shared::navidrome::DiscoveryProgress>, ServerFnError> {
     let progress = crate::globals::DISCOVERY_PROGRESS.read().await;
     match progress.get(&auth.0.sub) {
         Some(p) => {
@@ -260,7 +280,9 @@ pub async fn get_discovery_progress() -> Result<Option<shared::navidrome::Discov
 }
 
 #[cfg(feature = "server")]
-pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<shared::navidrome::GenerationResult, String> {
+pub async fn generate_discovery_playlist_internal(
+    user_id: &str,
+) -> Result<shared::navidrome::GenerationResult, String> {
     use crate::models::deletion_review::DeletionReviewRow;
     use crate::models::discovery_candidate::DiscoveryCandidateRow;
     use crate::models::discovery_history::DiscoveryHistoryRow;
@@ -335,18 +357,39 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
         let target = track_counts.get(&profile_name).copied().unwrap_or(10) as usize;
 
         // Account for tracks already in the playlist so regeneration fills gaps
-        let existing = DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name)
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let existing =
+            DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name)
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0);
         let tracks_per_profile = target.saturating_sub(existing);
         if tracks_per_profile == 0 {
-            update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::Skipped, 0, 0).await;
-            info!("{}: already at target ({} pending tracks)", profile_name, existing);
+            update_progress(
+                user_id,
+                &profile_name,
+                shared::navidrome::ProfilePhase::Skipped,
+                0,
+                0,
+            )
+            .await;
+            info!(
+                "{}: already at target ({} pending tracks)",
+                profile_name, existing
+            );
             continue;
         }
-        update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::PullingCandidates, 0, 0).await;
-        info!("{}: need {} more tracks ({} existing, {} target)", profile_name, tracks_per_profile, existing, target);
+        update_progress(
+            user_id,
+            &profile_name,
+            shared::navidrome::ProfilePhase::PullingCandidates,
+            0,
+            0,
+        )
+        .await;
+        info!(
+            "{}: need {} more tracks ({} existing, {} target)",
+            profile_name, tracks_per_profile, existing, target
+        );
 
         let mut profile_downloads = 0u32;
         let mut stats = ProfileGenerationStats {
@@ -367,16 +410,19 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
 
             // Over-fetch candidates (3x) to survive search/download/import attrition
             let fetch_count = (remaining as f64 * 3.0).ceil() as u32;
-            let mut candidates = DiscoveryCandidateRow::get_unused(
-                user_id,
-                &profile_name,
-                fetch_count,
-            )
-            .await?;
+            let mut candidates =
+                DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count).await?;
 
             if candidates.is_empty() {
                 if _attempt == 0 {
-                    update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::GeneratingRecommendations, 0, 0).await;
+                    update_progress(
+                        user_id,
+                        &profile_name,
+                        shared::navidrome::ProfilePhase::GeneratingRecommendations,
+                        0,
+                        0,
+                    )
+                    .await;
                     info!("No candidates for {}, running engine", profile_name);
                     match generate_recommendations_for_user(user_id, *profile).await {
                         Ok(count) => info!("Generated {} candidates for {}", count, profile_name),
@@ -385,12 +431,9 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                             break;
                         }
                     }
-                    candidates = DiscoveryCandidateRow::get_unused(
-                        user_id,
-                        &profile_name,
-                        fetch_count,
-                    )
-                    .await?;
+                    candidates =
+                        DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count)
+                            .await?;
                 }
                 if candidates.is_empty() {
                     info!("{}: no more candidates available", profile_name);
@@ -408,7 +451,7 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
             let mut queued: Vec<QueuedTrack> = Vec::new();
 
             // Over-queue by 50% to absorb import failures without another retry round
-            let queue_target = remaining + (remaining + 1) / 2;
+            let queue_target = remaining + remaining.div_ceil(2);
 
             for candidate in &candidates {
                 if queued.len() >= queue_target {
@@ -425,7 +468,14 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                     continue;
                 }
                 stats.candidates_tried += 1;
-                update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::SearchingSoulseek, stats.candidates_tried, candidates.len() as u32).await;
+                update_progress(
+                    user_id,
+                    &profile_name,
+                    shared::navidrome::ProfilePhase::SearchingSoulseek,
+                    stats.candidates_tried,
+                    candidates.len() as u32,
+                )
+                .await;
 
                 let search_tracks = vec![shared::metadata::Track {
                     id: String::new(),
@@ -442,10 +492,19 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                 let search_id = match backend.start_search(None, &search_tracks).await {
                     Ok(id) => id,
                     Err(e) => {
-                        warn!("Search failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
+                        warn!(
+                            "Search failed for '{}' - {}: {}",
+                            candidate.artist, candidate.track, e
+                        );
                         stats.search_errors += 1;
                         seen.insert(key.clone());
-                        DiscoveryCandidateRow::mark_used(user_id, &profile_name, &candidate.artist, &candidate.track).await?;
+                        DiscoveryCandidateRow::mark_used(
+                            user_id,
+                            &profile_name,
+                            &candidate.artist,
+                            &candidate.track,
+                        )
+                        .await?;
                         continue;
                     }
                 };
@@ -459,7 +518,10 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                     let search_result = match backend.poll_search(&search_id).await {
                         Ok(r) => r,
                         Err(e) => {
-                            warn!("Poll failed for '{}' - {}: {}", candidate.artist, candidate.track, e);
+                            warn!(
+                                "Poll failed for '{}' - {}: {}",
+                                candidate.artist, candidate.track, e
+                            );
                             break;
                         }
                     };
@@ -479,10 +541,19 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                 }
 
                 if ranked_items.is_empty() {
-                    info!("No results for '{}' - {}, skipping", candidate.artist, candidate.track);
+                    info!(
+                        "No results for '{}' - {}, skipping",
+                        candidate.artist, candidate.track
+                    );
                     stats.search_misses += 1;
                     seen.insert(key.clone());
-                    DiscoveryCandidateRow::mark_used(user_id, &profile_name, &candidate.artist, &candidate.track).await?;
+                    DiscoveryCandidateRow::mark_used(
+                        user_id,
+                        &profile_name,
+                        &candidate.artist,
+                        &candidate.track,
+                    )
+                    .await?;
                     continue;
                 }
                 stats.search_hits += 1;
@@ -495,9 +566,18 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                         Ok(r) => r,
                         Err(e) => {
                             if attempt_idx < 2 {
-                                info!("Download source {} failed for '{}' - {}, trying next: {}", attempt_idx + 1, candidate.artist, candidate.track, e);
+                                info!(
+                                    "Download source {} failed for '{}' - {}, trying next: {}",
+                                    attempt_idx + 1,
+                                    candidate.artist,
+                                    candidate.track,
+                                    e
+                                );
                             } else {
-                                warn!("Download failed for '{}' - {} (all sources exhausted): {}", candidate.artist, candidate.track, e);
+                                warn!(
+                                    "Download failed for '{}' - {} (all sources exhausted): {}",
+                                    candidate.artist, candidate.track, e
+                                );
                             }
                             stats.downloads_failed += 1;
                             continue;
@@ -533,12 +613,23 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                     // This source returned an error in the response
                     stats.downloads_failed += 1;
                     if attempt_idx < 2 {
-                        info!("Download source {} errored for '{}' - {}, trying next", attempt_idx + 1, candidate.artist, candidate.track);
+                        info!(
+                            "Download source {} errored for '{}' - {}, trying next",
+                            attempt_idx + 1,
+                            candidate.artist,
+                            candidate.track
+                        );
                     }
                 }
                 if !downloaded {
                     seen.insert(key.clone());
-                    DiscoveryCandidateRow::mark_used(user_id, &profile_name, &candidate.artist, &candidate.track).await?;
+                    DiscoveryCandidateRow::mark_used(
+                        user_id,
+                        &profile_name,
+                        &candidate.artist,
+                        &candidate.track,
+                    )
+                    .await?;
                 }
             }
 
@@ -570,8 +661,16 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
 
             while !pending_filenames.is_empty() && wait_start.elapsed() < max_wait {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                let completed = (queued.len() as u32).saturating_sub(pending_filenames.len() as u32 + failed_filenames.len() as u32);
-                update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::Downloading, completed, queued.len() as u32).await;
+                let completed = (queued.len() as u32)
+                    .saturating_sub(pending_filenames.len() as u32 + failed_filenames.len() as u32);
+                update_progress(
+                    user_id,
+                    &profile_name,
+                    shared::navidrome::ProfilePhase::Downloading,
+                    completed,
+                    queued.len() as u32,
+                )
+                .await;
 
                 let downloads = match backend.get_downloads().await {
                     Ok(d) => d,
@@ -608,7 +707,8 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
 
             stats.downloads_timed_out += pending_filenames.len() as u32;
             stats.downloads_failed += failed_filenames.len() as u32;
-            stats.downloads_completed += (queued.len() - pending_filenames.len() - failed_filenames.len()) as u32;
+            stats.downloads_completed +=
+                (queued.len() - pending_filenames.len() - failed_filenames.len()) as u32;
             if !pending_filenames.is_empty() {
                 warn!(
                     "{}: {} downloads didn't complete within timeout",
@@ -630,17 +730,29 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
             let discovery_target = std::path::PathBuf::from(&profile_path);
 
             // Skip both timed-out and slskd-failed downloads
-            let skip_filenames: std::collections::HashSet<&String> =
-                pending_filenames.iter().chain(failed_filenames.iter()).collect();
+            let skip_filenames: std::collections::HashSet<&String> = pending_filenames
+                .iter()
+                .chain(failed_filenames.iter())
+                .collect();
 
-            let importable_count = queued.iter().filter(|q| !skip_filenames.contains(&q.slskd_filename)).count() as u32;
+            let importable_count = queued
+                .iter()
+                .filter(|q| !skip_filenames.contains(&q.slskd_filename))
+                .count() as u32;
             let mut import_idx = 0u32;
             for qt in &queued {
                 if skip_filenames.contains(&qt.slskd_filename) {
                     continue;
                 }
                 import_idx += 1;
-                update_progress(user_id, &profile_name, shared::navidrome::ProfilePhase::Importing, import_idx, importable_count).await;
+                update_progress(
+                    user_id,
+                    &profile_name,
+                    shared::navidrome::ProfilePhase::Importing,
+                    import_idx,
+                    importable_count,
+                )
+                .await;
 
                 let resolved = crate::server_fns::download::utils::resolve_download_path(
                     &qt.slskd_filename,
@@ -665,7 +777,10 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                 if let Ok(ref imp) = importer {
                     match imp.import(&[src], &discovery_target, false).await {
                         Ok(soulbeet::ImportResult::Success) => {
-                            info!("Imported '{}' - {} into Discovery/{}", qt.artist, qt.track, profile_name);
+                            info!(
+                                "Imported '{}' - {} into Discovery/{}",
+                                qt.artist, qt.track, profile_name
+                            );
                         }
                         Ok(soulbeet::ImportResult::Skipped) => {
                             warn!("Beets skipped '{}' - {} (duplicate?)", qt.artist, qt.track);
@@ -674,13 +789,19 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
                             continue;
                         }
                         Ok(other) => {
-                            warn!("Beets import issue for '{}' - {}: {:?}", qt.artist, qt.track, other);
+                            warn!(
+                                "Beets import issue for '{}' - {}: {:?}",
+                                qt.artist, qt.track, other
+                            );
                             stats.imports_failed += 1;
                             let _ = tokio::fs::remove_file(src).await;
                             continue;
                         }
                         Err(e) => {
-                            warn!("Beets import failed for '{}' - {}: {}", qt.artist, qt.track, e);
+                            warn!(
+                                "Beets import failed for '{}' - {}: {}",
+                                qt.artist, qt.track, e
+                            );
                             stats.imports_failed += 1;
                             let _ = tokio::fs::remove_file(src).await;
                             continue;
@@ -743,7 +864,10 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
             }
             info!(
                 "{}: {}/{} tracks after attempt {}, retrying with more candidates...",
-                profile_name, profile_downloads, tracks_per_profile, _attempt + 1
+                profile_name,
+                profile_downloads,
+                tracks_per_profile,
+                _attempt + 1
             );
         } // end retry loop
 
@@ -764,7 +888,10 @@ pub async fn generate_discovery_playlist_internal(user_id: &str) -> Result<share
             if let Err(e) = navi.start_scan().await {
                 warn!("Failed to trigger Navidrome scan: {}", e);
             } else {
-                info!("Triggered Navidrome library scan after {} discovery imports", total_downloads);
+                info!(
+                    "Triggered Navidrome library scan after {} discovery imports",
+                    total_downloads
+                );
                 // Wait for scan to complete (poll every 3s, max 2 min)
                 for _ in 0..40u32 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -810,7 +937,10 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
     let navi = match crate::services::navidrome_client_for_user(user_id).await {
         Ok(c) => c,
         Err(e) => {
-            info!("Playlist reconciliation skipped (no Navidrome client): {}", e);
+            info!(
+                "Playlist reconciliation skipped (no Navidrome client): {}",
+                e
+            );
             return Ok(());
         }
     };
@@ -868,12 +998,9 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
             .await
         {
             Ok(playlist_id) => {
-                if let Err(e) = UserSettings::update_discovery_playlist_id(
-                    user_id,
-                    &profile_name,
-                    &playlist_id,
-                )
-                .await
+                if let Err(e) =
+                    UserSettings::update_discovery_playlist_id(user_id, &profile_name, &playlist_id)
+                        .await
                 {
                     warn!("Failed to save playlist ID for '{}': {}", profile_name, e);
                 }
@@ -944,7 +1071,10 @@ fn find_new_files(
         .map(|p| p.to_string_lossy().to_string())
         .collect();
     if audio_files.is_empty() {
-        new_files.iter().map(|p| p.to_string_lossy().to_string()).collect()
+        new_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect()
     } else {
         audio_files
     }
@@ -983,7 +1113,6 @@ pub async fn import_or_move(src: &std::path::Path, target: &std::path::Path) -> 
         }
     }
 }
-
 
 #[cfg(feature = "server")]
 fn parse_profiles(s: &str) -> Vec<shared::recommendation::DiscoveryProfile> {

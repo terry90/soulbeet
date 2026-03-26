@@ -339,7 +339,10 @@ pub async fn cached_mbid_lookup(client: &Client, artist: &str) -> Result<Option<
                         }
                     });
                     if fallback.is_some() {
-                        MBID_CACHE.lock().await.insert(primary_key, fallback.clone());
+                        MBID_CACHE
+                            .lock()
+                            .await
+                            .insert(primary_key, fallback.clone());
                         MBID_CACHE.lock().await.insert(key, fallback.clone());
                         return Ok(fallback);
                     }
@@ -391,10 +394,7 @@ static RECORDING_CACHE: LazyLock<Mutex<HashMap<String, Option<RecordingInfo>>>> 
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Look up a recording by MBID, returning artist name, track title, and earliest release year.
-pub async fn cached_recording_lookup(
-    client: &Client,
-    mbid: &str,
-) -> Result<Option<RecordingInfo>> {
+pub async fn cached_recording_lookup(client: &Client, mbid: &str) -> Result<Option<RecordingInfo>> {
     {
         let cache = RECORDING_CACHE.lock().await;
         if let Some(cached) = cache.get(mbid) {

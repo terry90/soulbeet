@@ -24,7 +24,6 @@ async fn cleanup_failed_file(file_path: &str) {
     }
 }
 
-
 #[cfg(feature = "server")]
 pub async fn import_group(
     entries: Vec<DownloadProgress>,

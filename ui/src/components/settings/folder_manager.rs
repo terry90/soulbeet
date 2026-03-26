@@ -49,34 +49,62 @@ pub fn FolderManager() -> Element {
             discovery_promote_threshold.set(user_settings.discovery_promote_threshold.to_string());
             lastfm_api_key.set(user_settings.lastfm_api_key.clone().unwrap_or_default());
             lastfm_username.set(user_settings.lastfm_username.clone().unwrap_or_default());
-            lb_username.set(user_settings.listenbrainz_username.clone().unwrap_or_default());
+            lb_username.set(
+                user_settings
+                    .listenbrainz_username
+                    .clone()
+                    .unwrap_or_default(),
+            );
             lb_token.set(user_settings.listenbrainz_token.clone().unwrap_or_default());
             discovery_enabled.set(user_settings.discovery_enabled);
-            discovery_folder_id.set(user_settings.discovery_folder_id.clone().unwrap_or_default());
+            discovery_folder_id.set(
+                user_settings
+                    .discovery_folder_id
+                    .clone()
+                    .unwrap_or_default(),
+            );
             discovery_profiles.set(user_settings.discovery_profiles.clone());
             // Parse per-profile playlist names from JSON
             if let Ok(names) = serde_json::from_str::<std::collections::HashMap<String, String>>(
                 &user_settings.discovery_playlist_name,
             ) {
-                if let Some(n) = names.get("Conservative") { pl_name_safe.set(n.clone()); }
-                if let Some(n) = names.get("Balanced") { pl_name_mix.set(n.clone()); }
-                if let Some(n) = names.get("Adventurous") { pl_name_wild.set(n.clone()); }
+                if let Some(n) = names.get("Conservative") {
+                    pl_name_safe.set(n.clone());
+                }
+                if let Some(n) = names.get("Balanced") {
+                    pl_name_mix.set(n.clone());
+                }
+                if let Some(n) = names.get("Adventurous") {
+                    pl_name_wild.set(n.clone());
+                }
             }
             // Parse per-profile track counts
             if let Ok(counts) = serde_json::from_str::<std::collections::HashMap<String, u32>>(
                 &user_settings.discovery_track_count,
             ) {
-                if let Some(n) = counts.get("Conservative") { tc_safe.set(n.to_string()); }
-                if let Some(n) = counts.get("Balanced") { tc_mix.set(n.to_string()); }
-                if let Some(n) = counts.get("Adventurous") { tc_wild.set(n.to_string()); }
+                if let Some(n) = counts.get("Conservative") {
+                    tc_safe.set(n.to_string());
+                }
+                if let Some(n) = counts.get("Balanced") {
+                    tc_mix.set(n.to_string());
+                }
+                if let Some(n) = counts.get("Adventurous") {
+                    tc_wild.set(n.to_string());
+                }
             }
             // Parse per-profile lifetime days
             if let Ok(days) = serde_json::from_str::<std::collections::HashMap<String, u32>>(
                 &user_settings.discovery_lifetime_days,
             ) {
-                if let Some(n) = days.get("Conservative") { lt_safe.set(n.to_string()); }
-                if let Some(n) = days.get("Balanced") { lt_mix.set(n.to_string()); }
-                if let Some(n) = days.get("Adventurous") { lt_wild.set(n.to_string()); }
+                if let Some(n) = days.get("Conservative") {
+                    lt_safe.set(n.to_string());
+                }
+                if let Some(n) = days.get("Balanced") {
+                    lt_mix.set(n.to_string());
+                }
+                if let Some(n) = days.get("Adventurous") {
+                    lt_wild.set(n.to_string());
+                }
             }
         }
     });

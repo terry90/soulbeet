@@ -107,8 +107,9 @@ pub static USER_CHANNELS: LazyLock<RwLock<HashMap<String, UserChannel>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[cfg(feature = "server")]
-pub static DISCOVERY_PROGRESS: LazyLock<RwLock<HashMap<String, shared::navidrome::DiscoveryProgress>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+pub static DISCOVERY_PROGRESS: LazyLock<
+    RwLock<HashMap<String, shared::navidrome::DiscoveryProgress>>,
+> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Get or create a user channel, returning the sender and cancellation token
 #[cfg(feature = "server")]
@@ -265,7 +266,9 @@ async fn run_automation() {
     }
 
     // Reset any tracks stuck in Promoting from a previous crash
-    if let Ok(reset_count) = crate::models::discovery_playlist::DiscoveryTrackRow::reset_stale_promoting().await {
+    if let Ok(reset_count) =
+        crate::models::discovery_playlist::DiscoveryTrackRow::reset_stale_promoting().await
+    {
         if reset_count > 0 {
             info!("Automation: reset {} stale Promoting tracks", reset_count);
         }
@@ -276,14 +279,23 @@ async fn run_automation() {
         match crate::server_fns::navidrome::check_report_real_path(&user.id).await {
             Ok(Some(true)) => {
                 // ReportRealPath is enabled. If status was MissingReportRealPath, restore to Connected.
-                if user.navidrome_status == shared::system::NavidromeStatus::MissingReportRealPath.as_str() {
+                if user.navidrome_status
+                    == shared::system::NavidromeStatus::MissingReportRealPath.as_str()
+                {
                     let _ = crate::models::user::User::update_navidrome_token(
                         &user.id,
                         user.navidrome_token.as_deref(),
                         shared::system::NavidromeStatus::Connected.as_str(),
-                    ).await;
-                    let _ = crate::models::user_settings::UserSettings::reset_navidrome_banner(&user.id).await;
-                    info!("Automation: ReportRealPath now enabled for user {}", user.username);
+                    )
+                    .await;
+                    let _ = crate::models::user_settings::UserSettings::reset_navidrome_banner(
+                        &user.id,
+                    )
+                    .await;
+                    info!(
+                        "Automation: ReportRealPath now enabled for user {}",
+                        user.username
+                    );
                 }
             }
             Ok(Some(false)) => {
@@ -292,20 +304,29 @@ async fn run_automation() {
                      Enable it in Navidrome Settings > Players > Soulbeet > ReportRealPath.",
                     user.username
                 );
-                if user.navidrome_status != shared::system::NavidromeStatus::MissingReportRealPath.as_str() {
+                if user.navidrome_status
+                    != shared::system::NavidromeStatus::MissingReportRealPath.as_str()
+                {
                     let _ = crate::models::user::User::update_navidrome_token(
                         &user.id,
                         user.navidrome_token.as_deref(),
                         shared::system::NavidromeStatus::MissingReportRealPath.as_str(),
-                    ).await;
-                    let _ = crate::models::user_settings::UserSettings::reset_navidrome_banner(&user.id).await;
+                    )
+                    .await;
+                    let _ = crate::models::user_settings::UserSettings::reset_navidrome_banner(
+                        &user.id,
+                    )
+                    .await;
                 }
             }
             Ok(None) => {
                 // Soulbeet player not registered yet -- skip, it gets created on first API call
             }
             Err(e) => {
-                info!("Automation: ReportRealPath check failed for {}: {}", user.username, e);
+                info!(
+                    "Automation: ReportRealPath check failed for {}: {}",
+                    user.username, e
+                );
             }
         }
     }
@@ -355,27 +376,33 @@ async fn run_automation() {
             Ok(s) if s.discovery_enabled => s,
             _ => continue,
         };
-        let Some(ref folder_id) = settings.discovery_folder_id else { continue };
+        let Some(ref folder_id) = settings.discovery_folder_id else {
+            continue;
+        };
         let lifetime_map = settings.parse_lifetime_days();
         let now = chrono::Utc::now();
 
         // Check each profile's pending tracks and expire those past their lifetime
-        let pending = match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(folder_id).await {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
+        let pending =
+            match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(
+                folder_id,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
         let mut expired_count = 0u32;
         for track in &pending {
             let lifetime_days = lifetime_map.get(&track.profile).copied().unwrap_or(7) as i64;
-            let created = match chrono::DateTime::parse_from_rfc3339(&track.created_at)
-                .or_else(|_| {
+            let created =
+                match chrono::DateTime::parse_from_rfc3339(&track.created_at).or_else(|_| {
                     chrono::NaiveDateTime::parse_from_str(&track.created_at, "%Y-%m-%d %H:%M:%S")
                         .map(|naive| naive.and_utc().fixed_offset())
-                })
-            {
-                Ok(dt) => dt,
-                Err(_) => continue,
-            };
+                }) {
+                    Ok(dt) => dt,
+                    Err(_) => continue,
+                };
             if now.signed_duration_since(created).num_days() < lifetime_days {
                 continue;
             }
@@ -388,21 +415,33 @@ async fn run_automation() {
                 }
             }
             let _ = crate::models::discovery_playlist::DiscoveryTrackRow::update_status(
-                &track.id, &shared::navidrome::DiscoveryStatus::Removed,
-            ).await;
+                &track.id,
+                &shared::navidrome::DiscoveryStatus::Removed,
+            )
+            .await;
             let _ = crate::models::discovery_history::DiscoveryHistoryRow::update_outcome(
-                user_id, &track.artist, &track.title, "expired",
-            ).await;
+                user_id,
+                &track.artist,
+                &track.title,
+                "expired",
+            )
+            .await;
             expired_count += 1;
         }
         if expired_count > 0 {
-            info!("Automation: expired {} tracks for user {}", expired_count, user.username);
+            info!(
+                "Automation: expired {} tracks for user {}",
+                expired_count, user.username
+            );
         }
 
         // Refill any gaps (generate_discovery_playlist_internal accounts for existing tracks)
         match crate::server_fns::discovery::generate_discovery_playlist_internal(user_id).await {
             Ok(result) if result.total_imported > 0 => {
-                info!("Automation: refilled {} tracks for user {}", result.total_imported, user.username);
+                info!(
+                    "Automation: refilled {} tracks for user {}",
+                    result.total_imported, user.username
+                );
             }
             Ok(_) => {}
             Err(e) => info!("Automation: refill failed for {}: {}", user.username, e),

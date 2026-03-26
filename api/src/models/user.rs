@@ -150,13 +150,11 @@ impl User {
     }
 
     pub async fn get_connected_users() -> Result<Vec<User>, String> {
-        sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE navidrome_status IN (?, ?)"
-        )
-        .bind(shared::system::NavidromeStatus::Connected.as_str())
-        .bind(shared::system::NavidromeStatus::MissingReportRealPath.as_str())
-        .fetch_all(&*DB)
-        .await
-        .map_err(|e| e.to_string())
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE navidrome_status IN (?, ?)")
+            .bind(shared::system::NavidromeStatus::Connected.as_str())
+            .bind(shared::system::NavidromeStatus::MissingReportRealPath.as_str())
+            .fetch_all(&*DB)
+            .await
+            .map_err(|e| e.to_string())
     }
 }

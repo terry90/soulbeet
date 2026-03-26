@@ -882,10 +882,7 @@ impl crate::ScrobbleProvider for LastFmProvider {
             .into_iter()
             .filter(|t| {
                 // Skip "now playing" entries that have no timestamp
-                t.attr
-                    .as_ref()
-                    .and_then(|a| a.nowplaying.as_deref())
-                    .map_or(true, |v| v != "true")
+                t.attr.as_ref().and_then(|a| a.nowplaying.as_deref()) != Some("true")
             })
             .filter_map(|t| {
                 let timestamp = t.date.as_ref()?.uts.parse::<i64>().ok()?;
