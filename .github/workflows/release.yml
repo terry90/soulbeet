@@ -30,4 +30,5 @@ jobs:
       tags: |
         type=raw,value=${{ github.ref_name }}
         type=raw,value=latest
+        type=raw,value=master
     secrets: inherit
