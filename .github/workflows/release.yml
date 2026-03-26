@@ -47,6 +47,25 @@ jobs:
           git tag v${{ steps.bump.outputs.new_version }}
           git push origin v${{ steps.bump.outputs.new_version }}
 
+  create-release:
+    needs: bump-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: v${{ needs.bump-version.outputs.new_version }}
+
+      - name: Create GitHub Release
+        run: |
+          gh release create "v${{ needs.bump-version.outputs.new_version }}" \
+            --title "v${{ needs.bump-version.outputs.new_version }}" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   call-build-and-push:
     needs: bump-version
     uses: ./.github/workflows/image-build-push.yml
