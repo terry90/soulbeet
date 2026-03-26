@@ -1,54 +1,11 @@
-name: Create Release
+name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      bump_type:
-        description: 'Version bump type'
-        required: true
-        default: 'patch'
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+  push:
+    tags: ['v*']
 
 jobs:
-  bump-version:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      new_version: ${{ steps.bump.outputs.new_version }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Configure Git
-        run: |
-          git config user.name "GitHub Action"
-          git config user.email "action@github.com"
-
-      - name: Bump Version
-        id: bump
-        run: |
-          ./scripts/bump_version.sh ${{ inputs.bump_type }}
-
-      - name: Commit and Push
-        run: |
-          git add .
-          git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
-          git push
-
-      - name: Create Tag
-        run: |
-          git tag v${{ steps.bump.outputs.new_version }}
-          git push origin v${{ steps.bump.outputs.new_version }}
-
   create-release:
-    needs: bump-version
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -56,22 +13,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          ref: v${{ needs.bump-version.outputs.new_version }}
+          ref: ${{ github.ref }}
 
       - name: Create GitHub Release
         run: |
-          gh release create "v${{ needs.bump-version.outputs.new_version }}" \
-            --title "v${{ needs.bump-version.outputs.new_version }}" \
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
             --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  call-build-and-push:
-    needs: bump-version
+  build-and-push:
     uses: ./.github/workflows/image-build-push.yml
     with:
-      ref: v${{ needs.bump-version.outputs.new_version }}
+      ref: ${{ github.ref_name }}
       tags: |
-        type=raw,value=${{ needs.bump-version.outputs.new_version }}
+        type=raw,value=${{ github.ref_name }}
         type=raw,value=latest
     secrets: inherit
