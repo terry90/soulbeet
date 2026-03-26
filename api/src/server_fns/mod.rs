@@ -35,8 +35,10 @@ pub fn server_error<E: std::fmt::Display>(e: E) -> ServerFnError {
 #[cfg(feature = "server")]
 pub async fn cleanup_empty_ancestors(dir: &std::path::Path) -> Result<(), std::io::Error> {
     let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if matches!(dir_name, "Discovery" | "Conservative" | "Balanced" | "Adventurous")
-        || dir.join(".beets_library.db").exists()
+    if matches!(
+        dir_name,
+        "Discovery" | "Conservative" | "Balanced" | "Adventurous"
+    ) || dir.join(".beets_library.db").exists()
     {
         return Ok(());
     }

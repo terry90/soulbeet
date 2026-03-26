@@ -10,7 +10,9 @@ pub fn friendly_error(error: &ServerFnError) -> String {
         ServerFnError::ServerError { code: 401, .. } => {
             "Session expired. Please log in again.".to_string()
         }
-        ServerFnError::ServerError { code: 500, message, .. } => {
+        ServerFnError::ServerError {
+            code: 500, message, ..
+        } => {
             if message.contains("not found") {
                 "The requested item was not found.".to_string()
             } else if message.contains("not authorized") || message.contains("Not authorized") {
@@ -24,7 +26,9 @@ pub fn friendly_error(error: &ServerFnError) -> String {
         ServerFnError::ServerError { code, .. } => {
             format!("Server error ({code}). Try again.")
         }
-        ServerFnError::Request(_) => "Could not reach the server. Check your connection.".to_string(),
+        ServerFnError::Request(_) => {
+            "Could not reach the server. Check your connection.".to_string()
+        }
         _ => "Something went wrong. Try again.".to_string(),
     }
 }

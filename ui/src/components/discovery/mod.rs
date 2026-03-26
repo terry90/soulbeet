@@ -7,22 +7,28 @@ use crate::use_auth;
 use crate::ConfirmModal;
 
 fn format_relative_time(ts: &str) -> String {
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts)
-        .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
-                .map(|naive| naive.and_utc().fixed_offset())
-        })
-    else {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts).or_else(|_| {
+        chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+            .map(|naive| naive.and_utc().fixed_offset())
+    }) else {
         return ts.to_string();
     };
     let delta = chrono::Utc::now().signed_duration_since(parsed);
     let mins = delta.num_minutes();
-    if mins < 1 { return "just now".to_string(); }
-    if mins < 60 { return format!("{}m ago", mins); }
+    if mins < 1 {
+        return "just now".to_string();
+    }
+    if mins < 60 {
+        return format!("{}m ago", mins);
+    }
     let hours = delta.num_hours();
-    if hours < 24 { return format!("{}h ago", hours); }
+    if hours < 24 {
+        return format!("{}h ago", hours);
+    }
     let days = delta.num_days();
-    if days < 30 { return format!("{}d ago", days); }
+    if days < 30 {
+        return format!("{}d ago", days);
+    }
     format!("{}d ago", days)
 }
 
@@ -209,7 +215,11 @@ fn ProgressPanel(progress: DiscoveryProgress) -> Element {
             }
         }
         GenerationStatus::Complete => {
-            let total = progress.result.as_ref().map(|r| r.total_imported).unwrap_or(0);
+            let total = progress
+                .result
+                .as_ref()
+                .map(|r| r.total_imported)
+                .unwrap_or(0);
             let detail = progress
                 .result
                 .as_ref()

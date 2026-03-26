@@ -788,7 +788,9 @@ impl SoulseekClient {
                     warn!(
                         "Partial enqueue: {} succeeded, {} failed out of {} files. \
                          Cannot determine which specific files failed from count-based response.",
-                        enqueued, failed, batch.len()
+                        enqueued,
+                        failed,
+                        batch.len()
                     );
                     let mut results = Vec::with_capacity(batch.len());
                     for (i, f) in batch.iter().enumerate() {
@@ -988,11 +990,9 @@ impl SoulseekClient {
                     );
                 }
                 if !app_state.server.is_logged_in {
-                    return Err(
-                        "slskd is connected to Soulseek but not logged in. \
+                    return Err("slskd is connected to Soulseek but not logged in. \
                          Check slskd's Soulseek username and password."
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 Ok(())
             }

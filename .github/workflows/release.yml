@@ -80,5 +80,4 @@ jobs:
       tags: |
         type=raw,value=${{ needs.bump-version.outputs.tag || github.ref_name }}
         type=raw,value=latest
-        type=raw,value=master
     secrets: inherit

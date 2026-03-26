@@ -244,7 +244,12 @@ fn NavidromeBanner() -> Element {
         .map(|s| s.navidrome_banner_dismissed)
         .unwrap_or(false);
 
-    if dismissed || matches!(status, NavidromeStatus::Connected | NavidromeStatus::Unknown) {
+    if dismissed
+        || matches!(
+            status,
+            NavidromeStatus::Connected | NavidromeStatus::Unknown
+        )
+    {
         return rsx! {};
     }
 

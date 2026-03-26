@@ -65,10 +65,7 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
         if auto_delete {
             if let Some(rating) = song.user_rating {
                 if rating == 1 {
-                    let shared_veto = song
-                        .average_rating
-                        .map(|avg| avg > 1.0)
-                        .unwrap_or(false);
+                    let shared_veto = song.average_rating.map(|avg| avg > 1.0).unwrap_or(false);
                     if shared_veto {
                         info!(
                             "Auto-delete skipped (shared veto, avg={:.1}): {} - {}",
@@ -154,15 +151,22 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                     if let Err(e) = remove_discovery_track_internal(&track.id).await {
                         warn!("Failed to remove track {}: {}", track.title, e);
                     } else {
-                        info!("Removed discovery track: {} - {} (rating 1)", track.artist, track.title);
+                        info!(
+                            "Removed discovery track: {} - {} (rating 1)",
+                            track.artist, track.title
+                        );
                         if let Err(e) = DiscoveryHistoryRow::update_outcome(
                             user_id,
                             &track.artist,
                             &track.title,
                             "removed",
                         )
-                        .await {
-                            warn!("Failed to update history for removed track '{}': {}", track.title, e);
+                        .await
+                        {
+                            warn!(
+                                "Failed to update history for removed track '{}': {}",
+                                track.title, e
+                            );
                         }
                         removed_tracks += 1;
                     }
@@ -273,7 +277,6 @@ fn resolve_navidrome_path(
     None
 }
 
-
 #[get("/api/navidrome/library-stats", auth: AuthSession)]
 pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
     let client = navidrome_client_for_user(&auth.0.sub)
@@ -334,13 +337,18 @@ pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
 }
 
 #[cfg(feature = "server")]
-pub(crate) async fn promote_discovery_track_internal(track_id: &str, user_id: &str) -> Result<(), String> {
+pub(crate) async fn promote_discovery_track_internal(
+    track_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
     use crate::models::discovery_history::DiscoveryHistoryRow;
     use crate::models::folder::Folder;
 
     // CAS guard: only one caller can promote a given track
     if !DiscoveryTrackRow::try_set_promoting(track_id).await? {
-        return Err("Track is no longer pending (already promoted, removed, or being promoted)".to_string());
+        return Err(
+            "Track is no longer pending (already promoted, removed, or being promoted)".to_string(),
+        );
     }
 
     let track = DiscoveryTrackRow::get_by_id(track_id)
@@ -367,11 +375,19 @@ pub(crate) async fn promote_discovery_track_internal(track_id: &str, user_id: &s
 
     DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Promoted).await?;
 
-    if let Err(e) = DiscoveryHistoryRow::update_outcome(user_id, &track.artist, &track.title, "promoted").await {
-        warn!("Failed to update history for promoted track '{}': {}", track.title, e);
+    if let Err(e) =
+        DiscoveryHistoryRow::update_outcome(user_id, &track.artist, &track.title, "promoted").await
+    {
+        warn!(
+            "Failed to update history for promoted track '{}': {}",
+            track.title, e
+        );
     }
 
-    info!("Promoted discovery track: {} -> {}", track.title, folder.path);
+    info!(
+        "Promoted discovery track: {} -> {}",
+        track.title, folder.path
+    );
     Ok(())
 }
 

@@ -189,6 +189,9 @@ pub struct DiscoveryProgress {
 
 impl DiscoveryProgress {
     pub fn is_terminal(&self) -> bool {
-        matches!(self.status, GenerationStatus::Complete | GenerationStatus::Error)
+        matches!(
+            self.status,
+            GenerationStatus::Complete | GenerationStatus::Error
+        )
     }
 }

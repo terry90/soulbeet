@@ -98,7 +98,11 @@ impl ListenBrainzClient {
     }
 
     pub async fn get_listens(&self, count: u32) -> Result<ListensResponse> {
-        let path = format!("/1/user/{}/listens?count={}", self.encoded_username(), count);
+        let path = format!(
+            "/1/user/{}/listens?count={}",
+            self.encoded_username(),
+            count
+        );
         self.get_json(&path, "listens").await
     }
 
@@ -113,7 +117,9 @@ impl ListenBrainzClient {
         let range = time_period_to_range(period);
         let path = format!(
             "/1/stats/user/{}/recordings?range={}&count={}",
-            urlencoding(username), range, count
+            urlencoding(username),
+            range,
+            count
         );
         self.get_json(&path, "top recordings").await
     }
@@ -128,7 +134,9 @@ impl ListenBrainzClient {
         let range = time_period_to_range(period);
         let path = format!(
             "/1/stats/user/{}/artists?range={}&count={}",
-            self.encoded_username(), range, count
+            self.encoded_username(),
+            range,
+            count
         );
         self.get_json(&path, "top artists").await
     }
@@ -141,7 +149,9 @@ impl ListenBrainzClient {
         let range = time_period_to_range(period);
         let path = format!(
             "/1/stats/user/{}/recordings?range={}&count={}",
-            self.encoded_username(), range, count
+            self.encoded_username(),
+            range,
+            count
         );
         self.get_json(&path, "top recordings").await
     }
@@ -157,7 +167,10 @@ impl ListenBrainzClient {
     // --- Recommendation Playlists ---
 
     pub async fn get_recommendation_playlists(&self) -> Result<RecommendationPlaylistsResponse> {
-        let path = format!("/1/user/{}/playlists/recommendations", self.encoded_username());
+        let path = format!(
+            "/1/user/{}/playlists/recommendations",
+            self.encoded_username()
+        );
         self.get_json(&path, "recommendation playlists").await
     }
 

@@ -145,7 +145,7 @@ pub fn SettingsProvider(children: Element) -> Element {
     });
 
     let mut settings_state = use_signal(|| None::<UserSettings>);
-    let mut providers_state = use_signal(|| Vec::<ProviderInfo>::new());
+    let mut providers_state = use_signal(Vec::<ProviderInfo>::new);
     let mut loaded_signal = use_signal(|| false);
 
     use_effect(move || {

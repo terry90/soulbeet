@@ -89,10 +89,7 @@ pub fn UserManager() -> Element {
             error.set("Username cannot be empty".to_string());
             return;
         }
-        match auth
-            .call(update_username(edit_user_username()))
-            .await
-        {
+        match auth.call(update_username(edit_user_username())).await {
             Ok(_) => {
                 success_msg.set("Username updated".to_string());
                 editing_user_id.set(None);

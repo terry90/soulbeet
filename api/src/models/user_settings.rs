@@ -241,19 +241,19 @@ impl UserSettings {
     }
 
     pub async fn reset_navidrome_banner(user_id: &str) -> Result<(), String> {
-        sqlx::query(
-            "UPDATE user_settings SET navidrome_banner_dismissed = 0 WHERE user_id = ?",
-        )
-        .bind(user_id)
-        .execute(&*DB)
-        .await
-        .map_err(|e| e.to_string())?;
+        sqlx::query("UPDATE user_settings SET navidrome_banner_dismissed = 0 WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&*DB)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     /// Parse per-profile track counts from the JSON column, with fallback for legacy integer values.
     pub fn parse_track_counts(&self) -> std::collections::HashMap<String, u32> {
-        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u32>>(&self.discovery_track_count) {
+        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u32>>(
+            &self.discovery_track_count,
+        ) {
             return map;
         }
         // Legacy fallback: plain integer -> split evenly across profiles
@@ -263,12 +263,16 @@ impl UserSettings {
             ("Conservative".to_string(), per),
             ("Balanced".to_string(), per),
             ("Adventurous".to_string(), total - per * 2),
-        ].into_iter().collect()
+        ]
+        .into_iter()
+        .collect()
     }
 
     /// Parse per-profile lifetime days from the JSON column, with fallback for legacy integer values.
     pub fn parse_lifetime_days(&self) -> std::collections::HashMap<String, u32> {
-        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u32>>(&self.discovery_lifetime_days) {
+        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u32>>(
+            &self.discovery_lifetime_days,
+        ) {
             return map;
         }
         // Legacy fallback: plain integer -> same value for all profiles
@@ -277,12 +281,16 @@ impl UserSettings {
             ("Conservative".to_string(), days),
             ("Balanced".to_string(), days),
             ("Adventurous".to_string(), days),
-        ].into_iter().collect()
+        ]
+        .into_iter()
+        .collect()
     }
 
     /// Get track count for a specific profile.
     pub fn track_count_for_profile(&self, profile: &str) -> usize {
-        self.parse_track_counts().get(profile).copied().unwrap_or(10) as usize
+        self.parse_track_counts()
+            .get(profile)
+            .copied()
+            .unwrap_or(10) as usize
     }
-
 }
