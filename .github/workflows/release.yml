@@ -3,9 +3,53 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 jobs:
+  bump-version:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+
+      - name: Bump Version
+        id: bump
+        run: |
+          ./scripts/bump_version.sh ${{ inputs.bump_type }}
+
+      - name: Commit and Push
+        run: |
+          git add .
+          git commit -m "bump version to ${{ steps.bump.outputs.new_version }}"
+          git push
+
+      - name: Create and Push Tag
+        run: |
+          git tag v${{ steps.bump.outputs.new_version }}
+          git push origin v${{ steps.bump.outputs.new_version }}
+
   create-release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -24,6 +68,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-and-push:
+    if: github.event_name == 'push'
     uses: ./.github/workflows/image-build-push.yml
     with:
       ref: ${{ github.ref_name }}
