@@ -29,3 +29,6 @@ inherits = "dev"
 
 [profile.android-dev]
 inherits = "dev"
+
+[profile.release]
+strip = "debuginfo"
