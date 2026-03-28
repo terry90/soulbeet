@@ -2,8 +2,9 @@ use dioxus::prelude::*;
 use shared::download::{DownloadProgress, DownloadState};
 
 #[component]
-pub fn DownloadItem(file: DownloadProgress) -> Element {
+pub fn DownloadItem(file: DownloadProgress, on_cancel: EventHandler<DownloadProgress>) -> Element {
     let state = &file.state;
+    let is_cancellable = matches!(state, DownloadState::Queued | DownloadState::InProgress);
 
     let (status_text, border_class, badge_class, badge_text) = match state {
         DownloadState::Queued => (
@@ -81,10 +82,26 @@ pub fn DownloadItem(file: DownloadProgress) -> Element {
             title: "{file.item}",
             "{display_name}"
           }
-          span {
-            class: "text-[10px] font-mono {badge_class} px-1.5 py-0.5 rounded uppercase cursor-help",
-            title: "{status_text}",
-            "{badge_text}"
+          div { class: "flex items-center gap-1.5 shrink-0",
+            span {
+              class: "text-[10px] font-mono {badge_class} px-1.5 py-0.5 rounded uppercase cursor-help",
+              title: "{status_text}",
+              "{badge_text}"
+            }
+            if is_cancellable {
+              { let file_clone = file.clone();
+              rsx! {
+                button {
+                  class: "text-[10px] font-mono px-1.5 py-0.5 rounded uppercase border border-transparent text-gray-600 opacity-0 group-hover:opacity-100 hover:border-red-500/40 hover:text-red-400 transition-all cursor-pointer",
+                  title: "Cancel download",
+                  onclick: move |evt: Event<MouseData>| {
+                      evt.stop_propagation();
+                      on_cancel.call(file_clone.clone());
+                  },
+                  "\u{00d7}"
+                }
+              }}
+            }
           }
         }
         div { class: "flex justify-between text-xs text-gray-400 font-mono mb-1",

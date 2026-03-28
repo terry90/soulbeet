@@ -573,6 +573,7 @@ impl From<FileEntry> for crate::download::DownloadProgress {
             percent: entry.percent_complete,
             speed: entry.average_speed,
             error: entry.exception,
+            backend: Some("slskd".into()),
         }
     }
 }

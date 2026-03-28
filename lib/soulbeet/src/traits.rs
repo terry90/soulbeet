@@ -43,6 +43,8 @@ pub trait DownloadBackend: Send + Sync {
     async fn poll_search(&self, search_id: &str) -> Result<SearchResult>;
     async fn download(&self, items: Vec<DownloadableItem>) -> Result<Vec<QueuedDownload>>;
     async fn get_downloads(&self) -> Result<Vec<DownloadProgress>>;
+    async fn cancel_download(&self, username: &str, download_id: &str, remove: bool)
+        -> Result<()>;
     async fn health_check(&self) -> bool;
 }
 

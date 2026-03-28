@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 use shared::download::{DownloadProgress, DownloadState};
 
 mod item;
+use api::CancelDownloadRequest;
 use item::DownloadItem;
 
 #[derive(Props, Clone, PartialEq)]
@@ -51,6 +52,25 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
                     | DownloadState::Importing
                     | DownloadState::Completed // Downloads that are completed but not yet imported
             )
+        });
+    };
+
+    let mut downloads_signal = props.downloads;
+    let cancel_download = move |file: DownloadProgress| {
+        let req = CancelDownloadRequest {
+            id: file.id.clone(),
+            source: file.source.clone(),
+            item: file.item.clone(),
+            backend: file.backend.clone(),
+        };
+        let item_key = file.item.clone();
+        spawn(async move {
+            if api::cancel_download(req).await.is_ok() {
+                let mut map = downloads_signal.write();
+                if let Some(entry) = map.get_mut(&item_key) {
+                    entry.state = DownloadState::Cancelled;
+                }
+            }
         });
     };
 
@@ -109,7 +129,7 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
             }
 
             for file in active_downloads.iter() {
-              DownloadItem { file: file.clone() }
+              DownloadItem { file: file.clone(), on_cancel: cancel_download }
             }
           }
           // Footer

@@ -111,6 +111,51 @@ pub async fn download_updates_ws(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelDownloadRequest {
+    pub id: String,
+    pub source: String,
+    pub item: String,
+    pub backend: Option<String>,
+}
+
+#[post("/api/downloads/cancel", auth: AuthSession)]
+pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnError> {
+    let username = auth.0.username;
+
+    let backend = download_backend(req.backend.as_deref())
+        .await
+        .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
+
+    backend
+        .cancel_download(&req.source, &req.id, false)
+        .await
+        .map_err(server_error)?;
+
+    info!(
+        "User {} cancelled download {} from {}",
+        username, req.id, req.source
+    );
+
+    // Send cancelled state to UI via broadcast channel
+    let (tx, _) = get_or_create_user_channel(&username).await;
+    let cancelled = DownloadProgress {
+        id: req.id,
+        source: req.source,
+        item: req.item,
+        size: 0,
+        transferred: 0,
+        state: shared::download::DownloadState::Cancelled,
+        percent: 0.0,
+        speed: 0.0,
+        error: None,
+        backend: req.backend,
+    };
+    let _ = tx.send(vec![cancelled]);
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadRequest {
     pub items: Vec<DownloadableItem>,
     pub target_folder: String,
@@ -137,16 +182,20 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
 
     let (tx, _) = get_or_create_user_channel(&username).await;
 
+    let backend_id = req.backend;
+
     if !failed.is_empty() {
         let failed_entries: Vec<DownloadProgress> = failed
             .iter()
             .map(|d| {
-                DownloadProgress::failed(
+                let mut p = DownloadProgress::failed(
                     d.id.clone(),
                     d.source.clone(),
                     d.item.clone(),
                     d.error.clone().unwrap_or_default(),
-                )
+                );
+                p.backend = backend_id.clone();
+                p
             })
             .collect();
         let _ = tx.send(failed_entries);
@@ -162,7 +211,12 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
     // Send initial "Queued" state immediately so UI shows the downloads right away
     let queued_entries: Vec<DownloadProgress> = successful
         .iter()
-        .map(|d| DownloadProgress::queued(d.id.clone(), d.source.clone(), d.item.clone(), d.size))
+        .map(|d| {
+            let mut p =
+                DownloadProgress::queued(d.id.clone(), d.source.clone(), d.item.clone(), d.size);
+            p.backend = backend_id.clone();
+            p
+        })
         .collect();
     let _ = tx.send(queued_entries);
 

@@ -144,6 +144,9 @@ pub struct DownloadProgress {
     pub speed: f64,
     /// Error message if failed
     pub error: Option<String>,
+    /// Which download backend owns this transfer
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 impl DownloadProgress {
@@ -158,6 +161,7 @@ impl DownloadProgress {
             percent: 0.0,
             speed: 0.0,
             error: None,
+            backend: None,
         }
     }
 
@@ -172,7 +176,13 @@ impl DownloadProgress {
             percent: 0.0,
             speed: 0.0,
             error: Some(error),
+            backend: None,
         }
+    }
+
+    pub fn with_backend(mut self, backend: impl Into<String>) -> Self {
+        self.backend = Some(backend.into());
+        self
     }
 
     pub fn with_state(mut self, state: DownloadState) -> Self {

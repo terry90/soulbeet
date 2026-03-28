@@ -1051,6 +1051,15 @@ impl crate::DownloadBackend for SoulseekClient {
         Ok(entries.into_iter().map(Into::into).collect())
     }
 
+    async fn cancel_download(
+        &self,
+        username: &str,
+        download_id: &str,
+        remove: bool,
+    ) -> Result<()> {
+        self.cancel_download(username, download_id, remove).await
+    }
+
     async fn health_check(&self) -> bool {
         match self.check_connection().await {
             Ok(()) => true,
