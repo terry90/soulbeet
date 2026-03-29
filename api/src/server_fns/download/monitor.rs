@@ -33,9 +33,18 @@ struct TrackState {
     processed: bool,
 }
 
+/// A tracked download identified by source peer and filename.
+#[derive(Clone, Debug)]
+struct TrackedFile {
+    source: String,
+    filename: String,
+}
+
 /// Monitors download progress from slskd and triggers processing on completion.
 pub struct DownloadMonitor {
-    /// Filenames being monitored.
+    /// Files being monitored (source + filename pairs).
+    tracked_files: Vec<TrackedFile>,
+    /// Filenames only (for legacy compatibility with process_downloads).
     filenames: Vec<String>,
     /// Target directory for imports.
     target_path: PathBuf,
@@ -54,12 +63,19 @@ pub struct DownloadMonitor {
 impl DownloadMonitor {
     /// Create a new download monitor.
     pub fn new(
+        sources: Vec<String>,
         filenames: Vec<String>,
         target_path: PathBuf,
         tx: broadcast::Sender<Vec<DownloadProgress>>,
         cancellation_token: CancellationToken,
         username: String,
     ) -> Self {
+        let tracked_files: Vec<TrackedFile> = sources
+            .into_iter()
+            .zip(filenames.iter().cloned())
+            .map(|(source, filename)| TrackedFile { source, filename })
+            .collect();
+
         let track_states = filenames
             .iter()
             .map(|f| {
@@ -74,6 +90,7 @@ impl DownloadMonitor {
             .collect();
 
         Self {
+            tracked_files,
             filenames,
             target_path,
             tx,
@@ -204,15 +221,35 @@ impl DownloadMonitor {
         self.check_completion(&batch_status).await
     }
 
-    /// Find downloads matching our tracked filenames.
+    /// Find downloads matching our tracked files.
+    ///
+    /// Matches by source (peer username) AND filename. This prevents the
+    /// monitor from confusing a stale completed transfer from a different
+    /// peer with the active download being tracked.
+    ///
+    /// When the same file exists multiple times from the same peer (e.g.
+    /// re-downloading a track), prefer the active entry over the stale one.
     fn find_matching_downloads(&self, downloads: &[DownloadProgress]) -> Vec<DownloadProgress> {
         let mut matched = Vec::new();
-        for download in downloads {
-            for target in &self.filenames {
-                if filenames_match(&download.item, target) {
-                    matched.push(download.clone());
-                    break;
+        for tracked in &self.tracked_files {
+            let mut best: Option<&DownloadProgress> = None;
+            for dl in downloads {
+                if dl.source != tracked.source || !filenames_match(&dl.item, &tracked.filename) {
+                    continue;
                 }
+                match best {
+                    None => best = Some(dl),
+                    Some(prev)
+                        if is_terminal_state(&prev.state)
+                            && !is_terminal_state(&dl.state) =>
+                    {
+                        best = Some(dl);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(dl) = best {
+                matched.push(dl.clone());
             }
         }
         matched

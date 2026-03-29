@@ -201,6 +201,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         let _ = tx.send(failed_entries);
     }
 
+    let download_sources: Vec<String> = successful.iter().map(|d| d.source.clone()).collect();
     let download_filenames: Vec<String> = successful.iter().map(|d| d.item.clone()).collect();
     let target_path = target_path_buf;
 
@@ -229,6 +230,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
     // Spawn the monitoring task
     tokio::spawn(async move {
         let mut monitor = DownloadMonitor::new(
+            download_sources,
             download_filenames,
             target_path,
             tx,
