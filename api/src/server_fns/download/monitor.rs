@@ -146,6 +146,13 @@ impl DownloadMonitor {
             interval.tick().await;
         }
 
+        // Clear completed transfers from slskd so they don't interfere with future downloads
+        if let Ok(backend) = download_backend(None).await {
+            if let Err(e) = backend.clear_completed_downloads().await {
+                warn!("Failed to clear completed downloads from slskd: {}", e);
+            }
+        }
+
         info!(
             "Download monitoring task completed for user: {}",
             self.username

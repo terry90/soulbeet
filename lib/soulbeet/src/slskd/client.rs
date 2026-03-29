@@ -1060,6 +1060,10 @@ impl crate::DownloadBackend for SoulseekClient {
         self.cancel_download(username, download_id, remove).await
     }
 
+    async fn clear_completed_downloads(&self) -> Result<()> {
+        self.clear_all_completed_downloads().await
+    }
+
     async fn health_check(&self) -> bool {
         match self.check_connection().await {
             Ok(()) => true,

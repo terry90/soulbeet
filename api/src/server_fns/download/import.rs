@@ -75,6 +75,11 @@ pub async fn import_group(
                 })
                 .collect();
             let _ = tx.send(imported_entries);
+
+            // Clean up empty source directories left after beets moves the files
+            if let Some(parent) = Path::new(&source_path).parent() {
+                let _ = crate::server_fns::cleanup_empty_ancestors(parent).await;
+            }
         }
         Ok(ImportResult::Skipped) => {
             info!("Import skipped items");
