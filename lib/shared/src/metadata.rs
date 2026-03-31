@@ -43,6 +43,7 @@ pub struct SearchResults {
 pub enum SearchResult {
     Track(Track),
     Album(Album),
+    AlbumGroup(AlbumGroup),
 }
 
 /// A track from a metadata provider.
@@ -87,6 +88,29 @@ pub struct Album {
     /// URL to the album cover image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
+}
+
+/// This represents a general album entity, containing specific versions.
+/// Equivalent to a MusicBrainz release group.
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct AlbumGroup {
+    /// Provider-specific identifier for lookups.
+    pub id: String,
+    /// The title of the album.
+    pub title: String,
+    /// A formatted string of the artist(s).
+    pub artist: String,
+    /// The release date of the album (YYYY-MM-DD).
+    pub release_date: Option<String>,
+    /// The MusicBrainz release ID, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbid: Option<String>,
+    /// URL to the album cover image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
+    /// List of known editions of the album (e.g. deluxe, remastered, etc.).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub editions: Vec<Album>,
 }
 
 /// An album with its full track listing.

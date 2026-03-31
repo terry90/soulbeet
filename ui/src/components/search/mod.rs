@@ -1,4 +1,5 @@
 pub mod album;
+mod albumgroup;
 pub mod context;
 pub mod track;
 
@@ -26,6 +27,7 @@ use std::collections::HashMap;
 use track::TrackResult;
 
 use crate::search::album::AlbumResult;
+use crate::search::albumgroup::AlbumGroupResult;
 use crate::settings_context::use_settings;
 use crate::{use_auth, Album, AlbumHeader, Button, Modal, SystemStatus};
 
@@ -741,6 +743,19 @@ pub fn Search() -> Element {
                                   }
                                 }
                             }
+                            SearchResult::AlbumGroup(ref album_group) => {
+                                rsx! {
+                                  li { key: "{album_group.id}",
+                                    AlbumGroupResult {
+                                      album_group: album_group.clone(),
+                                        on_edition_click: move |edition_id: String| {
+                                          spawn(view_full_album(edition_id, provider));
+                                        },
+                                    }
+                                  }
+                                }
+                            }
+
                         }
                       }
                     }
