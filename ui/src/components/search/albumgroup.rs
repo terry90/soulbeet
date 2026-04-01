@@ -45,16 +45,15 @@ pub fn AlbumGroupResult(props: Props) -> Element {
         date_a.cmp(date_b)
     });
 
-    let oldest_edition = editions.first();
-    let oldest_id = oldest_edition
-        .map(|e| e.id.clone())
-        .unwrap_or_else(|| props.album_group.id.clone());
+    // SAFETY: We know there's at least 2 editions here, so unwrap is fine
+    let oldest_edition = editions.first().unwrap();
+    let oldest_id = oldest_edition.id.clone();
     
     rsx! {
       div {
         class: "flex flex-col bg-white/5 border border-white/5 rounded-lg overflow-hidden transition-all duration-200 hover:border-beet-accent/30",
         
-        // Main Header
+        // Main Header, looks basically like AlbumResult
         div {
             onclick: move |_| {
                 props.on_edition_click.call(oldest_id.clone());
@@ -83,7 +82,7 @@ pub fn AlbumGroupResult(props: Props) -> Element {
             }
         }
 
-        // The "Flat Arrow" bar at the bottom of the element
+        // Bar with arrow at bottom of the list card item to toggle editions
         if !editions.is_empty() {
             div {
                 onclick: move |evt| {
