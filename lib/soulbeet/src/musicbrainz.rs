@@ -296,6 +296,19 @@ pub async fn search(
                     continue;
                 }
 
+                // For releases with more than 1 medium or with a single medium
+                // that is not "CD", "Digital Media" or "12\" Vinyl",
+                // it's likely a compilation, so skip it
+                if release.media.as_ref().is_some_and(|m| {
+                    m.len() > 1 ||
+                        m.len() == 1
+                            && m[0].format.as_deref() != Some("CD")
+                            && m[0].format.as_deref() != Some("Digital Media")
+                            && m[0].format.as_deref() != Some("12\" Vinyl")
+                }) {
+                    continue;
+                }
+
                 let rg_id = release.release_group.as_ref().unwrap().id.clone();
 
                 let title = match release.disambiguation.as_deref() {
