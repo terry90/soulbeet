@@ -7,7 +7,7 @@ use musicbrainz_rs::{
     },
     Fetch, MusicBrainzClient, Search,
 };
-use shared::metadata::{Album, AlbumWithTracks, AlbumGroup, SearchResult, Track};
+use shared::metadata::{Album, AlbumWithTracks, AlbumGroup, SearchResult, Track, compare_musicbrainz_dates};
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -282,9 +282,10 @@ pub async fn search(
             })
             .await?;
 
-            // release_group_id -> unique releases
-            let mut unique_releases: HashMap<String, HashSet<String>> = HashMap::new();
-            let mut results_container: HashMap<String, AlbumGroup> = HashMap::new();
+            // release_group_id -> (Title -> Album (edition))
+            let mut results_container: HashMap<String, HashMap<String, Album>> = HashMap::new();
+            // release_group_id -> release group title
+            let mut release_groups: HashMap<String, String> = HashMap::new();
             // track when release groups first appeared in response
             // used to sort the final result vec
             let mut rg_order: HashMap<String, usize> = HashMap::new();
@@ -319,10 +320,7 @@ pub async fn search(
                 if !rg_order.contains_key(&rg_id) {
                     rg_order.insert(rg_id.clone(), rg_order.len());
                 }
-                let release_group = unique_releases.entry(rg_id.clone()).or_default();
-                if !release_group.insert(title.clone()) {
-                    continue;
-                }
+
 
                 let edition = Album {
                     id: release.id.clone(),
@@ -332,58 +330,56 @@ pub async fn search(
                     mbid: Some(release.id.clone()),
                     cover_url: Some(format!("https://coverartarchive.org/release/{}/front-250", release.id)),
                 };
-                match results_container.entry(rg_id.clone()) {
+
+                // Use the release group ID to track unique releases and avoid duplicates based on title.
+                // However, for releases with the same title and release group ID,
+                // we keep the oldest one (based on release date) to ensure we get the canonical release
+                let release_group = results_container.entry(rg_id.clone()).or_insert_with(|| {
+                    release_groups.insert(rg_id.clone(), release.release_group.as_ref().unwrap().title.clone());
+                    HashMap::new()
+                });
+
+                match release_group.entry(title.clone()) {
                     Entry::Vacant(entry) => {
-                        entry.insert(AlbumGroup {
-                            id: rg_id.clone(),
-                            title: release.release_group.unwrap().title.clone(),
-                            artist: format_artist_credit(&release.artist_credit),
-                            release_date: edition.release_date.clone(),
-                            mbid: Some(rg_id.clone()),
-                            cover_url: Some(format!(
-                                "https://coverartarchive.org/release-group/{}/front-250",
-                                rg_id
-                            )),
-                            editions: vec![edition],
-                        });
+                        entry.insert(edition);
                     }
                     Entry::Occupied(mut entry) => {
-                        let existing = entry.get_mut();
-
-                        let existing_date = existing.release_date.as_deref().filter(|s| !s.is_empty());
-                        let new_date = edition.release_date.as_deref().filter(|s| !s.is_empty());
-
-                        match (existing_date, new_date) {
-                            (None, Some(date)) => {
-                                existing.release_date = Some(date.to_string());
-                            }
-                            (Some(ex_date), Some(n_date)) if n_date < ex_date => {
-                                existing.release_date = Some(n_date.to_string());
-                            }
-                            _ => {}
+                        let existing = entry.get();
+                        let new_date: Option<&str> = release.date.as_ref().map(|d| d.0.as_ref());
+                        if compare_musicbrainz_dates(&existing.release_date, &new_date) == std::cmp::Ordering::Greater {
+                            entry.insert(edition);
                         }
-
-                        existing.editions.push(edition);
                     }
                 }
             }
 
-            results.extend(results_container.into_values().map(SearchResult::AlbumGroup));
+            // Flatten the results container into a single vector of SearchResult::AlbumGroup
+            for (rg_id, editions) in results_container.into_iter() {
+                let oldest_edition = editions.values().min_by(|a, b|
+                    compare_musicbrainz_dates(&a.release_date, &b.release_date)
+                ).unwrap();
+                let album_group = AlbumGroup {
+                    id: rg_id.clone(),
+                    title: release_groups.get(&rg_id).unwrap_or(&oldest_edition.title).clone(),
+                    artist: oldest_edition.artist.clone(),
+                    release_date: oldest_edition.release_date.clone(),
+                    mbid: Some(rg_id.clone()),
+                    cover_url: Some(format!("https://coverartarchive.org/release-group/{}/front-250", rg_id)),
+                    editions: editions.into_values().collect(),
+                };
+                results.push(SearchResult::AlbumGroup(album_group));
+            }
 
             results.sort_by(|a, b| {
                 let SearchResult::AlbumGroup(a_album) = a else { return std::cmp::Ordering::Equal; };
                 let SearchResult::AlbumGroup(b_album) = b else { return std::cmp::Ordering::Equal; };
                 let a_rg_rank = rg_order.get(&a_album.id).unwrap_or(&usize::MAX);
                 let b_rg_rank = rg_order.get(&b_album.id).unwrap_or(&usize::MAX);
-                let is_missing = |date: &Option<String>| {
-                    date.as_deref().unwrap_or("").is_empty()
-                };
+
                 // First sort by release group rank (i.e. when they appeared in the musicbrainz response)
                 a_rg_rank.cmp(&b_rg_rank)
-                    // Then push releases without release date to the back
-                    .then(is_missing(&a_album.release_date).cmp(&is_missing(&b_album.release_date)))
-                    // Then sort by release date
-                    .then(a_album.release_date.cmp(&b_album.release_date))
+                    // then compare by date
+                    .then(compare_musicbrainz_dates(&a_album.release_date, &b_album.release_date))
             });
         }
     }

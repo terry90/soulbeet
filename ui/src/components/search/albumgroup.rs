@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use shared::metadata::{Album, AlbumGroup};
+use shared::metadata::{Album, AlbumGroup, compare_musicbrainz_dates};
 
 use crate::CoverArt;
 use super::album::AlbumResult;
@@ -39,11 +39,7 @@ pub fn AlbumGroupResult(props: Props) -> Element {
     }
     
     // Sort editions by date
-    editions.sort_by(|a, b| {
-        let date_a = a.release_date.as_deref().filter(|s| !s.is_empty()).unwrap_or("9999-12-31");
-        let date_b = b.release_date.as_deref().filter(|s| !s.is_empty()).unwrap_or("9999-12-31");
-        date_a.cmp(date_b)
-    });
+    editions.sort_by(|a, b| compare_musicbrainz_dates(&a.release_date, &b.release_date));
 
     // SAFETY: We know there's at least 2 editions here, so unwrap is fine
     let oldest_edition = editions.first().unwrap();
