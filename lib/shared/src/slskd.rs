@@ -574,6 +574,8 @@ impl From<FileEntry> for crate::download::DownloadProgress {
             speed: entry.average_speed,
             error: entry.exception,
             backend: Some("slskd".into()),
+            batch_id: None,
+            batch_label: None,
         }
     }
 }

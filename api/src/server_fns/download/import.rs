@@ -1,7 +1,7 @@
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
 #[cfg(feature = "server")]
-use shared::download::{DownloadProgress, DownloadState};
+use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
 #[cfg(feature = "server")]
 use soulbeet::ImportResult;
 #[cfg(feature = "server")]
@@ -29,7 +29,7 @@ pub async fn import_group(
     entries: Vec<DownloadProgress>,
     source_path: String,
     target_path: std::path::PathBuf,
-    tx: broadcast::Sender<Vec<DownloadProgress>>,
+    tx: broadcast::Sender<DownloadEvent>,
     as_album: bool,
 ) {
     info!(
@@ -44,7 +44,7 @@ pub async fn import_group(
             ..e.clone()
         })
         .collect();
-    let _ = tx.send(importing_entries);
+    let _ = tx.send(DownloadEvent::Progress(importing_entries));
 
     let importer = match music_importer(None).await {
         Ok(imp) => imp,
@@ -58,7 +58,7 @@ pub async fn import_group(
                     ..entry.clone()
                 })
                 .collect();
-            let _ = tx.send(failed_entries);
+            let _ = tx.send(DownloadEvent::Progress(failed_entries));
             return;
         }
     };
@@ -74,7 +74,7 @@ pub async fn import_group(
                     ..e.clone()
                 })
                 .collect();
-            let _ = tx.send(imported_entries);
+            let _ = tx.send(DownloadEvent::Progress(imported_entries));
 
             // Clean up empty source directories left after beets moves the files
             if let Some(parent) = Path::new(&source_path).parent() {
@@ -90,7 +90,7 @@ pub async fn import_group(
                     ..e.clone()
                 })
                 .collect();
-            let _ = tx.send(skipped_entries);
+            let _ = tx.send(DownloadEvent::Progress(skipped_entries));
 
             for entry in &entries {
                 cleanup_failed_file(&entry.item).await;
@@ -109,7 +109,7 @@ pub async fn import_group(
                     ..e.clone()
                 })
                 .collect();
-            let _ = tx.send(failed_entries);
+            let _ = tx.send(DownloadEvent::Progress(failed_entries));
 
             for entry in &entries {
                 cleanup_failed_file(&entry.item).await;
@@ -128,7 +128,7 @@ pub async fn import_group(
                     ..e.clone()
                 })
                 .collect();
-            let _ = tx.send(failed_entries);
+            let _ = tx.send(DownloadEvent::Progress(failed_entries));
 
             for entry in &entries {
                 cleanup_failed_file(&entry.item).await;
@@ -147,7 +147,7 @@ pub async fn import_group(
                     ..entry.clone()
                 })
                 .collect();
-            let _ = tx.send(failed_entries);
+            let _ = tx.send(DownloadEvent::Progress(failed_entries));
 
             for entry in &entries {
                 cleanup_failed_file(&entry.item).await;

@@ -34,6 +34,7 @@ axum = { version = "0.8.7", optional = true }
 aes-gcm = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
+futures = { version = "0.3", optional = true }
 
 [build-dependencies]
 dotenvy = "0.15.7"
@@ -54,4 +55,5 @@ server = [
   "dep:aes-gcm",
   "dep:sha2",
   "dep:base64",
+  "dep:futures",
 ]

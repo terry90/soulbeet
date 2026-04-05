@@ -4,7 +4,7 @@
 //! handles per-track timeouts, and triggers processing when downloads complete.
 
 use dioxus::logger::tracing::{debug, info, warn};
-use shared::download::{DownloadProgress, DownloadState};
+use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -49,7 +49,7 @@ pub struct DownloadMonitor {
     /// Target directory for imports.
     target_path: PathBuf,
     /// Broadcast sender for UI updates.
-    tx: broadcast::Sender<Vec<DownloadProgress>>,
+    tx: broadcast::Sender<DownloadEvent>,
     /// Per-track state tracking.
     track_states: HashMap<String, TrackState>,
     /// Whether album mode is enabled.
@@ -58,6 +58,10 @@ pub struct DownloadMonitor {
     cancellation_token: CancellationToken,
     /// Username for logging.
     username: String,
+    /// Batch identifier for grouping downloads.
+    batch_id: Option<String>,
+    /// Human-readable batch label (album name).
+    batch_label: Option<String>,
 }
 
 impl DownloadMonitor {
@@ -66,9 +70,11 @@ impl DownloadMonitor {
         sources: Vec<String>,
         filenames: Vec<String>,
         target_path: PathBuf,
-        tx: broadcast::Sender<Vec<DownloadProgress>>,
+        tx: broadcast::Sender<DownloadEvent>,
         cancellation_token: CancellationToken,
         username: String,
+        batch_id: Option<String>,
+        batch_label: Option<String>,
     ) -> Self {
         let tracked_files: Vec<TrackedFile> = sources
             .into_iter()
@@ -98,6 +104,8 @@ impl DownloadMonitor {
             album_mode: CONFIG.is_album_mode(),
             cancellation_token,
             username,
+            batch_id,
+            batch_label,
         }
     }
 
@@ -280,13 +288,25 @@ impl DownloadMonitor {
 
     /// Send status update to UI via broadcast channel.
     fn send_status_update(&self, batch_status: &[DownloadProgress]) {
-        if let Err(e) = self.tx.send(batch_status.to_vec()) {
+        let entries = self.stamp_batch(batch_status.to_vec());
+        if let Err(e) = self.tx.send(DownloadEvent::Progress(entries)) {
             if self.tx.receiver_count() == 0 {
                 info!("No receivers for download updates, but continuing monitoring");
             } else {
                 warn!("Failed to send download status update: {:?}", e);
             }
         }
+    }
+
+    /// Apply batch_id and batch_label to a set of progress entries.
+    fn stamp_batch(&self, mut entries: Vec<DownloadProgress>) -> Vec<DownloadProgress> {
+        if self.batch_id.is_some() || self.batch_label.is_some() {
+            for entry in &mut entries {
+                entry.batch_id.clone_from(&self.batch_id);
+                entry.batch_label.clone_from(&self.batch_label);
+            }
+        }
+        entries
     }
 
     /// Process each track, handling timeouts and completions.
@@ -324,7 +344,8 @@ impl DownloadMonitor {
                             error: Some("Per-track timeout".into()),
                             ..download.clone()
                         };
-                        let _ = self.tx.send(vec![timeout_entry]);
+                        let entries = self.stamp_batch(vec![timeout_entry]);
+                        let _ = self.tx.send(DownloadEvent::Progress(entries));
                         self.track_states.get_mut(&key).unwrap().processed = true;
                         continue;
                     }

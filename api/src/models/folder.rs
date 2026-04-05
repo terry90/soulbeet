@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
 pub struct Folder {
     pub id: String,

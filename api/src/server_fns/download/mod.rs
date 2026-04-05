@@ -1,7 +1,9 @@
 use dioxus::fullstack::{WebSocketOptions, Websocket};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
-use shared::download::{DownloadProgress, DownloadableItem, QueuedDownload};
+use shared::download::{DownloadEvent, DownloadableItem, QueuedDownload};
+#[cfg(feature = "server")]
+use shared::download::DownloadProgress;
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
@@ -20,6 +22,9 @@ use crate::globals::{
 use crate::services::download_backend;
 
 // Local modules
+pub mod auto_download;
+pub use auto_download::{auto_download, AutoDownloadRequest, AutoDownloadResult};
+
 #[cfg(feature = "server")]
 pub mod import;
 #[cfg(feature = "server")]
@@ -49,7 +54,7 @@ async fn do_download(
 #[get("/api/downloads/updates", auth: AuthSession)]
 pub async fn download_updates_ws(
     options: WebSocketOptions,
-) -> Result<Websocket<(), Vec<DownloadProgress>>, ServerFnError> {
+) -> Result<Websocket<(), DownloadEvent>, ServerFnError> {
     let username = auth.0.username;
 
     let rx = {
@@ -149,8 +154,10 @@ pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnE
         speed: 0.0,
         error: None,
         backend: req.backend,
+        batch_id: None,
+        batch_label: None,
     };
-    let _ = tx.send(vec![cancelled]);
+    let _ = tx.send(DownloadEvent::Progress(vec![cancelled]));
 
     Ok(())
 }
@@ -198,7 +205,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
                 p
             })
             .collect();
-        let _ = tx.send(failed_entries);
+        let _ = tx.send(DownloadEvent::Progress(failed_entries));
     }
 
     let download_sources: Vec<String> = successful.iter().map(|d| d.source.clone()).collect();
@@ -219,7 +226,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
             p
         })
         .collect();
-    let _ = tx.send(queued_entries);
+    let _ = tx.send(DownloadEvent::Progress(queued_entries));
 
     info!("Started monitoring downloads: {:?}", download_filenames);
 
@@ -236,6 +243,8 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
             tx,
             task_cancellation,
             task_username.clone(),
+            None, // batch_id - will be set by auto_download in Plan 02
+            None, // batch_label - will be set by auto_download in Plan 02
         );
         monitor.run().await;
         unregister_user_task(&task_username).await;

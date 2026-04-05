@@ -1,7 +1,7 @@
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
 #[cfg(feature = "server")]
-use shared::download::{DownloadProgress, DownloadState};
+use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
 #[cfg(feature = "server")]
 use std::collections::HashMap;
 #[cfg(feature = "server")]
@@ -61,7 +61,7 @@ async fn resolve_download_path_with_retry(filename: &str, download_base: &Path) 
 pub async fn process_downloads(
     successful_downloads: Vec<DownloadProgress>,
     target_path: std::path::PathBuf,
-    tx: broadcast::Sender<Vec<DownloadProgress>>,
+    tx: broadcast::Sender<DownloadEvent>,
 ) {
     if !successful_downloads.is_empty() {
         info!(
@@ -104,7 +104,7 @@ pub async fn process_downloads(
                         error: Some("Could not resolve file path".into()),
                         ..download
                     };
-                    let _ = tx.send(vec![failed_entry]);
+                    let _ = tx.send(DownloadEvent::Progress(vec![failed_entry]));
                 }
             }
 
@@ -134,7 +134,7 @@ pub async fn process_downloads(
                         error: Some("Could not resolve file path".into()),
                         ..download
                     };
-                    let _ = tx.send(vec![failed_entry]);
+                    let _ = tx.send(DownloadEvent::Progress(vec![failed_entry]));
                 }
             }
         }

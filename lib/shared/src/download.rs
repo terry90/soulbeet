@@ -147,6 +147,12 @@ pub struct DownloadProgress {
     /// Which download backend owns this transfer
     #[serde(default)]
     pub backend: Option<String>,
+    /// Groups this download with others from the same batch
+    #[serde(default)]
+    pub batch_id: Option<String>,
+    /// Human-readable batch label (album name)
+    #[serde(default)]
+    pub batch_label: Option<String>,
 }
 
 impl DownloadProgress {
@@ -162,6 +168,8 @@ impl DownloadProgress {
             speed: 0.0,
             error: None,
             backend: None,
+            batch_id: None,
+            batch_label: None,
         }
     }
 
@@ -177,6 +185,8 @@ impl DownloadProgress {
             speed: 0.0,
             error: Some(error),
             backend: None,
+            batch_id: None,
+            batch_label: None,
         }
     }
 
@@ -187,6 +197,12 @@ impl DownloadProgress {
 
     pub fn with_state(mut self, state: DownloadState) -> Self {
         self.state = state;
+        self
+    }
+
+    pub fn with_batch(mut self, batch_id: String, batch_label: String) -> Self {
+        self.batch_id = Some(batch_id);
+        self.batch_label = Some(batch_label);
         self
     }
 }
@@ -225,4 +241,54 @@ impl QueuedDownload {
     pub fn is_success(&self) -> bool {
         self.error.is_none()
     }
+}
+
+/// Wrapper for all download-related WebSocket events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DownloadEvent {
+    /// Standard download progress updates
+    Progress(Vec<DownloadProgress>),
+    /// Auto-download lifecycle events (displayed inline on search rows, not in download panel)
+    AutoDownload(AutoDownloadEvent),
+}
+
+/// Events from the auto-download pipeline, sent over WebSocket
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AutoDownloadEvent {
+    /// Backend search started
+    Searching {
+        batch_id: String,
+        query: String,
+        backend_count: usize,
+    },
+    /// Results scored and ranked
+    ScoringResults {
+        batch_id: String,
+        result_count: usize,
+        best_score: f64,
+    },
+    /// Source selected for download
+    PickedSource {
+        batch_id: String,
+        source: String,
+        score: f64,
+        quality: String,
+        track_count: usize,
+    },
+    /// Download queued with the picked source
+    Downloading {
+        batch_id: String,
+    },
+    /// Best score below threshold, client should show manual source picker
+    FallbackToManual {
+        batch_id: String,
+        results: Vec<DownloadableGroup>,
+        best_score: f64,
+        threshold: f64,
+    },
+    /// Auto-download pipeline failed
+    Failed {
+        batch_id: String,
+        error: String,
+    },
 }

@@ -6,7 +6,7 @@ use std::sync::{LazyLock, Once};
 use std::time::Duration;
 
 #[cfg(feature = "server")]
-use shared::download::DownloadProgress;
+use shared::download::DownloadEvent;
 #[cfg(feature = "server")]
 use tokio::sync::{broadcast, RwLock};
 #[cfg(feature = "server")]
@@ -25,7 +25,7 @@ const CHANNEL_STALE_THRESHOLD_SECS: u64 = 600;
 /// Channel info including the sender and cancellation token for cleanup
 #[cfg(feature = "server")]
 pub struct UserChannel {
-    pub sender: broadcast::Sender<Vec<DownloadProgress>>,
+    pub sender: broadcast::Sender<DownloadEvent>,
     pub cancellation_token: CancellationToken,
     pub active_tasks: std::sync::atomic::AtomicUsize,
     /// Timestamp of last activity (task registration or message send)
@@ -115,7 +115,7 @@ pub static DISCOVERY_PROGRESS: LazyLock<
 #[cfg(feature = "server")]
 pub async fn get_or_create_user_channel(
     username: &str,
-) -> (broadcast::Sender<Vec<DownloadProgress>>, CancellationToken) {
+) -> (broadcast::Sender<DownloadEvent>, CancellationToken) {
     let mut map = USER_CHANNELS.write().await;
     let channel = map
         .entry(username.to_string())
