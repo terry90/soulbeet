@@ -1,6 +1,8 @@
 use auth::{use_auth, AuthProvider};
 use dioxus::prelude::*;
 use shared::download::DownloadProgress;
+#[cfg(feature = "web")]
+use shared::download::DownloadEvent;
 use shared::system::NavidromeStatus;
 use std::collections::HashMap;
 
@@ -9,7 +11,7 @@ use dioxus::fullstack::WebSocketOptions;
 #[cfg(feature = "web")]
 use websocket::use_resilient_websocket;
 
-use ui::{Downloads, Layout, Navbar, SearchPrefill, SearchReset, SettingsProvider};
+use ui::{AutoDownloadSignal, Downloads, Layout, Navbar, SearchPrefill, SearchReset, SettingsProvider};
 use views::{DashboardPage, LoginPage, SearchPage, SettingsPage};
 
 mod auth;
@@ -106,13 +108,24 @@ fn WebNavbar() -> Element {
     use_context_provider(|| SearchReset(search_reset));
     use_context_provider(|| SearchPrefill(search_prefill));
 
+    #[allow(unused_mut)]
+    let mut auto_download_signal = use_signal(|| None::<shared::download::AutoDownloadEvent>);
+    use_context_provider(|| AutoDownloadSignal(auto_download_signal));
+
     #[cfg(feature = "web")]
     use_resilient_websocket(
         || api::download_updates_ws(WebSocketOptions::new()),
-        move |data: Vec<DownloadProgress>| {
-            let mut map = downloads.write();
-            for file in data {
-                map.insert(file.item.clone(), file);
+        move |event: DownloadEvent| {
+            match event {
+                DownloadEvent::Progress(data) => {
+                    let mut map = downloads.write();
+                    for file in data {
+                        map.insert(file.item.clone(), file);
+                    }
+                }
+                DownloadEvent::AutoDownload(auto_event) => {
+                    auto_download_signal.set(Some(auto_event));
+                }
             }
         },
     );

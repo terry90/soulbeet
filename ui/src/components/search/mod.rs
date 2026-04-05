@@ -2,15 +2,26 @@ pub mod album;
 pub mod context;
 pub mod track;
 
-pub use context::{SearchPrefill, SearchReset};
+pub use context::{AutoDownloadSignal, SearchPrefill, SearchReset};
 
+mod download_icon;
+pub use download_icon::{DownloadIcon, DownloadRowState};
+
+mod download_options_menu;
+
+mod folder_chip;
+use folder_chip::FolderChip;
+
+use api::models::folder::Folder;
 use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::*;
 use shared::download::{
-    DownloadQuery, DownloadableGroup, DownloadableItem, SearchState as DownloadSearchState,
+    AutoDownloadEvent, DownloadQuery, DownloadableGroup, DownloadableItem,
+    SearchState as DownloadSearchState,
 };
 use shared::metadata::{AlbumWithTracks, Provider, SearchResult, SearchResults};
 use shared::system::SystemHealth;
+use std::collections::HashMap;
 
 use track::TrackResult;
 
@@ -20,6 +31,9 @@ use crate::{use_auth, Album, AlbumHeader, Button, Modal, SystemStatus};
 
 mod download_results;
 use download_results::DownloadResults;
+
+mod toast;
+use toast::{FallbackToast, FallbackToastData};
 
 mod search_type_toggle;
 use search_type_toggle::{SearchType, SearchTypeToggle};
@@ -41,6 +55,15 @@ pub fn Search() -> Element {
 
     let mut system_status = use_signal(SystemHealth::default);
 
+    // Download state tracking
+    let mut download_states = use_signal::<HashMap<String, DownloadRowState>>(HashMap::new);
+    let mut batch_to_item = use_signal::<HashMap<String, String>>(HashMap::new);
+    let mut folders = use_signal::<Vec<Folder>>(Vec::new);
+    let mut selected_folder_id = use_signal::<Option<String>>(|| None);
+    let mut fallback_toasts = use_signal::<Vec<FallbackToastData>>(Vec::new);
+    let mut batch_to_name = use_signal::<HashMap<String, String>>(HashMap::new);
+    let mut active_menu = use_signal::<Option<String>>(|| None);
+
     // Track if we've synced search_type from settings (to avoid saving on initial load)
     let mut synced = use_signal(|| false);
 
@@ -59,6 +82,27 @@ pub fn Search() -> Element {
             spawn(async move {
                 let _ = settings.set_last_search_type(current_type).await;
             });
+        }
+    });
+
+    // Sync selected_folder_id from settings
+    use_effect(move || {
+        if settings.is_loaded() {
+            if let Some(us) = settings.get() {
+                if us.default_download_folder_id.is_some() {
+                    selected_folder_id.set(us.default_download_folder_id.clone());
+                }
+            }
+        }
+    });
+
+    // Fetch user folders
+    use_future(move || async move {
+        if let Ok(user_folders) = auth.call(api::get_user_folders()).await {
+            if user_folders.len() == 1 {
+                selected_folder_id.set(Some(user_folders[0].id.clone()));
+            }
+            folders.set(user_folders);
         }
     });
 
@@ -83,10 +127,216 @@ pub fn Search() -> Element {
         }
     });
 
+    // Buffer for events that arrive before batch_to_item is populated (race condition)
+    let mut pending_events = use_signal::<Vec<AutoDownloadEvent>>(Vec::new);
+
+    // Route AutoDownloadEvents from WebSocket to per-row download states
+    let auto_dl = try_use_context::<AutoDownloadSignal>();
+    use_effect(move || {
+        let Some(mut ctx) = auto_dl else { return };
+        let Some(event) = (ctx.0)() else { return };
+        (ctx.0).set(None);
+
+        // Collect the new event plus any buffered ones
+        let mut events_to_process = pending_events.read().clone();
+        events_to_process.push(event);
+        let mut still_pending = Vec::new();
+
+        for event in events_to_process {
+            let batch_id = match &event {
+                AutoDownloadEvent::Searching { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::ScoringResults { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::PickedSource { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::Downloading { batch_id } => batch_id.clone(),
+                AutoDownloadEvent::FallbackToManual { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::Failed { batch_id, .. } => batch_id.clone(),
+            };
+
+            let item_id = batch_to_item.read().get(&batch_id).cloned();
+            let Some(item_id) = item_id else {
+                // batch_id not yet registered, buffer for retry
+                still_pending.push(event);
+                continue;
+            };
+
+            match event {
+                AutoDownloadEvent::Searching { .. } | AutoDownloadEvent::ScoringResults { .. } => {
+                    download_states.write().insert(item_id, DownloadRowState::Searching);
+                }
+                AutoDownloadEvent::PickedSource { .. } | AutoDownloadEvent::Downloading { .. } => {
+                    let item_id_timer = item_id.clone();
+                    download_states.write().insert(item_id, DownloadRowState::Done);
+
+                    spawn(async move {
+                        gloo_timers::future::TimeoutFuture::new(5000).await;
+                        let current = download_states.read().get(&item_id_timer).cloned();
+                        if matches!(current, Some(DownloadRowState::Done)) {
+                            download_states.write().insert(item_id_timer, DownloadRowState::Idle);
+                        }
+                    });
+                }
+                AutoDownloadEvent::FallbackToManual { batch_id, results, .. } => {
+                    download_states.write().insert(item_id.clone(), DownloadRowState::Idle);
+
+                    let track_name = batch_to_name.read().get(&batch_id).cloned().unwrap_or(item_id.clone());
+
+                    let toast_id = batch_id.clone();
+                    fallback_toasts.write().push(FallbackToastData {
+                        id: batch_id,
+                        track_name,
+                        results,
+                    });
+
+                    spawn(async move {
+                        gloo_timers::future::TimeoutFuture::new(8000).await;
+                        fallback_toasts.write().retain(|t| t.id != toast_id);
+                    });
+                }
+                AutoDownloadEvent::Failed { error, .. } => {
+                    download_states.write().insert(item_id, DownloadRowState::Failed(error));
+                }
+            }
+        }
+
+        pending_events.set(still_pending);
+    });
+
+    // Drain pending events when batch_to_item changes (new batch registered)
+    use_effect(move || {
+        let _trigger = batch_to_item.read().len();
+        if pending_events.read().is_empty() { return; }
+
+        let events = pending_events.read().clone();
+        let mut still_pending = Vec::new();
+
+        for event in events {
+            let batch_id = match &event {
+                AutoDownloadEvent::Searching { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::ScoringResults { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::PickedSource { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::Downloading { batch_id } => batch_id.clone(),
+                AutoDownloadEvent::FallbackToManual { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::Failed { batch_id, .. } => batch_id.clone(),
+            };
+
+            let item_id = batch_to_item.read().get(&batch_id).cloned();
+            let Some(item_id) = item_id else {
+                still_pending.push(event);
+                continue;
+            };
+
+            match event {
+                AutoDownloadEvent::Searching { .. } | AutoDownloadEvent::ScoringResults { .. } => {
+                    download_states.write().insert(item_id, DownloadRowState::Searching);
+                }
+                AutoDownloadEvent::PickedSource { .. } | AutoDownloadEvent::Downloading { .. } => {
+                    let item_id_timer = item_id.clone();
+                    download_states.write().insert(item_id, DownloadRowState::Done);
+                    spawn(async move {
+                        gloo_timers::future::TimeoutFuture::new(5000).await;
+                        let current = download_states.read().get(&item_id_timer).cloned();
+                        if matches!(current, Some(DownloadRowState::Done)) {
+                            download_states.write().insert(item_id_timer, DownloadRowState::Idle);
+                        }
+                    });
+                }
+                AutoDownloadEvent::FallbackToManual { batch_id, results, .. } => {
+                    download_states.write().insert(item_id.clone(), DownloadRowState::Idle);
+                    let track_name = batch_to_name.read().get(&batch_id).cloned().unwrap_or(item_id.clone());
+                    let toast_id = batch_id.clone();
+                    fallback_toasts.write().push(FallbackToastData {
+                        id: batch_id,
+                        track_name,
+                        results,
+                    });
+                    spawn(async move {
+                        gloo_timers::future::TimeoutFuture::new(8000).await;
+                        fallback_toasts.write().retain(|t| t.id != toast_id);
+                    });
+                }
+                AutoDownloadEvent::Failed { error, .. } => {
+                    download_states.write().insert(item_id, DownloadRowState::Failed(error));
+                }
+            }
+        }
+
+        pending_events.set(still_pending);
+    });
+
     if !auth.is_logged_in() {
         info!("User not logged in");
         return rsx! {};
     }
+
+    // Start an auto_download for a specific folder
+    let mut start_auto_download = move |item_id: String, query: DownloadQuery, folder: Folder| {
+        download_states.write().insert(item_id.clone(), DownloadRowState::Searching);
+
+        // Extract display name before query is moved into the request
+        let display_name = query.album.as_ref().map(|a| a.title.clone())
+            .or_else(|| query.tracks.first().map(|t| format!("{} - {}", t.artist, t.title)))
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        spawn(async move {
+            let result = auth
+                .call(api::auto_download(api::AutoDownloadRequest {
+                    query,
+                    folder_id: folder.id.clone(),
+                    folder_path: folder.path.clone(),
+                }))
+                .await;
+
+            match result {
+                Ok(api::AutoDownloadResult::Accepted { batch_id }) => {
+                    batch_to_item.write().insert(batch_id.clone(), item_id);
+                    batch_to_name.write().insert(batch_id, display_name);
+                }
+                Ok(api::AutoDownloadResult::Error(e)) => {
+                    download_states
+                        .write()
+                        .insert(item_id, DownloadRowState::Failed(e));
+                }
+                Err(e) => {
+                    download_states
+                        .write()
+                        .insert(item_id, DownloadRowState::Failed(e.to_string()));
+                }
+            }
+        });
+    };
+
+    // Auto-download with default folder resolution
+    let mut handle_auto_download = move |item_id: String, query: DownloadQuery| {
+        let folder_id = selected_folder_id();
+        let folder = folder_id
+            .as_ref()
+            .and_then(|fid| folders.read().iter().find(|f| f.id == *fid).cloned());
+
+        let Some(folder) = folder else {
+            return;
+        };
+
+        start_auto_download(item_id, query, folder);
+    };
+
+    // Override download to a specific folder (D-02, does not change default)
+    let mut handle_override_download =
+        move |item_id: String, query: DownloadQuery, folder: Folder| {
+            start_auto_download(item_id, query, folder);
+        };
+
+    // Handle folder change from FolderChip
+    let handle_folder_change = move |folder: Folder| {
+        selected_folder_id.set(Some(folder.id.clone()));
+        spawn(async move {
+            let _ = settings
+                .update(api::UpdateUserSettings {
+                    default_download_folder_id: Some(folder.id),
+                    ..Default::default()
+                })
+                .await;
+        });
+    };
 
     let download = move |query: DownloadQuery| async move {
         loading.set(true);
@@ -231,7 +481,13 @@ pub fn Search() -> Element {
       div { class: "fixed top-1/4 -left-10 w-64 h-64 bg-beet-accent/10 rounded-full blur-[150px] pointer-events-none" }
       div { class: "fixed bottom-1/4 -right-10 w-64 h-64 bg-beet-leaf/10 rounded-full blur-[150px] pointer-events-none" }
 
-      div { class: "w-full max-w-3xl space-y-8 z-10 mx-auto flex flex-col items-center mt-20",
+      div {
+        class: "w-full max-w-3xl space-y-8 z-10 mx-auto flex flex-col items-center mt-20",
+        onclick: move |_| {
+            if active_menu().is_some() {
+                active_menu.set(None);
+            }
+        },
 
         // Title Area
         div { class: "text-center space-y-2",
@@ -293,7 +549,15 @@ pub fn Search() -> Element {
                   }
               },
             }
-            div { class: "hidden md:flex",
+            div { class: "hidden md:flex items-center",
+              if folders.read().len() > 1 {
+                FolderChip {
+                  folders: folders.read().clone(),
+                  selected_folder_id,
+                  on_folder_change: handle_folder_change,
+                  active_menu,
+                }
+              }
               SearchTypeToggle { search_type }
               Button {
                 class: "rounded ml-2 whitespace-nowrap",
@@ -336,6 +600,7 @@ pub fn Search() -> Element {
           }
         }
 
+
         SystemStatus { health: system_status.read().clone(), navidrome_status: auth.navidrome_status() }
 
         // Results
@@ -371,10 +636,18 @@ pub fn Search() -> Element {
                             SearchResult::Track(ref track) => {
                                 let track_clone = track.clone();
                                 let track_clone_2 = track.clone();
+                                let track_for_dl = track.clone();
+                                let track_for_override = track.clone();
+                                let track_id = track.id.clone();
+                                let dl_state = download_states.read().get(&track_id).cloned().unwrap_or_default();
+                                let has_folders = !folders.read().is_empty();
+                                let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                let current_folders = folders.read().clone();
+                                let current_folder_id = selected_folder_id();
                                 rsx! {
                                   li { key: "{track.id}",
                                     TrackResult {
-                                      on_track_click: move || {
+                                      on_search_sources: move || {
                                           spawn(download(DownloadQuery::from(track_clone.clone())));
                                       },
                                       on_album_click: move || {
@@ -389,19 +662,81 @@ pub fn Search() -> Element {
                                           );
                                       },
                                       track: track.clone(),
+                                      download_state: effective_state,
+                                      folders: current_folders,
+                                      selected_folder_id: current_folder_id.clone(),
+                                      active_menu,
+                                      on_download: move |_| {
+                                          handle_auto_download(track_for_dl.id.clone(), DownloadQuery::from(track_for_dl.clone()));
+                                      },
+                                      on_override_download: move |folder: Folder| {
+                                          handle_override_download(
+                                              track_for_override.id.clone(),
+                                              DownloadQuery::from(track_for_override.clone()),
+                                              folder,
+                                          );
+                                      },
                                     }
                                   }
                                 }
                             }
                             SearchResult::Album(ref album) => {
                                 let album_clone = album.clone();
+                                let album_for_dl = album.clone();
+                                let album_for_override = album.clone();
+                                let album_id = album.id.clone();
+                                let dl_state = download_states.read().get(&album_id).cloned().unwrap_or_default();
+                                let has_folders = !folders.read().is_empty();
+                                let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                let current_folders = folders.read().clone();
+                                let current_folder_id = selected_folder_id();
                                 rsx! {
                                   li { key: "{album.id}",
                                     AlbumResult {
                                       on_click: move || {
                                           spawn(view_full_album(album_clone.id.clone(), provider));
                                       },
+                                      on_search_sources: {
+                                          let album_for_search = album.clone();
+                                          move || {
+                                              let query = DownloadQuery::new(vec![]).album(shared::metadata::Album {
+                                                  id: album_for_search.id.clone(),
+                                                  title: album_for_search.title.clone(),
+                                                  artist: album_for_search.artist.clone(),
+                                                  release_date: album_for_search.release_date.clone(),
+                                                  mbid: album_for_search.mbid.clone(),
+                                                  cover_url: album_for_search.cover_url.clone(),
+                                              });
+                                              spawn(download(query));
+                                          }
+                                      },
                                       album: album.clone(),
+                                      download_state: effective_state,
+                                      folders: current_folders,
+                                      selected_folder_id: current_folder_id.clone(),
+                                      active_menu,
+                                      on_download: move |_| {
+                                          let query = DownloadQuery::new(vec![]).album(shared::metadata::Album {
+                                              id: album_for_dl.id.clone(),
+                                              title: album_for_dl.title.clone(),
+                                              artist: album_for_dl.artist.clone(),
+                                              release_date: album_for_dl.release_date.clone(),
+                                              mbid: album_for_dl.mbid.clone(),
+                                              cover_url: album_for_dl.cover_url.clone(),
+                                          });
+                                          handle_auto_download(album_for_dl.id.clone(), query);
+                                      },
+                                      on_override_download: move |folder: Folder| {
+                                          let query = DownloadQuery::new(vec![]).album(shared::metadata::Album {
+                                              id: album_for_override.id.clone(),
+                                              title: album_for_override.title.clone(),
+                                              artist: album_for_override.artist.clone(),
+                                              release_date: album_for_override.release_date.clone(),
+                                              mbid: album_for_override.mbid.clone(),
+                                              cover_url: album_for_override.cover_url.clone(),
+                                          });
+                                          handle_override_download(album_for_override.id.clone(), query, folder);
+                                      },
                                     }
                                   }
                                 }
@@ -416,6 +751,24 @@ pub fn Search() -> Element {
                 div { class: "text-center text-gray-500 py-10 font-mono", "No signals found in the ether." }
               },
               None => rsx! {},
+          }
+        }
+
+        // Fallback toasts (D-14 through D-17)
+        if !fallback_toasts.read().is_empty() {
+          div { class: "fixed bottom-4 right-4 flex flex-col-reverse gap-2 z-40 w-80 md:w-96",
+            for toast_data in fallback_toasts.read().iter() {
+              FallbackToast {
+                key: "{toast_data.id}",
+                toast: toast_data.clone(),
+                on_pick_source: move |results: Vec<DownloadableGroup>| {
+                    download_options.set(Some(results));
+                },
+                on_dismiss: move |id: String| {
+                    fallback_toasts.write().retain(|t| t.id != id);
+                },
+              }
+            }
           }
         }
       }
