@@ -8,27 +8,26 @@
 [![GitHub License](https://img.shields.io/github/license/terry90/soulbeet)](https://github.com/terry90/soulbeet)
 [![GitHub Repo stars](https://img.shields.io/github/stars/terry90/soulbeet)](https://github.com/terry90/soulbeet)
 
-Soulbeet is a self-hosted music downloader, library manager, and discovery engine. Search for music, download it from Soulseek, auto-tag with beets, and get weekly discovery playlists pushed to your Navidrome server based on your Last.fm and ListenBrainz listening history.
+Soulbeet is a self-hosted music downloader, library manager, and discovery engine. Search for music, download it, and let the app handle everything else: finding the best source, tagging, organizing, and keeping your library clean. Connect your scrobble history and Soulbeet will find new music for you automatically.
 
 Screenshots: [here](./screenshots)
 
 ## Features
 
-- **Search & Download**: Find albums and tracks via MusicBrainz or Last.fm, then download from Soulseek in one click. Beets handles tagging and organization.
-- **Music Discovery**: Get personalized recommendations based on your scrobble history. Soulbeet analyzes your listening across Last.fm and ListenBrainz, finds new music through track similarity, artist exploration, collaborative filtering, and genre discovery, then downloads the best candidates and creates Navidrome playlists for you.
-- **Three Discovery Profiles**: Conservative (stay close to what you know), Balanced, or Adventurous (push into unfamiliar territory). Run one or all three in parallel, each with its own playlist.
-- **Rate & Keep**: Listen to discovery tracks in Navidrome. Rate them: 3+ stars promotes to your library, 1 star deletes it. Unrated tracks expire after a configurable lifetime and get replaced with a fresh batch.
-- **Multi-user**: Private or shared folders for families and friend groups. Each user has their own discovery profiles, scrobble credentials, and preferences. Shared folders respect everyone's ratings before auto-deleting.
-- **Multiple Metadata Providers**: MusicBrainz (better for albums) or Last.fm (better for single tracks), selectable per user.
+- **Search & Download**: Find albums and tracks, hit download. Soulbeet picks the best available source from Soulseek, downloads it, tags it with beets, and puts it in your library. No manual file management.
+- **Music Discovery**: Soulbeet analyzes your Last.fm and ListenBrainz history, finds new music through track similarity, artist exploration, collaborative filtering, and genre discovery, downloads the best candidates, and pushes playlists to your Navidrome server. Fully automatic.
+- **Three Discovery Profiles**: Conservative (close to what you know), Balanced, or Adventurous (unfamiliar territory). Run one or all three, each with its own playlist.
+- **Rate & Keep**: Listen in Navidrome. 3+ stars promotes a track to your permanent library, 1 star deletes it. Unrated tracks expire and get replaced with fresh picks.
+- **Multi-user**: Private or shared folders. Each user gets their own discovery profiles, scrobble credentials, and preferences.
+- **Multiple Metadata Providers**: MusicBrainz (albums) or Last.fm (single tracks), selectable per user.
 
 ## How It Works
 
-1. **Soulbeet Web** -- the main interface (Dioxus fullstack app)
-2. **Slskd** -- Soulseek P2P client, handles the actual downloads
-3. **Beets** -- tags, organizes, and moves files into your library
-4. **Navidrome** -- streams your music, hosts discovery playlists, provides rating feedback
-5. **Last.fm / ListenBrainz** -- scrobble services that feed the recommendation engine
-6. **SQLite** -- stores everything (users, folders, candidates, engine reports, profiles)
+You search, you click download. Behind the scenes:
+
+1. **Soulbeet** finds the best source on Soulseek, downloads it through **slskd**, tags and organizes it with **beets**, and puts it in your library.
+2. **Navidrome** picks up the new files and makes them streamable.
+3. For discovery: **Last.fm / ListenBrainz** feed your listening history into the recommendation engine, which finds new tracks, downloads them, and pushes playlists to Navidrome.
 
 ## Self-Hosting with Docker
 
@@ -97,13 +96,12 @@ docker-compose up -d
 
 ### Initial Setup
 
-1.  Open `http://localhost:9765`
-2.  Log in -- Soulbeet authenticates against your Navidrome server, so use your Navidrome credentials.
-3.  Go to **Settings**.
-4.  **Configure slskd connection** (Settings > Config): Add your slskd URL (e.g., `http://slskd:5030`) and API key. Get your API key from slskd config file or [add one](https://github.com/slskd/slskd/blob/master/docs/config.md#yaml-24).
-5.  **Add Music Folders** (Settings > Library): Add the paths where you want your music stored (e.g., `/music/Person1`, `/music/Person2`, `/music/Shared`). These must be paths accessible inside the Docker container.
-6.  **Set up Discovery** (Settings > Library): Add your Last.fm API key and/or ListenBrainz token. Enable discovery on a folder, pick your profiles, and hit Generate.
-7.  **Enable scrobbling in Navidrome**: Go to your Navidrome personal settings and enable Last.fm/ListenBrainz scrobbling. The more listening history these services have, the better the recommendations get.
+1.  Open `http://localhost:9765` and log in with your **Navidrome credentials**.
+2.  In **Settings > Config**, connect slskd (URL + API key). [How to get an slskd API key](https://github.com/slskd/slskd/blob/master/docs/config.md#yaml-24).
+3.  In **Settings > Library**, add your music folders (e.g. `/music`).
+4.  That's it. Search for something and download it.
+
+For discovery (optional): add your Last.fm API key and/or ListenBrainz token in Settings > Library, enable discovery on a folder, pick your profiles, and hit Generate.
 
 ## Configuration
 
@@ -227,13 +225,8 @@ When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from 
     dx serve --platform web
     ```
 
-## TODO & Ideas
+## Roadmap
 
-- Mobile app (nothing much to do honestly)
-- Enhance the default beets configuration
-- Find a way to avoid album dups ? e.g `Clair Obscur_ Expedition 33 (Original Soundtrack)` & `Clair Obscur_ Expedition 33_ Original Soundtrack` - Rare but annoying
-- Add play preview on album track list
-- Improve slskd search. Currently:
-  - Single track search, query: "{artist} {track_title}" -> more resilient
-  - Multiple tracks search, query: "{artist} {album}" -> best for metadata and grouping tracks by album
-- Synchronize a playlist (Spotify or other)
+- Reduce friction: fewer clicks between "I want this" and "it's in my library"
+- Play preview on album track list before downloading
+- Smarter Soulseek search (better source ranking, automatic fallback between providers)
