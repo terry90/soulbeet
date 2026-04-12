@@ -89,4 +89,4 @@ ENV IP=0.0.0.0
 # Expose the port
 EXPOSE 9765
 
-ENTRYPOINT ["/app/server/web"]
+ENTRYPOINT ["/app/server/server"]
