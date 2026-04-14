@@ -377,7 +377,7 @@ pub async fn search(
                 let b_rg_rank = rg_order.get(&b_album.id).unwrap_or(&usize::MAX);
 
                 // First sort by release group rank (i.e. when they appeared in the musicbrainz response)
-                a_rg_rank.cmp(&b_rg_rank)
+                a_rg_rank.cmp(b_rg_rank)
                     // then compare by date
                     .then(compare_musicbrainz_dates(&a_album.release_date, &b_album.release_date))
             });
@@ -427,10 +427,15 @@ pub async fn find_album(release_id: &str) -> Result<AlbumWithTracks, musicbrainz
         }
     }
 
+    let title = match release.disambiguation.as_deref() {
+        None | Some("") => release.title.clone(),
+        Some(disambiguation) => format!("{} ({})", release.title.clone(), disambiguation),
+    };
+
     // First, create the standalone Album object.
     let album = Album {
         id: release.id.clone(),
-        title: release.title,
+        title,
         artist: format_artist_credit(&release.artist_credit),
         release_date: release.date.map(|d| d.0),
         mbid: Some(release.id),
