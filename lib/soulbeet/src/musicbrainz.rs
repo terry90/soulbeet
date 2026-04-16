@@ -2,13 +2,15 @@ use musicbrainz_rs::{
     entity::{
         artist_credit::ArtistCredit,
         recording::{Recording, RecordingSearchQuery},
-        release::{Release, ReleaseStatus},
-        release_group::{ReleaseGroup, ReleaseGroupPrimaryType, ReleaseGroupSearchQuery},
+        release::{Release, ReleaseSearchQuery},
+        release_group::ReleaseGroupPrimaryType,
     },
     Fetch, MusicBrainzClient, Search,
 };
-use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
+use shared::metadata::{Album, AlbumWithTracks, AlbumGroup, SearchResult, Track, compare_musicbrainz_dates};
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -97,10 +99,7 @@ fn is_retryable_error(error: &musicbrainz_rs::Error) -> bool {
 /// Retries an async operation with exponential backoff and request timeout.
 /// Only retries transient errors (network issues, timeouts, 5xx responses).
 /// Does NOT retry client errors (4xx) or permanent failures.
-async fn with_retry<T, F, Fut>(
-    operation_name: &str,
-    mut operation: F,
-) -> Result<T, musicbrainz_rs::Error>
+async fn with_retry<T, F, Fut>(operation_name: &str, mut operation: F) -> Result<T, musicbrainz_rs::Error>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, musicbrainz_rs::Error>>,
@@ -108,12 +107,11 @@ where
     let mut last_error = None;
 
     for attempt in 0..MAX_RETRIES {
-        // Respect MusicBrainz rate limit (1 req/sec)
-        crate::http::mb_rate_limit().await;
-
         // Apply timeout to each request
-        let result =
-            tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), operation()).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            operation()
+        ).await;
 
         match result {
             Ok(Ok(value)) => return Ok(value),
@@ -129,7 +127,10 @@ where
 
                 last_error = Some(e);
                 if attempt < MAX_RETRIES - 1 {
-                    let delay = std::cmp::min(BASE_DELAY_MS * 2u64.pow(attempt), MAX_BACKOFF_MS);
+                    let delay = std::cmp::min(
+                        BASE_DELAY_MS * 2u64.pow(attempt),
+                        MAX_BACKOFF_MS
+                    );
                     warn!(
                         "{} failed (attempt {}/{}), retrying in {}ms: {:?}",
                         operation_name,
@@ -150,18 +151,31 @@ where
                     attempt + 1,
                     MAX_RETRIES
                 );
-                last_error = Some(musicbrainz_rs::Error::MaxRetriesExceeded);
+                // Create a timeout error - we'll retry
                 if attempt < MAX_RETRIES - 1 {
-                    let delay = std::cmp::min(BASE_DELAY_MS * 2u64.pow(attempt), MAX_BACKOFF_MS);
+                    let delay = std::cmp::min(
+                        BASE_DELAY_MS * 2u64.pow(attempt),
+                        MAX_BACKOFF_MS
+                    );
                     sleep(Duration::from_millis(delay)).await;
                 }
             }
         }
     }
 
+    // Return the last error or panic (should never happen since we always set last_error on timeout)
+    // If we somehow have no error, create a synthetic one
     match last_error {
         Some(e) => Err(e),
-        None => Err(musicbrainz_rs::Error::MaxRetriesExceeded),
+        None => {
+            warn!(
+                "{} failed after {} retries with no recorded error (likely all timeouts)",
+                operation_name, MAX_RETRIES
+            );
+            // Re-run the operation one more time to get an error to return
+            // This is a fallback - shouldn't normally happen
+            operation().await
+        }
     }
 }
 
@@ -211,9 +225,7 @@ pub async fn search(
             recordings.sort_by(|a, b| {
                 let a_rating = a.rating.as_ref().and_then(|r| r.value).unwrap_or(0.0);
                 let b_rating = b.rating.as_ref().and_then(|r| r.value).unwrap_or(0.0);
-                b_rating
-                    .partial_cmp(&a_rating)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                b_rating.partial_cmp(&a_rating).unwrap_or(std::cmp::Ordering::Equal)
             });
 
             let mut unique_tracks = HashSet::new();
@@ -254,58 +266,121 @@ pub async fn search(
         }
         SearchType::Album => {
             let search_results = with_retry("MusicBrainz album search", || {
-                let mut album_query = ReleaseGroupSearchQuery::query_builder();
+                let mut album_query = ReleaseSearchQuery::query_builder();
                 if let Some(ref artist) = artist {
                     album_query.artist(artist).and();
                 }
-                let search_query = album_query.release_group(query).build();
+                let search_query = album_query.release(query).and().status("Official").build();
+                let limit = 100; // lower numbers (like 25) might not yield everything
                 async move {
-                    ReleaseGroup::search(search_query)
+                    Release::search(search_query)
                         .limit(limit)
-                        .with_releases()
-                        .with_ratings()
+                        .with_release_groups()
                         .execute_with_client(client)
                         .await
                 }
             })
             .await?;
 
-            // Sort by rating (descending) - higher rated albums first
-            let mut release_groups: Vec<_> = search_results.entities;
-            release_groups.sort_by(|a, b| {
-                let a_rating = a.rating.as_ref().and_then(|r| r.value).unwrap_or(0.0);
-                let b_rating = b.rating.as_ref().and_then(|r| r.value).unwrap_or(0.0);
-                b_rating
-                    .partial_cmp(&a_rating)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            // release_group_id -> (Title -> Album (edition))
+            let mut results_container: HashMap<String, HashMap<String, Album>> = HashMap::new();
+            // release_group_id -> release group title
+            let mut release_groups: HashMap<String, String> = HashMap::new();
+            // track when release groups first appeared in response
+            // used to sort the final result vec
+            let mut rg_order: HashMap<String, usize> = HashMap::new();
 
-            for release_group in release_groups {
-                if release_group.primary_type != Some(ReleaseGroupPrimaryType::Album)
-                    && release_group.primary_type != Some(ReleaseGroupPrimaryType::Ep)
+            for release in search_results.entities {
+                if release.release_group.as_ref().unwrap().primary_type != Some(ReleaseGroupPrimaryType::Album)
+                    && release.release_group.as_ref().unwrap().primary_type != Some(ReleaseGroupPrimaryType::Ep)
                 {
                     continue;
                 }
 
-                if let Some(best_release) = release_group.releases.as_ref().and_then(|releases| {
-                    releases
-                        .iter()
-                        .filter(|r| r.status == Some(ReleaseStatus::Official))
-                        .min_by_key(|release| release.date.as_ref().map(|d| &d.0))
+                // For releases with more than 1 medium or with a single medium
+                // that is not "CD", "Digital Media" or "12\" Vinyl",
+                // it's likely a compilation, so skip it
+                if release.media.as_ref().is_some_and(|m| {
+                    m.len() > 1 ||
+                        m.len() == 1
+                            && m[0].format.as_deref() != Some("CD")
+                            && m[0].format.as_deref() != Some("Digital Media")
+                            && m[0].format.as_deref() != Some("12\" Vinyl")
                 }) {
-                    // If no official release was found, take the first one available
-                    let final_release = best_release.clone();
+                    continue;
+                }
 
-                    results.push(SearchResult::Album(Album {
-                        id: final_release.id.clone(),
-                        title: release_group.title.clone(),
-                        artist: format_artist_credit(&release_group.artist_credit),
-                        release_date: final_release.date.as_ref().map(|d| d.0.clone()),
-                        mbid: Some(final_release.id.clone()),
-                        cover_url: None,
-                    }));
+                let rg_id = release.release_group.as_ref().unwrap().id.clone();
+
+                let title = match release.disambiguation.as_deref() {
+                    None | Some("") => release.title.clone(),
+                    Some(disambiguation) => format!("{} ({})", release.title.clone(), disambiguation),
+                };
+
+                if !rg_order.contains_key(&rg_id) {
+                    rg_order.insert(rg_id.clone(), rg_order.len());
+                }
+
+
+                let edition = Album {
+                    id: release.id.clone(),
+                    title: title.clone(),
+                    artist: format_artist_credit(&release.artist_credit),
+                    release_date: release.date.as_ref().map(|d| d.0.clone()),
+                    mbid: Some(release.id.clone()),
+                    cover_url: Some(format!("https://coverartarchive.org/release/{}/front-250", release.id)),
+                };
+
+                // Use the release group ID to track unique releases and avoid duplicates based on title.
+                // However, for releases with the same title and release group ID,
+                // we keep the oldest one (based on release date) to ensure we get the canonical release
+                let release_group = results_container.entry(rg_id.clone()).or_insert_with(|| {
+                    release_groups.insert(rg_id.clone(), release.release_group.as_ref().unwrap().title.clone());
+                    HashMap::new()
+                });
+
+                match release_group.entry(title.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(edition);
+                    }
+                    Entry::Occupied(mut entry) => {
+                        let existing = entry.get();
+                        let new_date: Option<&str> = release.date.as_ref().map(|d| d.0.as_ref());
+                        if compare_musicbrainz_dates(&existing.release_date, &new_date) == std::cmp::Ordering::Greater {
+                            entry.insert(edition);
+                        }
+                    }
                 }
             }
+
+            // Flatten the results container into a single vector of SearchResult::AlbumGroup
+            for (rg_id, editions) in results_container.into_iter() {
+                let oldest_edition = editions.values().min_by(|a, b|
+                    compare_musicbrainz_dates(&a.release_date, &b.release_date)
+                ).unwrap();
+                let album_group = AlbumGroup {
+                    id: rg_id.clone(),
+                    title: release_groups.get(&rg_id).unwrap_or(&oldest_edition.title).clone(),
+                    artist: oldest_edition.artist.clone(),
+                    release_date: oldest_edition.release_date.clone(),
+                    mbid: Some(rg_id.clone()),
+                    cover_url: Some(format!("https://coverartarchive.org/release-group/{}/front-250", rg_id)),
+                    editions: editions.into_values().collect(),
+                };
+                results.push(SearchResult::AlbumGroup(album_group));
+            }
+
+            results.sort_by(|a, b| {
+                let SearchResult::AlbumGroup(a_album) = a else { return std::cmp::Ordering::Equal; };
+                let SearchResult::AlbumGroup(b_album) = b else { return std::cmp::Ordering::Equal; };
+                let a_rg_rank = rg_order.get(&a_album.id).unwrap_or(&usize::MAX);
+                let b_rg_rank = rg_order.get(&b_album.id).unwrap_or(&usize::MAX);
+
+                // First sort by release group rank (i.e. when they appeared in the musicbrainz response)
+                a_rg_rank.cmp(b_rg_rank)
+                    // then compare by date
+                    .then(compare_musicbrainz_dates(&a_album.release_date, &b_album.release_date))
+            });
         }
     }
 
@@ -352,10 +427,15 @@ pub async fn find_album(release_id: &str) -> Result<AlbumWithTracks, musicbrainz
         }
     }
 
+    let title = match release.disambiguation.as_deref() {
+        None | Some("") => release.title.clone(),
+        Some(disambiguation) => format!("{} ({})", release.title.clone(), disambiguation),
+    };
+
     // First, create the standalone Album object.
     let album = Album {
         id: release.id.clone(),
-        title: release.title,
+        title,
         artist: format_artist_credit(&release.artist_credit),
         release_date: release.date.map(|d| d.0),
         mbid: Some(release.id),
@@ -398,7 +478,7 @@ impl crate::MetadataProvider for MusicBrainzProvider {
         limit: usize,
     ) -> crate::error::Result<Vec<SearchResult>> {
         let artist_opt = artist.map(String::from);
-        search(&artist_opt, query, SearchType::Album, limit.min(100) as u8)
+        search(&artist_opt, query, SearchType::Album, limit as u8)
             .await
             .map_err(|e| crate::error::SoulseekError::Api {
                 status: 500,
@@ -413,7 +493,7 @@ impl crate::MetadataProvider for MusicBrainzProvider {
         limit: usize,
     ) -> crate::error::Result<Vec<SearchResult>> {
         let artist_opt = artist.map(String::from);
-        search(&artist_opt, query, SearchType::Track, limit.min(100) as u8)
+        search(&artist_opt, query, SearchType::Track, limit as u8)
             .await
             .map_err(|e| crate::error::SoulseekError::Api {
                 status: 500,
@@ -422,11 +502,9 @@ impl crate::MetadataProvider for MusicBrainzProvider {
     }
 
     async fn get_album(&self, id: &str) -> crate::error::Result<AlbumWithTracks> {
-        find_album(id)
-            .await
-            .map_err(|e| crate::error::SoulseekError::Api {
-                status: 500,
-                message: e.to_string(),
-            })
+        find_album(id).await.map_err(|e| crate::error::SoulseekError::Api {
+            status: 500,
+            message: e.to_string(),
+        })
     }
 }

@@ -41,7 +41,7 @@ pub fn AlbumResult(props: Props) -> Element {
             "{album.title}"
           }
           p { class: "text-xs text-gray-400 font-mono truncate", "{album.artist}" }
-          if let Some(release_date) = &album.release_date {
+          if let Some(release_date) = album.release_date.as_ref().filter(|s| !s.is_empty()) {
             p { class: "text-xs text-gray-500 font-mono", "{release_date}" }
           }
         }
