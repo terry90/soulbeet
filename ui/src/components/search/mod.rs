@@ -1,5 +1,6 @@
 pub mod album;
 mod albumgroup;
+mod edition;
 pub mod context;
 pub mod track;
 
@@ -744,13 +745,63 @@ pub fn Search() -> Element {
                                 }
                             }
                             SearchResult::AlbumGroup(ref album_group) => {
+                                let album_group_clone = album_group.clone();
+                                let album_group_for_dl = album_group.clone();
+                                let album_group_for_override = album_group.clone();
+                                let album_group_id = album_group.id.clone();
+                                let dl_state = download_states.read().get(&album_group_id).cloned().unwrap_or_default();
+                                let has_folders = !folders.read().is_empty();
+                                let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                let current_folders = folders.read().clone();
+                                let current_folder_id = selected_folder_id();
+
                                 rsx! {
                                   li { key: "{album_group.id}",
                                     AlbumGroupResult {
                                       album_group: album_group.clone(),
-                                        on_edition_click: move |edition_id: String| {
-                                          spawn(view_full_album(edition_id, provider));
-                                        },
+                                      on_edition_click: move |edition_id: String| {
+                                        spawn(view_full_album(edition_id, provider));
+                                      },
+                                      on_search_sources: {
+                                          let album_for_search = album_group.clone();
+                                          move || {
+                                              let query = DownloadQuery::new(vec![]).album(shared::metadata::Album {
+                                                  id: album_for_search.id.clone(),
+                                                  title: album_for_search.title.clone(),
+                                                  artist: album_for_search.artist.clone(),
+                                                  release_date: album_for_search.release_date.clone(),
+                                                  mbid: album_for_search.mbid.clone(),
+                                                  cover_url: album_for_search.cover_url.clone(),
+                                              });
+                                              spawn(download(query));
+                                          }
+                                      },
+                                      download_state: effective_state,
+                                      folders: current_folders,
+                                      selected_folder_id: current_folder_id.clone(),
+                                      active_menu,
+                                      on_download: move |_| {
+                                          let query = DownloadQuery::new(vec![]).album(shared::metadata::Album {
+                                              id: album_group_for_dl.id.clone(),
+                                              title: album_group_for_dl.title.clone(),
+                                              artist: album_group_for_dl.artist.clone(),
+                                              release_date: album_group_for_dl.release_date.clone(),
+                                              mbid: album_group_for_dl.mbid.clone(),
+                                              cover_url: album_group_for_dl.cover_url.clone(),
+                                          });
+                                          handle_auto_download(album_group_for_dl.id.clone(), query);
+                                      },
+                                      on_override_download: move |folder: Folder| {
+                                          let query = DownloadQuery::new(vec![]).album(shared::metadata::Album {
+                                              id: album_group_for_override.id.clone(),
+                                              title: album_group_for_override.title.clone(),
+                                              artist: album_group_for_override.artist.clone(),
+                                              release_date: album_group_for_override.release_date.clone(),
+                                              mbid: album_group_for_override.mbid.clone(),
+                                              cover_url: album_group_for_override.cover_url.clone(),
+                                          });
+                                          handle_override_download(album_group_for_override.id.clone(), query, folder);
+                                      },
                                     }
                                   }
                                 }
