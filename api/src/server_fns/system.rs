@@ -7,10 +7,12 @@ use shared::system::BackendInfo;
 #[cfg(feature = "server")]
 use crate::services::{
     available_download_backends, available_importers, available_metadata_providers,
-    download_backend, music_importer, navidrome_client_for_user,
+    download_backend, evict_navidrome_client, music_importer, navidrome_client_for_user,
 };
 #[cfg(feature = "server")]
 use crate::AuthSession;
+#[cfg(feature = "server")]
+use dioxus::logger::tracing::debug;
 
 #[get("/api/system/health", auth: AuthSession)]
 pub async fn get_system_health() -> Result<SystemHealth, ServerFnError> {
@@ -27,7 +29,20 @@ pub async fn get_system_health() -> Result<SystemHealth, ServerFnError> {
         };
 
         let navidrome_online = match navidrome_client_for_user(&auth.0.sub).await {
-            Ok(client) => client.ping().await.is_ok(),
+            Ok(client) => match client.ping().await {
+                Ok(()) => true,
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("Circuit breaker open") {
+                        debug!(
+                            "Evicted stale Navidrome client for user {} after circuit-breaker-open ping",
+                            auth.0.sub
+                        );
+                        evict_navidrome_client(&auth.0.sub).await;
+                    }
+                    false
+                }
+            },
             Err(_) => false,
         };
 
