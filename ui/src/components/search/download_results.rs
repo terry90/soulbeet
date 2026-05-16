@@ -56,6 +56,8 @@ struct AlbumResultItemProps {
     selected_tracks: Signal<HashSet<String>>,
     on_album_select_all: EventHandler<DownloadableGroup>,
     on_track_toggle: EventHandler<String>,
+    is_best: bool,
+    starts_expanded: bool,
 }
 
 #[derive(Props, Clone, PartialEq)]
@@ -93,33 +95,65 @@ fn TrackItem(props: TrackItemProps) -> Element {
 #[component]
 fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
     let album = props.album.clone();
+    let mut is_expanded = use_signal(|| props.starts_expanded);
 
     rsx! {
         div {
             key: "{album.group_id}",
             class: "bg-white/5 border border-white/5 p-4 rounded-md",
-            div { class: "flex justify-between items-center mb-2",
+
+            // Clickable header for expand/collapse
+            div {
+                class: "flex justify-between items-center mb-2 cursor-pointer",
+                onclick: move |_| is_expanded.toggle(),
+
                 div { class: "flex-grow",
-                    h4 { class: "text-md font-bold text-beet-leaf", "{album.title}" }
+                    div { class: "flex items-center gap-2",
+                        h4 { class: "text-md font-bold text-beet-leaf", "{album.title}" }
+                        if props.is_best {
+                            span {
+                                class: "text-[10px] font-mono px-1.5 py-0.5 rounded border bg-beet-accent/20 text-beet-accent border-beet-accent/40 uppercase shrink-0",
+                                "Best match"
+                            }
+                        }
+                    }
                     p { class: "text-sm text-gray-400 font-mono",
                         "{album.artist.clone().unwrap_or_default()} - Quality: {album.quality}, Score: {album.score:.2}"
                     }
                 }
+
+                // Expand/collapse chevron
+                svg {
+                    class: "w-4 h-4 transition-transform duration-200 shrink-0",
+                    class: if *is_expanded.read() { "rotate-90 text-gray-400" } else { "text-gray-600" },
+                    fill: "none",
+                    stroke: "currentColor",
+                    stroke_width: "2",
+                    view_box: "0 0 24 24",
+                    path {
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                        d: "M8.25 4.5l7.5 7.5-7.5 7.5",
+                    }
+                }
+            }
+
+            // Track list and Select All only visible when expanded
+            if *is_expanded.read() {
                 button {
-                    class: "font-mono uppercase text-[10px] whitespace-nowrap tracking-widest px-3 py-1 border border-beet-leaf/30 text-beet-leaf hover:bg-beet-leaf hover:text-beet-dark transition-colors cursor-pointer rounded",
+                    class: "font-mono uppercase text-[10px] whitespace-nowrap tracking-widest px-3 py-1 mb-2 border border-beet-leaf/30 text-beet-leaf hover:bg-beet-leaf hover:text-beet-dark transition-colors cursor-pointer rounded",
                     onclick: move |_| props.on_album_select_all.call(album.clone()),
                     "Select All"
                 }
-            }
-            ul { class: "space-y-1",
-                for track in props.album.items {
-                    TrackItem {
-                        is_selected: props.selected_tracks.read().contains(&get_track_id(&track)),
-                        track,
-                        on_toggle: props.on_track_toggle,
+                ul { class: "space-y-1",
+                    for track in props.album.items {
+                        TrackItem {
+                            is_selected: props.selected_tracks.read().contains(&get_track_id(&track)),
+                            track,
+                            on_toggle: props.on_track_toggle,
+                        }
                     }
                 }
-
             }
         }
     }
@@ -256,12 +290,14 @@ pub fn DownloadResults(props: Props) -> Element {
                 } else if results.is_empty() {
                     div { class: "text-center text-gray-500 py-8 font-mono", "No results found" }
                 }
-                for album in results {
+                for (idx, album) in results.iter().enumerate() {
                     AlbumResultItem {
-                        album,
+                        album: album.clone(),
                         selected_tracks,
                         on_album_select_all: handle_album_select_all,
                         on_track_toggle: handle_track_toggle,
+                        is_best: idx == 0,
+                        starts_expanded: idx == 0,
                     }
                 }
             }

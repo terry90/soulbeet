@@ -9,6 +9,9 @@ pub use download_icon::{DownloadIcon, DownloadRowState};
 
 mod download_options_menu;
 
+mod inline_track_panel;
+mod inline_track_row;
+
 mod folder_chip;
 use folder_chip::FolderChip;
 
@@ -19,15 +22,15 @@ use shared::download::{
     AutoDownloadEvent, DownloadQuery, DownloadableGroup, DownloadableItem,
     SearchState as DownloadSearchState,
 };
-use shared::metadata::{AlbumWithTracks, Provider, SearchResult, SearchResults};
+use shared::metadata::{AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
 use shared::system::SystemHealth;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use track::TrackResult;
 
 use crate::search::album::AlbumResult;
 use crate::settings_context::use_settings;
-use crate::{use_auth, Album, AlbumHeader, Button, Modal, SystemStatus};
+use crate::{use_auth, Button, SystemStatus};
 
 mod download_results;
 use download_results::DownloadResults;
@@ -47,7 +50,8 @@ pub fn Search() -> Element {
     let mut artist = use_signal::<Option<String>>(|| None);
     let mut search_type = use_signal(|| settings.last_search_type());
     let mut loading = use_signal(|| false);
-    let mut viewing_album = use_signal::<Option<AlbumWithTracks>>(|| None);
+    let mut expanded_albums = use_signal::<HashSet<String>>(HashSet::new);
+    let mut album_cache = use_signal::<HashMap<String, AlbumWithTracks>>(HashMap::new);
     let mut download_options = use_signal::<Option<Vec<DownloadableGroup>>>(|| None);
     let mut is_downloading = use_signal(|| false);
     let search_reset = try_use_context::<SearchReset>();
@@ -121,7 +125,8 @@ pub fn Search() -> Element {
                 search_results.set(None);
                 search.set(String::new());
                 artist.set(None);
-                viewing_album.set(None);
+                expanded_albums.write().clear();
+                album_cache.write().clear();
                 loading.set(false);
             }
         }
@@ -134,11 +139,15 @@ pub fn Search() -> Element {
     let auto_dl = try_use_context::<AutoDownloadSignal>();
     use_effect(move || {
         let Some(mut ctx) = auto_dl else { return };
+        // Subscribe only to ctx.0 (WS event slot). Reading other signals with
+        // .read() would subscribe to them too, and writing the same signal
+        // later in this effect would self-retrigger because Dioxus 0.7
+        // Signal::set has no PartialEq dedupe (dioxus-signals/src/write.rs:345).
         let Some(event) = (ctx.0)() else { return };
         (ctx.0).set(None);
 
-        // Collect the new event plus any buffered ones
-        let mut events_to_process = pending_events.read().clone();
+        // Collect the new event plus any buffered ones — peek, no subscribe
+        let mut events_to_process = pending_events.peek().clone();
         events_to_process.push(event);
         let mut still_pending = Vec::new();
 
@@ -152,7 +161,7 @@ pub fn Search() -> Element {
                 AutoDownloadEvent::Failed { batch_id, .. } => batch_id.clone(),
             };
 
-            let item_id = batch_to_item.read().get(&batch_id).cloned();
+            let item_id = batch_to_item.peek().get(&batch_id).cloned();
             let Some(item_id) = item_id else {
                 // batch_id not yet registered, buffer for retry
                 still_pending.push(event);
@@ -161,15 +170,29 @@ pub fn Search() -> Element {
 
             match event {
                 AutoDownloadEvent::Searching { .. } | AutoDownloadEvent::ScoringResults { .. } => {
-                    download_states.write().insert(item_id, DownloadRowState::Searching);
+                    download_states.write().insert(item_id.clone(), DownloadRowState::Searching);
+                    // D-09: propagate to expanded track rows
+                    if let Some(cached) = album_cache.peek().get(&item_id) {
+                        let mut states = download_states.write();
+                        for track in &cached.tracks {
+                            states.insert(track.id.clone(), DownloadRowState::Searching);
+                        }
+                    }
                 }
                 AutoDownloadEvent::PickedSource { .. } | AutoDownloadEvent::Downloading { .. } => {
                     let item_id_timer = item_id.clone();
-                    download_states.write().insert(item_id, DownloadRowState::Done);
+                    download_states.write().insert(item_id.clone(), DownloadRowState::Done);
+                    // D-09: propagate to expanded track rows
+                    if let Some(cached) = album_cache.peek().get(&item_id) {
+                        let mut states = download_states.write();
+                        for track in &cached.tracks {
+                            states.insert(track.id.clone(), DownloadRowState::Done);
+                        }
+                    }
 
                     spawn(async move {
                         gloo_timers::future::TimeoutFuture::new(5000).await;
-                        let current = download_states.read().get(&item_id_timer).cloned();
+                        let current = download_states.peek().get(&item_id_timer).cloned();
                         if matches!(current, Some(DownloadRowState::Done)) {
                             download_states.write().insert(item_id_timer, DownloadRowState::Idle);
                         }
@@ -178,7 +201,7 @@ pub fn Search() -> Element {
                 AutoDownloadEvent::FallbackToManual { batch_id, results, .. } => {
                     download_states.write().insert(item_id.clone(), DownloadRowState::Idle);
 
-                    let track_name = batch_to_name.read().get(&batch_id).cloned().unwrap_or(item_id.clone());
+                    let track_name = batch_to_name.peek().get(&batch_id).cloned().unwrap_or(item_id.clone());
 
                     let toast_id = batch_id.clone();
                     fallback_toasts.write().push(FallbackToastData {
@@ -198,15 +221,23 @@ pub fn Search() -> Element {
             }
         }
 
+        // Safe to always set: neither this effect nor the drain effect
+        // below subscribe to `pending_events` (peek throughout), and the
+        // render does not read it either, so this is a leaf write.
         pending_events.set(still_pending);
     });
 
-    // Drain pending events when batch_to_item changes (new batch registered)
+    // Drain pending events when batch_to_item changes (new batch registered).
+    // Subscribe ONLY to batch_to_item via the `_trigger` read; every other
+    // signal is peeked. Without this, `pending_events.set(...)` below would
+    // self-retrigger the effect with the same value (Dioxus 0.7 Signal::set
+    // has no PartialEq dedupe) and the race between the WS Searching event
+    // and the auto_download HTTP response would freeze the browser.
     use_effect(move || {
         let _trigger = batch_to_item.read().len();
-        if pending_events.read().is_empty() { return; }
+        if pending_events.peek().is_empty() { return; }
 
-        let events = pending_events.read().clone();
+        let events = pending_events.peek().clone();
         let mut still_pending = Vec::new();
 
         for event in events {
@@ -219,7 +250,7 @@ pub fn Search() -> Element {
                 AutoDownloadEvent::Failed { batch_id, .. } => batch_id.clone(),
             };
 
-            let item_id = batch_to_item.read().get(&batch_id).cloned();
+            let item_id = batch_to_item.peek().get(&batch_id).cloned();
             let Some(item_id) = item_id else {
                 still_pending.push(event);
                 continue;
@@ -227,14 +258,28 @@ pub fn Search() -> Element {
 
             match event {
                 AutoDownloadEvent::Searching { .. } | AutoDownloadEvent::ScoringResults { .. } => {
-                    download_states.write().insert(item_id, DownloadRowState::Searching);
+                    download_states.write().insert(item_id.clone(), DownloadRowState::Searching);
+                    // D-09: propagate to expanded track rows
+                    if let Some(cached) = album_cache.peek().get(&item_id) {
+                        let mut states = download_states.write();
+                        for track in &cached.tracks {
+                            states.insert(track.id.clone(), DownloadRowState::Searching);
+                        }
+                    }
                 }
                 AutoDownloadEvent::PickedSource { .. } | AutoDownloadEvent::Downloading { .. } => {
                     let item_id_timer = item_id.clone();
-                    download_states.write().insert(item_id, DownloadRowState::Done);
+                    download_states.write().insert(item_id.clone(), DownloadRowState::Done);
+                    // D-09: propagate to expanded track rows
+                    if let Some(cached) = album_cache.peek().get(&item_id) {
+                        let mut states = download_states.write();
+                        for track in &cached.tracks {
+                            states.insert(track.id.clone(), DownloadRowState::Done);
+                        }
+                    }
                     spawn(async move {
                         gloo_timers::future::TimeoutFuture::new(5000).await;
-                        let current = download_states.read().get(&item_id_timer).cloned();
+                        let current = download_states.peek().get(&item_id_timer).cloned();
                         if matches!(current, Some(DownloadRowState::Done)) {
                             download_states.write().insert(item_id_timer, DownloadRowState::Idle);
                         }
@@ -242,7 +287,7 @@ pub fn Search() -> Element {
                 }
                 AutoDownloadEvent::FallbackToManual { batch_id, results, .. } => {
                     download_states.write().insert(item_id.clone(), DownloadRowState::Idle);
-                    let track_name = batch_to_name.read().get(&batch_id).cloned().unwrap_or(item_id.clone());
+                    let track_name = batch_to_name.peek().get(&batch_id).cloned().unwrap_or(item_id.clone());
                     let toast_id = batch_id.clone();
                     fallback_toasts.write().push(FallbackToastData {
                         id: batch_id,
@@ -271,6 +316,16 @@ pub fn Search() -> Element {
     // Start an auto_download for a specific folder
     let mut start_auto_download = move |item_id: String, query: DownloadQuery, folder: Folder| {
         download_states.write().insert(item_id.clone(), DownloadRowState::Searching);
+
+        // Propagate to expanded track rows (D-09)
+        if expanded_albums.read().contains(&item_id) {
+            if let Some(cached) = album_cache.read().get(&item_id) {
+                let mut states = download_states.write();
+                for track in &cached.tracks {
+                    states.insert(track.id.clone(), DownloadRowState::Searching);
+                }
+            }
+        }
 
         // Extract display name before query is moved into the request
         let display_name = query.album.as_ref().map(|a| a.title.clone())
@@ -340,7 +395,6 @@ pub fn Search() -> Element {
 
     let download = move |query: DownloadQuery| async move {
         loading.set(true);
-        viewing_album.set(None);
         download_options.set(Some(vec![]));
 
         let search_id = match auth.call(api::start_download_search(query)).await {
@@ -445,38 +499,54 @@ pub fn Search() -> Element {
         }
     });
 
-    let view_full_album = move |album_id: String, provider: Provider| async move {
-        loading.set(true);
+    let mut toggle_expand = move |album_id: String, provider: Provider| {
+        let is_expanded = expanded_albums.read().contains(&album_id);
+        if is_expanded {
+            expanded_albums.write().remove(&album_id);
+        } else {
+            expanded_albums.write().insert(album_id.clone());
+            let needs_fetch = !album_cache.read().contains_key(&album_id);
+            if needs_fetch {
+                let aid = album_id.clone();
+                spawn(async move {
+                    match auth
+                        .call(api::find_album(api::AlbumQuery {
+                            id: aid.clone(),
+                            provider: Some(provider),
+                        }))
+                        .await
+                    {
+                        Ok(album_data) => {
+                            album_cache.write().insert(aid, album_data);
+                        }
+                        Err(e) => {
+                            info!("Failed to fetch album details for {}: {:?}", aid, e);
+                            expanded_albums.write().remove(&aid);
+                        }
+                    }
+                });
+            }
+        }
+    };
 
-        match auth
-            .call(api::find_album(api::AlbumQuery {
-                id: album_id.clone(),
-                provider: Some(provider),
-            }))
-            .await
-        {
-            Ok(album_data) => viewing_album.set(Some(album_data)),
-            Err(e) => info!("Failed to fetch album details for {}: {:?}", album_id, e),
+    let mut handle_track_download = move |track: Track| {
+        let folder_id = selected_folder_id();
+        let folder = folder_id
+            .as_ref()
+            .and_then(|fid| folders.read().iter().find(|f| f.id == *fid).cloned());
+
+        let Some(folder) = folder else {
+            return;
         };
-        loading.set(false);
+
+        start_auto_download(track.id.clone(), DownloadQuery::from(track), folder);
+    };
+
+    let mut handle_track_override_download = move |(track, folder): (Track, Folder)| {
+        start_auto_download(track.id.clone(), DownloadQuery::from(track), folder);
     };
 
     rsx! {
-      if let Some(data) = viewing_album.read().clone() {
-        Modal {
-          on_close: move |_| viewing_album.set(None),
-          header: rsx! {
-            AlbumHeader { album: data.album.clone() }
-          },
-          Album {
-            data,
-            on_select: move |data: DownloadQuery| {
-                spawn(download(data));
-            },
-          }
-        }
-      }
-
       // bg decorations
       div { class: "fixed top-1/4 -left-10 w-64 h-64 bg-beet-accent/10 rounded-full blur-[150px] pointer-events-none" }
       div { class: "fixed bottom-1/4 -right-10 w-64 h-64 bg-beet-leaf/10 rounded-full blur-[150px] pointer-events-none" }
@@ -650,16 +720,13 @@ pub fn Search() -> Element {
                                       on_search_sources: move || {
                                           spawn(download(DownloadQuery::from(track_clone.clone())));
                                       },
-                                      on_album_click: move || {
-                                          spawn(
-                                              view_full_album(
-                                                  track_clone_2
-                                                      .album_id
-                                                      .clone()
-                                                      .expect("This callback should not be callable without an album"),
-                                                  provider,
-                                              ),
-                                          );
+                                      on_album_click: {
+                                          let album_id_for_expand = track_clone_2.album_id.clone();
+                                          move || {
+                                              if let Some(ref aid) = album_id_for_expand {
+                                                  toggle_expand(aid.clone(), provider);
+                                              }
+                                          }
                                       },
                                       track: track.clone(),
                                       download_state: effective_state,
@@ -690,11 +757,24 @@ pub fn Search() -> Element {
                                 let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
                                 let current_folders = folders.read().clone();
                                 let current_folder_id = selected_folder_id();
+
+                                let is_expanded = expanded_albums.read().contains(&album_id);
+                                let cached = album_cache.read().get(&album_id).cloned();
+                                let tracks_for_panel: Option<Vec<Track>> = if is_expanded {
+                                    cached.map(|awt| awt.tracks)
+                                } else {
+                                    Some(vec![])
+                                };
+
                                 rsx! {
                                   li { key: "{album.id}",
                                     AlbumResult {
-                                      on_click: move || {
-                                          spawn(view_full_album(album_clone.id.clone(), provider));
+                                      is_expanded,
+                                      on_toggle: {
+                                          let id = album_clone.id.clone();
+                                          move || {
+                                              toggle_expand(id.clone(), provider);
+                                          }
                                       },
                                       on_search_sources: {
                                           let album_for_search = album.clone();
@@ -736,6 +816,14 @@ pub fn Search() -> Element {
                                               cover_url: album_for_override.cover_url.clone(),
                                           });
                                           handle_override_download(album_for_override.id.clone(), query, folder);
+                                      },
+                                      tracks: tracks_for_panel,
+                                      download_states,
+                                      on_track_download: move |track: Track| {
+                                          handle_track_download(track);
+                                      },
+                                      on_track_override_download: move |(track, folder): (Track, Folder)| {
+                                          handle_track_override_download((track, folder));
                                       },
                                     }
                                   }
