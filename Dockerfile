@@ -88,6 +88,10 @@ RUN . /tmp/tier.env \
 # rewrite shebang line in the executable script.
 RUN sed -i '1s|^.*$|#!/usr/bin/python3|' $VIRTUAL_ENV/bin/beet
 
+# Static ffmpeg binaries (consumed by chroma-native when FFMPEG=true).
+# Declared before chroma-native so the bind-mount forward-reference resolves.
+FROM docker.io/mwader/static-ffmpeg:8.0.1 AS ffmpeg-stage
+
 # --- Chroma native deps (libchromaprint + libav* shared libs) ---
 # Empty for TIER=light (APT_EXTRAS=""); populated for medium/full.
 # Triplet derived from TARGETARCH (avoids needing dpkg-dev in the slim base).
@@ -124,9 +128,6 @@ RUN --mount=type=bind,from=ffmpeg-stage,target=/ffmpeg-src \
        && cp /ffmpeg-src/ffprobe /out/usr/local/bin/ffprobe \
        && chmod 0755 /out/usr/local/bin/ffmpeg /out/usr/local/bin/ffprobe ; \
      fi
-
-# Static ffmpeg binaries (consumed by chroma-native when FFMPEG=true).
-FROM docker.io/mwader/static-ffmpeg:8.0.1 AS ffmpeg-stage
 
 # --- RUNTIME STAGE ---
 FROM gcr.io/distroless/python3-debian12
