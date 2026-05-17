@@ -21,6 +21,8 @@ services:
       # Mount the beets config
       # Leave commented to use the default configuration
       # - ./beets_config.yaml:/app/beets_config.yaml
+      # Drop-in pure-Python beets plugins (see docs/beets-plugins.md):
+      # - ./my-plugins:/data/beets-plugins:ro
       # depends_on:
       #   - slskd
       # Optional: Slskd service if you want to run it together
