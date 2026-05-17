@@ -111,6 +111,43 @@ jobs:
             type=gha,scope=${{ github.workflow }}-${{ matrix.platform }}-rust
           cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ matrix.platform }}-${{ matrix.tier }}
 
+      # Per-tier smoke test. Only runs on amd64 (where ubuntu-latest can
+      # natively execute the built binary) and only when the build was
+      # actually pushed (PR builds skip push, so there is nothing to pull).
+      # arm64 correctness is trusted to the multi-arch build itself plus
+      # the merge job's manifest validation.
+      - name: Smoke test built image (amd64 only, push events only)
+        if: matrix.suffix == 'amd64' && github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -e
+          IMG="${{ env.IMAGE_NAME }}:${{ matrix.tier }}-amd64"
+          docker pull "$IMG"
+          case "${{ matrix.tier }}" in
+            light)
+              # Light must NOT have chroma deps in /opt/venv.
+              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "import acoustid" 2>&1 | grep -q ModuleNotFoundError \
+                || { echo "FAIL: light tier should not have acoustid"; exit 1; }
+              echo "light tier smoke OK"
+              ;;
+            medium)
+              # Medium must have fpcalc on PATH and pyacoustid in /opt/venv.
+              docker run --rm --entrypoint=/usr/bin/fpcalc "$IMG" -version | head -1
+              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "import acoustid"
+              echo "medium tier smoke OK"
+              ;;
+            full)
+              # Full must have ffmpeg, Pillow, the replaygain plugin module,
+              # and must NOT have PyGObject (Pitfall 2 mitigation).
+              docker run --rm --entrypoint=/usr/local/bin/ffmpeg "$IMG" -version | head -1
+              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "from PIL import Image"
+              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "import beetsplug.replaygain"
+              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "import gi" 2>&1 | grep -q ModuleNotFoundError \
+                || { echo "FAIL: full tier should not have PyGObject"; exit 1; }
+              echo "full tier smoke OK"
+              ;;
+          esac
+
   merge:
     needs: [metadata, build]
     runs-on: ubuntu-latest
@@ -157,4 +194,77 @@ jobs:
             done
           else
             echo "::notice::Skipping rolling per-tier manifests (ref=$GITHUB_REF is not master or a v* tag)"
+          fi
+
+  # NFR-16-01 size guard: warn (but do not block, per D-CI-03) if the new
+  # :light manifest's compressed size exceeds the previously-pushed :light
+  # by more than 5 MB. On the very first run after Phase 16 merges, no prior
+  # :light exists yet; we fall back to comparing against the existing :latest
+  # tag, which on Docker Hub today is the single-tier image. On subsequent
+  # runs :light and :latest both point at the freshly-pushed light variant
+  # via the merge job's alias step, so the same lookup serves both cases.
+  size-check:
+    needs: [metadata, merge]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Compute light tier size delta
+        shell: bash
+        run: |
+          set -e
+          # Sum compressed layer sizes from the manifest descriptor for the
+          # amd64 platform inside the freshly-published :light manifest list.
+          # docker manifest inspect returns the manifest list; we pick the
+          # amd64 child manifest, fetch it, and sum its layers' sizes.
+          sum_compressed_size() {
+            local ref="$1"
+            docker manifest inspect "$ref" 2>/dev/null \
+              | python3 -c '
+          import json, sys, subprocess
+          m = json.load(sys.stdin)
+          if "manifests" in m:
+              # Manifest list (multi-arch); pick amd64.
+              for entry in m["manifests"]:
+                  plat = entry.get("platform", {})
+                  if plat.get("architecture") == "amd64" and plat.get("os") == "linux":
+                      digest = entry["digest"]
+                      ref = sys.argv[1].split(":")[0] + "@" + digest
+                      out = subprocess.run(["docker", "manifest", "inspect", ref], capture_output=True, text=True, check=True)
+                      child = json.loads(out.stdout)
+                      print(sum(layer.get("size", 0) for layer in child.get("layers", [])))
+                      sys.exit(0)
+              print(0)
+          else:
+              # Single-arch manifest; sum its layers directly.
+              print(sum(layer.get("size", 0) for layer in m.get("layers", [])))
+          ' "$ref" || echo 0
+          }
+
+          NEW_SIZE=$(sum_compressed_size "${{ env.IMAGE_NAME }}:light")
+          # Baseline lookup: docker manifest inspect ${{ env.IMAGE_NAME }}:latest
+          # — prior :light on post-Phase-16 runs, single-tier :latest on the
+          # first run after this phase merges (D-CI-03 fallback).
+          OLD_SIZE=$(sum_compressed_size "${{ env.IMAGE_NAME }}:latest")
+
+          NEW_MB=$((NEW_SIZE / 1024 / 1024))
+          OLD_MB=$((OLD_SIZE / 1024 / 1024))
+          echo "Light tier compressed size (amd64): ${NEW_MB} MiB (baseline :latest: ${OLD_MB} MiB)"
+
+          if [ "$OLD_SIZE" -gt 0 ] && [ "$NEW_SIZE" -gt 0 ]; then
+            DELTA=$((NEW_SIZE - OLD_SIZE))
+            # Integer-MB delta with sign preserved (bash arithmetic floors toward zero).
+            DELTA_MB=$((DELTA / 1024 / 1024))
+            echo "Delta: ${DELTA_MB} MiB"
+            if [ "$DELTA_MB" -gt 5 ]; then
+              echo "::warning::Light tier compressed size grew by ${DELTA_MB} MB vs prior baseline (NFR-16-01 budget: 5 MB)"
+            fi
+          else
+            echo "::notice::Size baseline unavailable (first run or manifest inspect failed); skipping delta comparison"
           fi
