@@ -106,11 +106,16 @@ RUN . /tmp/tier.env \
        && apt-get install -y --no-install-recommends ${APT_EXTRAS} \
        && rm -rf /var/lib/apt/lists/* \
        && cp /usr/bin/fpcalc /out/usr/bin/ \
-       && cp -P /usr/lib/${TRIPLET}/libchromaprint.so.* /out/usr/lib/${TRIPLET}/ \
-       && cp -P /usr/lib/${TRIPLET}/libavcodec.so.* /out/usr/lib/${TRIPLET}/ \
-       && cp -P /usr/lib/${TRIPLET}/libavformat.so.* /out/usr/lib/${TRIPLET}/ \
-       && cp -P /usr/lib/${TRIPLET}/libavutil.so.* /out/usr/lib/${TRIPLET}/ \
-       && cp -P /usr/lib/${TRIPLET}/libswresample.so.* /out/usr/lib/${TRIPLET}/ ; \
+       && ldd /usr/bin/fpcalc | awk '/=>/ {print $3}' | grep -v '^$' | sort -u | while read lib; do \
+            real=$(readlink -f "$lib"); \
+            [ -f "$real" ] || continue; \
+            dest_dir="/out$(dirname "$real")"; \
+            mkdir -p "$dest_dir"; \
+            cp "$real" "$dest_dir/"; \
+            soname=$(basename "$lib"); \
+            realname=$(basename "$real"); \
+            [ "$soname" = "$realname" ] || ln -sf "$realname" "$dest_dir/$soname"; \
+          done ; \
      fi
 
 # --- RUNTIME STAGE ---
