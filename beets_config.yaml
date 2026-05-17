@@ -1,4 +1,8 @@
 plugins: musicbrainz
+# Drop-in pure-Python beets plugins live here at runtime. The Dockerfile
+# pre-creates /data/beets-plugins as an empty 0755 directory; users may
+# bind-mount their own directory at the same path to extend any tier.
+pluginpath: /data/beets-plugins
 directory: /music # Mapped in docker-compose
 import:
   copy: no
@@ -22,3 +26,11 @@ musicbrainz:
       media,
       year
     ]
+# Wire the replaygain plugin to the ffmpeg backend. Dormant on light / medium
+# tiers (the plugin is not enabled in `plugins:` there). Load-bearing on full,
+# where it avoids beets' gstreamer default which requires PyGObject and is not
+# available on distroless. Plan 16-03 ships the static ffmpeg binary that
+# satisfies this backend at runtime.
+replaygain:
+  backend: ffmpeg
+  overwrite: yes

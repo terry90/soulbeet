@@ -1,3 +1,8 @@
+# Tier selector. Sourced from build/tiers/${TIER}.env in the beets-builder
+# stage. Defaults to `light` so a plain `docker build .` preserves the
+# pre-tiering image shape (FR-16-07).
+ARG TIER=light
+
 # Build Stage
 FROM rust:1.91-bookworm AS builder
 
@@ -38,10 +43,16 @@ RUN npx @tailwindcss/cli -i ./web/assets/input.css -o ./web/assets/tailwind.css
 # Build the application
 RUN dx bundle --package web --release
 
-# Create an empty directory for data to be copied to runtime
-RUN mkdir -p /empty_data
+# Create empty directories for data and beets-plugin drop-in to be copied to
+# runtime. The /empty_plugins copy guarantees /data/beets-plugins exists even
+# when the user does not mount anything over it (Pitfall 4 mitigation).
+RUN mkdir -p /empty_data /empty_plugins \
+  && chmod 0755 /empty_data /empty_plugins
 
 FROM python:3.11-slim-bookworm AS beets-builder
+
+# Re-declare so the ARG is in scope within this stage (Dockerfile ARG scoping).
+ARG TIER=light
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
@@ -52,9 +63,26 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Install beets and dependencies
+# Pull the tier manifest. It exports BEETS_EXTRAS, BEETS_PLUGINS, APT_EXTRAS,
+# FFMPEG. The first two are consumed below; APT_EXTRAS and FFMPEG are reserved
+# for plans 16-02 (chroma-native stage) and 16-03 (static ffmpeg COPY).
+COPY build/tiers/${TIER}.env /tmp/tier.env
+
+# Install beets and dependencies. Quote "beets${BEETS_EXTRAS}" so the shell
+# does not glob the `[...]` extras list for medium / full tiers.
 RUN pip install --no-cache-dir wheel
-RUN pip install --no-cache-dir beets requests musicbrainzngs
+RUN . /tmp/tier.env \
+  && pip install --no-cache-dir "beets${BEETS_EXTRAS}" requests musicbrainzngs
+
+# Template beets_config.yaml's `plugins:` line from BEETS_PLUGINS, and ensure
+# `pluginpath:` is present. The sed pattern is anchored to `^plugins:` so the
+# other top-level blocks (replaygain, musicbrainz, etc.) survive untouched.
+COPY beets_config.yaml /tmp/beets_config.yaml
+RUN . /tmp/tier.env \
+  && sed -i "s|^plugins:.*|plugins: ${BEETS_PLUGINS}|" /tmp/beets_config.yaml \
+  && (grep -q "^pluginpath:" /tmp/beets_config.yaml \
+        || echo "pluginpath: /data/beets-plugins" >> /tmp/beets_config.yaml) \
+  && cp /tmp/beets_config.yaml /beets_config.yaml
 
 # rewrite shebang line in the executable script.
 RUN sed -i '1s|^.*$|#!/usr/bin/python3|' $VIRTUAL_ENV/bin/beet
@@ -73,10 +101,15 @@ WORKDIR /app
 
 # Copy artifacts from builder
 COPY --from=builder /app/target/dx/web/release/web /app/server
-COPY beets_config.yaml /app/beets_config.yaml
+# Ship the templated beets_config.yaml from the beets-builder stage rather
+# than the raw committed file, so the `plugins:` line matches the active tier.
+COPY --from=beets-builder /beets_config.yaml /app/beets_config.yaml
 
 # Copy empty data directory to ensure /data exists
 COPY --from=builder /empty_data /data
+# Pre-create /data/beets-plugins so beets does not silently no-op pluginpath
+# lookups when the user has not mounted anything (Pitfall 4 mitigation).
+COPY --from=builder /empty_plugins /data/beets-plugins
 
 ENV PATH="/opt/venv/bin:/usr/local/bin:$PATH"
 
