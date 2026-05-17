@@ -129,12 +129,32 @@ jobs:
       - name: Create and push multi-arch manifests
         shell: bash
         run: |
+          set -e
           TAGS="${{ needs.metadata.outputs.tags }}"
+          TIERS="light medium full"
+
+          # For each base tag (e.g. :latest, :v0.6.0), produce one multi-arch
+          # manifest list per tier, then alias the bare base tag to the light
+          # variant (D-CI-02: :latest -> :light, :<version> -> :<version>-light).
           IFS=$'\n'
           for tag in $TAGS; do
             SHORT_TAG="${tag#${{ env.IMAGE_NAME }}:}"
-            docker buildx imagetools create -t $tag \
-              ${{ env.IMAGE_NAME }}:${SHORT_TAG}-amd64 \
-              ${{ env.IMAGE_NAME }}:${SHORT_TAG}-arm64
+            for TIER in $TIERS; do
+              docker buildx imagetools create -t ${{ env.IMAGE_NAME }}:${SHORT_TAG}-${TIER} ${{ env.IMAGE_NAME }}:${SHORT_TAG}-${TIER}-amd64 ${{ env.IMAGE_NAME }}:${SHORT_TAG}-${TIER}-arm64
+            done
+            # Base-tag alias points at the light variant (D-CI-02).
+            docker buildx imagetools create -t $tag ${{ env.IMAGE_NAME }}:${SHORT_TAG}-light-amd64 ${{ env.IMAGE_NAME }}:${SHORT_TAG}-light-arm64
           done
           unset IFS
+
+          # Rolling per-tier multi-arch manifests (:light, :medium, :full).
+          # Only re-publish on master pushes or semver tag pushes so feature
+          # branches do not silently re-point the rolling :light/:medium/:full
+          # tags on Docker Hub.
+          if [[ "$GITHUB_REF" == "refs/heads/master" || "$GITHUB_REF" == refs/tags/v* ]]; then
+            for TIER in $TIERS; do
+              docker buildx imagetools create -t ${{ env.IMAGE_NAME }}:${TIER} ${{ env.IMAGE_NAME }}:${TIER}-amd64 ${{ env.IMAGE_NAME }}:${TIER}-arm64
+            done
+          else
+            echo "::notice::Skipping rolling per-tier manifests (ref=$GITHUB_REF is not master or a v* tag)"
+          fi
