@@ -89,13 +89,17 @@ RUN sed -i '1s|^.*$|#!/usr/bin/python3|' $VIRTUAL_ENV/bin/beet
 
 # --- Chroma native deps (libchromaprint + libav* shared libs) ---
 # Empty for TIER=light (APT_EXTRAS=""); populated for medium/full.
-# Uses dpkg-architecture so /usr/lib/<triplet>/ is correct on amd64 + arm64.
+# Triplet derived from TARGETARCH (avoids needing dpkg-dev in the slim base).
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS chroma-native
 ARG TIER
 ARG TARGETARCH
 COPY build/tiers/${TIER}.env /tmp/tier.env
 RUN . /tmp/tier.env \
-  && TRIPLET="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
+  && case "${TARGETARCH}" in \
+       amd64) TRIPLET="x86_64-linux-gnu" ;; \
+       arm64) TRIPLET="aarch64-linux-gnu" ;; \
+       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+     esac \
   && mkdir -p /out/usr/bin /out/usr/lib/${TRIPLET} \
   && if [ -n "${APT_EXTRAS}" ]; then \
        apt-get update \
