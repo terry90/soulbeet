@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Tier selector. Sourced from build/tiers/${TIER}.env in the beets-builder
 # stage. Defaults to `light` so a plain `docker build .` preserves the
 # pre-tiering image shape (FR-16-07).
@@ -94,13 +95,14 @@ FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS chroma-native
 ARG TIER
 ARG TARGETARCH
 COPY build/tiers/${TIER}.env /tmp/tier.env
-RUN . /tmp/tier.env \
+RUN --mount=type=bind,from=ffmpeg-stage,target=/ffmpeg-src \
+    . /tmp/tier.env \
   && case "${TARGETARCH}" in \
        amd64) TRIPLET="x86_64-linux-gnu" ;; \
        arm64) TRIPLET="aarch64-linux-gnu" ;; \
        *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
      esac \
-  && mkdir -p /out/usr/bin /out/usr/lib/${TRIPLET} \
+  && mkdir -p /out/usr/bin /out/usr/lib/${TRIPLET} /out/usr/local/bin \
   && if [ -n "${APT_EXTRAS}" ]; then \
        apt-get update \
        && apt-get install -y --no-install-recommends ${APT_EXTRAS} \
@@ -116,17 +118,23 @@ RUN . /tmp/tier.env \
             realname=$(basename "$real"); \
             [ "$soname" = "$realname" ] || ln -sf "$realname" "$dest_dir/$soname"; \
           done ; \
+     fi \
+  && if [ "${FFMPEG}" = "true" ]; then \
+       cp /ffmpeg-src/ffmpeg /out/usr/local/bin/ffmpeg \
+       && cp /ffmpeg-src/ffprobe /out/usr/local/bin/ffprobe \
+       && chmod 0755 /out/usr/local/bin/ffmpeg /out/usr/local/bin/ffprobe ; \
      fi
+
+# Static ffmpeg binaries (consumed by chroma-native when FFMPEG=true).
+FROM docker.io/mwader/static-ffmpeg:8.0.1 AS ffmpeg-stage
 
 # --- RUNTIME STAGE ---
 FROM gcr.io/distroless/python3-debian12
 
-# Native binaries for chroma (fpcalc + libchromaprint + libav* shared libs).
+# Native binaries for chroma (fpcalc + libchromaprint + libav* shared libs)
+# plus static ffmpeg + ffprobe at /usr/local/bin/ when TIER=full.
 # Empty when TIER=light; populated for medium/full.
 COPY --from=chroma-native /out/ /
-
-# COPY --from=docker.io/mwader/static-ffmpeg:8.0.1 /ffmpeg /usr/local/bin/ffmpeg
-# COPY --from=docker.io/mwader/static-ffmpeg:8.0.1 /ffprobe /usr/local/bin/ffprobe
 
 # Copy beets virtual environment
 COPY --from=beets-builder /opt/venv /opt/venv
