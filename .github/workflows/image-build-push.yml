@@ -44,7 +44,9 @@ jobs:
   build:
     needs: metadata
     strategy:
+      fail-fast: false
       matrix:
+        tier: [light, medium, full]
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
@@ -75,18 +77,26 @@ jobs:
         run: |
           TAGS="${{ needs.metadata.outputs.tags }}"
           SUFFIX="${{ matrix.suffix }}"
+          TIER="${{ matrix.tier }}"
           SUFFIXED_TAGS=""
           IFS=$'\n'
           for tag in $TAGS; do
             SHORT_TAG="${tag#${{ env.IMAGE_NAME }}:}"
-            SUFFIXED_TAGS="${SUFFIXED_TAGS},${{ env.IMAGE_NAME }}:${SHORT_TAG}-${SUFFIX}"
+            # Per-version, tier-specific, per-arch tag (e.g. v0.6.0-light-amd64).
+            SUFFIXED_TAGS="${SUFFIXED_TAGS},${{ env.IMAGE_NAME }}:${SHORT_TAG}-${TIER}-${SUFFIX}"
           done
           unset IFS
+          # Rolling per-tier per-arch tag (e.g. light-amd64). The merge job
+          # uses these to compose the rolling :light/:medium/:full multi-arch
+          # manifests; that step guards itself against feature-branch refs so
+          # the rolling image is only re-published on master / v* tags.
+          SUFFIXED_TAGS="${SUFFIXED_TAGS},${{ env.IMAGE_NAME }}:${TIER}-${SUFFIX}"
           SUFFIXED_TAGS="${SUFFIXED_TAGS#,}"
           echo "tags=$SUFFIXED_TAGS" >> $GITHUB_OUTPUT
           echo "Generated tags: $SUFFIXED_TAGS"
 
       - name: Build and push platform-specific
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -94,8 +104,12 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.platform-tags.outputs.tags }}
           labels: ${{ needs.metadata.outputs.labels }}
-          cache-from: type=gha,scope=${{ github.workflow }}-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ matrix.platform }}
+          build-args: |
+            TIER=${{ matrix.tier }}
+          cache-from: |
+            type=gha,scope=${{ github.workflow }}-${{ matrix.platform }}-${{ matrix.tier }}
+            type=gha,scope=${{ github.workflow }}-${{ matrix.platform }}-rust
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ matrix.platform }}-${{ matrix.tier }}
 
   merge:
     needs: [metadata, build]
