@@ -128,6 +128,10 @@ Default `beet import` flags used:
 -   `-l [library_path]`: Library database path (per-folder)
 -   `-d [target_path]`: Import to the specific folder selected in the web UI.
 
+### Image Tiers
+
+Soulbeet ships three image tiers: `:light` (default, MusicBrainz tagging only), `:medium` (adds AcoustID fingerprint matching via the `chroma` plugin), and `:full` (adds cover art, lyrics, ReplayGain, and more). `:latest` is an alias for `:light` so existing installs keep their current behavior. See [docs/beets-plugins.md](./docs/beets-plugins.md) for what each tier ships, how to switch, and how to drop in your own plugins.
+
 ### Library Management
 
 **Important**: Each music folder you configure in Soulbeet has its own beets database (`.beets_library.db`) stored at the root of that folder. This enables:
