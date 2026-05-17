@@ -87,8 +87,34 @@ RUN . /tmp/tier.env \
 # rewrite shebang line in the executable script.
 RUN sed -i '1s|^.*$|#!/usr/bin/python3|' $VIRTUAL_ENV/bin/beet
 
+# --- Chroma native deps (libchromaprint + libav* shared libs) ---
+# Empty for TIER=light (APT_EXTRAS=""); populated for medium/full.
+# Uses dpkg-architecture so /usr/lib/<triplet>/ is correct on amd64 + arm64.
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS chroma-native
+ARG TIER
+ARG TARGETARCH
+COPY build/tiers/${TIER}.env /tmp/tier.env
+RUN . /tmp/tier.env \
+  && TRIPLET="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
+  && mkdir -p /out/usr/bin /out/usr/lib/${TRIPLET} \
+  && if [ -n "${APT_EXTRAS}" ]; then \
+       apt-get update \
+       && apt-get install -y --no-install-recommends ${APT_EXTRAS} \
+       && rm -rf /var/lib/apt/lists/* \
+       && cp /usr/bin/fpcalc /out/usr/bin/ \
+       && cp -P /usr/lib/${TRIPLET}/libchromaprint.so.* /out/usr/lib/${TRIPLET}/ \
+       && cp -P /usr/lib/${TRIPLET}/libavcodec.so.* /out/usr/lib/${TRIPLET}/ \
+       && cp -P /usr/lib/${TRIPLET}/libavformat.so.* /out/usr/lib/${TRIPLET}/ \
+       && cp -P /usr/lib/${TRIPLET}/libavutil.so.* /out/usr/lib/${TRIPLET}/ \
+       && cp -P /usr/lib/${TRIPLET}/libswresample.so.* /out/usr/lib/${TRIPLET}/ ; \
+     fi
+
 # --- RUNTIME STAGE ---
 FROM gcr.io/distroless/python3-debian12
+
+# Native binaries for chroma (fpcalc + libchromaprint + libav* shared libs).
+# Empty when TIER=light; populated for medium/full.
+COPY --from=chroma-native /out/ /
 
 # COPY --from=docker.io/mwader/static-ffmpeg:8.0.1 /ffmpeg /usr/local/bin/ffmpeg
 # COPY --from=docker.io/mwader/static-ffmpeg:8.0.1 /ffprobe /usr/local/bin/ffprobe
