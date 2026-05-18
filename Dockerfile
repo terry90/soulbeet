@@ -75,6 +75,21 @@ RUN pip install --no-cache-dir wheel
 RUN . /tmp/tier.env \
   && pip install --no-cache-dir "beets${BEETS_EXTRAS}" requests musicbrainzngs
 
+# Prune the venv. beets 2.11 declares numba/scipy as deps but never imports
+# them (only lap + numpy in autotag/match.py). Stripping these and the venv
+# bootstrap tools (pip/wheel/setuptools, never used at runtime) reclaims
+# hundreds of MB. Also drop bytecode caches, package metadata, test suites,
+# locale files, and strip native extensions.
+RUN pip uninstall -y numba llvmlite scipy pip wheel setuptools \
+  && find /opt/venv -type d -name __pycache__ -prune -exec rm -rf {} + \
+  && find /opt/venv -type d -name '*.dist-info' -prune -exec rm -rf {} + \
+  && find /opt/venv/lib/python3.11/site-packages -type d \( \
+       -name tests -o -name test -o -name testing \
+       -o -name docs -o -name doc -o -name examples \
+       -o -name locale \
+     \) -prune -exec rm -rf {} + \
+  && find /opt/venv -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
 # Template beets_config.yaml's `plugins:` line from BEETS_PLUGINS, and ensure
 # `pluginpath:` is present. The sed pattern is anchored to `^plugins:` so the
 # other top-level blocks (replaygain, musicbrainz, etc.) survive untouched.
