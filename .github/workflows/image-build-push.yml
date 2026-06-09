@@ -46,7 +46,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # platform must be a real axis: include entries with only non-axis
+        # keys do not fan out, they merge into every tier job in order and
+        # the last one wins (this previously built all tiers as arm64 only).
         tier: [light, medium, full]
+        platform: [linux/amd64, linux/arm64]
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
