@@ -127,26 +127,39 @@ jobs:
           set -e
           IMG="${{ env.IMAGE_NAME }}:${{ matrix.tier }}-amd64"
           docker pull "$IMG"
+          # /opt/venv/bin/python3 is a dangling symlink in the distroless
+          # runtime (the builder's interpreter path does not exist there);
+          # the real interpreter is /usr/bin/python3, which finds the venv
+          # packages via the PYTHONPATH baked into the image. Same reason
+          # the Dockerfile patches the beet shebang.
+          py() { docker run --rm --entrypoint=/usr/bin/python3 "$IMG" "$@"; }
           case "${{ matrix.tier }}" in
             light)
-              # Light must NOT have chroma deps in /opt/venv.
-              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "import acoustid" 2>&1 | grep -q ModuleNotFoundError \
+              # Light must NOT have chroma deps in /opt/venv. The import is
+              # EXPECTED to fail, so capture output instead of piping the
+              # nonzero docker run into grep (pipefail would flag it).
+              out=$(py -c "import acoustid" 2>&1 || true)
+              grep -q ModuleNotFoundError <<<"$out" \
                 || { echo "FAIL: light tier should not have acoustid"; exit 1; }
               echo "light tier smoke OK"
               ;;
             medium)
               # Medium must have fpcalc on PATH and pyacoustid in /opt/venv.
-              docker run --rm --entrypoint=/usr/bin/fpcalc "$IMG" -version | head -1
-              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "import acoustid"
+              docker run --rm --entrypoint=/usr/bin/fpcalc "$IMG" -version
+              py -c "import acoustid"
               echo "medium tier smoke OK"
               ;;
             full)
               # Full must have ffmpeg, Pillow, the replaygain plugin module,
               # and must NOT have PyGObject (Pitfall 2 mitigation).
-              docker run --rm --entrypoint=/usr/local/bin/ffmpeg "$IMG" -version | head -1
-              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "from PIL import Image"
-              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "import beetsplug.replaygain"
-              docker run --rm --entrypoint=/opt/venv/bin/python3 "$IMG" -c "import gi" 2>&1 | grep -q ModuleNotFoundError \
+              # Capture ffmpeg -version: piping it straight into head -1
+              # kills ffmpeg with SIGPIPE, which pipefail turns into failure.
+              ffv=$(docker run --rm --entrypoint=/usr/local/bin/ffmpeg "$IMG" -version)
+              head -1 <<<"$ffv"
+              py -c "from PIL import Image"
+              py -c "import beetsplug.replaygain"
+              out=$(py -c "import gi" 2>&1 || true)
+              grep -q ModuleNotFoundError <<<"$out" \
                 || { echo "FAIL: full tier should not have PyGObject"; exit 1; }
               echo "full tier smoke OK"
               ;;
