@@ -8,6 +8,8 @@ pub(crate) struct SearchResponseFile {
     pub size: i64,
     pub bit_rate: Option<i32>,
     pub length: Option<i32>,
+    pub sample_rate: Option<i32>,
+    pub bit_depth: Option<i32>,
 }
 
 #[derive(Deserialize, Debug)]

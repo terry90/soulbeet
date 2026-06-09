@@ -50,6 +50,8 @@ pub fn process_search_responses(
                     size: file.size,
                     bitrate: file.bit_rate,
                     duration: file.length,
+                    sample_rate: file.sample_rate,
+                    bit_depth: file.bit_depth,
                     has_free_upload_slot: resp.has_free_upload_slot,
                     upload_speed: resp.upload_speed,
                     queue_length: resp.queue_length,

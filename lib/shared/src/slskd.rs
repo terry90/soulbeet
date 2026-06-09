@@ -393,6 +393,10 @@ pub struct SearchResult {
     pub size: i64,
     pub bitrate: Option<i32>,
     pub duration: Option<i32>,
+    #[serde(default)]
+    pub sample_rate: Option<i32>,
+    #[serde(default)]
+    pub bit_depth: Option<i32>,
     pub has_free_upload_slot: bool,
     pub upload_speed: i32,
     pub queue_length: i32,

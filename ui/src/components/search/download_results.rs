@@ -5,21 +5,45 @@ use std::collections::HashSet;
 
 use crate::{use_auth, Checkbox};
 
+/// Format a sample rate in Hz as kHz, trimming a trailing .0 (44100 -> "44.1", 48000 -> "48").
+fn format_khz(hz: i32) -> String {
+    let khz = hz as f64 / 1000.0;
+    if khz.fract() == 0.0 {
+        format!("{}", khz as i64)
+    } else {
+        format!("{khz:.1}")
+    }
+}
+
 fn quality_badge(item: &DownloadableItem) -> Element {
     let quality = item.quality.as_str();
 
+    let search_result = item
+        .backend_data
+        .as_ref()
+        .and_then(|data| serde_json::from_str::<shared::slskd::SearchResult>(data).ok());
+
     let label = if quality == "mp3" {
-        let bitrate = item
-            .backend_data
-            .as_ref()
-            .and_then(|data| serde_json::from_str::<shared::slskd::SearchResult>(data).ok())
-            .and_then(|sr| sr.bitrate);
+        let bitrate = search_result.as_ref().and_then(|sr| sr.bitrate);
         match bitrate {
             Some(br) if br >= 320 => "320k".to_string(),
             Some(br) if br >= 256 => "256k".to_string(),
             Some(br) if br >= 192 => "192k".to_string(),
             Some(br) if br > 0 => format!("{}k", br),
             _ => "MP3".to_string(),
+        }
+    } else if matches!(quality, "flac" | "wav") {
+        // Lossless: show bit depth / sample rate like slskd does (e.g. FLAC 16/44.1)
+        let (depth, rate) = search_result
+            .as_ref()
+            .map(|sr| (sr.bit_depth, sr.sample_rate))
+            .unwrap_or((None, None));
+        match (depth, rate) {
+            (Some(d), Some(r)) => {
+                format!("{} {}/{}", quality.to_uppercase(), d, format_khz(r))
+            }
+            (None, Some(r)) => format!("{} {}", quality.to_uppercase(), format_khz(r)),
+            _ => quality.to_uppercase(),
         }
     } else {
         quality.to_uppercase()
