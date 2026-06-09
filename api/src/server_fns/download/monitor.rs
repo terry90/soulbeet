@@ -25,10 +25,20 @@ const MAX_CONSECUTIVE_EMPTY: usize = 15;
 /// Per-track timeout duration (1 hour).
 const PER_TRACK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// How long a track may stay absent from slskd's transfer list before it is
+/// marked failed: never appearing at all, or vanishing after being seen.
+/// Without this, one absent track keeps the whole batch unfinished forever.
+const ABSENT_TRACK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Consecutive backend resolution failures tolerated before giving up.
+const MAX_BACKEND_FAILURES: u32 = 5;
+
 /// State tracking for individual track downloads.
 struct TrackState {
     /// When the track was first seen in slskd's download list.
     first_seen: Option<Instant>,
+    /// When the track went missing from slskd's list after being seen.
+    missing_since: Option<Instant>,
     /// Whether this track has been processed (imported or marked as failed).
     processed: bool,
 }
@@ -56,6 +66,8 @@ pub struct DownloadMonitor {
     album_mode: bool,
     /// Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
+    /// When monitoring started, for the never-appeared timeout.
+    started_at: Instant,
     /// Username for logging.
     username: String,
     /// Batch identifier for grouping downloads.
@@ -89,6 +101,7 @@ impl DownloadMonitor {
                     f.clone(),
                     TrackState {
                         first_seen: None,
+                        missing_since: None,
                         processed: false,
                     },
                 )
@@ -103,6 +116,7 @@ impl DownloadMonitor {
             track_states,
             album_mode: CONFIG.is_album_mode(),
             cancellation_token,
+            started_at: Instant::now(),
             username,
             batch_id,
             batch_label,
@@ -114,6 +128,7 @@ impl DownloadMonitor {
         let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
         let mut consecutive_empty = 0;
         let mut poll_count = 0;
+        let mut backend_failures: u32 = 0;
 
         // Poll immediately on first iteration
         interval.tick().await;
@@ -130,10 +145,22 @@ impl DownloadMonitor {
             poll_count += 1;
 
             let backend = match download_backend(None).await {
-                Ok(b) => b,
+                Ok(b) => {
+                    backend_failures = 0;
+                    b
+                }
                 Err(e) => {
-                    warn!("No download backend available for monitoring: {}", e);
-                    break;
+                    backend_failures += 1;
+                    warn!(
+                        "No download backend available for monitoring ({}/{}): {}",
+                        backend_failures, MAX_BACKEND_FAILURES, e
+                    );
+                    if backend_failures >= MAX_BACKEND_FAILURES {
+                        self.fail_unprocessed_tracks("Download backend unavailable");
+                        break;
+                    }
+                    interval.tick().await;
+                    continue;
                 }
             };
             match backend.get_downloads().await {
@@ -232,6 +259,10 @@ impl DownloadMonitor {
         // Process individual tracks
         self.process_tracks(&batch_status).await;
 
+        // Fail tracks that never appeared or vanished from slskd's list,
+        // so one absent track cannot stall the batch forever
+        self.handle_absent_tracks(&batch_status);
+
         // Check completion
         self.check_completion(&batch_status).await
     }
@@ -244,9 +275,15 @@ impl DownloadMonitor {
     ///
     /// When the same file exists multiple times from the same peer (e.g.
     /// re-downloading a track), prefer the active entry over the stale one.
-    fn find_matching_downloads(&self, downloads: &[DownloadProgress]) -> Vec<DownloadProgress> {
+    ///
+    /// When the tracked peer has no usable transfer (nothing, or only a
+    /// failed one) but another peer has an active transfer of the same file,
+    /// the download was retried from a different source: rebind tracking to
+    /// the new peer. Stale terminal transfers from other peers stay ignored.
+    fn find_matching_downloads(&mut self, downloads: &[DownloadProgress]) -> Vec<DownloadProgress> {
         let mut matched = Vec::new();
-        for tracked in &self.tracked_files {
+        let mut rebinds: Vec<(usize, String)> = Vec::new();
+        for (idx, tracked) in self.tracked_files.iter().enumerate() {
             let mut best: Option<&DownloadProgress> = None;
             for dl in downloads {
                 if dl.source != tracked.source || !filenames_match(&dl.item, &tracked.filename) {
@@ -263,10 +300,40 @@ impl DownloadMonitor {
                     _ => {}
                 }
             }
+
+            let unusable =
+                best.is_none_or(|b| is_terminal_state(&b.state) && !is_completed(&b.state));
+            if unusable {
+                if let Some(retry) = downloads.iter().find(|dl| {
+                    dl.source != tracked.source
+                        && !is_terminal_state(&dl.state)
+                        && filenames_match(&dl.item, &tracked.filename)
+                }) {
+                    rebinds.push((idx, retry.source.clone()));
+                    best = Some(retry);
+                }
+            }
+
             if let Some(dl) = best {
                 matched.push(dl.clone());
             }
         }
+
+        for (idx, new_source) in rebinds {
+            let tracked = &mut self.tracked_files[idx];
+            info!(
+                "Download of {} retried from new peer {} (was {}), rebinding",
+                tracked.filename, new_source, tracked.source
+            );
+            tracked.source = new_source;
+            // Reset state so the retried transfer is monitored and imported
+            if let Some(state) = self.track_states.get_mut(&tracked.filename) {
+                state.processed = false;
+                state.first_seen = None;
+                state.missing_since = None;
+            }
+        }
+
         matched
     }
 
@@ -374,6 +441,77 @@ impl DownloadMonitor {
         }
     }
 
+    /// Fail tracks that are absent from slskd's transfer list: either they
+    /// never appeared (rejected/lost requests) or they vanished after being
+    /// seen (transfer removed). Each gets a terminal Failed event so the UI
+    /// and batch completion never wait on them forever.
+    fn handle_absent_tracks(&mut self, batch_status: &[DownloadProgress]) {
+        let mut failed: Vec<DownloadProgress> = Vec::new();
+
+        for tracked in &self.tracked_files {
+            let Some(state) = self.track_states.get_mut(&tracked.filename) else {
+                continue;
+            };
+            if state.processed {
+                continue;
+            }
+
+            let present = batch_status
+                .iter()
+                .any(|d| filenames_match(&d.item, &tracked.filename));
+            if present {
+                state.missing_since = None;
+                continue;
+            }
+
+            let absent_reason = match state.first_seen {
+                None if self.started_at.elapsed() > ABSENT_TRACK_TIMEOUT => {
+                    Some("Download never appeared in slskd")
+                }
+                Some(_) => {
+                    let missing_since = state.missing_since.get_or_insert_with(Instant::now);
+                    (missing_since.elapsed() > ABSENT_TRACK_TIMEOUT)
+                        .then_some("Download disappeared from slskd")
+                }
+                None => None,
+            };
+
+            if let Some(reason) = absent_reason {
+                warn!(
+                    "{} after {}s, marking failed: {}",
+                    reason,
+                    ABSENT_TRACK_TIMEOUT.as_secs(),
+                    tracked.filename
+                );
+                state.processed = true;
+                failed.push(make_failed_progress(tracked, reason));
+            }
+        }
+
+        if !failed.is_empty() {
+            let entries = self.stamp_batch(failed);
+            let _ = self.tx.send(DownloadEvent::Progress(entries));
+        }
+    }
+
+    /// Mark every unprocessed track as failed and notify the UI. Used when
+    /// monitoring must stop early so downloads are never left dangling.
+    fn fail_unprocessed_tracks(&mut self, reason: &str) {
+        let mut failed: Vec<DownloadProgress> = Vec::new();
+        for tracked in &self.tracked_files {
+            if let Some(state) = self.track_states.get_mut(&tracked.filename) {
+                if !state.processed {
+                    state.processed = true;
+                    failed.push(make_failed_progress(tracked, reason));
+                }
+            }
+        }
+        if !failed.is_empty() {
+            let entries = self.stamp_batch(failed);
+            let _ = self.tx.send(DownloadEvent::Progress(entries));
+        }
+    }
+
     /// Check if all downloads are complete. Returns true if monitoring should stop.
     async fn check_completion(&mut self, batch_status: &[DownloadProgress]) -> bool {
         let all_processed = self.track_states.values().all(|s| s.processed);
@@ -422,6 +560,25 @@ impl DownloadMonitor {
         } else {
             info!("Album mode: No successful downloads to process");
         }
+    }
+}
+
+/// Build a synthetic terminal progress entry for a track slskd no longer
+/// reports, so the UI can settle its row.
+fn make_failed_progress(tracked: &TrackedFile, reason: &str) -> DownloadProgress {
+    DownloadProgress {
+        id: tracked.filename.clone(),
+        source: tracked.source.clone(),
+        item: tracked.filename.clone(),
+        size: 0,
+        transferred: 0,
+        state: DownloadState::Failed(reason.to_string()),
+        percent: 0.0,
+        speed: 0.0,
+        error: Some(reason.to_string()),
+        backend: None,
+        batch_id: None,
+        batch_label: None,
     }
 }
 
