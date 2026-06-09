@@ -178,6 +178,11 @@ ENV DATABASE_URL=sqlite:/data/soulbeet.db
 ENV PORT=9765
 ENV IP=0.0.0.0
 
+# beets (confuse) derives its config dir from $HOME; without it the fallback is
+# "/" and non-root containers (user: 1000:1000) fail with
+# PermissionError: '/.config'. /tmp is writable for any uid.
+ENV HOME=/tmp
+
 # Expose the port
 EXPOSE 9765
 
