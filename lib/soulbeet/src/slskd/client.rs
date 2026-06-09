@@ -955,12 +955,20 @@ impl SoulseekClient {
     /// Returns Err with a descriptive message if either check fails.
     pub async fn check_connection(&self) -> std::result::Result<(), String> {
         // First verify slskd is reachable (session endpoint)
-        if self
+        if let Err(e) = self
             .make_request::<serde_json::Value, ()>(Method::GET, "session", None)
             .await
-            .is_err()
         {
-            return Err("Cannot reach slskd (session endpoint failed)".to_string());
+            return Err(match e {
+                SoulseekError::Api {
+                    status: status @ (401 | 403),
+                    ..
+                } => format!(
+                    "slskd rejected the API key (HTTP {status}). Check the API key value, its role, \
+                     and any CIDR restriction in slskd's web.authentication.api_keys config."
+                ),
+                other => format!("Cannot reach slskd (session endpoint failed: {other})"),
+            });
         }
 
         // Then verify Soulseek network connection via application state
