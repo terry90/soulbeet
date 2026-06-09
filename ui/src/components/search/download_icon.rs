@@ -1,7 +1,6 @@
 use api::models::folder::Folder;
+use dioxus::dioxus_core::Task;
 use dioxus::prelude::*;
-use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use super::download_options_menu::FolderDropdown;
 
@@ -38,7 +37,7 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
     let mut active_menu = props.active_menu;
     let item_id = props.item_id.clone();
 
-    let mut timer_id = use_signal(|| None::<i32>);
+    let mut press_task = use_signal(|| None::<Task>);
     let mut suppress_click = use_signal(|| false);
 
     let is_interactive = matches!(state, DownloadRowState::Idle | DownloadRowState::Failed(_));
@@ -48,11 +47,8 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
     let item_id_toggle = item_id.clone();
 
     let mut cancel_timer = move || {
-        if let Some(id) = timer_id() {
-            if let Some(window) = web_sys::window() {
-                let _ = window.clear_timeout_with_handle(id);
-            }
-            timer_id.set(None);
+        if let Some(task) = press_task.write().take() {
+            task.cancel();
         }
     };
 
@@ -74,25 +70,26 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
                         return;
                     }
                     cancel_timer();
+                    // Each new gesture starts clean: a long-press on mobile never
+                    // fires the click that would otherwise consume a stale latch.
+                    suppress_click.set(false);
                     let id_for_timer = item_id_open.clone();
-                    if let Some(window) = web_sys::window() {
-                        let cb = Closure::once(move || {
-                            suppress_click.set(true);
-                            active_menu.set(Some(id_for_timer));
-                        });
-                        if let Ok(id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                            cb.as_ref().unchecked_ref(),
-                            500,
-                        ) {
-                            cb.forget();
-                            timer_id.set(Some(id));
-                        }
-                    }
+                    let task = spawn(async move {
+                        gloo_timers::future::TimeoutFuture::new(500).await;
+                        suppress_click.set(true);
+                        active_menu.set(Some(id_for_timer));
+                    });
+                    press_task.set(Some(task));
                 },
                 onpointerup: move |_| {
                     cancel_timer();
                 },
                 onpointerleave: move |_| {
+                    cancel_timer();
+                },
+                // Touch scrolls and system gestures end with pointercancel, not
+                // pointerup; without this the long-press timer keeps running.
+                onpointercancel: move |_| {
                     cancel_timer();
                 },
                 onclick: move |evt: MouseEvent| {
@@ -111,11 +108,12 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
                     if !is_interactive {
                         return;
                     }
-                    if is_menu_open {
-                        active_menu.set(None);
-                    } else {
-                        active_menu.set(Some(item_id_toggle.clone()));
-                    }
+                    // Android long-press fires contextmenu while the 500ms timer
+                    // may already have opened the menu; toggling here would close
+                    // it again. Cancel the timer and ensure the menu is open.
+                    cancel_timer();
+                    suppress_click.set(true);
+                    active_menu.set(Some(item_id_toggle.clone()));
                 },
                 title: if matches!(state, DownloadRowState::Disabled) { "Configure a folder in Settings" } else { "" },
 
