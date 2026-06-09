@@ -168,7 +168,10 @@ jobs:
         run: |
           set -e
           TAGS="${{ needs.metadata.outputs.tags }}"
-          TIERS="light medium full"
+          # Array, not a space-separated string: the tag loop below sets
+          # IFS to newline-only, which would stop $TIERS from splitting on
+          # spaces and produce refs like ":master-light medium full".
+          TIERS=(light medium full)
 
           # For each base tag (e.g. :latest, :v0.6.0), produce one multi-arch
           # manifest list per tier, then alias the bare base tag to the light
@@ -176,7 +179,7 @@ jobs:
           IFS=$'\n'
           for tag in $TAGS; do
             SHORT_TAG="${tag#${{ env.IMAGE_NAME }}:}"
-            for TIER in $TIERS; do
+            for TIER in "${TIERS[@]}"; do
               docker buildx imagetools create -t ${{ env.IMAGE_NAME }}:${SHORT_TAG}-${TIER} ${{ env.IMAGE_NAME }}:${SHORT_TAG}-${TIER}-amd64 ${{ env.IMAGE_NAME }}:${SHORT_TAG}-${TIER}-arm64
             done
             # Base-tag alias points at the light variant (D-CI-02).
@@ -189,7 +192,7 @@ jobs:
           # branches do not silently re-point the rolling :light/:medium/:full
           # tags on Docker Hub.
           if [[ "$GITHUB_REF" == "refs/heads/master" || "$GITHUB_REF" == refs/tags/v* ]]; then
-            for TIER in $TIERS; do
+            for TIER in "${TIERS[@]}"; do
               docker buildx imagetools create -t ${{ env.IMAGE_NAME }}:${TIER} ${{ env.IMAGE_NAME }}:${TIER}-amd64 ${{ env.IMAGE_NAME }}:${TIER}-arm64
             done
           else
