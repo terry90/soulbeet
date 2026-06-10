@@ -23,14 +23,13 @@ use shared::download::{
     SearchState as DownloadSearchState,
 };
 use shared::metadata::{AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
-use shared::system::SystemHealth;
 use std::collections::{HashMap, HashSet};
 
 use track::TrackResult;
 
 use crate::search::album::AlbumResult;
 use crate::settings_context::use_settings;
-use crate::{use_auth, Button, SystemStatus};
+use crate::{use_auth, use_system_health, Button, SystemStatus};
 
 mod download_results;
 use download_results::DownloadResults;
@@ -57,7 +56,7 @@ pub fn Search() -> Element {
     let search_reset = try_use_context::<SearchReset>();
     let search_prefill = try_use_context::<SearchPrefill>();
 
-    let mut system_status = use_signal(SystemHealth::default);
+    let system_health = use_system_health();
 
     // Download state tracking
     let mut download_states = use_signal::<HashMap<String, DownloadRowState>>(HashMap::new);
@@ -107,15 +106,6 @@ pub fn Search() -> Element {
                 selected_folder_id.set(Some(user_folders[0].id.clone()));
             }
             folders.set(user_folders);
-        }
-    });
-
-    use_future(move || async move {
-        loop {
-            if let Ok(health) = auth.call(api::get_system_health()).await {
-                system_status.set(health);
-            }
-            gloo_timers::future::TimeoutFuture::new(10000).await;
         }
     });
 
@@ -671,7 +661,7 @@ pub fn Search() -> Element {
         }
 
 
-        SystemStatus { health: system_status.read().clone(), navidrome_status: auth.navidrome_status() }
+        SystemStatus { health: system_health.get(), navidrome_status: auth.navidrome_status() }
 
         // Results
         if let Some(results) = download_options.read().clone() {

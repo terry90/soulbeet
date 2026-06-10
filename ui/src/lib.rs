@@ -9,6 +9,9 @@ pub use layout::Layout;
 mod auth;
 pub use auth::*;
 
+mod health_context;
+pub use health_context::*;
+
 mod settings_context;
 pub use settings_context::*;
 

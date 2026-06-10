@@ -11,7 +11,10 @@ use dioxus::fullstack::WebSocketOptions;
 #[cfg(feature = "web")]
 use websocket::use_resilient_websocket;
 
-use ui::{AutoDownloadSignal, Downloads, Layout, Navbar, SearchPrefill, SearchReset, SettingsProvider};
+use ui::{
+    AutoDownloadSignal, Downloads, HealthProvider, Layout, Navbar, SearchPrefill, SearchReset,
+    SettingsProvider,
+};
 use views::{DashboardPage, LoginPage, SearchPage, SettingsPage};
 
 mod auth;
@@ -65,7 +68,9 @@ fn App() -> Element {
 
         AuthProvider {
             SettingsProvider {
-                Router::<Route> {}
+                HealthProvider {
+                    Router::<Route> {}
+                }
             }
         }
     }
@@ -251,6 +256,7 @@ fn WebNavbar() -> Element {
 fn NavidromeBanner() -> Element {
     let auth = use_auth();
     let mut settings = ui::use_settings();
+    let health = ui::use_system_health();
     let status = auth.navidrome_status();
 
     let dismissed = settings
@@ -258,7 +264,12 @@ fn NavidromeBanner() -> Element {
         .map(|s| s.navidrome_banner_dismissed)
         .unwrap_or(false);
 
+    // The status is a login-time snapshot; live health overrides it, so the
+    // banner clears on its own once Navidrome answers again.
+    let back_online = matches!(status, NavidromeStatus::Offline) && health.navidrome_online();
+
     if dismissed
+        || back_online
         || matches!(
             status,
             NavidromeStatus::Connected | NavidromeStatus::Unknown
