@@ -1,0 +1,24 @@
+{
+	"name": "soulbeet-e2e",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"lint": "eslint .",
+		"fixtures": "tsx fixtures/generate.ts",
+		"stubs": "tsx stubs/src/main.ts",
+		"test": "playwright test",
+		"test:headed": "playwright test --headed",
+		"report": "playwright show-report"
+	},
+	"devDependencies": {
+		"@eslint/js": "^9.39.0",
+		"@playwright/test": "^1.60.0",
+		"@types/node": "^22.19.0",
+		"eslint": "^9.39.0",
+		"tsx": "^4.20.0",
+		"typescript": "^5.9.0",
+		"typescript-eslint": "^8.46.0",
+		"yaml": "^2.8.0"
+	}
+}

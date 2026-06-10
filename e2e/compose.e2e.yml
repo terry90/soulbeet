@@ -1,0 +1,57 @@
+# E2E stack: the production soulbeet image wired to a fake slskd, a fake
+# MusicBrainz and a real Navidrome. Downloads and the music library are
+# bind-mounted so the specs can assert on delivered and imported files.
+#
+# Build the app image first (from the repo root):
+#   docker build -t soulbeet:e2e --build-arg TIER=light .
+# Generate fixtures before starting (from e2e/):
+#   E2E_MB_HOST=stubs:5050 npm run fixtures
+
+services:
+  soulbeet:
+    image: ${SOULBEET_IMAGE:-soulbeet:e2e}
+    ports:
+      - "9765:9765"
+    environment:
+      - DATABASE_URL=sqlite:/data/soulbeet.db
+      - SECRET_KEY=e2e-secret-key
+      - DOWNLOAD_PATH=/downloads
+      - BEETS_CONFIG=/app/beets-e2e.yaml
+      - MUSICBRAINZ_HOST=stubs:5050
+      - NAVIDROME_URL=http://navidrome:4533
+    volumes:
+      - ./.runtime/downloads:/downloads
+      - ./.runtime/music:/music
+      - ./.fixtures/beets-e2e.yaml:/app/beets-e2e.yaml:ro
+    depends_on:
+      - stubs
+      - navidrome
+
+  stubs:
+    build:
+      context: .
+      dockerfile: stubs/Dockerfile
+    ports:
+      - "5030:5030"
+      - "5050:5050"
+    environment:
+      - SLSKD_API_KEY=e2e-slskd-api-key
+    volumes:
+      - ./.fixtures/audio:/e2e/.fixtures/audio:ro
+      - ./.runtime/downloads:/downloads
+
+  navidrome:
+    image: deluan/navidrome:0.58.0
+    ports:
+      - "4533:4533"
+    environment:
+      - ND_MUSICFOLDER=/music
+      - ND_DATAFOLDER=/data
+      - ND_SCANSCHEDULE=15s
+      - ND_LOGLEVEL=info
+      - ND_SESSIONTIMEOUT=24h
+      - ND_DEVAUTOCREATEADMINPASSWORD=e2e-navidrome-admin
+      - ND_SUBSONIC_DEFAULTREPORTREALPATH=true
+    volumes:
+      - ./.runtime/music:/music:ro
+      - ./.runtime/navidrome:/data
