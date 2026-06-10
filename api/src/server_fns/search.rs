@@ -92,8 +92,34 @@ pub async fn find_album(input: AlbumQuery) -> Result<AlbumWithTracks, ServerFnEr
     provider.get_album(&input.id).await.map_err(server_error)
 }
 
+/// Album queries arrive from the UI with an empty track list; source matching
+/// scores candidate files against expected track titles, so resolve the
+/// album's tracklist through the metadata provider before searching.
+#[cfg(feature = "server")]
+pub(crate) async fn hydrate_album_tracks(query: &mut DownloadQuery) -> Result<(), String> {
+    if !query.tracks.is_empty() {
+        return Ok(());
+    }
+    let Some(album) = query.album.clone() else {
+        return Ok(());
+    };
+
+    let provider = metadata_provider(None, None)
+        .await
+        .map_err(|e| format!("metadata provider unavailable: {e}"))?;
+    let album_with_tracks = provider
+        .get_album(&album.id)
+        .await
+        .map_err(|e| format!("could not resolve tracklist for '{}': {e}", album.title))?;
+    query.tracks = album_with_tracks.tracks;
+    Ok(())
+}
+
 #[post("/api/download/search/start", _: AuthSession)]
 pub async fn start_download_search(data: DownloadQuery) -> Result<String, ServerFnError> {
+    let mut data = data;
+    hydrate_album_tracks(&mut data).await.map_err(server_error)?;
+
     let backend = download_backend(data.backend.as_deref())
         .await
         .map_err(|e| server_error(format!("download backend not available: {}", e)))?;

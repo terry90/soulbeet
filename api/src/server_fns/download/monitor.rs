@@ -5,8 +5,10 @@
 
 use dioxus::logger::tracing::{debug, info, warn};
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
+use soulbeet::DownloadBackend;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::Instant;
@@ -181,17 +183,44 @@ impl DownloadMonitor {
             interval.tick().await;
         }
 
-        // Clear completed transfers from slskd so they don't interfere with future downloads
+        // Remove this batch's terminal transfers from slskd so they don't
+        // interfere with future downloads of the same files. Only this
+        // batch's: clearing ALL completed transfers would race concurrent
+        // batches and delete their finished-but-unprocessed entries.
         if let Ok(backend) = download_backend(None).await {
-            if let Err(e) = backend.clear_completed_downloads().await {
-                warn!("Failed to clear completed downloads from slskd: {}", e);
-            }
+            self.remove_batch_transfers(&backend).await;
         }
 
         info!(
             "Download monitoring task completed for user: {}",
             self.username
         );
+    }
+
+    /// Remove the terminal slskd transfer records belonging to this batch.
+    async fn remove_batch_transfers(&mut self, backend: &Arc<dyn DownloadBackend>) {
+        let downloads = match backend.get_downloads().await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Could not list downloads for batch cleanup: {}", e);
+                return;
+            }
+        };
+
+        for entry in self.find_matching_downloads(&downloads) {
+            if !is_terminal_state(&entry.state) {
+                continue;
+            }
+            if let Err(e) = backend
+                .cancel_download(&entry.source, &entry.id, true)
+                .await
+            {
+                warn!(
+                    "Failed to remove finished transfer {} from slskd: {}",
+                    entry.id, e
+                );
+            }
+        }
     }
 
     /// Process a poll result from slskd.
@@ -242,6 +271,9 @@ impl DownloadMonitor {
                     MAX_CONSECUTIVE_EMPTY * 2,
                     self.filenames
                 );
+                // Without this, rows whose transfer never surfaced in slskd
+                // would sit at "Queued" in the UI forever.
+                self.fail_unprocessed_tracks("Download never appeared in slskd");
                 return true;
             }
             if (*consecutive_empty).is_multiple_of(5) {

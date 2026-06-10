@@ -418,7 +418,33 @@ impl SoulseekClient {
                             return Ok((albums, true, SearchState::InProgress));
                         }
                     } else {
-                        // No new data
+                        // No new data. slskd ends a search a short while after
+                        // responses stop arriving; once it reports completion
+                        // there is nothing more to wait for, so return what we
+                        // have instead of spinning until our own 120s timeout.
+                        if self.is_search_complete(&search_id).await {
+                            self.active_searches.lock().await.remove(&search_id);
+                            let _ = self.delete_search(&search_id).await;
+
+                            let track_titles_ref: Vec<&str> =
+                                context.track_titles.iter().map(|s| s.as_str()).collect();
+                            let mut albums = processing::process_search_responses(
+                                &current_responses,
+                                &context.artist,
+                                context.album.as_deref(),
+                                &track_titles_ref,
+                            );
+                            albums.sort_by(|a, b| {
+                                b.score
+                                    .partial_cmp(&a.score)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            albums.truncate(MAX_SEARCH_RESULTS);
+
+                            info!("Search {} completed on slskd side", search_id);
+                            return Ok((albums, false, SearchState::Completed));
+                        }
+
                         if (Utc::now() - poll_start) > long_poll_timeout {
                             // Long poll expired, return "no update" but "in progress"
                             return Ok((vec![], true, SearchState::InProgress));
@@ -926,16 +952,6 @@ impl SoulseekClient {
             .await
     }
 
-    pub async fn clear_all_completed_downloads(&self) -> Result<()> {
-        info!("Clearing all completed downloads");
-        self.make_request(
-            Method::DELETE,
-            "transfers/downloads/all/completed",
-            None::<()>,
-        )
-        .await
-    }
-
     pub async fn delete_search(&self, search_id: &str) -> Result<()> {
         let endpoint = format!("searches/{search_id}");
         debug!("Deleting search {}", search_id);
@@ -946,6 +962,32 @@ impl SoulseekClient {
             Ok(_) => Ok(()),
             Err(SoulseekError::Api { status: 404, .. }) => Ok(()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Whether slskd reports the search as finished. A search that slskd no
+    /// longer knows about (404) counts as finished too. Errors are treated as
+    /// "not complete" so polling falls back to its own timeout.
+    async fn is_search_complete(&self, search_id: &str) -> bool {
+        #[derive(Deserialize)]
+        struct SearchStatus {
+            #[serde(rename = "isComplete", default)]
+            is_complete: bool,
+            #[serde(default)]
+            state: String,
+        }
+
+        let endpoint = format!("searches/{search_id}");
+        match self
+            .make_request::<SearchStatus, ()>(Method::GET, &endpoint, None)
+            .await
+        {
+            Ok(status) => status.is_complete || status.state.contains("Completed"),
+            Err(SoulseekError::Api { status: 404, .. }) => true,
+            Err(e) => {
+                debug!("Search state check failed for {}: {}", search_id, e);
+                false
+            }
         }
     }
 
@@ -1066,10 +1108,6 @@ impl crate::DownloadBackend for SoulseekClient {
         remove: bool,
     ) -> Result<()> {
         self.cancel_download(username, download_id, remove).await
-    }
-
-    async fn clear_completed_downloads(&self) -> Result<()> {
-        self.clear_all_completed_downloads().await
     }
 
     async fn health_check(&self) -> bool {

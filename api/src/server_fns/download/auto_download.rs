@@ -59,6 +59,11 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
     let username = auth.0.username;
     let (tx, _) = get_or_create_user_channel(&username).await;
 
+    let mut req = req;
+    if let Err(e) = crate::server_fns::search::hydrate_album_tracks(&mut req.query).await {
+        return Ok(AutoDownloadResult::Error(e));
+    }
+
     // Build search description for logging and events
     let query_desc = req
         .query
@@ -149,8 +154,13 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                         }
                     };
 
-                    // Poll until results are ready or timeout
+                    // Poll until results are ready or timeout. Polls that report
+                    // InProgress carry the groups processed so far (the backend
+                    // rescores the full response set each time), so keep the
+                    // latest non-empty batch: the final Completed poll is empty
+                    // when the search ends by timeout instead of result volume.
                     let deadline = tokio::time::Instant::now() + SEARCH_TIMEOUT;
+                    let mut latest_groups = Vec::<DownloadableGroup>::new();
                     loop {
                         if tokio::time::Instant::now() >= deadline {
                             warn!("Backend {} search timed out", id);
@@ -161,20 +171,27 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                         match backend.poll_search(&search_id).await {
                             Ok(result) => match result.state {
                                 SearchState::Completed | SearchState::TimedOut => {
-                                    return (id, result.groups);
+                                    if !result.groups.is_empty() {
+                                        latest_groups = result.groups;
+                                    }
+                                    return (id, latest_groups);
                                 }
                                 SearchState::NotFound => {
-                                    return (id, Vec::new());
+                                    return (id, latest_groups);
                                 }
-                                SearchState::InProgress => continue,
+                                SearchState::InProgress => {
+                                    if !result.groups.is_empty() {
+                                        latest_groups = result.groups;
+                                    }
+                                }
                             },
                             Err(e) => {
                                 warn!("Backend {} poll error: {}", id, e);
-                                return (id, Vec::new());
+                                return (id, latest_groups);
                             }
                         }
                     }
-                    (id, Vec::new())
+                    (id, latest_groups)
                 }
             })
             .collect();
