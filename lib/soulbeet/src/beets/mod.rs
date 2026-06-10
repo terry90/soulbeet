@@ -1,10 +1,30 @@
 pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
+};
 use tokio::process::Command;
 use tracing::{info, warn};
 
 /// Timeout for beets import process (5 minutes)
 const IMPORT_TIMEOUT_SECS: u64 = 300;
+
+/// One lock per target library. Concurrent `beet` processes against the same
+/// library database race its schema creation and locking ("table items
+/// already exists"), so imports into one library run one at a time. Imports
+/// into different libraries still run in parallel.
+static IMPORT_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn import_lock_for(target: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = IMPORT_LOCKS.lock().expect("import lock registry poisoned");
+    locks
+        .entry(target.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 /// Result of a beets import operation
 #[derive(Debug)]
@@ -85,6 +105,9 @@ pub async fn import(
 ) -> Result<ImportResult, ImportError> {
     // Validate sources exist before attempting import
     validate_sources(&sources)?;
+
+    let lock = import_lock_for(target);
+    let _serialized = lock.lock().await;
 
     let config_path =
         std::env::var("BEETS_CONFIG").unwrap_or_else(|_| "beets_config.yaml".to_string());
