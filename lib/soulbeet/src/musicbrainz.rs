@@ -29,10 +29,20 @@ fn musicbrainz_client() -> &'static MusicBrainzClient {
     static CLIENT: OnceLock<MusicBrainzClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let version = env!("CARGO_PKG_VERSION");
-        MusicBrainzClient::new(&format!(
+        let mut client = MusicBrainzClient::new(&format!(
             "Soulbeet/{version} ( https://github.com/terry90/soulbeet )"
         ))
-        .expect("Failed to create MusicBrainz client - invalid user agent format")
+        .expect("Failed to create MusicBrainz client - invalid user agent format");
+        // MUSICBRAINZ_HOST points the client at a MusicBrainz mirror
+        // (host[:port], no scheme). Mirrors the `musicbrainz.host` option
+        // beets exposes for the same purpose.
+        if let Ok(host) = std::env::var("MUSICBRAINZ_HOST") {
+            let host = host.trim();
+            if !host.is_empty() {
+                client.musicbrainz_domain = host.to_string();
+            }
+        }
+        client
     })
 }
 
