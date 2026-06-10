@@ -1,0 +1,98 @@
+name: End-to-End Tests
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint and typecheck
+        run: |
+          npm run lint
+          npm run typecheck
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build app image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: soulbeet:e2e
+          build-args: |
+            TIER=light
+          # Reuse the layer cache from the image publishing workflow; the
+          # light/amd64 build there is byte-identical to this one.
+          cache-from: |
+            type=gha,scope=Build and Push Docker Image-linux/amd64-light
+            type=gha,scope=Build and Push Docker Image-linux/amd64-rust
+            type=gha,scope=e2e
+          cache-to: type=gha,mode=max,scope=e2e
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Generate fixtures
+        run: E2E_MB_HOST=stubs:5050 npm run fixtures
+
+      - name: Start the stack
+        run: docker compose -f compose.e2e.yml up -d --build
+
+      - name: Wait for the app
+        run: timeout 120 bash -c 'until curl -fso /dev/null --max-time 2 http://127.0.0.1:9765/; do sleep 2; done'
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the suite
+        env:
+          CI: "true"
+          E2E_SLSKD_URL: http://stubs:5030
+          E2E_MUSIC_DIR: /music
+          E2E_NAVIDROME: "1"
+        run: npx playwright test
+
+      - name: Collect stack logs
+        if: failure()
+        run: docker compose -f compose.e2e.yml logs --no-color > stack.log 2>&1 || true
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+            e2e/stack.log
+          retention-days: 7
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose -f compose.e2e.yml down -v || true
