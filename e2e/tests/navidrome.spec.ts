@@ -3,7 +3,7 @@
 // against Navidrome first and fall back to local accounts.
 
 import { expect, test } from '@playwright/test';
-import { loginViaUi, openSettings } from '../helpers/app.js';
+import { loginViaUi, openSettings, registerUser, uniqueUser } from '../helpers/app.js';
 import { navidromeAdminPassword, navidromeAdminUser, navidromeEnabled } from '../helpers/env.js';
 
 test.skip(!navidromeEnabled, 'stack has no Navidrome (set E2E_NAVIDROME=1)');
@@ -18,8 +18,11 @@ test('authenticates through Navidrome and reports the connection', async ({ page
 });
 
 test('still accepts local accounts when Navidrome rejects them', async ({ page }) => {
-  // The seeded admin/admin user does not exist in Navidrome with that
-  // password; the local Argon2 fallback must let it in.
-  await loginViaUi(page, { username: 'admin', password: 'admin' });
+  // A locally registered user is unknown to Navidrome, so its auth fails
+  // and the local Argon2 fallback must let them in.
+  const user = uniqueUser('local-only');
+  await registerUser(page.context().request, user);
+
+  await loginViaUi(page, user);
   await expect(page.getByPlaceholder('Search artist, album or track...')).toBeVisible();
 });
