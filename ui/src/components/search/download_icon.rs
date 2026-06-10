@@ -63,6 +63,7 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
         div { class: "{wrapper_class}",
             button {
                 class: "p-2 rounded-full hover:bg-white/10 transition-colors cursor-pointer group/dl",
+                aria_label: "Download",
                 disabled: !is_interactive,
                 onpointerdown: move |evt: PointerEvent| {
                     evt.stop_propagation();
@@ -115,7 +116,11 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
                     suppress_click.set(true);
                     active_menu.set(Some(item_id_toggle.clone()));
                 },
-                title: if matches!(state, DownloadRowState::Disabled) { "Configure a folder in Settings" } else { "" },
+                title: match state {
+                    DownloadRowState::Disabled => "Configure a folder in Settings".to_string(),
+                    DownloadRowState::Failed(msg) => msg.clone(),
+                    _ => String::new(),
+                },
 
                 match state {
                     DownloadRowState::Idle => rsx! {

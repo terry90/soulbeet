@@ -104,6 +104,7 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
             }
             button {
               class: "text-gray-400 hover:text-white transition-colors cursor-pointer",
+              aria_label: "Close downloads",
               onclick: close_modal,
               svg {
                 class: "w-6 h-6",

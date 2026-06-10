@@ -269,6 +269,7 @@ pub fn DownloadResults(props: Props) -> Element {
             div { class: "relative mb-6",
                 button {
                     class: "absolute left-0 top-1/2 -translate-y-1/2 p-2 rounded-full hover:bg-white/10 transition-colors cursor-pointer",
+                    aria_label: "Back",
                     onclick: move |_| props.on_back.call(()),
                     svg {
                         class: "w-5 h-5 text-gray-400",
@@ -328,6 +329,7 @@ pub fn DownloadResults(props: Props) -> Element {
             div { class: "fixed bottom-8 right-8",
                 button {
                     class: "bg-beet-accent hover:bg-fuchsia-400 text-white font-bold p-4 rounded-full shadow-[0_0_15px_rgba(255,0,255,0.5)] transition-transform hover:scale-105 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:shadow-none flex items-center justify-center cursor-pointer",
+                    aria_label: "Start download",
                     disabled: selected_tracks.read().is_empty() || selected_folder.read().is_empty() || *is_downloading.read(),
                     onclick: handle_download,
                     if *is_downloading.read() {

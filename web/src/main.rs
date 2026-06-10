@@ -207,6 +207,7 @@ fn WebNavbar() -> Element {
                 // Downloads Toggle
                 button {
                     class: "relative group p-2 hover:bg-white/5 rounded-lg transition-colors focus:outline-none cursor-pointer",
+                    aria_label: "Downloads",
                     onclick: move |_| downloads_open.set(!downloads_open()),
                     svg {
                         class: "w-5 h-5 text-gray-300 group-hover:text-beet-leaf transition-colors",
