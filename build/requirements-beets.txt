@@ -1,0 +1,14 @@
+# Pins for the beets virtualenv. Applied as a pip constraints file so the venv
+# is reproducible and the numpy <-> lap C-ABI always agrees.
+#
+# beets pulls `lap` (a numpy native extension) via beets/autotag/match.py, which
+# is imported on EVERY `beet` invocation, including `beet --version`. An unpinned
+# install once shipped a numpy/lap pair with mismatched C-ABI, so every `beet`
+# call aborted with "numpy.core.multiarray failed to import" and Soulful's health
+# check reported "Missing Beets" (issue #66).
+#
+# To bump: change a version here, rebuild. The CI `beet --version` smoke test
+# (.github/workflows/image-build-push.yml) re-validates the ABI before publish.
+beets==2.11.0
+numpy==2.2.6
+lap==0.5.13

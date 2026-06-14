@@ -127,6 +127,14 @@ jobs:
           set -e
           IMG="${{ env.IMAGE_NAME }}:${{ matrix.tier }}-amd64"
           docker pull "$IMG"
+          # beets itself must run on every tier. Soulful's runtime health check
+          # shells out to `beet --version`; that triggers beets' full command
+          # import chain (autotag.match -> import lap), so a numpy/lap C-ABI
+          # mismatch aborts it and the app reports "Missing Beets" (issue #66).
+          # Run the exact health-check command here so a broken venv fails the
+          # build instead of being published. The beet shebang is patched to
+          # /usr/bin/python3, which is why it runs under the distroless runtime.
+          docker run --rm --entrypoint=/opt/venv/bin/beet "$IMG" --version
           # /opt/venv/bin/python3 is a dangling symlink in the distroless
           # runtime (the builder's interpreter path does not exist there);
           # the real interpreter is /usr/bin/python3, which finds the venv

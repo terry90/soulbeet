@@ -70,10 +70,14 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 COPY build/tiers/${TIER}.env /tmp/tier.env
 
 # Install beets and dependencies. Quote "beets${BEETS_EXTRAS}" so the shell
-# does not glob the `[...]` extras list for medium / full tiers.
+# does not glob the `[...]` extras list for medium / full tiers. The constraints
+# file pins beets/numpy/lap so the numpy <-> lap C-ABI is reproducible and can
+# never drift into a mismatched pair that aborts every `beet` call (issue #66).
+COPY build/requirements-beets.txt /tmp/requirements-beets.txt
 RUN pip install --no-cache-dir wheel
 RUN . /tmp/tier.env \
-  && pip install --no-cache-dir "beets${BEETS_EXTRAS}" requests musicbrainzngs
+  && pip install --no-cache-dir -c /tmp/requirements-beets.txt \
+       "beets${BEETS_EXTRAS}" requests musicbrainzngs
 
 # Prune the venv. beets 2.11 declares numba/scipy as deps but never imports
 # them (only lap + numpy in autotag/match.py). Stripping these and the venv
