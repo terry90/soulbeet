@@ -489,7 +489,10 @@ pub async fn generate_discovery_playlist_internal(
                     release_mbid: None,
                 }];
 
-                let search_id = match backend.start_search(None, &search_tracks).await {
+                let search_id = match backend
+                    .start_search(None, &search_tracks, settings.require_flac_only)
+                    .await
+                {
                     Ok(id) => id,
                     Err(e) => {
                         warn!(
