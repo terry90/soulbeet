@@ -2,8 +2,13 @@ use api::models::folder::Folder;
 use dioxus::prelude::*;
 
 fn truncate_name(name: &str, max: usize) -> String {
-    if name.len() > max {
-        format!("{}...", &name[..max])
+    // Truncate on a *char* boundary, never a byte boundary: slicing `&name[..max]`
+    // on a byte index that falls inside a multi-byte UTF-8 char (accented or
+    // non-Latin usernames/folders) panics, which in wasm32 lowers to an
+    // `unreachable` that aborts the whole module (see issue #68).
+    if name.chars().count() > max {
+        let truncated: String = name.chars().take(max).collect();
+        format!("{truncated}...")
     } else {
         name.to_string()
     }
@@ -99,5 +104,26 @@ pub fn FolderDropdown(props: FolderDropdownProps) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_name;
+
+    #[test]
+    fn does_not_panic_on_multibyte_utf8() {
+        // Same regression guard as folder_chip: byte-slice truncation panics on
+        // multi-byte chars in wasm (issue #68).
+        let name = "Café Música 音楽ライブラリ";
+        let short = truncate_name(name, 6);
+        let long = truncate_name(name, 40);
+        assert!(short.ends_with("..."));
+        assert_eq!(long, name);
+    }
+
+    #[test]
+    fn ascii_truncation_unchanged() {
+        assert_eq!(truncate_name("Hello world", 5), "Hello...");
     }
 }

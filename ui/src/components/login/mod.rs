@@ -62,7 +62,12 @@ pub fn Login(props: Props) -> Element {
           }
 
           // Form
-          div { class: "space-y-6",
+          form {
+            class: "space-y-6",
+            onsubmit: move |e| {
+                e.prevent_default();
+                handle_login();
+            },
             div {
               label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
                 "Username"
@@ -73,11 +78,6 @@ pub fn Login(props: Props) -> Element {
                 oninput: move |e| username.set(e.value()),
                 "type": "text",
                 placeholder: "Enter username",
-                onkeydown: move |e| {
-                    if e.key() == Key::Enter {
-                        handle_login();
-                    }
-                },
               }
             }
             div {
@@ -90,11 +90,6 @@ pub fn Login(props: Props) -> Element {
                 oninput: move |e| password.set(e.value()),
                 "type": "password",
                 placeholder: "Enter password",
-                onkeydown: move |e| {
-                    if e.key() == Key::Enter {
-                        handle_login();
-                    }
-                },
               }
             }
 
@@ -118,7 +113,7 @@ pub fn Login(props: Props) -> Element {
 
             button {
               class: "w-full retro-btn flex justify-center items-center gap-2 group",
-              onclick: move |_| handle_login(),
+              "type": "submit",
               span { "AUTHENTICATE" }
               svg {
                 class: "w-4 h-4 group-hover:translate-x-1 transition-transform",

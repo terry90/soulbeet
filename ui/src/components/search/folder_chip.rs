@@ -12,8 +12,13 @@ pub struct FolderChipProps {
 }
 
 fn truncate_name(name: &str, max: usize) -> String {
-    if name.len() > max {
-        format!("{}...", &name[..max])
+    // Truncate on a *char* boundary, never a byte boundary: slicing `&name[..max]`
+    // on a byte index that falls inside a multi-byte UTF-8 char (accented or
+    // non-Latin usernames/folders) panics, which in wasm32 lowers to an
+    // `unreachable` that aborts the whole module (see issue #68).
+    if name.chars().count() > max {
+        let truncated: String = name.chars().take(max).collect();
+        format!("{truncated}...")
     } else {
         name.to_string()
     }
@@ -87,5 +92,31 @@ pub fn FolderChip(props: FolderChipProps) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_name;
+
+    #[test]
+    fn does_not_panic_on_multibyte_utf8() {
+        // "Café Música": é/ú are 2-byte chars. Truncating at a byte count that
+        // lands inside a multi-byte char must not panic (issue #68 — the old
+        // `&name[..max]` byte slice did, and in wasm that aborts the module).
+        let name = "Café Música 音楽ライブラリ";
+        // exercise char counts both above and below the limit
+        let short = truncate_name(name, 4);
+        let long = truncate_name(name, 40);
+        assert!(short.ends_with("..."));
+        assert_eq!(long, name);
+        // every output must be valid char-boundary strings
+        assert_eq!(short.trim_end_matches('.').chars().count(), 4);
+    }
+
+    #[test]
+    fn ascii_truncation_unchanged() {
+        assert_eq!(truncate_name("Hello world", 5), "Hello...");
+        assert_eq!(truncate_name("Hello", 5), "Hello");
     }
 }

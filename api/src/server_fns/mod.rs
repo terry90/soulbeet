@@ -30,6 +30,14 @@ pub fn server_error<E: std::fmt::Display>(e: E) -> ServerFnError {
     }
 }
 
+pub fn unauthorized_error<E: std::fmt::Display>(e: E) -> ServerFnError {
+    ServerFnError::ServerError {
+        message: e.to_string(),
+        code: 401,
+        details: None,
+    }
+}
+
 /// Remove a directory if empty, then recurse upward to its parent.
 /// Stops at Discovery profile directories and beets library roots.
 #[cfg(feature = "server")]

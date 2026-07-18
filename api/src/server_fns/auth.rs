@@ -2,7 +2,11 @@ use crate::auth::AuthResponse;
 use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
-use crate::{auth, models, server_fns::server_error, AuthSession};
+use crate::{
+    auth, models,
+    server_fns::{server_error, unauthorized_error},
+    AuthSession,
+};
 
 #[cfg(feature = "server")]
 use tower_cookies::{
@@ -144,12 +148,12 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             let user = User::get_by_username(&username)
                 .await
                 .map_err(server_error)?
-                .ok_or_else(|| server_error("Invalid username or password"))?;
+                .ok_or_else(|| unauthorized_error("Invalid username or password"))?;
 
             // Verify local password
             let _ = User::verify(&username, &password)
                 .await
-                .map_err(|_| server_error("Invalid username or password"))?;
+                .map_err(|_| unauthorized_error("Invalid username or password"))?;
 
             // Mark Navidrome status as invalid_credentials
             User::update_navidrome_token(
@@ -177,7 +181,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             // Navidrome is down. Fall back to local password verification.
             let user = User::verify(&username, &password)
                 .await
-                .map_err(|_| server_error("Invalid username or password"))?;
+                .map_err(|_| unauthorized_error("Invalid username or password"))?;
 
             // Mark Navidrome status as offline (keep existing token)
             User::update_navidrome_token(
