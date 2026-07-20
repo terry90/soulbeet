@@ -545,17 +545,29 @@ impl DownloadMonitor {
     }
 
     /// Check if all downloads are complete. Returns true if monitoring should stop.
+    ///
+    /// A track is settled when it was processed (imported, failed, or timed
+    /// out) or its transfer reached a terminal state. Settled must be judged
+    /// per track: in album mode completed tracks stay unprocessed until the
+    /// whole batch is handled, so requiring all-processed or all-terminal
+    /// across the batch would poll forever once one track is processed via
+    /// timeout while the rest sit completed.
     async fn check_completion(&mut self, batch_status: &[DownloadProgress]) -> bool {
-        let all_processed = self.track_states.values().all(|s| s.processed);
-        let all_terminal = self.filenames.iter().all(|fname| {
-            batch_status
+        let all_settled = self.filenames.iter().all(|fname| {
+            let processed = self
+                .track_states
+                .get(fname)
+                .map(|s| s.processed)
+                .unwrap_or(true);
+            let terminal = batch_status
                 .iter()
                 .find(|d| filenames_match(&d.item, fname))
                 .map(|d| is_terminal_state(&d.state))
-                .unwrap_or(false)
+                .unwrap_or(false);
+            processed || terminal
         });
 
-        if all_processed || all_terminal {
+        if all_settled {
             if self.album_mode {
                 self.process_album_mode(batch_status).await;
             }
