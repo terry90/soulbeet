@@ -26,12 +26,15 @@ pub struct DownloadResponse {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum DownloadState {
     InProgress,
+    Initializing,
     Importing,
     Queued,
+    Requested,
     Downloaded,
     Imported,
     ImportSkipped,
     Errored,
+    TimedOut,
     ImportFailed,
     Aborted,
     Cancelled,
@@ -43,10 +46,16 @@ impl From<String> for DownloadState {
     fn from(s: String) -> Self {
         match s.as_str() {
             "Queued" => DownloadState::Queued,
+            "Requested" => DownloadState::Requested,
+            // Initial/unset state, before the request is sent to the peer
+            "None" => DownloadState::Requested,
+            "Initializing" => DownloadState::Initializing,
             "InProgress" => DownloadState::InProgress,
             "Completed" => DownloadState::Downloaded,
+            "Succeeded" => DownloadState::Downloaded,
             "Aborted" => DownloadState::Aborted,
             "Cancelled" => DownloadState::Cancelled,
+            "TimedOut" => DownloadState::TimedOut,
             "Rejected" => DownloadState::Rejected,
             "Errored" => DownloadState::Errored,
             "Importing" => DownloadState::Importing,
@@ -185,10 +194,15 @@ impl FileEntry {
 ///
 /// TransferStates is a flags enum: Completed=16, Succeeded=32,
 /// Cancelled=64, TimedOut=128, Errored=256, Rejected=512,
-/// Aborted=1024. Queued=2, InProgress=8. Locally=2048, Remotely=4096.
+/// Aborted=1024. None=0, Requested=1, Queued=2, Initializing=4,
+/// InProgress=8. Locally=2048, Remotely=4096.
 ///
 /// Check terminal reasons first (Completed + reason flag), then active states.
 fn bitfield_to_download_state(value: u64) -> DownloadState {
+    const REQUESTED: u64 = 1;
+    const QUEUED: u64 = 2;
+    const INITIALIZING: u64 = 4;
+    const IN_PROGRESS: u64 = 8;
     const COMPLETED: u64 = 16;
     const SUCCEEDED: u64 = 32;
     const CANCELLED: u64 = 64;
@@ -196,8 +210,6 @@ fn bitfield_to_download_state(value: u64) -> DownloadState {
     const ERRORED: u64 = 256;
     const REJECTED: u64 = 512;
     const ABORTED: u64 = 1024;
-    const QUEUED: u64 = 2;
-    const IN_PROGRESS: u64 = 8;
 
     if value & COMPLETED != 0 {
         if value & SUCCEEDED != 0 {
@@ -210,7 +222,7 @@ fn bitfield_to_download_state(value: u64) -> DownloadState {
             return DownloadState::Cancelled;
         }
         if value & TIMED_OUT != 0 {
-            return DownloadState::Errored;
+            return DownloadState::TimedOut;
         }
         if value & ERRORED != 0 {
             return DownloadState::Errored;
@@ -224,8 +236,16 @@ fn bitfield_to_download_state(value: u64) -> DownloadState {
     if value & IN_PROGRESS != 0 {
         return DownloadState::InProgress;
     }
+    if value & INITIALIZING != 0 {
+        return DownloadState::Initializing;
+    }
     if value & QUEUED != 0 {
         return DownloadState::Queued;
+    }
+    if value & REQUESTED != 0 || value == 0 {
+        // Requested, or None (0): the transfer exists but hasn't reached a
+        // queue yet. Both precede Queued in the slskd lifecycle.
+        return DownloadState::Requested;
     }
 
     DownloadState::Unknown(format!("bitfield:{}", value))
@@ -556,6 +576,7 @@ impl From<FileEntry> for crate::download::DownloadProgress {
                     | DownloadState::Errored
                     | DownloadState::Aborted
                     | DownloadState::Cancelled
+                    | DownloadState::TimedOut
                     | DownloadState::ImportFailed
             )
         }) {
@@ -589,6 +610,8 @@ impl From<DownloadState> for crate::download::DownloadState {
         use crate::download::DownloadState as DS;
         match state {
             DownloadState::Queued => DS::Queued,
+            DownloadState::Requested => DS::Queued,
+            DownloadState::Initializing => DS::InProgress,
             DownloadState::InProgress => DS::InProgress,
             DownloadState::Downloaded => DS::Completed,
             DownloadState::Importing => DS::Importing,
@@ -599,7 +622,12 @@ impl From<DownloadState> for crate::download::DownloadState {
             DownloadState::Aborted => DS::Failed("Aborted".into()),
             DownloadState::Cancelled => DS::Cancelled,
             DownloadState::Rejected => DS::Failed("Transfer rejected by peer".into()),
-            DownloadState::Unknown(s) => DS::Failed(format!("Unknown state: {s}")),
+            DownloadState::TimedOut => DS::Failed("Download timed out".into()),
+            // Unrecognized states must never map to a terminal state: the
+            // monitor treats terminal as finished and cancels the live slskd
+            // transfer (issue #71). Treat as active; the per-track timeout
+            // is the backstop if the state never advances.
+            DownloadState::Unknown(_) => DS::Queued,
         }
     }
 }
@@ -630,5 +658,103 @@ impl crate::download::DownloadableItem {
             album: self.album.clone(),
             match_score: self.quality_score,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::download::DownloadState as DS;
+    use serde_json::json;
+
+    /// Deserialize a transfer entry exactly as slskd's API would return it,
+    /// with the given `state` value (string or numeric bitfield), and return
+    /// the DownloadState the monitor would see.
+    fn mapped(state: serde_json::Value) -> DS {
+        let entry: FileEntry = serde_json::from_value(json!({
+            "id": "890f943c-02e1-4d45-af76-d55e3d855684",
+            "username": "peer",
+            "direction": "Download",
+            "filename": "shared\\Artist\\Album\\01. Track.flac",
+            "size": 1024,
+            "state": state,
+            "stateDescription": "",
+            "requestedAt": "2026-07-19T05:11:22Z",
+            "bytesTransferred": 0,
+            "bytesRemaining": 1024,
+            "percentComplete": 0.0
+        }))
+        .expect("FileEntry should deserialize");
+        crate::download::DownloadProgress::from(entry).state
+    }
+
+    #[test]
+    fn active_transfer_states_stay_active() {
+        // Every state a live slskd transfer passes through before completion.
+        // Mapping any of these to a terminal state makes the monitor declare
+        // the batch finished and cancel the transfer (issue #71).
+        for state in [
+            "None",
+            "Requested",
+            "Queued, Locally",
+            "Queued, Remotely",
+            "Initializing",
+            "InProgress",
+        ] {
+            let got = mapped(json!(state));
+            assert!(
+                matches!(got, DS::Queued | DS::InProgress),
+                "string state {state:?} mapped to {got:?}"
+            );
+        }
+        // Same states as numeric bitfields: None, Requested,
+        // Queued|Locally, Queued|Remotely, Initializing, InProgress.
+        for value in [0u64, 1, 2050, 4098, 4, 8] {
+            let got = mapped(json!(value));
+            assert!(
+                matches!(got, DS::Queued | DS::InProgress),
+                "bitfield state {value} mapped to {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completed_states_map_to_their_outcome() {
+        assert_eq!(mapped(json!("Completed, Succeeded")), DS::Completed);
+        assert_eq!(mapped(json!("Completed, Cancelled")), DS::Cancelled);
+        for state in [
+            "Completed, Errored",
+            "Completed, Rejected",
+            "Completed, Aborted",
+            "Completed, TimedOut",
+        ] {
+            let got = mapped(json!(state));
+            assert!(
+                matches!(got, DS::Failed(_)),
+                "string state {state:?} mapped to {got:?}"
+            );
+        }
+        // Completed|Succeeded, Completed|Cancelled as bitfields
+        assert_eq!(mapped(json!(48u64)), DS::Completed);
+        assert_eq!(mapped(json!(80u64)), DS::Cancelled);
+        // Completed|Errored, Completed|Rejected, Completed|Aborted, Completed|TimedOut
+        for value in [272u64, 528, 1040, 144] {
+            let got = mapped(json!(value));
+            assert!(
+                matches!(got, DS::Failed(_)),
+                "bitfield state {value} mapped to {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_states_never_map_terminal() {
+        for state in [json!("SomethingNew"), json!("Weird, Flags"), json!(8192u64)] {
+            let got = mapped(state.clone());
+            assert!(
+                matches!(got, DS::Queued | DS::InProgress),
+                "unrecognized state {state} mapped to {got:?}"
+            );
+        }
     }
 }

@@ -77,20 +77,27 @@ interface TransferRecord {
   delivered: boolean;
 }
 
+// Transfers hold "Requested" and "Initializing" for longer than the app's 2s
+// monitor poll interval so every download is guaranteed to be observed in
+// those states: treating them as terminal made the monitor cancel live
+// transfers (issue #71).
 const BEHAVIOR_PLANS: Record<Exclude<PeerBehavior, 'offline'>, TransferStep[]> = {
   happy: [
     { afterMs: 0, state: 'Queued, Locally', percent: 0 },
-    { afterMs: 400, state: 'Queued, Remotely', percent: 0 },
-    { afterMs: 900, state: 'InProgress', percent: 24 },
-    { afterMs: 1600, state: 'InProgress', percent: 71 },
-    { afterMs: 2300, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
+    { afterMs: 100, state: 'Requested', percent: 0 },
+    { afterMs: 2600, state: 'Queued, Remotely', percent: 0 },
+    { afterMs: 3400, state: 'Initializing', percent: 0 },
+    { afterMs: 5900, state: 'InProgress', percent: 24 },
+    { afterMs: 6600, state: 'InProgress', percent: 71 },
+    { afterMs: 7300, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
   ],
   flaky: [
     { afterMs: 0, state: 'Queued, Locally', percent: 0 },
-    { afterMs: 400, state: 'Queued, Remotely', percent: 0 },
-    { afterMs: 900, state: 'InProgress', percent: 31 },
+    { afterMs: 100, state: 'Requested', percent: 0 },
+    { afterMs: 2600, state: 'Queued, Remotely', percent: 0 },
+    { afterMs: 3100, state: 'InProgress', percent: 31 },
     {
-      afterMs: 1800,
+      afterMs: 4000,
       state: 'Completed, Errored',
       percent: 31,
       exception: 'Connection reset by peer',
@@ -291,9 +298,9 @@ export class SlskdState {
         failed.push(file.filename);
         continue;
       }
-      // Real slskd enqueues straight into "Queued, Locally"
-      // (DownloadService.EnqueueAsync); a transfer is never visible in any
-      // earlier state.
+      // Real slskd creates the record in "Queued, Locally"
+      // (DownloadService.EnqueueAsync), then the download task overwrites the
+      // state with Soulseek.NET's own progression starting at "Requested".
       const transfer: TransferRecord = {
         id: randomUUID(),
         username,
