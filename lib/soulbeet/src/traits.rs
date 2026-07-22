@@ -39,7 +39,12 @@ pub trait DownloadBackend: Send + Sync {
     fn id(&self) -> &'static str;
     fn name(&self) -> &'static str;
 
-    async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String>;
+    async fn start_search(
+        &self,
+        album: Option<&Album>,
+        tracks: &[Track],
+        require_flac: bool,
+    ) -> Result<String>;
     async fn poll_search(&self, search_id: &str) -> Result<SearchResult>;
     async fn download(&self, items: Vec<DownloadableItem>) -> Result<Vec<QueuedDownload>>;
     async fn get_downloads(&self) -> Result<Vec<DownloadProgress>>;

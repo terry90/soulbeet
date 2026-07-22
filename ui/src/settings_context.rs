@@ -87,6 +87,15 @@ impl Settings {
         self.providers.read().clone()
     }
 
+    /// Whether search/download results are restricted to FLAC only.
+    pub fn require_flac_only(&self) -> bool {
+        self.state
+            .read()
+            .as_ref()
+            .map(|s| s.require_flac_only)
+            .unwrap_or(false)
+    }
+
     /// Update settings (call after successful API update).
     pub fn set(&mut self, settings: UserSettings) {
         self.state.set(Some(settings));

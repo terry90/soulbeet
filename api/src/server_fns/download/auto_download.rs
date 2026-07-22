@@ -17,6 +17,8 @@ use std::time::Duration;
 #[cfg(feature = "server")]
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
 #[cfg(feature = "server")]
+use crate::models::user_settings::UserSettings;
+#[cfg(feature = "server")]
 use crate::services::{available_download_backends, download_backend};
 #[cfg(feature = "server")]
 use crate::AuthSession;
@@ -57,6 +59,10 @@ pub enum AutoDownloadResult {
 #[post("/api/auto-download", auth: AuthSession)]
 pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResult, ServerFnError> {
     let username = auth.0.username;
+    let require_flac = UserSettings::get(&auth.0.sub)
+        .await
+        .map(|s| s.require_flac_only)
+        .unwrap_or(false);
     let (tx, _) = get_or_create_user_channel(&username).await;
 
     let mut req = req;
@@ -146,7 +152,10 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                 let tracks = tracks.clone();
                 async move {
                     // Start search
-                    let search_id = match backend.start_search(album.as_ref(), &tracks).await {
+                    let search_id = match backend
+                        .start_search(album.as_ref(), &tracks, require_flac)
+                        .await
+                    {
                         Ok(sid) => sid,
                         Err(e) => {
                             warn!("Backend {} search start failed: {}", id, e);
