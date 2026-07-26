@@ -201,4 +201,8 @@ pub struct NativeSong {
     pub id: String,
     pub path: String,
     pub title: String,
+    /// True when Navidrome has flagged the underlying file as gone (not yet
+    /// pruned from the index). Such rows must not be matched during resolution.
+    #[serde(default)]
+    pub missing: bool,
 }

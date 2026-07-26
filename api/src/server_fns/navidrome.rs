@@ -195,6 +195,14 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
         total_songs_scanned, deleted_tracks, promoted_tracks, removed_tracks
     );
 
+    // Rating-driven promotes/removes change which tracks are Pending, so update
+    // the static discovery playlists to match.
+    if promoted_tracks + removed_tracks > 0 {
+        if let Err(e) = crate::server_fns::discovery::reconcile_discovery_playlists(user_id).await {
+            warn!("Playlist reconcile after ratings sync failed: {}", e);
+        }
+    }
+
     Ok(SyncResult {
         deleted_tracks,
         promoted_tracks,

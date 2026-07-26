@@ -406,7 +406,14 @@ async fn run_automation() {
             if now.signed_duration_since(created).num_days() < lifetime_days {
                 continue;
             }
-            // This track has expired
+            // Atomically claim the expiry; skip if a promote is already in flight
+            // for this track (so expiry can't clobber an in-progress promotion).
+            match crate::models::discovery_playlist::DiscoveryTrackRow::expire_if_pending(&track.id)
+                .await
+            {
+                Ok(true) => {}
+                _ => continue,
+            }
             let path = std::path::Path::new(&track.path);
             if path.exists() {
                 let _ = tokio::fs::remove_file(path).await;
@@ -414,11 +421,6 @@ async fn run_automation() {
                     let _ = crate::server_fns::cleanup_empty_ancestors(parent).await;
                 }
             }
-            let _ = crate::models::discovery_playlist::DiscoveryTrackRow::update_status(
-                &track.id,
-                &shared::navidrome::DiscoveryStatus::Removed,
-            )
-            .await;
             let _ = crate::models::discovery_history::DiscoveryHistoryRow::update_outcome(
                 user_id,
                 &track.artist,
@@ -433,6 +435,16 @@ async fn run_automation() {
                 "Automation: expired {} tracks for user {}",
                 expired_count, user.username
             );
+            // Drop the expired tracks from their static playlists now, in case the
+            // refill below finds nothing new to add.
+            if let Err(e) =
+                crate::server_fns::discovery::reconcile_discovery_playlists(user_id).await
+            {
+                info!(
+                    "Automation: playlist reconcile after expiry failed for {}: {}",
+                    user.username, e
+                );
+            }
         }
 
         // Refill any gaps (generate_discovery_playlist_internal accounts for existing tracks)

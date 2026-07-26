@@ -109,6 +109,58 @@ impl DiscoveryTrackRow {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// All discovery tracks for a (folder, profile), regardless of status.
+    /// Used by playlist reconciliation to compute which song IDs to add (Pending)
+    /// and which to remove (Promoted/Removed) from the static Navidrome playlist.
+    pub async fn get_by_folder_and_profile(
+        folder_id: &str,
+        profile: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
+        let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
+            "SELECT * FROM discovery_tracks WHERE folder_id = ? AND profile = ? ORDER BY created_at",
+        )
+        .bind(folder_id)
+        .bind(profile)
+        .fetch_all(&*DB)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Pending tracks for a (folder, profile) that have no resolved Navidrome song
+    /// ID yet. These are the rows song-ID resolution still needs to match.
+    pub async fn get_pending_unresolved(
+        folder_id: &str,
+        profile: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
+        let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
+            "SELECT * FROM discovery_tracks
+             WHERE folder_id = ? AND profile = ? AND status = ? AND song_id IS NULL
+             ORDER BY created_at",
+        )
+        .bind(folder_id)
+        .bind(profile)
+        .bind(DiscoveryStatus::Pending.to_string())
+        .fetch_all(&*DB)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Atomically mark a track Removed only if it is still Pending. Returns true
+    /// if this caller won the transition. Mirrors `try_set_promoting` so expiry
+    /// and an in-flight promote can never both act on the same track.
+    pub async fn expire_if_pending(id: &str) -> Result<bool, String> {
+        let result = sqlx::query(
+            "UPDATE discovery_tracks SET status = 'Removed' WHERE id = ? AND status = 'Pending'",
+        )
+        .bind(id)
+        .execute(&*DB)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn get_by_path(path: &str) -> Result<Option<DiscoveryTrack>, String> {
         let row =
             sqlx::query_as::<_, DiscoveryTrackRow>("SELECT * FROM discovery_tracks WHERE path = ?")

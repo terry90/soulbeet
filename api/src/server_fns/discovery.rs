@@ -18,6 +18,20 @@ use tokio::sync::Mutex;
 static GENERATION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Per-user lock serializing playlist reconciliation so generation, the 6h
+/// automation loop, and manual promote/remove actions never write the same
+/// Navidrome playlist concurrently.
+#[cfg(feature = "server")]
+static RECONCILE_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A Pending discovery track still unresolved to a Navidrome song this long after
+/// import is treated as unindexable (Navidrome skipped it): its file is removed
+/// and the row marked Removed so the next refill replaces it, keeping the
+/// per-profile count valid.
+#[cfg(feature = "server")]
+const UNRESOLVED_GRACE_HOURS: i64 = 6;
+
 #[cfg(feature = "server")]
 async fn update_progress(
     user_id: &str,
@@ -109,7 +123,14 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
 
     super::navidrome::promote_discovery_track_internal(&req.track_id, &auth.0.sub)
         .await
-        .map_err(server_error)
+        .map_err(server_error)?;
+
+    // Drop the promoted track from its discovery playlist now (the file has moved
+    // out of Discovery/, so it must be removed explicitly).
+    if let Err(e) = reconcile_discovery_playlists(&auth.0.sub).await {
+        warn!("Playlist reconcile after promote failed: {}", e);
+    }
+    Ok(())
 }
 
 #[post("/api/discovery/remove", auth: AuthSession)]
@@ -157,6 +178,11 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
     }
 
     info!("Removed discovery track: {}", track.title);
+
+    // Drop the removed track from its discovery playlist now.
+    if let Err(e) = reconcile_discovery_playlists(&auth.0.sub).await {
+        warn!("Playlist reconcile after remove failed: {}", e);
+    }
     Ok(())
 }
 
@@ -915,11 +941,119 @@ pub async fn generate_discovery_playlist_internal(
     })
 }
 
-/// Create or update smart playlists in Navidrome for each discovery profile.
+/// Resolve Pending discovery tracks for a (folder, profile) to their Navidrome
+/// song IDs and persist them on the rows.
 ///
-/// Uses Navidrome's native API to create smart playlists with a filepath rule
-/// that matches the Discovery/{profile}/ directory. The playlist auto-updates
-/// as Navidrome scans new files. Owned by the authenticated user.
+/// Uses the native API (real relative paths, independent of the per-player
+/// ReportRealPath flag) and matches by the path tail after `Discovery/<profile>/`,
+/// which is identical on disk and in Navidrome, so the match is exact and
+/// collision-free. Self-heal: a Pending track still unresolved more than
+/// `UNRESOLVED_GRACE_HOURS` after import (Navidrome never indexed it) is dropped
+/// so the next refill replaces it.
+#[cfg(feature = "server")]
+async fn resolve_discovery_song_ids(
+    navi: &soulbeet::NavidromeClient,
+    user_id: &str,
+    folder_id: &str,
+    profile: &str,
+) -> Result<(), String> {
+    use crate::models::discovery_history::DiscoveryHistoryRow;
+
+    let unresolved = DiscoveryTrackRow::get_pending_unresolved(folder_id, profile).await?;
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+
+    let songs = navi
+        .get_discovery_songs(profile)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Map each Navidrome song to its path tail. First writer wins so the same
+    // file can never bind to two discovery rows.
+    let mut tail_to_song: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for s in &songs {
+        if let Some(tail) = soulbeet::discovery_path_tail(&s.path, profile) {
+            tail_to_song.entry(tail).or_insert_with(|| s.id.clone());
+        }
+    }
+
+    let now = chrono::Utc::now();
+    let mut resolved = 0u32;
+    let mut dropped = 0u32;
+    for track in &unresolved {
+        if let Some(song_id) = soulbeet::discovery_path_tail(&track.path, profile)
+            .as_ref()
+            .and_then(|t| tail_to_song.get(t))
+        {
+            DiscoveryTrackRow::update_song_id(&track.id, song_id).await?;
+            resolved += 1;
+            continue;
+        }
+
+        // Not indexed (yet). Only drop it once it is well past the grace window.
+        // An unparseable timestamp means the row is already broken, so treat it
+        // as past grace (and warn) rather than letting it block the slot forever.
+        let age_hours = chrono::DateTime::parse_from_rfc3339(&track.created_at)
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(&track.created_at, "%Y-%m-%d %H:%M:%S")
+                    .map(|n| n.and_utc().fixed_offset())
+            })
+            .map(|dt| now.signed_duration_since(dt).num_hours())
+            .unwrap_or_else(|_| {
+                warn!(
+                    "Unparseable created_at '{}' for discovery track {}; treating as past grace",
+                    track.created_at, track.id
+                );
+                UNRESOLVED_GRACE_HOURS
+            });
+        if age_hours >= UNRESOLVED_GRACE_HOURS {
+            // Claim the drop atomically; skip if a promote/remove already took the
+            // row, so this never clobbers an in-flight promotion.
+            if DiscoveryTrackRow::expire_if_pending(&track.id)
+                .await
+                .unwrap_or(false)
+            {
+                let path = std::path::Path::new(&track.path);
+                if path.exists() {
+                    let _ = tokio::fs::remove_file(path).await;
+                    if let Some(parent) = path.parent() {
+                        let _ = super::cleanup_empty_ancestors(parent).await;
+                    }
+                }
+                let _ = DiscoveryHistoryRow::update_outcome(
+                    user_id,
+                    &track.artist,
+                    &track.title,
+                    "unresolved",
+                )
+                .await;
+                dropped += 1;
+            }
+        }
+    }
+    if resolved > 0 || dropped > 0 {
+        info!(
+            "{}: resolved {} song IDs, dropped {} unindexable ({} still pending Navidrome scan)",
+            profile,
+            resolved,
+            dropped,
+            unresolved.len() as u32 - resolved - dropped
+        );
+    }
+    Ok(())
+}
+
+/// Reconcile each enabled profile's static Navidrome playlist so it contains
+/// exactly the song IDs of its Pending discovery tracks.
+///
+/// Per profile: resolve any unresolved Pending tracks to song IDs, ensure a
+/// stable static playlist exists (migrating a legacy smart playlist on first
+/// run), then apply the membership delta in a single `updatePlaylist` call.
+/// Add = Pending song IDs not yet present; remove = Promoted/Removed song IDs
+/// still present. The playlist ID is reused across runs so offline-client
+/// subscriptions survive. Owned by (and private to) the authenticated user.
 #[cfg(feature = "server")]
 pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> {
     let settings = UserSettings::get(user_id).await?;
@@ -945,77 +1079,269 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         }
     };
 
-    let selected_profiles = parse_profiles(&settings.discovery_profiles);
+    // Serialize reconcile per user against generation/automation/manual actions.
+    let user_lock = {
+        let mut locks = RECONCILE_LOCKS.lock().await;
+        locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = user_lock.lock().await;
 
+    let mut playlist_ids: HashMap<String, String> = settings
+        .discovery_navidrome_playlist_id
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let selected_profiles = parse_profiles(&settings.discovery_profiles);
+    let mut failures: Vec<String> = Vec::new();
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
-
-        // Delete stale playlist so we can recreate with the correct rule
-        if let Some(old_id) = UserSettings::get_playlist_id_for_profile(
-            &settings.discovery_navidrome_playlist_id,
+        if let Err(e) = reconcile_one_profile(
+            &navi,
+            user_id,
+            &folder_id,
             &profile_name,
-        ) {
-            let _ = navi.delete_smart_playlist(&old_id).await;
-        }
-
-        let playlist_name = UserSettings::get_playlist_name_for_profile(
-            &settings.discovery_playlist_name,
-            &profile_name,
-        );
-
-        // Derive the Navidrome-relative path prefix by sampling a song from this profile's folder.
-        // The native API returns the raw media_file.path (relative to library root), which is what
-        // the filepath smart playlist operator matches against.
-        let profile_path = match navi.get_songs_by_path_prefix(&profile_name, 50).await {
-            Ok(songs) if !songs.is_empty() => {
-                // Extract the directory prefix from the first song's path.
-                // Song path looks like "Discovery/Balanced/Artist/Album/track.flac"
-                // or "staging/Discovery/Balanced/Artist/Album/track.flac"
-                // We want everything up to and including the profile name.
-                let song_path = &songs[0].path;
-                if let Some(idx) = song_path.find(&format!("{}/", profile_name)) {
-                    let end = idx + profile_name.len();
-                    song_path[..end].to_string()
-                } else {
-                    // Song matched but path doesn't contain profile name as a directory
-                    warn!(
-                        "Could not extract profile prefix from song path '{}', falling back to Discovery/{}",
-                        song_path, profile_name
-                    );
-                    format!("Discovery/{}", profile_name)
-                }
-            }
-            _ => {
-                // No songs imported yet (first run) or API error: use hardcoded default.
-                // This is correct because on first run the folder structure matches the default.
-                format!("Discovery/{}", profile_name)
-            }
-        };
-        let comment = format!("Soulbeet discovery ({})", profile_name);
-
-        match navi
-            .create_smart_playlist(&playlist_name, &comment, &profile_path)
-            .await
+            &settings,
+            &mut playlist_ids,
+        )
+        .await
         {
-            Ok(playlist_id) => {
-                if let Err(e) =
-                    UserSettings::update_discovery_playlist_id(user_id, &profile_name, &playlist_id)
-                        .await
-                {
-                    warn!("Failed to save playlist ID for '{}': {}", profile_name, e);
-                }
-                info!(
-                    "Created smart playlist '{}' (path filter: {}) for user {}",
-                    playlist_name, profile_path, user_id
-                );
-            }
-            Err(e) => {
-                warn!("Failed to create smart playlist '{}': {}", playlist_name, e);
-            }
+            warn!(
+                "Playlist reconciliation failed for profile '{}': {}",
+                profile_name, e
+            );
+            failures.push(format!("{}: {}", profile_name, e));
         }
     }
 
+    // One failed profile must not abort the others, but the caller still needs to
+    // know the invariant is not yet satisfied (the next cycle retries).
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}/{} discovery profile(s) failed to reconcile: {}",
+            failures.len(),
+            selected_profiles.len(),
+            failures.join("; ")
+        ))
+    }
+}
+
+/// A profile's static playlist resolved to its current Navidrome state.
+#[cfg(feature = "server")]
+struct StaticPlaylist {
+    id: String,
+    /// Current track song IDs, in playlist order (the basis for removal indices).
+    entries: Vec<String>,
+    name: String,
+}
+
+/// Reconcile a single profile's static playlist. See `reconcile_discovery_playlists`.
+#[cfg(feature = "server")]
+async fn reconcile_one_profile(
+    navi: &soulbeet::NavidromeClient,
+    user_id: &str,
+    folder_id: &str,
+    profile: &str,
+    settings: &UserSettings,
+    playlist_ids: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    // 1. Resolve unresolved Pending tracks (native fetch only runs when needed).
+    resolve_discovery_song_ids(navi, user_id, folder_id, profile).await?;
+
+    // 2. Partition this profile's tracks into "must be present" (Pending) and
+    //    "must be absent" (Promoted/Removed) song IDs.
+    let rows = DiscoveryTrackRow::get_by_folder_and_profile(folder_id, profile).await?;
+    let mut want_present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut want_absent: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in &rows {
+        let Some(ref sid) = r.song_id else { continue };
+        match r.status {
+            DiscoveryStatus::Pending => {
+                want_present.insert(sid.clone());
+            }
+            DiscoveryStatus::Promoted | DiscoveryStatus::Removed => {
+                want_absent.insert(sid.clone());
+            }
+            DiscoveryStatus::Promoting => {} // in-flight; leave untouched
+        }
+    }
+
+    let playlist_name =
+        UserSettings::get_playlist_name_for_profile(&settings.discovery_playlist_name, profile);
+
+    // 3. Ensure a stable static playlist (creates/migrates and persists its ID).
+    let playlist = ensure_static_playlist(navi, user_id, profile, &playlist_name, playlist_ids)
+        .await?;
+
+    // 4. Correct a user-renamed playlist back to the configured name.
+    if playlist.name != playlist_name {
+        if let Err(e) = navi.rename_playlist(&playlist.id, &playlist_name).await {
+            warn!("Failed to rename playlist '{}': {}", playlist_name, e);
+        }
+    }
+
+    // 5. Compute and apply the membership delta. Only ever remove tracks we know
+    //    have left (Promoted/Removed), never tracks we merely can't account for,
+    //    so a resolution hiccup can't wipe the playlist.
+    let current_set: std::collections::HashSet<&String> = playlist.entries.iter().collect();
+    let add: Vec<String> = want_present
+        .iter()
+        .filter(|id| !current_set.contains(*id))
+        .cloned()
+        .collect();
+    let remove_idx: Vec<usize> = playlist
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| want_absent.contains(*id))
+        .map(|(i, _)| i)
+        .collect();
+
+    if add.is_empty() && remove_idx.is_empty() {
+        return Ok(());
+    }
+    navi.update_playlist_diff(&playlist.id, &add, &remove_idx)
+        .await
+        .map_err(|e| e.to_string())?;
+    info!(
+        "Reconciled playlist '{}' for user {}: +{} -{} ({} pending)",
+        playlist_name,
+        user_id,
+        add.len(),
+        remove_idx.len(),
+        want_present.len()
+    );
     Ok(())
+}
+
+/// Resolve the profile's static playlist, creating it (or migrating a legacy
+/// smart playlist) when necessary, and persisting its ID so the same playlist is
+/// reused across runs. A transient Navidrome error returns `Err` (the caller
+/// defers to the next cycle) rather than orphaning the playlist or wiping it.
+#[cfg(feature = "server")]
+async fn ensure_static_playlist(
+    navi: &soulbeet::NavidromeClient,
+    user_id: &str,
+    profile: &str,
+    desired_name: &str,
+    playlist_ids: &mut HashMap<String, String>,
+) -> Result<StaticPlaylist, String> {
+    if let Some(id) = playlist_ids.get(profile).cloned() {
+        // `Ok(None)` means a genuine 404 (recreate); `Err` is transient (defer).
+        match navi.get_playlist_opt(&id).await.map_err(|e| e.to_string())? {
+            Some(detail) => {
+                // A transient failure here must not be read as "static", or we
+                // would diff against a smart playlist's evaluated tracks.
+                if navi.playlist_is_smart(&id).await.map_err(|e| e.to_string())? {
+                    return migrate_smart_to_static(
+                        navi,
+                        user_id,
+                        profile,
+                        desired_name,
+                        &id,
+                        playlist_ids,
+                    )
+                    .await;
+                }
+                return Ok(StaticPlaylist {
+                    id: detail.id,
+                    entries: detail.entry.iter().map(|s| s.id.clone()).collect(),
+                    name: detail.name,
+                });
+            }
+            None => { /* genuinely gone -- create a fresh one below */ }
+        }
+    }
+
+    create_and_bind_playlist(navi, user_id, profile, desired_name, playlist_ids).await
+}
+
+/// Create a fresh static playlist and persist its ID. Rolls back the created
+/// playlist if persisting the binding fails, so we never leave an unbound orphan.
+#[cfg(feature = "server")]
+async fn create_and_bind_playlist(
+    navi: &soulbeet::NavidromeClient,
+    user_id: &str,
+    profile: &str,
+    desired_name: &str,
+    playlist_ids: &mut HashMap<String, String>,
+) -> Result<StaticPlaylist, String> {
+    let created = navi
+        .create_playlist(desired_name, &[])
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = UserSettings::update_discovery_playlist_id(user_id, profile, &created.id).await {
+        let _ = navi.delete_playlist(&created.id).await;
+        return Err(format!(
+            "Failed to persist playlist ID for '{}' (rolled back): {}",
+            profile, e
+        ));
+    }
+    playlist_ids.insert(profile.to_string(), created.id.clone());
+    Ok(StaticPlaylist {
+        id: created.id,
+        entries: Vec::new(),
+        name: created.name,
+    })
+}
+
+/// Migrate a legacy smart playlist to a static one. Ordering is crash-safe:
+/// create the replacement, persist the new binding, then delete the old smart
+/// playlist. Any step's failure restores the pre-migration state (old playlist
+/// still bound and live) and defers to the next cycle, so there is never a
+/// duplicate, an orphan, or a window with no playlist.
+#[cfg(feature = "server")]
+async fn migrate_smart_to_static(
+    navi: &soulbeet::NavidromeClient,
+    user_id: &str,
+    profile: &str,
+    desired_name: &str,
+    old_smart_id: &str,
+    playlist_ids: &mut HashMap<String, String>,
+) -> Result<StaticPlaylist, String> {
+    let created = navi
+        .create_playlist(desired_name, &[])
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Persist the new binding before deleting the old, so a failure can never
+    // leave the new playlist unreferenced.
+    if let Err(e) = UserSettings::update_discovery_playlist_id(user_id, profile, &created.id).await {
+        let _ = navi.delete_playlist(&created.id).await;
+        return Err(format!(
+            "Migration deferred for '{}': persist failed (rolled back): {}",
+            profile, e
+        ));
+    }
+
+    if let Err(e) = navi.delete_playlist(old_smart_id).await {
+        // Restore the pre-migration state: drop the replacement, re-bind the old
+        // smart playlist (still live), and retry next cycle. No duplicate/orphan.
+        let _ = navi.delete_playlist(&created.id).await;
+        let _ =
+            UserSettings::update_discovery_playlist_id(user_id, profile, old_smart_id).await;
+        playlist_ids.insert(profile.to_string(), old_smart_id.to_string());
+        return Err(format!(
+            "Migration deferred for '{}': could not delete legacy smart playlist {} (rolled back): {}",
+            profile, old_smart_id, e
+        ));
+    }
+
+    playlist_ids.insert(profile.to_string(), created.id.clone());
+    info!(
+        "Migrated profile '{}' from smart playlist {} to static playlist {}",
+        profile, old_smart_id, created.id
+    );
+    Ok(StaticPlaylist {
+        id: created.id,
+        entries: Vec::new(),
+        name: created.name,
+    })
 }
 
 #[post("/api/discovery/generate-recommendations", auth: AuthSession)]

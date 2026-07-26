@@ -91,7 +91,7 @@ async fn cleanup_stale_discovery_playlists(
 
     for profile in &profiles_to_delete {
         if let Some(playlist_id) = old_ids.get(profile) {
-            if let Err(e) = navi.delete_smart_playlist(playlist_id).await {
+            if let Err(e) = navi.delete_playlist(playlist_id).await {
                 warn!(
                     "Failed to delete playlist '{}' ({}): {}",
                     profile, playlist_id, e

@@ -211,16 +211,6 @@ impl UserSettings {
         Ok(())
     }
 
-    pub fn get_playlist_id_for_profile(
-        playlist_ids_json: &Option<String>,
-        profile: &str,
-    ) -> Option<String> {
-        playlist_ids_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok())
-            .and_then(|m| m.get(profile).cloned())
-    }
-
     /// Get the playlist name for a specific profile
     pub fn get_playlist_name_for_profile(names_json: &str, profile: &str) -> String {
         serde_json::from_str::<std::collections::HashMap<String, String>>(names_json)

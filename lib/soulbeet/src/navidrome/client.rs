@@ -13,6 +13,27 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const API_VERSION: &str = "1.16.1";
 const CLIENT_NAME: &str = "Soulbeet";
 
+/// Return the path components after `Discovery/<profile>/`, joined by `/`, or
+/// `None` if `path` is not a file under that directory.
+///
+/// This is the single source of truth for discovery path matching. It matches by
+/// path *component* (`Discovery` immediately followed by `<profile>`), so
+/// `Discovery_Archive` or `album-balanced-edition` can never be mistaken for the
+/// profile directory, and it handles a `staging/` or library-root prefix. Because
+/// beets writes the same `Artist/Album/track.ext` tail on disk and in Navidrome's
+/// relative path, comparing tails resolves a local file to its Navidrome song
+/// exactly and collision-free.
+pub fn discovery_path_tail(path: &str, profile: &str) -> Option<String> {
+    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    for i in 0..comps.len().saturating_sub(1) {
+        if comps[i] == "Discovery" && comps[i + 1] == profile {
+            let tail = comps[i + 2..].join("/");
+            return if tail.is_empty() { None } else { Some(tail) };
+        }
+    }
+    None
+}
+
 pub struct NavidromeClient {
     base_url: Url,
     username: String,
@@ -285,16 +306,56 @@ impl NavidromeClient {
         Ok(())
     }
 
-    pub async fn update_playlist_songs(
+    /// Fetch a playlist with its ordered track entries.
+    ///
+    /// Returns `Ok(None)` only when the playlist genuinely does not exist
+    /// (Subsonic error code 70, "data not found"); transient failures
+    /// (timeouts, 5xx, circuit-breaker) surface as `Err`, so callers can tell
+    /// "deleted in Navidrome" apart from "Navidrome temporarily unreachable" and
+    /// avoid orphaning a playlist by recreating it on a blip.
+    pub async fn get_playlist_opt(&self, id: &str) -> Result<Option<SubsonicPlaylistDetail>> {
+        match self
+            .get::<PlaylistBody>("getPlaylist", &[("id", id)])
+            .await
+        {
+            Ok(body) => Ok(body.playlist),
+            Err(SoulseekError::Api { status: 70, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Apply an add/remove delta to a playlist in a single `updatePlaylist` call.
+    ///
+    /// `indices_to_remove` are 0-based positions in the playlist's CURRENT track
+    /// list. Navidrome resolves every removal index against the original list (no
+    /// index-shift), then appends the added tracks, so add and remove are safe to
+    /// send together.
+    pub async fn update_playlist_diff(
         &self,
         playlist_id: &str,
         song_ids_to_add: &[String],
+        indices_to_remove: &[usize],
     ) -> Result<()> {
+        if song_ids_to_add.is_empty() && indices_to_remove.is_empty() {
+            return Ok(());
+        }
+        let idx_strings: Vec<String> = indices_to_remove.iter().map(|i| i.to_string()).collect();
         let mut params: Vec<(&str, &str)> = vec![("playlistId", playlist_id)];
         for id in song_ids_to_add {
             params.push(("songIdToAdd", id));
         }
+        for s in &idx_strings {
+            params.push(("songIndexToRemove", s));
+        }
         let _: PingBody = self.get("updatePlaylist", &params).await?;
+        Ok(())
+    }
+
+    /// Rename a playlist via `updatePlaylist`.
+    pub async fn rename_playlist(&self, playlist_id: &str, name: &str) -> Result<()> {
+        let _: PingBody = self
+            .get("updatePlaylist", &[("playlistId", playlist_id), ("name", name)])
+            .await?;
         Ok(())
     }
 
@@ -353,7 +414,7 @@ impl NavidromeClient {
         Ok(all_songs)
     }
 
-    // --- Navidrome Native API (for smart playlists) ---
+    // --- Navidrome Native API (JWT auth; real media_file paths) ---
 
     /// Get a cached JWT token, or fetch a fresh one from Navidrome.
     async fn native_token(&self) -> Result<String> {
@@ -447,61 +508,14 @@ impl NavidromeClient {
         Ok(resp)
     }
 
-    /// Create a smart playlist via Navidrome's native API.
-    pub async fn create_smart_playlist(
-        &self,
-        name: &str,
-        comment: &str,
-        filepath_contains: &str,
-    ) -> Result<String> {
-        let url = self
-            .base_url
-            .join("api/playlist")
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("URL error: {}", e),
-            })?;
-
-        let body = serde_json::json!({
-            "name": name,
-            "comment": comment,
-            "public": false,
-            "rules": {
-                "all": [
-                    { "contains": { "filepath": filepath_contains } }
-                ],
-                "sort": "-dateAdded",
-                "order": "desc"
-            }
-        });
-
-        let resp = self
-            .native_request(self.client.post(url).json(&body))
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SoulseekError::Api {
-                status,
-                message: format!("Create smart playlist failed ({}): {}", status, body),
-            });
-        }
-
-        #[derive(serde::Deserialize)]
-        struct PlaylistResp {
-            id: String,
-        }
-
-        let pl: PlaylistResp = resp.json().await.map_err(|e| SoulseekError::Api {
-            status: 0,
-            message: format!("Failed to parse playlist response: {}", e),
-        })?;
-        Ok(pl.id)
-    }
-
-    /// Delete a smart playlist via Navidrome's native API.
-    pub async fn delete_smart_playlist(&self, playlist_id: &str) -> Result<()> {
+    /// Return true if the playlist is a Navidrome smart playlist (has criteria
+    /// rules). Used to detect playlists created by the legacy smart-playlist code
+    /// path so they can be migrated to explicitly-managed static playlists.
+    ///
+    /// The native `GET /api/playlist/{id}` returns the `rules` JSON; a static
+    /// playlist has no rules. A missing playlist (404) is reported as not-smart so
+    /// the caller recreates it.
+    pub async fn playlist_is_smart(&self, playlist_id: &str) -> Result<bool> {
         let url = self
             .base_url
             .join(&format!("api/playlist/{}", playlist_id))
@@ -510,27 +524,42 @@ impl NavidromeClient {
                 message: format!("URL error: {}", e),
             })?;
 
-        let resp = self.native_request(self.client.delete(url)).await?;
+        let resp = self.native_request(self.client.get(url)).await?;
 
+        if resp.status().as_u16() == 404 {
+            return Ok(false);
+        }
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             return Err(SoulseekError::Api {
                 status,
-                message: format!("Delete smart playlist failed ({})", status),
+                message: format!("Get playlist failed ({})", status),
             });
         }
 
-        Ok(())
+        #[derive(serde::Deserialize)]
+        struct PlaylistRules {
+            #[serde(default)]
+            rules: Option<serde_json::Value>,
+        }
+
+        let pl: PlaylistRules = resp.json().await.map_err(|e| SoulseekError::Api {
+            status: 0,
+            message: format!("Failed to parse playlist response: {}", e),
+        })?;
+        Ok(pl.rules.as_ref().is_some_and(|r| !r.is_null()))
     }
 
-    /// Query songs via the native API, filtered to a specific path prefix.
-    /// Returns up to `limit` songs whose path contains the given prefix.
-    /// The native API returns raw `media_file.path` values (relative to library root).
-    pub async fn get_songs_by_path_prefix(
-        &self,
-        prefix: &str,
-        limit: u32,
-    ) -> Result<Vec<NativeSong>> {
+    /// Fetch every Navidrome song that lives under the `Discovery/<profile>/`
+    /// directory, paginating the native `api/song` endpoint to completion.
+    ///
+    /// The native API returns the raw `media_file.path` (relative to the library
+    /// root), independent of the per-player `ReportRealPath` flag, so it is the
+    /// reliable source for resolving discovery files to Navidrome song IDs.
+    /// Matching is by path *component* (`Discovery` followed by `<profile>`), so a
+    /// `Discovery_Archive` or `album-balanced` directory can never be mistaken for
+    /// the profile directory.
+    pub async fn get_discovery_songs(&self, profile: &str) -> Result<Vec<NativeSong>> {
         let url = self
             .base_url
             .join("api/song")
@@ -539,32 +568,43 @@ impl NavidromeClient {
                 message: format!("URL error: {}", e),
             })?;
 
-        let resp = self
-            .native_request(self.client.get(url).query(&[
-                ("_start", "0".to_string()),
-                ("_end", limit.to_string()),
-                ("_sort", "path".to_string()),
-                ("_order", "ASC".to_string()),
-            ]))
-            .await?;
+        const PAGE: u32 = 1000;
+        let mut start = 0u32;
+        let mut out = Vec::new();
+        loop {
+            let resp = self
+                .native_request(self.client.get(url.clone()).query(&[
+                    ("_start", start.to_string()),
+                    ("_end", (start + PAGE).to_string()),
+                    ("_sort", "path".to_string()),
+                    ("_order", "ASC".to_string()),
+                ]))
+                .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            return Err(SoulseekError::Api {
-                status,
-                message: format!("Get songs failed ({})", status),
-            });
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                return Err(SoulseekError::Api {
+                    status,
+                    message: format!("Get songs failed ({})", status),
+                });
+            }
+
+            let songs: Vec<NativeSong> = resp.json().await.map_err(|e| SoulseekError::Api {
+                status: 0,
+                message: format!("Failed to parse songs response: {}", e),
+            })?;
+            let page_len = songs.len() as u32;
+            out.extend(
+                songs
+                    .into_iter()
+                    .filter(|s| !s.missing && discovery_path_tail(&s.path, profile).is_some()),
+            );
+            if page_len < PAGE {
+                break;
+            }
+            start += PAGE;
         }
-
-        let songs: Vec<NativeSong> = resp.json().await.map_err(|e| SoulseekError::Api {
-            status: 0,
-            message: format!("Failed to parse songs response: {}", e),
-        })?;
-
-        Ok(songs
-            .into_iter()
-            .filter(|s| s.path.contains(prefix))
-            .collect())
+        Ok(out)
     }
 
     /// List all players visible to the authenticated user via Navidrome's native API.
@@ -592,5 +632,63 @@ impl NavidromeClient {
             status: 0,
             message: format!("Failed to parse players response: {}", e),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::discovery_path_tail;
+
+    #[test]
+    fn extracts_tail_under_discovery_profile() {
+        assert_eq!(
+            discovery_path_tail("Discovery/Balanced/Artist/Album/t.flac", "Balanced").as_deref(),
+            Some("Artist/Album/t.flac")
+        );
+        // staging/ prefix and an absolute library root both resolve the same tail.
+        assert_eq!(
+            discovery_path_tail("staging/Discovery/Balanced/A/B/t.mp3", "Balanced").as_deref(),
+            Some("A/B/t.mp3")
+        );
+        assert_eq!(
+            discovery_path_tail("/srv/music/Discovery/Adventurous/X/t.flac", "Adventurous")
+                .as_deref(),
+            Some("X/t.flac")
+        );
+    }
+
+    #[test]
+    fn local_and_relative_paths_share_a_tail() {
+        // The core resolution property: a local absolute path and Navidrome's
+        // library-relative path produce the same tail, so they match.
+        let local = "/srv/music/Discovery/Adventurous/Boards of Canada/Geogaddi/01 track.flac";
+        let navi = "Discovery/Adventurous/Boards of Canada/Geogaddi/01 track.flac";
+        assert_eq!(
+            discovery_path_tail(local, "Adventurous"),
+            discovery_path_tail(navi, "Adventurous")
+        );
+        assert!(discovery_path_tail(local, "Adventurous").is_some());
+    }
+
+    #[test]
+    fn rejects_substring_lookalikes_and_other_profiles() {
+        assert_eq!(
+            discovery_path_tail("Discovery_Archive/Balanced/t.flac", "Balanced"),
+            None
+        );
+        assert_eq!(
+            discovery_path_tail("Music/album-balanced/t.flac", "Balanced"),
+            None
+        );
+        assert_eq!(
+            discovery_path_tail("Discovery/Adventurous/t.flac", "Balanced"),
+            None
+        );
+        assert_eq!(discovery_path_tail("Other/Balanced/t.flac", "Balanced"), None);
+    }
+
+    #[test]
+    fn none_when_profile_dir_has_no_file_tail() {
+        assert_eq!(discovery_path_tail("Discovery/Balanced", "Balanced"), None);
     }
 }
