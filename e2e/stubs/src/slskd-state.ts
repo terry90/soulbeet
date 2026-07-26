@@ -71,6 +71,8 @@ interface TransferRecord {
   percentComplete: number;
   exception: string | null;
   attempts: number;
+  /** explicit batch destination directory, relative to the downloads dir */
+  destination: string | null;
   /** ghost transfers are accepted but never show up in listings */
   hidden: boolean;
   removed: boolean;
@@ -80,20 +82,34 @@ interface TransferRecord {
   delivered: boolean;
 }
 
+export interface BatchEnqueueBody {
+  username?: unknown;
+  files?: unknown;
+  options?: { destination?: unknown };
+}
+
 // Transfers hold "Requested" and "Initializing" for longer than the app's 2s
 // monitor poll interval so every download is guaranteed to be observed in
 // those states: treating them as terminal made the monitor cancel live
 // transfers (issue #71).
-const BEHAVIOR_PLANS: Record<Exclude<PeerBehavior, 'offline'>, TransferStep[]> = {
-  happy: [
-    { afterMs: 0, state: 'Queued, Locally', percent: 0 },
-    { afterMs: 100, state: 'Requested', percent: 0 },
-    { afterMs: 2600, state: 'Queued, Remotely', percent: 0 },
-    { afterMs: 3400, state: 'Initializing', percent: 0 },
-    { afterMs: 5900, state: 'InProgress', percent: 24 },
-    { afterMs: 6600, state: 'InProgress', percent: 71 },
-    { afterMs: 7300, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
-  ],
+const HAPPY_STEPS: TransferStep[] = [
+  { afterMs: 0, state: 'Queued, Locally', percent: 0 },
+  { afterMs: 100, state: 'Requested', percent: 0 },
+  { afterMs: 2600, state: 'Queued, Remotely', percent: 0 },
+  { afterMs: 3400, state: 'Initializing', percent: 0 },
+  { afterMs: 5900, state: 'InProgress', percent: 24 },
+  { afterMs: 6600, state: 'InProgress', percent: 71 },
+  { afterMs: 7300, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
+];
+
+/** Behaviors whose enqueue is accepted and whose transfers follow a plan. */
+type EnqueueableBehavior = Exclude<PeerBehavior, 'offline' | 'enqueueoffline'>;
+
+const BEHAVIOR_PLANS: Record<EnqueueableBehavior, TransferStep[]> = {
+  happy: HAPPY_STEPS,
+  // Enqueue-time behavior: the first file of the first batch is rejected with
+  // a per-file failure record; everything that does enqueue proceeds happily.
+  partialenqueue: HAPPY_STEPS,
   flaky: [
     { afterMs: 0, state: 'Queued, Locally', percent: 0 },
     { afterMs: 100, state: 'Requested', percent: 0, attempts: 1 },
@@ -163,6 +179,8 @@ export class SlskdState {
   private behaviors = new Map<string, PeerBehavior>();
   private fileSizes = new Map<string, number>();
   private nextToken = 1000;
+  /** peers whose one-off partialenqueue rejection already fired */
+  private rejectedOnce = new Set<string>();
   outage = false;
 
   constructor(
@@ -189,6 +207,7 @@ export class SlskdState {
     this.searches.clear();
     this.transfers = [];
     this.resetBehaviors();
+    this.rejectedOnce.clear();
     this.outage = false;
   }
 
@@ -308,28 +327,58 @@ export class SlskdState {
 
   // ---- transfers ---------------------------------------------------------
 
-  enqueue(
-    username: string,
-    files: Array<{ filename: string; size: number }>,
-  ): { status: number; body: unknown } {
-    const peer = peers.find((p) => p.username === username);
-    if (!peer) {
-      return { status: 404, body: `User ${username} not found` };
+  /**
+   * POST /api/v0/transfers/downloads/batches (slskd 0.26). Mirrors
+   * TransfersController.EnqueueBatchAsync: 400 for invalid bodies, 404 with
+   * "appears to be offline" for offline (or unknown) users, otherwise a
+   * batch record plus per-file {filename, message} failures with 201 when
+   * everything enqueued, 207 on partial failure and 200 when all failed.
+   */
+  enqueueBatch(body: BatchEnqueueBody): { status: number; body: unknown } {
+    const username = typeof body.username === 'string' ? body.username : '';
+    const files = Array.isArray(body.files)
+      ? (body.files as Array<{ filename?: unknown; size?: unknown }>)
+      : [];
+    const destination =
+      typeof body.options?.destination === 'string' && body.options.destination.length > 0
+        ? body.options.destination
+        : null;
+
+    if (username.length === 0 || files.length === 0) {
+      return { status: 400, body: 'The Username and Files fields are required' };
     }
+    if (files.some((f) => typeof f.filename !== 'string' || f.filename.length === 0)) {
+      return { status: 400, body: 'One or more files in the request are null' };
+    }
+    if (new Set(files.map((f) => f.filename)).size !== files.length) {
+      return { status: 400, body: 'Two or more files in the request are repeated' };
+    }
+
+    const peer = peers.find((p) => p.username === username);
     const behavior = this.behaviorOf(username);
-    if (behavior === 'offline') {
+    // Real slskd resolves the user's endpoint before creating anything and
+    // maps UserOfflineException to 404; unknown users look the same.
+    // 'enqueueoffline' models a peer that answered the search but dropped off
+    // the network before the download was requested.
+    if (!peer || behavior === 'offline' || behavior === 'enqueueoffline') {
       return { status: 404, body: `User ${username} appears to be offline` };
     }
 
     const plan = BEHAVIOR_PLANS[behavior];
     const now = Date.now();
     const enqueued: Array<Record<string, unknown>> = [];
-    const failed: string[] = [];
+    const failures: Array<{ filename: string; message: string }> = [];
 
     for (const file of files) {
-      const share = peer.shares.find((s) => s.remotePath === file.filename);
+      const filename = file.filename as string;
+      const share = peer.shares.find((s) => s.remotePath === filename);
       if (!share) {
-        failed.push(file.filename);
+        failures.push({ filename, message: 'Error: File not shared' });
+        continue;
+      }
+      if (behavior === 'partialenqueue' && !this.rejectedOnce.has(username)) {
+        this.rejectedOnce.add(username);
+        failures.push({ filename, message: 'Error: Enqueue rejected by peer' });
         continue;
       }
       // Real slskd creates the record in "Queued, Locally"
@@ -338,8 +387,8 @@ export class SlskdState {
       const transfer: TransferRecord = {
         id: randomUUID(),
         username,
-        filename: file.filename,
-        size: this.fileSizes.get(file.filename) ?? file.size,
+        filename,
+        size: this.fileSizes.get(filename) ?? (Number(file.size) || 0),
         requestedAtMs: now,
         enqueuedAtMs: null,
         startedAtMs: null,
@@ -348,6 +397,7 @@ export class SlskdState {
         percentComplete: 0,
         exception: null,
         attempts: 0,
+        destination,
         hidden: behavior === 'ghost',
         removed: false,
         plan: plan.map((step) => ({ ...step })),
@@ -359,9 +409,24 @@ export class SlskdState {
     }
 
     console.log(
-      `[slskd] enqueue ${files.length} file(s) from ${username} (${behavior}): ${enqueued.length} ok, ${failed.length} failed`,
+      `[slskd] batch enqueue ${files.length} file(s) from ${username} (${behavior}): ${enqueued.length} ok, ${failures.length} failed`,
     );
-    return { status: 201, body: { enqueued, failed } };
+
+    const status = failures.length === 0 ? 201 : enqueued.length === 0 ? 200 : 207;
+    return {
+      status,
+      body: {
+        batch: {
+          id: randomUUID(),
+          username,
+          direction: 'Download',
+          createdAt: new Date(now).toISOString(),
+          transfers: enqueued,
+          options: destination ? { destination } : {},
+        },
+        failures,
+      },
+    };
   }
 
   /** Advance every transfer along its behavior plan; called on a short timer. */
@@ -416,7 +481,10 @@ export class SlskdState {
       return;
     }
     const { directory, file } = toLocalRelativePath(transfer.filename);
-    const targetDir = directory ? join(this.downloadsDir, directory) : this.downloadsDir;
+    // An explicit batch destination overrides the server's subdirectory
+    // pattern (DownloadService.DeriveDestination in the slskd source).
+    const dir = transfer.destination ?? directory;
+    const targetDir = dir ? join(this.downloadsDir, dir) : this.downloadsDir;
     mkdirSync(targetDir, { recursive: true });
     const target = join(targetDir, file);
     copyFileSync(join(this.audioDir, audioFileName(share)), target);

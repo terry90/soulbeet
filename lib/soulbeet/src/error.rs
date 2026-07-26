@@ -37,7 +37,12 @@ impl SoulseekError {
         match self {
             SoulseekError::UserOffline { .. } => false,
             SoulseekError::NotConfigured => false,
-            SoulseekError::Api { status, .. } if *status == 401 || *status == 403 => false,
+            // 400 and 404 are definitive: a rejected request body or a
+            // missing route (slskd older than 0.26) will not heal on retry.
+            SoulseekError::Api {
+                status: 400 | 401 | 403 | 404,
+                ..
+            } => false,
             _ => true,
         }
     }

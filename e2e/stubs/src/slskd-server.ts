@@ -4,7 +4,7 @@
 import type { Server } from 'node:http';
 import type { PeerBehavior } from '../../fixtures/dataset.js';
 import { createStubServer, sendEmpty, sendJson, sendText } from './router.js';
-import type { SlskdState } from './slskd-state.js';
+import type { BatchEnqueueBody, SlskdState } from './slskd-state.js';
 
 const VALID_BEHAVIORS: PeerBehavior[] = [
   'happy',
@@ -13,6 +13,8 @@ const VALID_BEHAVIORS: PeerBehavior[] = [
   'retryflap',
   'stall',
   'offline',
+  'enqueueoffline',
+  'partialenqueue',
 ];
 
 export function createSlskdServer(state: SlskdState, apiKey: string): Server {
@@ -98,19 +100,12 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
       // ---- transfers ------------------------------------------------------
       {
         method: 'POST',
-        pattern: '/api/v0/transfers/downloads/:username',
-        handler: ({ res, params, body }) => {
-          const files = body as Array<{ filename: string; size: number }>;
-          if (!Array.isArray(files)) {
-            sendText(res, 400, 'request body must be an array');
-            return;
-          }
-          const result = state.enqueue(params.username as string, files);
-          if (typeof result.body === 'string') {
-            sendText(res, result.status, result.body);
-          } else {
-            sendJson(res, result.status, result.body);
-          }
+        pattern: '/api/v0/transfers/downloads/batches',
+        handler: ({ res, body }) => {
+          const result = state.enqueueBatch((body ?? {}) as BatchEnqueueBody);
+          // slskd's [Produces("application/json")] serializes string bodies
+          // (offline / validation messages) as JSON strings too.
+          sendJson(res, result.status, result.body);
         },
       },
       {

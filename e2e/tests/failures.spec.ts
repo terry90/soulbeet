@@ -114,6 +114,50 @@ test('rides out slskd auto-retry of a failed transfer', async ({ context, page }
   await expectFileAppears(imported, 120_000);
 });
 
+test('fails fast when the peer goes offline before enqueue', async ({ context, page }) => {
+  // slskd reports an offline peer with "appears to be offline" in the enqueue
+  // response body (404 on the batches endpoint). That is non-retryable: the
+  // row must fail with the offline reason well before the ~14s the generic
+  // 3-retry backoff would take.
+  await setPeerBehavior('mp3_hoarder', 'offline');
+  // enqueueoffline: still answers searches, but is gone by download time.
+  await setPeerBehavior('collector_01', 'enqueueoffline');
+  await freshSession(context, page, 'fail-offline');
+
+  await performSearch(page, 'Paper Lanterns', 'TRACK');
+  const row = page.locator('li').filter({ hasText: 'Paper Lanterns' }).first();
+  await row.getByRole('button', { name: 'Download' }).click();
+
+  await page.getByRole('button', { name: 'Downloads', exact: true }).click();
+  const item = transferRow(
+    page,
+    'Music\\FLAC\\Static Harbor\\Glass Atlas\\02 - Paper Lanterns.flac',
+  );
+  await expect(item.getByText('ERR', { exact: true })).toBeVisible({ timeout: 10_000 });
+  await expect(item.getByText(/is offline/)).toBeVisible();
+});
+
+test('surfaces a per-file enqueue rejection with its real reason', async ({ context, page }) => {
+  // The batches endpoint reports enqueue failures per file as
+  // {filename, message}; the row must carry that message instead of a
+  // generic whole-batch error.
+  await setPeerBehavior('collector_01', 'partialenqueue');
+  await setPeerBehavior('mp3_hoarder', 'offline');
+  await freshSession(context, page, 'fail-reject');
+
+  await performSearch(page, 'Paper Lanterns', 'TRACK');
+  const row = page.locator('li').filter({ hasText: 'Paper Lanterns' }).first();
+  await row.getByRole('button', { name: 'Download' }).click();
+
+  await page.getByRole('button', { name: 'Downloads', exact: true }).click();
+  const item = transferRow(
+    page,
+    'Music\\FLAC\\Static Harbor\\Glass Atlas\\02 - Paper Lanterns.flac',
+  );
+  await expect(item.getByText('ERR', { exact: true })).toBeVisible({ timeout: 30_000 });
+  await expect(item.getByText('Error: Enqueue rejected by peer')).toBeVisible();
+});
+
 test('reports a failed search when slskd is unreachable', async ({ context, page }) => {
   await freshSession(context, page, 'fail-outage');
   await setOutage(true);

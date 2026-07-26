@@ -86,7 +86,7 @@ services:
       - "5030:5030"
 ```
 
-2.  **Important**: The `/downloads` volume must match between `slskd` and `soulbeet` so Soulbeet can see the files `slskd` downloaded. The `/music` volume must match between `soulbeet` and `navidrome` so Navidrome can see the organized library.
+2.  **Important**: The `/downloads` volume must match between `slskd` and `soulbeet` so Soulbeet can see the files `slskd` downloaded. The `/music` volume must match between `soulbeet` and `navidrome` so Navidrome can see the organized library. Soulbeet requires **slskd 0.26 or newer** (downloads are enqueued through the batches API introduced in 0.26).
 
 3.  Run:
 

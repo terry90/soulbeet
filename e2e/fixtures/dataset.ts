@@ -39,7 +39,15 @@ export interface PeerShare {
   bitDepth: number | null;
 }
 
-export type PeerBehavior = 'happy' | 'ghost' | 'flaky' | 'retryflap' | 'stall' | 'offline';
+export type PeerBehavior =
+  | 'happy'
+  | 'ghost'
+  | 'flaky'
+  | 'retryflap'
+  | 'stall'
+  | 'offline'
+  | 'enqueueoffline'
+  | 'partialenqueue';
 
 export interface Peer {
   username: string;

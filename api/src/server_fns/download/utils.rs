@@ -1,4 +1,6 @@
 #[cfg(feature = "server")]
+use shared::slskd::{sanitize_filename, sanitize_filename_unix};
+#[cfg(feature = "server")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "server")]
 use tracing::warn;
@@ -32,29 +34,32 @@ pub fn resolve_download_path(filename: &str, download_base: &Path) -> Option<Str
         return None;
     }
 
-    // Strategy 1: Mirror slskd's ToLocalRelativeFilename algorithm.
-    // slskd stores files using only the last 2 path components (directory + filename),
-    // with invalid filename characters replaced by '_'.
+    // Strategy 1: the layout Soulful pins at enqueue time (batch destination =
+    // sanitized parent directory), which is also slskd's default pattern:
+    // <downloads>/<directory>/<filename>. The basename is sanitized by slskd
+    // with its host OS's invalid set, so both variants are tried.
     if components.len() >= 2 {
         let dir_part = sanitize_filename(components[components.len() - 2]);
-        let file_part = sanitize_filename(components[components.len() - 1]);
-        let candidate = download_base.join(&dir_part).join(&file_part);
-        if candidate.exists() {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-
-        // slskd appends _<ticks> when a file with the same name already exists.
-        // Search the expected album directory for files whose stem starts with ours.
         let album_dir = download_base.join(&dir_part);
-        if let Some(found) = find_file_by_stem(&album_dir, &file_part) {
-            return Some(found.to_string_lossy().to_string());
+        for file_part in basename_candidates(components[components.len() - 1]) {
+            let candidate = album_dir.join(&file_part);
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+
+            // slskd appends _<ticks> when a file with the same name already exists.
+            // Search the expected album directory for files whose stem starts with ours.
+            if let Some(found) = find_file_by_stem(&album_dir, &file_part) {
+                return Some(found.to_string_lossy().to_string());
+            }
         }
     } else {
         // Single component (just a filename)
-        let file_part = sanitize_filename(components[0]);
-        let candidate = download_base.join(&file_part);
-        if candidate.exists() {
-            return Some(candidate.to_string_lossy().to_string());
+        for file_part in basename_candidates(components[0]) {
+            let candidate = download_base.join(&file_part);
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
         }
     }
 
@@ -105,22 +110,19 @@ pub fn resolve_download_path(filename: &str, download_base: &Path) -> Option<Str
     None
 }
 
-/// Replace characters that are invalid in filenames with `_`.
-/// Mirrors slskd's `ReplaceInvalidFileNameCharacters` behavior.
-/// On Linux only `/` and `\0` are truly invalid, but slskd runs cross-platform
-/// and replaces the Windows-invalid set: < > : " / \ | ? *
+/// The on-disk basename variants slskd may have produced for a remote
+/// filename: sanitized with the Windows-invalid set (slskd on Windows, and
+/// what Soulful's own destinations use) or with the Unix set (slskd on
+/// Linux keeps characters like `:`). Deduplicated when they agree.
 #[cfg(feature = "server")]
-fn sanitize_filename(name: &str) -> String {
-    let invalid = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    let mut result = String::with_capacity(name.len());
-    for c in name.chars() {
-        if invalid.contains(&c) || c == '\0' {
-            result.push('_');
-        } else {
-            result.push(c);
-        }
+fn basename_candidates(name: &str) -> Vec<String> {
+    let windows = sanitize_filename(name);
+    let unix = sanitize_filename_unix(name);
+    if unix == windows {
+        vec![windows]
+    } else {
+        vec![windows, unix]
     }
-    result
 }
 
 /// Search a specific directory for a file whose stem matches the expected filename,
@@ -228,5 +230,60 @@ pub fn same_album_directory(path1: &str, path2: &str) -> bool {
     match (get_album_directory(path1), get_album_directory(path2)) {
         (Some(dir1), Some(dir2)) => dir1 == dir2,
         _ => false,
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    fn temp_base(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "soulful-utils-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn resolves_windows_sanitized_basename() {
+        let base = temp_base("win");
+        let album = base.join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("AC_ DC - 01.mp3"), b"x").unwrap();
+
+        let resolved = resolve_download_path(r"music\Album\AC: DC - 01.mp3", &base).unwrap();
+        assert!(resolved.ends_with("AC_ DC - 01.mp3"));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn resolves_unix_sanitized_basename() {
+        // A Linux slskd only replaces '/' and NUL, so ':' survives on disk.
+        let base = temp_base("unix");
+        let album = base.join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("AC: DC - 01.mp3"), b"x").unwrap();
+
+        let resolved = resolve_download_path(r"music\Album\AC: DC - 01.mp3", &base).unwrap();
+        assert!(resolved.ends_with("AC: DC - 01.mp3"));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn resolves_collision_suffixed_file() {
+        let base = temp_base("ticks");
+        let album = base.join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("track_639097129778484198.mp3"), b"x").unwrap();
+
+        let resolved = resolve_download_path(r"music\Album\track.mp3", &base).unwrap();
+        assert!(resolved.ends_with("track_639097129778484198.mp3"));
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

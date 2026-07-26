@@ -296,6 +296,40 @@ impl<'de> Deserialize<'de> for FlattenedFiles {
     }
 }
 
+/// Replace characters that are invalid in filenames with `_`.
+/// Mirrors slskd's `ReplaceInvalidFileNameCharacters` on Windows hosts and,
+/// since slskd sanitizes idempotently, produces names slskd will not alter
+/// again on either OS. Used both to pre-sanitize the batch enqueue
+/// `destination` and to predict where slskd placed a downloaded file.
+pub fn sanitize_filename(name: &str) -> String {
+    let invalid = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    let mut result = String::with_capacity(name.len());
+    for c in name.chars() {
+        if invalid.contains(&c) || c == '\0' {
+            result.push('_');
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Sanitize like slskd running on a Unix host: only `/` and NUL are invalid.
+/// slskd 0.26 sanitizes basenames with the host OS's invalid set, so a Linux
+/// slskd keeps characters like `:` that [`sanitize_filename`] would replace;
+/// path resolution has to try both candidates.
+pub fn sanitize_filename_unix(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c == '/' || c == '\0' {
+            result.push('_');
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MatchResult {
     pub guessed_artist: String,
