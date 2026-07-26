@@ -54,6 +54,8 @@ interface TransferStep {
   percent: number;
   exception?: string;
   deliverFile?: boolean;
+  /** value slskd's retry framework would have written at this point */
+  attempts?: number;
 }
 
 interface TransferRecord {
@@ -68,6 +70,7 @@ interface TransferRecord {
   state: string;
   percentComplete: number;
   exception: string | null;
+  attempts: number;
   /** ghost transfers are accepted but never show up in listings */
   hidden: boolean;
   removed: boolean;
@@ -93,7 +96,7 @@ const BEHAVIOR_PLANS: Record<Exclude<PeerBehavior, 'offline'>, TransferStep[]> =
   ],
   flaky: [
     { afterMs: 0, state: 'Queued, Locally', percent: 0 },
-    { afterMs: 100, state: 'Requested', percent: 0 },
+    { afterMs: 100, state: 'Requested', percent: 0, attempts: 1 },
     { afterMs: 2600, state: 'Queued, Remotely', percent: 0 },
     { afterMs: 3100, state: 'InProgress', percent: 31 },
     {
@@ -101,7 +104,29 @@ const BEHAVIOR_PLANS: Record<Exclude<PeerBehavior, 'offline'>, TransferStep[]> =
       state: 'Completed, Errored',
       percent: 31,
       exception: 'Connection reset by peer',
+      attempts: 3,
     },
+  ],
+  // slskd 0.26 auto-retry: a failed attempt is briefly persisted as
+  // "Completed, Errored" before onRetry re-queues the transfer. The failed
+  // dwell (2s) must stay under the monitor's FAILED_STATE_CONFIRM window
+  // (4s) so a correct monitor rides the flap out and imports the file; a
+  // monitor acting on a single failed sighting abandons the transfer and
+  // the import assertion in the spec fails.
+  retryflap: [
+    { afterMs: 0, state: 'Queued, Locally', percent: 0 },
+    { afterMs: 100, state: 'Requested', percent: 0, attempts: 1 },
+    { afterMs: 2600, state: 'Queued, Remotely', percent: 0 },
+    { afterMs: 3100, state: 'InProgress', percent: 40 },
+    {
+      afterMs: 5300,
+      state: 'Completed, Errored',
+      percent: 40,
+      exception: 'Connection reset by peer',
+    },
+    { afterMs: 7300, state: 'Queued, Locally', percent: 40, attempts: 2 },
+    { afterMs: 9000, state: 'InProgress', percent: 80 },
+    { afterMs: 10500, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
   ],
   stall: [
     { afterMs: 0, state: 'Queued, Locally', percent: 0 },
@@ -109,6 +134,15 @@ const BEHAVIOR_PLANS: Record<Exclude<PeerBehavior, 'offline'>, TransferStep[]> =
   ],
   ghost: [{ afterMs: 0, state: 'Queued, Locally', percent: 0 }],
 };
+
+/** Render a duration the way slskd serializes TimeSpan values. */
+function timeSpanJson(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const h = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const m = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+  const s = String(totalSeconds % 60).padStart(2, '0');
+  return `${h}:${m}:${s}`;
+}
 
 /**
  * slskd maps a remote path to {downloads}/{last directory}/{filename}
@@ -313,6 +347,7 @@ export class SlskdState {
         state: 'Queued, Locally',
         percentComplete: 0,
         exception: null,
+        attempts: 0,
         hidden: behavior === 'ghost',
         removed: false,
         plan: plan.map((step) => ({ ...step })),
@@ -346,13 +381,18 @@ export class SlskdState {
   }
 
   private applyStep(transfer: TransferRecord, step: TransferStep): void {
-    // Cancellation is terminal; the rest of the plan no longer applies.
-    if (transfer.state.startsWith('Completed')) {
+    // Cancellation and success are terminal. Other Completed states are
+    // not: slskd 0.26's retry framework re-queues a failed transfer, so a
+    // plan may continue past "Completed, Errored" (retryflap).
+    if (transfer.state === 'Completed, Cancelled' || transfer.state === 'Completed, Succeeded') {
       return;
     }
 
     transfer.state = step.state;
     transfer.percentComplete = step.percent;
+    if (step.attempts !== undefined) {
+      transfer.attempts = step.attempts;
+    }
     if (step.state === 'Queued, Remotely' && transfer.enqueuedAtMs === null) {
       transfer.enqueuedAtMs = Date.now();
     }
@@ -400,28 +440,44 @@ export class SlskdState {
 
   transferJson(transfer: TransferRecord): Record<string, unknown> {
     const bytesTransferred = Math.round((transfer.size * transfer.percentComplete) / 100);
-    return {
+    const averageSpeed = transfer.state === 'InProgress' ? 250000 : 0;
+    // slskd 0.26 wire shape: no startOffset (property dropped) and no
+    // stateDescription ([JsonIgnore] upstream), null fields omitted
+    // entirely (WhenWritingNull), removed and attempts serialized.
+    // elapsedTime appears once startedAt is set, remainingTime once
+    // averageSpeed is non-zero (computed properties on slskd's Transfer).
+    const json: Record<string, unknown> = {
       id: transfer.id,
       username: transfer.username,
       direction: 'Download',
       filename: transfer.filename,
       size: transfer.size,
-      startOffset: 0,
       state: transfer.state,
-      stateDescription: transfer.state,
       requestedAt: new Date(transfer.requestedAtMs).toISOString(),
-      enqueuedAt: transfer.enqueuedAtMs ? new Date(transfer.enqueuedAtMs).toISOString() : null,
-      startedAt: transfer.startedAtMs ? new Date(transfer.startedAtMs).toISOString() : null,
-      endedAt: transfer.endedAtMs ? new Date(transfer.endedAtMs).toISOString() : null,
       bytesTransferred,
       bytesRemaining: transfer.size - bytesTransferred,
-      averageSpeed: transfer.state === 'InProgress' ? 250000 : 0,
+      averageSpeed,
       percentComplete: transfer.percentComplete,
-      elapsedTime: null,
-      remainingTime: null,
-      placeInQueue: null,
-      exception: transfer.exception,
+      attempts: transfer.attempts,
+      removed: transfer.removed,
     };
+    if (transfer.enqueuedAtMs) {
+      json.enqueuedAt = new Date(transfer.enqueuedAtMs).toISOString();
+    }
+    if (transfer.startedAtMs) {
+      json.startedAt = new Date(transfer.startedAtMs).toISOString();
+      json.elapsedTime = timeSpanJson((transfer.endedAtMs ?? Date.now()) - transfer.startedAtMs);
+    }
+    if (transfer.endedAtMs) {
+      json.endedAt = new Date(transfer.endedAtMs).toISOString();
+    }
+    if (averageSpeed > 0) {
+      json.remainingTime = timeSpanJson(((transfer.size - bytesTransferred) / averageSpeed) * 1000);
+    }
+    if (transfer.exception) {
+      json.exception = transfer.exception;
+    }
+    return json;
   }
 
   /** GET /api/v0/transfers/downloads shape: user -> directories -> files. */

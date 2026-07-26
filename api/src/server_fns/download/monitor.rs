@@ -5,6 +5,7 @@
 
 use dioxus::logger::tracing::{debug, info, warn};
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
+use soulbeet::error::SoulseekError;
 use soulbeet::DownloadBackend;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,12 +36,31 @@ const ABSENT_TRACK_TIMEOUT: Duration = Duration::from_secs(120);
 /// Consecutive backend resolution failures tolerated before giving up.
 const MAX_BACKEND_FAILURES: u32 = 5;
 
+/// Consecutive unparseable download listings tolerated before failing the
+/// batch. Scoped to schema drift (`SoulseekError::InvalidResponse`): slskd
+/// answered but its response no longer parses, which will not fix itself,
+/// so the batch must fail with that error instead of "Download never
+/// appeared in slskd". Transport errors are excluded: slskd being briefly
+/// unreachable (restart, upgrade) resolves on its own, and the shared
+/// circuit breaker can keep rejecting requests for up to a minute after
+/// recovery, so a bounded fuse on those would fail healthy batches.
+const MAX_INVALID_RESPONSES: u32 = 15;
+
+/// How long a failed transfer state must persist before it is treated as
+/// final. slskd 0.26 auto-retries failed downloads (3 attempts by default):
+/// the failed state is persisted only briefly before the retry re-queues
+/// the transfer as "Queued, Locally". Acting on a single sighting would
+/// abandon a transfer slskd is about to retry.
+const FAILED_STATE_CONFIRM: Duration = Duration::from_secs(4);
+
 /// State tracking for individual track downloads.
 struct TrackState {
     /// When the track was first seen in slskd's download list.
     first_seen: Option<Instant>,
     /// When the track went missing from slskd's list after being seen.
     missing_since: Option<Instant>,
+    /// When the track's transfer was first seen in a failed terminal state.
+    failing_since: Option<Instant>,
     /// Whether this track has been processed (imported or marked as failed).
     processed: bool,
 }
@@ -104,6 +124,7 @@ impl DownloadMonitor {
                     TrackState {
                         first_seen: None,
                         missing_since: None,
+                        failing_since: None,
                         processed: false,
                     },
                 )
@@ -131,6 +152,7 @@ impl DownloadMonitor {
         let mut consecutive_empty = 0;
         let mut poll_count = 0;
         let mut backend_failures: u32 = 0;
+        let mut invalid_responses: u32 = 0;
 
         // Poll immediately on first iteration
         interval.tick().await;
@@ -167,6 +189,7 @@ impl DownloadMonitor {
             };
             match backend.get_downloads().await {
                 Ok(downloads) => {
+                    invalid_responses = 0;
                     let should_break = self
                         .process_poll_result(downloads, &mut consecutive_empty, poll_count)
                         .await;
@@ -174,9 +197,27 @@ impl DownloadMonitor {
                         break;
                     }
                 }
+                Err(e @ SoulseekError::InvalidResponse(_)) => {
+                    // Schema drift: slskd answered but its downloads list no
+                    // longer parses. That will not fix itself, so fail the
+                    // batch with the real error instead of polling forever
+                    // (pre-fix this surfaced as the misleading "Download
+                    // never appeared in slskd", issue #73).
+                    invalid_responses += 1;
+                    warn!(
+                        "Unparseable slskd downloads list ({}/{}): {}",
+                        invalid_responses, MAX_INVALID_RESPONSES, e
+                    );
+                    if invalid_responses >= MAX_INVALID_RESPONSES {
+                        self.fail_unprocessed_tracks(&format!(
+                            "Could not read slskd downloads list: {e}"
+                        ));
+                        break;
+                    }
+                }
                 Err(e) => {
+                    // Transport errors: don't break, slskd might recover
                     warn!("Error fetching download status from slskd: {}", e);
-                    // Don't break on transient errors - slskd might recover
                 }
             }
 
@@ -363,6 +404,7 @@ impl DownloadMonitor {
                 state.processed = false;
                 state.first_seen = None;
                 state.missing_since = None;
+                state.failing_since = None;
             }
         }
 
@@ -465,9 +507,21 @@ impl DownloadMonitor {
                     });
                 }
 
-                // Mark terminal states (errored/cancelled/aborted) as processed
-                if is_terminal_state(&download.state) && !is_completed(&download.state) {
-                    self.track_states.get_mut(&key).unwrap().processed = true;
+                // Mark terminal failures (errored/cancelled/aborted) as
+                // processed, but only once the failure has persisted for
+                // FAILED_STATE_CONFIRM: slskd 0.26 retries failures and
+                // briefly reports the failed state before re-queueing the
+                // transfer, and a re-queued transfer resets the clock.
+                let failed_now =
+                    is_terminal_state(&download.state) && !is_completed(&download.state);
+                let state = self.track_states.get_mut(&key).unwrap();
+                if failed_now {
+                    let failing_since = state.failing_since.get_or_insert_with(Instant::now);
+                    if failing_since.elapsed() >= FAILED_STATE_CONFIRM {
+                        state.processed = true;
+                    }
+                } else {
+                    state.failing_since = None;
                 }
             }
         }
@@ -547,11 +601,13 @@ impl DownloadMonitor {
     /// Check if all downloads are complete. Returns true if monitoring should stop.
     ///
     /// A track is settled when it was processed (imported, failed, or timed
-    /// out) or its transfer reached a terminal state. Settled must be judged
+    /// out) or its transfer completed successfully. Settled must be judged
     /// per track: in album mode completed tracks stay unprocessed until the
     /// whole batch is handled, so requiring all-processed or all-terminal
     /// across the batch would poll forever once one track is processed via
-    /// timeout while the rest sit completed.
+    /// timeout while the rest sit completed. Failed states settle through
+    /// `processed` only, after process_tracks confirms the failure persisted
+    /// (slskd 0.26 may retry it).
     async fn check_completion(&mut self, batch_status: &[DownloadProgress]) -> bool {
         let all_settled = self.filenames.iter().all(|fname| {
             let processed = self
@@ -559,12 +615,12 @@ impl DownloadMonitor {
                 .get(fname)
                 .map(|s| s.processed)
                 .unwrap_or(true);
-            let terminal = batch_status
+            let completed = batch_status
                 .iter()
                 .find(|d| filenames_match(&d.item, fname))
-                .map(|d| is_terminal_state(&d.state))
+                .map(|d| is_completed(&d.state))
                 .unwrap_or(false);
-            processed || terminal
+            processed || completed
         });
 
         if all_settled {

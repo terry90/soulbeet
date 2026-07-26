@@ -67,7 +67,12 @@ impl From<String> for DownloadState {
     }
 }
 
-// The exact structure of a single file entry
+/// A single transfer entry from slskd's downloads listing.
+///
+/// Mirrors the JSON slskd 0.26 serializes for its `Transfer` type. slskd
+/// omits null fields entirely (`WhenWritingNull`), and 0.26 stopped sending
+/// `stateDescription` (marked `[JsonIgnore]` upstream) and `startOffset`
+/// (property deleted) — requiring either fails every entry (#73).
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
@@ -76,11 +81,8 @@ pub struct FileEntry {
     pub direction: String,
     pub filename: String,
     pub size: u64,
-    #[serde(default)]
-    pub start_offset: u64,
     #[serde(deserialize_with = "deserialize_download_state")]
     pub state: Vec<DownloadState>,
-    pub state_description: String,
     pub requested_at: String,
     pub enqueued_at: Option<String>,
     #[serde(default)]
@@ -98,96 +100,6 @@ pub struct FileEntry {
     pub remaining_time: Option<String>,
     #[serde(default)]
     pub exception: Option<String>,
-}
-
-impl FileEntry {
-    pub fn get_state(&self) -> Vec<DownloadState> {
-        self.state.clone()
-    }
-
-    /// Create a new FileEntry from a DownloadResponse with a specified state.
-    ///
-    /// This is the primary factory method for creating FileEntry objects,
-    /// reducing code duplication in the download module.
-    pub fn from_download_response(
-        response: &DownloadResponse,
-        state: DownloadState,
-        state_description: String,
-    ) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            username: response.username.clone(),
-            direction: "Download".to_string(),
-            filename: response.filename.clone(),
-            size: response.size,
-            start_offset: 0,
-            state: vec![state],
-            state_description,
-            requested_at: chrono::Utc::now().to_rfc3339(),
-            enqueued_at: None,
-            started_at: None,
-            ended_at: None,
-            bytes_transferred: 0,
-            average_speed: 0.0,
-            bytes_remaining: response.size,
-            elapsed_time: None,
-            percent_complete: 0.0,
-            remaining_time: None,
-            exception: response.error.clone(),
-        }
-    }
-
-    /// Create a queued FileEntry from a DownloadResponse.
-    pub fn queued(response: &DownloadResponse) -> Self {
-        let mut entry = Self::from_download_response(
-            response,
-            DownloadState::Queued,
-            "Queued for download".to_string(),
-        );
-        entry.enqueued_at = Some(chrono::Utc::now().to_rfc3339());
-        entry
-    }
-
-    /// Create an errored FileEntry from a DownloadResponse.
-    pub fn errored(response: &DownloadResponse) -> Self {
-        Self::from_download_response(
-            response,
-            DownloadState::Errored,
-            response.error.clone().unwrap_or_default(),
-        )
-    }
-
-    /// Create a new FileEntry with a different state, preserving other fields.
-    pub fn with_state(mut self, state: DownloadState, description: String) -> Self {
-        self.state = vec![state];
-        self.state_description = description;
-        self
-    }
-
-    /// Create a timeout error entry from an existing FileEntry.
-    pub fn as_timeout(&self) -> Self {
-        Self {
-            id: self.id.clone(),
-            username: self.username.clone(),
-            direction: "Download".to_string(),
-            filename: self.filename.clone(),
-            size: self.size,
-            start_offset: 0,
-            state: vec![DownloadState::Errored],
-            state_description: "Download timed out after 1 hour".to_string(),
-            requested_at: self.requested_at.clone(),
-            enqueued_at: self.enqueued_at.clone(),
-            started_at: self.started_at.clone(),
-            ended_at: Some(chrono::Utc::now().to_rfc3339()),
-            bytes_transferred: self.bytes_transferred,
-            average_speed: self.average_speed,
-            bytes_remaining: self.bytes_remaining,
-            elapsed_time: self.elapsed_time.clone(),
-            percent_complete: self.percent_complete,
-            remaining_time: None,
-            exception: Some("Per-track timeout".to_string()),
-        }
-    }
 }
 
 /// Map slskd's TransferStates bitfield to a DownloadState.
@@ -303,72 +215,84 @@ where
     deserializer.deserialize_any(StateVisitor)
 }
 
-// Custom deserializer that flattens everything into Vec<FileEntry>
-fn deserialize_flattened_files<'de, D>(deserializer: D) -> Result<Vec<FileEntry>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    // First deserialize as generic JSON to traverse it manually
-    let v = Value::deserialize(deserializer)?;
+/// The slskd downloads listing flattened to its file entries.
+///
+/// slskd returns `[ { "username": "...", "directories": [ { "files": [...] } ] }, ... ]`;
+/// only the file entries matter. Entries that fail to parse are collected
+/// into `errors` instead of being dropped: a silent skip is indistinguishable
+/// from an empty transfer list, which is how the 0.26 schema drift surfaced
+/// as "Download never appeared in slskd" with nothing in the logs (#73).
+#[derive(Debug)]
+pub struct FlattenedFiles {
+    pub files: Vec<FileEntry>,
+    pub errors: Vec<String>,
+}
 
-    let mut files = Vec::new();
+/// Cap embedded JSON in error strings: they end up in logs and in the
+/// UI-facing failure reason, where a full transfer entry would be noise.
+fn truncated(value: &Value) -> String {
+    let s = value.to_string();
+    if s.len() <= 200 {
+        return s;
+    }
+    let mut end = 200;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
 
-    match &v {
-        Value::Array(users) => {
-            for user in users {
-                // The slskd API returns: [ { "username": "...", "directories": [...] }, ... ]
-                if let Some(directories) = user.get("directories").and_then(|d| d.as_array()) {
-                    for dir in directories {
-                        if let Some(dir_files) = dir.get("files").and_then(|f| f.as_array()) {
-                            for file in dir_files {
-                                match serde_json::from_value::<FileEntry>(file.clone()) {
-                                    Ok(file_entry) => files.push(file_entry),
-                                    Err(_) => continue,
-                                }
-                            }
-                        }
-                    }
-                }
+fn collect_user_files(user: &Value, out: &mut FlattenedFiles) {
+    let Some(directories) = user.get("directories").and_then(|d| d.as_array()) else {
+        out.errors
+            .push(format!("user entry without directories: {}", truncated(user)));
+        return;
+    };
+    for dir in directories {
+        let Some(dir_files) = dir.get("files").and_then(|f| f.as_array()) else {
+            out.errors
+                .push(format!("directory entry without files: {}", truncated(dir)));
+            continue;
+        };
+        for file in dir_files {
+            match serde_json::from_value::<FileEntry>(file.clone()) {
+                Ok(file_entry) => out.files.push(file_entry),
+                Err(e) => out.errors.push(format!("{e}; entry: {}", truncated(file))),
             }
-        }
-        Value::Object(obj) => {
-            // Handle case where response is a single object instead of array
-            if let Some(directories) = obj.get("directories").and_then(|d| d.as_array()) {
-                for dir in directories {
-                    if let Some(dir_files) = dir.get("files").and_then(|f| f.as_array()) {
-                        for file in dir_files {
-                            match serde_json::from_value::<FileEntry>(file.clone()) {
-                                Ok(file_entry) => files.push(file_entry),
-                                Err(_) => continue,
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {
-            // Unexpected format - return empty
         }
     }
-
-    Ok(files)
 }
-
-// Final struct you actually care about
-#[derive(Debug, Deserialize)]
-pub struct DownloadHistory {
-    #[serde(deserialize_with = "deserialize_flattened_files")]
-    pub files: Vec<FileEntry>,
-}
-
-pub struct FlattenedFiles(pub Vec<FileEntry>);
 
 impl<'de> Deserialize<'de> for FlattenedFiles {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserialize_flattened_files(deserializer).map(FlattenedFiles)
+        // Deserialize as generic JSON to traverse the grouping manually
+        let v = Value::deserialize(deserializer)?;
+
+        let mut out = FlattenedFiles {
+            files: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        match &v {
+            Value::Array(users) => {
+                for user in users {
+                    collect_user_files(user, &mut out);
+                }
+            }
+            // Handle case where response is a single object instead of array
+            Value::Object(_) => collect_user_files(&v, &mut out),
+            other => {
+                out.errors.push(format!(
+                    "unexpected downloads response shape: {}",
+                    truncated(other)
+                ));
+            }
+        }
+
+        Ok(out)
     }
 }
 
@@ -678,7 +602,6 @@ mod tests {
             "filename": "shared\\Artist\\Album\\01. Track.flac",
             "size": 1024,
             "state": state,
-            "stateDescription": "",
             "requestedAt": "2026-07-19T05:11:22Z",
             "bytesTransferred": 0,
             "bytesRemaining": 1024,
@@ -686,6 +609,85 @@ mod tests {
         }))
         .expect("FileEntry should deserialize");
         crate::download::DownloadProgress::from(entry).state
+    }
+
+    /// A verbatim `GET /api/v0/transfers/downloads` payload as slskd 0.26.0
+    /// serializes it: no `stateDescription` (marked [JsonIgnore] upstream),
+    /// no `startOffset` (property deleted), `removed` newly present, null
+    /// fields omitted entirely (WhenWritingNull). Requiring a field slskd
+    /// no longer sends makes every entry fail to parse, the transfer list
+    /// comes back empty, and completed downloads are never noticed (#73).
+    #[test]
+    fn parses_slskd_0_26_downloads_payload() {
+        let payload = json!([{
+            "username": "peer",
+            "directories": [{
+                "directory": "shared\\Artist\\Album",
+                "fileCount": 1,
+                "files": [{
+                    "id": "890f943c-02e1-4d45-af76-d55e3d855684",
+                    "username": "peer",
+                    "direction": "Download",
+                    "filename": "shared\\Artist\\Album\\01. Track.flac",
+                    "size": 1024,
+                    "state": "Completed, Succeeded",
+                    "requestedAt": "2026-07-19T05:11:22Z",
+                    "enqueuedAt": "2026-07-19T05:11:23Z",
+                    "startedAt": "2026-07-19T05:11:24Z",
+                    "endedAt": "2026-07-19T05:11:30Z",
+                    "bytesTransferred": 1024,
+                    "averageSpeed": 250000.0,
+                    "attempts": 1,
+                    "removed": false,
+                    "bytesRemaining": 0,
+                    "elapsedTime": "00:00:06",
+                    "percentComplete": 100.0,
+                    "remainingTime": "00:00:00"
+                }]
+            }]
+        }]);
+
+        let files: FlattenedFiles =
+            serde_json::from_value(payload).expect("payload should deserialize");
+        assert_eq!(files.files.len(), 1, "transfer entry was silently dropped");
+        assert_eq!(
+            crate::download::DownloadProgress::from(files.files[0].clone()).state,
+            DS::Completed
+        );
+    }
+
+    /// Entries that fail to parse must be reported, not silently skipped:
+    /// a silent skip is indistinguishable from "no downloads in progress",
+    /// which is exactly how the 0.26 schema drift went unnoticed.
+    #[test]
+    fn flattener_surfaces_parse_errors() {
+        let payload = json!([{
+            "username": "peer",
+            "directories": [{
+                "directory": "d",
+                "fileCount": 2,
+                "files": [
+                    {
+                        "id": "890f943c-02e1-4d45-af76-d55e3d855684",
+                        "username": "peer",
+                        "direction": "Download",
+                        "filename": "d\\a.flac",
+                        "size": 1024,
+                        "state": "InProgress",
+                        "requestedAt": "2026-07-19T05:11:22Z",
+                        "bytesTransferred": 0,
+                        "bytesRemaining": 1024,
+                        "percentComplete": 0.0
+                    },
+                    { "garbage": true }
+                ]
+            }]
+        }]);
+
+        let files: FlattenedFiles =
+            serde_json::from_value(payload).expect("payload should deserialize");
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.errors.len(), 1, "parse failure was swallowed");
     }
 
     #[test]

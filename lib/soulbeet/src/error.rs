@@ -25,6 +25,9 @@ pub enum SoulseekError {
 
     #[error("Could not find a username for the given download ID")]
     UsernameNotFound,
+
+    #[error("Unparseable slskd response: {0}")]
+    InvalidResponse(String),
 }
 
 impl SoulseekError {

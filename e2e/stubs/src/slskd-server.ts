@@ -6,7 +6,14 @@ import type { PeerBehavior } from '../../fixtures/dataset.js';
 import { createStubServer, sendEmpty, sendJson, sendText } from './router.js';
 import type { SlskdState } from './slskd-state.js';
 
-const VALID_BEHAVIORS: PeerBehavior[] = ['happy', 'ghost', 'flaky', 'stall', 'offline'];
+const VALID_BEHAVIORS: PeerBehavior[] = [
+  'happy',
+  'ghost',
+  'flaky',
+  'retryflap',
+  'stall',
+  'offline',
+];
 
 export function createSlskdServer(state: SlskdState, apiKey: string): Server {
   return createStubServer({

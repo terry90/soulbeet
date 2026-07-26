@@ -92,6 +92,28 @@ test('surfaces a mid-transfer error and recovers on retry', async ({ context, pa
   await expectFileAppears(imported, 120_000);
 });
 
+test('rides out slskd auto-retry of a failed transfer', async ({ context, page }) => {
+  // slskd 0.26 retries failed downloads itself: the transfer briefly shows
+  // "Completed, Errored", then re-queues and succeeds. The monitor must not
+  // act on the transient failure; the proof is that the file still imports.
+  await setPeerBehavior('collector_01', 'retryflap');
+  await setPeerBehavior('mp3_hoarder', 'offline');
+  const { folder } = await freshSession(context, page, 'fail-retryflap');
+
+  await performSearch(page, 'Paper Lanterns', 'TRACK');
+  const row = page.locator('li').filter({ hasText: 'Paper Lanterns' }).first();
+  await row.getByRole('button', { name: 'Download' }).click();
+
+  const imported = importedTrackPath(
+    folder.name,
+    glassAtlas.artist,
+    glassAtlas.title,
+    'Paper Lanterns',
+    'flac',
+  );
+  await expectFileAppears(imported, 120_000);
+});
+
 test('reports a failed search when slskd is unreachable', async ({ context, page }) => {
   await freshSession(context, page, 'fail-outage');
   await setOutage(true);

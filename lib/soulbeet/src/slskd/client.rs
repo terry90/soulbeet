@@ -233,17 +233,16 @@ impl SoulseekClient {
     async fn handle_response<T: DeserializeOwned>(response: Response) -> Result<T> {
         let status = response.status();
         if status.is_success() {
+            // A 2xx body that does not parse is schema drift, not an API
+            // error: InvalidResponse lets callers distinguish it from
+            // transport failures (the download monitor bounds it).
             let text = response.text().await?;
             if text.trim().is_empty() {
-                serde_json::from_str("null").map_err(|e| SoulseekError::Api {
-                    status: status.as_u16(),
-                    message: format!("JSON parse error: {e}"),
-                })
+                serde_json::from_str("null")
+                    .map_err(|e| SoulseekError::InvalidResponse(format!("JSON parse error: {e}")))
             } else {
-                serde_json::from_str(&text).map_err(|e| SoulseekError::Api {
-                    status: status.as_u16(),
-                    message: format!("JSON parse error: {e}"),
-                })
+                serde_json::from_str(&text)
+                    .map_err(|e| SoulseekError::InvalidResponse(format!("JSON parse error: {e}")))
             }
         } else {
             let text = response
@@ -937,7 +936,24 @@ impl SoulseekClient {
         let flattened: FlattenedFiles = self
             .make_request(Method::GET, "transfers/downloads", None::<()>)
             .await?;
-        Ok(flattened.0)
+        if !flattened.errors.is_empty() {
+            if flattened.files.is_empty() {
+                // Every entry failed to parse: schema drift, not an empty
+                // queue. Returning Ok([]) here is what made slskd 0.26 look
+                // like downloads never appeared (#73).
+                return Err(SoulseekError::InvalidResponse(format!(
+                    "all {} transfer entries failed to parse; first error: {}",
+                    flattened.errors.len(),
+                    flattened.errors[0]
+                )));
+            }
+            warn!(
+                "Skipped {} unparseable slskd transfer entries; first error: {}",
+                flattened.errors.len(),
+                flattened.errors[0]
+            );
+        }
+        Ok(flattened.files)
     }
 
     pub async fn cancel_download(
