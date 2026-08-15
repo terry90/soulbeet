@@ -742,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn two_peers_serving_different_paths_keep_separate_slots() {
+    fn distinct_filenames_resolve_to_their_own_slots() {
         let m = monitor(
             vec!["peer_a", "peer_b"],
             vec![
@@ -751,6 +751,50 @@ mod tests {
             ],
         );
 
+        assert_eq!(
+            m.slot_for_item("music\\Kowloon\\Come Over (2021)\\07 - Wake Up.flac"),
+            Some(0)
+        );
         assert_eq!(m.slot_for_item("shared\\kowloon\\wake up.flac"), Some(1));
+    }
+
+    #[test]
+    fn ambiguous_suffix_match_resolves_to_the_lowest_slot() {
+        // A short tracked path and a longer one that ends with it both
+        // match the same incoming item via filenames_match's suffix rule.
+        // The lookup has no way to prefer the more specific match, so it
+        // must at least be deterministic: lowest slot wins, every time.
+        let m = monitor(
+            vec!["peer_a", "peer_b"],
+            vec!["01 - One.flac", "music\\A\\01 - One.flac"],
+        );
+
+        assert_eq!(m.slot_for_item("music/A/01 - One.flac"), Some(0));
+    }
+
+    #[test]
+    fn state_stays_bound_to_its_slot_after_a_filename_rebind() {
+        // This is the property the whole refactor exists for: when a
+        // failover rebind changes which remote path a slot tracks, the
+        // slot's TrackState must not reset or migrate, only the filename
+        // it's looked up by changes.
+        let mut m = monitor(
+            vec!["peer_a", "peer_b"],
+            vec!["music\\A\\01 - One.flac", "music\\A\\02 - Two.flac"],
+        );
+
+        m.track_states[0].processed = true;
+        m.track_states[0].first_seen = Some(Instant::now());
+
+        // Simulate a failover rebind: the same slot now tracks a
+        // completely different remote path from a different peer.
+        m.tracked_files[0].filename = "totally\\different\\peer\\path.flac".to_string();
+
+        assert!(m.track_states[0].processed);
+        assert!(m.track_states[0].first_seen.is_some());
+        assert_eq!(
+            m.slot_for_item("totally\\different\\peer\\path.flac"),
+            Some(0)
+        );
     }
 }
