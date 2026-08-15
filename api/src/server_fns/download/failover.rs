@@ -7,8 +7,11 @@
 //! attempt budget; the waiters (`DownloadMonitor`, discovery's poll loop)
 //! decide *when* a transfer has definitively failed.
 
-use shared::download::{DownloadableGroup, DownloadableItem};
+use shared::download::{DownloadableGroup, DownloadableItem, QueuedDownload};
+use soulbeet::DownloadBackend;
 use std::collections::VecDeque;
+use std::sync::Arc;
+use tracing::{info, warn};
 
 /// Sources tried per track before it is declared failed: the peer picked at
 /// search time plus three alternates. slskd retries each peer 3 times on its
@@ -86,12 +89,43 @@ impl SourcePool {
         slot.used += 1;
         Some(item)
     }
+
+    /// Enqueue this slot's next alternate. Walks past alternates the backend
+    /// rejects (peer offline, file already in slskd's list) so one bad
+    /// candidate does not cost a whole poll cycle. `None` means the slot is
+    /// out of sources or budget.
+    pub async fn enqueue_next(
+        &mut self,
+        slot: usize,
+        backend: &Arc<dyn DownloadBackend>,
+    ) -> Option<QueuedDownload> {
+        while let Some(item) = self.take_next(slot) {
+            let source = item.source.clone();
+            match backend.download(vec![item]).await {
+                Ok(queued) => {
+                    if let Some(ok) = queued.into_iter().find(|d| d.error.is_none()) {
+                        info!("Failover enqueued {} from {}", ok.item, ok.source);
+                        return Some(ok);
+                    }
+                    warn!("Failover source {} rejected the enqueue", source);
+                }
+                Err(e) => warn!("Failover enqueue to {} failed: {}", source, e),
+            }
+        }
+        None
+    }
 }
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use shared::download::{DownloadProgress, QueuedDownload, SearchResult};
     use shared::download::{DownloadableGroup, DownloadableItem};
+    use shared::metadata::{Album, Track};
+    use soulbeet::error::Result as SoulResult;
+    use soulbeet::DownloadBackend;
+    use std::sync::{Arc, Mutex};
 
     fn item(source: &str, title: &str, id: &str) -> DownloadableItem {
         DownloadableItem {
@@ -197,5 +231,105 @@ mod tests {
         let mut pool = SourcePool::single(vec![item("peer_a", "Wake Up", "a.flac")]);
         assert!(pool.take_next(0).is_none());
         assert!(pool.take_next(9).is_none());
+    }
+
+    /// Records every enqueue and answers each one from a scripted list.
+    struct StubBackend {
+        /// One entry per expected call: Some(source) enqueues, None errors.
+        script: Mutex<Vec<Option<String>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl StubBackend {
+        fn new(script: Vec<Option<String>>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DownloadBackend for StubBackend {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+        fn name(&self) -> &'static str {
+            "Stub"
+        }
+        async fn start_search(&self, _album: Option<&Album>, _tracks: &[Track]) -> SoulResult<String> {
+            Ok("search".to_string())
+        }
+        async fn poll_search(&self, _search_id: &str) -> SoulResult<SearchResult> {
+            unreachable!("failover never searches")
+        }
+        async fn download(&self, items: Vec<DownloadableItem>) -> SoulResult<Vec<QueuedDownload>> {
+            let item = items.into_iter().next().expect("one item per enqueue");
+            self.calls.lock().unwrap().push(item.source.clone());
+            let outcome = {
+                let mut script = self.script.lock().unwrap();
+                if script.is_empty() {
+                    None
+                } else {
+                    script.remove(0)
+                }
+            };
+            Ok(vec![QueuedDownload {
+                id: item.id.clone(),
+                source: item.source.clone(),
+                item: item.id.clone(),
+                size: item.size.unwrap_or(0),
+                error: outcome.is_none().then(|| "peer offline".to_string()),
+            }])
+        }
+        async fn get_downloads(&self) -> SoulResult<Vec<DownloadProgress>> {
+            Ok(Vec::new())
+        }
+        async fn cancel_download(&self, _u: &str, _id: &str, _remove: bool) -> SoulResult<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueues_the_next_alternate() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![Some("peer_b".into())]);
+
+        let queued = pool.enqueue_next(0, &backend).await.expect("enqueued");
+        assert_eq!(queued.source, "peer_b");
+    }
+
+    #[tokio::test]
+    async fn skips_an_alternate_whose_enqueue_errors() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+            item("peer_c", "Wake Up", "c.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        // peer_b's enqueue fails, peer_c's succeeds
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![None, Some("peer_c".into())]);
+
+        let queued = pool.enqueue_next(0, &backend).await.expect("enqueued");
+        assert_eq!(queued.source, "peer_c");
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_every_alternate_fails() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![None]);
+
+        assert!(pool.enqueue_next(0, &backend).await.is_none());
     }
 }

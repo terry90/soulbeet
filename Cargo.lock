@@ -123,6 +123,7 @@ version = "0.6.1"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "async-trait",
  "axum",
  "base64",
  "chrono",
