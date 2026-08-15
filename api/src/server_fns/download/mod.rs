@@ -36,8 +36,10 @@ pub mod process;
 #[cfg(feature = "server")]
 pub mod utils;
 
+// Shared with the tests of sibling modules outside `download`, so it cannot
+// stay private to this one.
 #[cfg(all(test, feature = "server"))]
-mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(feature = "server")]
 use self::monitor::DownloadMonitor;

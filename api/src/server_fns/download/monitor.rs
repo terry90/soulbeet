@@ -761,7 +761,7 @@ fn make_failed_progress(tracked: &TrackedFile, reason: &str) -> DownloadProgress
 }
 
 /// Check if a download state indicates a terminal state (complete or failed).
-fn is_terminal_state(state: &DownloadState) -> bool {
+pub(crate) fn is_terminal_state(state: &DownloadState) -> bool {
     matches!(
         state,
         DownloadState::Completed
