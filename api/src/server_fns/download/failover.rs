@@ -149,6 +149,22 @@ mod tests {
     }
 
     #[test]
+    fn alternates_follow_the_order_of_the_remaining_groups() {
+        let picked = group("peer_a", vec![item("peer_a", "Wake Up", "a.flac")], 1.0);
+        let rest = vec![
+            group("peer_b", vec![item("peer_b", "Wake Up", "b.flac")], 0.9),
+            group("peer_c", vec![item("peer_c", "Wake Up", "c.flac")], 0.8),
+            group("peer_d", vec![item("peer_d", "Wake Up", "d.flac")], 0.7),
+        ];
+
+        let mut pool = SourcePool::from_groups(&picked, &rest);
+        assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_b".into()));
+        assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_c".into()));
+        assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_d".into()));
+        assert!(pool.take_next(0).is_none());
+    }
+
+    #[test]
     fn ignores_alternates_for_a_different_title() {
         let picked = group("peer_a", vec![item("peer_a", "Wake Up", "a.flac")], 1.0);
         let rest = vec![group(
