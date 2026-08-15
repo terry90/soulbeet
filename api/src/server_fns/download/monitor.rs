@@ -54,8 +54,13 @@ const MAX_INVALID_RESPONSES: u32 = 15;
 const FAILED_STATE_CONFIRM: Duration = Duration::from_secs(4);
 
 /// State tracking for individual track downloads.
-#[derive(Default)]
 struct TrackState {
+    /// When this slot was bound to its current peer and remote path. Reset on
+    /// every rebind, so the never-appeared window measures the age of THIS
+    /// binding. A batch-wide clock would declare a slot that just failed over
+    /// absent on the same poll, because the alternate's path cannot appear in
+    /// a transfer list that was fetched before it was enqueued.
+    bound_at: Instant,
     /// When the track was first seen in slskd's download list.
     first_seen: Option<Instant>,
     /// When the track went missing from slskd's list after being seen.
@@ -64,6 +69,20 @@ struct TrackState {
     failing_since: Option<Instant>,
     /// Whether this track has been processed (imported or marked as failed).
     processed: bool,
+}
+
+impl TrackState {
+    /// Fresh state for a slot bound to a peer right now. Every construction
+    /// site is a binding or a rebinding, so there is no meaningful `Default`.
+    fn bound_now() -> Self {
+        Self {
+            bound_at: Instant::now(),
+            first_seen: None,
+            missing_since: None,
+            failing_since: None,
+            processed: false,
+        }
+    }
 }
 
 /// A tracked download identified by source peer and filename.
@@ -89,8 +108,6 @@ pub struct DownloadMonitor {
     album_mode: bool,
     /// Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
-    /// When monitoring started, for the never-appeared timeout.
-    started_at: Instant,
     /// Username for logging.
     username: String,
     /// Batch identifier for grouping downloads.
@@ -118,7 +135,7 @@ impl DownloadMonitor {
             .collect();
 
         let track_states = (0..tracked_files.len())
-            .map(|_| TrackState::default())
+            .map(|_| TrackState::bound_now())
             .collect();
 
         Self {
@@ -129,7 +146,6 @@ impl DownloadMonitor {
             pool: None,
             album_mode: CONFIG.is_album_mode(),
             cancellation_token,
-            started_at: Instant::now(),
             username,
             batch_id,
             batch_label,
@@ -182,7 +198,7 @@ impl DownloadMonitor {
             source: queued.source.clone(),
             filename: queued.item.clone(),
         };
-        self.track_states[slot] = TrackState::default();
+        self.track_states[slot] = TrackState::bound_now();
 
         let entry = DownloadProgress::queued(queued.id, queued.source, queued.item, queued.size);
         let entries = self.stamp_batch(vec![entry]);
@@ -465,7 +481,7 @@ impl DownloadMonitor {
             );
             tracked.source = new_source;
             // Reset state so the retried transfer is monitored and imported
-            self.track_states[idx] = TrackState::default();
+            self.track_states[idx] = TrackState::bound_now();
         }
 
         matched
@@ -615,7 +631,7 @@ impl DownloadMonitor {
             }
 
             let absent_reason = match self.track_states[slot].first_seen {
-                None if self.started_at.elapsed() > ABSENT_TRACK_TIMEOUT => {
+                None if self.track_states[slot].bound_at.elapsed() > ABSENT_TRACK_TIMEOUT => {
                     Some("Download never appeared in slskd")
                 }
                 Some(_) => {
@@ -629,15 +645,17 @@ impl DownloadMonitor {
             };
 
             if let Some(reason) = absent_reason {
+                // Logged only once the track is really being written off:
+                // a successful failover reports its own retry instead.
+                if self.try_failover(slot, backend, reason).await {
+                    continue;
+                }
                 warn!(
                     "{} after {}s, marking failed: {}",
                     reason,
                     ABSENT_TRACK_TIMEOUT.as_secs(),
                     filename
                 );
-                if self.try_failover(slot, backend, reason).await {
-                    continue;
-                }
                 self.track_states[slot].processed = true;
                 failed.push(make_failed_progress(&self.tracked_files[slot], reason));
             }
@@ -794,7 +812,40 @@ pub fn filenames_match(a: &str, b: &str) -> bool {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::server_fns::download::test_support::{item, ScriptedOutcome, StubBackend};
     use tokio::sync::broadcast;
+
+    /// An instant `d` in the past, so a test can reach the monitor's
+    /// elapsed-time windows without sleeping through them.
+    fn ago(d: Duration) -> Instant {
+        Instant::from_std(
+            std::time::Instant::now()
+                .checked_sub(d)
+                .expect("monotonic clock younger than the window under test"),
+        )
+    }
+
+    /// A slskd transfer of `filename` from `source` in a failed terminal state.
+    fn failed_transfer(source: &str, filename: &str) -> DownloadProgress {
+        DownloadProgress {
+            state: DownloadState::Failed("peer went away".into()),
+            ..DownloadProgress::queued(
+                filename.to_string(),
+                source.to_string(),
+                filename.to_string(),
+                0,
+            )
+        }
+    }
+
+    /// A monitor watching one track, with two alternates behind it.
+    fn failover_monitor() -> DownloadMonitor {
+        monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]).with_failover(SourcePool::single(vec![
+            item("peer_a", "Wake Up", "dirA/aaa.flac"),
+            item("peer_b", "Wake Up", "dirB/bbb.flac"),
+            item("peer_c", "Wake Up", "dirC/ccc.flac"),
+        ]))
+    }
 
     fn monitor(sources: Vec<&str>, filenames: Vec<&str>) -> DownloadMonitor {
         let (tx, _rx) = broadcast::channel(16);
@@ -808,6 +859,71 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn one_failure_fails_over_once_per_poll() {
+        // process_tracks and handle_absent_tracks run back to back on the SAME
+        // batch_status. Once process_tracks has rebound the slot, the
+        // alternate's path cannot be in that already-fetched list, so a slot
+        // whose absence window ran from the batch's start would be declared
+        // "never appeared" and fail over a second time in the same poll,
+        // orphaning the transfer just enqueued.
+        let mut m = failover_monitor();
+        let backend: Arc<dyn DownloadBackend> =
+            StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
+
+        // Old enough that a batch-wide clock would consider it absent, with a
+        // failure that has already outlived the confirmation window.
+        m.track_states[0].bound_at = ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1));
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        let batch_status = vec![failed_transfer("peer_a", "dirA/aaa.flac")];
+        m.process_tracks(&batch_status, &backend).await;
+        m.handle_absent_tracks(&batch_status, &backend).await;
+
+        assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 2);
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+        assert_eq!(m.tracked_files[0].filename, "dirB/bbb.flac");
+        assert!(!m.track_states[0].processed);
+    }
+
+    #[tokio::test]
+    async fn the_absence_window_restarts_on_every_rebind() {
+        // The same guarantee stated directly: a slot that has just been
+        // rebound is young, however old the batch is.
+        let mut m = failover_monitor();
+        let backend: Arc<dyn DownloadBackend> =
+            StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
+        m.track_states[0].bound_at = ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1));
+
+        // Nothing for this track anywhere in slskd's list.
+        m.handle_absent_tracks(&[], &backend).await;
+        assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 2);
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+
+        // The rebind reset the window, so the next sweep leaves it alone.
+        m.handle_absent_tracks(&[], &backend).await;
+        assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 2);
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_transfer_settles_without_failing_over() {
+        let mut m = failover_monitor();
+        let backend: Arc<dyn DownloadBackend> =
+            StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        let cancelled = DownloadProgress {
+            state: DownloadState::Cancelled,
+            ..failed_transfer("peer_a", "dirA/aaa.flac")
+        };
+        m.process_tracks(&[cancelled], &backend).await;
+
+        assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 1);
+        assert_eq!(m.tracked_files[0].source, "peer_a");
+        assert!(m.track_states[0].processed);
     }
 
     #[test]

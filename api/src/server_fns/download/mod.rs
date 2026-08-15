@@ -36,6 +36,9 @@ pub mod process;
 #[cfg(feature = "server")]
 pub mod utils;
 
+#[cfg(all(test, feature = "server"))]
+mod test_support;
+
 #[cfg(feature = "server")]
 use self::monitor::DownloadMonitor;
 

@@ -4,8 +4,7 @@ use shared::download::DownloadQuery;
 
 #[cfg(feature = "server")]
 use shared::download::{
-    AutoDownloadEvent, DownloadEvent, DownloadProgress, DownloadableGroup, DownloadableItem,
-    SearchState,
+    AutoDownloadEvent, DownloadEvent, DownloadProgress, DownloadableGroup, SearchState,
 };
 
 #[cfg(feature = "server")]
@@ -23,7 +22,7 @@ use crate::services::{available_download_backends, download_backend};
 use crate::AuthSession;
 
 #[cfg(feature = "server")]
-use super::failover::SourcePool;
+use super::failover::{align_pool_tracks, SourcePool};
 #[cfg(feature = "server")]
 use super::monitor::DownloadMonitor;
 
@@ -361,19 +360,9 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             successful.iter().map(|d| d.item.clone()).collect();
 
         // Pool slots must line up with the monitor's slots, which follow
-        // `successful`, not `picked.items`: slskd returns enqueue results
-        // grouped by peer and destination in HashMap order.
-        let enqueued: Vec<Option<DownloadableItem>> = successful
-            .iter()
-            .map(|d| {
-                picked
-                    .items
-                    .iter()
-                    .find(|item| item.id == d.item && item.source == d.source)
-                    .cloned()
-            })
-            .collect();
-        let pool = SourcePool::from_tracks(&enqueued, &all_groups);
+        // `successful`, not `picked.items`.
+        let pool =
+            SourcePool::from_tracks(&align_pool_tracks(&successful, &picked.items), &all_groups);
 
         info!(
             "Auto-download: queued {} tracks, starting monitor for '{}'",

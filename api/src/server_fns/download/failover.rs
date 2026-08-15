@@ -137,44 +137,68 @@ impl SourcePool {
     }
 }
 
+/// Line the accepted downloads up with the tracks they came from, in the
+/// order the caller will monitor them.
+///
+/// `queued` is neither the order nor the length of `items`: slskd groups an
+/// enqueue by peer and destination directory and returns the groups in
+/// HashMap order, items whose backend data will not parse are dropped before
+/// the request is sent, and rejected enqueues are filtered out by the caller.
+/// Feeding `items` straight to `from_tracks` would hand slot N the alternates
+/// of a different track.
+///
+/// Matching keys on both `id` and `source`: `QueuedDownload::item` is the
+/// item's `id` verbatim, both being the remote filename, and the same
+/// filename can be offered by more than one peer. A download that matches no
+/// item stays `None` so the slots after it keep their index.
+pub fn align_pool_tracks(
+    queued: &[QueuedDownload],
+    items: &[DownloadableItem],
+) -> Vec<Option<DownloadableItem>> {
+    queued
+        .iter()
+        .map(|d| {
+            items
+                .iter()
+                .find(|item| item.id == d.item && item.source == d.source)
+                .cloned()
+        })
+        .collect()
+}
+
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use shared::download::{DownloadProgress, QueuedDownload, SearchResult};
-    use shared::download::{DownloadableGroup, DownloadableItem};
-    use shared::metadata::{Album, Track};
-    use soulbeet::error::{Result as SoulResult, SoulseekError};
+    use crate::server_fns::download::test_support::{group, item, ScriptedOutcome, StubBackend};
+    use shared::download::DownloadableItem;
     use soulbeet::DownloadBackend;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    fn item(source: &str, title: &str, id: &str) -> DownloadableItem {
-        DownloadableItem {
-            id: id.to_string(),
+    fn queued(source: &str, item: &str) -> QueuedDownload {
+        QueuedDownload {
+            id: item.to_string(),
             source: source.to_string(),
-            title: title.to_string(),
-            artist: "Kowloon".to_string(),
-            album: "Come Over".to_string(),
-            size: Some(27_213_250),
-            duration: Some(200),
-            quality: "FLAC".to_string(),
-            quality_score: 1.0,
-            backend_data: None,
+            item: item.to_string(),
+            size: 0,
+            error: None,
         }
     }
 
-    fn group(source: &str, items: Vec<DownloadableItem>, score: f64) -> DownloadableGroup {
-        DownloadableGroup {
-            source: source.to_string(),
-            group_id: format!("{source}/group"),
-            title: "Come Over".to_string(),
-            artist: Some("Kowloon".to_string()),
-            item_count: items.len(),
-            total_size: 0,
-            items,
-            quality: "FLAC".to_string(),
-            score,
-        }
+    /// The ids `align_pool_tracks` lands in each slot, `None` for a gap.
+    fn aligned_ids(queued: &[QueuedDownload], items: &[DownloadableItem]) -> Vec<Option<String>> {
+        align_pool_tracks(queued, items)
+            .into_iter()
+            .map(|track| track.map(|i| i.id))
+            .collect()
+    }
+
+    /// Three tracks of one album as the search returned them, `dirA` first.
+    fn searched() -> Vec<DownloadableItem> {
+        vec![
+            item("peer_a", "One", "dirA/01.flac"),
+            item("peer_a", "Two", "dirB/02.flac"),
+            item("peer_a", "Three", "dirB/03.flac"),
+        ]
     }
 
     #[test]
@@ -217,6 +241,88 @@ mod tests {
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_c".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_d".into()));
         assert!(pool.take_next(0).is_none());
+    }
+
+    #[test]
+    fn align_pool_tracks_follows_the_enqueue_order() {
+        // slskd split the album by destination directory and returned the
+        // dirB group first. Returning `items` in search order here would give
+        // slot 0 the alternates for "One" while the monitor watches "Two".
+        let items = searched();
+        let accepted = vec![
+            queued("peer_a", "dirB/02.flac"),
+            queued("peer_a", "dirB/03.flac"),
+            queued("peer_a", "dirA/01.flac"),
+        ];
+
+        assert_eq!(
+            aligned_ids(&accepted, &items),
+            vec![
+                Some("dirB/02.flac".to_string()),
+                Some("dirB/03.flac".to_string()),
+                Some("dirA/01.flac".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn align_pool_tracks_skips_an_item_dropped_before_enqueue() {
+        // "Two" had unparseable backend data, so to_slskd_track dropped it and
+        // slskd was never asked about it. Three items, two slots.
+        let items = searched();
+        let accepted = vec![
+            queued("peer_a", "dirA/01.flac"),
+            queued("peer_a", "dirB/03.flac"),
+        ];
+
+        assert_eq!(
+            aligned_ids(&accepted, &items),
+            vec![
+                Some("dirA/01.flac".to_string()),
+                Some("dirB/03.flac".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn align_pool_tracks_skips_a_rejected_enqueue() {
+        // "Two" came back with an error and the caller partitioned it out, and
+        // the survivors arrived in destination order rather than search order.
+        let items = searched();
+        let accepted = vec![
+            queued("peer_a", "dirB/03.flac"),
+            queued("peer_a", "dirA/01.flac"),
+        ];
+
+        assert_eq!(
+            aligned_ids(&accepted, &items),
+            vec![
+                Some("dirB/03.flac".to_string()),
+                Some("dirA/01.flac".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn align_pool_tracks_leaves_an_unrecognised_download_as_a_gap() {
+        // Same remote filename, different peer: the source half of the key
+        // must stop it matching, and the slot must stay in place so the
+        // download after it is not shifted down.
+        let items = searched();
+        let accepted = vec![
+            queued("peer_a", "dirA/01.flac"),
+            queued("peer_z", "dirB/02.flac"),
+            queued("peer_a", "dirB/03.flac"),
+        ];
+
+        assert_eq!(
+            aligned_ids(&accepted, &items),
+            vec![
+                Some("dirA/01.flac".to_string()),
+                None,
+                Some("dirB/03.flac".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -313,87 +419,6 @@ mod tests {
         let mut pool = SourcePool::single(vec![item("peer_a", "Wake Up", "a.flac")]);
         assert!(pool.take_next(0).is_none());
         assert!(pool.take_next(9).is_none());
-    }
-
-    /// What a scripted `download` call does: accept the item, accept the
-    /// call but mark the item rejected (peer offline, already queued
-    /// elsewhere), or fail the call itself (transport error).
-    enum ScriptedOutcome {
-        Enqueued,
-        Rejected,
-        TransportError,
-    }
-
-    /// Records every enqueue and answers each one from a scripted list.
-    struct StubBackend {
-        script: Mutex<Vec<ScriptedOutcome>>,
-        calls: Mutex<Vec<String>>,
-    }
-
-    impl StubBackend {
-        fn new(script: Vec<ScriptedOutcome>) -> Arc<Self> {
-            Arc::new(Self {
-                script: Mutex::new(script),
-                calls: Mutex::new(Vec::new()),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl DownloadBackend for StubBackend {
-        fn id(&self) -> &'static str {
-            "stub"
-        }
-        fn name(&self) -> &'static str {
-            "Stub"
-        }
-        async fn start_search(&self, _album: Option<&Album>, _tracks: &[Track]) -> SoulResult<String> {
-            Ok("search".to_string())
-        }
-        async fn poll_search(&self, _search_id: &str) -> SoulResult<SearchResult> {
-            unreachable!("failover never searches")
-        }
-        async fn download(&self, items: Vec<DownloadableItem>) -> SoulResult<Vec<QueuedDownload>> {
-            let item = items.into_iter().next().expect("one item per enqueue");
-            self.calls.lock().unwrap().push(item.source.clone());
-            let outcome = {
-                let mut script = self.script.lock().unwrap();
-                if script.is_empty() {
-                    ScriptedOutcome::Rejected
-                } else {
-                    script.remove(0)
-                }
-            };
-            match outcome {
-                ScriptedOutcome::Enqueued => Ok(vec![QueuedDownload {
-                    id: item.id.clone(),
-                    source: item.source.clone(),
-                    item: item.id.clone(),
-                    size: item.size.unwrap_or(0),
-                    error: None,
-                }]),
-                ScriptedOutcome::Rejected => Ok(vec![QueuedDownload {
-                    id: item.id.clone(),
-                    source: item.source.clone(),
-                    item: item.id.clone(),
-                    size: item.size.unwrap_or(0),
-                    error: Some("peer offline".to_string()),
-                }]),
-                // LockError stands in for any transport-level failure; its
-                // meaning doesn't matter here, only that `download` itself
-                // errors rather than returning an Ok with a rejected item.
-                ScriptedOutcome::TransportError => Err(SoulseekError::LockError),
-            }
-        }
-        async fn get_downloads(&self) -> SoulResult<Vec<DownloadProgress>> {
-            Ok(Vec::new())
-        }
-        async fn cancel_download(&self, _u: &str, _id: &str, _remove: bool) -> SoulResult<()> {
-            Ok(())
-        }
-        async fn health_check(&self) -> bool {
-            true
-        }
     }
 
     #[tokio::test]
