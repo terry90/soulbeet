@@ -420,10 +420,14 @@ impl DownloadMonitor {
                     MAX_CONSECUTIVE_EMPTY * 2,
                     self.filenames()
                 );
-                // Without this, rows whose transfer never surfaced in slskd
-                // would sit at "Queued" in the UI forever.
-                self.fail_unprocessed_tracks("Download never appeared in slskd");
-                return true;
+                if self.retry_or_fail_absent_batch(backend).await {
+                    return true;
+                }
+                // At least one slot moved to another peer. Its alternate
+                // cannot show up in a list fetched before it was enqueued, so
+                // the grace window starts again from here.
+                *consecutive_empty = 0;
+                return false;
             }
             if (*consecutive_empty).is_multiple_of(5) {
                 info!(
@@ -700,6 +704,45 @@ impl DownloadMonitor {
             let entries = self.stamp_batch(failed);
             let _ = self.tx.send(DownloadEvent::Progress(entries));
         }
+    }
+
+    /// Give every unsettled slot another peer after a batch's transfers never
+    /// showed up in slskd at all, and write off only the ones with nowhere
+    /// left to go. Returns true when nothing was retried, i.e. the batch is
+    /// finished.
+    ///
+    /// This is the only failover route a single-track batch has on this path:
+    /// while nothing of the batch matches, `process_poll_result` returns
+    /// before `process_tracks` and `handle_absent_tracks` ever run, and the
+    /// empty-poll fuse burns out at 30s, well inside the 120s those two wait.
+    /// A batch with more than one track only reaches them because a sibling
+    /// keeps the batch non-empty.
+    async fn retry_or_fail_absent_batch(&mut self, backend: &Arc<dyn DownloadBackend>) -> bool {
+        const REASON: &str = "Download never appeared in slskd";
+        let mut retried = false;
+        let mut failed: Vec<DownloadProgress> = Vec::new();
+
+        for slot in 0..self.tracked_files.len() {
+            if self.track_states[slot].processed {
+                continue;
+            }
+            // Nothing of this batch is in slskd's list, so there is no
+            // transfer for the failover to drop.
+            if self.try_failover(slot, backend, REASON, &[]).await {
+                retried = true;
+                continue;
+            }
+            // Without this, rows whose transfer never surfaced in slskd would
+            // sit at "Queued" in the UI forever.
+            self.track_states[slot].processed = true;
+            failed.push(make_failed_progress(&self.tracked_files[slot], REASON));
+        }
+
+        if !failed.is_empty() {
+            let entries = self.stamp_batch(failed);
+            let _ = self.tx.send(DownloadEvent::Progress(entries));
+        }
+        !retried
     }
 
     /// Mark every unprocessed track as failed and notify the UI. Used when
@@ -1022,6 +1065,42 @@ mod tests {
         m.handle_absent_tracks(&[], &backend).await;
         assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 2);
         assert_eq!(m.tracked_files[0].source, "peer_b");
+    }
+
+    #[tokio::test]
+    async fn a_single_track_batch_that_never_appears_fails_over() {
+        // A lone track has no sibling to keep the batch non-empty, so
+        // process_tracks and handle_absent_tracks never see it: the empty
+        // poll fuse is the only place its failover can fire.
+        let mut m = failover_monitor();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let mut consecutive_empty = MAX_CONSECUTIVE_EMPTY - 1;
+
+        let stop = m
+            .process_poll_result(vec![], &mut consecutive_empty, 99, &backend)
+            .await;
+
+        assert!(!stop, "the batch keeps polling for the new peer");
+        assert_eq!(consecutive_empty, 0, "the grace window restarts");
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+        assert!(!m.track_states[0].processed);
+    }
+
+    #[tokio::test]
+    async fn a_never_appeared_batch_with_no_peers_left_is_still_written_off() {
+        // The fallback has to stay reachable, or an absent batch with a dry
+        // pool would poll forever.
+        let mut m = failover_monitor();
+        // Every alternate is refused, so the pool yields nothing.
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let mut consecutive_empty = MAX_CONSECUTIVE_EMPTY - 1;
+
+        let stop = m
+            .process_poll_result(vec![], &mut consecutive_empty, 99, &backend)
+            .await;
+
+        assert!(stop);
+        assert!(m.track_states[0].processed);
     }
 
     #[tokio::test]
