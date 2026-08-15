@@ -101,10 +101,12 @@ impl SourcePool {
         Some(item)
     }
 
-    /// Enqueue this slot's next alternate. Walks past alternates the backend
-    /// rejects (peer offline, file already in slskd's list) so one bad
-    /// candidate does not cost a whole poll cycle. `None` means the slot is
-    /// out of sources or budget.
+    /// Enqueue this slot's next alternate, walking past the ones the backend
+    /// rejects outright (peer offline, file already in slskd's list) until one
+    /// is accepted or the slot runs dry. A rejected alternate still costs the
+    /// slot a source, so three dead peers in a row spend the whole budget
+    /// without a transfer ever being attempted. `None` means the slot is out
+    /// of sources or budget.
     pub async fn enqueue_next(
         &mut self,
         slot: usize,

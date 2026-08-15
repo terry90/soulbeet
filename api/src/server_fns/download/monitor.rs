@@ -1190,10 +1190,12 @@ mod tests {
 
     #[test]
     fn state_stays_bound_to_its_slot_after_a_filename_rebind() {
-        // This is the property the whole refactor exists for: when a
-        // failover rebind changes which remote path a slot tracks, the
-        // slot's TrackState must not reset or migrate, only the filename
-        // it's looked up by changes.
+        // This is the property the whole refactor exists for: TrackState
+        // lives at a slot index, so changing the remote path a slot tracks
+        // neither strands its state nor migrates it to another slot, and the
+        // slot is still found under the new path. What try_failover then does
+        // with that state is its own decision: it replaces it deliberately,
+        // to start the retry's windows from zero.
         let mut m = monitor(
             vec!["peer_a", "peer_b"],
             vec!["music\\A\\01 - One.flac", "music\\A\\02 - Two.flac"],
