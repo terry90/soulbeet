@@ -45,7 +45,7 @@ use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
 use crate::server_fns::download::failover::{self, SourcePool};
 #[cfg(feature = "server")]
-use crate::server_fns::download::monitor::{filenames_match, is_terminal_state};
+use crate::server_fns::download::monitor::best_match;
 #[cfg(feature = "server")]
 use crate::AuthSession;
 
@@ -311,35 +311,21 @@ enum Outcome {
 
 /// The transfer a track is waiting on, as slskd currently reports it.
 ///
-/// Keyed on peer AND path, and a live transfer always beats a terminal one.
-/// A track that fails over leaves the dead peer's failed transfer behind in
-/// slskd's list, nothing prunes it during a batch (the only cleanup the
-/// backend offers is `cancel_download(.., remove: true)`, which discovery
-/// never calls), and `filenames_match` falls back to comparing basenames.
-/// The peer half of the key is not enough on its own either: a peer that
-/// holds the track in two directories contributes two ranked items, so the
-/// alternate can be the very peer that just failed. Taking the first hit
-/// would let the corpse shadow the live transfer and fail the track over
-/// again until its sources ran out.
+/// Keyed on peer AND path, and ranked so that a running transfer beats a
+/// finished one and a finished one beats a failure. A track that fails over
+/// leaves the dead peer's transfer behind in slskd's list until it is
+/// removed, and `filenames_match` falls back to comparing basenames. The peer
+/// half of the key is not enough on its own either: a peer that holds the
+/// track in two directories contributes two ranked items, so the alternate
+/// can be the very peer that just failed. Taking the first hit would let the
+/// corpse shadow the retry and fail the track over again, or write it off
+/// with its file already downloaded.
 #[cfg(feature = "server")]
 fn matching_transfer<'a>(
     downloads: &'a [shared::download::DownloadProgress],
     qt: &QueuedTrack,
 ) -> Option<&'a shared::download::DownloadProgress> {
-    let mut best: Option<&shared::download::DownloadProgress> = None;
-    for dl in downloads {
-        if dl.source != qt.slskd_source || !filenames_match(&dl.item, &qt.slskd_filename) {
-            continue;
-        }
-        match best {
-            None => best = Some(dl),
-            Some(prev) if is_terminal_state(&prev.state) && !is_terminal_state(&dl.state) => {
-                best = Some(dl)
-            }
-            _ => {}
-        }
-    }
-    best
+    best_match(downloads, &qt.slskd_source, &qt.slskd_filename)
 }
 
 /// Settle one poll of slskd's transfer list against the tracks still pending.
@@ -1508,6 +1494,10 @@ mod tests {
         DownloadProgress::queued(path.to_string(), source.to_string(), path.to_string(), 0)
     }
 
+    fn completed_transfer(source: &str, path: &str) -> DownloadProgress {
+        live_transfer(source, path).with_state(shared::download::DownloadState::Completed)
+    }
+
     fn pending_of(queued: &[QueuedTrack]) -> HashSet<String> {
         queued.iter().map(|q| q.slskd_filename.clone()).collect()
     }
@@ -1569,6 +1559,32 @@ mod tests {
             1,
             "the live transfer must not cost the track a source"
         );
+    }
+
+    #[tokio::test]
+    async fn a_completed_retry_outranks_the_dead_peer_it_replaced() {
+        // Same peer, two directories, so the retry's transfer and the dead
+        // one both match the track. Once the retry finishes both are terminal
+        // and the corpse is listed first: reading it as the track's state
+        // would drop a downloaded file and burn another source.
+        let mut queued = vec![queued_track(vec![
+            item("peer_a", "Wake Up", "b/07 - Wake Up.flac"),
+            item("peer_a", "Wake Up", "c/07 - Wake Up.flac"),
+        ])];
+        let mut pending = pending_of(&queued);
+        let mut failed = HashSet::new();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let downloads = vec![
+            failed_transfer("peer_a", "a/07 - Wake Up.flac"),
+            completed_transfer("peer_a", "b/07 - Wake Up.flac"),
+        ];
+
+        settle_poll(&mut queued, &downloads, &mut pending, &mut failed, &backend).await;
+
+        assert!(pending.is_empty(), "the track settled as done");
+        assert!(failed.is_empty());
+        assert_eq!(queued[0].slskd_filename, "b/07 - Wake Up.flac");
+        assert_eq!(queued[0].pool.attempts_used(0), 1);
     }
 
     #[tokio::test]

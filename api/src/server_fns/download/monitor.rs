@@ -428,7 +428,8 @@ impl DownloadMonitor {
     /// peer with the active download being tracked.
     ///
     /// When the same file exists multiple times from the same peer (e.g.
-    /// re-downloading a track), prefer the active entry over the stale one.
+    /// re-downloading a track), the entries are ranked by `best_match`, so a
+    /// finished transfer wins over the failed one it replaced.
     ///
     /// When the tracked peer has no usable transfer (nothing, or only a
     /// failed one) but another peer has an active transfer of the same file,
@@ -438,22 +439,7 @@ impl DownloadMonitor {
         let mut matched = Vec::new();
         let mut rebinds: Vec<(usize, String)> = Vec::new();
         for (idx, tracked) in self.tracked_files.iter().enumerate() {
-            let mut best: Option<&DownloadProgress> = None;
-            for dl in downloads {
-                if dl.source != tracked.source || !filenames_match(&dl.item, &tracked.filename) {
-                    continue;
-                }
-                match best {
-                    None => best = Some(dl),
-                    Some(prev)
-                        if is_terminal_state(&prev.state)
-                            && !is_terminal_state(&dl.state) =>
-                    {
-                        best = Some(dl);
-                    }
-                    _ => {}
-                }
-            }
+            let mut best = best_match(downloads, &tracked.source, &tracked.filename);
 
             let unusable =
                 best.is_none_or(|b| is_terminal_state(&b.state) && !is_completed(&b.state));
@@ -760,6 +746,38 @@ fn make_failed_progress(tracked: &TrackedFile, reason: &str) -> DownloadProgress
     }
 }
 
+/// How good a slskd transfer is as the match for a tracked file, highest
+/// first: still running beats finished, and finished beats failed.
+///
+/// Ranking failures last is what keeps a completed retry from being read as a
+/// failure. A slot can fail over to the *same* peer under another path, since
+/// a peer holding the track in two directories contributes two ranked items,
+/// and `filenames_match` bridges those two paths by basename. If the dead
+/// peer's transfer is still in slskd's list when the retry finishes, both
+/// entries are terminal and both match the slot: preferring only non-terminal
+/// entries would leave the order of slskd's list deciding, and a corpse
+/// listed first would fail the track over again with its file already on disk.
+pub(crate) fn transfer_match_rank(state: &DownloadState) -> u8 {
+    match state {
+        DownloadState::Failed(_) | DownloadState::Cancelled => 0,
+        s if is_terminal_state(s) => 1,
+        _ => 2,
+    }
+}
+
+/// The transfer a peer/path pair is best matched by, or `None` when slskd
+/// lists none. Ties keep the first entry so the choice is deterministic.
+pub(crate) fn best_match<'a>(
+    downloads: &'a [DownloadProgress],
+    source: &str,
+    filename: &str,
+) -> Option<&'a DownloadProgress> {
+    downloads
+        .iter()
+        .filter(|dl| dl.source == source && filenames_match(&dl.item, filename))
+        .min_by_key(|dl| std::cmp::Reverse(transfer_match_rank(&dl.state)))
+}
+
 /// Check if a download state indicates a terminal state (complete or failed).
 pub(crate) fn is_terminal_state(state: &DownloadState) -> bool {
     matches!(
@@ -829,6 +847,19 @@ mod tests {
     fn failed_transfer(source: &str, filename: &str) -> DownloadProgress {
         DownloadProgress {
             state: DownloadState::Failed("peer went away".into()),
+            ..DownloadProgress::queued(
+                filename.to_string(),
+                source.to_string(),
+                filename.to_string(),
+                0,
+            )
+        }
+    }
+
+    /// A slskd transfer of `filename` from `source` that finished cleanly.
+    fn completed_transfer(source: &str, filename: &str) -> DownloadProgress {
+        DownloadProgress {
+            state: DownloadState::Completed,
             ..DownloadProgress::queued(
                 filename.to_string(),
                 source.to_string(),
@@ -924,6 +955,27 @@ mod tests {
         assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 1);
         assert_eq!(m.tracked_files[0].source, "peer_a");
         assert!(m.track_states[0].processed);
+    }
+
+    #[test]
+    fn a_completed_retry_outranks_the_dead_peer_it_replaced() {
+        // The slot failed over to the same peer under a different path, so
+        // both transfers match it on source and, through filenames_match's
+        // basename rule, on path too. Both are terminal by the time the retry
+        // lands, and the corpse is listed first. Picking it would fail the
+        // track over again or write it off with its file already on disk.
+        let mut m = monitor(vec!["peer_a"], vec!["b/07 - Wake Up.flac"]);
+        let downloads = vec![
+            failed_transfer("peer_a", "a/07 - Wake Up.flac"),
+            completed_transfer("peer_a", "b/07 - Wake Up.flac"),
+        ];
+
+        let matched = m.find_matching_downloads(&downloads);
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].item, "b/07 - Wake Up.flac");
+        assert_eq!(matched[0].state, DownloadState::Completed);
+        assert_eq!(m.tracked_files[0].source, "peer_a", "no rebind was needed");
     }
 
     #[test]
