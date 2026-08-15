@@ -37,6 +37,9 @@ async fn update_progress(
 }
 
 #[cfg(feature = "server")]
+use crate::server_fns::download::failover::{self, SourcePool};
+
+#[cfg(feature = "server")]
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 #[cfg(feature = "server")]
 use crate::models::folder::Folder;
@@ -446,8 +449,24 @@ pub async fn generate_discovery_playlist_internal(
                 artist: String,
                 track: String,
                 album: Option<String>,
+                /// The peer serving the transfer this track is currently
+                /// waiting on. Part of the transfer's identity together with
+                /// `slskd_filename`, and swapped with it on every retry.
+                slskd_source: String,
                 slskd_filename: String,
+                /// Alternate peers for this track, and how many have been tried.
+                pool: SourcePool,
             }
+
+            /// What a discovery download did, as observed in the phase 2 poll loop.
+            enum Outcome {
+                Succeeded,
+                /// Transfer error: worth another peer.
+                Failed,
+                /// Cancelled by a user or by monitor cleanup: never retried.
+                Cancelled,
+            }
+
             let mut queued: Vec<QueuedTrack> = Vec::new();
 
             // Over-queue by 50% to absorb import failures without another retry round
@@ -558,14 +577,15 @@ pub async fn generate_discovery_playlist_internal(
                 }
                 stats.search_hits += 1;
 
-                // Try up to 3 sources, falling back on download failure
-                ranked_items.truncate(3);
+                // Keep the sources this track is allowed to try: the one
+                // enqueued here plus the alternates phase 2 fails over to.
+                ranked_items.truncate(failover::MAX_SOURCES_PER_TRACK);
                 let mut downloaded = false;
                 for (attempt_idx, item) in ranked_items.iter().enumerate() {
                     let download_results = match backend.download(vec![item.clone()]).await {
                         Ok(r) => r,
                         Err(e) => {
-                            if attempt_idx < 2 {
+                            if attempt_idx + 1 < ranked_items.len() {
                                 info!(
                                     "Download source {} failed for '{}' - {}, trying next: {}",
                                     attempt_idx + 1,
@@ -591,7 +611,12 @@ pub async fn generate_discovery_playlist_internal(
                             artist: candidate.artist.clone(),
                             track: candidate.track.clone(),
                             album: candidate.album.clone(),
+                            slskd_source: dl.source.clone(),
                             slskd_filename: dl.item.clone(),
+                            // Start the pool at the source that actually
+                            // enqueued: earlier entries were already tried and
+                            // rejected in this loop, and must not be retried.
+                            pool: SourcePool::single(ranked_items[attempt_idx..].to_vec()),
                         });
                         DiscoveryCandidateRow::mark_used(
                             user_id,
@@ -600,19 +625,12 @@ pub async fn generate_discovery_playlist_internal(
                             &candidate.track,
                         )
                         .await?;
-                        DiscoveryHistoryRow::record(
-                            user_id,
-                            &candidate.artist,
-                            &candidate.track,
-                            &profile_name,
-                        )
-                        .await?;
                         downloaded = true;
                         break;
                     }
                     // This source returned an error in the response
                     stats.downloads_failed += 1;
-                    if attempt_idx < 2 {
+                    if attempt_idx + 1 < ranked_items.len() {
                         info!(
                             "Download source {} errored for '{}' - {}, trying next",
                             attempt_idx + 1,
@@ -677,30 +695,74 @@ pub async fn generate_discovery_playlist_internal(
                     Err(_) => continue,
                 };
 
+                // A transfer is identified by peer AND path: a track that fails
+                // over leaves the dead peer's failed transfer in slskd's list
+                // for the rest of the batch, and filenames_match falls back to
+                // comparing basenames, so matching on the path alone would let
+                // that corpse shadow the live transfer and fail the track over
+                // again until its sources ran out.
                 let mut newly_done = Vec::new();
-                for fname in pending_filenames.iter() {
+                for qt in queued.iter() {
+                    if !pending_filenames.contains(&qt.slskd_filename) {
+                        continue;
+                    }
                     let matched = downloads.iter().find(|d| {
-                        crate::server_fns::download::monitor::filenames_match(&d.item, fname)
+                        d.source == qt.slskd_source
+                            && crate::server_fns::download::monitor::filenames_match(
+                                &d.item,
+                                &qt.slskd_filename,
+                            )
                     });
                     if let Some(dl) = matched {
                         match &dl.state {
                             shared::download::DownloadState::Completed
                             | shared::download::DownloadState::Imported
                             | shared::download::DownloadState::ImportSkipped => {
-                                newly_done.push((fname.clone(), true));
+                                newly_done.push((qt.slskd_filename.clone(), Outcome::Succeeded));
                             }
-                            shared::download::DownloadState::Failed(_)
-                            | shared::download::DownloadState::Cancelled => {
-                                newly_done.push((fname.clone(), false));
+                            shared::download::DownloadState::Failed(_) => {
+                                newly_done.push((qt.slskd_filename.clone(), Outcome::Failed));
+                            }
+                            shared::download::DownloadState::Cancelled => {
+                                newly_done.push((qt.slskd_filename.clone(), Outcome::Cancelled));
                             }
                             _ => {}
                         }
                     }
                 }
-                for (fname, succeeded) in &newly_done {
+
+                for (fname, outcome) in &newly_done {
                     pending_filenames.remove(fname);
-                    if !succeeded {
-                        failed_filenames.insert(fname.clone());
+                    match outcome {
+                        Outcome::Succeeded => {}
+                        Outcome::Cancelled => {
+                            failed_filenames.insert(fname.clone());
+                        }
+                        Outcome::Failed => {
+                            let retried =
+                                match queued.iter_mut().find(|q| &q.slskd_filename == fname) {
+                                    Some(qt) => match qt.pool.enqueue_next(0, &backend).await {
+                                        Some(next) => {
+                                            info!(
+                                                "Discovery: '{}' - {} failed from {}, retrying from {}",
+                                                qt.artist, qt.track, fname, next.source
+                                            );
+                                            // The new peer serves this track
+                                            // under its own remote path, so the
+                                            // whole identity moves at once.
+                                            qt.slskd_source = next.source;
+                                            qt.slskd_filename = next.item.clone();
+                                            pending_filenames.insert(next.item);
+                                            true
+                                        }
+                                        None => false,
+                                    },
+                                    None => false,
+                                };
+                            if !retried {
+                                failed_filenames.insert(fname.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -855,6 +917,10 @@ pub async fn generate_discovery_playlist_internal(
                     )
                     .await?;
                 }
+                // Recorded here, not at enqueue: discovery history is the
+                // permanent exclusion set, and a track killed by a bad peer
+                // must stay available to suggest again.
+                DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_name).await?;
                 stats.imports_succeeded += 1;
                 profile_downloads += 1;
             }
