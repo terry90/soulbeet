@@ -248,6 +248,15 @@ impl QueuedDownload {
 pub enum DownloadEvent {
     /// Standard download progress updates
     Progress(Vec<DownloadProgress>),
+    /// A track moved to another peer. The client keys rows by remote path and
+    /// every peer serves the track under its own, so a plain progress update
+    /// would leave the abandoned transfer's row sitting next to the retry's.
+    /// Failover rebinds one download rather than starting a second, and the
+    /// panel has to show it that way.
+    Replaced {
+        previous_item: String,
+        entry: DownloadProgress,
+    },
     /// Auto-download lifecycle events (displayed inline on search rows, not in download panel)
     AutoDownload(AutoDownloadEvent),
 }

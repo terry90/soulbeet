@@ -128,6 +128,14 @@ fn WebNavbar() -> Element {
                         map.insert(file.item.clone(), file);
                     }
                 }
+                DownloadEvent::Replaced {
+                    previous_item,
+                    entry,
+                } => {
+                    let mut map = downloads.write();
+                    map.remove(&previous_item);
+                    map.insert(entry.item.clone(), entry);
+                }
                 DownloadEvent::AutoDownload(auto_event) => {
                     auto_download_signal.set(Some(auto_event));
                 }

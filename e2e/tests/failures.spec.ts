@@ -136,6 +136,12 @@ test('falls over to the next peer when the best source errors', async ({ context
     'mp3',
   );
   await expectFileAppears(imported, 120_000);
+
+  // Failover rebinds one download rather than starting a second, so the dead
+  // peer's row is replaced by the retry's instead of sitting beside it.
+  await page.getByRole('button', { name: 'Downloads', exact: true }).click();
+  const drawer = page.locator('div.bg-beet-panel').filter({ hasText: 'Active Transfers' });
+  await expect(drawer.locator('div.group')).toHaveCount(1);
 });
 
 test('fails fast when the peer goes offline before enqueue', async ({ context, page }) => {

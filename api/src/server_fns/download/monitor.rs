@@ -203,15 +203,24 @@ impl DownloadMonitor {
         // The new peer serves this track under a completely different remote
         // path, and filenames_match will not bridge the two, so the slot must
         // track the new path outright or the monitor loses sight of it.
-        self.tracked_files[slot] = TrackedFile {
-            source: queued.source.clone(),
-            filename: queued.item.clone(),
-        };
+        let previous_item = std::mem::replace(
+            &mut self.tracked_files[slot],
+            TrackedFile {
+                source: queued.source.clone(),
+                filename: queued.item.clone(),
+            },
+        )
+        .filename;
         self.track_states[slot] = TrackState::bound_now();
 
         let entry = DownloadProgress::queued(queued.id, queued.source, queued.item, queued.size);
-        let entries = self.stamp_batch(vec![entry]);
-        let _ = self.tx.send(DownloadEvent::Progress(entries));
+        let entry = self.stamp_batch(vec![entry]).remove(0);
+        // One slot is still one download, so the panel replaces the abandoned
+        // peer's row instead of gaining a second one for the same track.
+        let _ = self.tx.send(DownloadEvent::Replaced {
+            previous_item,
+            entry,
+        });
         true
     }
 
@@ -964,17 +973,31 @@ mod tests {
         }
     }
 
-    /// A monitor watching one track, with two alternates behind it.
-    fn failover_monitor() -> DownloadMonitor {
-        monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]).with_failover(SourcePool::single(vec![
-            item("peer_a", "Wake Up", "dirA/aaa.flac"),
-            item("peer_b", "Wake Up", "dirB/bbb.flac"),
-            item("peer_c", "Wake Up", "dirC/ccc.flac"),
-        ]))
+    /// A monitor watching one track with two alternates behind it, plus the
+    /// receiver its events land in. Holding the receiver keeps the broadcast
+    /// live, so tests see what the UI would.
+    fn failover_monitor() -> (DownloadMonitor, broadcast::Receiver<DownloadEvent>) {
+        let (tx, rx) = broadcast::channel(16);
+        let m = monitor_on(tx, vec!["peer_a"], vec!["dirA/aaa.flac"]).with_failover(
+            SourcePool::single(vec![
+                item("peer_a", "Wake Up", "dirA/aaa.flac"),
+                item("peer_b", "Wake Up", "dirB/bbb.flac"),
+                item("peer_c", "Wake Up", "dirC/ccc.flac"),
+            ]),
+        );
+        (m, rx)
     }
 
     fn monitor(sources: Vec<&str>, filenames: Vec<&str>) -> DownloadMonitor {
         let (tx, _rx) = broadcast::channel(16);
+        monitor_on(tx, sources, filenames)
+    }
+
+    fn monitor_on(
+        tx: broadcast::Sender<DownloadEvent>,
+        sources: Vec<&str>,
+        filenames: Vec<&str>,
+    ) -> DownloadMonitor {
         DownloadMonitor::new(
             sources.into_iter().map(String::from).collect(),
             filenames.into_iter().map(String::from).collect(),
@@ -995,7 +1018,7 @@ mod tests {
         // whose absence window ran from the batch's start would be declared
         // "never appeared" and fail over a second time in the same poll,
         // orphaning the transfer just enqueued.
-        let mut m = failover_monitor();
+        let (mut m, _rx) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
 
@@ -1025,7 +1048,7 @@ mod tests {
         // The abandoned peer is still sending at the per-track timeout.
         // Leaving it running would put two peers on one track, and whatever
         // it finally delivers lands under a path no slot maps to any more.
-        let mut m = failover_monitor();
+        let (mut m, _rx) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].first_seen = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(1)));
@@ -1054,7 +1077,7 @@ mod tests {
     async fn the_absence_window_restarts_on_every_rebind() {
         // The same guarantee stated directly: a slot that has just been
         // rebound is young, however old the batch is.
-        let mut m = failover_monitor();
+        let (mut m, _rx) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> =
             StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
         m.track_states[0].bound_at = ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1));
@@ -1071,11 +1094,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rebind_replaces_the_abandoned_peers_row_instead_of_adding_one() {
+        // The panel keys rows by remote path and each peer serves the track
+        // under its own, so a plain progress update would leave the dead
+        // peer's row beside the retry's: one track, two rows.
+        let (mut m, mut rx) = failover_monitor();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        m.process_tracks(&[failed_transfer("peer_a", "dirA/aaa.flac")], &backend)
+            .await;
+
+        match rx.try_recv().expect("an event for the retry") {
+            DownloadEvent::Replaced {
+                previous_item,
+                entry,
+            } => {
+                assert_eq!(previous_item, "dirA/aaa.flac");
+                assert_eq!(entry.item, "dirB/bbb.flac");
+                assert_eq!(entry.source, "peer_b");
+            }
+            other => panic!("expected a row replacement, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn a_single_track_batch_that_never_appears_fails_over() {
         // A lone track has no sibling to keep the batch non-empty, so
         // process_tracks and handle_absent_tracks never see it: the empty
         // poll fuse is the only place its failover can fire.
-        let mut m = failover_monitor();
+        let (mut m, _rx) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let mut consecutive_empty = MAX_CONSECUTIVE_EMPTY - 1;
 
@@ -1093,7 +1141,7 @@ mod tests {
     async fn a_never_appeared_batch_with_no_peers_left_is_still_written_off() {
         // The fallback has to stay reachable, or an absent batch with a dry
         // pool would poll forever.
-        let mut m = failover_monitor();
+        let (mut m, _rx) = failover_monitor();
         // Every alternate is refused, so the pool yields nothing.
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let mut consecutive_empty = MAX_CONSECUTIVE_EMPTY - 1;
@@ -1108,7 +1156,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_transfer_settles_without_failing_over() {
-        let mut m = failover_monitor();
+        let (mut m, _rx) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> =
             StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
         m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
