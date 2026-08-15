@@ -31,16 +31,6 @@ pub struct SourcePool {
 }
 
 impl SourcePool {
-    /// Album or multi-track batch: map every track of the picked group to the
-    /// same-titled items in the remaining groups, in the group's own order.
-    /// Only safe when the caller monitors the picked group verbatim; when the
-    /// enqueue may reorder or drop tracks, use `from_tracks`.
-    pub fn from_groups(picked: &DownloadableGroup, rest: &[DownloadableGroup]) -> Self {
-        let tracks: Vec<Option<DownloadableItem>> =
-            picked.items.iter().cloned().map(Some).collect();
-        Self::from_tracks(&tracks, rest)
-    }
-
     /// Alternates for a batch, indexed by the slot the caller will monitor.
     ///
     /// Callers pass the tracks in the exact order they were enqueued, which is
@@ -203,15 +193,11 @@ mod tests {
 
     #[test]
     fn matches_alternates_by_title_across_differing_paths() {
-        let picked = group(
+        let tracks = vec![Some(item(
             "ElevatorsForPeople",
-            vec![item(
-                "ElevatorsForPeople",
-                "Wake Up",
-                "music\\Kowloon\\Come Over (2021)\\Kowloon - Come Over - 07 - Wake Up - [FLAC 44.1kHz].flac",
-            )],
-            1.0,
-        );
+            "Wake Up",
+            "music\\Kowloon\\Come Over (2021)\\Kowloon - Come Over - 07 - Wake Up - [FLAC 44.1kHz].flac",
+        ))];
         let rest = vec![group(
             "Cornflake9026",
             vec![item(
@@ -222,21 +208,21 @@ mod tests {
             0.9,
         )];
 
-        let mut pool = SourcePool::from_groups(&picked, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest);
         let next = pool.take_next(0).expect("alternate for slot 0");
         assert_eq!(next.source, "Cornflake9026");
     }
 
     #[test]
     fn alternates_follow_the_order_of_the_remaining_groups() {
-        let picked = group("peer_a", vec![item("peer_a", "Wake Up", "a.flac")], 1.0);
+        let tracks = vec![Some(item("peer_a", "Wake Up", "a.flac"))];
         let rest = vec![
             group("peer_b", vec![item("peer_b", "Wake Up", "b.flac")], 0.9),
             group("peer_c", vec![item("peer_c", "Wake Up", "c.flac")], 0.8),
             group("peer_d", vec![item("peer_d", "Wake Up", "d.flac")], 0.7),
         ];
 
-        let mut pool = SourcePool::from_groups(&picked, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest);
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_b".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_c".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_d".into()));
@@ -388,14 +374,14 @@ mod tests {
 
     #[test]
     fn ignores_alternates_for_a_different_title() {
-        let picked = group("peer_a", vec![item("peer_a", "Wake Up", "a.flac")], 1.0);
+        let tracks = vec![Some(item("peer_a", "Wake Up", "a.flac"))];
         let rest = vec![group(
             "peer_b",
             vec![item("peer_b", "Come Over", "b.flac")],
             0.9,
         )];
 
-        let mut pool = SourcePool::from_groups(&picked, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest);
         assert!(pool.take_next(0).is_none());
     }
 
