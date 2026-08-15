@@ -46,6 +46,17 @@ const MAX_BACKEND_FAILURES: u32 = 5;
 /// recovery, so a bounded fuse on those would fail healthy batches.
 const MAX_INVALID_RESPONSES: u32 = 15;
 
+/// How long the monitor may go without a readable transfer list before it
+/// gives up. Transport errors are deliberately not fused by count (see
+/// above), but they must still be fused by time: every other deadline in
+/// this loop is evaluated from a successful poll, so a monitor whose
+/// requests keep timing out never re-checks any of them and polls forever,
+/// holding its task and channel alive for the life of the process (#78).
+///
+/// Ten minutes clears the circuit breaker's recovery window by an order of
+/// magnitude, so a slskd restart or upgrade still resolves on its own.
+const BACKEND_STALL_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// How long a failed transfer state must persist before it is treated as
 /// final. slskd 0.26 auto-retries failed downloads (3 attempts by default):
 /// the failed state is persisted only briefly before the retry re-queues
@@ -117,6 +128,10 @@ pub struct DownloadMonitor {
     batch_id: Option<String>,
     /// Human-readable batch label (album name).
     batch_label: Option<String>,
+    /// When slskd's transfer list was last read successfully. Every other
+    /// deadline is evaluated from a readable list, so this one bounds the
+    /// case where no list is readable at all.
+    last_readable_poll: Instant,
 }
 
 impl DownloadMonitor {
@@ -152,7 +167,27 @@ impl DownloadMonitor {
             username,
             batch_id,
             batch_label,
+            last_readable_poll: Instant::now(),
         }
+    }
+
+    /// Give up when slskd's transfer list has been unreadable for too long.
+    ///
+    /// Transport errors are deliberately not fused by count, because a slskd
+    /// restart resolves on its own, but they must be fused by time: while no
+    /// list can be read, no per-track deadline is ever evaluated and the
+    /// monitor polls for the life of the process (#78).
+    fn fail_if_backend_stalled(&mut self) -> bool {
+        if self.last_readable_poll.elapsed() <= BACKEND_STALL_TIMEOUT {
+            return false;
+        }
+        let reason = format!(
+            "slskd's transfer list was unreadable for {} minutes",
+            BACKEND_STALL_TIMEOUT.as_secs() / 60
+        );
+        warn!("{} - giving up on batch {:?}", reason, self.filenames());
+        self.fail_unprocessed_tracks(&reason);
+        true
     }
 
     /// Attach alternate sources so failed transfers retry from another peer.
@@ -267,6 +302,7 @@ impl DownloadMonitor {
         let mut poll_count = 0;
         let mut backend_failures: u32 = 0;
         let mut invalid_responses: u32 = 0;
+        self.last_readable_poll = Instant::now();
 
         // Poll immediately on first iteration
         interval.tick().await;
@@ -277,6 +313,10 @@ impl DownloadMonitor {
                     "Download monitoring cancelled for batch {:?}",
                     self.filenames()
                 );
+                break;
+            }
+
+            if self.fail_if_backend_stalled() {
                 break;
             }
 
@@ -304,6 +344,7 @@ impl DownloadMonitor {
             match backend.get_downloads().await {
                 Ok(downloads) => {
                     invalid_responses = 0;
+                    self.last_readable_poll = Instant::now();
                     let should_break = self
                         .process_poll_result(
                             downloads,
@@ -1041,6 +1082,35 @@ mod tests {
             stub.cancelled(),
             vec![("peer_a".to_string(), "dirA/aaa.flac".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_backend_eventually_ends_the_monitor() {
+        // Every per-track deadline is evaluated from a readable transfer
+        // list, so while the list cannot be read at all none of them fire.
+        // Before this fuse the loop polled forever, one immortal task per
+        // download, which is what grew RSS to gigabytes on a long-lived
+        // instance (#78).
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["a.flac", "b.flac"]);
+
+        assert!(!m.fail_if_backend_stalled(), "gave up while slskd was fine");
+
+        m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
+        assert!(m.fail_if_backend_stalled(), "polled a dead backend forever");
+
+        assert!(
+            m.track_states.iter().all(|s| s.processed),
+            "a track was left unresolved, so its slot never reports back"
+        );
+        let Ok(DownloadEvent::Progress(entries)) = rx.try_recv() else {
+            panic!("the UI was never told the batch died");
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e
+            .error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("unreadable"))));
     }
 
     #[tokio::test]
