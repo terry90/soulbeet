@@ -316,13 +316,13 @@ enum Outcome {
 ///
 /// Keyed on peer AND path, and ranked so that a running transfer beats a
 /// finished one and a finished one beats a failure. A track that fails over
-/// leaves the dead peer's transfer behind in slskd's list until it is
-/// removed, and `filenames_match` falls back to comparing basenames. The peer
-/// half of the key is not enough on its own either: a peer that holds the
-/// track in two directories contributes two ranked items, so the alternate
-/// can be the very peer that just failed. Taking the first hit would let the
-/// corpse shadow the retry and fail the track over again, or write it off
-/// with its file already downloaded.
+/// leaves the dead peer's transfer behind in slskd's list, where nothing
+/// prunes it during a run, and `filenames_match` falls back to comparing
+/// basenames. The peer half of the key is not enough on its own either: a
+/// peer that holds the track in two directories contributes two ranked items,
+/// so the alternate can be the very peer that just failed. Taking the first
+/// hit would let the corpse shadow the retry and fail the track over again,
+/// or write it off with its file already downloaded.
 #[cfg(feature = "server")]
 fn matching_transfer<'a>(
     downloads: &'a [shared::download::DownloadProgress],
