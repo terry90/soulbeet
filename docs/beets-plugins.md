@@ -10,7 +10,7 @@ Soulbeet ships three image tiers. They are strictly additive: `full` is a supers
 
 | Tag | Plugins enabled | Image size delta | Use when |
 | --- | --- | --- | --- |
-| `:light` (= `:latest`) | `musicbrainz` | baseline | You want the smallest image. Tagging via MusicBrainz only. |
+| `:light` (= `:latest`) | `musicbrainz`, `mbtwopass` | baseline | You want the smallest image. Tagging via MusicBrainz only. |
 | `:medium` | `:light` + `chroma` | +~40-60 MB | You want fingerprint matching (AcoustID) to catch files MusicBrainz alone can't match by length. |
 | `:full` | `:medium` + `fetchart`, `embedart`, `lyrics`, `lastgenre`, `scrub`, `replaygain`[^rg], plus several zero-cost convenience plugins | +~150-200 MB on top of medium | You want a complete tagging pipeline: cover art, lyrics, genres, normalization. |
 
@@ -45,6 +45,7 @@ Active by default in `:full`:
 | --- | --- |
 | `chroma` | AcoustID fingerprint matching (also in `:medium`) |
 | `musicbrainz` | MusicBrainz tag lookup (all tiers) |
+| `mbtwopass` | Ships with Soulbeet, all tiers. Splits beets' single-track MusicBrainz search into two passes so short titles stop losing to repetitive ones. See below. |
 | `fetchart` | Pulls album art from Cover Art Archive, iTunes, Amazon |
 | `embedart` | Embeds the fetched art into the file tags |
 | `lyrics` | Lyrics from LRCLIB, Genius, Google |
@@ -161,6 +162,7 @@ services:
 
 Sensitive values (Discogs token, Last.fm username, Genius API key, AcoustID submit key) live in that YAML. `chmod 600` on the host file is a reasonable baseline. The default AcoustID lookup key shipped with beets is sufficient for `chroma` to work; you only need your own AcoustID key if you want to submit fingerprints back.
 
+- **`mbtwopass` (all tiers, ships with the image):** No configuration. It changes how single tracks are looked up in MusicBrainz. Beets sends `alias: <title>` alongside `recording: <title>`, which does not narrow the search but adds tokens to it, and MusicBrainz ranks a recording higher the more often it repeats them. A short title loses to a long repetitive one: searching Kowloon's "Wake Up" returns "Up Up Up Up Up Up" at 37.9% ahead of the exact recording, far enough off that a quiet import skips the file without saying why. The plugin searches without the alias term first and only retries with it when nothing came back close enough to import, so the alternate-title case it exists for still works. Measured over 25 real downloads, the alias term helped 4 files and hurt 1; running both passes takes the better of the two every time. The plugin lives at `/opt/beets-plugins`, not `/data/beets-plugins`, because deployments bind-mount `/data` and would hide it. If you replace `pluginpath`, keep `/opt/beets-plugins` in the list.
 - **`replaygain` (full tier only):** Soulbeet's `full` tier ships `replaygain: { backend: ffmpeg, overwrite: yes }` baked into the default `beets_config.yaml`. The distroless runtime does not include GStreamer (which the replaygain plugin would otherwise use as a default backend), so the ffmpeg backend is required. If you mount your own `beets_config.yaml`, preserve this block or `beet replaygain` will fail to load with `No module named 'gi'`.
 
 ## Reference
