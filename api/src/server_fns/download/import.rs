@@ -81,12 +81,15 @@ pub async fn import_group(
                 let _ = crate::server_fns::cleanup_empty_ancestors(parent).await;
             }
         }
-        Ok(ImportResult::Skipped) => {
-            info!("Import skipped items");
+        Ok(ImportResult::Skipped(reason)) => {
+            info!("Import skipped items: {}", reason);
             let skipped_entries: Vec<_> = entries
                 .iter()
                 .map(|e| DownloadProgress {
                     state: DownloadState::ImportSkipped,
+                    // Carry the reason to the UI: a skipped row that explains
+                    // nothing is the whole of issue #69.
+                    error: Some(reason.clone()),
                     ..e.clone()
                 })
                 .collect();

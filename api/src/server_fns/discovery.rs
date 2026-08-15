@@ -897,8 +897,11 @@ pub async fn generate_discovery_playlist_internal(
                                 qt.artist, qt.track, profile_name
                             );
                         }
-                        Ok(soulbeet::ImportResult::Skipped) => {
-                            warn!("Beets skipped '{}' - {} (duplicate?)", qt.artist, qt.track);
+                        Ok(soulbeet::ImportResult::Skipped(reason)) => {
+                            warn!(
+                                "Beets skipped '{}' - {}: {}",
+                                qt.artist, qt.track, reason
+                            );
                             stats.imports_skipped += 1;
                             let _ = tokio::fs::remove_file(src).await;
                             // A duplicate is a permanent condition: the library
@@ -1216,8 +1219,8 @@ pub async fn import_or_move(src: &std::path::Path, target: &std::path::Path) -> 
     match crate::services::music_importer(None).await {
         Ok(imp) => match imp.import(&[src], target, false).await {
             Ok(soulbeet::ImportResult::Success) => Ok(()),
-            Ok(soulbeet::ImportResult::Skipped) => {
-                Err("Beets skipped track (duplicate?)".to_string())
+            Ok(soulbeet::ImportResult::Skipped(reason)) => {
+                Err(format!("Beets skipped track: {reason}"))
             }
             Ok(other) => Err(format!("Import issue: {:?}", other)),
             Err(e) => Err(format!("Import failed: {}", e)),

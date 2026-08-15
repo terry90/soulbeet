@@ -51,7 +51,8 @@ pub trait DownloadBackend: Send + Sync {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImportResult {
     Success,
-    Skipped,
+    /// The importer declined to import, with the reason it gave.
+    Skipped(String),
     Failed(String),
     TimedOut,
 }

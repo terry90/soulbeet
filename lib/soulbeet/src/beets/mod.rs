@@ -31,8 +31,8 @@ fn import_lock_for(target: &Path) -> Arc<tokio::sync::Mutex<()>> {
 pub enum ImportResult {
     /// Import completed successfully
     Success,
-    /// Import was skipped (e.g., duplicate detection)
-    Skipped,
+    /// Import was skipped, with the reason beets' output implies
+    Skipped(String),
     /// Import failed with an error message
     Failed(String),
     /// Import timed out
@@ -124,7 +124,8 @@ pub async fn import(
     let library_path = target.join(".beets_library.db");
 
     let mut cmd = Command::new("beet");
-    cmd.arg("-c")
+    cmd.arg("-v") // report why a match was rejected; quiet mode alone prints only "Skipping."
+        .arg("-c")
         .arg(&config_path)
         .arg("-l") // library database path (for duplicate detection)
         .arg(&library_path)
@@ -201,6 +202,44 @@ async fn read_child_stderr(pipe: Option<tokio::process::ChildStderr>) -> String 
     }
 }
 
+/// Whether beets declined to import.
+///
+/// Matched on beets' own `Skipping.` line rather than any occurrence of
+/// "skip": with `-v` the word appears in unrelated debug output, and a
+/// substring test there would report a successful import as skipped.
+fn was_skipped(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.trim_start().starts_with("Skipping"))
+}
+
+/// Explain a skip in terms the user can act on.
+///
+/// Beets never states a reason: quiet mode prints only `Skipping.`, and even
+/// `-vv` adds nothing beyond the candidate count. That count is the one
+/// signal that separates "the release is not in MusicBrainz" from "it is
+/// there but the tags are too far off", so it is what gets reported (#69).
+fn skip_reason(output: &str) -> String {
+    let candidates = output.lines().rev().find_map(|line| {
+        let line = line.trim();
+        let rest = line.strip_prefix("Found ")?;
+        let count: u32 = rest.split_whitespace().next()?.parse().ok()?;
+        rest.contains("candidate").then_some(count)
+    });
+
+    match candidates {
+        Some(0) | None => {
+            "MusicBrainz returned no candidate release for these tags, so beets left the files in \
+             place"
+                .to_string()
+        }
+        Some(n) => format!(
+            "none of the {n} MusicBrainz candidates was close enough to import automatically \
+             (match.strong_rec_thresh), so beets left the files in place"
+        ),
+    }
+}
+
 /// Process beets command output and determine result
 fn process_beets_output(
     status: std::process::ExitStatus,
@@ -209,13 +248,13 @@ fn process_beets_output(
     _sources: &[String],
 ) -> Result<ImportResult, ImportError> {
     if status.success() {
-        // Check both stdout and stderr for skip indicators
-        // Beets may output to either depending on version/config
-        let output_combined = format!("{}{}", stdout, stderr).to_lowercase();
+        // Beets may write to either stream depending on version and config.
+        let combined = format!("{stdout}\n{stderr}");
 
-        if output_combined.contains("skipping") || output_combined.contains("skip") {
-            info!("Beet import skipped items");
-            Ok(ImportResult::Skipped)
+        if was_skipped(&combined) {
+            let reason = skip_reason(&combined);
+            info!("Beet import skipped items: {}", reason);
+            Ok(ImportResult::Skipped(reason))
         } else {
             info!("Beet import successful");
             Ok(ImportResult::Success)
@@ -407,7 +446,7 @@ impl crate::MusicImporter for BeetsImporter {
         match import(sources_str, target, as_album).await {
             Ok(result) => Ok(match result {
                 ImportResult::Success => crate::ImportResult::Success,
-                ImportResult::Skipped => crate::ImportResult::Skipped,
+                ImportResult::Skipped(reason) => crate::ImportResult::Skipped(reason),
                 ImportResult::Failed(msg) => crate::ImportResult::Failed(msg),
                 ImportResult::TimedOut => crate::ImportResult::TimedOut,
             }),
@@ -434,5 +473,50 @@ impl crate::MusicImporter for BeetsImporter {
             .await
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim tail of `beet -v ... import -q -s` for a file whose tags
+    /// match a real release too loosely to auto-apply.
+    const SKIPPED_WITH_CANDIDATES: &str = "\
+musicbrainz: alias fallback added 2 candidate(s) for The Neighbourhood - Sweater Weather
+Found 8 candidates.
+Skipping.
+";
+
+    #[test]
+    fn a_skip_is_recognised_from_beets_own_line() {
+        assert!(was_skipped(SKIPPED_WITH_CANDIDATES));
+    }
+
+    /// `-v` puts the word "skip" in plenty of unrelated debug output, so a
+    /// substring test would report successful imports as skipped.
+    #[test]
+    fn debug_chatter_mentioning_skipping_is_not_a_skip() {
+        let output = "\
+import: skipping duplicate check, no library configured
+Sending event: import_task_created
+";
+        assert!(!was_skipped(output));
+    }
+
+    #[test]
+    fn the_reason_names_how_many_candidates_were_rejected() {
+        let reason = skip_reason(SKIPPED_WITH_CANDIDATES);
+        assert!(reason.contains('8'), "candidate count missing: {reason}");
+        assert!(reason.contains("strong_rec_thresh"), "no lever named: {reason}");
+    }
+
+    /// Nothing found at all is a different problem from a weak match: the
+    /// release is not in MusicBrainz under those tags.
+    #[test]
+    fn no_candidates_reads_differently_from_weak_candidates() {
+        let reason = skip_reason("Found 0 candidates.\nSkipping.\n");
+        assert!(reason.contains("no candidate"), "wrong reason: {reason}");
+        assert_eq!(reason, skip_reason("Skipping.\n"));
     }
 }
