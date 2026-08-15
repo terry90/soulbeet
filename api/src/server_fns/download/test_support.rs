@@ -52,16 +52,24 @@ pub enum ScriptedOutcome {
 }
 
 /// Answers each enqueue from a scripted list, then rejects everything after
-/// the script runs out.
+/// the script runs out. Records every cancellation so tests can assert on the
+/// transfers a failover left behind.
 pub struct StubBackend {
     script: Mutex<Vec<ScriptedOutcome>>,
+    cancelled: Mutex<Vec<(String, String)>>,
 }
 
 impl StubBackend {
     pub fn new(script: Vec<ScriptedOutcome>) -> Arc<Self> {
         Arc::new(Self {
             script: Mutex::new(script),
+            cancelled: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The `(peer, transfer id)` pairs passed to `cancel_download`, in order.
+    pub fn cancelled(&self) -> Vec<(String, String)> {
+        self.cancelled.lock().unwrap().clone()
     }
 }
 
@@ -113,7 +121,11 @@ impl DownloadBackend for StubBackend {
     async fn get_downloads(&self) -> SoulResult<Vec<DownloadProgress>> {
         Ok(Vec::new())
     }
-    async fn cancel_download(&self, _u: &str, _id: &str, _remove: bool) -> SoulResult<()> {
+    async fn cancel_download(&self, username: &str, id: &str, _remove: bool) -> SoulResult<()> {
+        self.cancelled
+            .lock()
+            .unwrap()
+            .push((username.to_string(), id.to_string()));
         Ok(())
     }
     async fn health_check(&self) -> bool {

@@ -161,6 +161,9 @@ impl DownloadMonitor {
     /// Re-enqueue this slot from its next-best peer. Returns true when the
     /// slot was rebound, in which case the caller must not mark it failed.
     ///
+    /// `transfers` is the current poll's view of slskd, used to resolve the
+    /// transfer being abandoned so it can be stopped and removed.
+    ///
     /// Never fires for cancellations: a user cancelling a download, or the
     /// monitor's own cleanup, must not spawn a fresh transfer.
     async fn try_failover(
@@ -168,6 +171,7 @@ impl DownloadMonitor {
         slot: usize,
         backend: &Arc<dyn DownloadBackend>,
         reason: &str,
+        transfers: &[DownloadProgress],
     ) -> bool {
         if self.cancellation_token.is_cancelled() {
             return false;
@@ -191,6 +195,8 @@ impl DownloadMonitor {
             MAX_SOURCES_PER_TRACK
         );
 
+        self.drop_abandoned_transfer(slot, backend, transfers).await;
+
         // The new peer serves this track under a completely different remote
         // path, and filenames_match will not bridge the two, so the slot must
         // track the new path outright or the monitor loses sight of it.
@@ -204,6 +210,42 @@ impl DownloadMonitor {
         let entries = self.stamp_batch(vec![entry]);
         let _ = self.tx.send(DownloadEvent::Progress(entries));
         true
+    }
+
+    /// Stop and delete the transfer a slot is about to stop tracking.
+    ///
+    /// At the per-track timeout that transfer is still running, so leaving it
+    /// alone would have two peers sending the same track and only one of the
+    /// two files reachable from a slot. Even a dead transfer has to go: once
+    /// the slot no longer points at it nothing else prunes it, and it stays in
+    /// slskd's list competing with the retry for the slot's own lookups.
+    ///
+    /// slskd deletes by transfer id, not by filename, so the id comes from the
+    /// poll that triggered the failover. A slot that never appeared has no id
+    /// to resolve, and a delete that fails is not worth losing the retry over.
+    async fn drop_abandoned_transfer(
+        &self,
+        slot: usize,
+        backend: &Arc<dyn DownloadBackend>,
+        transfers: &[DownloadProgress],
+    ) {
+        let tracked = &self.tracked_files[slot];
+        let Some(abandoned) = best_match(transfers, &tracked.source, &tracked.filename) else {
+            debug!(
+                "No slskd transfer to remove for {} from {}",
+                tracked.filename, tracked.source
+            );
+            return;
+        };
+        if let Err(e) = backend
+            .cancel_download(&abandoned.source, &abandoned.id, true)
+            .await
+        {
+            warn!(
+                "Failed to remove abandoned transfer {} from slskd: {}",
+                abandoned.id, e
+            );
+        }
     }
 
     /// Run the monitoring loop until all downloads complete or timeout.
@@ -539,7 +581,10 @@ impl DownloadMonitor {
                         first_seen.elapsed().as_secs() / 60,
                         download.item
                     );
-                    if self.try_failover(slot, backend, "Transfer timed out").await {
+                    if self
+                        .try_failover(slot, backend, "Transfer timed out", batch_status)
+                        .await
+                    {
                         continue;
                     }
                     let timeout_entry = DownloadProgress {
@@ -581,7 +626,11 @@ impl DownloadMonitor {
                     .get_or_insert_with(Instant::now);
                 if failing_since.elapsed() >= FAILED_STATE_CONFIRM {
                     let retryable = !matches!(download.state, DownloadState::Cancelled);
-                    if !retryable || !self.try_failover(slot, backend, "Transfer failed").await {
+                    if !retryable
+                        || !self
+                            .try_failover(slot, backend, "Transfer failed", batch_status)
+                            .await
+                    {
                         self.track_states[slot].processed = true;
                     }
                 }
@@ -633,7 +682,7 @@ impl DownloadMonitor {
             if let Some(reason) = absent_reason {
                 // Logged only once the track is really being written off:
                 // a successful failover reports its own retry instead.
-                if self.try_failover(slot, backend, reason).await {
+                if self.try_failover(slot, backend, reason, batch_status).await {
                     continue;
                 }
                 warn!(
@@ -901,8 +950,8 @@ mod tests {
         // "never appeared" and fail over a second time in the same poll,
         // orphaning the transfer just enqueued.
         let mut m = failover_monitor();
-        let backend: Arc<dyn DownloadBackend> =
-            StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
 
         // Old enough that a batch-wide clock would consider it absent, with a
         // failure that has already outlived the confirmation window.
@@ -916,6 +965,42 @@ mod tests {
         assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 2);
         assert_eq!(m.tracked_files[0].source, "peer_b");
         assert_eq!(m.tracked_files[0].filename, "dirB/bbb.flac");
+        assert!(!m.track_states[0].processed);
+        // Only the first rebind had a transfer to drop: the second slot had
+        // nothing in slskd's list to begin with, which is why it failed over.
+        assert_eq!(
+            stub.cancelled(),
+            vec![("peer_a".to_string(), "dirA/aaa.flac".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_transfer_is_dropped_before_the_retry_starts() {
+        // The abandoned peer is still sending at the per-track timeout.
+        // Leaving it running would put two peers on one track, and whatever
+        // it finally delivers lands under a path no slot maps to any more.
+        let mut m = failover_monitor();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].first_seen = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(1)));
+
+        let live = DownloadProgress {
+            state: DownloadState::InProgress,
+            ..DownloadProgress::queued(
+                "transfer-1".to_string(),
+                "peer_a".to_string(),
+                "dirA/aaa.flac".to_string(),
+                0,
+            )
+        };
+        m.process_tracks(&[live], &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![("peer_a".to_string(), "transfer-1".to_string())],
+            "slskd cancels by transfer id, not by filename"
+        );
+        assert_eq!(m.tracked_files[0].source, "peer_b");
         assert!(!m.track_states[0].processed);
     }
 
