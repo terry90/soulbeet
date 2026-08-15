@@ -73,6 +73,13 @@ impl From<String> for DownloadState {
 /// omits null fields entirely (`WhenWritingNull`), and 0.26 stopped sending
 /// `stateDescription` (marked `[JsonIgnore]` upstream) and `startOffset`
 /// (property deleted) — requiring either fails every entry (#73).
+///
+/// Byte counts are signed upstream (`long`), so they are signed here too.
+/// `bytesRemaining` is computed as `Size - BytesTransferred` and goes
+/// negative whenever a peer sends more than it advertised; parsing it as
+/// unsigned rejected the whole entry, which hid the transfer from the
+/// monitor for the rest of its life (#78). It is not read anywhere, so it
+/// is not modelled at all — serde ignores the key.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
@@ -80,7 +87,7 @@ pub struct FileEntry {
     pub username: String,
     pub direction: String,
     pub filename: String,
-    pub size: u64,
+    pub size: i64,
     #[serde(deserialize_with = "deserialize_download_state")]
     pub state: Vec<DownloadState>,
     pub requested_at: String,
@@ -89,10 +96,9 @@ pub struct FileEntry {
     pub started_at: Option<String>,
     #[serde(default)]
     pub ended_at: Option<String>,
-    pub bytes_transferred: u64,
+    pub bytes_transferred: i64,
     #[serde(default)]
     pub average_speed: f64,
-    pub bytes_remaining: u64,
     #[serde(default)]
     pub elapsed_time: Option<String>,
     pub percent_complete: f64,
@@ -550,8 +556,10 @@ impl From<FileEntry> for crate::download::DownloadProgress {
             id: entry.id,
             source: entry.username,
             item: entry.filename,
-            size: entry.size,
-            transferred: entry.bytes_transferred,
+            // Clamped, not cast: slskd's counters are signed and the UI's are
+            // not. A nonsensical negative must not wrap into a huge size.
+            size: entry.size.max(0) as u64,
+            transferred: entry.bytes_transferred.max(0) as u64,
             state: state.into(),
             percent: entry.percent_complete,
             speed: entry.average_speed,
@@ -688,6 +696,42 @@ mod tests {
             crate::download::DownloadProgress::from(files.files[0].clone()).state,
             DS::Completed
         );
+    }
+
+    /// slskd computes `bytesRemaining` as `Size - BytesTransferred` and
+    /// types it `long`, so a peer that sends more than it advertised makes
+    /// it negative. Parsing that as `u64` failed the entry, and since the
+    /// monitor only sees transfers it can parse, the download stayed
+    /// invisible until the batch was written off (#78).
+    #[test]
+    fn parses_transfer_that_overshot_its_advertised_size() {
+        let payload = json!([{
+            "username": "peer",
+            "directories": [{
+                "directory": "d",
+                "fileCount": 1,
+                "files": [{
+                    "id": "890f943c-02e1-4d45-af76-d55e3d855684",
+                    "username": "peer",
+                    "direction": "Download",
+                    "filename": "d\\a.flac",
+                    "size": 1024,
+                    "state": "InProgress",
+                    "requestedAt": "2026-07-19T05:11:22Z",
+                    "bytesTransferred": 5120,
+                    "bytesRemaining": -4096,
+                    "percentComplete": 500.0
+                }]
+            }]
+        }]);
+
+        let files: FlattenedFiles =
+            serde_json::from_value(payload).expect("payload should deserialize");
+        assert_eq!(files.errors.len(), 0, "overshooting transfer was rejected");
+        assert_eq!(files.files.len(), 1, "overshooting transfer was dropped");
+        let progress = crate::download::DownloadProgress::from(files.files[0].clone());
+        assert_eq!(progress.transferred, 5120);
+        assert_eq!(progress.size, 1024);
     }
 
     /// Entries that fail to parse must be reported, not silently skipped:
