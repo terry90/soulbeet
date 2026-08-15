@@ -26,6 +26,8 @@ pub mod auto_download;
 pub use auto_download::{auto_download, AutoDownloadRequest, AutoDownloadResult};
 
 #[cfg(feature = "server")]
+pub mod failover;
+#[cfg(feature = "server")]
 pub mod import;
 #[cfg(feature = "server")]
 pub mod monitor;
