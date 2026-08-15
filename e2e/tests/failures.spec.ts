@@ -114,6 +114,30 @@ test('rides out slskd auto-retry of a failed transfer', async ({ context, page }
   await expectFileAppears(imported, 120_000);
 });
 
+test('falls over to the next peer when the best source errors', async ({ context, page }) => {
+  // collector_01 ranks first (FLAC) and dies mid-transfer: 'flaky' ends at
+  // "Completed, Errored" with no slskd retry. mp3_hoarder serves the same
+  // album from a completely different remote path and in a different format,
+  // so failover has to match the track by title rather than by filename.
+  await setPeerBehavior('collector_01', 'flaky');
+  const { folder } = await freshSession(context, page, 'fail-failover');
+
+  await performSearch(page, 'Paper Lanterns', 'TRACK');
+  const row = page.locator('li').filter({ hasText: 'Paper Lanterns' }).first();
+  await row.getByRole('button', { name: 'Download' }).click();
+
+  // The mp3 extension is the assertion that matters: the file can only exist
+  // if the fallback peer served it.
+  const imported = importedTrackPath(
+    folder.name,
+    glassAtlas.artist,
+    glassAtlas.title,
+    'Paper Lanterns',
+    'mp3',
+  );
+  await expectFileAppears(imported, 120_000);
+});
+
 test('fails fast when the peer goes offline before enqueue', async ({ context, page }) => {
   // slskd reports an offline peer with "appears to be offline" in the enqueue
   // response body (404 on the batches endpoint). That is non-retryable: the
