@@ -51,7 +51,10 @@ const MAX_INVALID_RESPONSES: u32 = 15;
 /// the failed state is persisted only briefly before the retry re-queues
 /// the transfer as "Queued, Locally". Acting on a single sighting would
 /// abandon a transfer slskd is about to retry.
-const FAILED_STATE_CONFIRM: Duration = Duration::from_secs(4);
+///
+/// Shared with discovery's poll loop, which waits on the same transfers and
+/// so must judge them by the same rule.
+pub(crate) const FAILED_STATE_CONFIRM: Duration = Duration::from_secs(4);
 
 /// State tracking for individual track downloads.
 struct TrackState {
