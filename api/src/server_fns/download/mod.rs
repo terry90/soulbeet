@@ -26,6 +26,8 @@ pub mod auto_download;
 pub use auto_download::{auto_download, AutoDownloadRequest, AutoDownloadResult};
 
 #[cfg(feature = "server")]
+pub mod failover;
+#[cfg(feature = "server")]
 pub mod import;
 #[cfg(feature = "server")]
 pub mod monitor;
@@ -33,6 +35,11 @@ pub mod monitor;
 pub mod process;
 #[cfg(feature = "server")]
 pub mod utils;
+
+// Shared with the tests of sibling modules outside `download`, so it cannot
+// stay private to this one.
+#[cfg(all(test, feature = "server"))]
+pub(crate) mod test_support;
 
 #[cfg(feature = "server")]
 use self::monitor::DownloadMonitor;

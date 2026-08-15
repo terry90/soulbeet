@@ -22,6 +22,8 @@ use crate::services::{available_download_backends, download_backend};
 use crate::AuthSession;
 
 #[cfg(feature = "server")]
+use super::failover::{align_pool_tracks, SourcePool};
+#[cfg(feature = "server")]
 use super::monitor::DownloadMonitor;
 
 /// Score threshold for automatic source selection (per D-04).
@@ -357,6 +359,11 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         let download_filenames: Vec<String> =
             successful.iter().map(|d| d.item.clone()).collect();
 
+        // Pool slots must line up with the monitor's slots, which follow
+        // `successful`, not `picked.items`.
+        let pool =
+            SourcePool::from_tracks(&align_pool_tracks(&successful, &picked.items), &all_groups);
+
         info!(
             "Auto-download: queued {} tracks, starting monitor for '{}'",
             download_filenames.len(),
@@ -375,7 +382,8 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             task_username.clone(),
             Some(batch_id),
             Some(batch_label),
-        );
+        )
+        .with_failover(pool);
         monitor.run().await;
         unregister_user_task(&task_username).await;
     });

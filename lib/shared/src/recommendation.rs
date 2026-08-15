@@ -198,7 +198,7 @@ pub struct CandidateSet {
 /// then collapses whitespace. Handles cases like "don't" vs "dont",
 /// "AC/DC" vs "ACDC", and whitespace differences between Last.fm
 /// and MusicBrainz names.
-fn normalize_for_matching(s: &str) -> String {
+pub fn normalize_for_matching(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())

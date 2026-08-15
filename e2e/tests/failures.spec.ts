@@ -40,7 +40,11 @@ test('falls back to manual source picking when no source scores high enough', as
 });
 
 test('fails tracks whose transfer never shows up in slskd', async ({ context, page }) => {
+  // mp3_hoarder shares this album and would otherwise be the failover
+  // target once the never-appeared fuse trips at 30s; ghost it too so
+  // there is no alternate source and the write-off path actually runs.
   await setPeerBehavior('collector_01', 'ghost');
+  await setPeerBehavior('mp3_hoarder', 'ghost');
   await freshSession(context, page, 'fail-ghost');
 
   await performSearch(page, 'Paper Lanterns', 'TRACK');
@@ -48,16 +52,28 @@ test('fails tracks whose transfer never shows up in slskd', async ({ context, pa
   await row.getByRole('button', { name: 'Download' }).click();
 
   await page.getByRole('button', { name: 'Downloads', exact: true }).click();
+  const drawer = page.locator('div.bg-beet-panel').filter({ hasText: 'Active Transfers' });
+
+  // A row is keyed by remote path, and failover rebinds it to the peer it
+  // retries from (DownloadEvent::Replaced) instead of adding a new one, so
+  // the user sees a single row follow the track across peers. With both
+  // peers dead the row still rebinds once, from collector_01's FLAC path to
+  // mp3_hoarder's mp3 path, before giving up with nowhere left to fail over
+  // to, so mp3_hoarder's path is the row's final binding, not an arbitrary
+  // choice.
   const item = transferRow(
     page,
-    'Music\\FLAC\\Static Harbor\\Glass Atlas\\02 - Paper Lanterns.flac',
+    'Music\\mp3\\Static Harbor\\Glass Atlas\\02 - Paper Lanterns.mp3',
   );
-  await expect(item).toBeVisible({ timeout: 60_000 });
 
   // The monitor gives up after its empty-poll grace period and fails the row
   // instead of leaving it queued forever.
   await expect(item.getByText('ERR', { exact: true })).toBeVisible({ timeout: 90_000 });
   await expect(item.getByText('Download never appeared in slskd')).toBeVisible();
+
+  // Exactly one row for the track: failover replaces the row in place
+  // rather than leaving a dead row behind per attempted peer.
+  await expect(drawer.locator('div.group')).toHaveCount(1);
 });
 
 test('surfaces a mid-transfer error and recovers on retry', async ({ context, page }) => {
@@ -112,6 +128,36 @@ test('rides out slskd auto-retry of a failed transfer', async ({ context, page }
     'flac',
   );
   await expectFileAppears(imported, 120_000);
+});
+
+test('falls over to the next peer when the best source errors', async ({ context, page }) => {
+  // collector_01 ranks first (FLAC) and dies mid-transfer: 'flaky' ends at
+  // "Completed, Errored" with no slskd retry. mp3_hoarder serves the same
+  // album from a completely different remote path and in a different format,
+  // so failover has to match the track by title rather than by filename.
+  await setPeerBehavior('collector_01', 'flaky');
+  const { folder } = await freshSession(context, page, 'fail-failover');
+
+  await performSearch(page, 'Paper Lanterns', 'TRACK');
+  const row = page.locator('li').filter({ hasText: 'Paper Lanterns' }).first();
+  await row.getByRole('button', { name: 'Download' }).click();
+
+  // The mp3 extension is the assertion that matters: the file can only exist
+  // if the fallback peer served it.
+  const imported = importedTrackPath(
+    folder.name,
+    glassAtlas.artist,
+    glassAtlas.title,
+    'Paper Lanterns',
+    'mp3',
+  );
+  await expectFileAppears(imported, 120_000);
+
+  // Failover rebinds one download rather than starting a second, so the dead
+  // peer's row is replaced by the retry's instead of sitting beside it.
+  await page.getByRole('button', { name: 'Downloads', exact: true }).click();
+  const drawer = page.locator('div.bg-beet-panel').filter({ hasText: 'Active Transfers' });
+  await expect(drawer.locator('div.group')).toHaveCount(1);
 });
 
 test('fails fast when the peer goes offline before enqueue', async ({ context, page }) => {

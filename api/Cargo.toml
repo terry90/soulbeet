@@ -39,6 +39,9 @@ futures = { version = "0.3", optional = true }
 [build-dependencies]
 dotenvy = "0.15.7"
 
+[dev-dependencies]
+async-trait = "0.1"
+
 [features]
 default = []
 server = [

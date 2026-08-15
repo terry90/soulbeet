@@ -43,6 +43,10 @@ use crate::models::folder::Folder;
 #[cfg(feature = "server")]
 use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
+use crate::server_fns::download::failover::{self, SourcePool};
+#[cfg(feature = "server")]
+use crate::server_fns::download::monitor::{best_match, FAILED_STATE_CONFIRM};
+#[cfg(feature = "server")]
 use crate::AuthSession;
 
 #[cfg(feature = "server")]
@@ -279,6 +283,141 @@ pub async fn get_discovery_progress(
     }
 }
 
+/// A track discovery has enqueued and is waiting on, plus the peers it can
+/// still fall back to.
+#[cfg(feature = "server")]
+struct QueuedTrack {
+    artist: String,
+    track: String,
+    album: Option<String>,
+    /// The peer serving the transfer this track is waiting on. Half of that
+    /// transfer's identity, and swapped together with `slskd_filename` on
+    /// every retry.
+    slskd_source: String,
+    slskd_filename: String,
+    /// When this track's transfer was first seen failed, cleared the moment
+    /// it is seen in any other state.
+    failing_since: Option<tokio::time::Instant>,
+    /// Alternate peers for this track, and how many have been tried.
+    pool: SourcePool,
+}
+
+/// What a discovery download did, as observed in the phase 2 poll loop.
+#[cfg(feature = "server")]
+enum Outcome {
+    Succeeded,
+    /// Transfer error: worth another peer.
+    Failed,
+    /// Cancelled by a user or by monitor cleanup: never retried.
+    Cancelled,
+}
+
+/// The transfer a track is waiting on, as slskd currently reports it.
+///
+/// Keyed on peer AND path, and ranked so that a running transfer beats a
+/// finished one and a finished one beats a failure. A track that fails over
+/// leaves the dead peer's transfer behind in slskd's list, where nothing
+/// prunes it during a run, and `filenames_match` falls back to comparing
+/// basenames. The peer half of the key is not enough on its own either: a
+/// peer that holds the track in two directories contributes two ranked items,
+/// so the alternate can be the very peer that just failed. Taking the first
+/// hit would let the corpse shadow the retry and fail the track over again,
+/// or write it off with its file already downloaded.
+#[cfg(feature = "server")]
+fn matching_transfer<'a>(
+    downloads: &'a [shared::download::DownloadProgress],
+    qt: &QueuedTrack,
+) -> Option<&'a shared::download::DownloadProgress> {
+    best_match(downloads, &qt.slskd_source, &qt.slskd_filename)
+}
+
+/// Settle one poll of slskd's transfer list against the tracks still pending.
+///
+/// Finished transfers leave `pending`; a failed one retries from the track's
+/// next-best peer, moving the whole `(source, filename)` identity to it, and
+/// only lands in `failed` once the track is out of peers. A cancellation is
+/// a decision rather than a peer problem, so it fails without a retry.
+///
+/// A failure counts only once it has persisted for `FAILED_STATE_CONFIRM`,
+/// the same window `DownloadMonitor` applies. slskd 0.26 retries failed
+/// transfers itself and reports the failure in between attempts, so acting on
+/// the first sighting would put a second peer on a track slskd is still
+/// delivering, and the winner would be whichever finished last. At a 5s poll
+/// interval this costs one extra poll.
+#[cfg(feature = "server")]
+async fn settle_poll(
+    queued: &mut [QueuedTrack],
+    downloads: &[shared::download::DownloadProgress],
+    pending: &mut std::collections::HashSet<String>,
+    failed: &mut std::collections::HashSet<String>,
+    backend: &Arc<dyn soulbeet::DownloadBackend>,
+) {
+    let mut newly_done: Vec<(usize, String, Outcome)> = Vec::new();
+    for (idx, qt) in queued.iter_mut().enumerate() {
+        if !pending.contains(&qt.slskd_filename) {
+            continue;
+        }
+        let Some(dl) = matching_transfer(downloads, qt) else {
+            continue;
+        };
+        if !matches!(dl.state, shared::download::DownloadState::Failed(_)) {
+            qt.failing_since = None;
+        }
+        match &dl.state {
+            shared::download::DownloadState::Completed
+            | shared::download::DownloadState::Imported
+            | shared::download::DownloadState::ImportSkipped => {
+                newly_done.push((idx, qt.slskd_filename.clone(), Outcome::Succeeded));
+            }
+            shared::download::DownloadState::Failed(_) => {
+                let failing_since = qt
+                    .failing_since
+                    .get_or_insert_with(tokio::time::Instant::now);
+                if failing_since.elapsed() >= FAILED_STATE_CONFIRM {
+                    newly_done.push((idx, qt.slskd_filename.clone(), Outcome::Failed));
+                }
+            }
+            shared::download::DownloadState::Cancelled => {
+                newly_done.push((idx, qt.slskd_filename.clone(), Outcome::Cancelled));
+            }
+            _ => {}
+        }
+    }
+
+    for (idx, fname, outcome) in &newly_done {
+        pending.remove(fname);
+        match outcome {
+            Outcome::Succeeded => {}
+            Outcome::Cancelled => {
+                failed.insert(fname.clone());
+            }
+            Outcome::Failed => {
+                let qt = &mut queued[*idx];
+                let retried = match qt.pool.enqueue_next(0, backend).await {
+                    Some(next) => {
+                        info!(
+                            "Discovery: '{}' - {} failed from {}, retrying from {}",
+                            qt.artist, qt.track, fname, next.source
+                        );
+                        // The new peer serves this track under its own remote
+                        // path, so the whole identity moves at once, and the
+                        // fresh transfer starts with no failure recorded.
+                        qt.slskd_source = next.source;
+                        qt.slskd_filename = next.item.clone();
+                        qt.failing_since = None;
+                        pending.insert(next.item);
+                        true
+                    }
+                    None => false,
+                };
+                if !retried {
+                    failed.insert(fname.clone());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "server")]
 pub async fn generate_discovery_playlist_internal(
     user_id: &str,
@@ -442,12 +581,6 @@ pub async fn generate_discovery_playlist_internal(
             }
 
             // Phase 1: Search and queue downloads
-            struct QueuedTrack {
-                artist: String,
-                track: String,
-                album: Option<String>,
-                slskd_filename: String,
-            }
             let mut queued: Vec<QueuedTrack> = Vec::new();
 
             // Over-queue by 50% to absorb import failures without another retry round
@@ -558,14 +691,15 @@ pub async fn generate_discovery_playlist_internal(
                 }
                 stats.search_hits += 1;
 
-                // Try up to 3 sources, falling back on download failure
-                ranked_items.truncate(3);
+                // Keep the sources this track is allowed to try: the one
+                // enqueued here plus the alternates phase 2 fails over to.
+                ranked_items.truncate(failover::MAX_SOURCES_PER_TRACK);
                 let mut downloaded = false;
                 for (attempt_idx, item) in ranked_items.iter().enumerate() {
                     let download_results = match backend.download(vec![item.clone()]).await {
                         Ok(r) => r,
                         Err(e) => {
-                            if attempt_idx < 2 {
+                            if attempt_idx + 1 < ranked_items.len() {
                                 info!(
                                     "Download source {} failed for '{}' - {}, trying next: {}",
                                     attempt_idx + 1,
@@ -591,7 +725,13 @@ pub async fn generate_discovery_playlist_internal(
                             artist: candidate.artist.clone(),
                             track: candidate.track.clone(),
                             album: candidate.album.clone(),
+                            slskd_source: dl.source.clone(),
                             slskd_filename: dl.item.clone(),
+                            failing_since: None,
+                            // Start the pool at the source that actually
+                            // enqueued: earlier entries were already tried and
+                            // rejected in this loop, and must not be retried.
+                            pool: SourcePool::single(ranked_items[attempt_idx..].to_vec()),
                         });
                         DiscoveryCandidateRow::mark_used(
                             user_id,
@@ -600,19 +740,12 @@ pub async fn generate_discovery_playlist_internal(
                             &candidate.track,
                         )
                         .await?;
-                        DiscoveryHistoryRow::record(
-                            user_id,
-                            &candidate.artist,
-                            &candidate.track,
-                            &profile_name,
-                        )
-                        .await?;
                         downloaded = true;
                         break;
                     }
                     // This source returned an error in the response
                     stats.downloads_failed += 1;
-                    if attempt_idx < 2 {
+                    if attempt_idx + 1 < ranked_items.len() {
                         info!(
                             "Download source {} errored for '{}' - {}, trying next",
                             attempt_idx + 1,
@@ -677,32 +810,14 @@ pub async fn generate_discovery_playlist_internal(
                     Err(_) => continue,
                 };
 
-                let mut newly_done = Vec::new();
-                for fname in pending_filenames.iter() {
-                    let matched = downloads.iter().find(|d| {
-                        crate::server_fns::download::monitor::filenames_match(&d.item, fname)
-                    });
-                    if let Some(dl) = matched {
-                        match &dl.state {
-                            shared::download::DownloadState::Completed
-                            | shared::download::DownloadState::Imported
-                            | shared::download::DownloadState::ImportSkipped => {
-                                newly_done.push((fname.clone(), true));
-                            }
-                            shared::download::DownloadState::Failed(_)
-                            | shared::download::DownloadState::Cancelled => {
-                                newly_done.push((fname.clone(), false));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                for (fname, succeeded) in &newly_done {
-                    pending_filenames.remove(fname);
-                    if !succeeded {
-                        failed_filenames.insert(fname.clone());
-                    }
-                }
+                settle_poll(
+                    &mut queued,
+                    &downloads,
+                    &mut pending_filenames,
+                    &mut failed_filenames,
+                    &backend,
+                )
+                .await;
             }
 
             stats.downloads_timed_out += pending_filenames.len() as u32;
@@ -786,6 +901,17 @@ pub async fn generate_discovery_playlist_internal(
                             warn!("Beets skipped '{}' - {} (duplicate?)", qt.artist, qt.track);
                             stats.imports_skipped += 1;
                             let _ = tokio::fs::remove_file(src).await;
+                            // A duplicate is a permanent condition: the library
+                            // already holds this track, so suggesting it again
+                            // would download it again. Only genuine failures
+                            // stay eligible for rediscovery.
+                            DiscoveryHistoryRow::record(
+                                user_id,
+                                &qt.artist,
+                                &qt.track,
+                                &profile_name,
+                            )
+                            .await?;
                             continue;
                         }
                         Ok(other) => {
@@ -855,6 +981,10 @@ pub async fn generate_discovery_playlist_internal(
                     )
                     .await?;
                 }
+                // Recorded here, not at enqueue: discovery history is the
+                // permanent exclusion set, and a track killed by a bad peer
+                // must stay available to suggest again.
+                DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_name).await?;
                 stats.imports_succeeded += 1;
                 profile_downloads += 1;
             }
@@ -1347,4 +1477,231 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
     }
     #[cfg(not(feature = "server"))]
     Ok(Vec::new())
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::{settle_poll, QueuedTrack, FAILED_STATE_CONFIRM};
+    use crate::server_fns::download::failover::SourcePool;
+    use crate::server_fns::download::test_support::{item, ScriptedOutcome, StubBackend};
+    use shared::download::{DownloadProgress, DownloadableItem};
+    use soulbeet::DownloadBackend;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    /// A track waiting on `items[0]`, with the rest as its alternates.
+    fn queued_track(items: Vec<DownloadableItem>) -> QueuedTrack {
+        QueuedTrack {
+            artist: "Kowloon".to_string(),
+            track: "Wake Up".to_string(),
+            album: Some("Come Over".to_string()),
+            slskd_source: items[0].source.clone(),
+            slskd_filename: items[0].id.clone(),
+            failing_since: None,
+            pool: SourcePool::single(items),
+        }
+    }
+
+    /// Backdate a track's failure so it has already outlived the confirmation
+    /// window, letting a single poll act on it without sleeping through it.
+    fn already_confirmed_failing(qt: &mut QueuedTrack) {
+        qt.failing_since = Some(tokio::time::Instant::from_std(
+            std::time::Instant::now()
+                .checked_sub(FAILED_STATE_CONFIRM + std::time::Duration::from_secs(1))
+                .expect("monotonic clock younger than the confirmation window"),
+        ));
+    }
+
+    fn failed_transfer(source: &str, path: &str) -> DownloadProgress {
+        DownloadProgress::failed(
+            path.to_string(),
+            source.to_string(),
+            path.to_string(),
+            "Transfer rejected".to_string(),
+        )
+    }
+
+    fn live_transfer(source: &str, path: &str) -> DownloadProgress {
+        DownloadProgress::queued(path.to_string(), source.to_string(), path.to_string(), 0)
+    }
+
+    fn completed_transfer(source: &str, path: &str) -> DownloadProgress {
+        live_transfer(source, path).with_state(shared::download::DownloadState::Completed)
+    }
+
+    fn pending_of(queued: &[QueuedTrack]) -> HashSet<String> {
+        queued.iter().map(|q| q.slskd_filename.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_retry_moves_the_whole_identity_to_the_new_peer() {
+        let mut queued = vec![queued_track(vec![
+            item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+            item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+        ])];
+        let mut pending = pending_of(&queued);
+        let mut failed = HashSet::new();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        already_confirmed_failing(&mut queued[0]);
+
+        settle_poll(
+            &mut queued,
+            &[failed_transfer("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed,
+            &backend,
+        )
+        .await;
+
+        // Source and filename identify the transfer as a pair: leaving either
+        // on the dead peer would lose sight of the retry.
+        assert_eq!(queued[0].slskd_source, "peer_b");
+        assert_eq!(queued[0].slskd_filename, "b/07 - Wake Up.flac");
+        assert_eq!(pending, pending_of(&queued));
+        assert!(failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_transfer_from_the_retried_peer_does_not_shadow_the_live_one() {
+        // One peer holding the track in two directories is two ranked items,
+        // so an alternate can be the peer that just failed. Both transfers
+        // then match on source, and filenames_match's basename fallback makes
+        // the paths match too. The dead one must not re-trigger failover.
+        let mut queued = vec![queued_track(vec![
+            item("peer_a", "Wake Up", "b/07 - Wake Up.flac"),
+            item("peer_a", "Wake Up", "c/07 - Wake Up.flac"),
+        ])];
+        let mut pending = pending_of(&queued);
+        let mut failed = HashSet::new();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        // Nothing but the ranking stands between the corpse and a failover.
+        already_confirmed_failing(&mut queued[0]);
+        // The corpse is listed first, which is what taking the first hit would
+        // pick up.
+        let downloads = vec![
+            failed_transfer("peer_a", "a/07 - Wake Up.flac"),
+            live_transfer("peer_a", "b/07 - Wake Up.flac"),
+        ];
+
+        settle_poll(&mut queued, &downloads, &mut pending, &mut failed, &backend).await;
+
+        assert_eq!(queued[0].slskd_filename, "b/07 - Wake Up.flac");
+        assert_eq!(pending, pending_of(&queued));
+        assert!(failed.is_empty());
+        assert_eq!(
+            queued[0].pool.attempts_used(0),
+            1,
+            "the live transfer must not cost the track a source"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_retry_outranks_the_dead_peer_it_replaced() {
+        // Same peer, two directories, so the retry's transfer and the dead
+        // one both match the track. Once the retry finishes both are terminal
+        // and the corpse is listed first: reading it as the track's state
+        // would drop a downloaded file and burn another source.
+        let mut queued = vec![queued_track(vec![
+            item("peer_a", "Wake Up", "b/07 - Wake Up.flac"),
+            item("peer_a", "Wake Up", "c/07 - Wake Up.flac"),
+        ])];
+        let mut pending = pending_of(&queued);
+        let mut failed = HashSet::new();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        already_confirmed_failing(&mut queued[0]);
+        let downloads = vec![
+            failed_transfer("peer_a", "a/07 - Wake Up.flac"),
+            completed_transfer("peer_a", "b/07 - Wake Up.flac"),
+        ];
+
+        settle_poll(&mut queued, &downloads, &mut pending, &mut failed, &backend).await;
+
+        assert!(pending.is_empty(), "the track settled as done");
+        assert!(failed.is_empty());
+        assert_eq!(queued[0].slskd_filename, "b/07 - Wake Up.flac");
+        assert_eq!(queued[0].pool.attempts_used(0), 1);
+    }
+
+    #[tokio::test]
+    async fn a_track_that_runs_out_of_peers_is_failed_exactly_once() {
+        let mut queued = vec![queued_track(vec![
+            item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+            item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+        ])];
+        let mut pending = pending_of(&queued);
+        let mut failed = HashSet::new();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        already_confirmed_failing(&mut queued[0]);
+
+        // The first peer dies and the track moves to its only alternate.
+        settle_poll(
+            &mut queued,
+            &[failed_transfer("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed,
+            &backend,
+        )
+        .await;
+        assert!(failed.is_empty());
+
+        // The alternate dies too, and there is nothing left to try. The dead
+        // first peer is still in slskd's list and must not be counted as a
+        // second loss: stats.downloads_failed adds failed_filenames.len().
+        already_confirmed_failing(&mut queued[0]);
+        let downloads = vec![
+            failed_transfer("peer_a", "a/07 - Wake Up.flac"),
+            failed_transfer("peer_b", "b/07 - Wake Up.flac"),
+        ];
+        settle_poll(&mut queued, &downloads, &mut pending, &mut failed, &backend).await;
+
+        assert!(pending.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert!(failed.contains("b/07 - Wake Up.flac"));
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_clears_on_the_next_poll_never_reaches_another_peer() {
+        // slskd 0.26 retries a failed transfer itself, reporting the failure
+        // only between its own attempts. Enqueueing a second peer on that
+        // sighting would leave two transfers running, and whichever landed
+        // second would decide which file the track ends up pointing at.
+        let mut queued = vec![queued_track(vec![
+            item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+            item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+        ])];
+        let mut pending = pending_of(&queued);
+        let mut failed = HashSet::new();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+
+        settle_poll(
+            &mut queued,
+            &[failed_transfer("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed,
+            &backend,
+        )
+        .await;
+
+        assert_eq!(queued[0].slskd_source, "peer_a", "the first sighting waits");
+        assert_eq!(queued[0].pool.attempts_used(0), 1);
+        assert!(queued[0].failing_since.is_some());
+        assert_eq!(pending, pending_of(&queued));
+
+        // slskd's own retry re-queued the transfer, so the failure is gone and
+        // the clock must go with it.
+        settle_poll(
+            &mut queued,
+            &[live_transfer("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed,
+            &backend,
+        )
+        .await;
+
+        assert_eq!(queued[0].slskd_source, "peer_a");
+        assert_eq!(queued[0].pool.attempts_used(0), 1);
+        assert!(queued[0].failing_since.is_none());
+        assert_eq!(pending, pending_of(&queued));
+        assert!(failed.is_empty());
+    }
 }
