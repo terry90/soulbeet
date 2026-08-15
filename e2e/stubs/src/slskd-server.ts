@@ -117,6 +117,21 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
         },
       },
       {
+        // slskd 0.26 serves per-peer transfers here, and answers 404 when it
+        // holds none for that peer. Soulbeet polls this rather than the whole
+        // list, which grows with the instance's entire history (#78).
+        method: 'GET',
+        pattern: '/api/v0/transfers/downloads/:username',
+        handler: ({ res, params }) => {
+          const user = state.downloadsForUserJson(params.username as string);
+          if (user === null) {
+            sendEmpty(res, 404);
+            return;
+          }
+          sendJson(res, 200, user);
+        },
+      },
+      {
         method: 'DELETE',
         pattern: '/api/v0/transfers/downloads/:username/:id',
         handler: ({ res, params, url }) => {

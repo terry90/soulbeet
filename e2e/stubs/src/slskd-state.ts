@@ -562,23 +562,39 @@ export class SlskdState {
 
     const result: Array<Record<string, unknown>> = [];
     for (const [username, list] of byUser) {
-      const byDirectory = new Map<string, TransferRecord[]>();
-      for (const transfer of list) {
-        const dir = transfer.filename.split('\\').slice(0, -1).join('\\');
-        const dirList = byDirectory.get(dir) ?? [];
-        dirList.push(transfer);
-        byDirectory.set(dir, dirList);
-      }
-      result.push({
-        username,
-        directories: Array.from(byDirectory.entries()).map(([directory, files]) => ({
-          directory,
-          fileCount: files.length,
-          files: files.map((t) => this.transferJson(t)),
-        })),
-      });
+      result.push(this.userJson(username, list));
     }
     return result;
+  }
+
+  /**
+   * GET /api/v0/transfers/downloads/{username}. Returns the single-user
+   * object, or null when that peer holds nothing, which slskd answers as a
+   * 404 rather than an empty body.
+   */
+  downloadsForUserJson(username: string): Record<string, unknown> | null {
+    const list = this.transfers.filter(
+      (transfer) => transfer.username === username && !transfer.hidden && !transfer.removed,
+    );
+    return list.length > 0 ? this.userJson(username, list) : null;
+  }
+
+  private userJson(username: string, list: TransferRecord[]): Record<string, unknown> {
+    const byDirectory = new Map<string, TransferRecord[]>();
+    for (const transfer of list) {
+      const dir = transfer.filename.split('\\').slice(0, -1).join('\\');
+      const dirList = byDirectory.get(dir) ?? [];
+      dirList.push(transfer);
+      byDirectory.set(dir, dirList);
+    }
+    return {
+      username,
+      directories: Array.from(byDirectory.entries()).map(([directory, files]) => ({
+        directory,
+        fileCount: files.length,
+        files: files.map((t) => this.transferJson(t)),
+      })),
+    };
   }
 
   /** Debug/control snapshot for specs. */

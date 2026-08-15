@@ -805,7 +805,17 @@ pub async fn generate_discovery_playlist_internal(
                 )
                 .await;
 
-                let downloads = match backend.get_downloads().await {
+                // Only the peers this batch is waiting on: the full list
+                // carries slskd's entire retained history (#78). Rebuilt each
+                // pass so a failover's new peer is included.
+                let mut sources: Vec<String> = Vec::new();
+                for track in &queued {
+                    if !sources.contains(&track.slskd_source) {
+                        sources.push(track.slskd_source.clone());
+                    }
+                }
+
+                let downloads = match backend.get_downloads_for(&sources).await {
                     Ok(d) => d,
                     Err(_) => continue,
                 };

@@ -42,6 +42,14 @@ pub trait DownloadBackend: Send + Sync {
     async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String>;
     async fn poll_search(&self, search_id: &str) -> Result<SearchResult>;
     async fn download(&self, items: Vec<DownloadableItem>) -> Result<Vec<QueuedDownload>>;
+    /// Transfers held for the given peers. Scoped rather than global: the
+    /// backend's full list grows with its whole history, and every caller
+    /// here is waiting on a specific batch (#78). This is the polling path.
+    async fn get_downloads_for(&self, sources: &[String]) -> Result<Vec<DownloadProgress>>;
+
+    /// Every transfer the backend holds. Only for the case that genuinely
+    /// needs peers outside the batch: adopting a file retried from a source
+    /// nobody is tracking.
     async fn get_downloads(&self) -> Result<Vec<DownloadProgress>>;
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool)
         -> Result<()>;

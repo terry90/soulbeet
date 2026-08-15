@@ -118,6 +118,9 @@ impl DownloadBackend for StubBackend {
             ScriptedOutcome::TransportError => Err(SoulseekError::LockError),
         }
     }
+    async fn get_downloads_for(&self, _sources: &[String]) -> SoulResult<Vec<DownloadProgress>> {
+        Ok(Vec::new())
+    }
     async fn get_downloads(&self) -> SoulResult<Vec<DownloadProgress>> {
         Ok(Vec::new())
     }

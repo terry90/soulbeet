@@ -171,6 +171,33 @@ impl DownloadMonitor {
         }
     }
 
+    /// The peers this batch is currently waiting on, deduplicated. Follows
+    /// failover: a rebound slot names its new peer, and the abandoned one is
+    /// already cancelled by the rebind.
+    fn sources(&self) -> Vec<String> {
+        let mut sources: Vec<String> = Vec::new();
+        for file in &self.tracked_files {
+            if !sources.contains(&file.source) {
+                sources.push(file.source.clone());
+            }
+        }
+        sources
+    }
+
+    /// Whether some unprocessed slot has no usable transfer from its own
+    /// peer. Such a slot may have been retried from a peer this batch never
+    /// asked (#62), and only the unscoped list can show that.
+    fn any_slot_unresolved(&self, downloads: &[DownloadProgress]) -> bool {
+        self.tracked_files
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !self.track_states[*idx].processed)
+            .any(|(_, tracked)| {
+                best_match(downloads, &tracked.source, &tracked.filename)
+                    .is_none_or(|best| is_terminal_state(&best.state) && !is_completed(&best.state))
+            })
+    }
+
     /// Give up when slskd's transfer list has been unreadable for too long.
     ///
     /// Transport errors are deliberately not fused by count, because a slskd
@@ -341,10 +368,21 @@ impl DownloadMonitor {
                     continue;
                 }
             };
-            match backend.get_downloads().await {
-                Ok(downloads) => {
+            match backend.get_downloads_for(&self.sources()).await {
+                Ok(mut downloads) => {
                     invalid_responses = 0;
                     self.last_readable_poll = Instant::now();
+
+                    // Widen to every peer only while a slot has nothing
+                    // usable, so the unbounded list is read when it can
+                    // actually tell us something new rather than every poll.
+                    if self.any_slot_unresolved(&downloads) {
+                        match backend.get_downloads().await {
+                            Ok(all) => downloads = all,
+                            Err(e) => debug!("Could not widen the transfer view: {}", e),
+                        }
+                    }
+
                     let should_break = self
                         .process_poll_result(
                             downloads,
@@ -400,7 +438,7 @@ impl DownloadMonitor {
 
     /// Remove the terminal slskd transfer records belonging to this batch.
     async fn remove_batch_transfers(&mut self, backend: &Arc<dyn DownloadBackend>) {
-        let downloads = match backend.get_downloads().await {
+        let downloads = match backend.get_downloads_for(&self.sources()).await {
             Ok(d) => d,
             Err(e) => {
                 warn!("Could not list downloads for batch cleanup: {}", e);

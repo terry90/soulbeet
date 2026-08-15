@@ -8,6 +8,7 @@ use crate::{
     },
 };
 use chrono::{DateTime, Duration, Utc};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
@@ -678,28 +679,94 @@ impl SoulseekClient {
         parse_batch_enqueue_response(username, batch, &resp_text)
     }
 
+    /// Everything that cannot appear literally in one URL path segment.
+    /// Soulseek usernames are free-form, so a peer called `a/b` or `x?y`
+    /// would otherwise re-point the request at a different route.
+    const PATH_SEGMENT: &'static AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'/')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}');
+
+    /// Every transfer slskd holds, across every peer.
+    ///
+    /// Unbounded on slskd's side, so this is reserved for the one case that
+    /// needs it: spotting a file retried from a peer this batch never asked.
+    /// Routine polling uses `get_downloads_for_users`.
     pub async fn get_all_downloads(&self) -> Result<Vec<FileEntry>> {
         let flattened: FlattenedFiles = self
             .make_request(Method::GET, "transfers/downloads", None::<()>)
             .await?;
-        if !flattened.errors.is_empty() {
-            if flattened.files.is_empty() {
-                // Every entry failed to parse: schema drift, not an empty
-                // queue. Returning Ok([]) here is what made slskd 0.26 look
-                // like downloads never appeared (#73).
+        Self::usable_files(flattened.files, flattened.errors)
+    }
+
+    /// Report entries that failed to parse rather than dropping them: a
+    /// silent skip is indistinguishable from "no downloads in progress",
+    /// which is how the 0.26 schema drift went unnoticed (#73). Only a
+    /// wholesale failure is fatal, since one bad entry among good ones is
+    /// a single broken transfer, not schema drift.
+    fn usable_files(files: Vec<FileEntry>, errors: Vec<String>) -> Result<Vec<FileEntry>> {
+        if !errors.is_empty() {
+            if files.is_empty() {
                 return Err(SoulseekError::InvalidResponse(format!(
                     "all {} transfer entries failed to parse; first error: {}",
-                    flattened.errors.len(),
-                    flattened.errors[0]
+                    errors.len(),
+                    errors[0]
                 )));
             }
             warn!(
                 "Skipped {} unparseable slskd transfer entries; first error: {}",
-                flattened.errors.len(),
-                flattened.errors[0]
+                errors.len(),
+                errors[0]
             );
         }
-        Ok(flattened.files)
+        Ok(files)
+    }
+
+    /// Transfers for the given peers only.
+    ///
+    /// slskd retains every completed transfer with `Removed = 0` until the
+    /// user clears it, so `GET transfers/downloads` grows without bound: one
+    /// instance answered with 40,092 transfers in 24.7 MB of JSON, which a
+    /// 2-second poll could not read before timing out, and the circuit
+    /// breaker then stayed open (#78). Asking per peer bounds the response
+    /// by that peer's history rather than the whole instance's.
+    pub async fn get_downloads_for_users(&self, usernames: &[String]) -> Result<Vec<FileEntry>> {
+        let mut requested: Vec<&String> = Vec::new();
+        for username in usernames {
+            if !requested.contains(&username) {
+                requested.push(username);
+            }
+        }
+
+        let mut files: Vec<FileEntry> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        for username in requested {
+            let endpoint = format!(
+                "transfers/downloads/{}",
+                utf8_percent_encode(username, Self::PATH_SEGMENT)
+            );
+            let flattened: FlattenedFiles =
+                match self.make_request(Method::GET, &endpoint, None::<()>).await {
+                    Ok(flattened) => flattened,
+                    // slskd answers 404 for a peer it holds no transfers
+                    // for. That is an empty result, not a failure.
+                    Err(SoulseekError::Api { status: 404, .. }) => continue,
+                    Err(e) => return Err(e),
+                };
+            files.extend(flattened.files);
+            errors.extend(flattened.errors);
+        }
+
+        Self::usable_files(files, errors)
     }
 
     pub async fn cancel_download(
@@ -926,6 +993,14 @@ impl crate::DownloadBackend for SoulseekClient {
 
         let responses = self.download(tracks).await?;
         Ok(responses.into_iter().map(Into::into).collect())
+    }
+
+    async fn get_downloads_for(
+        &self,
+        sources: &[String],
+    ) -> Result<Vec<shared::download::DownloadProgress>> {
+        let entries = self.get_downloads_for_users(sources).await?;
+        Ok(entries.into_iter().map(Into::into).collect())
     }
 
     async fn get_downloads(&self) -> Result<Vec<shared::download::DownloadProgress>> {
