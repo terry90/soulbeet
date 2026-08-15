@@ -123,7 +123,7 @@ mod tests {
     use shared::download::{DownloadProgress, QueuedDownload, SearchResult};
     use shared::download::{DownloadableGroup, DownloadableItem};
     use shared::metadata::{Album, Track};
-    use soulbeet::error::Result as SoulResult;
+    use soulbeet::error::{Result as SoulResult, SoulseekError};
     use soulbeet::DownloadBackend;
     use std::sync::{Arc, Mutex};
 
@@ -233,15 +233,23 @@ mod tests {
         assert!(pool.take_next(9).is_none());
     }
 
+    /// What a scripted `download` call does: accept the item, accept the
+    /// call but mark the item rejected (peer offline, already queued
+    /// elsewhere), or fail the call itself (transport error).
+    enum ScriptedOutcome {
+        Enqueued,
+        Rejected,
+        TransportError,
+    }
+
     /// Records every enqueue and answers each one from a scripted list.
     struct StubBackend {
-        /// One entry per expected call: Some(source) enqueues, None errors.
-        script: Mutex<Vec<Option<String>>>,
+        script: Mutex<Vec<ScriptedOutcome>>,
         calls: Mutex<Vec<String>>,
     }
 
     impl StubBackend {
-        fn new(script: Vec<Option<String>>) -> Arc<Self> {
+        fn new(script: Vec<ScriptedOutcome>) -> Arc<Self> {
             Arc::new(Self {
                 script: Mutex::new(script),
                 calls: Mutex::new(Vec::new()),
@@ -269,18 +277,31 @@ mod tests {
             let outcome = {
                 let mut script = self.script.lock().unwrap();
                 if script.is_empty() {
-                    None
+                    ScriptedOutcome::Rejected
                 } else {
                     script.remove(0)
                 }
             };
-            Ok(vec![QueuedDownload {
-                id: item.id.clone(),
-                source: item.source.clone(),
-                item: item.id.clone(),
-                size: item.size.unwrap_or(0),
-                error: outcome.is_none().then(|| "peer offline".to_string()),
-            }])
+            match outcome {
+                ScriptedOutcome::Enqueued => Ok(vec![QueuedDownload {
+                    id: item.id.clone(),
+                    source: item.source.clone(),
+                    item: item.id.clone(),
+                    size: item.size.unwrap_or(0),
+                    error: None,
+                }]),
+                ScriptedOutcome::Rejected => Ok(vec![QueuedDownload {
+                    id: item.id.clone(),
+                    source: item.source.clone(),
+                    item: item.id.clone(),
+                    size: item.size.unwrap_or(0),
+                    error: Some("peer offline".to_string()),
+                }]),
+                // LockError stands in for any transport-level failure; its
+                // meaning doesn't matter here, only that `download` itself
+                // errors rather than returning an Ok with a rejected item.
+                ScriptedOutcome::TransportError => Err(SoulseekError::LockError),
+            }
         }
         async fn get_downloads(&self) -> SoulResult<Vec<DownloadProgress>> {
             Ok(Vec::new())
@@ -300,7 +321,7 @@ mod tests {
             item("peer_b", "Wake Up", "b.flac"),
         ];
         let mut pool = SourcePool::single(items);
-        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![Some("peer_b".into())]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
 
         let queued = pool.enqueue_next(0, &backend).await.expect("enqueued");
         assert_eq!(queued.source, "peer_b");
@@ -314,8 +335,27 @@ mod tests {
             item("peer_c", "Wake Up", "c.flac"),
         ];
         let mut pool = SourcePool::single(items);
-        // peer_b's enqueue fails, peer_c's succeeds
-        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![None, Some("peer_c".into())]);
+        // peer_b's enqueue is rejected (Ok response, item.error set), peer_c's succeeds
+        let backend: Arc<dyn DownloadBackend> =
+            StubBackend::new(vec![ScriptedOutcome::Rejected, ScriptedOutcome::Enqueued]);
+
+        let queued = pool.enqueue_next(0, &backend).await.expect("enqueued");
+        assert_eq!(queued.source, "peer_c");
+    }
+
+    #[tokio::test]
+    async fn skips_an_alternate_whose_transport_call_errors() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+            item("peer_c", "Wake Up", "c.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        // peer_b's download() call itself fails, peer_c's succeeds
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![
+            ScriptedOutcome::TransportError,
+            ScriptedOutcome::Enqueued,
+        ]);
 
         let queued = pool.enqueue_next(0, &backend).await.expect("enqueued");
         assert_eq!(queued.source, "peer_c");
@@ -328,8 +368,29 @@ mod tests {
             item("peer_b", "Wake Up", "b.flac"),
         ];
         let mut pool = SourcePool::single(items);
-        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![None]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Rejected]);
 
         assert!(pool.enqueue_next(0, &backend).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stops_enqueueing_once_the_budget_is_spent() {
+        // 1 already-used source plus 6 alternates: more alternates than the
+        // budget (MAX_SOURCES_PER_TRACK - 1 = 3) allows.
+        let items: Vec<DownloadableItem> = (0..7)
+            .map(|i| item(&format!("peer_{i}"), "Wake Up", &format!("{i}.flac")))
+            .collect();
+        let mut pool = SourcePool::single(items);
+        // Every alternate the backend is asked about is rejected. A
+        // regression that drained `alternates` directly instead of going
+        // through `take_next` would call the backend a 4th time here.
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![
+            ScriptedOutcome::Rejected,
+            ScriptedOutcome::Rejected,
+            ScriptedOutcome::Rejected,
+        ]);
+
+        assert!(pool.enqueue_next(0, &backend).await.is_none());
+        assert_eq!(pool.attempts_used(0), MAX_SOURCES_PER_TRACK);
     }
 }
