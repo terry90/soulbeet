@@ -1,8 +1,11 @@
 plugins: musicbrainz
-# Drop-in pure-Python beets plugins live here at runtime. The Dockerfile
-# pre-creates /data/beets-plugins as an empty 0755 directory; users may
-# bind-mount their own directory at the same path to extend any tier.
-pluginpath: /data/beets-plugins
+# /opt/beets-plugins ships with the image and must come first: /data is a bind
+# mount in every deployment, so anything baked under it is hidden at runtime.
+# The Dockerfile pre-creates /data/beets-plugins as an empty 0755 directory;
+# users may bind-mount their own directory there to extend any tier.
+pluginpath:
+  - /opt/beets-plugins
+  - /data/beets-plugins
 directory: /music # Mapped in docker-compose
 import:
   copy: no

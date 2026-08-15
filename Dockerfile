@@ -168,6 +168,10 @@ COPY --from=builder /app/target/dx/web/release/web /app/server
 # than the raw committed file, so the `plugins:` line matches the active tier.
 COPY --from=beets-builder /beets_config.yaml /app/beets_config.yaml
 
+# Plugins that ship with the image. They live outside /data because every
+# deployment bind-mounts /data, which would hide anything baked underneath it.
+COPY beets_plugins /opt/beets-plugins
+
 # Copy empty data directory to ensure /data exists
 COPY --from=builder /empty_data /data
 # Pre-create /data/beets-plugins so beets does not silently no-op pluginpath
