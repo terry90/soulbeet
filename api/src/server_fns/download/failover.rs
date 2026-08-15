@@ -31,26 +31,47 @@ pub struct SourcePool {
 }
 
 impl SourcePool {
-    /// Album or multi-track batch: map each track of the picked group to the
-    /// same-titled items in the remaining groups. `rest` must already be in
-    /// descending score order, which is how `auto_download` sorts it.
-    ///
-    /// Matching is by normalized title, never by filename: the same track has
-    /// a completely different remote path on each peer.
+    /// Album or multi-track batch: map every track of the picked group to the
+    /// same-titled items in the remaining groups, in the group's own order.
+    /// Only safe when the caller monitors the picked group verbatim; when the
+    /// enqueue may reorder or drop tracks, use `from_tracks`.
     pub fn from_groups(picked: &DownloadableGroup, rest: &[DownloadableGroup]) -> Self {
-        let slots = picked
-            .items
+        let tracks: Vec<Option<DownloadableItem>> =
+            picked.items.iter().cloned().map(Some).collect();
+        Self::from_tracks(&tracks, rest)
+    }
+
+    /// Alternates for a batch, indexed by the slot the caller will monitor.
+    ///
+    /// Callers pass the tracks in the exact order they were enqueued, which is
+    /// not the order they were searched: slskd groups an enqueue by peer and
+    /// destination directory and returns the groups in HashMap order, and
+    /// items whose backend data will not parse are dropped before enqueue. A
+    /// `None` entry keeps a slot aligned when its track cannot be recovered,
+    /// and that slot simply gets no alternates.
+    ///
+    /// `rest` must already be in descending score order, which is how
+    /// `auto_download` sorts it. Matching is by normalized title, never by
+    /// filename: the same track has a completely different remote path on
+    /// each peer.
+    pub fn from_tracks(tracks: &[Option<DownloadableItem>], rest: &[DownloadableGroup]) -> Self {
+        let slots = tracks
             .iter()
             .map(|track| {
-                let wanted = shared::recommendation::normalize_for_matching(&track.title);
-                let alternates = rest
-                    .iter()
-                    .flat_map(|group| group.items.iter())
-                    .filter(|candidate| {
-                        shared::recommendation::normalize_for_matching(&candidate.title) == wanted
-                    })
-                    .cloned()
-                    .collect();
+                let alternates = match track {
+                    Some(track) => {
+                        let wanted = shared::recommendation::normalize_for_matching(&track.title);
+                        rest.iter()
+                            .flat_map(|group| group.items.iter())
+                            .filter(|candidate| {
+                                shared::recommendation::normalize_for_matching(&candidate.title)
+                                    == wanted
+                            })
+                            .cloned()
+                            .collect()
+                    }
+                    None => VecDeque::new(),
+                };
                 Slot {
                     alternates,
                     used: 1,
@@ -196,6 +217,67 @@ mod tests {
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_c".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_d".into()));
         assert!(pool.take_next(0).is_none());
+    }
+
+    #[test]
+    fn from_tracks_slots_follow_the_given_order() {
+        // The enqueue order is not the search order: slskd returns its enqueue
+        // results grouped by peer and destination directory, so slot 0 here is
+        // the track the alternate group happens to list second. Slots must
+        // follow the tracks handed in, never the order found in `rest`.
+        let rest = vec![group(
+            "peer_b",
+            vec![
+                item("peer_b", "Come Over", "b-come-over.flac"),
+                item("peer_b", "Wake Up", "b-wake-up.flac"),
+            ],
+            0.9,
+        )];
+        let tracks = vec![
+            Some(item("peer_a", "Wake Up", "a-wake-up.flac")),
+            Some(item("peer_a", "Come Over", "a-come-over.flac")),
+        ];
+
+        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        assert_eq!(
+            pool.take_next(0).map(|i| i.id),
+            Some("b-wake-up.flac".to_string())
+        );
+        assert_eq!(
+            pool.take_next(1).map(|i| i.id),
+            Some("b-come-over.flac".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unrecoverable_track_keeps_the_slots_after_it_aligned() {
+        let rest = vec![group(
+            "peer_b",
+            vec![
+                item("peer_b", "Wake Up", "b-wake-up.flac"),
+                item("peer_b", "Come Over", "b-come-over.flac"),
+            ],
+            0.9,
+        )];
+        // Slot 1's track could not be matched back to the picked group. It
+        // must still take a slot: compacting it away would shift "Come Over"
+        // down to slot 1 and hand slot 2's failover the wrong track.
+        let tracks = vec![
+            Some(item("peer_a", "Wake Up", "a-wake-up.flac")),
+            None,
+            Some(item("peer_a", "Come Over", "a-come-over.flac")),
+        ];
+
+        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        assert_eq!(
+            pool.take_next(0).map(|i| i.id),
+            Some("b-wake-up.flac".to_string())
+        );
+        assert!(pool.take_next(1).is_none());
+        assert_eq!(
+            pool.take_next(2).map(|i| i.id),
+            Some("b-come-over.flac".to_string())
+        );
     }
 
     #[test]

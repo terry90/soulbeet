@@ -14,6 +14,7 @@ use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::process_downloads;
 use crate::config::CONFIG;
 use crate::services::download_backend;
@@ -82,6 +83,8 @@ pub struct DownloadMonitor {
     tx: broadcast::Sender<DownloadEvent>,
     /// Per-track state, parallel to `tracked_files` by index.
     track_states: Vec<TrackState>,
+    /// Alternate sources per slot; `None` disables failover.
+    pool: Option<SourcePool>,
     /// Whether album mode is enabled.
     album_mode: bool,
     /// Cancellation token for graceful shutdown.
@@ -123,6 +126,7 @@ impl DownloadMonitor {
             target_path,
             tx,
             track_states,
+            pool: None,
             album_mode: CONFIG.is_album_mode(),
             cancellation_token,
             started_at: Instant::now(),
@@ -130,6 +134,60 @@ impl DownloadMonitor {
             batch_id,
             batch_label,
         }
+    }
+
+    /// Attach alternate sources so failed transfers retry from another peer.
+    pub fn with_failover(mut self, pool: SourcePool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Re-enqueue this slot from its next-best peer. Returns true when the
+    /// slot was rebound, in which case the caller must not mark it failed.
+    ///
+    /// Never fires for cancellations: a user cancelling a download, or the
+    /// monitor's own cleanup, must not spawn a fresh transfer.
+    async fn try_failover(
+        &mut self,
+        slot: usize,
+        backend: &Arc<dyn DownloadBackend>,
+        reason: &str,
+    ) -> bool {
+        if self.cancellation_token.is_cancelled() {
+            return false;
+        }
+        let Some(pool) = self.pool.as_mut() else {
+            return false;
+        };
+        let Some(queued) = pool.enqueue_next(slot, backend).await else {
+            return false;
+        };
+
+        let attempt = pool.attempts_used(slot);
+        let previous = self.tracked_files[slot].source.clone();
+        info!(
+            "{} for {} from {}, retrying from {} ({}/{})",
+            reason,
+            self.tracked_files[slot].filename,
+            previous,
+            queued.source,
+            attempt,
+            MAX_SOURCES_PER_TRACK
+        );
+
+        // The new peer serves this track under a completely different remote
+        // path, and filenames_match will not bridge the two, so the slot must
+        // track the new path outright or the monitor loses sight of it.
+        self.tracked_files[slot] = TrackedFile {
+            source: queued.source.clone(),
+            filename: queued.item.clone(),
+        };
+        self.track_states[slot] = TrackState::default();
+
+        let entry = DownloadProgress::queued(queued.id, queued.source, queued.item, queued.size);
+        let entries = self.stamp_batch(vec![entry]);
+        let _ = self.tx.send(DownloadEvent::Progress(entries));
+        true
     }
 
     /// Run the monitoring loop until all downloads complete or timeout.
@@ -177,7 +235,12 @@ impl DownloadMonitor {
                 Ok(downloads) => {
                     invalid_responses = 0;
                     let should_break = self
-                        .process_poll_result(downloads, &mut consecutive_empty, poll_count)
+                        .process_poll_result(
+                            downloads,
+                            &mut consecutive_empty,
+                            poll_count,
+                            &backend,
+                        )
                         .await;
                     if should_break {
                         break;
@@ -257,6 +320,7 @@ impl DownloadMonitor {
         downloads: Vec<DownloadProgress>,
         consecutive_empty: &mut usize,
         poll_count: u32,
+        backend: &Arc<dyn DownloadBackend>,
     ) -> bool {
         // Debug logging for first few polls
         if poll_count <= 3 {
@@ -316,11 +380,11 @@ impl DownloadMonitor {
         }
 
         // Process individual tracks
-        self.process_tracks(&batch_status).await;
+        self.process_tracks(&batch_status, backend).await;
 
         // Fail tracks that never appeared or vanished from slskd's list,
         // so one absent track cannot stall the batch forever
-        self.handle_absent_tracks(&batch_status);
+        self.handle_absent_tracks(&batch_status, backend).await;
 
         // Check completion
         self.check_completion(&batch_status).await
@@ -447,7 +511,11 @@ impl DownloadMonitor {
     }
 
     /// Process each track, handling timeouts and completions.
-    async fn process_tracks(&mut self, batch_status: &[DownloadProgress]) {
+    async fn process_tracks(
+        &mut self,
+        batch_status: &[DownloadProgress],
+        backend: &Arc<dyn DownloadBackend>,
+    ) {
         for download in batch_status {
             let Some(slot) = self.slot_for_item(&download.item) else {
                 continue;
@@ -469,6 +537,9 @@ impl DownloadMonitor {
                         first_seen.elapsed().as_secs() / 60,
                         download.item
                     );
+                    if self.try_failover(slot, backend, "Transfer timed out").await {
+                        continue;
+                    }
                     let timeout_entry = DownloadProgress {
                         state: DownloadState::Failed("Download timed out after 1 hour".into()),
                         error: Some("Per-track timeout".into()),
@@ -507,7 +578,10 @@ impl DownloadMonitor {
                     .failing_since
                     .get_or_insert_with(Instant::now);
                 if failing_since.elapsed() >= FAILED_STATE_CONFIRM {
-                    self.track_states[slot].processed = true;
+                    let retryable = !matches!(download.state, DownloadState::Cancelled);
+                    if !retryable || !self.try_failover(slot, backend, "Transfer failed").await {
+                        self.track_states[slot].processed = true;
+                    }
                 }
             } else {
                 self.track_states[slot].failing_since = None;
@@ -519,7 +593,11 @@ impl DownloadMonitor {
     /// never appeared (rejected/lost requests) or they vanished after being
     /// seen (transfer removed). Each gets a terminal Failed event so the UI
     /// and batch completion never wait on them forever.
-    fn handle_absent_tracks(&mut self, batch_status: &[DownloadProgress]) {
+    async fn handle_absent_tracks(
+        &mut self,
+        batch_status: &[DownloadProgress],
+        backend: &Arc<dyn DownloadBackend>,
+    ) {
         let mut failed: Vec<DownloadProgress> = Vec::new();
 
         for slot in 0..self.tracked_files.len() {
@@ -557,6 +635,9 @@ impl DownloadMonitor {
                     ABSENT_TRACK_TIMEOUT.as_secs(),
                     filename
                 );
+                if self.try_failover(slot, backend, reason).await {
+                    continue;
+                }
                 self.track_states[slot].processed = true;
                 failed.push(make_failed_progress(&self.tracked_files[slot], reason));
             }
