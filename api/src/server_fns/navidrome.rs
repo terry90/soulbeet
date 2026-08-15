@@ -75,7 +75,12 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                         );
                         skipped_veto += 1;
                     } else if let Some(ref path_str) = song.path {
-                        // Skip auto-delete for pending discovery tracks (handled separately below)
+                        // A pending discovery track is deleted by the
+                        // discovery branch below instead, which also marks
+                        // its row Removed and records the outcome. Skip only
+                        // the library delete: `continue`ing the whole song
+                        // here jumped over that branch, so a 1-star pending
+                        // track was never removed at all (#77).
                         let is_discovery = pending_discovery_tracks.iter().any(|dt| {
                             dt.song_id.as_deref() == Some(&song.id)
                                 || std::path::Path::new(&dt.path)
@@ -85,34 +90,34 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                                         .file_name()
                                         .map(|f| f.to_ascii_lowercase())
                         });
-                        if is_discovery {
-                            continue;
-                        }
-                        // Navidrome stores relative paths from its library root.
-                        // Resolve to a local absolute path by trying each user folder.
-                        if let Some(local_path) = resolve_navidrome_path(path_str, &folders) {
-                            let path = std::path::Path::new(&local_path);
-                            if let Err(e) = tokio::fs::remove_file(path).await {
-                                warn!("Auto-delete failed for {}: {}", path.display(), e);
-                            } else {
-                                if let Some(parent) = path.parent() {
-                                    let _ = super::cleanup_empty_ancestors(parent).await;
+                        if !is_discovery {
+                            // Navidrome stores relative paths from its library
+                            // root. Resolve to a local absolute path by trying
+                            // each user folder.
+                            if let Some(local_path) = resolve_navidrome_path(path_str, &folders) {
+                                let path = std::path::Path::new(&local_path);
+                                if let Err(e) = tokio::fs::remove_file(path).await {
+                                    warn!("Auto-delete failed for {}: {}", path.display(), e);
+                                } else {
+                                    if let Some(parent) = path.parent() {
+                                        let _ = super::cleanup_empty_ancestors(parent).await;
+                                    }
+                                    DeletionReviewRow::upsert(
+                                        &song.id,
+                                        &song.title,
+                                        song.artist.as_deref().unwrap_or("Unknown"),
+                                        song.album.as_deref().unwrap_or("Unknown"),
+                                        Some(&local_path),
+                                        Some(rating),
+                                        user_id,
+                                    )
+                                    .await?;
+                                    deleted_tracks += 1;
                                 }
-                                DeletionReviewRow::upsert(
-                                    &song.id,
-                                    &song.title,
-                                    song.artist.as_deref().unwrap_or("Unknown"),
-                                    song.album.as_deref().unwrap_or("Unknown"),
-                                    Some(&local_path),
-                                    Some(rating),
-                                    user_id,
-                                )
-                                .await?;
-                                deleted_tracks += 1;
+                            } else {
+                                real_path_failures += 1;
+                                skipped_not_found += 1;
                             }
-                        } else {
-                            real_path_failures += 1;
-                            skipped_not_found += 1;
                         }
                     }
                 }
