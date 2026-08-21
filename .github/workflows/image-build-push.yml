@@ -158,14 +158,16 @@ jobs:
               echo "medium tier smoke OK"
               ;;
             full)
-              # Full must have ffmpeg, Pillow, the replaygain plugin module,
-              # and must NOT have PyGObject (Pitfall 2 mitigation).
+              # Full must have ffmpeg, Pillow, the replaygain and lastgenre
+              # plugin modules, and must NOT have PyGObject (Pitfall 2
+              # mitigation).
               # Capture ffmpeg -version: piping it straight into head -1
               # kills ffmpeg with SIGPIPE, which pipefail turns into failure.
               ffv=$(docker run --rm --entrypoint=/usr/local/bin/ffmpeg "$IMG" -version)
               head -1 <<<"$ffv"
               py -c "from PIL import Image"
               py -c "import beetsplug.replaygain"
+              py -c "import httpx2; import pylast; import beetsplug.lastgenre"
               out=$(py -c "import gi" 2>&1 || true)
               grep -q ModuleNotFoundError <<<"$out" \
                 || { echo "FAIL: full tier should not have PyGObject"; exit 1; }
