@@ -54,6 +54,9 @@ for FILE in "${FILES[@]}"; do
     fi
 done
 
+# Cargo.lock records the workspace crates' versions too; refresh only those
+cargo update --workspace
+
 # for GitHub Actions
 if [ -n "$GITHUB_OUTPUT" ]; then
     echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
