@@ -7,6 +7,7 @@ use crate::settings_context::use_settings;
 pub fn PreferencesManager() -> Element {
     let mut settings = use_settings();
     let mut selected_provider = use_signal(|| settings.default_provider());
+    let mut require_flac_only = use_signal(|| settings.require_flac_only());
     let mut error = use_signal(String::new);
     let mut success_msg = use_signal(String::new);
     let mut saving = use_signal(|| false);
@@ -15,6 +16,7 @@ pub fn PreferencesManager() -> Element {
     use_effect(move || {
         if settings.is_loaded() && !synced() {
             selected_provider.set(settings.default_provider());
+            require_flac_only.set(settings.require_flac_only());
             synced.set(true);
         }
     });
@@ -105,6 +107,36 @@ pub fn PreferencesManager() -> Element {
                     } else {
                         p { class: "text-xs text-gray-500 mt-1 font-mono",
                             "Choose which service to use for searching albums and tracks."
+                        }
+                    }
+                }
+
+                div { class: "flex items-center justify-between p-3 bg-beet-dark rounded border border-white/10",
+                    div {
+                        p { class: "text-sm text-white font-medium", "Require FLAC only" }
+                        p { class: "text-xs text-gray-500 font-mono mt-0.5",
+                            "Only accept FLAC sources for search and auto-download. Non-FLAC results are excluded entirely, not just down-ranked."
+                        }
+                    }
+                    button {
+                        class: format!(
+                            "relative w-11 h-6 rounded-full cursor-pointer transition-colors {}",
+                            if require_flac_only() { "bg-beet-accent" } else { "bg-gray-600" }
+                        ),
+                        onclick: move |_| async move {
+                            let new_val = !require_flac_only();
+                            require_flac_only.set(new_val);
+                            let update = api::UpdateUserSettings {
+                                require_flac_only: Some(new_val),
+                                ..Default::default()
+                            };
+                            let _ = settings.update(update).await;
+                        },
+                        span {
+                            class: format!(
+                                "absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform {}",
+                                if require_flac_only() { "translate-x-5" } else { "" }
+                            ),
                         }
                     }
                 }

@@ -115,17 +115,23 @@ pub(crate) async fn hydrate_album_tracks(query: &mut DownloadQuery) -> Result<()
     Ok(())
 }
 
-#[post("/api/download/search/start", _: AuthSession)]
+#[post("/api/download/search/start", auth: AuthSession)]
 pub async fn start_download_search(data: DownloadQuery) -> Result<String, ServerFnError> {
     let mut data = data;
     hydrate_album_tracks(&mut data).await.map_err(server_error)?;
+
+    let user_settings = UserSettings::get(&auth.0.sub).await.map_err(server_error)?;
 
     let backend = download_backend(data.backend.as_deref())
         .await
         .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
 
     backend
-        .start_search(data.album.as_ref(), &data.tracks)
+        .start_search(
+            data.album.as_ref(),
+            &data.tracks,
+            user_settings.require_flac_only,
+        )
         .await
         .map_err(server_error)
 }

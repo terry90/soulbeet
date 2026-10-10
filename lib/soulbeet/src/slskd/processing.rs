@@ -10,6 +10,7 @@ pub fn process_search_responses(
     searched_artist: &str,
     searched_album: Option<&str>,
     expected_tracks: &[&str],
+    require_flac: bool,
 ) -> Vec<AlbumResult> {
     const MIN_SCORE_THRESHOLD: f64 = 0.6;
     let audio_extensions: HashSet<&str> = ["flac", "wav", "m4a", "ogg", "aac", "wma", "mp3"]
@@ -27,7 +28,14 @@ pub fn process_search_responses(
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_lowercase());
 
-                if let Some(ext) = ext {
+                if require_flac {
+                    // Strict mode: only confirmed FLAC files pass. Unlike the
+                    // default allowlist below, an unlabeled extension is not
+                    // trusted to be FLAC and is excluded.
+                    if ext.as_deref() != Some("flac") {
+                        return None;
+                    }
+                } else if let Some(ext) = &ext {
                     if !audio_extensions.contains(ext.as_str()) {
                         return None;
                     }
@@ -161,4 +169,121 @@ fn find_best_albums(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slskd::models::SearchResponseFile;
+
+    fn file(filename: &str) -> SearchResponseFile {
+        SearchResponseFile {
+            filename: filename.to_string(),
+            size: 30_000_000,
+            bit_rate: None,
+            length: None,
+            sample_rate: None,
+            bit_depth: None,
+        }
+    }
+
+    fn response(username: &str, files: Vec<SearchResponseFile>) -> SearchResponse {
+        SearchResponse {
+            username: username.to_string(),
+            files,
+            has_free_upload_slot: true,
+            upload_speed: 500,
+            queue_length: 0,
+        }
+    }
+
+    /// `require_flac: false` must behave exactly as before this feature was
+    /// added: both a FLAC source and an MP3 source are valid candidates, so
+    /// both users' groups come back.
+    #[test]
+    fn require_flac_false_keeps_all_supported_formats() {
+        let responses = vec![
+            response(
+                "flac_user",
+                vec![file("Test Artist/Test Album/01 Song One.flac")],
+            ),
+            response(
+                "mp3_user",
+                vec![file("Test Artist/Test Album/01 Song One.mp3")],
+            ),
+        ];
+
+        let results = process_search_responses(
+            &responses,
+            "Test Artist",
+            Some("Test Album"),
+            &["Song One"],
+            false,
+        );
+
+        assert_eq!(results.len(), 2, "both flac and mp3 sources should match");
+        let qualities: HashSet<_> = results.iter().map(|r| r.dominant_quality.as_str()).collect();
+        assert!(qualities.contains("flac"));
+        assert!(qualities.contains("mp3"));
+    }
+
+    /// `require_flac: true` must hard-exclude non-FLAC files before matching,
+    /// not just down-rank them: a lossy-only source should never appear in
+    /// the results at all.
+    #[test]
+    fn require_flac_true_excludes_non_flac_sources() {
+        let responses = vec![
+            response(
+                "flac_user",
+                vec![file("Test Artist/Test Album/01 Song One.flac")],
+            ),
+            response(
+                "mp3_user",
+                vec![file("Test Artist/Test Album/01 Song One.mp3")],
+            ),
+        ];
+
+        let results = process_search_responses(
+            &responses,
+            "Test Artist",
+            Some("Test Album"),
+            &["Song One"],
+            true,
+        );
+
+        assert_eq!(results.len(), 1, "the mp3-only source must be excluded entirely");
+        assert_eq!(results[0].username, "flac_user");
+        assert_eq!(results[0].dominant_quality, "flac");
+    }
+
+    /// `require_flac: true` on a peer who only has some tracks in FLAC must
+    /// keep just the FLAC tracks (lower completeness) rather than filling the
+    /// gap with a lossy file from the same folder.
+    #[test]
+    fn require_flac_true_drops_only_the_non_flac_tracks_in_a_mixed_group() {
+        let responses = vec![response(
+            "mixed_user",
+            vec![
+                file("Test Artist/Test Album/01 Song One.flac"),
+                file("Test Artist/Test Album/02 Song Two.mp3"),
+            ],
+        )];
+
+        let results = process_search_responses(
+            &responses,
+            "Test Artist",
+            Some("Test Album"),
+            &["Song One", "Song Two"],
+            true,
+        );
+
+        assert_eq!(results.len(), 1);
+        let group = &results[0];
+        assert_eq!(group.track_count, 1, "only the flac track should survive");
+        assert_eq!(group.dominant_quality, "flac");
+        assert!(group
+            .tracks
+            .iter()
+            .all(|t| t.base.filename.ends_with(".flac")));
+    }
 }

@@ -9,6 +9,7 @@ pub struct UserSettings {
     pub default_metadata_provider: Option<String>,
     pub last_search_type: Option<String>,
     pub auto_delete_enabled: bool,
+    pub require_flac_only: bool,
     pub lastfm_api_key: Option<String>,
     pub lastfm_username: Option<String>,
     pub discovery_promote_threshold: u8,
@@ -34,6 +35,8 @@ pub struct UpdateUserSettings {
     pub last_search_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_delete_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_flac_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lastfm_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +81,7 @@ impl UserSettings {
             default_metadata_provider: Some("musicbrainz".to_string()),
             last_search_type: Some("album".to_string()),
             auto_delete_enabled: false,
+            require_flac_only: false,
             lastfm_api_key: None,
             lastfm_username: None,
             discovery_promote_threshold: 3,
@@ -107,6 +111,9 @@ impl UserSettings {
         let auto_delete = update
             .auto_delete_enabled
             .unwrap_or(current.auto_delete_enabled);
+        let require_flac_only = update
+            .require_flac_only
+            .unwrap_or(current.require_flac_only);
         let lastfm_key = update.lastfm_api_key.or(current.lastfm_api_key);
         let lastfm_user = update.lastfm_username.or(current.lastfm_username);
         let promote_threshold = update
@@ -141,12 +148,13 @@ impl UserSettings {
 
         sqlx::query(
             r#"
-            INSERT INTO user_settings (user_id, default_metadata_provider, last_search_type, auto_delete_enabled, lastfm_api_key, lastfm_username, discovery_promote_threshold, navidrome_banner_dismissed, listenbrainz_username, listenbrainz_token, discovery_enabled, discovery_folder_id, discovery_track_count, discovery_lifetime_days, discovery_profiles, discovery_playlist_name, default_download_folder_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO user_settings (user_id, default_metadata_provider, last_search_type, auto_delete_enabled, require_flac_only, lastfm_api_key, lastfm_username, discovery_promote_threshold, navidrome_banner_dismissed, listenbrainz_username, listenbrainz_token, discovery_enabled, discovery_folder_id, discovery_track_count, discovery_lifetime_days, discovery_profiles, discovery_playlist_name, default_download_folder_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 default_metadata_provider = excluded.default_metadata_provider,
                 last_search_type = excluded.last_search_type,
                 auto_delete_enabled = excluded.auto_delete_enabled,
+                require_flac_only = excluded.require_flac_only,
                 lastfm_api_key = excluded.lastfm_api_key,
                 lastfm_username = excluded.lastfm_username,
                 discovery_promote_threshold = excluded.discovery_promote_threshold,
@@ -166,6 +174,7 @@ impl UserSettings {
         .bind(&provider)
         .bind(&search_type)
         .bind(auto_delete)
+        .bind(require_flac_only)
         .bind(&lastfm_key)
         .bind(&lastfm_user)
         .bind(promote_threshold)
