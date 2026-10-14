@@ -61,7 +61,10 @@ fn main() {
 #[component]
 fn App() -> Element {
     rsx! {
-        document::Link { rel: "icon", href: FAVICON }
+        // Browsers that take SVG icons use the logo; the .ico (rendered from
+        // it) covers the rest.
+        document::Link { rel: "icon", href: FAVICON, sizes: "16x16 32x32 48x48 256x256" }
+        document::Link { rel: "icon", href: ui::LOGO, r#type: "image/svg+xml" }
         document::Link { rel: "stylesheet", href: MAIN_CSS }
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
         document::Title { "SoulBeet" }

@@ -3,6 +3,8 @@ use std::pin::Pin;
 
 use dioxus::prelude::*;
 
+use crate::Logo;
+
 type LoginCallback = Callback<(String, String), Pin<Box<dyn Future<Output = Result<(), String>>>>>;
 
 #[derive(Props, PartialEq, Clone)]
@@ -39,19 +41,9 @@ pub fn Login(props: Props) -> Element {
         div { class: "p-8 bg-beet-panel border border-white/10 rounded-lg shadow-2xl w-full max-w-md relative z-10",
           // Header
           div { class: "flex flex-col items-center mb-8",
-            div { class: "w-12 h-12 bg-beet-accent rounded-sm flex items-center justify-center shadow-[0_0_15px_rgba(217,70,239,0.5)] mb-4 rotate-3 hover:rotate-6 transition-transform",
-              svg {
-                class: "w-8 h-8 text-white",
-                fill: "none",
-                stroke: "currentColor",
-                view_box: "0 0 24 24",
-                path {
-                  stroke_linecap: "round",
-                  stroke_linejoin: "round",
-                  stroke_width: "2",
-                  d: "M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3",
-                }
-              }
+            Logo {
+              size: 64,
+              class: "mb-4 drop-shadow-[0_0_14px_rgba(255,0,255,0.5)] hover:-translate-y-1 transition-transform",
             }
             h1 { class: "text-2xl font-bold tracking-tighter uppercase text-transparent bg-clip-text bg-gradient-to-r from-white to-gray-400",
               "Soulbeet"
