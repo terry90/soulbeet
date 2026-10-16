@@ -57,6 +57,7 @@ struct SearchContext {
     start_time: DateTime<Utc>,
     timeout: Duration,
     seen_response_count: usize,
+    require_flac: bool,
 }
 
 #[derive(Debug)]
@@ -291,6 +292,7 @@ impl SoulseekClient {
         album: Option<Album>,
         tracks: Vec<Track>,
         timeout: Duration,
+        require_flac: bool,
     ) -> Result<String> {
         self.wait_for_rate_limit().await?;
 
@@ -347,6 +349,7 @@ impl SoulseekClient {
                 start_time: Utc::now(),
                 timeout,
                 seen_response_count: 0,
+                require_flac,
             },
         );
 
@@ -404,6 +407,7 @@ impl SoulseekClient {
                             &context.artist,
                             context.album.as_deref(),
                             &track_titles_ref,
+                            context.require_flac,
                         );
 
                         albums.sort_by(|a, b| {
@@ -436,6 +440,7 @@ impl SoulseekClient {
                                 &context.artist,
                                 context.album.as_deref(),
                                 &track_titles_ref,
+                                context.require_flac,
                             );
                             albums.sort_by(|a, b| {
                                 b.score
@@ -966,9 +971,14 @@ impl crate::DownloadBackend for SoulseekClient {
         "Soulseek"
     }
 
-    async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String> {
+    async fn start_search(
+        &self,
+        album: Option<&Album>,
+        tracks: &[Track],
+        require_flac: bool,
+    ) -> Result<String> {
         let timeout = Duration::seconds(120);
-        self.start_search(album.cloned(), tracks.to_vec(), timeout)
+        self.start_search(album.cloned(), tracks.to_vec(), timeout, require_flac)
             .await
     }
 
