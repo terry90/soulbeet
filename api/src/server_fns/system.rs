@@ -50,6 +50,7 @@ pub async fn get_system_health() -> Result<SystemHealth, ServerFnError> {
             downloader_online,
             beets_ready,
             navidrome_online,
+            importer: Default::default(),
         })
     }
     #[cfg(not(feature = "server"))]

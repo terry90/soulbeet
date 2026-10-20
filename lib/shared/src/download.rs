@@ -115,6 +115,8 @@ pub enum DownloadState {
     Queued,
     InProgress,
     Completed,
+    /// Waiting for the library importer; payload is the jobs ahead, including the running one (always >= 1)
+    ImportQueued(u32),
     Importing,
     Imported,
     ImportSkipped,
@@ -153,6 +155,12 @@ pub struct DownloadProgress {
     /// Human-readable batch label (album name)
     #[serde(default)]
     pub batch_label: Option<String>,
+    /// Where the downloaded file sits on disk once known
+    #[serde(default)]
+    pub local_path: Option<String>,
+    /// Tail of the importer's output for this row
+    #[serde(default)]
+    pub import_output: Option<String>,
 }
 
 impl DownloadProgress {
@@ -170,6 +178,8 @@ impl DownloadProgress {
             backend: None,
             batch_id: None,
             batch_label: None,
+            local_path: None,
+            import_output: None,
         }
     }
 
@@ -187,6 +197,8 @@ impl DownloadProgress {
             backend: None,
             batch_id: None,
             batch_label: None,
+            local_path: None,
+            import_output: None,
         }
     }
 
@@ -205,6 +217,49 @@ impl DownloadProgress {
         self.batch_label = Some(batch_label);
         self
     }
+
+    pub fn with_import_details(
+        mut self,
+        local_path: Option<String>,
+        import_output: Option<String>,
+    ) -> Self {
+        self.local_path = local_path;
+        self.import_output = import_output;
+        self
+    }
+}
+
+const MAX_LABEL_BYTES: usize = 200;
+
+/// Folder name for a download batch: `<label> [<first 8 alphanumerics of batch_id>]`,
+/// safe on Windows and Unix file systems.
+pub fn batch_folder(label: &str, batch_id: &str) -> String {
+    let mut label: String = label
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_control() || "<>:\"/\\|?*".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if label.len() > MAX_LABEL_BYTES {
+        let mut end = MAX_LABEL_BYTES;
+        while !label.is_char_boundary(end) {
+            end -= 1;
+        }
+        label.truncate(end);
+    }
+    let label = label.trim_end_matches(['.', ' ']);
+    let label = if label.is_empty() { "Download" } else { label };
+    let short: String = batch_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect();
+    format!("{label} [{short}]")
 }
 
 /// Response from queueing downloads
@@ -300,4 +355,41 @@ pub enum AutoDownloadEvent {
         batch_id: String,
         error: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_from_older_servers_deserialize() {
+        let v = serde_json::json!({"id":"1","source":"p","item":"a.flac","size":1,"transferred":0,
+            "state":"Queued","percent":0.0,"error":null});
+        let row: DownloadProgress = serde_json::from_value(v).unwrap();
+        assert_eq!(row.local_path, None);
+        assert_eq!(row.import_output, None);
+    }
+
+    #[test]
+    fn import_queued_round_trips_and_sorts_between_completed_and_importing() {
+        let s = DownloadState::ImportQueued(2);
+        assert_eq!(serde_json::to_value(&s).unwrap(), serde_json::json!({"ImportQueued":2}));
+        assert!(DownloadState::Completed < DownloadState::ImportQueued(1));
+        assert!(DownloadState::ImportQueued(1) < DownloadState::ImportQueued(3));
+        assert!(DownloadState::ImportQueued(9) < DownloadState::Importing);
+    }
+
+    #[test]
+    fn batch_folder_sanitizes_hostile_labels() {
+        let id = "1f2e3d4c-aaaa-bbbb-cccc-ddddeeeeffff";
+        assert_eq!(batch_folder("Blue Train", id), "Blue Train [1f2e3d4c]");
+        assert_eq!(batch_folder("AC/DC: Live?", id), "AC_DC_ Live_ [1f2e3d4c]");
+        assert_eq!(batch_folder("  dots... ", id), "dots [1f2e3d4c]");
+        assert_eq!(batch_folder("tab\there\u{7}", id), "tab_here_ [1f2e3d4c]");
+        assert_eq!(batch_folder("", id), "Download [1f2e3d4c]");
+        let long = batch_folder(&"é".repeat(300), id);
+        assert!(long.len() <= 200 + " [1f2e3d4c]".len());
+        assert!(long.ends_with(" [1f2e3d4c]"));
+        assert!(!long.contains('/'));
+    }
 }

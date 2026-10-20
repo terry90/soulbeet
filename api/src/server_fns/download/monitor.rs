@@ -926,6 +926,8 @@ fn make_failed_progress(tracked: &TrackedFile, reason: &str) -> DownloadProgress
         backend: None,
         batch_id: None,
         batch_label: None,
+        local_path: None,
+        import_output: None,
     }
 }
 

@@ -567,6 +567,8 @@ impl From<FileEntry> for crate::download::DownloadProgress {
             backend: Some("slskd".into()),
             batch_id: None,
             batch_label: None,
+            local_path: None,
+            import_output: None,
         }
     }
 }

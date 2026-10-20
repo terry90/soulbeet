@@ -8,49 +8,55 @@ pub fn DownloadItem(file: DownloadProgress, on_cancel: EventHandler<DownloadProg
 
     let (status_text, border_class, badge_class, badge_text) = match state {
         DownloadState::Queued => (
-            "Queued",
+            "Queued".to_string(),
             "border-white/5 opacity-60",
             "border border-gray-600 text-gray-400",
             "QUEUED",
         ),
         DownloadState::InProgress => (
-            "Downloading",
+            "Downloading".to_string(),
             "border-beet-accent/50",
             "bg-blue-500/20 text-blue-300",
             "SLSK",
         ),
         DownloadState::Completed => (
-            "Completed",
+            "Completed".to_string(),
             "border-beet-leaf/50",
             "bg-beet-leaf/20 text-beet-leaf",
             "DOWNLOADED",
         ),
+        DownloadState::ImportQueued(n) => (
+            format!("Waiting for library ({n} ahead)"),
+            "border-beet-leaf/30",
+            "border border-beet-leaf/40 text-beet-leaf",
+            "WAIT",
+        ),
         DownloadState::Importing => (
-            "Importing...",
+            "Importing...".to_string(),
             "border-beet-leaf/50",
             "bg-beet-leaf/20 text-beet-leaf",
             "BEETS",
         ),
         DownloadState::Imported => (
-            "Imported",
+            "Imported".to_string(),
             "border-green-500/50",
             "bg-green-500/20 text-green-300",
             "LIB",
         ),
         DownloadState::ImportSkipped => (
-            "Import Skipped",
+            "Import Skipped".to_string(),
             "border-yellow-500/50",
             "bg-yellow-500/20 text-yellow-300",
             "SKIP",
         ),
         DownloadState::Failed(_) => (
-            "Failed",
+            "Failed".to_string(),
             "border-red-500/50",
             "bg-red-500/20 text-red-300",
             "ERR",
         ),
         DownloadState::Cancelled => (
-            "Cancelled",
+            "Cancelled".to_string(),
             "border-orange-500/50",
             "bg-orange-500/20 text-orange-300",
             "CANCEL",
