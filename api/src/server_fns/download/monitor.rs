@@ -422,10 +422,14 @@ impl DownloadMonitor {
     /// into this batch's folder. Even a dead transfer has to go: once no slot
     /// points at it nothing else prunes it. slskd cancels by transfer id, and
     /// a cancel that fails is not worth losing the retry over.
+    ///
+    /// The cancel keeps the record: the transfer may have just succeeded, and
+    /// removing a succeeded record before slskd moves its file strands the
+    /// file. End-of-run cleanup removes it once it shows Cancelled or Failed.
     async fn abandon(&mut self, slot: usize, backend: &Arc<dyn DownloadBackend>) {
         let tracked = &self.tracked_files[slot];
         if let Err(e) = backend
-            .cancel_download(&tracked.source, &tracked.transfer_id, true)
+            .cancel_download(&tracked.source, &tracked.transfer_id, false)
             .await
         {
             warn!(
@@ -1344,7 +1348,7 @@ pub fn filenames_match(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use crate::server_fns::download::test_support::{
-        batch, item, key, transfer, ScriptedOutcome, StubBackend,
+        batch, item, key, transfer, Cancel, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::AddedSlot;
     use tokio::sync::broadcast;
@@ -1482,8 +1486,8 @@ mod tests {
         assert_eq!(phase(&m, 0), SlotPhase::Watching);
         assert_eq!(
             stub.cancelled(),
-            vec![("peer_a".to_string(), id_of("dirA/aaa.flac"))],
-            "the abandoned transfer is removed by its id"
+            vec![Cancel::only("peer_a", &id_of("dirA/aaa.flac"))],
+            "the abandoned transfer is cancelled by its id, its record left for cleanup"
         );
     }
 
@@ -1683,8 +1687,8 @@ mod tests {
         assert_eq!(
             stub.cancelled(),
             vec![
-                ("peer_a".to_string(), id_of("dirA/aaa.flac")),
-                ("peer_q".to_string(), "t-q".to_string()),
+                Cancel::removing("peer_a", &id_of("dirA/aaa.flac")),
+                Cancel::removing("peer_q", "t-q"),
             ]
         );
     }
@@ -1710,7 +1714,7 @@ mod tests {
 
         assert_eq!(
             stub.cancelled(),
-            vec![("peer_a".to_string(), id_of("one.flac"))],
+            vec![Cancel::only("peer_a", &id_of("one.flac"))],
             "only the timeout's cancel, no removal of the succeeded record"
         );
     }
@@ -1781,7 +1785,7 @@ mod tests {
 
         assert_eq!(
             stub.cancelled(),
-            vec![("peer_a".to_string(), id_of("dirA/aaa.flac"))],
+            vec![Cancel::only("peer_a", &id_of("dirA/aaa.flac"))],
             "slskd cancels by transfer id, not by filename"
         );
         assert_eq!(m.tracked_files[0].source, "peer_b");
@@ -1823,7 +1827,7 @@ mod tests {
             );
             assert!(stub
                 .cancelled()
-                .contains(&("peer_a".to_string(), id_of("one.flac"))));
+                .contains(&Cancel::only("peer_a", &id_of("one.flac"))));
             assert_eq!(phase(&m, 0), SlotPhase::TimedOut);
             assert!(TransferRegistry::global().may_adopt(&held, &batch("Y").owner));
         }
@@ -2058,7 +2062,7 @@ mod tests {
 
         assert_eq!(
             stub.cancelled(),
-            vec![("peer_a".to_string(), id_of("one.flac"))]
+            vec![Cancel::removing("peer_a", &id_of("one.flac"))]
         );
         assert!(
             TransferRegistry::global().may_adopt(&held, &batch("Y").owner),
@@ -2104,8 +2108,8 @@ mod tests {
         assert_eq!(
             cancelled,
             vec![
-                ("peer_a".to_string(), id_of("01.flac")),
-                ("peer_a".to_string(), id_of("02.flac")),
+                Cancel::removing("peer_a", &id_of("01.flac")),
+                Cancel::removing("peer_a", &id_of("02.flac")),
             ]
         );
         let jobs: Vec<Vec<String>> = import_events(&mut imports)
@@ -2147,7 +2151,7 @@ mod tests {
 
         assert_eq!(
             stub.cancelled(),
-            vec![("peer_a".to_string(), id_of("dirA/01.flac"))]
+            vec![Cancel::removing("peer_a", &id_of("dirA/01.flac"))]
         );
     }
 

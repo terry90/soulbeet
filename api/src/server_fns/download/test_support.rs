@@ -89,7 +89,7 @@ pub enum ScriptedOutcome {
 pub struct StubBackend {
     id: &'static str,
     script: Mutex<Vec<ScriptedOutcome>>,
-    cancelled: Mutex<Vec<(String, String)>>,
+    cancelled: Mutex<Vec<Cancel>>,
     destinations: Mutex<Vec<String>>,
     listing: Mutex<Vec<DownloadProgress>>,
     hold: Mutex<Option<Hold>>,
@@ -116,8 +116,8 @@ impl StubBackend {
         })
     }
 
-    /// The `(peer, transfer id)` pairs passed to `cancel_download`, in order.
-    pub fn cancelled(&self) -> Vec<(String, String)> {
+    /// Every `cancel_download` call, in order.
+    pub fn cancelled(&self) -> Vec<Cancel> {
         self.cancelled.lock().unwrap().clone()
     }
 
@@ -140,6 +140,34 @@ impl StubBackend {
     /// What `get_downloads_for` (filtered by peer) and `get_downloads` return.
     pub fn set_listing(&self, listing: Vec<DownloadProgress>) {
         *self.listing.lock().unwrap() = listing;
+    }
+}
+
+/// One `cancel_download` call. `remove` also deletes slskd's record of the
+/// transfer.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Cancel {
+    pub peer: String,
+    pub id: String,
+    pub remove: bool,
+}
+
+impl Cancel {
+    /// A cancel that leaves the record for a later cleanup.
+    pub fn only(peer: &str, id: &str) -> Self {
+        Self {
+            peer: peer.to_string(),
+            id: id.to_string(),
+            remove: false,
+        }
+    }
+
+    /// A cancel that also removes the record.
+    pub fn removing(peer: &str, id: &str) -> Self {
+        Self {
+            remove: true,
+            ..Self::only(peer, id)
+        }
     }
 }
 
@@ -223,11 +251,12 @@ impl DownloadBackend for StubBackend {
     async fn get_downloads(&self) -> SoulResult<Vec<DownloadProgress>> {
         Ok(self.listing.lock().unwrap().clone())
     }
-    async fn cancel_download(&self, username: &str, id: &str, _remove: bool) -> SoulResult<()> {
-        self.cancelled
-            .lock()
-            .unwrap()
-            .push((username.to_string(), id.to_string()));
+    async fn cancel_download(&self, username: &str, id: &str, remove: bool) -> SoulResult<()> {
+        self.cancelled.lock().unwrap().push(Cancel {
+            peer: username.to_string(),
+            id: id.to_string(),
+            remove,
+        });
         Ok(())
     }
     async fn health_check(&self) -> bool {

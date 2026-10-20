@@ -293,30 +293,6 @@ fn find_file_recursive_fuzzy(dir: &Path, expected_filename: &str) -> Option<Path
     search(dir, expected_filename, 0)
 }
 
-/// Extract the album directory from a resolved path.
-/// This is used for grouping files by album for beets import.
-///
-/// # Arguments
-/// * `resolved_path` - A resolved filesystem path to a downloaded file
-///
-/// # Returns
-/// * The parent directory path (album directory)
-#[cfg(feature = "server")]
-pub fn get_album_directory(resolved_path: &str) -> Option<String> {
-    let path = Path::new(resolved_path);
-    path.parent().map(|p| p.to_string_lossy().to_string())
-}
-
-/// Check if two paths are in the same album directory.
-/// This is used for grouping files together for album-mode import.
-#[cfg(feature = "server")]
-pub fn same_album_directory(path1: &str, path2: &str) -> bool {
-    match (get_album_directory(path1), get_album_directory(path2)) {
-        (Some(dir1), Some(dir2)) => dir1 == dir2,
-        _ => false,
-    }
-}
-
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
