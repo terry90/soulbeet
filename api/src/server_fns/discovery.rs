@@ -582,6 +582,11 @@ pub async fn generate_discovery_playlist_internal(
                 }
             }
 
+            if let Some(issue) = crate::importer_health::broken_issue().await {
+                warn!("Discovery for {user_id} skipped: {}", issue.title);
+                break;
+            }
+
             // Phase 1: Search and queue downloads
             let mut queued: Vec<QueuedTrack> = Vec::new();
 

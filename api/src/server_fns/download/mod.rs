@@ -183,7 +183,15 @@ pub struct DownloadRequest {
 pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, ServerFnError> {
     let username = auth.0.username;
 
-    let target_path_buf = std::path::Path::new(&req.target_folder).to_path_buf();
+    if let Some(issue) = crate::importer_health::broken_issue().await {
+        return Err(server_error(issue.title));
+    }
+    let folder = crate::models::folder::Folder::find_for_user_by_path(&auth.0.sub, &req.target_folder)
+        .await
+        .map_err(server_error)?
+        .ok_or_else(|| server_error("Folder not found"))?;
+
+    let target_path_buf = std::path::Path::new(&folder.path).to_path_buf();
     if let Err(e) = tokio::fs::create_dir_all(&target_path_buf).await {
         return Err(server_error(format!(
             "Failed to create target directory: {}",

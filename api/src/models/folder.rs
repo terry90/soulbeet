@@ -68,6 +68,16 @@ impl Folder {
             .map_err(|e| e.to_string())
     }
 
+    /// The user's own folder at `path`. Paths compare by component, so a
+    /// trailing slash does not matter and `..` never matches.
+    pub async fn find_for_user_by_path(
+        user_id: &str,
+        path: &str,
+    ) -> Result<Option<Folder>, String> {
+        let folders = Self::get_all_by_user(user_id).await?;
+        Ok(match_folder(&folders, path).cloned())
+    }
+
     pub fn discovery_path(&self) -> String {
         format!("{}/Discovery", self.path)
     }
@@ -80,5 +90,39 @@ impl Folder {
         use crate::models::user_settings::UserSettings;
         let settings = UserSettings::get(&self.user_id).await?;
         Ok(settings.discovery_enabled && settings.discovery_folder_id.as_deref() == Some(&self.id))
+    }
+}
+
+#[cfg(feature = "server")]
+fn match_folder<'a>(folders: &'a [Folder], path: &str) -> Option<&'a Folder> {
+    let wanted = std::path::Path::new(path);
+    folders
+        .iter()
+        .find(|f| std::path::Path::new(&f.path) == wanted)
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_matching_is_component_wise() {
+        let f = |p: &str| Folder {
+            id: "1".into(),
+            user_id: "u".into(),
+            name: "n".into(),
+            path: p.into(),
+        };
+        let folders = vec![f("/music/rock"), f("/music/jazz/")];
+        assert_eq!(
+            match_folder(&folders, "/music/rock/").map(|f| &f.path[..]),
+            Some("/music/rock")
+        );
+        assert_eq!(
+            match_folder(&folders, "/music/jazz").map(|f| &f.path[..]),
+            Some("/music/jazz/")
+        );
+        assert!(match_folder(&folders, "/music/rock/../../etc").is_none());
+        assert!(match_folder(&folders, "/elsewhere").is_none());
     }
 }

@@ -53,6 +53,7 @@ pub fn Search() -> Element {
     let mut album_cache = use_signal::<HashMap<String, AlbumWithTracks>>(HashMap::new);
     let mut download_options = use_signal::<Option<Vec<DownloadableGroup>>>(|| None);
     let mut is_downloading = use_signal(|| false);
+    let mut download_error = use_signal(String::new);
     let search_reset = try_use_context::<SearchReset>();
     let search_prefill = try_use_context::<SearchPrefill>();
 
@@ -441,6 +442,7 @@ pub fn Search() -> Element {
     };
 
     let download_tracks = move |(items, folder): (Vec<DownloadableItem>, String)| async move {
+        download_error.set(String::new());
         match auth
             .call(api::download(api::DownloadRequest {
                 items,
@@ -450,7 +452,10 @@ pub fn Search() -> Element {
             .await
         {
             Ok(_res) => info!("Downloads started"),
-            Err(e) => warn!("Failed to start downloads: {:?}", e),
+            Err(e) => {
+                warn!("Failed to start downloads: {:?}", e);
+                download_error.set(refusal_text(&e));
+            }
         }
         is_downloading.set(false);
     };
@@ -663,6 +668,10 @@ pub fn Search() -> Element {
 
         SystemStatus { health: system_health.get(), navidrome_status: auth.navidrome_status() }
 
+        if !download_error().is_empty() {
+          p { class: "text-sm font-mono text-red-400 mt-4", "{download_error}" }
+        }
+
         // Results
         if let Some(results) = download_options.read().clone() {
           DownloadResults {
@@ -850,5 +859,16 @@ pub fn Search() -> Element {
           }
         }
       }
+    }
+}
+
+/// A refused download carries its reason in the server message, which the
+/// generic mapping would hide.
+fn refusal_text(e: &ServerFnError) -> String {
+    match e {
+        ServerFnError::ServerError {
+            code: 500, message, ..
+        } => message.clone(),
+        _ => crate::friendly_error(e),
     }
 }

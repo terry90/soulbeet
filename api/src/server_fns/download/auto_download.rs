@@ -17,6 +17,8 @@ use std::time::Duration;
 #[cfg(feature = "server")]
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
 #[cfg(feature = "server")]
+use crate::models::folder::Folder;
+#[cfg(feature = "server")]
 use crate::services::{available_download_backends, download_backend};
 #[cfg(feature = "server")]
 use crate::AuthSession;
@@ -59,6 +61,21 @@ pub enum AutoDownloadResult {
 #[post("/api/auto-download", auth: AuthSession)]
 pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResult, ServerFnError> {
     let username = auth.0.username;
+
+    if let Some(issue) = crate::importer_health::broken_issue().await {
+        return Ok(AutoDownloadResult::Error(issue.title));
+    }
+    let folder = match Folder::get_by_id(&req.folder_id).await {
+        Ok(Some(f))
+            if f.user_id == auth.0.sub
+                && std::path::Path::new(&req.folder_path) == std::path::Path::new(&f.path) =>
+        {
+            f
+        }
+        Ok(_) => return Ok(AutoDownloadResult::Error("Folder not found".to_string())),
+        Err(e) => return Ok(AutoDownloadResult::Error(e)),
+    };
+
     let (tx, _) = get_or_create_user_channel(&username).await;
 
     let mut req = req;
@@ -119,7 +136,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
 
     // Spawn the entire search-score-pick-download pipeline onto a background task.
     // This avoids blocking the HTTP response during the search-poll loop (Research Pitfall 4).
-    let folder_path = req.folder_path.clone();
+    let folder_path = folder.path;
     let album = req.query.album.clone();
     let tracks = req.query.tracks.clone();
     let task_username = username.clone();
