@@ -1,13 +1,16 @@
 use dioxus::prelude::*;
 use shared::system::NavidromeStatus;
 
+use super::connection_status_row::{beets_row, ConnectionStatusRow, ImporterDetails};
 use crate::friendly_error;
 use crate::settings_context::use_settings;
-use crate::use_auth;
+use crate::{use_auth, use_system_health};
 
 #[component]
 pub fn AppConfigManager() -> Element {
     let mut settings = use_settings();
+    let auth = use_auth();
+    let health = use_system_health();
     let mut config_resource = use_resource(|| async { api::get_app_config().await });
 
     let config = match &*config_resource.read() {
@@ -103,32 +106,36 @@ pub fn AppConfigManager() -> Element {
                     }
                 }
 
-                // Navidrome note
-                div {
-                    h3 { class: "text-sm font-semibold text-white mb-3", "Navidrome" }
-                    {
-                        let auth = use_auth();
-                        let (dot_color, status_text) = match auth.navidrome_status() {
-                            NavidromeStatus::Connected => ("bg-blue-400", "Connected"),
-                            NavidromeStatus::MissingReportRealPath => ("bg-yellow-500", "ReportRealPath not enabled"),
-                            NavidromeStatus::InvalidCredentials => ("bg-beet-accent", "User not found in Navidrome"),
-                            NavidromeStatus::Offline => ("bg-gray-500", "Server unreachable"),
-                            NavidromeStatus::Unknown => ("bg-gray-500", "Not configured"),
-                        };
-                        rsx! {
-                            div { class: "flex items-center gap-2 mb-2",
-                                span { class: format!("w-2 h-2 rounded-full {dot_color}") }
-                                span { class: "text-xs font-mono text-gray-300", "{status_text}" }
-                            }
+                {
+                    let (dot_class, summary) = match auth.navidrome_status() {
+                        NavidromeStatus::Connected => ("bg-blue-400", "Connected"),
+                        NavidromeStatus::MissingReportRealPath => ("bg-yellow-500", "ReportRealPath not enabled"),
+                        NavidromeStatus::InvalidCredentials => ("bg-beet-accent", "User not found in Navidrome"),
+                        NavidromeStatus::Offline => ("bg-gray-500", "Server unreachable"),
+                        NavidromeStatus::Unknown => ("bg-gray-500", "Not configured"),
+                    };
+                    rsx! {
+                        ConnectionStatusRow {
+                            label: "Navidrome",
+                            dot_class,
+                            summary,
+                            note: "Navidrome credentials are managed per-user through the login flow. Set the NAVIDROME_URL environment variable on the server.".to_string(),
                         }
                     }
-                    p { class: "text-xs text-gray-400 font-mono",
-                        "Navidrome credentials are managed per-user through the login flow. "
-                        "Set the NAVIDROME_URL environment variable on the server."
+                }
+                {
+                    let importer = health.importer();
+                    let (dot_class, summary) = beets_row(&importer);
+                    let has_details = !importer.issues.is_empty() || !importer.facts.is_empty();
+                    rsx! {
+                        ConnectionStatusRow {
+                            label: "Beets",
+                            dot_class,
+                            summary,
+                            details: has_details.then(|| rsx! { ImporterDetails { health: importer.clone() } }),
+                        }
                     }
                 }
-
-
             }
 
             button {

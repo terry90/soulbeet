@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
+use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
 use shared::download::{DownloadProgress, DownloadState};
 
 mod item;
 use api::CancelDownloadRequest;
 use item::DownloadItem;
+
+use crate::friendly_error;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct DownloadsProps {
@@ -15,13 +18,7 @@ pub struct DownloadsProps {
 
 #[component]
 pub fn Downloads(mut props: DownloadsProps) -> Element {
-    let mut active_downloads: Vec<DownloadProgress> =
-        props.downloads.read().values().cloned().collect();
-    active_downloads.sort_by(|a, b| {
-        a.state
-            .partial_cmp(&b.state)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let active_downloads = sorted_rows(&props.downloads.read());
 
     // Count specific states for the header summary
     let processing_count = active_downloads
@@ -44,17 +41,29 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
         .count();
 
     let clear_finished = move |_| {
-        let mut map = props.downloads.write();
-        map.retain(|_, file| {
-            matches!(
+        let mut cleared = Vec::new();
+        props.downloads.write().retain(|item, file| {
+            let keep = matches!(
                 file.state,
                 DownloadState::Queued
                     | DownloadState::InProgress
                     | DownloadState::ImportQueued(_)
                     | DownloadState::Importing
                     | DownloadState::Completed // Downloads that are completed but not yet imported
-            )
+            );
+            if !keep {
+                cleared.push(item.clone());
+            }
+            keep
         });
+        // The server keeps a retry for each row that did not import; drop those too.
+        if !cleared.is_empty() {
+            spawn(async move {
+                if let Err(e) = api::forget_import_retries(cleared).await {
+                    warn!("Could not drop import retries for cleared rows: {e}");
+                }
+            });
+        }
     };
 
     let mut downloads_signal = props.downloads;
@@ -71,6 +80,17 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
                 let mut map = downloads_signal.write();
                 if let Some(entry) = map.get_mut(&item_key) {
                     entry.state = DownloadState::Cancelled;
+                }
+            }
+        });
+    };
+
+    let retry_import = move |file: DownloadProgress| {
+        let item = file.item;
+        spawn(async move {
+            if let Err(e) = api::retry_import(item.clone()).await {
+                if let Some(entry) = downloads_signal.write().get_mut(&item) {
+                    entry.error = Some(friendly_error(&e));
                 }
             }
         });
@@ -132,7 +152,12 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
             }
 
             for file in active_downloads.iter() {
-              DownloadItem { file: file.clone(), on_cancel: cancel_download }
+              DownloadItem {
+                key: "{file.item}",
+                file: file.clone(),
+                on_cancel: cancel_download,
+                on_retry: retry_import,
+              }
             }
           }
           // Footer
@@ -145,5 +170,43 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
           }
         }
       }
+    }
+}
+
+/// Rows by state, then by item so rows with the same state keep their place.
+fn sorted_rows(downloads: &HashMap<String, DownloadProgress>) -> Vec<DownloadProgress> {
+    let mut rows: Vec<DownloadProgress> = downloads.values().cloned().collect();
+    rows.sort_by(|a, b| {
+        a.state
+            .partial_cmp(&b.state)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.item.cmp(&b.item))
+    });
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(item: &str, state: DownloadState) -> (String, DownloadProgress) {
+        let p =
+            DownloadProgress::queued(item.into(), "peer".into(), item.into(), 1).with_state(state);
+        (item.to_string(), p)
+    }
+
+    #[test]
+    fn equal_states_sort_by_item() {
+        let map: HashMap<String, DownloadProgress> = [
+            row("c", DownloadState::Imported),
+            row("a", DownloadState::Imported),
+            row("z", DownloadState::InProgress),
+            row("b", DownloadState::Imported),
+            row("d", DownloadState::ImportQueued(1)),
+        ]
+        .into_iter()
+        .collect();
+        let items: Vec<String> = sorted_rows(&map).into_iter().map(|r| r.item).collect();
+        assert_eq!(items, ["z", "d", "a", "b", "c"]);
     }
 }

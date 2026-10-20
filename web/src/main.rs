@@ -15,7 +15,7 @@ use ui::{
     AutoDownloadSignal, Downloads, HealthProvider, Layout, Navbar, SearchPrefill, SearchReset,
     SettingsProvider,
 };
-use views::{DashboardPage, LoginPage, SearchPage, SettingsPage};
+use views::{DashboardPage, LoginPage, SearchPage, SettingsPage, SettingsTab, SettingsTabRequest};
 
 mod auth;
 mod views;
@@ -117,6 +117,8 @@ fn WebNavbar() -> Element {
     let search_prefill = use_signal(|| None::<(String, String)>);
     use_context_provider(|| SearchReset(search_reset));
     use_context_provider(|| SearchPrefill(search_prefill));
+    let settings_tab_request = use_signal(|| None::<SettingsTab>);
+    use_context_provider(|| SettingsTabRequest(settings_tab_request));
 
     #[allow(unused_mut)]
     let mut auto_download_signal = use_signal(|| None::<shared::download::AutoDownloadEvent>);
@@ -255,12 +257,39 @@ fn WebNavbar() -> Element {
                 }
             }
 
+            ImporterBanner {}
             NavidromeBanner {}
 
             main { class: "px-4 sm:px-6 lg:px-8 flex-grow flex flex-col relative overflow-y-auto w-full py-8 no-scrollbar",
                 Outlet::<Route> {}
             }
             Downloads { is_open: downloads_open, downloads }
+        }
+    }
+}
+
+/// Shown while beets cannot import. Not dismissible: downloads are refused until it is fixed.
+#[component]
+fn ImporterBanner() -> Element {
+    let health = ui::use_system_health();
+    let SettingsTabRequest(mut requested_tab) = use_context();
+
+    let importer = health.importer();
+    let Some(issue) = importer.blocking_issue() else {
+        return rsx! {};
+    };
+
+    rsx! {
+        div { class: "mx-4 sm:mx-6 lg:mx-8 mt-2 px-3 py-2 bg-beet-panel border border-white/10 rounded flex items-center gap-3 text-xs font-mono",
+            span { class: "w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" }
+            span { class: "text-gray-500 uppercase tracking-widest shrink-0 hidden sm:inline", "BEETS" }
+            span { class: "text-gray-400 flex-1 min-w-0 truncate", "{issue.title}" }
+            Link {
+                class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted",
+                to: Route::SettingsPage {},
+                onclick: move |_| requested_tab.set(Some(SettingsTab::Config)),
+                "Fix in Config"
+            }
         }
     }
 }

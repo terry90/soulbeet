@@ -1,10 +1,13 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use dioxus::prelude::*;
 use shared::navidrome::{DiscoveryProgress, DiscoveryStatus, GenerationStatus, ProfilePhase};
 use shared::system::NavidromeStatus;
 
 use crate::friendly_error;
 use crate::use_auth;
-use crate::ConfirmModal;
+use crate::{ConfirmModal, Disclosure};
 
 fn format_relative_time(ts: &str) -> String {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts).or_else(|_| {
@@ -298,79 +301,63 @@ fn render_profile_row(pp: &shared::navidrome::ProfileProgress) -> Element {
 
 #[component]
 fn EngineReportView() -> Element {
-    let mut show = use_signal(|| false);
     let mut entries: Signal<Vec<api::ReportEntry>> = use_signal(Vec::new);
-    let mut loading = use_signal(|| false);
     let mut expanded_idx: Signal<Option<usize>> = use_signal(|| None);
 
-    let handle_toggle = move |_| async move {
-        if show() {
-            show.set(false);
-            return;
-        }
-        loading.set(true);
-        match api::get_engine_reports().await {
-            Ok(list) => entries.set(list),
-            Err(e) => entries.set(vec![api::ReportEntry {
-                profile: "Error".to_string(),
-                candidate_count: 0,
-                created_at: String::new(),
-                text: format!("Failed to load reports: {e}"),
-            }]),
-        }
-        loading.set(false);
-        show.set(true);
-    };
+    let load = use_callback(move |_| -> Pin<Box<dyn Future<Output = ()>>> {
+        Box::pin(async move {
+            match api::get_engine_reports().await {
+                Ok(list) => entries.set(list),
+                Err(e) => entries.set(vec![api::ReportEntry {
+                    profile: "Error".to_string(),
+                    candidate_count: 0,
+                    created_at: String::new(),
+                    text: format!("Failed to load reports: {e}"),
+                }]),
+            }
+        })
+    });
 
     rsx! {
-        div { class: "mt-4",
-            button {
-                class: "text-xs font-mono text-gray-500 hover:text-gray-300 cursor-pointer underline decoration-dotted",
-                onclick: handle_toggle,
-                if loading() { "Loading..." }
-                else if show() { "Hide engine reports" }
-                else { "Show engine reports" }
-            }
-            if show() {
-                div { class: "mt-2 max-h-96 overflow-y-auto border border-white/10 rounded bg-beet-dark",
-                    if entries().is_empty() {
-                        p { class: "p-3 text-xs font-mono text-gray-500",
-                            "No engine reports available. Run discovery generation first."
-                        }
-                    } else {
-                        for (idx, entry) in entries().iter().enumerate() {
-                            {
-                                let is_expanded = expanded_idx() == Some(idx);
-                                let badge_class = profile_badge_class(&entry.profile);
-                                let badge_label = entry.profile.clone();
-                                let date = entry.created_at.clone();
-                                let count = entry.candidate_count;
-                                let text = entry.text.clone();
-                                rsx! {
-                                    div { class: "border-b border-white/5 last:border-b-0",
-                                        button {
-                                            class: "w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 cursor-pointer",
-                                            onclick: move |_| {
-                                                if expanded_idx() == Some(idx) {
-                                                    expanded_idx.set(None);
-                                                } else {
-                                                    expanded_idx.set(Some(idx));
-                                                }
-                                            },
-                                            span {
-                                                class: "text-xs font-mono px-1.5 py-0.5 rounded border {badge_class}",
-                                                "{badge_label}"
+        Disclosure { class: "mt-4", label: "engine reports", on_open: load,
+            div { class: "mt-2 max-h-96 overflow-y-auto border border-white/10 rounded bg-beet-dark",
+                if entries().is_empty() {
+                    p { class: "p-3 text-xs font-mono text-gray-500",
+                        "No engine reports available. Run discovery generation first."
+                    }
+                } else {
+                    for (idx, entry) in entries().iter().enumerate() {
+                        {
+                            let is_expanded = expanded_idx() == Some(idx);
+                            let badge_class = profile_badge_class(&entry.profile);
+                            let badge_label = entry.profile.clone();
+                            let date = entry.created_at.clone();
+                            let count = entry.candidate_count;
+                            let text = entry.text.clone();
+                            rsx! {
+                                div { class: "border-b border-white/5 last:border-b-0",
+                                    button {
+                                        class: "w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 cursor-pointer",
+                                        onclick: move |_| {
+                                            if expanded_idx() == Some(idx) {
+                                                expanded_idx.set(None);
+                                            } else {
+                                                expanded_idx.set(Some(idx));
                                             }
-                                            span { class: "text-xs font-mono text-gray-500 flex-1", "{date}" }
-                                            span { class: "text-xs font-mono text-gray-400", "{count} candidates" }
-                                            span { class: "text-xs text-gray-600 ml-1",
-                                                if is_expanded { "\u{25BC}" } else { "\u{25B6}" }
-                                            }
+                                        },
+                                        span {
+                                            class: "text-xs font-mono px-1.5 py-0.5 rounded border {badge_class}",
+                                            "{badge_label}"
                                         }
-                                        if is_expanded {
-                                            pre { class: "px-3 pb-3 text-xs font-mono text-gray-400 whitespace-pre-wrap overflow-x-auto",
-                                                "{text}"
-                                            }
+                                        span { class: "text-xs font-mono text-gray-500 flex-1", "{date}" }
+                                        span { class: "text-xs font-mono text-gray-400", "{count} candidates" }
+                                        span { class: "text-xs text-gray-600 ml-1",
+                                            if is_expanded { "\u{25BC}" } else { "\u{25B6}" }
+                                        }
+                                    }
+                                    if is_expanded {
+                                        pre { class: "px-3 pb-3 text-xs font-mono text-gray-400 whitespace-pre-wrap overflow-x-auto",
+                                            "{text}"
                                         }
                                     }
                                 }
@@ -393,7 +380,6 @@ struct PendingDrop {
 #[component]
 fn DiscoveryTrackList() -> Element {
     let mut tracks = use_resource(|| async { api::get_discovery_tracks().await });
-    let mut show_history = use_signal(|| false);
     let mut pending_drop: Signal<Option<PendingDrop>> = use_signal(|| None);
 
     let items = match &*tracks.read() {
@@ -501,32 +487,21 @@ fn DiscoveryTrackList() -> Element {
 
             // Collapsed history for promoted/removed
             if !history.is_empty() {
-                div { class: "mt-2",
-                    button {
-                        class: "text-xs font-mono text-gray-500 hover:text-gray-300 cursor-pointer underline decoration-dotted",
-                        onclick: move |_| show_history.set(!show_history()),
-                        if show_history() {
-                            "Hide history ({history.len()})"
-                        } else {
-                            "Show history ({history.len()})"
-                        }
-                    }
-                    if show_history() {
-                        div { class: "mt-2 space-y-1",
-                            for track in &history {
-                                {
-                                    let (icon, color) = match track.status {
-                                        DiscoveryStatus::Promoted => ("\u{2713}", "text-green-600"),
-                                        DiscoveryStatus::Removed => ("\u{2717}", "text-red-600"),
-                                        _ => ("", "text-gray-600"),
-                                    };
-                                    rsx! {
-                                        div { class: "flex items-center gap-2 px-2 py-1 text-xs font-mono text-gray-600",
-                                            span { class: "{color}", "{icon}" }
-                                            span { "{track.artist} - {track.title}" }
-                                            span { class: "text-gray-700 ml-auto",
-                                                "{track.profile}"
-                                            }
+                Disclosure { class: "mt-2", label: format!("history ({})", history.len()),
+                    div { class: "mt-2 space-y-1",
+                        for track in &history {
+                            {
+                                let (icon, color) = match track.status {
+                                    DiscoveryStatus::Promoted => ("\u{2713}", "text-green-600"),
+                                    DiscoveryStatus::Removed => ("\u{2717}", "text-red-600"),
+                                    _ => ("", "text-gray-600"),
+                                };
+                                rsx! {
+                                    div { class: "flex items-center gap-2 px-2 py-1 text-xs font-mono text-gray-600",
+                                        span { class: "{color}", "{icon}" }
+                                        span { "{track.artist} - {track.title}" }
+                                        span { class: "text-gray-700 ml-auto",
+                                            "{track.profile}"
                                         }
                                     }
                                 }

@@ -1,12 +1,19 @@
 use dioxus::prelude::*;
 use shared::download::{DownloadProgress, DownloadState};
 
-#[component]
-pub fn DownloadItem(file: DownloadProgress, on_cancel: EventHandler<DownloadProgress>) -> Element {
-    let state = &file.state;
-    let is_cancellable = matches!(state, DownloadState::Queued | DownloadState::InProgress);
+use crate::Disclosure;
 
-    let (status_text, border_class, badge_class, badge_text) = match state {
+/// How a row's state is shown: badge text and tooltip, plus row and badge classes.
+#[derive(Debug, PartialEq)]
+struct Badge {
+    title: String,
+    border: &'static str,
+    class: &'static str,
+    text: &'static str,
+}
+
+fn badge(state: &DownloadState) -> Badge {
+    let (title, border, class, text) = match state {
         DownloadState::Queued => (
             "Queued".to_string(),
             "border-white/5 opacity-60",
@@ -26,7 +33,7 @@ pub fn DownloadItem(file: DownloadProgress, on_cancel: EventHandler<DownloadProg
             "DOWNLOADED",
         ),
         DownloadState::ImportQueued(n) => (
-            format!("Waiting for library ({n} ahead)"),
+            waiting_text(*n),
             "border-beet-leaf/30",
             "border border-beet-leaf/40 text-beet-leaf",
             "WAIT",
@@ -62,6 +69,49 @@ pub fn DownloadItem(file: DownloadProgress, on_cancel: EventHandler<DownloadProg
             "CANCEL",
         ),
     };
+    Badge {
+        title,
+        border,
+        class,
+        text,
+    }
+}
+
+/// Text class of the reason line; only finished rows that did not import have one.
+fn reason_class(state: &DownloadState) -> Option<&'static str> {
+    match state {
+        DownloadState::ImportSkipped => Some("text-yellow-400"),
+        DownloadState::Failed(_) => Some("text-red-400"),
+        _ => None,
+    }
+}
+
+fn waiting_text(ahead: u32) -> String {
+    format!("Waiting for library ({ahead} ahead)")
+}
+
+/// Only import outcomes set `local_path`, so a failed download never offers a retry.
+fn shows_retry(row: &DownloadProgress) -> bool {
+    matches!(
+        row.state,
+        DownloadState::ImportSkipped | DownloadState::Failed(_)
+    ) && row.local_path.is_some()
+}
+
+#[component]
+pub fn DownloadItem(
+    file: DownloadProgress,
+    on_cancel: EventHandler<DownloadProgress>,
+    on_retry: EventHandler<DownloadProgress>,
+) -> Element {
+    let state = &file.state;
+    let is_cancellable = matches!(state, DownloadState::Queued | DownloadState::InProgress);
+    let Badge {
+        title: status_text,
+        border: border_class,
+        class: badge_class,
+        text: badge_text,
+    } = badge(state);
 
     let percent = file.percent as i32;
 
@@ -77,8 +127,6 @@ pub fn DownloadItem(file: DownloadProgress, on_cancel: EventHandler<DownloadProg
             .to_string_lossy()
             .into_owned(),
     };
-
-    let error_msg = file.error.clone();
 
     rsx! {
       div { class: "bg-white/5 border {border_class} p-4 rounded-lg hover:border-beet-accent/50 transition-colors group",
@@ -135,10 +183,34 @@ pub fn DownloadItem(file: DownloadProgress, on_cancel: EventHandler<DownloadProg
           }
         } else if matches!(state, DownloadState::Queued) {
           div { class: "h-1 w-full bg-gray-800 rounded-full mt-2" }
-        } else if matches!(state, DownloadState::Failed(_)) {
-          if let Some(err) = &error_msg {
-            div { class: "text-xs text-red-400 mt-1 break-words", "{err}" }
+        }
+        if let DownloadState::ImportQueued(n) = state {
+          div { class: "text-xs text-gray-300 font-mono mt-2", "{waiting_text(*n)}" }
+        }
+        // The only element holding the reason: e2e matches it by text.
+        if let (Some(reason_class), Some(err)) = (reason_class(state), &file.error) {
+          div { class: "text-xs {reason_class} mt-1 break-words", "{err}" }
+        }
+        if let Some(kept) = &file.local_path {
+          div { class: "text-xs text-gray-500 font-mono mt-1 break-all", "Kept in {kept}" }
+        }
+        if let Some(tail) = &file.import_output {
+          Disclosure { class: "mt-2", label: "beets output",
+            pre { class: "mt-1 max-h-48 overflow-y-auto text-xs font-mono text-gray-400 whitespace-pre-wrap break-all", "{tail}" }
           }
+        }
+        if shows_retry(&file) {
+          { let file_clone = file.clone();
+          rsx! {
+            button {
+              class: "mt-2 text-xs font-mono px-2 py-1 rounded border border-white/10 text-gray-300 hover:border-beet-accent/50 hover:text-white transition-colors cursor-pointer",
+              onclick: move |evt: Event<MouseData>| {
+                  evt.stop_propagation();
+                  on_retry.call(file_clone.clone());
+              },
+              "Retry import"
+            }
+          }}
         }
         if matches!(state, DownloadState::Importing) {
           div { class: "flex items-center gap-2 text-xs text-gray-300 font-mono mt-2",
@@ -180,5 +252,37 @@ fn format_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(state: DownloadState, local_path: Option<&str>) -> DownloadProgress {
+        DownloadProgress::queued("1".into(), "peer".into(), "a\\b\\01.flac".into(), 10)
+            .with_state(state)
+            .with_import_details(local_path.map(str::to_string), None)
+    }
+
+    #[test]
+    fn wait_badge_and_text() {
+        let b = badge(&DownloadState::ImportQueued(2));
+        assert_eq!(b.text, "WAIT");
+        assert_eq!(b.title, "Waiting for library (2 ahead)");
+    }
+
+    #[test]
+    fn retry_shows_only_for_kept_import_failures() {
+        assert!(shows_retry(&row(
+            DownloadState::ImportSkipped,
+            Some("/dl/X")
+        )));
+        assert!(shows_retry(&row(
+            DownloadState::Failed("beets exited with code 1".into()),
+            Some("/dl/X")
+        )));
+        assert!(!shows_retry(&row(DownloadState::Failed("x".into()), None)));
+        assert!(!shows_retry(&row(DownloadState::Imported, Some("/dl/X"))));
     }
 }

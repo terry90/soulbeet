@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use ui::settings::{AppConfigManager, FolderManager, PreferencesManager, UserManager};
 
 #[derive(PartialEq, Clone, Copy, Default)]
-enum SettingsTab {
+pub(crate) enum SettingsTab {
     #[default]
     Search,
     Library,
@@ -10,9 +10,22 @@ enum SettingsTab {
     Config,
 }
 
+/// A tab another part of the app wants Settings to open on. The route takes no
+/// parameter, so links set this before navigating.
+#[derive(Clone, Copy)]
+pub(crate) struct SettingsTabRequest(pub Signal<Option<SettingsTab>>);
+
 #[component]
 pub fn SettingsPage() -> Element {
     let mut active_tab = use_signal(SettingsTab::default);
+    let SettingsTabRequest(mut requested_tab) = use_context();
+
+    use_effect(move || {
+        if let Some(tab) = requested_tab() {
+            active_tab.set(tab);
+            requested_tab.set(None);
+        }
+    });
 
     rsx! {
         div { class: "fixed top-1/4 -left-10 w-64 h-64 bg-beet-accent/10 rounded-full blur-[100px] pointer-events-none" }
