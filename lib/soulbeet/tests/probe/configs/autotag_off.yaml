@@ -1,0 +1,3 @@
+plugins: musicbrainz
+import:
+  autotag: no

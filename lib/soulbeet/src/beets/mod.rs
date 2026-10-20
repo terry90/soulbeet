@@ -1,8 +1,12 @@
 // Unused outside tests until import() switches to it.
 #[cfg_attr(not(test), allow(dead_code))]
 mod classify;
+// Unused outside tests until BeetsImporter switches to it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod probe;
 mod runner;
 
+pub use probe::{python_from_shebang, resolve_on_path};
 pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
 
 pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};

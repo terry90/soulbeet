@@ -32,6 +32,7 @@ screenshots/
 # Not part of the image; keeps test and CI changes from invalidating the build cache
 e2e/
 .github/
+lib/soulbeet/tests/
 
 # Python bytecode
 **/__pycache__
