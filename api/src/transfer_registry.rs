@@ -69,6 +69,17 @@ pub struct Claim {
     pub other_user: Vec<TransferKey>,
 }
 
+/// What `claim_for_request` found and did.
+#[derive(Debug)]
+pub struct RequestClaim {
+    /// `claimed` lists the keys now owned by `batch`.
+    pub claim: Claim,
+    /// The running batch the request joined, or the request's own.
+    pub batch: BatchRef,
+    /// Holds the joined batch open. None for the request's own batch.
+    pub reservation: Option<InboxReservation>,
+}
+
 #[derive(Default)]
 pub struct TransferRegistry {
     owners: Mutex<HashMap<TransferKey, BatchRef>>,
@@ -85,25 +96,67 @@ impl TransferRegistry {
         self.owners.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Claims every free key for `batch` in one step. A key repeated in
-    /// `keys` is reported once.
-    pub fn claim(&self, keys: &[TransferKey], batch: &BatchRef) -> Claim {
-        let mut owners = self.owners();
+    /// Sorts `keys` by who holds them, from `user_id`'s point of view, and
+    /// lists the free ones in `claimed` without claiming them. A key repeated
+    /// in `keys` is reported once.
+    fn classify(
+        owners: &HashMap<TransferKey, BatchRef>,
+        keys: &[TransferKey],
+        user_id: &str,
+    ) -> Claim {
         let mut claim = Claim::default();
         let mut seen = HashSet::new();
         for key in keys.iter().filter(|key| seen.insert(*key)) {
             match owners.get(key) {
-                None => {
-                    owners.insert(key.clone(), batch.clone());
-                    claim.claimed.push(key.clone());
-                }
-                Some(running) if running.owner.user_id == batch.owner.user_id => {
+                None => claim.claimed.push(key.clone()),
+                Some(running) if running.owner.user_id == user_id => {
                     claim.mine.push((key.clone(), running.clone()));
                 }
                 Some(_) => claim.other_user.push(key.clone()),
             }
         }
         claim
+    }
+
+    /// Claims every free key for `batch` in one step.
+    pub fn claim(&self, keys: &[TransferKey], batch: &BatchRef) -> Claim {
+        let mut owners = self.owners();
+        let claim = Self::classify(&owners, keys, &batch.owner.user_id);
+        for key in &claim.claimed {
+            owners.insert(key.clone(), batch.clone());
+        }
+        claim
+    }
+
+    /// Claims a request's free keys in one step, for the batch that will
+    /// download them. When the user is already downloading some of the files
+    /// into `fresh`'s library folder and that batch still takes files, its
+    /// inbox is reserved and the free keys go straight to it. Otherwise they
+    /// go to `fresh`. No other request ever sees them owned by a batch that
+    /// gets no monitor.
+    pub fn claim_for_request(&self, keys: &[TransferKey], fresh: &BatchRef) -> RequestClaim {
+        let mut owners = self.owners();
+        let claim = Self::classify(&owners, keys, &fresh.owner.user_id);
+        let joined = match claim.claimed.is_empty() {
+            true => None,
+            false => claim
+                .mine
+                .iter()
+                .filter(|(_, running)| running.target == fresh.target)
+                .find_map(|(_, running)| Some((running.clone(), running.inbox.reserve()?))),
+        };
+        let (batch, reservation) = match joined {
+            Some((running, reservation)) => (running, Some(reservation)),
+            None => (fresh.clone(), None),
+        };
+        for key in &claim.claimed {
+            owners.insert(key.clone(), batch.clone());
+        }
+        RequestClaim {
+            claim,
+            batch,
+            reservation,
+        }
     }
 
     /// Releases `key` if `owner` still holds it. A key released and claimed
@@ -135,20 +188,6 @@ impl TransferRegistry {
         }
         owners.insert(new, batch.clone());
         true
-    }
-
-    /// Gives `key` from batch `from` to batch `to`, for a request that joins
-    /// a running batch with the keys it just claimed. Refused, with nothing
-    /// changed, when `from` does not hold `key`.
-    pub fn hand_over(&self, key: &TransferKey, from: &TransferOwner, to: &BatchRef) -> bool {
-        let mut owners = self.owners();
-        match owners.get_mut(key) {
-            Some(held) if held.owner == *from => {
-                *held = to.clone();
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Whether a batch may start watching a transfer it did not enqueue:
@@ -420,19 +459,81 @@ mod tests {
         assert!(registry.may_adopt(&key("02.flac"), &other.owner));
     }
 
+    fn keys(range: std::ops::RangeInclusive<u32>) -> Vec<TransferKey> {
+        range.map(|i| key(&format!("{i:02}.flac"))).collect()
+    }
+
     #[test]
-    fn hand_over_moves_a_key_to_another_batch_of_the_same_user() {
+    fn a_request_joining_a_running_batch_claims_its_free_keys_for_that_batch() {
         let registry = TransferRegistry::default();
-        let fresh = batch("alice", "a2");
-        let running = batch("alice", "a1");
-        registry.claim(&[key("01.flac")], &fresh);
+        let running = batch("alice", "r");
+        registry.claim(&keys(1..=5), &running);
+        let fresh = batch("alice", "a");
 
-        assert!(!registry.hand_over(&key("01.flac"), &running.owner, &fresh));
-        assert!(registry.hand_over(&key("01.flac"), &fresh.owner, &running));
+        let joined = registry.claim_for_request(&keys(1..=10), &fresh);
 
-        assert!(registry.may_adopt(&key("01.flac"), &running.owner));
-        assert!(!registry.may_adopt(&key("01.flac"), &fresh.owner));
-        assert!(!registry.hand_over(&key("02.flac"), &fresh.owner, &running));
+        assert_eq!(joined.batch.owner, running.owner);
+        assert!(joined.reservation.is_some());
+        assert_eq!(joined.claim.claimed, keys(6..=10));
+        assert_eq!(joined.claim.mine.len(), 5);
+        for k in keys(6..=10) {
+            assert!(registry.may_adopt(&k, &running.owner));
+            assert!(!registry.may_adopt(&k, &fresh.owner));
+        }
+    }
+
+    #[test]
+    fn a_second_request_never_sees_the_first_ones_unmonitored_batch() {
+        // Request A joins the running batch R. Request B, for some of A's
+        // files and more, comes right after A's claim and before A enqueues:
+        // it must find R, not A's own batch, which never gets a monitor.
+        let registry = TransferRegistry::default();
+        let running = batch("alice", "r");
+        registry.claim(&keys(1..=5), &running);
+        let fresh_a = batch("alice", "a");
+        let fresh_b = batch("alice", "b");
+
+        let a = registry.claim_for_request(&keys(1..=10), &fresh_a);
+        let b = registry.claim_for_request(&keys(6..=12), &fresh_b);
+
+        assert_eq!(a.batch.owner, running.owner);
+        assert_eq!(b.batch.owner, running.owner);
+        assert!(b
+            .claim
+            .mine
+            .iter()
+            .all(|(_, held)| held.owner == running.owner));
+        assert_eq!(b.claim.claimed, keys(11..=12));
+        for k in keys(1..=12) {
+            assert!(!registry.may_adopt(&k, &fresh_a.owner), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn a_request_whose_running_batch_finished_claims_for_itself() {
+        let registry = TransferRegistry::default();
+        let running = batch("alice", "r");
+        registry.claim(&keys(1..=1), &running);
+        assert!(running.inbox.close_if_idle());
+        let fresh = batch("alice", "a");
+
+        let own = registry.claim_for_request(&keys(1..=2), &fresh);
+
+        assert_eq!(own.batch.owner, fresh.owner);
+        assert!(own.reservation.is_none());
+        assert!(registry.may_adopt(&key("02.flac"), &fresh.owner));
+    }
+
+    #[test]
+    fn a_request_with_nothing_free_reserves_nothing() {
+        let registry = TransferRegistry::default();
+        let running = batch("alice", "r");
+        registry.claim(&keys(1..=2), &running);
+
+        let none_free = registry.claim_for_request(&keys(1..=2), &batch("alice", "a"));
+
+        assert!(none_free.reservation.is_none());
+        assert!(running.inbox.close_if_idle(), "no reservation left behind");
     }
 
     #[test]

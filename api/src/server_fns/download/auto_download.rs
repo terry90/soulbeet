@@ -80,7 +80,10 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             f
         }
         Ok(_) => return Ok(AutoDownloadResult::Error("Folder not found".to_string())),
-        Err(e) => return Ok(AutoDownloadResult::Error(e)),
+        Err(e) => {
+            warn!("Folder lookup for auto-download failed: {e}");
+            return Ok(AutoDownloadResult::Error("Folder not found".to_string()));
+        }
     };
 
     let (tx, _) = get_or_create_user_channel(&username).await;
@@ -333,12 +336,15 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             batch_label,
             target_path_buf,
         );
+        let enq = enqueue_request(&backend, items, fresh).await;
+        let refusal = enq.refusal();
         let RequestEnqueue {
             batch,
             results,
             watcher,
             error,
-        } = enqueue_request(&backend, items, fresh).await;
+            ..
+        } = enq;
         let row =
             |p: DownloadProgress| p.with_batch(batch.owner.batch_id.clone(), batch.label.clone());
 
@@ -372,6 +378,11 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                 batch_id: batch_id.clone(),
                 error: format!("Download queue failed: {}", e),
+            }));
+        } else if let Some(reason) = refusal {
+            let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
+                batch_id: batch_id.clone(),
+                error: reason.to_string(),
             }));
         } else if successful.is_empty() && !already_downloading {
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
@@ -409,7 +420,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                     query_desc,
                     batch.owner.batch_id
                 );
-                let lost = deliver(reservation, &successful, backend.id(), &batch);
+                let lost = deliver(reservation, &successful, &backend, &batch).await;
                 if !lost.is_empty() {
                     let _ = tx.send(DownloadEvent::Progress(stopped_rows(&lost, &batch)));
                 }

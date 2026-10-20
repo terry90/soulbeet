@@ -29,7 +29,9 @@ use crate::config::CONFIG;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
 use crate::services::download_backend;
-use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
+use crate::transfer_registry::{
+    AddedSlot, BatchRef, TransferKey, TransferOwner, TransferRegistry,
+};
 
 /// Poll interval for checking download status (2 seconds).
 const POLL_INTERVAL_SECS: u64 = 2;
@@ -309,8 +311,8 @@ impl DownloadMonitor {
     }
 
     /// Stop taking slots, and write off the ones delivered but never taken.
-    /// Idempotent.
-    fn close_inbox(&self) {
+    /// Returns those. Idempotent.
+    fn close_inbox(&self) -> Vec<AddedSlot> {
         let unwatched = self.batch.inbox.close();
         if !unwatched.is_empty() {
             warn!(
@@ -322,6 +324,25 @@ impl DownloadMonitor {
                 &unwatched,
                 &self.batch,
             )));
+        }
+        unwatched
+    }
+
+    /// `close_inbox`, then cancel the transfers it wrote off: left running
+    /// they would download into this folder with nobody to import them.
+    /// End-of-run cleanup removes their records like the abandoned ones.
+    async fn close_inbox_cancelling(&mut self, backend: &Arc<dyn DownloadBackend>) {
+        for slot in self.close_inbox() {
+            if let Err(e) = backend
+                .cancel_download(&slot.source, &slot.transfer_id, false)
+                .await
+            {
+                warn!(
+                    "Failed to cancel unwatched transfer {} in slskd: {}",
+                    slot.transfer_id, e
+                );
+            }
+            self.abandoned.push((slot.source, slot.transfer_id));
         }
     }
 
@@ -547,10 +568,14 @@ impl DownloadMonitor {
         }
 
         // Joiners must not enqueue into a batch that is only cleaning up.
-        self.close_inbox();
-
-        if let Ok(backend) = download_backend(None).await {
-            self.remove_batch_transfers(&backend).await;
+        match download_backend(None).await {
+            Ok(backend) => {
+                self.close_inbox_cancelling(&backend).await;
+                self.remove_batch_transfers(&backend).await;
+            }
+            Err(_) => {
+                self.close_inbox();
+            }
         }
 
         // Their keys stay claimed until their imports are done, and the
@@ -1214,7 +1239,8 @@ impl Drop for DownloadMonitor {
     /// Whatever ended the monitor, its batch takes no more slots, and its
     /// files may be downloaded again by anyone.
     fn drop(&mut self) {
-        self.close_inbox();
+        // Nothing can be cancelled here; run() already did unless it never finished.
+        let _ = self.close_inbox();
         TransferRegistry::global().release_batch(&self.batch.owner);
     }
 }
@@ -1357,7 +1383,6 @@ mod tests {
     use crate::server_fns::download::test_support::{
         batch, item, key, transfer, Cancel, ScriptedOutcome, StubBackend,
     };
-    use crate::transfer_registry::AddedSlot;
     use tokio::sync::broadcast;
 
     /// An instant `d` in the past, so a test can reach the monitor's
@@ -2316,6 +2341,37 @@ mod tests {
                 .await
         );
         assert_eq!(handed_off(&mut imports), vec!["01.flac"]);
+    }
+
+    #[tokio::test]
+    async fn slots_written_off_at_the_end_of_a_run_are_cancelled() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.batch
+            .inbox
+            .reserve()
+            .expect("open inbox")
+            .deliver(vec![AddedSlot {
+                source: "peer_b".to_string(),
+                filename: "02.flac".to_string(),
+                transfer_id: "t-02".to_string(),
+            }])
+            .expect("delivered");
+
+        m.close_inbox_cancelling(&backend).await;
+
+        let Ok(DownloadEvent::Progress(rows)) = rx.try_recv() else {
+            panic!("the undrained slot was never written off");
+        };
+        assert_eq!(
+            rows[0].error.as_deref(),
+            Some(crate::server_fns::download::enqueue::MONITOR_STOPPED)
+        );
+        assert_eq!(stub.cancelled(), vec![Cancel::only("peer_b", "t-02")]);
+        let record = transfer("peer_b", "02.flac", "t-02", DownloadState::Cancelled);
+        assert!(m.owns(&record), "its record is removed at cleanup");
     }
 
     #[tokio::test]

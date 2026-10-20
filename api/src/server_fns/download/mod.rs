@@ -240,13 +240,29 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         manual_batch_label(&req.items),
         target_path_buf,
     );
-    let (results, error) = queue_detached(backend, req.items, fresh, username, req.backend)
+    let queued = queue_detached(backend, req.items, fresh, username, req.backend)
         .await
         .map_err(server_error)?;
-    match error {
-        Some(e) => Err(server_error(e)),
-        None => Ok(results),
+    match queued {
+        Queued {
+            error: Some(e), ..
+        } => Err(server_error(e)),
+        Queued {
+            refusal: Some(reason),
+            ..
+        } => Err(refusal_error(reason)),
+        Queued { results, .. } => Ok(results),
     }
+}
+
+/// What a manual request's enqueue came to.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+struct Queued {
+    results: Vec<QueuedDownload>,
+    error: Option<SoulseekError>,
+    /// Nothing was enqueued, for this reason.
+    refusal: Option<&'static str>,
 }
 
 /// Runs `queue_and_watch` as its own task. Registry keys are claimed from
@@ -260,7 +276,7 @@ async fn queue_detached(
     fresh: BatchRef,
     username: String,
     backend_id: Option<String>,
-) -> Result<(Vec<QueuedDownload>, Option<SoulseekError>), tokio::task::JoinError> {
+) -> Result<Queued, tokio::task::JoinError> {
     tokio::spawn(queue_and_watch(backend, items, fresh, username, backend_id)).await
 }
 
@@ -274,13 +290,16 @@ async fn queue_and_watch(
     fresh: BatchRef,
     username: String,
     backend_id: Option<String>,
-) -> (Vec<QueuedDownload>, Option<SoulseekError>) {
+) -> Queued {
+    let enq = enqueue_request(&backend, items, fresh).await;
+    let refusal = enq.refusal();
     let RequestEnqueue {
         batch,
         results,
         watcher,
         error,
-    } = enqueue_request(&backend, items, fresh).await;
+        ..
+    } = enq;
 
     let (tx, _) = get_or_create_user_channel(&username).await;
     let row = |p: DownloadProgress| {
@@ -334,7 +353,7 @@ async fn queue_and_watch(
                 enqueued.len(),
                 batch.owner.batch_id
             );
-            let lost = deliver(reservation, &enqueued, backend.id(), &batch);
+            let lost = deliver(reservation, &enqueued, &backend, &batch).await;
             if !lost.is_empty() {
                 let _ = tx.send(DownloadEvent::Progress(stopped_rows(&lost, &batch)));
             }
@@ -365,7 +384,11 @@ async fn queue_and_watch(
         }
     }
 
-    (results, error)
+    Queued {
+        results,
+        error,
+        refusal,
+    }
 }
 
 /// Imports a failed or skipped row again, from the job kept for it.

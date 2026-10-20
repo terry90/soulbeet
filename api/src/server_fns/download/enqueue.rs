@@ -9,15 +9,16 @@ use soulbeet::DownloadBackend;
 use std::sync::Arc;
 
 use crate::transfer_registry::{
-    AddedSlot, BatchRef, InboxReservation, TransferKey, TransferRegistry,
+    AddedSlot, BatchRef, InboxReservation, RequestClaim, TransferKey, TransferRegistry,
 };
+use tracing::warn;
 
 /// Row text for a file another user's batch is downloading.
 pub const OTHER_USER: &str = "already being downloaded by another user";
 /// Row text for a file slskd is already fetching outside any batch.
 pub const ALREADY_IN_SLSKD: &str = "already downloading in slskd";
-/// Row text for a file the same user is downloading into another library
-/// folder.
+/// Refusal for a request whose files the same user is already downloading
+/// into another library folder.
 pub const ANOTHER_FOLDER: &str = "already downloading into another folder";
 /// Row text for a file that joined a batch whose monitor had stopped.
 pub const MONITOR_STOPPED: &str = "Download monitoring stopped";
@@ -89,18 +90,35 @@ pub enum Watcher {
 pub struct RequestEnqueue {
     /// The batch the new transfers went into.
     pub batch: BatchRef,
-    /// One entry per distinct file. AlreadyInFlight marks a file one of the
-    /// user's batches is already downloading, which was not enqueued again.
+    /// One entry per file, except those the user is already downloading into
+    /// another folder: that batch shows their rows. AlreadyInFlight marks a
+    /// file one of the user's batches is already downloading into this
+    /// folder, which was not enqueued again.
     pub results: Vec<QueuedDownload>,
     pub watcher: Watcher,
     /// The backend call itself failed: `results` lacks the files sent in it,
     /// and their keys are released.
     pub error: Option<SoulseekError>,
+    /// Some files are already downloading into another folder.
+    another_folder: bool,
 }
 
-/// Claims a request's files for `fresh` and enqueues the free ones. When the
-/// user is already downloading some of them, the rest join that batch
-/// instead, so its monitor imports them together, unless it has finished.
+impl RequestEnqueue {
+    /// Why the request did nothing, when that is because its files are
+    /// already downloading into another folder.
+    pub fn refusal(&self) -> Option<&'static str> {
+        let enqueued = self
+            .results
+            .iter()
+            .any(|q| q.status == EnqueueStatus::Enqueued);
+        (self.another_folder && !enqueued).then_some(ANOTHER_FOLDER)
+    }
+}
+
+/// Claims a request's files and enqueues the free ones. When the user is
+/// already downloading some of them into the same folder, the rest join that
+/// batch, so its monitor imports them together, unless it has finished.
+/// Otherwise they go to `fresh`.
 ///
 /// A request left with its own batch and nothing enqueued still owes that
 /// batch a monitor when `batch.inbox.close_if_idle()` fails: another request
@@ -110,9 +128,12 @@ pub async fn enqueue_request(
     items: Vec<DownloadableItem>,
     fresh: BatchRef,
 ) -> RequestEnqueue {
-    let registry = TransferRegistry::global();
     let keys: Vec<TransferKey> = items.iter().map(|i| item_key(backend.id(), i)).collect();
-    let claim = registry.claim(&keys, &fresh);
+    let RequestClaim {
+        claim,
+        batch,
+        reservation,
+    } = TransferRegistry::global().claim_for_request(&keys, &fresh);
     let item_of = |key: &TransferKey| {
         let at = keys
             .iter()
@@ -133,17 +154,13 @@ pub async fn enqueue_request(
 
     // A batch importing elsewhere neither takes this request's files nor
     // lets it import the shared ones here.
-    let same_folder = |running: &BatchRef| running.target == fresh.target;
-    let mut results: Vec<QueuedDownload> = claim
+    let (here, elsewhere): (Vec<_>, Vec<_>) = claim
         .mine
         .iter()
-        .map(|(key, running)| {
-            if same_folder(running) {
-                not_enqueued(key, EnqueueStatus::AlreadyInFlight)
-            } else {
-                not_enqueued(key, EnqueueStatus::Failed(ANOTHER_FOLDER.to_string()))
-            }
-        })
+        .partition(|(_, running)| running.target == fresh.target);
+    let mut results: Vec<QueuedDownload> = here
+        .iter()
+        .map(|(key, _)| not_enqueued(key, EnqueueStatus::AlreadyInFlight))
         .chain(
             claim
                 .other_user
@@ -151,28 +168,9 @@ pub async fn enqueue_request(
                 .map(|key| not_enqueued(key, EnqueueStatus::Failed(OTHER_USER.to_string()))),
         )
         .collect();
-
-    let joined = if claim.claimed.is_empty() {
-        None
-    } else {
-        claim
-            .mine
-            .iter()
-            .filter(|(_, running)| same_folder(running))
-            .find_map(|(_, running)| {
-                let reservation = running.inbox.reserve()?;
-                Some((running.clone(), reservation))
-            })
-    };
-    let (batch, watcher) = match joined {
-        Some((running, reservation)) => {
-            for key in &claim.claimed {
-                let moved = registry.hand_over(key, &fresh.owner, &running);
-                debug_assert!(moved, "a key this request just claimed");
-            }
-            (running, Watcher::Joined(reservation))
-        }
-        None => (fresh, Watcher::Own),
+    let watcher = match reservation {
+        Some(reservation) => Watcher::Joined(reservation),
+        None => Watcher::Own,
     };
 
     let to_enqueue: Vec<DownloadableItem> = claim.claimed.iter().map(item_of).collect();
@@ -188,16 +186,18 @@ pub async fn enqueue_request(
         results,
         watcher,
         error,
+        another_folder: !elsewhere.is_empty(),
     }
 }
 
 /// Hands a joining request's enqueued transfers to `batch`'s monitor.
 /// Returns the ones nobody will watch because that monitor stopped first,
-/// with their keys released.
-pub fn deliver(
+/// with their keys released and their transfers cancelled, since they would
+/// download into the batch's folder with nobody to import them.
+pub async fn deliver(
     reservation: InboxReservation,
     enqueued: &[QueuedDownload],
-    backend: &'static str,
+    backend: &Arc<dyn DownloadBackend>,
     batch: &BatchRef,
 ) -> Vec<AddedSlot> {
     let slots = enqueued
@@ -208,19 +208,27 @@ pub fn deliver(
             transfer_id: q.id.clone(),
         })
         .collect();
-    match reservation.deliver(slots) {
-        Ok(()) => Vec::new(),
-        Err(lost) => {
-            let registry = TransferRegistry::global();
-            for slot in &lost {
-                registry.release(
-                    &transfer_key(backend, &slot.source, &slot.filename),
-                    &batch.owner,
-                );
-            }
-            lost
+    let lost = match reservation.deliver(slots) {
+        Ok(()) => return Vec::new(),
+        Err(lost) => lost,
+    };
+    let registry = TransferRegistry::global();
+    for slot in &lost {
+        registry.release(
+            &transfer_key(backend.id(), &slot.source, &slot.filename),
+            &batch.owner,
+        );
+        if let Err(e) = backend
+            .cancel_download(&slot.source, &slot.transfer_id, false)
+            .await
+        {
+            warn!(
+                "Failed to cancel unwatched transfer {} in slskd: {}",
+                slot.transfer_id, e
+            );
         }
     }
+    lost
 }
 
 /// Failed rows for transfers no monitor will watch because the batch they
@@ -243,7 +251,7 @@ pub fn stopped_rows(lost: &[AddedSlot], batch: &BatchRef) -> Vec<DownloadProgres
 mod tests {
     use super::*;
     use crate::server_fns::download::test_support::{
-        batch, item, key, ScriptedOutcome, StubBackend,
+        batch, item, key, Cancel, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferOwner;
     use std::path::PathBuf;
@@ -309,7 +317,9 @@ mod tests {
             .into_iter()
             .filter(|q| q.status == EnqueueStatus::Enqueued)
             .collect();
-        assert!(deliver(reservation, &enqueued, backend.id(), &running).is_empty());
+        assert!(deliver(reservation, &enqueued, &backend, &running)
+            .await
+            .is_empty());
         assert_eq!(
             running.inbox.take(),
             vec![AddedSlot {
@@ -334,16 +344,12 @@ mod tests {
 
         let enq = enqueue_request(&backend, items, fresh.clone()).await;
 
+        // The running batch shows the shared file's row.
         assert_eq!(
             statuses(&enq.results),
-            vec![
-                (
-                    "01.flac".to_string(),
-                    EnqueueStatus::Failed(ANOTHER_FOLDER.to_string())
-                ),
-                ("02.flac".to_string(), EnqueueStatus::Enqueued),
-            ]
+            vec![("02.flac".to_string(), EnqueueStatus::Enqueued)]
         );
+        assert_eq!(enq.refusal(), None);
         assert!(matches!(enq.watcher, Watcher::Own));
         assert_eq!(enq.batch.owner, fresh.owner);
         assert_eq!(stub.destinations(), vec![fresh.destination.clone()]);
@@ -375,14 +381,30 @@ mod tests {
         assert_eq!(
             statuses(&enq.results),
             vec![
-                (
-                    "01.flac".to_string(),
-                    EnqueueStatus::Failed(ANOTHER_FOLDER.to_string())
-                ),
                 ("02.flac".to_string(), EnqueueStatus::AlreadyInFlight),
                 ("03.flac".to_string(), EnqueueStatus::Enqueued),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_only_for_files_downloading_elsewhere_is_refused() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = batch("Come Over");
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
+
+        let enq = enqueue_request(
+            &backend,
+            vec![item("peer_a", "One", "01.flac")],
+            same_user_into(&running, PathBuf::from("/other-library")),
+        )
+        .await;
+
+        assert!(enq.results.is_empty(), "no row would replace the running one");
+        assert_eq!(enq.refusal(), Some(ANOTHER_FOLDER));
+        assert!(stub.destinations().is_empty());
+        assert!(running.inbox.close_if_idle(), "the running batch was not joined");
     }
 
     #[tokio::test]
@@ -433,8 +455,10 @@ mod tests {
             )]
         );
         assert!(stub.destinations().is_empty());
-        assert!(TransferRegistry::global()
-            .may_adopt(&key(&backend, "peer_a", "01.flac"), &theirs.owner));
+        // Still theirs: a third batch may not take it over.
+        let held = key(&backend, "peer_a", "01.flac");
+        assert!(TransferRegistry::global().may_adopt(&held, &theirs.owner));
+        assert!(!TransferRegistry::global().may_adopt(&held, &batch("Other").owner));
     }
 
     #[tokio::test]
@@ -495,18 +519,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_delivery_to_a_stopped_batch_comes_back_with_its_key_released() {
-        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+    async fn a_delivery_to_a_stopped_batch_comes_back_released_and_cancelled() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
         let running = batch("Come Over");
         let reservation = running.inbox.reserve().expect("open inbox");
         let enqueued = enqueue_claimed_for(&backend, &running).await;
         running.inbox.close();
 
-        let lost = deliver(reservation, &enqueued, backend.id(), &running);
+        let lost = deliver(reservation, &enqueued, &backend, &running).await;
 
         assert_eq!(lost.len(), 1);
         assert!(TransferRegistry::global()
             .may_adopt(&key(&backend, "peer_a", "01.flac"), &batch("Other").owner));
+        assert_eq!(stub.cancelled(), vec![Cancel::only("peer_a", "t-01.flac")]);
     }
 
     /// Claims and enqueues `01.flac` into `running`.
