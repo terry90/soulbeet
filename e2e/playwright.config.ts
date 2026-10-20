@@ -1,9 +1,9 @@
 import { defineConfig, devices } from '@playwright/test';
-import { baseUrl } from './helpers/env.js';
+import { baseUrl, user90BaseUrl } from './helpers/env.js';
 
 // Stack lifecycles live outside this config (compose.e2e.yml in CI,
 // scripts/dev-stack.sh natively); the suite targets whatever E2E_BASE_URL
-// points at.
+// and E2E_USER90_BASE_URL point at.
 export default defineConfig({
   testDir: './tests',
   fullyParallel: true,
@@ -25,10 +25,27 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'] },
     },
     {
+      // The same setup on the instance with the issue #90 beets config.
+      name: 'setup-user90',
+      testMatch: /setup\.app\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: user90BaseUrl },
+    },
+    {
       name: 'chromium',
       dependencies: ['setup'],
-      testIgnore: [/mobile\.spec\.ts/, /failures\.spec\.ts/],
+      testIgnore: [
+        /mobile\.spec\.ts/,
+        /failures\.spec\.ts/,
+        /imports\.spec\.ts/,
+        /user90\.spec\.ts/,
+      ],
       use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'user90',
+      dependencies: ['setup-user90'],
+      testMatch: /user90\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], baseURL: user90BaseUrl },
     },
     {
       name: 'mobile',
@@ -40,8 +57,17 @@ export default defineConfig({
       // Tests that mutate shared stub state (peer behavior, outages) run
       // alone, after everything else.
       name: 'failures',
-      dependencies: ['chromium', 'mobile'],
+      dependencies: ['chromium', 'mobile', 'user90'],
       testMatch: /failures\.spec\.ts/,
+      workers: 1,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      // Import queue scenarios script the MusicBrainz stub and reset the
+      // stubs, so they run alone too, after the failures.
+      name: 'imports',
+      dependencies: ['failures'],
+      testMatch: /imports\.spec\.ts/,
       workers: 1,
       use: { ...devices['Desktop Chrome'] },
     },

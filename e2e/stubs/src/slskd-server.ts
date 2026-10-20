@@ -101,8 +101,8 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
       {
         method: 'POST',
         pattern: '/api/v0/transfers/downloads/batches',
-        handler: ({ res, body }) => {
-          const result = state.enqueueBatch((body ?? {}) as BatchEnqueueBody);
+        handler: async ({ res, body }) => {
+          const result = await state.enqueueBatch((body ?? {}) as BatchEnqueueBody);
           // slskd's [Produces("application/json")] serializes string bodies
           // (offline / validation messages) as JSON strings too.
           sendJson(res, result.status, result.body);

@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Runs the e2e stack natively (no docker): the stub services plus the
-# soulbeet server binary produced by `dx bundle --package web --release`.
-# Useful on machines without a container runtime; CI uses compose.e2e.yml.
+# Runs the e2e stack natively (no docker): the stub services plus two
+# soulbeet servers from the binary produced by `dx bundle --package web
+# --release`, the main one on 9765 and the issue #90 one on 9766. Useful on
+# machines without a container runtime; CI uses compose.e2e.yml.
 #
-#   scripts/dev-stack.sh up      start stubs + server, wait until ready
-#   scripts/dev-stack.sh down    stop both
+#   scripts/dev-stack.sh up      start stubs + servers, wait until ready
+#   scripts/dev-stack.sh down    stop them
 #
-# Requires: a beets install on PATH or at .runtime/beets-venv (created with
-# `python3 -m venv .runtime/beets-venv && .runtime/beets-venv/bin/pip install beets requests`).
+# Requires Python 3.11 or newer (the beets config check runs `python -P`).
+# beets is installed into .runtime/beets-venv, pinned like the image
+# (build/requirements-beets.txt). PYTHON picks the interpreter for a new venv.
 
 set -euo pipefail
 
@@ -42,8 +44,10 @@ free_port() {
 
 down() {
   stop_pid soulbeet
+  stop_pid soulbeet-user90
   stop_pid stubs
   free_port 9765
+  free_port 9766
   free_port 5030
   free_port 5050
   echo "stack stopped"
@@ -69,19 +73,26 @@ up() {
   fi
 
   free_port 9765
+  free_port 9766
   free_port 5030
   free_port 5050
 
-  mkdir -p "$PID_DIR" "$LOG_DIR" "$RUNTIME/downloads" "$RUNTIME/music" "$RUNTIME/data"
+  mkdir -p "$PID_DIR" "$LOG_DIR"
   (cd "$E2E_DIR" && npm run --silent fixtures)
 
-  if [[ -x "$RUNTIME/beets-venv/bin/beet" ]]; then
-    export PATH="$RUNTIME/beets-venv/bin:$PATH"
+  local venv="$RUNTIME/beets-venv"
+  if [[ ! -x "$venv/bin/python" ]]; then
+    "${PYTHON:-python3}" -c 'import sys; sys.exit(sys.version_info < (3, 11))' || {
+      echo "beets needs Python 3.11 or newer; set PYTHON to one" >&2
+      exit 1
+    }
+    "${PYTHON:-python3}" -m venv "$venv"
   fi
-  command -v beet >/dev/null || {
-    echo "beet not found; create $RUNTIME/beets-venv (see header) or install beets" >&2
-    exit 1
-  }
+  "$venv/bin/pip" install --quiet -c "$REPO_DIR/build/requirements-beets.txt" \
+    beets requests musicbrainzngs
+  export PATH="$venv/bin:$PATH"
+  # The servers' beets config check runs this interpreter.
+  export BEETS_PYTHON="$venv/bin/python"
 
   (cd "$E2E_DIR" && setsid npx tsx stubs/src/main.ts >"$LOG_DIR/stubs.log" 2>&1 </dev/null &
    echo $! >"$PID_DIR/stubs.pid")
@@ -98,7 +109,19 @@ up() {
    echo $! >"$PID_DIR/soulbeet.pid")
   wait_for "http://127.0.0.1:9765/" "soulbeet"
 
-  echo "stack up: app http://127.0.0.1:9765, slskd stub :5030, mb stub :5050"
+  (cd "$SERVER_DIR" && \
+    DATABASE_URL="sqlite:$RUNTIME/data/user90.db" \
+    SECRET_KEY="e2e-secret-key" \
+    DOWNLOAD_PATH="$RUNTIME/downloads" \
+    BEETS_CONFIG="$RUNTIME/user90-config/config.yaml" \
+    MUSICBRAINZ_HOST="127.0.0.1:5050" \
+    PORT=9766 IP=127.0.0.1 \
+    setsid ./server >"$LOG_DIR/soulbeet-user90.log" 2>&1 </dev/null &
+   echo $! >"$PID_DIR/soulbeet-user90.pid")
+  wait_for "http://127.0.0.1:9766/" "soulbeet-user90"
+
+  echo "stack up: app http://127.0.0.1:9765, issue #90 app http://127.0.0.1:9766,"
+  echo "slskd stub :5030, mb stub :5050"
   echo "logs: $LOG_DIR"
 }
 

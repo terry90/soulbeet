@@ -1,7 +1,7 @@
 // Host-side filesystem assertions on the bind-mounted music and downloads
 // directories: the final word on whether the pipeline really worked.
 
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect } from '@playwright/test';
 import { musicDirOnHost } from './env.js';
@@ -29,6 +29,12 @@ export async function expectFileAppears(path: string, timeoutMs = 60_000): Promi
     .toBe(true);
 }
 
-export function fileExists(path: string): boolean {
-  return existsSync(path);
+/** Every regular file under `dir`, as absolute paths; empty when `dir` is missing. */
+export function listFilesRecursive(dir: string): string[] {
+  if (!existsSync(dir)) {
+    return [];
+  }
+  return readdirSync(dir, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => join(entry.parentPath, entry.name));
 }

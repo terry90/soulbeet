@@ -3,8 +3,9 @@
 // flag strings) as implemented in the slskd C# source.
 
 import { randomUUID } from 'node:crypto';
-import { copyFileSync, mkdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { extname, join } from 'node:path';
 import {
   audioFileName,
   peers,
@@ -83,10 +84,27 @@ interface TransferRecord {
 }
 
 export interface BatchEnqueueBody {
+  id?: unknown;
   username?: unknown;
   files?: unknown;
   options?: { destination?: unknown };
 }
+
+interface ParsedBatch {
+  /** lowercase, hyphenated, the way slskd prints a Guid */
+  id: string;
+  username: string;
+  files: Array<{ filename: string; size?: unknown }>;
+  destination: string | null;
+}
+
+type Reply = { status: number; body: unknown };
+
+/** TransfersController.DownloadRequestLimiter: SemaphoreSlim(2, 2), tried with Wait(0). */
+const ENQUEUE_SLOTS = 2;
+
+const ENQUEUE_THROTTLED =
+  'Only one concurrent operation is permitted. Wait until the previous request completes';
 
 // Transfers hold "Requested" and "Initializing" for longer than the app's 2s
 // monitor poll interval so every download is guaranteed to be observed in
@@ -173,6 +191,20 @@ export function toLocalRelativePath(remotePath: string): { directory: string; fi
   return { directory, file };
 }
 
+/** DateTime.UtcNow.Ticks: 100 ns intervals since 0001-01-01. */
+function dotnetTicks(): string {
+  const sinceEpoch = BigInt(Date.now()) * 10_000n + (process.hrtime.bigint() / 100n) % 10_000n;
+  return String(sinceEpoch + 621_355_968_000_000_000n);
+}
+
+/** Guid.Parse for the hyphenated and the bare 32-digit forms. */
+function parseGuid(text: string): string | null {
+  const match = /^([0-9a-f]{8})-?([0-9a-f]{4})-?([0-9a-f]{4})-?([0-9a-f]{4})-?([0-9a-f]{12})$/i.exec(
+    text,
+  );
+  return match ? match.slice(1).join('-').toLowerCase() : null;
+}
+
 export class SlskdState {
   private searches = new Map<string, SearchRecord>();
   private transfers: TransferRecord[] = [];
@@ -181,12 +213,16 @@ export class SlskdState {
   private nextToken = 1000;
   /** peers whose one-off partialenqueue rejection already fired */
   private rejectedOnce = new Set<string>();
+  private batchIds = new Set<string>();
+  private enqueuesInFlight = 0;
   outage = false;
 
   constructor(
     private readonly audioDir: string,
     private readonly downloadsDir: string,
     private readonly searchCompleteAfterMs = 1500,
+    /** how long an enqueue holds its limiter slot; makes the 429 reachable */
+    private readonly enqueueLatencyMs = 150,
   ) {
     this.resetBehaviors();
     for (const peer of peers) {
@@ -208,7 +244,14 @@ export class SlskdState {
     this.transfers = [];
     this.resetBehaviors();
     this.rejectedOnce.clear();
+    this.batchIds.clear();
+    // enqueuesInFlight is left alone: running requests release their own slot.
     this.outage = false;
+  }
+
+  /** Any other record of a file blocks a new enqueue of it (DownloadService.EnqueueAsync). */
+  private static isFinished(transfer: TransferRecord): boolean {
+    return transfer.endedAtMs !== null && transfer.state.startsWith('Completed');
   }
 
   private resetBehaviors(): void {
@@ -329,12 +372,32 @@ export class SlskdState {
 
   /**
    * POST /api/v0/transfers/downloads/batches (slskd 0.26). Mirrors
-   * TransfersController.EnqueueBatchAsync: 400 for invalid bodies, 404 with
-   * "appears to be offline" for offline (or unknown) users, otherwise a
-   * batch record plus per-file {filename, message} failures with 201 when
-   * everything enqueued, 207 on partial failure and 200 when all failed.
+   * TransfersController.EnqueueBatchAsync in order: 400 for invalid bodies,
+   * 429 while two enqueues are already running, 404 with "appears to be
+   * offline" for offline (or unknown) users, 409 when the batch id was used
+   * before, otherwise a batch record plus per-file {filename, message}
+   * failures with 201 when everything enqueued, 207 on partial failure and
+   * 200 when all failed.
    */
-  enqueueBatch(body: BatchEnqueueBody): { status: number; body: unknown } {
+  async enqueueBatch(body: BatchEnqueueBody): Promise<Reply> {
+    const parsed = SlskdState.parseBatch(body);
+    if ('status' in parsed) {
+      return parsed;
+    }
+    if (this.enqueuesInFlight >= ENQUEUE_SLOTS) {
+      console.log(`[slskd] batch enqueue from ${parsed.username} throttled`);
+      return { status: 429, body: ENQUEUE_THROTTLED };
+    }
+    this.enqueuesInFlight++;
+    try {
+      await sleep(this.enqueueLatencyMs);
+      return this.createBatch(parsed);
+    } finally {
+      this.enqueuesInFlight--;
+    }
+  }
+
+  private static parseBatch(body: BatchEnqueueBody): ParsedBatch | Reply {
     const username = typeof body.username === 'string' ? body.username : '';
     const files = Array.isArray(body.files)
       ? (body.files as Array<{ filename?: unknown; size?: unknown }>)
@@ -353,7 +416,20 @@ export class SlskdState {
     if (new Set(files.map((f) => f.filename)).size !== files.length) {
       return { status: 400, body: 'Two or more files in the request are repeated' };
     }
+    const requested = typeof body.id === 'string' ? body.id.trim() : '';
+    const id = requested.length > 0 ? parseGuid(requested) : randomUUID();
+    if (id === null) {
+      return { status: 400, body: 'One or more provided identifiers is not a valid GUID/UUID' };
+    }
+    return {
+      id,
+      username,
+      files: files as Array<{ filename: string; size?: unknown }>,
+      destination,
+    };
+  }
 
+  private createBatch({ id, username, files, destination }: ParsedBatch): Reply {
     const peer = peers.find((p) => p.username === username);
     const behavior = this.behaviorOf(username);
     // Real slskd resolves the user's endpoint before creating anything and
@@ -363,6 +439,13 @@ export class SlskdState {
     if (!peer || behavior === 'offline' || behavior === 'enqueueoffline') {
       return { status: 404, body: `User ${username} appears to be offline` };
     }
+    // The batch record is created before any file is looked at, so an id is
+    // used up even when every file then fails.
+    if (this.batchIds.has(id)) {
+      console.log(`[slskd] batch ${id} from ${username} already exists`);
+      return { status: 409, body: `A batch with ID ${id} already exists` };
+    }
+    this.batchIds.add(id);
 
     const plan = BEHAVIOR_PLANS[behavior];
     const now = Date.now();
@@ -370,10 +453,17 @@ export class SlskdState {
     const failures: Array<{ filename: string; message: string }> = [];
 
     for (const file of files) {
-      const filename = file.filename as string;
+      const filename = file.filename;
       const share = peer.shares.find((s) => s.remotePath === filename);
       if (!share) {
         failures.push({ filename, message: 'Error: File not shared' });
+        continue;
+      }
+      const previous = this.transfers.filter(
+        (t) => t.username === username && t.filename === filename,
+      );
+      if (previous.some((t) => !SlskdState.isFinished(t))) {
+        failures.push({ filename, message: 'Skipped: Already in progress' });
         continue;
       }
       if (behavior === 'partialenqueue' && !this.rejectedOnce.has(username)) {
@@ -405,11 +495,15 @@ export class SlskdState {
         delivered: false,
       };
       this.transfers.push(transfer);
+      // The new record supersedes the finished ones for the same file.
+      for (const old of previous) {
+        old.removed = true;
+      }
       enqueued.push(this.transferJson(transfer));
     }
 
     console.log(
-      `[slskd] batch enqueue ${files.length} file(s) from ${username} (${behavior}): ${enqueued.length} ok, ${failures.length} failed`,
+      `[slskd] batch ${id} enqueue ${files.length} file(s) from ${username} (${behavior}): ${enqueued.length} ok, ${failures.length} failed`,
     );
 
     const status = failures.length === 0 ? 201 : enqueued.length === 0 ? 200 : 207;
@@ -417,7 +511,7 @@ export class SlskdState {
       status,
       body: {
         batch: {
-          id: randomUUID(),
+          id,
           username,
           direction: 'Download',
           createdAt: new Date(now).toISOString(),
@@ -486,7 +580,14 @@ export class SlskdState {
     const dir = transfer.destination ?? directory;
     const targetDir = dir ? join(this.downloadsDir, dir) : this.downloadsDir;
     mkdirSync(targetDir, { recursive: true });
-    const target = join(targetDir, file);
+    // FileService.MoveFile without overwrite: an existing file gets a
+    // {name}_{ticks}{ext} sibling instead of being replaced.
+    let target = join(targetDir, file);
+    const ext = extname(file);
+    const stem = join(targetDir, file.slice(0, file.length - ext.length));
+    while (existsSync(target)) {
+      target = `${stem}_${dotnetTicks()}${ext}`;
+    }
     copyFileSync(join(this.audioDir, audioFileName(share)), target);
     console.log(`[slskd] delivered ${target}`);
   }

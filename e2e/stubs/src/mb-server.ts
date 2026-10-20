@@ -3,9 +3,11 @@
 //   entities inlined, plus release lookup for tracklists
 // - beets 2.x (musicbrainz plugin): recording search for candidate ids,
 //   then per-id recording lookups
-// Everything is served from the shared fixture dataset.
+// Everything is served from the shared fixture dataset. A control API sets
+// how beets is answered (see MbControl); soulbeet is always answered normally.
 
-import type { Server } from 'node:http';
+import type { IncomingMessage, Server } from 'node:http';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
   findRecording,
   findRelease,
@@ -13,7 +15,54 @@ import {
   type FixtureRelease,
   type FixtureTrack,
 } from '../../fixtures/dataset.js';
-import { createStubServer, sendJson } from './router.js';
+import { createStubServer, sendJson, type RouteContext } from './router.js';
+
+// ---- control ------------------------------------------------------------------
+
+/**
+ * normal: the dataset as is. weak: every recording is a poor match (a live
+ * title and three times the length), so beets skips with candidates.
+ * unavailable: 503 for everything, which beets reports as a lookup error.
+ */
+export type MbMode = 'normal' | 'weak' | 'unavailable';
+
+const MB_MODES: MbMode[] = ['normal', 'weak', 'unavailable'];
+
+export class MbControl {
+  mode: MbMode = 'normal';
+  /** delay before every answer to beets */
+  latencyMs = 0;
+
+  reset(): void {
+    this.mode = 'normal';
+    this.latencyMs = 0;
+  }
+}
+
+/** beets 2.11 sends "beets/2.11.0 https://beets.io/"; soulbeet sends "Soulbeet/...". */
+function isBeets(req: IncomingMessage): boolean {
+  return req.headers['user-agent']?.startsWith('beets/') ?? false;
+}
+
+const WEAK_SUFFIX = ' (Live at Somewhere)';
+const WEAK_LENGTH_FACTOR = 3;
+
+function weakened(release: FixtureRelease): FixtureRelease {
+  return {
+    ...release,
+    tracks: release.tracks.map((track) => ({
+      ...track,
+      title: `${track.title}${WEAK_SUFFIX}`,
+      lengthMs: track.lengthMs * WEAK_LENGTH_FACTOR,
+    })),
+  };
+}
+
+function weakHit(hit: RecordingHit): RecordingHit {
+  const release = weakened(hit.release);
+  const track = release.tracks.find((t) => t.mbid === hit.track.mbid) as FixtureTrack;
+  return { release, track };
+}
 
 // ---- Lucene query handling -------------------------------------------------
 
@@ -216,20 +265,46 @@ function releaseWithRecordingsJson(release: FixtureRelease): Record<string, unkn
 
 // ---- server -----------------------------------------------------------------
 
-export function createMusicBrainzServer(): Server {
+/**
+ * Applies the control to beets requests: latency, then a 503 when
+ * unavailable. The handler gets whether to weaken what it serves.
+ */
+function served(
+  control: MbControl,
+  handler: (ctx: RouteContext, weak: boolean) => void,
+): (ctx: RouteContext) => Promise<void> {
+  return async (ctx) => {
+    if (!isBeets(ctx.req)) {
+      handler(ctx, false);
+      return;
+    }
+    if (control.latencyMs > 0) {
+      await sleep(control.latencyMs);
+    }
+    if (control.mode === 'unavailable') {
+      console.log(`[mb] unavailable: 503 for ${ctx.url.pathname}`);
+      sendJson(ctx.res, 503, { error: 'Service Temporarily Unavailable' });
+      return;
+    }
+    handler(ctx, control.mode === 'weak');
+  };
+}
+
+export function createMusicBrainzServer(control: MbControl): Server {
   return createStubServer({
     name: 'musicbrainz',
     routes: [
       {
         method: 'GET',
         pattern: '/ws/2/recording',
-        handler: ({ res, url }) => {
+        handler: served(control, ({ res, url }, weak) => {
           const query = url.searchParams.get('query') ?? '';
           const limitParam = Number(url.searchParams.get('limit') ?? '25');
           const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 25;
           const hits = searchRecordings(query)
             .sort((a, b) => b.release.rating - a.release.rating)
-            .slice(0, limit);
+            .slice(0, limit)
+            .map((hit) => (weak ? weakHit(hit) : hit));
           console.log(`[mb] recording search "${query}" -> ${hits.length}`);
           sendJson(res, 200, {
             created: new Date().toISOString(),
@@ -237,25 +312,25 @@ export function createMusicBrainzServer(): Server {
             offset: 0,
             recordings: hits.map((hit) => recordingJson(hit, true)),
           });
-        },
+        }),
       },
       {
         method: 'GET',
         pattern: '/ws/2/recording/:id',
-        handler: ({ res, params }) => {
+        handler: served(control, ({ res, params }, weak) => {
           const hit = findRecording(params.id as string);
           console.log(`[mb] recording lookup ${params.id} -> ${hit ? 'hit' : 'miss'}`);
           if (!hit) {
             sendJson(res, 404, { error: 'Not Found' });
             return;
           }
-          sendJson(res, 200, recordingJson(hit, true));
-        },
+          sendJson(res, 200, recordingJson(weak ? weakHit(hit) : hit, true));
+        }),
       },
       {
         method: 'GET',
         pattern: '/ws/2/release-group',
-        handler: ({ res, url }) => {
+        handler: served(control, ({ res, url }) => {
           const query = url.searchParams.get('query') ?? '';
           const found = searchReleaseGroups(query).sort((a, b) => b.rating - a.rating);
           console.log(`[mb] release-group search "${query}" -> ${found.length}`);
@@ -265,19 +340,53 @@ export function createMusicBrainzServer(): Server {
             offset: 0,
             'release-groups': found.map((r) => releaseGroupJson(r)),
           });
-        },
+        }),
       },
       {
         method: 'GET',
         pattern: '/ws/2/release/:id',
-        handler: ({ res, params }) => {
+        handler: served(control, ({ res, params }, weak) => {
           const release = findRelease(params.id as string);
           console.log(`[mb] release lookup ${params.id} -> ${release ? 'hit' : 'miss'}`);
           if (!release) {
             sendJson(res, 404, { error: 'Not Found' });
             return;
           }
-          sendJson(res, 200, releaseWithRecordingsJson(release));
+          sendJson(res, 200, releaseWithRecordingsJson(weak ? weakened(release) : release));
+        }),
+      },
+
+      // ---- control API (specs only, not part of MusicBrainz) ----------------
+      {
+        method: 'POST',
+        pattern: '/_control/mode',
+        handler: ({ res, body }) => {
+          const request = (body ?? {}) as { mode?: unknown; latencyMs?: unknown };
+          const mode = request.mode as MbMode | undefined;
+          if (mode !== undefined && !MB_MODES.includes(mode)) {
+            sendJson(res, 400, { error: `mode must be one of ${MB_MODES.join(', ')}` });
+            return;
+          }
+          const latencyMs = request.latencyMs;
+          if (
+            latencyMs !== undefined &&
+            (typeof latencyMs !== 'number' || !Number.isFinite(latencyMs) || latencyMs < 0)
+          ) {
+            sendJson(res, 400, { error: 'latencyMs must be a number of milliseconds >= 0' });
+            return;
+          }
+          control.mode = mode ?? control.mode;
+          control.latencyMs = latencyMs ?? control.latencyMs;
+          console.log(`[mb] mode ${control.mode}, beets latency ${control.latencyMs} ms`);
+          sendJson(res, 200, { ok: true, mode: control.mode, latencyMs: control.latencyMs });
+        },
+      },
+      {
+        method: 'POST',
+        pattern: '/_control/reset',
+        handler: ({ res }) => {
+          control.reset();
+          sendJson(res, 200, { ok: true });
         },
       },
     ],

@@ -4,7 +4,8 @@
 #
 # Build the app image first (from the repo root):
 #   docker build -t soulbeet:e2e --build-arg TIER=light .
-# Generate fixtures before starting (from e2e/):
+# Generate fixtures before starting (from e2e/); this also creates the
+# bind-mounted directories:
 #   E2E_MB_HOST=stubs:5050 npm run fixtures
 
 services:
@@ -26,6 +27,26 @@ services:
     depends_on:
       - stubs
       - navidrome
+
+  # A second instance with the beets config from issue #90 (no metadata
+  # source). Its config directory is mounted, not the file, so a spec can
+  # replace the file on the host and the instance sees the new one.
+  soulbeet-user90:
+    image: ${SOULBEET_IMAGE:-soulbeet:e2e}
+    ports:
+      - "9766:9765"
+    environment:
+      - DATABASE_URL=sqlite:/data/soulbeet.db
+      - SECRET_KEY=e2e-secret-key
+      - DOWNLOAD_PATH=/downloads
+      - BEETS_CONFIG=/config/config.yaml
+      - MUSICBRAINZ_HOST=stubs:5050
+    volumes:
+      - ./.runtime/downloads:/downloads
+      - ./.runtime/music-user90:/music
+      - ./.runtime/user90-config:/config:ro
+    depends_on:
+      - stubs
 
   stubs:
     build:

@@ -2,7 +2,7 @@
 
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createMusicBrainzServer } from './mb-server.js';
+import { MbControl, createMusicBrainzServer } from './mb-server.js';
 import { createSlskdServer } from './slskd-server.js';
 import { SlskdState } from './slskd-state.js';
 
@@ -13,8 +13,9 @@ const mbPort = Number(process.env.MB_PORT ?? 5050);
 const apiKey = process.env.SLSKD_API_KEY ?? 'e2e-slskd-api-key';
 const audioDir = resolve(process.env.AUDIO_DIR ?? join(e2eRoot, '.fixtures', 'audio'));
 const downloadsDir = resolve(process.env.DOWNLOADS_DIR ?? join(e2eRoot, '.runtime', 'downloads'));
+const enqueueLatencyMs = Number(process.env.ENQUEUE_LATENCY_MS ?? 150);
 
-const state = new SlskdState(audioDir, downloadsDir);
+const state = new SlskdState(audioDir, downloadsDir, undefined, enqueueLatencyMs);
 setInterval(() => state.tick(), 200).unref();
 
 const slskd = createSlskdServer(state, apiKey);
@@ -22,7 +23,7 @@ slskd.listen(slskdPort, '0.0.0.0', () => {
   console.log(`[slskd] listening on :${slskdPort} (downloads -> ${downloadsDir})`);
 });
 
-const mb = createMusicBrainzServer();
+const mb = createMusicBrainzServer(new MbControl());
 mb.listen(mbPort, '0.0.0.0', () => {
   console.log(`[mb] listening on :${mbPort}`);
 });

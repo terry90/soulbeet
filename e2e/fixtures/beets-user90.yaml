@@ -1,0 +1,177 @@
+# The beets config from issue #90, minus its import.log path. Its plugin list
+# has no musicbrainz, so beets has no metadata source.
+plugins: fetchart scrub chroma discogs mbsync albumtypes lastgenre zero permissions inline the ftintitle fromfilename web
+
+#web:
+#  host: 0.0.0.0
+
+# asciify_paths: yes
+threaded: yes
+clutter:
+    - "Thumbs.DB"
+    - "Thumbs.db"
+    - "thumbs.db"
+    - ".DS_Store"
+    - "*.m3u"
+    - "*.pls"
+    - "*.cue"
+    - "*.jpg"
+    - "*.jpeg"
+    - "*.bmp"
+    - "*.png"
+    - "*.gif"
+    - "*.pdf"
+    - "*.tif"
+    - "*.nfo"
+    - "*.txt"
+    - "*.log"
+    - "*.db"
+    - "*.iso"
+    - "*.accurip"
+         
+ignore: .AppleDouble ._* *~ .DS_Store
+per_disc_numbering: yes
+
+#%if{$media,[$media]}%if{$atypes,[$atypes]}%if{$label,[$label]}%if{$country,[$country]}
+# Test: %if{$albumdisambig, ($albumdisambig)}
+paths:
+  default: $albumartist/%if{$year,$year - }$album%aunique{} [${samplerate_max}-${bitdepth_max}${disctotal_ex}]/%if{$multidisc,Disc $disc/}$track - $artist - $album%aunique{} - $title
+#  singleton: _Singles/$the{$first_artist_singleton}/$the{$artist} - $title
+  comp: _Compilations/$year - $album%aunique{} [${samplerate_max}-${bitdepth_max}]/%if{$multidisc,Disc $disc/}$track - $title
+#  albumtype_soundtrack: _Soundtracks/$album/$track $title 
+
+aunique:
+  keys: albumartist albumtype year album disctotal
+  disambuguators: format mastering media label albumdisambig releasegroupdisambig
+  bracket: '[]'
+
+album_fields:  
+  samplerate_max: |
+        max = 0
+        for item in items:
+            if item.samplerate > max:
+                max = item.samplerate
+        return int(max/1000)
+
+  bitdepth_max: |
+        max = 0
+        for item in items:
+            if item.bitdepth > max:
+                max = item.bitdepth
+        return int(max)
+        
+  disctotal_ex: |
+        discs = int(disctotal)
+        return ', '+str(discs)+'xCD' if discs > 1 else ''
+
+
+item_fields:  
+  first_artist: |
+    # import an album to another artists directory, like:
+    # Tom Jones │1999│ Burning Down the House [Single, CD, FLAC]
+    # to The Cardigans/+singles/Tom Jones & the Cardigans │1999│ Burning Down the House [Single, CD, FLAC]
+    # https://github.com/beetbox/beets/discussions/4012#discussioncomment-1021414
+    # beet import --set myartist='The Cardigans'
+    # we must first check to see if myartist is defined, that is, given on
+    # import time, or we raise an NameError exception.
+    try:
+      myartist
+    except NameError:
+      import re
+      return re.split(',|\s+(feat(.?|uring)|and|with|&|(Vs|Ft).)', albumartist, 1, flags=re.IGNORECASE)[0]
+    else:
+      return myartist
+
+  first_artist_singleton: |
+    try:
+      myartist
+    except NameError:
+      import re
+      return re.split(',|\s+(feat(.?|uring)|and|with|&|(Vs|Ft).)', artist, 1, flags=re.IGNORECASE)[0]
+    else:
+      return myartist
+
+  multidisc: 1 if disctotal > 1 else 0
+  
+
+import:
+  write: yes
+  copy: no
+  move: yes
+  resume: no
+  duplicate_action: ask
+  incremental: no
+  quiet: no
+  quiet_fallback: skip
+  timid: no
+  group_albums: no
+
+  
+match:
+  strong_rec_thresh: 0.15
+  medium_rec_thresh: 0.25
+  rec_gap_thresh: 0.25
+  
+  
+ui:
+  color: yes
+  colors:
+    text_success: green
+    text_warning: yellow
+    text_error: red
+    text_highlight: red
+    text_highlight_minor: lightgray
+    action_default: turquoise
+    action: blue
+
+    count: 10
+  source: artist
+  title_case: yes
+
+  
+permissions:
+  file: 777
+  dir: 777
+  
+  
+zero:
+  fields: comments
+       
+
+scrub:
+  auto: yes
+
+  
+  
+albumtypes:
+  types:
+    - album: 'LP'
+    - ep: 'EP'
+    - single: 'Single'
+    - soundtrack: 'OST'
+    - live: 'Live'
+    - compilation: 'Anthology'
+    - remix: 'Remix'
+  ignore_va: compilation
+  bracket: ''
+
+  
+the:
+  a: yes
+  the: yes
+  
+
+ftintitle:
+  auto: yes
+  format: feat. {0}
+  
+  
+fetchart:
+    # art_filename: cover.jpg
+    minwidth: 500
+    # enforce_ratio: yes
+    sources: coverart itunes amazon albumart wikipedia google
+    # cover_format: JPEG
+    high_resolution: yes
+    quality: 100
+   

@@ -1,10 +1,12 @@
 // Generates everything the stack needs that does not belong in git:
 // tagged audio files for every peer share (ffmpeg sine tones), the beets
 // config for the e2e stack (the shipped beets_config.yaml with MusicBrainz
-// pointed at the stub) and the runtime directories the services share.
+// pointed at the stub), the broken config the user90 instance starts with
+// and the runtime directories the services share. Run it before the stack
+// starts, so the container runtime does not create those directories as root.
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse, stringify } from 'yaml';
@@ -90,11 +92,20 @@ function generateBeetsConfig(): void {
 }
 
 function createRuntimeDirs(): void {
-  for (const dir of ['downloads', 'music', 'data', 'navidrome']) {
+  for (const dir of ['downloads', 'music', 'data', 'navidrome', 'user90-config', 'music-user90']) {
     mkdirSync(join(runtimeDir, dir), { recursive: true });
   }
+}
+
+// The issue #90 config: no musicbrainz in plugins. Copied on every run, since
+// user90.spec.ts replaces it with a working one.
+function generateUser90Config(): void {
+  const target = join(runtimeDir, 'user90-config', 'config.yaml');
+  copyFileSync(join(e2eRoot, 'fixtures', 'beets-user90.yaml'), target);
+  console.log(`generated ${target}`);
 }
 
 generateAudio();
 generateBeetsConfig();
 createRuntimeDirs();
+generateUser90Config();

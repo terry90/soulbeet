@@ -5,9 +5,9 @@
 import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
 import { freshSession, performSearch } from '../helpers/app.js';
-import { expectFileAppears, fileExists, importedTrackPath } from '../helpers/files.js';
+import { expectFileAppears, importedTrackPath, listFilesRecursive } from '../helpers/files.js';
 import { glassAtlas, senders } from '../fixtures/dataset.js';
-import { join } from 'node:path';
+import { basename } from 'node:path';
 import { downloadsDirOnHost } from '../helpers/env.js';
 
 test.describe.configure({ timeout: 180_000 });
@@ -49,10 +49,13 @@ test('downloads and imports a single track', async ({ context, page }) => {
   );
   await expectFileAppears(imported, 30_000);
 
-  // beets moved (not copied) the file out of the downloads area.
-  expect(fileExists(join(downloadsDirOnHost, 'Glass Atlas', '01 - Northern Line.flac'))).toBe(
-    false,
-  );
+  // beets moved (not copied) the file out of its batch folder, and slskd never
+  // had to write a renamed {name}_{ticks} copy next to an existing one.
+  const leftovers = listFilesRecursive(downloadsDirOnHost).filter((path) => {
+    const name = basename(path);
+    return name === '01 - Northern Line.flac' || /_\d{18}\./.test(name);
+  });
+  expect(leftovers).toEqual([]);
 });
 
 test('downloads and imports a full album from the album card', async ({ context, page }) => {

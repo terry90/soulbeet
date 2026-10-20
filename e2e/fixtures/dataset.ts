@@ -189,12 +189,170 @@ export const maritime: FixtureRelease = {
   ],
 };
 
+// Releases only imports.spec.ts downloads, one or two per test: the app's
+// transfer registry is process-wide, so no other spec may touch their files.
+const marrowChoirMbid = '3f4a5b6c-7d8e-4f9a-8b1c-2d3e4f5a6b7c';
+
+export const copperSeason: FixtureRelease = {
+  releaseMbid: '1a7b8c9d-2e3f-4a4b-9c5d-6e7f8a9b0c11',
+  releaseGroupMbid: '2b8c9d0e-3f4a-4b5c-8d6e-7f8a9b0c1d22',
+  title: 'Copper Season',
+  artist: 'Marrow Choir',
+  artistMbid: marrowChoirMbid,
+  date: '2018-04-06',
+  primaryType: 'Album',
+  rating: 83,
+  tracks: [
+    {
+      mbid: '3c9d0e1f-4a5b-4c6d-9e7f-8a9b0c1d2e33',
+      title: 'Kiln Weather',
+      position: 1,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '4d0e1f2a-5b6c-4d7e-8f8a-9b0c1d2e3f44',
+      title: 'Brass Orchard',
+      position: 2,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '5e1f2a3b-6c7d-4e8f-9a9b-0c1d2e3f4a55',
+      title: 'Low Furnace',
+      position: 3,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const ferryLights: FixtureRelease = {
+  releaseMbid: '6f2a3b4c-7d8e-4f9a-8b0c-1d2e3f4a5b66',
+  releaseGroupMbid: '7a3b4c5d-8e9f-4a0b-9c1d-2e3f4a5b6c77',
+  title: 'Ferry Lights',
+  artist: 'Marrow Choir',
+  artistMbid: marrowChoirMbid,
+  date: '2019-08-30',
+  primaryType: 'Album',
+  rating: 80,
+  tracks: [
+    {
+      mbid: '8b4c5d6e-9f0a-4b1c-8d2e-3f4a5b6c7d88',
+      title: 'Harbour Gate',
+      position: 1,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '9c5d6e7f-0a1b-4c2d-9e3f-4a5b6c7d8e99',
+      title: 'Night Ferry',
+      position: 2,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const saltRoads: FixtureRelease = {
+  releaseMbid: '0d6e7f8a-1b2c-4d3e-8f4a-5b6c7d8e9f00',
+  releaseGroupMbid: '1e7f8a9b-2c3d-4e4f-9a5b-6c7d8e9f0a01',
+  title: 'Salt Roads',
+  artist: 'Marrow Choir',
+  artistMbid: marrowChoirMbid,
+  date: '2020-02-14',
+  primaryType: 'Album',
+  rating: 79,
+  tracks: [
+    {
+      mbid: '2f8a9b0c-3d4e-4f5a-8b6c-7d8e9f0a1b02',
+      title: 'Dry Dock',
+      position: 1,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '3a9b0c1d-4e5f-4a6b-9c7d-8e9f0a1b2c03',
+      title: 'Gull Static',
+      position: 2,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const tinMoons: FixtureRelease = {
+  releaseMbid: '4b0c1d2e-5f6a-4b7c-8d8e-9f0a1b2c3d04',
+  releaseGroupMbid: '5c1d2e3f-6a7b-4c8d-9e9f-0a1b2c3d4e05',
+  title: 'Tin Moons',
+  artist: 'Marrow Choir',
+  artistMbid: marrowChoirMbid,
+  date: '2021-06-18',
+  primaryType: 'Album',
+  rating: 77,
+  tracks: [
+    {
+      mbid: '6d2e3f4a-7b8c-4d9e-8f0a-1b2c3d4e5f06',
+      title: 'Crescent Wire',
+      position: 1,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '7e3f4a5b-8c9d-4e0f-9a1b-2c3d4e5f6a07',
+      title: 'Moon Ledger',
+      position: 2,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const vesperBells: FixtureRelease = {
+  releaseMbid: '8f4a5b6c-9d0e-4f1a-8b2c-3d4e5f6a7b08',
+  releaseGroupMbid: '9a5b6c7d-0e1f-4a2b-9c3d-4e5f6a7b8c09',
+  title: 'Vesper Bells',
+  artist: 'Marrow Choir',
+  artistMbid: marrowChoirMbid,
+  date: '2022-10-07',
+  primaryType: 'Single',
+  rating: 76,
+  tracks: [
+    {
+      mbid: '0b6c7d8e-1f2a-4b3c-8d4e-5f6a7b8c9d10',
+      title: 'Vesper Bells',
+      position: 1,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const quietRelay: FixtureRelease = {
+  releaseMbid: '1c7d8e9f-2a3b-4c4d-9e5f-6a7b8c9d0e11',
+  releaseGroupMbid: '2d8e9f0a-3b4c-4d5e-8f6a-7b8c9d0e1f12',
+  title: 'Quiet Relay',
+  artist: 'Marrow Choir',
+  artistMbid: marrowChoirMbid,
+  date: '2023-05-26',
+  primaryType: 'Single',
+  rating: 75,
+  tracks: [
+    {
+      mbid: '3e9f0a1b-4c5d-4e6f-9a7b-8c9d0e1f2a13',
+      title: 'Quiet Relay',
+      position: 1,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const importReleases: FixtureRelease[] = [
+  copperSeason,
+  ferryLights,
+  saltRoads,
+  tinMoons,
+  vesperBells,
+  quietRelay,
+];
+
 export const releases: FixtureRelease[] = [
   glassAtlas,
   driftwoodCodes,
   senders,
   foglight,
   maritime,
+  ...importReleases,
 ];
 
 export function findRelease(releaseMbid: string): FixtureRelease | undefined {
@@ -251,6 +409,9 @@ export const peers: Peer[] = [
       ...albumShares('Music\\FLAC', senders, 'flac', null, 44100, 16),
       ...albumShares('Music\\FLAC', foglight, 'flac', null, 44100, 16),
       ...albumShares('Music\\FLAC', maritime, 'flac', null, 44100, 16),
+      ...importReleases.flatMap((release) =>
+        albumShares('Music\\FLAC', release, 'flac', null, 44100, 16),
+      ),
     ],
   },
   // Lower-quality alternative for the same album: ranks below collector_01.
