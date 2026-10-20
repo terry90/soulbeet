@@ -58,7 +58,7 @@ use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferReg
 use crate::AuthSession;
 
 #[cfg(feature = "server")]
-use super::server_error;
+use super::{refusal_error, server_error};
 
 /// Get the current user's discovery configuration
 #[get("/api/discovery/config", auth: AuthSession)]
@@ -119,9 +119,13 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
         return Err(server_error("Not authorized to modify this track"));
     }
 
+    use super::navidrome::PromoteError;
     super::navidrome::promote_discovery_track_internal(&req.track_id, &auth.0.sub)
         .await
-        .map_err(server_error)
+        .map_err(|e| match e {
+            PromoteError::Refused(reason) => refusal_error(reason),
+            PromoteError::Failed(e) => server_error(e),
+        })
 }
 
 #[post("/api/discovery/remove", auth: AuthSession)]
@@ -464,6 +468,11 @@ pub async fn generate_discovery_playlist_internal(
         .await?
         .ok_or("Discovery folder not found")?;
 
+    // Shown as the run's error, so the user sees why nothing was imported.
+    if let Some(issue) = crate::importer_health::broken_issue().await {
+        return Err(issue.title);
+    }
+
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
     let track_counts = settings.parse_track_counts();
 
@@ -502,6 +511,8 @@ pub async fn generate_discovery_playlist_internal(
 
     let mut total_downloads = 0u32;
     let mut all_profile_stats: Vec<ProfileGenerationStats> = Vec::new();
+    // Set when the importer broke during the run and stopped it.
+    let mut importer_issue: Option<String> = None;
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
@@ -594,6 +605,7 @@ pub async fn generate_discovery_playlist_internal(
 
             if let Some(issue) = crate::importer_health::broken_issue().await {
                 warn!("Discovery for {user_id} skipped: {}", issue.title);
+                importer_issue = Some(issue.title);
                 break;
             }
 
@@ -1075,6 +1087,9 @@ pub async fn generate_discovery_playlist_internal(
         }
     }
 
+    if let Some(issue) = importer_issue {
+        return Err(issue);
+    }
     Ok(GenerationResult {
         total_imported: total_downloads,
         profiles: all_profile_stats,

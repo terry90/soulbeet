@@ -347,19 +347,63 @@ pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
     })
 }
 
+/// Why a promote did not happen.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+pub(crate) enum PromoteError {
+    /// Written for the user: the track's state or the import outcome.
+    Refused(String),
+    /// Internal, such as a database error.
+    Failed(String),
+}
+
+#[cfg(feature = "server")]
+impl std::fmt::Display for PromoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromoteError::Refused(m) | PromoteError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl From<String> for PromoteError {
+    fn from(e: String) -> Self {
+        PromoteError::Failed(e)
+    }
+}
+
+#[cfg(feature = "server")]
+impl From<&str> for PromoteError {
+    fn from(e: &str) -> Self {
+        PromoteError::Failed(e.to_string())
+    }
+}
+
+/// Promotes in its own task, so the status and history updates always follow
+/// the import even when the request that started it goes away while the
+/// import waits in the library's queue.
 #[cfg(feature = "server")]
 pub(crate) async fn promote_discovery_track_internal(
     track_id: &str,
     user_id: &str,
-) -> Result<(), String> {
+) -> Result<(), PromoteError> {
+    let (track_id, user_id) = (track_id.to_string(), user_id.to_string());
+    tokio::spawn(async move { promote_detached(&track_id, &user_id).await })
+        .await
+        .unwrap_or_else(|e| Err(PromoteError::Failed(format!("Promote stopped: {e}"))))
+}
+
+#[cfg(feature = "server")]
+async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), PromoteError> {
     use crate::models::discovery_history::DiscoveryHistoryRow;
     use crate::models::folder::Folder;
 
     // CAS guard: only one caller can promote a given track
     if !DiscoveryTrackRow::try_set_promoting(track_id).await? {
-        return Err(
+        return Err(PromoteError::Refused(
             "Track is no longer pending (already promoted, removed, or being promoted)".to_string(),
-        );
+        ));
     }
 
     let track = DiscoveryTrackRow::get_by_id(track_id)
@@ -374,14 +418,15 @@ pub(crate) async fn promote_discovery_track_internal(
     if !src.exists() {
         // File missing -- revert to Pending so expiry can handle it
         let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
-        return Err(format!("Source file not found: {}", track.path));
+        warn!("Promote of '{}': {} is gone", track.title, track.path);
+        return Err(PromoteError::Refused("The downloaded file is gone".to_string()));
     }
 
     let target = std::path::PathBuf::from(&folder.path);
-    if let Err(e) = crate::import_queue::import_to_library(&src, &target).await {
+    if let Err(outcome) = crate::import_queue::import_to_library(&src, &target).await {
         // Import failed -- revert to Pending
         let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
-        return Err(e);
+        return Err(PromoteError::Refused(outcome));
     }
 
     if let Some(parent) = src.parent() {

@@ -183,7 +183,7 @@ impl DiscoveryTrackRow {
     }
 
     /// Reset any tracks stuck in Promoting back to Pending.
-    /// Called at automation loop start to handle server crashes mid-promote.
+    /// Called once at startup, for a server that stopped mid-promote.
     pub async fn reset_stale_promoting() -> Result<u64, String> {
         let result = sqlx::query(
             "UPDATE discovery_tracks SET status = 'Pending' WHERE status = 'Promoting'",
