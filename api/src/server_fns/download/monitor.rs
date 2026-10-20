@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
-use super::process::process_downloads;
+use super::process::submit_imports;
 use crate::config::CONFIG;
 use crate::services::download_backend;
 
@@ -122,7 +122,7 @@ pub struct DownloadMonitor {
     album_mode: bool,
     /// Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
-    /// Username for logging.
+    /// Whose rows these are; imports report to this user's channel.
     username: String,
     /// Batch identifier for grouping downloads.
     batch_id: Option<String>,
@@ -701,12 +701,12 @@ impl DownloadMonitor {
                     download.item
                 );
                 self.track_states[slot].processed = true;
-                let dl = download.clone();
-                let tp = self.target_path.clone();
-                let tx_clone = self.tx.clone();
-                tokio::spawn(async move {
-                    process_downloads(vec![dl], tp, tx_clone).await;
-                });
+                let rows = self.stamp_batch(vec![download.clone()]);
+                tokio::spawn(submit_imports(
+                    rows,
+                    self.target_path.clone(),
+                    self.username.clone(),
+                ));
             }
 
             // Mark terminal failures (errored/cancelled/aborted) as
@@ -903,7 +903,8 @@ impl DownloadMonitor {
                 "Album mode: Processing {} successful downloads together",
                 successful.len()
             );
-            process_downloads(successful, self.target_path.clone(), self.tx.clone()).await;
+            let rows = self.stamp_batch(successful);
+            submit_imports(rows, self.target_path.clone(), self.username.clone()).await;
         } else {
             info!("Album mode: No successful downloads to process");
         }

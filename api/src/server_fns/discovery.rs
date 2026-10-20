@@ -37,6 +37,8 @@ async fn update_progress(
 }
 
 #[cfg(feature = "server")]
+use crate::import_queue::{ImportJob, IMPORT_QUEUE};
+#[cfg(feature = "server")]
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 #[cfg(feature = "server")]
 use crate::models::folder::Folder;
@@ -857,7 +859,6 @@ pub async fn generate_discovery_playlist_internal(
             }
 
             // Phase 3: Import completed files into Discovery/{profile}/ via beets and record in DB
-            let importer = crate::services::music_importer(None).await;
             let profile_path = folder.discovery_profile_path(&profile_name);
             let discovery_target = std::path::PathBuf::from(&profile_path);
 
@@ -902,90 +903,51 @@ pub async fn generate_discovery_playlist_internal(
                     }
                 };
 
-                // Snapshot files before import so we can detect what beets added
-                let before = collect_files(&discovery_target).await;
-
-                let src = std::path::Path::new(&src_path);
-                let imported = if let Ok(ref imp) = importer {
-                    let result = imp
-                        .import(&[src], &discovery_target, soulbeet::ImportMode::Singleton)
-                        .await;
-                    match &result.outcome {
-                        soulbeet::ImportOutcome::Imported { .. } => {
-                            info!(
-                                "Imported '{}' - {} into Discovery/{}",
-                                qt.artist, qt.track, profile_name
-                            );
-                            true
-                        }
-                        soulbeet::ImportOutcome::Skipped(
-                            soulbeet::SkipReason::NoMatch { .. }
-                            | soulbeet::SkipReason::AlreadyInLibrary,
-                        ) => {
-                            warn!("Beets skipped '{}' - {}: {result}", qt.artist, qt.track);
-                            stats.imports_skipped += 1;
-                            let _ = tokio::fs::remove_file(src).await;
-                            // A duplicate is a permanent condition: the library
-                            // already holds this track, so suggesting it again
-                            // would download it again. Only genuine failures
-                            // stay eligible for rediscovery.
-                            DiscoveryHistoryRow::record(
-                                user_id,
-                                &qt.artist,
-                                &qt.track,
-                                &profile_name,
-                            )
-                            .await?;
-                            false
-                        }
-                        _ => {
-                            warn!(
-                                "Beets import failed for '{}' - {}: {result}",
-                                qt.artist, qt.track
-                            );
-                            stats.imports_failed += 1;
-                            let _ = tokio::fs::remove_file(src).await;
-                            false
-                        }
+                let src = std::path::PathBuf::from(&src_path);
+                let outcome = IMPORT_QUEUE
+                    .submit(ImportJob {
+                        sources: vec![src.clone()],
+                        target: discovery_target.clone(),
+                        mode: soulbeet::ImportMode::Singleton,
+                        owner: None,
+                        snapshot_target: true,
+                        cleanup_root: Some(download_base.clone()),
+                    })
+                    .await
+                    .wait()
+                    .await;
+                let result = &outcome.result;
+                match classify_discovery(&result.outcome) {
+                    DiscoveryImport::Imported => {
+                        info!(
+                            "Imported '{}' - {} into Discovery/{}",
+                            qt.artist, qt.track, profile_name
+                        );
                     }
-                } else {
-                    // No importer available - fall back to raw move
-                    let filename = src
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    if filename.is_empty() {
+                    DiscoveryImport::Permanent => {
+                        warn!("Beets skipped '{}' - {}: {result}", qt.artist, qt.track);
+                        stats.imports_skipped += 1;
+                        discard_download(&src, &download_base).await;
+                        // A duplicate is a permanent condition: the library
+                        // already holds this track, so suggesting it again
+                        // would download it again. Only genuine failures
+                        // stay eligible for rediscovery.
+                        DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_name)
+                            .await?;
                         continue;
                     }
-                    let dest = format!("{}/{}", profile_path, filename);
-                    if let Err(e) = tokio::fs::rename(&src_path, &dest).await {
-                        if e.raw_os_error() == Some(18) {
-                            if let Err(e) = tokio::fs::copy(&src_path, &dest).await {
-                                warn!("Failed to copy to Discovery/: {}", e);
-                                continue;
-                            }
-                            let _ = tokio::fs::remove_file(&src_path).await;
-                        } else {
-                            warn!("Failed to move to Discovery/: {}", e);
-                            continue;
-                        }
+                    DiscoveryImport::Failed => {
+                        warn!(
+                            "Beets import failed for '{}' - {}: {result}",
+                            qt.artist, qt.track
+                        );
+                        stats.imports_failed += 1;
+                        discard_download(&src, &download_base).await;
+                        continue;
                     }
-                    true
-                };
-
-                // The file is gone from its slskd folder now (imported, moved
-                // or deleted), but nothing prunes the folder itself (#84).
-                if let Some(dir) = src.parent() {
-                    let _ = super::cleanup_empty_ancestors(dir, &download_base).await;
-                }
-                if !imported {
-                    continue;
                 }
 
-                // Find imported files by diffing before/after snapshots
-                let after = collect_files(&discovery_target).await;
-                let new_files = find_new_files(&before, &after);
+                let new_files = &outcome.new_files;
                 if new_files.is_empty() {
                     warn!(
                         "Could not find imported file for '{}' - {} in {}",
@@ -994,13 +956,13 @@ pub async fn generate_discovery_playlist_internal(
                     stats.imports_file_missing += 1;
                     continue;
                 }
-                for track_path in &new_files {
+                for rel in new_files {
                     DiscoveryTrackRow::create(
                         None,
                         &qt.track,
                         &qt.artist,
                         qt.album.as_deref().unwrap_or(""),
-                        track_path,
+                        &discovery_target.join(rel).to_string_lossy(),
                         folder_id,
                         &profile_name,
                     )
@@ -1180,87 +1142,40 @@ pub async fn generate_recommendations() -> Result<u32, ServerFnError> {
         .map_err(server_error)
 }
 
-/// Collect all file paths under a directory (recursive, async).
-/// Used to snapshot before/after beets import to find what was added.
+/// How a discovery import counts. Config and runtime failures must not land
+/// in the history, or the track could never be suggested again.
 #[cfg(feature = "server")]
-async fn collect_files(dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
-    let mut files = std::collections::HashSet::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&current).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext != "nsp" && ext != "db" {
-                    files.insert(path);
-                }
-            }
-        }
-    }
-    files
+#[derive(Debug, PartialEq)]
+enum DiscoveryImport {
+    Imported,
+    /// The library cannot take this track: recorded so it is not suggested again.
+    Permanent,
+    Failed,
 }
 
-/// Find all files added after a beets import by comparing before/after snapshots.
-/// Returns only audio files when possible, falls back to any new file.
 #[cfg(feature = "server")]
-fn find_new_files(
-    before: &std::collections::HashSet<std::path::PathBuf>,
-    after: &std::collections::HashSet<std::path::PathBuf>,
-) -> Vec<String> {
-    let new_files: Vec<_> = after.difference(before).collect();
-    let audio_files: Vec<String> = new_files
-        .iter()
-        .filter(|p| soulbeet::audio::is_audio_path(p))
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
-    if audio_files.is_empty() {
-        new_files
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect()
-    } else {
-        audio_files
+fn classify_discovery(outcome: &soulbeet::ImportOutcome) -> DiscoveryImport {
+    use soulbeet::{ImportOutcome, SkipReason};
+    match outcome {
+        ImportOutcome::Imported { .. } => DiscoveryImport::Imported,
+        ImportOutcome::Skipped(SkipReason::NoMatch { .. } | SkipReason::AlreadyInLibrary) => {
+            DiscoveryImport::Permanent
+        }
+        ImportOutcome::Skipped(SkipReason::NothingToImport)
+        | ImportOutcome::LookupFailed { .. }
+        | ImportOutcome::Failed { .. }
+        | ImportOutcome::TimedOut { .. }
+        | ImportOutcome::Refused { .. } => DiscoveryImport::Failed,
     }
 }
 
-/// Import a file into a target directory via beets, with raw-move fallback.
+/// Deletes a download discovery could not import (it has no retry) and
+/// prunes the folder it leaves empty.
 #[cfg(feature = "server")]
-pub async fn import_or_move(src: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
-    match crate::services::music_importer(None).await {
-        Ok(imp) => {
-            let result = imp
-                .import(&[src], target, soulbeet::ImportMode::Singleton)
-                .await;
-            match result.outcome {
-                soulbeet::ImportOutcome::Imported { .. } => Ok(()),
-                _ => Err(result.to_string()),
-            }
-        }
-        Err(_) => {
-            let filename = src
-                .file_name()
-                .ok_or("Invalid filename")?
-                .to_string_lossy()
-                .to_string();
-            let dest = target.join(&filename);
-            if let Err(e) = tokio::fs::rename(src, &dest).await {
-                if e.raw_os_error() == Some(18) {
-                    tokio::fs::copy(src, &dest)
-                        .await
-                        .map_err(|e| format!("Failed to copy: {}", e))?;
-                    let _ = tokio::fs::remove_file(src).await;
-                } else {
-                    return Err(format!("Failed to move: {}", e));
-                }
-            }
-            Ok(())
-        }
+async fn discard_download(src: &std::path::Path, download_base: &std::path::Path) {
+    let _ = tokio::fs::remove_file(src).await;
+    if let Some(dir) = src.parent() {
+        let _ = super::cleanup_empty_ancestors(dir, download_base).await;
     }
 }
 
@@ -1508,6 +1423,64 @@ mod tests {
     use soulbeet::DownloadBackend;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    #[test]
+    fn classify_discovery_keeps_config_failures_out_of_history() {
+        use super::{classify_discovery, DiscoveryImport};
+        use soulbeet::{ImportOutcome, SkipReason, TimeoutKind};
+        use std::time::Duration;
+
+        let cases = [
+            (
+                ImportOutcome::Imported {
+                    untagged: false,
+                    warnings: vec![],
+                },
+                DiscoveryImport::Imported,
+            ),
+            (
+                ImportOutcome::Skipped(SkipReason::NoMatch { candidates: None }),
+                DiscoveryImport::Permanent,
+            ),
+            (
+                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary),
+                DiscoveryImport::Permanent,
+            ),
+            (
+                ImportOutcome::Skipped(SkipReason::NothingToImport),
+                DiscoveryImport::Failed,
+            ),
+            (
+                ImportOutcome::LookupFailed {
+                    source: "MusicBrainz".into(),
+                    message: "timed out".into(),
+                },
+                DiscoveryImport::Failed,
+            ),
+            (
+                ImportOutcome::Failed {
+                    message: "beets exited with code 1".into(),
+                },
+                DiscoveryImport::Failed,
+            ),
+            (
+                ImportOutcome::TimedOut {
+                    limit: TimeoutKind::Idle(Duration::from_secs(180)),
+                    last_line: None,
+                },
+                DiscoveryImport::Failed,
+            ),
+            (
+                ImportOutcome::Refused {
+                    issue: "No metadata source plugin loaded".into(),
+                },
+                DiscoveryImport::Failed,
+            ),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(classify_discovery(&outcome), expected, "{outcome:?}");
+        }
+    }
 
     /// A track waiting on `items[0]`, with the rest as its alternates.
     fn queued_track(items: Vec<DownloadableItem>) -> QueuedTrack {

@@ -31,6 +31,7 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
                 f.state,
                 DownloadState::Queued
                     | DownloadState::InProgress
+                    | DownloadState::ImportQueued(_)
                     | DownloadState::Importing
                     | DownloadState::Completed // Still needs to be imported
             )
@@ -49,6 +50,7 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
                 file.state,
                 DownloadState::Queued
                     | DownloadState::InProgress
+                    | DownloadState::ImportQueued(_)
                     | DownloadState::Importing
                     | DownloadState::Completed // Downloads that are completed but not yet imported
             )

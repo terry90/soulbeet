@@ -378,7 +378,7 @@ pub(crate) async fn promote_discovery_track_internal(
     }
 
     let target = std::path::PathBuf::from(&folder.path);
-    if let Err(e) = crate::server_fns::discovery::import_or_move(&src, &target).await {
+    if let Err(e) = crate::import_queue::import_to_library(&src, &target).await {
         // Import failed -- revert to Pending
         let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
         return Err(e);

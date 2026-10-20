@@ -31,8 +31,6 @@ pub use auto_download::{auto_download, AutoDownloadRequest, AutoDownloadResult};
 #[cfg(feature = "server")]
 pub mod failover;
 #[cfg(feature = "server")]
-pub mod import;
-#[cfg(feature = "server")]
 pub mod monitor;
 #[cfg(feature = "server")]
 pub mod process;
@@ -272,4 +270,19 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
     });
 
     Ok(res)
+}
+
+/// Imports a failed or skipped row again, from the job kept for it.
+#[post("/api/downloads/retry-import", auth: AuthSession)]
+pub async fn retry_import(item: String) -> Result<(), ServerFnError> {
+    crate::import_queue::retry_import_for(&auth.0.username, &item)
+        .await
+        .map_err(refusal_error)
+}
+
+/// Drops the stored imports of rows the user cleared.
+#[post("/api/downloads/forget-retries", auth: AuthSession)]
+pub async fn forget_import_retries(items: Vec<String>) -> Result<(), ServerFnError> {
+    crate::import_queue::forget_retries(&auth.0.username, &items);
+    Ok(())
 }

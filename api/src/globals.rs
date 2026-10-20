@@ -123,6 +123,19 @@ pub async fn get_or_create_user_channel(
     (channel.sender.clone(), channel.cancellation_token.clone())
 }
 
+/// Sends to the user's channel as it is now: `cleanup_stale_channels` may
+/// have replaced the one a long-running job saw at its start. Without a
+/// channel nobody is listening, so none is created.
+#[cfg(feature = "server")]
+pub async fn send_user_event(username: &str, event: DownloadEvent) -> bool {
+    let channels = USER_CHANNELS.read().await;
+    let Some(channel) = channels.get(username) else {
+        return false;
+    };
+    channel.touch();
+    channel.sender.send(event).is_ok()
+}
+
 /// Register a new task for a user and return the cancellation token
 #[cfg(feature = "server")]
 pub async fn register_user_task(username: &str) -> CancellationToken {
