@@ -33,6 +33,8 @@ screenshots/
 e2e/
 .github/
 lib/soulbeet/tests/
+# Read only by #[cfg(test)] include_str!, which release builds never expand
+lib/soulbeet/fixtures/
 
 # Python bytecode
 **/__pycache__

@@ -12,6 +12,17 @@ export const baseUrl = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:9765';
 /** A second app instance whose beets config is the one from issue #90. */
 export const user90BaseUrl = process.env.E2E_USER90_BASE_URL ?? 'http://127.0.0.1:9766';
 
+/** The issue #90 config itself, shared with the probe tests. */
+export const user90BrokenConfig = join(
+  dirname(e2eRoot),
+  'lib',
+  'soulbeet',
+  'tests',
+  'probe',
+  'configs',
+  'user90.yaml',
+);
+
 /** That instance's config directory on the host; the specs rewrite it at runtime. */
 export const user90ConfigDirOnHost = join(e2eRoot, '.runtime', 'user90-config');
 

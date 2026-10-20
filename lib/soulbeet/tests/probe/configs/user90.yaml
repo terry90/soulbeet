@@ -1,3 +1,5 @@
+# The beets config from issue #90, minus its import.log path. Its plugin list
+# has no musicbrainz, so beets has no metadata source.
 plugins: fetchart scrub chroma discogs mbsync albumtypes lastgenre zero permissions inline the ftintitle fromfilename web
 
 #web:

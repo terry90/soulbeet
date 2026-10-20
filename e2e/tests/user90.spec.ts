@@ -7,7 +7,7 @@ import { expect, test } from '@playwright/test';
 import { copyFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { freshSession, performSearch } from '../helpers/app.js';
-import { e2eRoot, user90ConfigDirOnHost } from '../helpers/env.js';
+import { e2eRoot, user90BrokenConfig, user90ConfigDirOnHost } from '../helpers/env.js';
 import { maritime } from '../fixtures/dataset.js';
 
 const BROKEN = 'No metadata source plugin loaded';
@@ -29,7 +29,7 @@ function installConfig(source: string): void {
 }
 
 test('a broken config is visible and refuses downloads', async ({ context, page }) => {
-  installConfig(join(e2eRoot, 'fixtures', 'beets-user90.yaml'));
+  installConfig(user90BrokenConfig);
   const { folder } = await freshSession(context, page, 'user90-broken');
 
   await expect(page.getByText('BEETS BROKEN', { exact: true })).toBeVisible({

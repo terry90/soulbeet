@@ -11,6 +11,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse, stringify } from 'yaml';
 import { allAudioFiles, audioFileName, findRecording } from './dataset.js';
+import { user90BrokenConfig } from '../helpers/env.js';
 
 const e2eRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const audioDir = join(e2eRoot, '.fixtures', 'audio');
@@ -97,11 +98,11 @@ function createRuntimeDirs(): void {
   }
 }
 
-// The issue #90 config: no musicbrainz in plugins. Copied on every run, since
-// user90.spec.ts replaces it with a working one.
+// The issue #90 config: no musicbrainz in plugins. Copied on every run, since user90.spec.ts replaces it with a
+// working one.
 function generateUser90Config(): void {
   const target = join(runtimeDir, 'user90-config', 'config.yaml');
-  copyFileSync(join(e2eRoot, 'fixtures', 'beets-user90.yaml'), target);
+  copyFileSync(user90BrokenConfig, target);
   console.log(`generated ${target}`);
 }
 
