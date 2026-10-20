@@ -1,13 +1,10 @@
-use std::future::Future;
-use std::pin::Pin;
-
 use dioxus::prelude::*;
 use shared::navidrome::{DiscoveryProgress, DiscoveryStatus, GenerationStatus, ProfilePhase};
 use shared::system::NavidromeStatus;
 
 use crate::friendly_error;
 use crate::use_auth;
-use crate::{ConfirmModal, Disclosure};
+use crate::{use_open_handler, ConfirmModal, Disclosure};
 
 fn format_relative_time(ts: &str) -> String {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts).or_else(|_| {
@@ -304,18 +301,16 @@ fn EngineReportView() -> Element {
     let mut entries: Signal<Vec<api::ReportEntry>> = use_signal(Vec::new);
     let mut expanded_idx: Signal<Option<usize>> = use_signal(|| None);
 
-    let load = use_callback(move |_| -> Pin<Box<dyn Future<Output = ()>>> {
-        Box::pin(async move {
-            match api::get_engine_reports().await {
-                Ok(list) => entries.set(list),
-                Err(e) => entries.set(vec![api::ReportEntry {
-                    profile: "Error".to_string(),
-                    candidate_count: 0,
-                    created_at: String::new(),
-                    text: format!("Failed to load reports: {e}"),
-                }]),
-            }
-        })
+    let load = use_open_handler(move || async move {
+        match api::get_engine_reports().await {
+            Ok(list) => entries.set(list),
+            Err(e) => entries.set(vec![api::ReportEntry {
+                profile: "Error".to_string(),
+                candidate_count: 0,
+                created_at: String::new(),
+                text: format!("Failed to load reports: {e}"),
+            }]),
+        }
     });
 
     rsx! {
@@ -387,9 +382,22 @@ fn DiscoveryTrackList() -> Element {
         _ => vec![],
     };
 
+    // Why the last Keep of a track failed, by track id.
+    let mut promote_errors: Signal<std::collections::HashMap<String, String>> =
+        use_signal(Default::default);
+
     let handle_promote = move |track_id: String| async move {
-        let req = api::TrackActionRequest { track_id };
-        let _ = api::promote_discovery_track(req).await;
+        let req = api::TrackActionRequest {
+            track_id: track_id.clone(),
+        };
+        match api::promote_discovery_track(req).await {
+            Ok(()) => {
+                promote_errors.write().remove(&track_id);
+            }
+            Err(e) => {
+                promote_errors.write().insert(track_id, friendly_error(&e));
+            }
+        }
         tracks.restart();
     };
 
@@ -443,38 +451,44 @@ fn DiscoveryTrackList() -> Element {
                                     let id_remove = track.id.clone();
                                     let title_remove = track.title.clone();
                                     let artist_remove = track.artist.clone();
+                                    let promote_error = promote_errors.read().get(&track.id).cloned();
                                     rsx! {
-                                        div { class: "flex items-center justify-between p-2 bg-beet-panel border border-white/10 rounded text-sm",
-                                            div { class: "flex-1 min-w-0",
-                                                span { class: "text-white truncate", "{track.title}" }
-                                                span { class: "text-gray-400 mx-2", "-" }
-                                                span { class: "text-gray-400 truncate", "{track.artist}" }
-                                                if let Some(r) = track.rating {
-                                                    span { class: "text-yellow-500 text-xs font-mono ml-2",
-                                                        "({r})"
+                                        div { class: "p-2 bg-beet-panel border border-white/10 rounded text-sm",
+                                            div { class: "flex items-center justify-between",
+                                                div { class: "flex-1 min-w-0",
+                                                    span { class: "text-white truncate", "{track.title}" }
+                                                    span { class: "text-gray-400 mx-2", "-" }
+                                                    span { class: "text-gray-400 truncate", "{track.artist}" }
+                                                    if let Some(r) = track.rating {
+                                                        span { class: "text-yellow-500 text-xs font-mono ml-2",
+                                                            "({r})"
+                                                        }
+                                                    }
+                                                }
+                                                div { class: "flex gap-1 ml-2",
+                                                    button {
+                                                        class: "px-2 py-0.5 text-xs rounded bg-green-900/50 text-green-400 hover:bg-green-800/50 cursor-pointer",
+                                                        onclick: move |_| {
+                                                            let id = id_promote.clone();
+                                                            async move { handle_promote(id).await }
+                                                        },
+                                                        "Keep"
+                                                    }
+                                                    button {
+                                                        class: "px-2 py-0.5 text-xs rounded bg-red-900/50 text-red-400 hover:bg-red-800/50 cursor-pointer",
+                                                        onclick: move |_| {
+                                                            pending_drop.set(Some(PendingDrop {
+                                                                track_id: id_remove.clone(),
+                                                                title: title_remove.clone(),
+                                                                artist: artist_remove.clone(),
+                                                            }));
+                                                        },
+                                                        "Drop"
                                                     }
                                                 }
                                             }
-                                            div { class: "flex gap-1 ml-2",
-                                                button {
-                                                    class: "px-2 py-0.5 text-xs rounded bg-green-900/50 text-green-400 hover:bg-green-800/50 cursor-pointer",
-                                                    onclick: move |_| {
-                                                        let id = id_promote.clone();
-                                                        async move { handle_promote(id).await }
-                                                    },
-                                                    "Keep"
-                                                }
-                                                button {
-                                                    class: "px-2 py-0.5 text-xs rounded bg-red-900/50 text-red-400 hover:bg-red-800/50 cursor-pointer",
-                                                    onclick: move |_| {
-                                                        pending_drop.set(Some(PendingDrop {
-                                                            track_id: id_remove.clone(),
-                                                            title: title_remove.clone(),
-                                                            artist: artist_remove.clone(),
-                                                        }));
-                                                    },
-                                                    "Drop"
-                                                }
+                                            if let Some(error) = promote_error {
+                                                p { class: "text-xs font-mono text-red-400 mt-1 break-words", "{error}" }
                                             }
                                         }
                                     }

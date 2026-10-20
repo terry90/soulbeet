@@ -4,4 +4,4 @@ mod disclosure;
 
 pub use button::Button;
 pub use checkbox::Checkbox;
-pub use disclosure::{Disclosure, OpenHandler};
+pub use disclosure::{use_open_handler, Disclosure};

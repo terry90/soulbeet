@@ -125,13 +125,14 @@ pub fn AppConfigManager() -> Element {
                 }
                 {
                     let importer = health.importer();
-                    let (dot_class, summary) = beets_row(&importer);
+                    let row = beets_row(&importer);
                     let has_details = !importer.issues.is_empty() || !importer.facts.is_empty();
                     rsx! {
                         ConnectionStatusRow {
                             label: "Beets",
-                            dot_class,
-                            summary,
+                            dot_class: row.dot_class,
+                            summary: row.summary,
+                            note: row.note,
                             details: has_details.then(|| rsx! { ImporterDetails { health: importer.clone() } }),
                         }
                     }

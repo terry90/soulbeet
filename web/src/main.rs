@@ -280,16 +280,35 @@ fn ImporterBanner() -> Element {
     };
 
     rsx! {
-        div { class: "mx-4 sm:mx-6 lg:mx-8 mt-2 px-3 py-2 bg-beet-panel border border-white/10 rounded flex items-center gap-3 text-xs font-mono",
-            span { class: "w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" }
-            span { class: "text-gray-500 uppercase tracking-widest shrink-0 hidden sm:inline", "BEETS" }
-            span { class: "text-gray-400 flex-1 min-w-0 truncate", "{issue.title}" }
+        StatusBanner {
+            dot_class: ui::importer_chip(importer.level).0,
+            label: "BEETS",
+            message: issue.title.clone(),
             Link {
                 class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted",
                 to: Route::SettingsPage {},
                 onclick: move |_| requested_tab.set(Some(SettingsTab::Config)),
                 "Fix in Config"
             }
+        }
+    }
+}
+
+/// One line under the navbar: a status dot, a label (hidden on small
+/// screens), a message and an action.
+#[component]
+fn StatusBanner(
+    dot_class: &'static str,
+    label: &'static str,
+    message: String,
+    children: Element,
+) -> Element {
+    rsx! {
+        div { class: "mx-4 sm:mx-6 lg:mx-8 mt-2 px-3 py-2 bg-beet-panel border border-white/10 rounded flex items-center gap-3 text-xs font-mono",
+            span { class: "w-1.5 h-1.5 rounded-full {dot_class} shrink-0" }
+            span { class: "text-gray-500 uppercase tracking-widest shrink-0 hidden sm:inline", "{label}" }
+            span { class: "text-gray-400 flex-1 min-w-0 truncate", "{message}" }
+            {children}
         }
     }
 }
@@ -351,10 +370,7 @@ fn NavidromeBanner() -> Element {
     };
 
     rsx! {
-        div { class: "mx-4 sm:mx-6 lg:mx-8 mt-2 px-3 py-2 bg-beet-panel border border-white/10 rounded flex items-center gap-3 text-xs font-mono",
-            span { class: format!("w-1.5 h-1.5 rounded-full {} shrink-0", dot_color) }
-            span { class: "text-gray-500 uppercase tracking-widest shrink-0 hidden sm:inline", "{label}" }
-            span { class: "text-gray-400 flex-1 min-w-0 truncate", "{message}" }
+        StatusBanner { dot_class: dot_color, label, message: message.to_string(),
             button {
                 class: "shrink-0 text-gray-600 hover:text-gray-300 transition-colors cursor-pointer p-2 -mr-1",
                 onclick: dismiss,

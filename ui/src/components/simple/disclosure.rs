@@ -6,16 +6,23 @@ use dioxus::prelude::*;
 /// Awaited before the body opens.
 pub type OpenHandler = Callback<(), Pin<Box<dyn Future<Output = ()>>>>;
 
+/// An `on_open` handler that runs `load` on every open.
+pub fn use_open_handler<F>(mut load: impl FnMut() -> F + 'static) -> OpenHandler
+where
+    F: Future<Output = ()> + 'static,
+{
+    use_callback(move |()| Box::pin(load()) as Pin<Box<dyn Future<Output = ()>>>)
+}
+
 #[derive(Props, Clone, PartialEq)]
 pub struct DisclosureProps {
     /// Noun phrase; the toggle reads "Show {label}" / "Hide {label}".
     #[props(into)]
     pub label: String,
-    /// Runs on every open; the toggle shows `loading_label` until it finishes.
+    /// Runs on every open; the toggle reads "Loading..." and is disabled
+    /// until it finishes.
     #[props(default)]
     pub on_open: Option<OpenHandler>,
-    #[props(default = "Loading...".to_string(), into)]
-    pub loading_label: String,
     #[props(default, into)]
     pub class: String,
     pub children: Element,
@@ -29,9 +36,6 @@ pub fn Disclosure(props: DisclosureProps) -> Element {
     let on_open = props.on_open;
 
     let toggle = move |_| {
-        if loading() {
-            return;
-        }
         if open() {
             open.set(false);
             return;
@@ -53,11 +57,13 @@ pub fn Disclosure(props: DisclosureProps) -> Element {
     rsx! {
         div { class: "{props.class}",
             button {
-                class: "text-xs font-mono text-gray-500 hover:text-gray-300 cursor-pointer underline decoration-dotted",
+                class: "text-xs font-mono text-gray-500 hover:text-gray-300 cursor-pointer underline decoration-dotted disabled:cursor-wait",
                 aria_expanded: open(),
+                aria_busy: loading(),
+                disabled: loading(),
                 onclick: toggle,
                 if loading() {
-                    "{props.loading_label}"
+                    "Loading..."
                 } else if open() {
                     "Hide {label}"
                 } else {

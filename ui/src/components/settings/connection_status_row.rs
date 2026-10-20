@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use shared::system::{HealthLevel, ImporterHealth};
 
-use crate::Disclosure;
+use crate::{importer_chip, Disclosure};
 
 #[derive(Props, Clone, PartialEq)]
 pub(crate) struct ConnectionStatusRowProps {
@@ -36,18 +36,37 @@ pub(crate) fn ConnectionStatusRow(props: ConnectionStatusRowProps) -> Element {
     }
 }
 
-/// Dot class and summary for the Beets row. The summary is never "Connected".
-pub(crate) fn beets_row(h: &ImporterHealth) -> (&'static str, String) {
-    match h.level {
-        HealthLevel::Checking => ("bg-gray-500", "Checking...".to_string()),
-        HealthLevel::Ready => ("bg-beet-accent", "Ready".to_string()),
-        HealthLevel::Degraded => ("bg-yellow-500", "Ready with warnings".to_string()),
-        HealthLevel::Broken => (
-            "bg-red-500",
-            h.blocking_issue()
-                .map(|issue| issue.title.clone())
-                .unwrap_or_else(|| h.level.chip().to_string()),
-        ),
+/// What the Beets row shows: the status dot, a summary that is never
+/// "Connected", and when Broken, the blocking issue's detail, which says
+/// what to fix.
+#[derive(Debug, PartialEq)]
+pub(crate) struct BeetsRow {
+    pub dot_class: &'static str,
+    pub summary: String,
+    pub note: Option<String>,
+}
+
+pub(crate) fn beets_row(h: &ImporterHealth) -> BeetsRow {
+    let (dot_class, _) = importer_chip(h.level);
+    let blocking = h.blocking_issue();
+    let summary = match h.level {
+        HealthLevel::Checking => "Checking...".to_string(),
+        HealthLevel::Ready => "Ready".to_string(),
+        HealthLevel::Degraded => "Ready with warnings".to_string(),
+        HealthLevel::Broken => blocking
+            .map(|issue| issue.title.clone())
+            .unwrap_or_else(|| h.level.chip().to_string()),
+    };
+    let note = match h.level {
+        HealthLevel::Broken => blocking
+            .map(|issue| issue.detail.clone())
+            .filter(|detail| !detail.is_empty()),
+        _ => None,
+    };
+    BeetsRow {
+        dot_class,
+        summary,
+        note,
     }
 }
 
@@ -106,13 +125,18 @@ mod tests {
 
     #[test]
     fn beets_row_never_says_connected() {
+        let row = |dot_class, summary: &str, note: Option<&str>| BeetsRow {
+            dot_class,
+            summary: summary.to_string(),
+            note: note.map(str::to_string),
+        };
         assert_eq!(
             beets_row(&health(HealthLevel::Checking, vec![])),
-            ("bg-gray-500", "Checking...".to_string())
+            row("bg-gray-500 animate-pulse", "Checking...", None)
         );
         assert_eq!(
             beets_row(&health(HealthLevel::Ready, vec![])),
-            ("bg-beet-accent", "Ready".to_string())
+            row("bg-beet-accent", "Ready", None)
         );
         let warning = HealthIssue {
             severity: HealthLevel::Degraded,
@@ -121,7 +145,7 @@ mod tests {
         };
         assert_eq!(
             beets_row(&health(HealthLevel::Degraded, vec![warning.clone()])),
-            ("bg-yellow-500", "Ready with warnings".to_string())
+            row("bg-yellow-500", "Ready with warnings", None)
         );
         let blocking = HealthIssue {
             severity: HealthLevel::Broken,
@@ -130,7 +154,11 @@ mod tests {
         };
         assert_eq!(
             beets_row(&health(HealthLevel::Broken, vec![warning, blocking])),
-            ("bg-red-500", "No metadata source plugin loaded".to_string())
+            row(
+                "bg-red-500",
+                "No metadata source plugin loaded",
+                Some("Add musicbrainz to plugins:.")
+            )
         );
     }
 }

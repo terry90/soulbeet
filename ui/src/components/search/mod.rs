@@ -386,6 +386,7 @@ pub fn Search() -> Element {
 
     let download = move |query: DownloadQuery| async move {
         loading.set(true);
+        download_error.set(String::new());
         download_options.set(Some(vec![]));
 
         let search_id = match auth.call(api::start_download_search(query)).await {
@@ -462,6 +463,7 @@ pub fn Search() -> Element {
 
     let perform_search = move || async move {
         loading.set(true);
+        download_error.set(String::new());
         download_options.set(None);
 
         let provider = Some(settings.default_provider());
@@ -683,6 +685,7 @@ pub fn Search() -> Element {
             },
             on_back: move |_| {
                 download_options.set(None);
+                download_error.set(String::new());
                 loading.set(false);
             },
           }
