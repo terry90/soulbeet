@@ -1,12 +1,13 @@
 #[cfg(feature = "server")]
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{Arc, LazyLock},
 };
 
 #[cfg(feature = "server")]
 use soulbeet::{
-    beets::BeetsImporter,
+    beets::{BeetsImporter, BeetsSettings},
     musicbrainz::MusicBrainzProvider,
     navidrome::NavidromeClientBuilder,
     slskd::{DownloadConfig, SoulseekClientBuilder},
@@ -166,7 +167,16 @@ pub async fn download_backend(id: Option<&str>) -> Result<Arc<dyn DownloadBacken
 #[cfg(feature = "server")]
 fn init_importer(id: &str) -> Result<Arc<dyn MusicImporter>, String> {
     match id {
-        importers::BEETS => Ok(Arc::new(BeetsImporter::from_env())),
+        importers::BEETS => {
+            // Named in full: `AppConfig` here is the database-backed settings.
+            let config = &crate::config::CONFIG;
+            Ok(Arc::new(BeetsImporter::new(BeetsSettings {
+                config: config.beets_config().clone(),
+                beet: config.beet_bin().to_path_buf(),
+                python: config.beets_python().map(Path::to_path_buf),
+                limits: Default::default(),
+            })))
+        }
         _ => Err(format!("Unknown importer: {}", id)),
     }
 }

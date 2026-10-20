@@ -68,10 +68,9 @@ impl From<String> for NavidromeStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SystemHealth {
     pub downloader_online: bool,
-    pub beets_ready: bool,
-    pub navidrome_online: bool,
     #[serde(default)]
     pub importer: ImporterHealth,
+    pub navidrome_online: bool,
 }
 
 /// How well the importer can do its job; later variants are worse.
@@ -153,7 +152,7 @@ mod tests {
 
     #[test]
     fn system_health_without_importer_field_deserializes() {
-        let v = serde_json::json!({"downloader_online":true,"beets_ready":true,"navidrome_online":false});
+        let v = serde_json::json!({"downloader_online":true,"navidrome_online":false});
         let h: SystemHealth = serde_json::from_value(v).unwrap();
         assert_eq!(h.importer.level, HealthLevel::Checking);
     }

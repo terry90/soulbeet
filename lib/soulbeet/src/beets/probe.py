@@ -92,16 +92,33 @@ try:
     ]
 except BaseException:
     pass
-if report["fatal"] is None:
+
+
+def read_field(key, read):
+    """Stores read() in the report. A failure is fatal only when nothing
+    failed before it, so the first cause stays the reported one."""
     try:
-        # Resolved the way beets resolves them, against the cwd.
-        report["pluginpath"] = [
-            str(Path(p).expanduser().absolute())
-            for p in config["pluginpath"].as_str_seq(split=False)
-        ]
-        report["autotag"] = config["import"]["autotag"].get(bool)
+        report[key] = read()
     except BaseException as exc:
-        report["fatal"] = describe(exc)
+        if report["fatal"] is None:
+            report["fatal"] = (
+                f"configuration error: {exc}"
+                if isinstance(exc, confuse.ConfigError)
+                else describe(exc)
+            )
+
+
+# Resolved the way beets resolves them, against the cwd. Read even after a
+# fatal error, so soulbeet notices when a pluginpath dir changes.
+read_field(
+    "pluginpath",
+    lambda: [
+        str(Path(p).expanduser().absolute())
+        for p in config["pluginpath"].as_str_seq(split=False)
+    ],
+)
+if report["fatal"] is None:
+    read_field("autotag", lambda: config["import"]["autotag"].get(bool))
 
 
 def encode(cap):

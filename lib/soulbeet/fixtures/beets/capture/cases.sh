@@ -3,11 +3,13 @@
 # Needs ffmpeg and a beets 2.11.0 venv (BEETS_VENV). Generated audio and work
 # dirs live under FIXTURE_WORK and are not committed.
 #
-# usage: cases.sh [CASE...]   (default: every case)
+# usage: BEETS_VENV=DIR FIXTURE_WORK=DIR cases.sh [CASE...]   (default: every case)
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-work=${FIXTURE_WORK:-$HOME/.cache/claude-scratch/soulful/fixture-work}
+usage="usage: BEETS_VENV=DIR FIXTURE_WORK=DIR $0 [CASE...]"
+: "${BEETS_VENV:?$usage}"
+work=${FIXTURE_WORK:?$usage}
 capture=$here/capture.sh
 
 # mkalbum DIR N [ARTIST] [ALBUM]: N tagged two-second mp3 files.

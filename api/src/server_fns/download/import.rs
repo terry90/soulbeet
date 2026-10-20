@@ -3,7 +3,7 @@ use dioxus::logger::tracing::{info, warn};
 #[cfg(feature = "server")]
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
 #[cfg(feature = "server")]
-use soulbeet::LegacyImportResult;
+use soulbeet::{ImportMode, ImportOutcome};
 #[cfg(feature = "server")]
 use std::path::Path;
 #[cfg(feature = "server")]
@@ -64,9 +64,15 @@ pub async fn import_group(
     };
 
     let source = Path::new(&source_path);
-    match importer.import(&[source], &target_path, as_album).await {
-        Ok(LegacyImportResult::Success) => {
-            info!("Import successful");
+    let mode = if as_album {
+        ImportMode::Album
+    } else {
+        ImportMode::Singleton
+    };
+    let result = importer.import(&[source], &target_path, mode).await;
+    match &result.outcome {
+        ImportOutcome::Imported { .. } => {
+            info!("Import successful: {result}");
             let imported_entries: Vec<_> = entries
                 .iter()
                 .map(|e| DownloadProgress {
@@ -76,15 +82,15 @@ pub async fn import_group(
                 .collect();
             let _ = tx.send(DownloadEvent::Progress(imported_entries));
         }
-        Ok(LegacyImportResult::Skipped(reason)) => {
-            info!("Import skipped items: {}", reason);
+        ImportOutcome::Skipped(_) => {
+            info!("Import skipped items: {result}");
             let skipped_entries: Vec<_> = entries
                 .iter()
                 .map(|e| DownloadProgress {
                     state: DownloadState::ImportSkipped,
                     // Carry the reason to the UI: a skipped row that explains
                     // nothing is the whole of issue #69.
-                    error: Some(reason.clone()),
+                    error: Some(result.to_string()),
                     ..e.clone()
                 })
                 .collect();
@@ -94,46 +100,17 @@ pub async fn import_group(
                 cleanup_failed_file(&entry.item).await;
             }
         }
-        Ok(LegacyImportResult::Failed(err)) => {
-            info!("Import failed: {}", err);
+        ImportOutcome::LookupFailed { .. }
+        | ImportOutcome::Failed { .. }
+        | ImportOutcome::TimedOut { .. }
+        | ImportOutcome::Refused { .. } => {
+            warn!("Import failed for {source_path}: {result}");
             let failed_entries: Vec<_> = entries
                 .iter()
                 .map(|e| DownloadProgress {
-                    state: DownloadState::Failed(format!("Import failed: {err}")),
-                    error: Some(format!("Import failed: {err}")),
+                    state: DownloadState::Failed(result.to_string()),
+                    error: Some(result.to_string()),
                     ..e.clone()
-                })
-                .collect();
-            let _ = tx.send(DownloadEvent::Progress(failed_entries));
-
-            for entry in &entries {
-                cleanup_failed_file(&entry.item).await;
-            }
-        }
-        Ok(LegacyImportResult::TimedOut) => {
-            warn!("Import timed out for: {}", source_path);
-            let failed_entries: Vec<_> = entries
-                .iter()
-                .map(|e| DownloadProgress {
-                    state: DownloadState::Failed("Import timed out".into()),
-                    error: Some("Import timed out".into()),
-                    ..e.clone()
-                })
-                .collect();
-            let _ = tx.send(DownloadEvent::Progress(failed_entries));
-
-            for entry in &entries {
-                cleanup_failed_file(&entry.item).await;
-            }
-        }
-        Err(e) => {
-            warn!("Import error for {}: {}", source_path, e);
-            let failed_entries: Vec<_> = entries
-                .iter()
-                .map(|entry| DownloadProgress {
-                    state: DownloadState::Failed(format!("Import error: {e}")),
-                    error: Some(format!("Import error: {e}")),
-                    ..entry.clone()
                 })
                 .collect();
             let _ = tx.send(DownloadEvent::Progress(failed_entries));

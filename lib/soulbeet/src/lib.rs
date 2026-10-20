@@ -17,6 +17,6 @@ pub use navidrome::{NavidromeClient, NavidromeClientBuilder};
 pub use services::{Services, ServicesBuilder};
 pub use traits::{
     CandidateGenerator, DownloadBackend, FallbackMetadataProvider, ImportMode, ImportOutcome,
-    ImportResult, LegacyImportResult, MetadataProvider, MusicImporter, ScrobbleProvider,
-    SkipReason, TaskCount, TimeoutKind,
+    ImportResult, MetadataProvider, MusicImporter, ScrobbleProvider, SkipReason, TaskCount,
+    TimeoutKind,
 };

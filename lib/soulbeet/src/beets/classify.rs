@@ -282,9 +282,14 @@ impl Classifier {
             let candidates = self.candidates.filter(|_| !self.candidates_differ);
             return ImportOutcome::Skipped(SkipReason::NoMatch { candidates });
         }
-        // Without an imported event beets applied nothing and gave no reason.
         if self.tasks.imported == 0 {
-            return ImportOutcome::Skipped(SkipReason::NothingToImport);
+            if self.tasks.total == 0 {
+                return ImportOutcome::Skipped(SkipReason::NothingToImport);
+            }
+            // Tasks ran, none was applied, and beets gave no reason.
+            return ImportOutcome::Failed {
+                message: "beets finished without importing anything".to_string(),
+            };
         }
 
         let mut warnings = Vec::new();
@@ -773,6 +778,63 @@ mod tests {
             result.to_string(),
             "Imported; beets could not write tags to 2 file(s)"
         );
+    }
+
+    #[test]
+    fn tasks_that_end_without_an_import_or_a_reason_are_a_failure() {
+        let mut c = Classifier::new(ImportMode::Album, 2, false);
+        c.feed(Stream::Stderr, "Sending event: import_task_created");
+        let result = c.finish(&exited(0), &RunLimits::default(), &[], String::new());
+        assert_eq!(
+            result.outcome,
+            ImportOutcome::Failed {
+                message: "beets finished without importing anything".to_string()
+            }
+        );
+
+        let none = Classifier::new(ImportMode::Album, 0, false).finish(
+            &exited(0),
+            &RunLimits::default(),
+            &[],
+            String::new(),
+        );
+        assert_eq!(none.outcome, NOTHING);
+    }
+
+    #[test]
+    fn one_candidate_is_singular() {
+        assert_eq!(
+            no_match(Some(1)).to_string(),
+            "No close match (1 candidate)"
+        );
+        assert_eq!(
+            no_match(Some(0)).to_string(),
+            "No close match (0 candidates)"
+        );
+    }
+
+    #[test]
+    fn a_long_last_line_is_clipped_in_the_timeout_text() {
+        let line = "é".repeat(250);
+        let outcome = ImportOutcome::TimedOut {
+            limit: TimeoutKind::Idle(Duration::from_secs(180)),
+            last_line: Some(line),
+        };
+        assert_eq!(
+            outcome.to_string(),
+            format!("No output from beets for 3 min (last: {})", "é".repeat(200))
+        );
+    }
+
+    #[test]
+    fn a_signal_is_named_in_the_failure() {
+        let result = Classifier::new(ImportMode::Album, 1, false).finish(
+            &RunEnd::Exited(ExitStatus::from_raw(9)),
+            &RunLimits::default(),
+            &[],
+            String::new(),
+        );
+        assert_eq!(result.to_string(), "beets was killed by signal 9");
     }
 
     #[test]

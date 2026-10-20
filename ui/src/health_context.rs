@@ -1,6 +1,6 @@
 use crate::use_auth;
 use dioxus::prelude::*;
-use shared::system::SystemHealth;
+use shared::system::{ImporterHealth, SystemHealth};
 
 /// Health context that provides live backend availability throughout the app.
 /// Polled in one place so components can react to it without running their own loops.
@@ -17,6 +17,10 @@ impl Health {
 
     pub fn navidrome_online(&self) -> bool {
         self.state.read().navidrome_online
+    }
+
+    pub fn importer(&self) -> ImporterHealth {
+        self.state.read().importer.clone()
     }
 }
 

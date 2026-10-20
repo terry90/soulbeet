@@ -333,9 +333,11 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    // Loose enough that a loaded machine never hits them by accident. Tests
+    // about a limit set that one tight.
     const SHORT: RunLimits = RunLimits {
-        idle: Duration::from_millis(300),
-        total: Duration::from_secs(2),
+        idle: Duration::from_secs(10),
+        total: Duration::from_secs(30),
         drain: Duration::from_millis(300),
     };
 
@@ -376,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_larger_than_any_pipe_does_not_deadlock() {
-        let start = Instant::now();
+        // A deadlock would end as Idle.
         let (out, lines) = run(
             "head -c 2000000 /dev/zero | tr '\\0' 'x' | fold -w 100 >&2; exit 0",
             SHORT,
@@ -385,14 +387,18 @@ mod tests {
         assert!(exited_ok(&out.end), "{:?}", out.end);
         assert_eq!(lines.len(), 20000);
         assert!(lines.iter().all(|(s, _)| *s == Stream::Stderr));
-        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
     async fn idle_resets_on_bytes_without_newline() {
+        // Each gap is under the idle limit, both together are over it.
+        let limits = RunLimits {
+            idle: Duration::from_secs(2),
+            ..SHORT
+        };
         let (out, lines) = run(
-            "printf 'a'; sleep 0.2; printf 'b'; sleep 0.2; printf 'c\\n'; exit 0",
-            SHORT,
+            "printf 'a'; sleep 1.2; printf 'b'; sleep 1.2; printf 'c\\n'; exit 0",
+            limits,
         )
         .await;
         assert!(exited_ok(&out.end), "{:?}", out.end);
@@ -401,7 +407,11 @@ mod tests {
 
     #[tokio::test]
     async fn silence_ends_as_idle() {
-        let (out, _) = run("echo start; sleep 5", SHORT).await;
+        let limits = RunLimits {
+            idle: Duration::from_millis(300),
+            ..SHORT
+        };
+        let (out, _) = run("echo start; sleep 5", limits).await;
         assert!(matches!(out.end, RunEnd::Idle), "{:?}", out.end);
         assert!(out.tail.ends_with("start"), "{:?}", out.tail);
     }
@@ -423,7 +433,7 @@ mod tests {
         assert!(exited_ok(&out.end), "{:?}", out.end);
         assert!(!out.drain_timed_out);
         assert_eq!(texts(&lines), ["done"]);
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[tokio::test]
@@ -434,7 +444,7 @@ mod tests {
         let start = Instant::now();
         let (out, _) = run(
             &format!(
-                "setsid sh -c 'touch \"$0\"; sleep 3' '{m}' & \
+                "setsid sh -c 'touch \"$0\"; sleep 20' '{m}' & \
                  while [ ! -e '{m}' ]; do sleep 0.01; done; echo done; exit 0",
                 m = marker.display()
             ),
@@ -443,7 +453,7 @@ mod tests {
         .await;
         assert!(exited_ok(&out.end), "{:?}", out.end);
         assert!(out.drain_timed_out);
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[tokio::test]
@@ -482,7 +492,8 @@ mod tests {
             "{:?}",
             out.end
         );
-        assert!(start.elapsed() < Duration::from_secs(1));
+        // A read waiting on stdin would run into the 10 s idle limit.
+        assert!(start.elapsed() < Duration::from_secs(5));
         assert!(out.tail.contains("stdin stream ended"), "{:?}", out.tail);
     }
 
@@ -525,7 +536,11 @@ mod tests {
 
         task.abort();
         let _ = task.await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Reaping the killed processes can lag on a loaded machine.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pids.iter().any(|&p| alive(p)) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         for pid in pids {
             assert!(!alive(pid), "pid {pid} survived the dropped run");
         }

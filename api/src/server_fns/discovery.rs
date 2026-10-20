@@ -902,19 +902,22 @@ pub async fn generate_discovery_playlist_internal(
 
                 let src = std::path::Path::new(&src_path);
                 let imported = if let Ok(ref imp) = importer {
-                    match imp.import(&[src], &discovery_target, false).await {
-                        Ok(soulbeet::LegacyImportResult::Success) => {
+                    let result = imp
+                        .import(&[src], &discovery_target, soulbeet::ImportMode::Singleton)
+                        .await;
+                    match &result.outcome {
+                        soulbeet::ImportOutcome::Imported { .. } => {
                             info!(
                                 "Imported '{}' - {} into Discovery/{}",
                                 qt.artist, qt.track, profile_name
                             );
                             true
                         }
-                        Ok(soulbeet::LegacyImportResult::Skipped(reason)) => {
-                            warn!(
-                                "Beets skipped '{}' - {}: {}",
-                                qt.artist, qt.track, reason
-                            );
+                        soulbeet::ImportOutcome::Skipped(
+                            soulbeet::SkipReason::NoMatch { .. }
+                            | soulbeet::SkipReason::AlreadyInLibrary,
+                        ) => {
+                            warn!("Beets skipped '{}' - {}: {result}", qt.artist, qt.track);
                             stats.imports_skipped += 1;
                             let _ = tokio::fs::remove_file(src).await;
                             // A duplicate is a permanent condition: the library
@@ -930,19 +933,10 @@ pub async fn generate_discovery_playlist_internal(
                             .await?;
                             false
                         }
-                        Ok(other) => {
+                        _ => {
                             warn!(
-                                "Beets import issue for '{}' - {}: {:?}",
-                                qt.artist, qt.track, other
-                            );
-                            stats.imports_failed += 1;
-                            let _ = tokio::fs::remove_file(src).await;
-                            false
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Beets import failed for '{}' - {}: {}",
-                                qt.artist, qt.track, e
+                                "Beets import failed for '{}' - {}: {result}",
+                                qt.artist, qt.track
                             );
                             stats.imports_failed += 1;
                             let _ = tokio::fs::remove_file(src).await;
@@ -1234,14 +1228,15 @@ fn find_new_files(
 #[cfg(feature = "server")]
 pub async fn import_or_move(src: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
     match crate::services::music_importer(None).await {
-        Ok(imp) => match imp.import(&[src], target, false).await {
-            Ok(soulbeet::LegacyImportResult::Success) => Ok(()),
-            Ok(soulbeet::LegacyImportResult::Skipped(reason)) => {
-                Err(format!("Beets skipped track: {reason}"))
+        Ok(imp) => {
+            let result = imp
+                .import(&[src], target, soulbeet::ImportMode::Singleton)
+                .await;
+            match result.outcome {
+                soulbeet::ImportOutcome::Imported { .. } => Ok(()),
+                _ => Err(result.to_string()),
             }
-            Ok(other) => Err(format!("Import issue: {:?}", other)),
-            Err(e) => Err(format!("Import failed: {}", e)),
-        },
+        }
         Err(_) => {
             let filename = src
                 .file_name()

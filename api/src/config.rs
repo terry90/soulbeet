@@ -4,7 +4,7 @@
 //! This prevents scattered `env::var()` calls and ensures early failure on missing config.
 
 #[cfg(feature = "server")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "server")]
 const DEFAULT_SECRET_KEY: &str = "secret";
@@ -47,6 +47,10 @@ pub struct AppConfig {
     beets_config: PathBuf,
     /// Enable album mode for beets import (groups tracks by folder)
     beets_album_mode: bool,
+    /// The `beet` executable, resolved on PATH once
+    beet_bin: PathBuf,
+    /// The Python that runs `beet` (BEETS_PYTHON, else beet's shebang)
+    beets_python: Option<PathBuf>,
     /// HTTP server port (default: 9765)
     pub port: u16,
     /// HTTP server bind address (default: "0.0.0.0")
@@ -75,6 +79,14 @@ impl AppConfig {
             );
         }
 
+        // Left as a bare name when it is not on PATH, so the spawn error names it.
+        let beet_bin =
+            soulbeet::beets::resolve_on_path("beet").unwrap_or_else(|| PathBuf::from("beet"));
+        let beets_python = std::env::var_os("BEETS_PYTHON")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| soulbeet::beets::python_from_shebang(&beet_bin));
+
         Self {
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite:soulbeet.db".to_string()),
@@ -86,6 +98,8 @@ impl AppConfig {
                 std::env::var("BEETS_CONFIG").unwrap_or_else(|_| "beets_config.yaml".to_string()),
             ),
             beets_album_mode: parse_bool_env("BEETS_ALBUM_MODE", false),
+            beet_bin,
+            beets_python,
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
@@ -112,6 +126,16 @@ impl AppConfig {
     /// Get the beets config path.
     pub fn beets_config(&self) -> &PathBuf {
         &self.beets_config
+    }
+
+    /// The `beet` executable.
+    pub fn beet_bin(&self) -> &Path {
+        &self.beet_bin
+    }
+
+    /// The Python that runs `beet`, when it is known.
+    pub fn beets_python(&self) -> Option<&Path> {
+        self.beets_python.as_deref()
     }
 
     /// Check if album mode is enabled.

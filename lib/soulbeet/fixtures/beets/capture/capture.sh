@@ -2,7 +2,9 @@
 # Runs one real beets import the way soulbeet runs it and stores the transcript
 # as a classifier fixture in ../<CASE>/.
 #
-# usage: capture.sh CASE CONFIG [extra import args]
+# usage: BEETS_VENV=DIR FIXTURE_WORK=DIR capture.sh CASE CONFIG [extra import args]
+#   BEETS_VENV    a beets 2.11.0 venv
+#   FIXTURE_WORK  scratch dir for sources, libraries and raw transcripts
 #   CONFIG    a file under configs/. A name that is not there is passed to
 #             beets as a path that does not exist.
 #   The source must already be in $FIXTURE_WORK/CASE/src (cases.sh builds it).
@@ -14,8 +16,9 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 fixtures=$(dirname "$here")
-venv=${BEETS_VENV:-$HOME/.cache/claude-scratch/soulful/repro90/venv}
-work=${FIXTURE_WORK:-$HOME/.cache/claude-scratch/soulful/fixture-work}
+usage="usage: BEETS_VENV=DIR FIXTURE_WORK=DIR $0 CASE CONFIG [extra import args]"
+venv=${BEETS_VENV:?$usage}
+work=${FIXTURE_WORK:?$usage}
 
 case_name=$1 cfg_name=$2
 shift 2

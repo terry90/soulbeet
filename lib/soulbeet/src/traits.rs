@@ -7,6 +7,7 @@ use shared::{
         ArtistPopularity, CandidateSet, Listen, ProfileConfig, RankedArtist, RankedTrack,
         SignalReport, SimilarArtist, SimilarTrack, TimePeriod, UserMusicProfile, WeightedTag,
     },
+    system::ImporterHealth,
 };
 use std::fmt;
 use std::path::Path;
@@ -56,15 +57,6 @@ pub trait DownloadBackend: Send + Sync {
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool)
         -> Result<()>;
     async fn health_check(&self) -> bool;
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum LegacyImportResult {
-    Success,
-    /// The importer declined to import, with the reason it gave.
-    Skipped(String),
-    Failed(String),
-    TimedOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +152,13 @@ fn minutes(d: Duration) -> String {
     }
 }
 
+/// How much of beets' last line a timeout message quotes.
+const LAST_LINE_CHARS: usize = 200;
+
+fn clip(s: &str, chars: usize) -> &str {
+    s.char_indices().nth(chars).map_or(s, |(i, _)| &s[..i])
+}
+
 impl fmt::Display for ImportOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -174,6 +173,9 @@ impl fmt::Display for ImportOutcome {
             ImportOutcome::Skipped(SkipReason::AlreadyInLibrary) => {
                 f.write_str("Already in library")
             }
+            ImportOutcome::Skipped(SkipReason::NoMatch {
+                candidates: Some(1),
+            }) => f.write_str("No close match (1 candidate)"),
             ImportOutcome::Skipped(SkipReason::NoMatch {
                 candidates: Some(n),
             }) => {
@@ -194,8 +196,9 @@ impl fmt::Display for ImportOutcome {
                 last_line: Some(line),
             } => write!(
                 f,
-                "No output from beets for {} min (last: {line})",
-                minutes(*d)
+                "No output from beets for {} min (last: {})",
+                minutes(*d),
+                clip(line, LAST_LINE_CHARS)
             ),
             ImportOutcome::TimedOut {
                 limit: TimeoutKind::Idle(d),
@@ -229,15 +232,22 @@ pub trait MusicImporter: Send + Sync {
     fn id(&self) -> &'static str;
     fn name(&self) -> &'static str;
 
-    async fn import(
-        &self,
-        sources: &[&Path],
-        target: &Path,
-        as_album: bool,
-    ) -> Result<LegacyImportResult>;
+    async fn import(&self, sources: &[&Path], target: &Path, mode: ImportMode) -> ImportResult;
 
-    async fn find_duplicates(&self, libraries: &[&Path]) -> Result<DuplicateReport>;
-    async fn health_check(&self) -> bool;
+    async fn find_duplicates(
+        &self,
+        libraries: &[&Path],
+    ) -> std::result::Result<DuplicateReport, String>;
+
+    /// The last known health, without waiting. `Checking` before the first check.
+    fn health(&self) -> ImporterHealth;
+
+    /// Checks again and returns the new health. Concurrent callers share one check.
+    async fn refresh_health(&self) -> ImporterHealth;
+
+    /// Whether what the last check depended on has changed since. True before
+    /// the first check, false while one is running.
+    async fn health_stale(&self) -> bool;
 }
 
 pub struct FallbackMetadataProvider {

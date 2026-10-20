@@ -232,6 +232,19 @@ impl Stamp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Fingerprint(Vec<(PathBuf, Option<Stamp>)>);
 
+impl Fingerprint {
+    /// This fingerprint with the stamps `earlier` holds for the same paths, so a
+    /// change made after `earlier` was taken still reads as a change.
+    pub(crate) fn backdated(mut self, earlier: &Fingerprint) -> Fingerprint {
+        for (path, stamp) in &mut self.0 {
+            if let Some((_, old)) = earlier.0.iter().find(|(p, _)| p == path) {
+                *stamp = old.clone();
+            }
+        }
+        self
+    }
+}
+
 async fn stamp(path: &Path) -> Option<Stamp> {
     tokio::fs::metadata(path).await.ok().map(|m| Stamp::of(&m))
 }
@@ -552,12 +565,33 @@ mod tests {
         assert_ne!(before, fingerprint(&config, Some(&r)).await);
     }
 
+    #[tokio::test]
+    async fn a_backdated_fingerprint_keeps_a_change_made_in_between() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        let plugins = dir.path().join("plugins");
+        std::fs::create_dir(&plugins).unwrap();
+        std::fs::write(&config, "plugins: musicbrainz\n").unwrap();
+
+        // Taken before the check knew about the pluginpath.
+        let before = fingerprint(&config, None).await;
+        std::fs::write(&config, "plugins: musicbrainz chroma\n").unwrap();
+        let mut r = report(&["MusicBrainz"]);
+        r.pluginpath = vec![plugins.to_string_lossy().into_owned()];
+        let after = fingerprint(&config, Some(&r)).await;
+
+        let stored = after.clone().backdated(&before);
+        assert_ne!(stored, after);
+        assert_ne!(stored, fingerprint(&config, Some(&r)).await);
+        assert_eq!(after.clone().backdated(&after), after);
+    }
+
     // A bash script stands in for python: `bash -P -c SCRIPT CFG` runs SCRIPT
     // with CFG as $0, the way python gets it as sys.argv[1].
     const BASH: &str = "/bin/bash";
     const SHORT: RunLimits = RunLimits {
-        idle: Duration::from_millis(500),
-        total: Duration::from_secs(2),
+        idle: Duration::from_secs(10),
+        total: Duration::from_secs(30),
         drain: Duration::from_millis(300),
     };
 
@@ -599,7 +633,12 @@ mod tests {
 
     #[tokio::test]
     async fn run_probe_times_out() {
-        assert!(matches!(fake("sleep 5").await, Err(ProbeFailure::Timeout)));
+        let limits = RunLimits {
+            idle: Duration::from_millis(500),
+            ..SHORT
+        };
+        let r = probe_with(Some(Path::new(BASH)), "sleep 5", Path::new(CFG), limits).await;
+        assert!(matches!(r, Err(ProbeFailure::Timeout)));
     }
 
     #[tokio::test]
@@ -624,7 +663,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = run_probe(Some(&python), &dir.path().join("missing.yaml")).await;
         match r {
-            Ok(report) => assert!(report.fatal.is_some(), "{report:?}"),
+            Ok(report) => {
+                let fatal = report.fatal.as_deref().unwrap_or_default();
+                assert!(
+                    fatal.starts_with("configuration error:")
+                        || fatal.starts_with("ModuleNotFoundError:"),
+                    "{report:?}"
+                );
+            }
             Err(e) => panic!("{e:?}"),
         }
     }

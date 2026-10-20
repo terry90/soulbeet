@@ -49,6 +49,8 @@ fn main() {
         dioxus::serve(|| async move {
             // Start background cleanup task for user channels
             api::globals::start_channel_cleanup_task();
+            // Check the beets config in the background; never awaited here.
+            api::importer_health::start_startup_probe();
 
             Ok(dioxus::server::router(App).layer(CookieManagerLayer::new()))
         });

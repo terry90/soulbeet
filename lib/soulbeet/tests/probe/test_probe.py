@@ -120,3 +120,21 @@ def test_a_plugin_prompting_on_stdout_does_not_corrupt_the_report(run_probe, tmp
 def test_autotag_off_is_reported(run_probe):
     report = run_probe(CONFIGS / "autotag_off.yaml")
     assert report["autotag"] is False
+
+
+def test_pluginpath_is_reported_after_a_fatal_error(run_probe, tmp_path):
+    path = tmp_path / "fatal_with_pluginpath.yaml"
+    path.write_text(
+        (CONFIGS / "mbpseudo.yaml").read_text()
+        + yaml.safe_dump({"pluginpath": [str(REPO_PLUGINS)]})
+    )
+    report = run_probe(path)
+    assert report["fatal"] is not None
+    assert report["pluginpath"] == [str(REPO_PLUGINS)]
+
+
+def test_a_bad_value_read_after_load_is_a_configuration_error(run_probe, tmp_path):
+    path = tmp_path / "bad_autotag.yaml"
+    path.write_text(yaml.safe_dump({"plugins": "musicbrainz", "import": {"autotag": [1, 2]}}))
+    report = run_probe(path)
+    assert report["fatal"].startswith("configuration error:"), report["fatal"]

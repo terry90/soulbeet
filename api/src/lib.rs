@@ -3,6 +3,8 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod globals;
+#[cfg(feature = "server")]
+pub mod importer_health;
 pub mod models;
 pub mod services;
 
