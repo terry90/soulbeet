@@ -45,11 +45,15 @@ use crate::models::folder::Folder;
 #[cfg(feature = "server")]
 use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
+use crate::server_fns::download::enqueue::{
+    enqueue_claimed, failed_reason, transfer_key, OTHER_USER,
+};
+#[cfg(feature = "server")]
 use crate::server_fns::download::failover::{self, SourcePool};
 #[cfg(feature = "server")]
 use crate::server_fns::download::monitor::{best_match, FAILED_STATE_CONFIRM};
 #[cfg(feature = "server")]
-use crate::server_fns::download::not_enqueued_reason;
+use crate::transfer_registry::{BatchRef, TransferOwner, TransferRegistry};
 #[cfg(feature = "server")]
 use crate::AuthSession;
 
@@ -301,14 +305,23 @@ struct QueuedTrack {
     /// every retry.
     slskd_source: String,
     slskd_filename: String,
-    /// The folder under slskd's download directory this track's transfers
-    /// are enqueued into, its own for every attempt.
-    destination: String,
+    /// This track's own batch: the folder under slskd's download directory
+    /// every attempt is enqueued into, and the owner of their registry keys.
+    batch: BatchRef,
     /// When this track's transfer was first seen failed, cleared the moment
     /// it is seen in any other state.
     failing_since: Option<tokio::time::Instant>,
     /// Alternate peers for this track, and how many have been tried.
     pool: SourcePool,
+}
+
+/// The track's import is done or abandoned once it is dropped, so whoever
+/// asks for its files next may download them.
+#[cfg(feature = "server")]
+impl Drop for QueuedTrack {
+    fn drop(&mut self) {
+        TransferRegistry::global().release_batch(&self.batch.owner);
+    }
 }
 
 /// What a discovery download did, as observed in the phase 2 poll loop.
@@ -402,7 +415,7 @@ async fn settle_poll(
             }
             Outcome::Failed => {
                 let qt = &mut queued[*idx];
-                let retried = match qt.pool.enqueue_next(0, backend, &qt.destination).await {
+                let retried = match qt.pool.enqueue_next(0, backend, &qt.batch).await {
                     Some(next) => {
                         info!(
                             "Discovery: '{}' - {} failed from {}, retrying from {}",
@@ -708,14 +721,37 @@ pub async fn generate_discovery_playlist_internal(
                 // Keep the sources this track is allowed to try: the one
                 // enqueued here plus the alternates phase 2 fails over to.
                 ranked_items.truncate(failover::MAX_SOURCES_PER_TRACK);
-                let destination = shared::download::batch_folder(
-                    &format!("{} - {}", candidate.artist, candidate.track),
-                    &uuid::Uuid::new_v4().to_string(),
+                let track_batch = BatchRef::new(
+                    TransferOwner {
+                        user_id: user_id.to_string(),
+                        batch_id: uuid::Uuid::new_v4().to_string(),
+                    },
+                    format!("{} - {}", candidate.artist, candidate.track),
                 );
+                // Discovery watches its own transfers, so nothing may join it.
+                track_batch.inbox.close();
                 let mut downloaded = false;
                 for (attempt_idx, item) in ranked_items.iter().enumerate() {
+                    let transfer = transfer_key(backend.id(), &item.source, &item.id);
+                    let claim = TransferRegistry::global().claim(&[transfer], &track_batch);
+                    if claim.claimed.is_empty() {
+                        let owner = if claim.other_user.is_empty() {
+                            "already downloading for this user"
+                        } else {
+                            OTHER_USER
+                        };
+                        info!(
+                            "Download source {} skipped for '{}' - {}: {}",
+                            attempt_idx + 1,
+                            candidate.artist,
+                            candidate.track,
+                            owner
+                        );
+                        stats.downloads_failed += 1;
+                        continue;
+                    }
                     let download_results =
-                        match backend.download(vec![item.clone()], &destination).await {
+                        match enqueue_claimed(&backend, vec![item.clone()], &track_batch).await {
                             Ok(r) => r,
                             Err(e) => {
                                 if attempt_idx + 1 < ranked_items.len() {
@@ -749,7 +785,7 @@ pub async fn generate_discovery_playlist_internal(
                             album: candidate.album.clone(),
                             slskd_source: dl.source.clone(),
                             slskd_filename: dl.item.clone(),
-                            destination: destination.clone(),
+                            batch: track_batch.clone(),
                             failing_since: None,
                             // Start the pool at the source that actually
                             // enqueued: earlier entries were already tried and
@@ -771,8 +807,8 @@ pub async fn generate_discovery_playlist_internal(
                     if attempt_idx + 1 < ranked_items.len() {
                         let reason = download_results
                             .iter()
-                            .find_map(|dl| not_enqueued_reason(&dl.status))
-                            .unwrap_or_else(|| "nothing enqueued".to_string());
+                            .find_map(|dl| failed_reason(&dl.status))
+                            .unwrap_or("nothing enqueued");
                         info!(
                             "Download source {} refused '{}' - {} ({}), trying next",
                             attempt_idx + 1,
@@ -909,7 +945,7 @@ pub async fn generate_discovery_playlist_internal(
                 let resolved = crate::server_fns::download::process::resolve_on_disk(
                     &qt.slskd_filename,
                     &download_base,
-                    Some(&qt.destination),
+                    Some(&qt.batch.destination),
                     &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .await;
@@ -1439,7 +1475,7 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 mod tests {
     use super::{settle_poll, QueuedTrack, FAILED_STATE_CONFIRM};
     use crate::server_fns::download::failover::SourcePool;
-    use crate::server_fns::download::test_support::{item, ScriptedOutcome, StubBackend};
+    use crate::server_fns::download::test_support::{batch, item, ScriptedOutcome, StubBackend};
     use shared::download::{DownloadProgress, DownloadableItem};
     use soulbeet::DownloadBackend;
     use std::collections::HashSet;
@@ -1511,7 +1547,7 @@ mod tests {
             album: Some("Come Over".to_string()),
             slskd_source: items[0].source.clone(),
             slskd_filename: items[0].id.clone(),
-            destination: "Kowloon - Wake Up [12345678]".to_string(),
+            batch: batch("Kowloon - Wake Up"),
             failing_since: None,
             pool: SourcePool::single(items),
         }

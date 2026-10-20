@@ -1,9 +1,9 @@
 use dioxus::fullstack::{WebSocketOptions, Websocket};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "server")]
-use shared::download::{batch_folder, DownloadProgress, EnqueueStatus};
 use shared::download::{DownloadEvent, DownloadableItem, QueuedDownload};
+#[cfg(feature = "server")]
+use shared::download::{DownloadProgress, EnqueueStatus};
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
@@ -29,6 +29,8 @@ pub mod auto_download;
 pub use auto_download::{auto_download, AutoDownloadRequest, AutoDownloadResult};
 
 #[cfg(feature = "server")]
+pub mod enqueue;
+#[cfg(feature = "server")]
 pub mod failover;
 #[cfg(feature = "server")]
 pub mod monitor;
@@ -43,33 +45,13 @@ pub mod utils;
 pub(crate) mod test_support;
 
 #[cfg(feature = "server")]
+use self::enqueue::{
+    deliver, enqueue_request, failed_reason, stopped_rows, RequestEnqueue, Watcher,
+};
+#[cfg(feature = "server")]
 use self::monitor::DownloadMonitor;
-
 #[cfg(feature = "server")]
-async fn do_download(
-    items: Vec<DownloadableItem>,
-    destination: &str,
-    backend_id: Option<&str>,
-) -> Result<Vec<QueuedDownload>, ServerFnError> {
-    let backend = download_backend(backend_id)
-        .await
-        .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
-
-    backend
-        .download(items, destination)
-        .await
-        .map_err(server_error)
-}
-
-/// Why a file was not enqueued, as its row shows it; `None` when it was.
-#[cfg(feature = "server")]
-pub(crate) fn not_enqueued_reason(status: &EnqueueStatus) -> Option<String> {
-    match status {
-        EnqueueStatus::Enqueued => None,
-        EnqueueStatus::AlreadyInFlight => Some("already downloading in slskd".to_string()),
-        EnqueueStatus::Failed(message) => Some(message.clone()),
-    }
-}
+use crate::transfer_registry::{BatchRef, TransferOwner};
 
 /// Name for a manual download's batch: the album its items share, or the
 /// first item's title when they span albums.
@@ -230,79 +212,113 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         )));
     }
 
-    let batch_id = uuid::Uuid::new_v4().to_string();
-    let batch_label = manual_batch_label(&req.items);
-    let destination = batch_folder(&batch_label, &batch_id);
-    let res = do_download(req.items, &destination, req.backend.as_deref()).await?;
+    let backend = download_backend(req.backend.as_deref())
+        .await
+        .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
+    let fresh = BatchRef::new(
+        TransferOwner {
+            user_id: auth.0.sub.clone(),
+            batch_id: uuid::Uuid::new_v4().to_string(),
+        },
+        manual_batch_label(&req.items),
+    );
+    let RequestEnqueue {
+        batch,
+        results,
+        watcher,
+        error,
+    } = enqueue_request(&backend, req.items, fresh).await;
 
     let (tx, _) = get_or_create_user_channel(&username).await;
-
     let backend_id = req.backend;
+    let row = |p: DownloadProgress| {
+        let mut p = p.with_batch(batch.owner.batch_id.clone(), batch.label.clone());
+        p.backend = backend_id.clone();
+        p
+    };
 
-    let failed_entries: Vec<DownloadProgress> = res
+    let failed_entries: Vec<DownloadProgress> = results
         .iter()
         .filter_map(|d| {
-            let reason = not_enqueued_reason(&d.status)?;
-            let mut p =
-                DownloadProgress::failed(d.id.clone(), d.source.clone(), d.item.clone(), reason)
-                    .with_batch(batch_id.clone(), batch_label.clone());
-            p.backend = backend_id.clone();
-            Some(p)
+            let reason = failed_reason(&d.status)?;
+            Some(row(DownloadProgress::failed(
+                d.id.clone(),
+                d.source.clone(),
+                d.item.clone(),
+                reason.to_string(),
+            )))
         })
         .collect();
     if !failed_entries.is_empty() {
         let _ = tx.send(DownloadEvent::Progress(failed_entries));
     }
 
-    let successful: Vec<&QueuedDownload> = res
+    let enqueued: Vec<QueuedDownload> = results
         .iter()
         .filter(|d| d.status == EnqueueStatus::Enqueued)
+        .cloned()
         .collect();
-
-    let download_sources: Vec<String> = successful.iter().map(|d| d.source.clone()).collect();
-    let download_filenames: Vec<String> = successful.iter().map(|d| d.item.clone()).collect();
-    let target_path = target_path_buf;
-
-    if download_filenames.is_empty() {
-        return Ok(res);
-    }
 
     // Send initial "Queued" state immediately so UI shows the downloads right away
-    let queued_entries: Vec<DownloadProgress> = successful
+    let queued_entries: Vec<DownloadProgress> = enqueued
         .iter()
         .map(|d| {
-            let mut p =
-                DownloadProgress::queued(d.id.clone(), d.source.clone(), d.item.clone(), d.size)
-                    .with_batch(batch_id.clone(), batch_label.clone());
-            p.backend = backend_id.clone();
-            p
+            row(DownloadProgress::queued(
+                d.id.clone(),
+                d.source.clone(),
+                d.item.clone(),
+                d.size,
+            ))
         })
         .collect();
-    let _ = tx.send(DownloadEvent::Progress(queued_entries));
+    if !queued_entries.is_empty() {
+        let _ = tx.send(DownloadEvent::Progress(queued_entries));
+    }
 
-    info!("Started monitoring downloads: {:?}", download_filenames);
+    match watcher {
+        Watcher::Joined(reservation) => {
+            info!(
+                "Added {} downloads to running batch {}",
+                enqueued.len(),
+                batch.owner.batch_id
+            );
+            let lost = deliver(reservation, &enqueued, backend.id());
+            if !lost.is_empty() {
+                let _ = tx.send(DownloadEvent::Progress(stopped_rows(&lost, &batch)));
+            }
+        }
+        Watcher::Own if enqueued.is_empty() && batch.inbox.close_if_idle() => {}
+        // Starts empty when nothing was enqueued but another request joined
+        // the batch while this one was enqueueing.
+        Watcher::Own => {
+            info!(
+                "Started monitoring downloads: {:?}",
+                enqueued.iter().map(|d| &d.item).collect::<Vec<_>>()
+            );
+            let sources = enqueued.iter().map(|d| d.source.clone()).collect();
+            let filenames = enqueued.iter().map(|d| d.item.clone()).collect();
+            let task_username = username.clone();
+            let task_cancellation = register_user_task(&username).await;
+            tokio::spawn(async move {
+                let mut monitor = DownloadMonitor::new(
+                    sources,
+                    filenames,
+                    target_path_buf,
+                    tx,
+                    task_cancellation,
+                    task_username.clone(),
+                    batch,
+                );
+                monitor.run().await;
+                unregister_user_task(&task_username).await;
+            });
+        }
+    }
 
-    // Register this task for cleanup tracking
-    let task_username = username.clone();
-    let task_cancellation = register_user_task(&username).await;
-
-    // Spawn the monitoring task
-    tokio::spawn(async move {
-        let mut monitor = DownloadMonitor::new(
-            download_sources,
-            download_filenames,
-            target_path,
-            tx,
-            task_cancellation,
-            task_username.clone(),
-            batch_id,
-            batch_label,
-        );
-        monitor.run().await;
-        unregister_user_task(&task_username).await;
-    });
-
-    Ok(res)
+    match error {
+        Some(e) => Err(server_error(e)),
+        None => Ok(results),
+    }
 }
 
 /// Imports a failed or skipped row again, from the job kept for it.
@@ -339,11 +355,5 @@ mod tests {
             i.album = " ".to_string();
         }
         assert_eq!(manual_batch_label(&no_album), "One");
-
-        assert_eq!(not_enqueued_reason(&EnqueueStatus::Enqueued), None);
-        assert_eq!(
-            not_enqueued_reason(&EnqueueStatus::AlreadyInFlight).as_deref(),
-            Some("already downloading in slskd")
-        );
     }
 }

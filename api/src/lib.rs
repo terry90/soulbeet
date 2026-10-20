@@ -9,6 +9,8 @@ pub mod import_queue;
 pub mod importer_health;
 pub mod models;
 pub mod services;
+#[cfg(feature = "server")]
+pub mod transfer_registry;
 
 pub mod server_fns;
 

@@ -12,7 +12,10 @@ use shared::download::{
 use shared::metadata::{Album, Track};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::DownloadBackend;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner};
 
 pub fn item(source: &str, title: &str, id: &str) -> DownloadableItem {
     DownloadableItem {
@@ -43,6 +46,28 @@ pub fn group(source: &str, items: Vec<DownloadableItem>, score: f64) -> Download
     }
 }
 
+/// A batch of its own user, so tests sharing the process-wide registry never
+/// see each other's claims. Its folder is `<label> [12345678]`.
+pub fn batch(label: &str) -> BatchRef {
+    let unique = uuid::Uuid::new_v4();
+    BatchRef::new(
+        TransferOwner {
+            user_id: format!("tester-{unique}"),
+            batch_id: format!("12345678-{unique}"),
+        },
+        label.to_string(),
+    )
+}
+
+/// The registry key of `filename` from `peer` on this backend.
+pub fn key(backend: &Arc<dyn DownloadBackend>, peer: &str, filename: &str) -> TransferKey {
+    TransferKey {
+        backend: backend.id(),
+        peer: peer.to_string(),
+        filename: filename.to_string(),
+    }
+}
+
 /// What a scripted `download` call does: accept the item (transfer id
 /// `t-{item.id}`), refuse it because the backend is already fetching it,
 /// accept the call but mark the item rejected (peer offline), or fail the
@@ -56,8 +81,10 @@ pub enum ScriptedOutcome {
 
 /// Answers each enqueue from a scripted list, then rejects everything after
 /// the script runs out. Records every destination and cancellation, and
-/// lists whatever transfers the test sets.
+/// lists whatever transfers the test sets. Each stub has its own backend id,
+/// so the registry keys of concurrent tests never collide.
 pub struct StubBackend {
+    id: &'static str,
     script: Mutex<Vec<ScriptedOutcome>>,
     cancelled: Mutex<Vec<(String, String)>>,
     destinations: Mutex<Vec<String>>,
@@ -66,7 +93,10 @@ pub struct StubBackend {
 
 impl StubBackend {
     pub fn new(script: Vec<ScriptedOutcome>) -> Arc<Self> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let id = format!("stub-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         Arc::new(Self {
+            id: Box::leak(id.into_boxed_str()),
             script: Mutex::new(script),
             cancelled: Mutex::new(Vec::new()),
             destinations: Mutex::new(Vec::new()),
@@ -99,7 +129,7 @@ pub fn transfer(source: &str, filename: &str, id: &str, state: DownloadState) ->
 #[async_trait]
 impl DownloadBackend for StubBackend {
     fn id(&self) -> &'static str {
-        "stub"
+        self.id
     }
     fn name(&self) -> &'static str {
         "Stub"

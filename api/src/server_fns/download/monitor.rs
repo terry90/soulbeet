@@ -4,7 +4,7 @@
 //! handles per-track timeouts, and triggers processing when downloads complete.
 
 use dioxus::logger::tracing::{debug, info, warn};
-use shared::download::{batch_folder, DownloadEvent, DownloadProgress, DownloadState};
+use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
 use soulbeet::error::SoulseekError;
 use soulbeet::DownloadBackend;
 use std::collections::HashSet;
@@ -16,11 +16,13 @@ use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use super::enqueue::stopped_rows;
 use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::{submit_imports, Handoff};
 use super::utils::FileId;
 use crate::config::CONFIG;
 use crate::services::download_backend;
+use crate::transfer_registry::{BatchRef, TransferRegistry};
 
 /// Poll interval for checking download status (2 seconds).
 const POLL_INTERVAL_SECS: u64 = 2;
@@ -107,6 +109,9 @@ impl TrackState {
 struct TrackedFile {
     source: String,
     filename: String,
+    /// The backend's id for the transfer, when the monitor learned it: an
+    /// added, failed-over or adopted slot.
+    transfer_id: Option<String>,
     /// The batch folder the transfer was enqueued into, or `None` for a
     /// transfer this batch adopted from another peer, which slskd saves
     /// wherever its own enqueue said.
@@ -131,13 +136,9 @@ pub struct DownloadMonitor {
     cancellation_token: CancellationToken,
     /// Whose rows these are; imports report to this user's channel.
     username: String,
-    /// Batch identifier for grouping downloads.
-    batch_id: String,
-    /// Human-readable batch label (album name).
-    batch_label: String,
-    /// The batch's folder under the download directory, which every
-    /// transfer of the batch is enqueued into.
-    destination: String,
+    /// The batch this monitor watches: its rows, its folder under the
+    /// download directory, and the inbox joining requests deliver to.
+    batch: BatchRef,
     /// slskd's download directory as this server sees it.
     download_base: PathBuf,
     /// Files already handed to the import queue.
@@ -150,7 +151,8 @@ pub struct DownloadMonitor {
 
 impl DownloadMonitor {
     /// Create a new download monitor. The transfers must have been enqueued
-    /// into `batch_folder(&batch_label, &batch_id)`.
+    /// into `batch.destination`. Dropping the monitor closes the batch's
+    /// inbox and releases every registry key the batch holds.
     pub fn new(
         sources: Vec<String>,
         filenames: Vec<String>,
@@ -158,17 +160,16 @@ impl DownloadMonitor {
         tx: broadcast::Sender<DownloadEvent>,
         cancellation_token: CancellationToken,
         username: String,
-        batch_id: String,
-        batch_label: String,
+        batch: BatchRef,
     ) -> Self {
-        let destination = batch_folder(&batch_label, &batch_id);
         let tracked_files: Vec<TrackedFile> = sources
             .into_iter()
             .zip(filenames.iter().cloned())
             .map(|(source, filename)| TrackedFile {
                 source,
                 filename,
-                destination: Some(destination.clone()),
+                transfer_id: None,
+                destination: Some(batch.destination.clone()),
             })
             .collect();
 
@@ -185,9 +186,7 @@ impl DownloadMonitor {
             album_mode: CONFIG.is_album_mode(),
             cancellation_token,
             username,
-            batch_id,
-            batch_label,
-            destination,
+            batch,
             download_base: CONFIG.download_path().clone(),
             claimed: Arc::new(Mutex::new(HashSet::new())),
             last_readable_poll: Instant::now(),
@@ -229,6 +228,27 @@ impl DownloadMonitor {
                 best_match(downloads, &tracked.source, &tracked.filename)
                     .is_none_or(|best| is_terminal_state(&best.state) && !is_completed(&best.state))
             })
+    }
+
+    /// Watch the transfers joining requests delivered since the last poll.
+    /// Returns whether there were any.
+    fn drain_inbox(&mut self) -> bool {
+        let added = self.batch.inbox.take();
+        let any = !added.is_empty();
+        for slot in added {
+            info!(
+                "Batch {} now also watches {} from {}",
+                self.batch.owner.batch_id, slot.filename, slot.source
+            );
+            self.tracked_files.push(TrackedFile {
+                source: slot.source,
+                filename: slot.filename,
+                transfer_id: Some(slot.transfer_id),
+                destination: Some(self.batch.destination.clone()),
+            });
+            self.track_states.push(TrackState::bound_now());
+        }
+        any
     }
 
     /// Give up when slskd's transfer list has been unreadable for too long.
@@ -277,7 +297,7 @@ impl DownloadMonitor {
         let Some(pool) = self.pool.as_mut() else {
             return false;
         };
-        let Some(queued) = pool.enqueue_next(slot, backend, &self.destination).await else {
+        let Some(queued) = pool.enqueue_next(slot, backend, &self.batch).await else {
             return false;
         };
 
@@ -303,7 +323,8 @@ impl DownloadMonitor {
             TrackedFile {
                 source: queued.source.clone(),
                 filename: queued.item.clone(),
-                destination: Some(self.destination.clone()),
+                transfer_id: Some(queued.id.clone()),
+                destination: Some(self.batch.destination.clone()),
             },
         )
         .filename;
@@ -369,6 +390,11 @@ impl DownloadMonitor {
         interval.tick().await;
 
         loop {
+            if self.drain_inbox() {
+                // The new transfers get the whole window to show up.
+                consecutive_empty = 0;
+            }
+
             if self.cancellation_token.is_cancelled() {
                 info!(
                     "Download monitoring cancelled for batch {:?}",
@@ -545,12 +571,15 @@ impl DownloadMonitor {
                     MAX_CONSECUTIVE_EMPTY * 2,
                     self.filenames()
                 );
-                if self.retry_or_fail_absent_batch(backend).await {
+                if self.retry_or_fail_absent_batch(backend).await
+                    && self.batch.inbox.close_if_idle()
+                {
                     return true;
                 }
-                // At least one slot moved to another peer. Its alternate
-                // cannot show up in a list fetched before it was enqueued, so
-                // the grace window starts again from here.
+                // At least one slot moved to another peer, or a joining
+                // request is adding slots. Neither can show up in a list
+                // fetched before it was enqueued, so the grace window starts
+                // again from here.
                 *consecutive_empty = 0;
                 return false;
             }
@@ -608,7 +637,7 @@ impl DownloadMonitor {
     /// the new peer. Stale terminal transfers from other peers stay ignored.
     fn find_matching_downloads(&mut self, downloads: &[DownloadProgress]) -> Vec<DownloadProgress> {
         let mut matched = Vec::new();
-        let mut rebinds: Vec<(usize, String)> = Vec::new();
+        let mut rebinds: Vec<(usize, String, String)> = Vec::new();
         for (idx, tracked) in self.tracked_files.iter().enumerate() {
             let mut best = best_match(downloads, &tracked.source, &tracked.filename);
 
@@ -620,7 +649,7 @@ impl DownloadMonitor {
                         && !is_terminal_state(&dl.state)
                         && filenames_match(&dl.item, &tracked.filename)
                 }) {
-                    rebinds.push((idx, retry.source.clone()));
+                    rebinds.push((idx, retry.source.clone(), retry.id.clone()));
                     best = Some(retry);
                 }
             }
@@ -630,13 +659,14 @@ impl DownloadMonitor {
             }
         }
 
-        for (idx, new_source) in rebinds {
+        for (idx, new_source, transfer_id) in rebinds {
             let tracked = &mut self.tracked_files[idx];
             info!(
                 "Download of {} retried from new peer {} (was {}), rebinding",
                 tracked.filename, new_source, tracked.source
             );
             tracked.source = new_source;
+            tracked.transfer_id = Some(transfer_id);
             tracked.destination = None;
             // Reset state so the retried transfer is monitored and imported
             self.track_states[idx] = TrackState::bound_now();
@@ -675,7 +705,7 @@ impl DownloadMonitor {
 
     /// Apply batch_id and batch_label to a progress entry.
     fn stamp(&self, entry: DownloadProgress) -> DownloadProgress {
-        entry.with_batch(self.batch_id.clone(), self.batch_label.clone())
+        entry.with_batch(self.batch.owner.batch_id.clone(), self.batch.label.clone())
     }
 
     /// Apply batch_id and batch_label to a set of progress entries.
@@ -904,7 +934,9 @@ impl DownloadMonitor {
             processed || completed
         });
 
-        if all_settled {
+        // A joining request may still be enqueueing into this batch, or its
+        // slots wait to be drained: finishing now would leave them unwatched.
+        if all_settled && self.batch.inbox.close_if_idle() {
             if self.album_mode {
                 self.process_album_mode(batch_status).await;
             }
@@ -943,11 +975,34 @@ impl DownloadMonitor {
     }
 }
 
+impl Drop for DownloadMonitor {
+    /// Whatever ended the monitor, its batch takes no more slots, and its
+    /// files may be downloaded again by anyone.
+    fn drop(&mut self) {
+        let unwatched = self.batch.inbox.close();
+        if !unwatched.is_empty() {
+            warn!(
+                "Batch {} stopped before watching {} added downloads",
+                self.batch.owner.batch_id,
+                unwatched.len()
+            );
+            let _ = self.tx.send(DownloadEvent::Progress(stopped_rows(
+                &unwatched,
+                &self.batch,
+            )));
+        }
+        TransferRegistry::global().release_batch(&self.batch.owner);
+    }
+}
+
 /// Build a synthetic terminal progress entry for a track slskd no longer
 /// reports, so the UI can settle its row.
 fn make_failed_progress(tracked: &TrackedFile, reason: &str) -> DownloadProgress {
     DownloadProgress {
-        id: tracked.filename.clone(),
+        id: tracked
+            .transfer_id
+            .clone()
+            .unwrap_or_else(|| tracked.filename.clone()),
         source: tracked.source.clone(),
         item: tracked.filename.clone(),
         size: 0,
@@ -1048,7 +1103,10 @@ pub fn filenames_match(a: &str, b: &str) -> bool {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use crate::server_fns::download::test_support::{item, transfer, ScriptedOutcome, StubBackend};
+    use crate::server_fns::download::test_support::{
+        batch, item, key, transfer, ScriptedOutcome, StubBackend,
+    };
+    use crate::transfer_registry::AddedSlot;
     use tokio::sync::broadcast;
 
     /// An instant `d` in the past, so a test can reach the monitor's
@@ -1119,8 +1177,7 @@ mod tests {
             tx,
             CancellationToken::new(),
             "tester".to_string(),
-            "12345678-aaaa-bbbb-cccc-ddddeeeeffff".to_string(),
-            "X".to_string(),
+            batch("X"),
         )
     }
 
@@ -1181,10 +1238,7 @@ mod tests {
             DownloadEvent::Replaced { entry, .. } => {
                 // A cancel from this row must reach slskd by transfer id.
                 assert_eq!(entry.id, "t-dirB/bbb.flac");
-                assert_eq!(
-                    entry.batch_id.as_deref(),
-                    Some("12345678-aaaa-bbbb-cccc-ddddeeeeffff")
-                );
+                assert_eq!(entry.batch_id.as_ref(), Some(&m.batch.owner.batch_id));
             }
             other => panic!("expected a row replacement, got {other:?}"),
         }
@@ -1469,5 +1523,142 @@ mod tests {
             m.slot_for_item("totally\\different\\peer\\path.flac"),
             Some(0)
         );
+    }
+
+    /// An album-mode monitor of `username` whose finished files are found in
+    /// a temporary download folder, and whose import target cannot be
+    /// created, so a handed-off row comes straight back from the import
+    /// queue as Failed on the user's channel without beets ever running.
+    async fn album_monitor(
+        username: &str,
+        files: &[&str],
+    ) -> (
+        DownloadMonitor,
+        tempfile::TempDir,
+        broadcast::Receiver<DownloadEvent>,
+    ) {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("not-a-dir"), b"x").unwrap();
+        let (tx, _rx) = broadcast::channel(64);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec![files[0]]);
+        m.album_mode = true;
+        m.download_base = base.path().to_path_buf();
+        m.target_path = base.path().join("not-a-dir").join("library");
+        let folder = base.path().join(&m.batch.destination);
+        std::fs::create_dir_all(&folder).unwrap();
+        for file in files {
+            std::fs::write(folder.join(file), b"x").unwrap();
+        }
+        let (user_tx, _) = crate::globals::get_or_create_user_channel(username).await;
+        m.username = username.to_string();
+        (m, base, user_tx.subscribe())
+    }
+
+    /// The items of every row the import queue has sent back so far.
+    fn handed_off(rx: &mut broadcast::Receiver<DownloadEvent>) -> Vec<String> {
+        let mut items = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let DownloadEvent::Progress(rows) = event {
+                items.extend(rows.into_iter().map(|r| r.item));
+            }
+        }
+        items.sort();
+        items
+    }
+
+    #[tokio::test]
+    async fn added_slots_are_monitored() {
+        let (mut m, _base, mut imports) =
+            album_monitor("monitor-added-slots", &["01.flac", "02.flac"]).await;
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        m.batch
+            .inbox
+            .reserve()
+            .expect("open inbox")
+            .deliver(vec![AddedSlot {
+                source: "peer_b".to_string(),
+                filename: "02.flac".to_string(),
+                transfer_id: "t-02".to_string(),
+            }])
+            .expect("delivered");
+
+        // The top of the next run-loop iteration.
+        assert!(m.drain_inbox());
+        assert_eq!(m.sources(), vec!["peer_a", "peer_b"]);
+        let listing = vec![
+            transfer("peer_a", "01.flac", "t-01", DownloadState::Completed),
+            transfer("peer_b", "02.flac", "t-02", DownloadState::Completed),
+        ];
+        let mut empty = 0;
+        assert!(
+            m.process_poll_result(listing, &mut empty, 1, &backend)
+                .await
+        );
+
+        assert_eq!(handed_off(&mut imports), vec!["01.flac", "02.flac"]);
+        assert!(
+            m.batch.inbox.reserve().is_none(),
+            "the finished batch is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_monitor_waits_for_reserved_slots_before_finishing_an_album() {
+        let (mut m, _base, mut imports) =
+            album_monitor("monitor-reserved-slots", &["01.flac"]).await;
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let listing = || {
+            vec![transfer(
+                "peer_a",
+                "01.flac",
+                "t-01",
+                DownloadState::Completed,
+            )]
+        };
+        let reservation = m.batch.inbox.reserve().expect("open inbox");
+
+        let mut empty = 0;
+        assert!(
+            !m.process_poll_result(listing(), &mut empty, 1, &backend)
+                .await
+        );
+        assert!(handed_off(&mut imports).is_empty(), "the album waited");
+
+        drop(reservation);
+        assert!(
+            m.process_poll_result(listing(), &mut empty, 2, &backend)
+                .await
+        );
+        assert_eq!(handed_off(&mut imports), vec!["01.flac"]);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_monitor_closes_its_inbox_and_frees_its_keys() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let m = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
+        let inbox = Arc::clone(&m.batch.inbox);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let held = key(&backend, "peer_a", "01.flac");
+        TransferRegistry::global().claim(std::slice::from_ref(&held), &m.batch);
+        let late = inbox.reserve().expect("open inbox");
+        inbox
+            .reserve()
+            .expect("open inbox")
+            .deliver(vec![AddedSlot {
+                source: "peer_b".to_string(),
+                filename: "02.flac".to_string(),
+                transfer_id: "t-02".to_string(),
+            }])
+            .expect("delivered");
+
+        drop(m);
+
+        let Ok(DownloadEvent::Progress(rows)) = rx.try_recv() else {
+            panic!("the undrained slot was never written off");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "t-02");
+        assert!(late.deliver(vec![]).is_err(), "a late join is handed back");
+        assert!(TransferRegistry::global().may_adopt(&held, &batch("Y").owner));
     }
 }

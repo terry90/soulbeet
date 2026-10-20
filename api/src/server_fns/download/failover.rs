@@ -13,6 +13,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use super::enqueue::{enqueue_claimed, transfer_key};
+use crate::transfer_registry::{BatchRef, TransferRegistry};
+
 /// Sources tried per track before it is declared failed: the peer picked at
 /// search time plus three alternates. slskd retries each peer 3 times on its
 /// own (~40s) before reporting failure, so this caps a dead track at roughly
@@ -100,21 +103,34 @@ impl SourcePool {
         Some(item)
     }
 
-    /// Enqueue this slot's next alternate into the batch folder `destination`,
-    /// walking past the ones the backend refuses (peer offline, file already
-    /// downloading in slskd) until one is accepted or the slot runs dry. A
-    /// refused alternate still costs the slot a source, so three dead peers in
-    /// a row spend the whole budget without a transfer ever being attempted.
-    /// `None` means the slot is out of sources or budget.
+    /// Enqueue this slot's next alternate into `batch`'s folder, walking past
+    /// the ones it cannot have (another batch owns the transfer, the peer is
+    /// offline, slskd is already fetching it) until one is accepted or the
+    /// slot runs dry. The accepted alternate's key stays claimed by `batch`.
+    /// A refused alternate still costs the slot a source, so three dead peers
+    /// in a row spend the whole budget without a transfer ever being
+    /// attempted. `None` means the slot is out of sources or budget.
     pub async fn enqueue_next(
         &mut self,
         slot: usize,
         backend: &Arc<dyn DownloadBackend>,
-        destination: &str,
+        batch: &BatchRef,
     ) -> Option<QueuedDownload> {
         while let Some(item) = self.take_next(slot) {
             let source = item.source.clone();
-            match backend.download(vec![item], destination).await {
+            let key = transfer_key(backend.id(), &item.source, &item.id);
+            if TransferRegistry::global()
+                .claim(&[key], batch)
+                .claimed
+                .is_empty()
+            {
+                warn!(
+                    "Failover source {} skipped: another batch is downloading {}",
+                    source, item.id
+                );
+                continue;
+            }
+            match enqueue_claimed(backend, vec![item], batch).await {
                 Ok(queued) => {
                     if let Some(ok) = queued
                         .into_iter()
@@ -164,7 +180,10 @@ pub fn align_pool_tracks(
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use crate::server_fns::download::test_support::{group, item, ScriptedOutcome, StubBackend};
+    use crate::server_fns::download::test_support::{
+        batch, group, item, key, ScriptedOutcome, StubBackend,
+    };
+    use crate::transfer_registry::TransferRegistry;
     use shared::download::DownloadableItem;
     use soulbeet::DownloadBackend;
     use std::sync::Arc;
@@ -421,7 +440,7 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
 
         let queued = pool
-            .enqueue_next(0, &backend, "X [12345678]")
+            .enqueue_next(0, &backend, &batch("X"))
             .await
             .expect("enqueued");
         assert_eq!(queued.source, "peer_b");
@@ -440,7 +459,7 @@ mod tests {
             StubBackend::new(vec![ScriptedOutcome::Rejected, ScriptedOutcome::Enqueued]);
 
         let queued = pool
-            .enqueue_next(0, &backend, "X [12345678]")
+            .enqueue_next(0, &backend, &batch("X"))
             .await
             .expect("enqueued");
         assert_eq!(queued.source, "peer_c");
@@ -461,7 +480,7 @@ mod tests {
         ]);
 
         let queued = pool
-            .enqueue_next(0, &backend, "X [12345678]")
+            .enqueue_next(0, &backend, &batch("X"))
             .await
             .expect("enqueued");
         assert_eq!(queued.source, "peer_c");
@@ -481,7 +500,7 @@ mod tests {
         ]);
 
         let queued = pool
-            .enqueue_next(0, &backend, "X [12345678]")
+            .enqueue_next(0, &backend, &batch("X"))
             .await
             .expect("enqueued");
         assert_eq!(queued.source, "peer_c");
@@ -499,10 +518,68 @@ mod tests {
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
 
-        pool.enqueue_next(0, &backend, "X [12345678]")
+        pool.enqueue_next(0, &backend, &batch("X"))
             .await
             .expect("enqueued");
         assert_eq!(stub.destinations(), vec!["X [12345678]".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_claimed_key_is_released_when_slskd_says_already_in_flight() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+            item("peer_c", "Wake Up", "c.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![
+            ScriptedOutcome::AlreadyInFlight,
+            ScriptedOutcome::Enqueued,
+        ]);
+        let mine = batch("X");
+        let someone_else = batch("Y").owner;
+
+        let queued = pool
+            .enqueue_next(0, &backend, &mine)
+            .await
+            .expect("enqueued");
+
+        assert_eq!(queued.source, "peer_c");
+        let registry = TransferRegistry::global();
+        assert!(
+            registry.may_adopt(&key(&backend, "peer_b", "b.flac"), &someone_else),
+            "the refused alternate's key was released"
+        );
+        assert!(registry.may_adopt(&key(&backend, "peer_c", "c.flac"), &mine.owner));
+        assert!(
+            !registry.may_adopt(&key(&backend, "peer_c", "c.flac"), &someone_else),
+            "the accepted alternate stays claimed by its batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alternate_another_user_is_downloading_is_skipped() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+            item("peer_c", "Wake Up", "c.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let other = batch("Other");
+        TransferRegistry::global().claim(&[key(&backend, "peer_b", "b.flac")], &other);
+
+        let queued = pool
+            .enqueue_next(0, &backend, &batch("X"))
+            .await
+            .expect("enqueued");
+
+        assert_eq!(queued.source, "peer_c");
+        assert_eq!(stub.destinations().len(), 1, "peer_b was never asked");
+        assert!(
+            TransferRegistry::global().may_adopt(&key(&backend, "peer_b", "b.flac"), &other.owner)
+        );
     }
 
     #[tokio::test]
@@ -514,10 +591,7 @@ mod tests {
         let mut pool = SourcePool::single(items);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Rejected]);
 
-        assert!(pool
-            .enqueue_next(0, &backend, "X [12345678]")
-            .await
-            .is_none());
+        assert!(pool.enqueue_next(0, &backend, &batch("X")).await.is_none());
     }
 
     #[tokio::test]
@@ -537,10 +611,7 @@ mod tests {
             ScriptedOutcome::Rejected,
         ]);
 
-        assert!(pool
-            .enqueue_next(0, &backend, "X [12345678]")
-            .await
-            .is_none());
+        assert!(pool.enqueue_next(0, &backend, &batch("X")).await.is_none());
         assert_eq!(pool.attempts_used(0), MAX_SOURCES_PER_TRACK);
     }
 }
