@@ -1285,38 +1285,6 @@ pub(crate) fn transfer_by_id<'a>(
         .find(|dl| dl.source == source && dl.id == id)
 }
 
-/// How good a slskd transfer is as the match for a tracked file, highest
-/// first: still running beats finished, and finished beats failed.
-///
-/// Ranking failures last is what keeps a completed retry from being read as a
-/// failure. A slot can fail over to the *same* peer under another path, since
-/// a peer holding the track in two directories contributes two ranked items,
-/// and `filenames_match` bridges those two paths by basename. If the dead
-/// peer's transfer is still in slskd's list when the retry finishes, both
-/// entries are terminal and both match the slot: preferring only non-terminal
-/// entries would leave the order of slskd's list deciding, and a corpse
-/// listed first would fail the track over again with its file already on disk.
-pub(crate) fn transfer_match_rank(state: &DownloadState) -> u8 {
-    match state {
-        DownloadState::Failed(_) | DownloadState::Cancelled => 0,
-        s if is_terminal_state(s) => 1,
-        _ => 2,
-    }
-}
-
-/// The transfer a peer/path pair is best matched by, or `None` when slskd
-/// lists none. Ties keep the first entry so the choice is deterministic.
-pub(crate) fn best_match<'a>(
-    downloads: &'a [DownloadProgress],
-    source: &str,
-    filename: &str,
-) -> Option<&'a DownloadProgress> {
-    downloads
-        .iter()
-        .filter(|dl| dl.source == source && filenames_match(&dl.item, filename))
-        .min_by_key(|dl| std::cmp::Reverse(transfer_match_rank(&dl.state)))
-}
-
 /// Check if a download state indicates a terminal state (complete or failed).
 pub(crate) fn is_terminal_state(state: &DownloadState) -> bool {
     matches!(
