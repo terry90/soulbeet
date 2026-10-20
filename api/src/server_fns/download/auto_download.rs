@@ -4,7 +4,8 @@ use shared::download::DownloadQuery;
 
 #[cfg(feature = "server")]
 use shared::download::{
-    AutoDownloadEvent, DownloadEvent, DownloadProgress, DownloadableGroup, SearchState,
+    batch_folder, AutoDownloadEvent, DownloadEvent, DownloadProgress, DownloadableGroup,
+    EnqueueStatus, QueuedDownload, SearchState,
 };
 
 #[cfg(feature = "server")]
@@ -27,6 +28,8 @@ use crate::AuthSession;
 use super::failover::{align_pool_tracks, SourcePool};
 #[cfg(feature = "server")]
 use super::monitor::DownloadMonitor;
+#[cfg(feature = "server")]
+use super::not_enqueued_reason;
 
 /// Score threshold for automatic source selection (per D-04).
 /// Below this, the client gets FallbackToManual with results attached.
@@ -317,7 +320,8 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             }
         };
 
-        let queued = match backend.download(items).await {
+        let destination = batch_folder(&batch_label, &batch_id);
+        let queued = match backend.download(items, &destination).await {
             Ok(q) => q,
             Err(e) => {
                 let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
@@ -328,25 +332,30 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             }
         };
 
-        let (failed, successful): (Vec<_>, Vec<_>) =
-            queued.iter().cloned().partition(|d| d.error.is_some());
-
         // Send failed entries as progress events
-        if !failed.is_empty() {
-            let failed_entries: Vec<DownloadProgress> = failed
-                .iter()
-                .map(|d| {
+        let failed_entries: Vec<DownloadProgress> = queued
+            .iter()
+            .filter_map(|d| {
+                let reason = not_enqueued_reason(&d.status)?;
+                Some(
                     DownloadProgress::failed(
                         d.id.clone(),
                         d.source.clone(),
                         d.item.clone(),
-                        d.error.clone().unwrap_or_default(),
+                        reason,
                     )
-                    .with_batch(batch_id.clone(), batch_label.clone())
-                })
-                .collect();
+                    .with_batch(batch_id.clone(), batch_label.clone()),
+                )
+            })
+            .collect();
+        if !failed_entries.is_empty() {
             let _ = tx.send(DownloadEvent::Progress(failed_entries));
         }
+
+        let successful: Vec<QueuedDownload> = queued
+            .into_iter()
+            .filter(|d| d.status == EnqueueStatus::Enqueued)
+            .collect();
 
         if successful.is_empty() {
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
@@ -397,8 +406,8 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             tx,
             task_cancellation,
             task_username.clone(),
-            Some(batch_id),
-            Some(batch_label),
+            batch_id,
+            batch_label,
         )
         .with_failover(pool);
         monitor.run().await;

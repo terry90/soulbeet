@@ -12,6 +12,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
+    download::EnqueueStatus,
     metadata::{Album, Track},
     slskd::{AlbumResult, DownloadResponse, FileEntry, FlattenedFiles, SearchState, TrackResult},
 };
@@ -474,168 +475,60 @@ impl SoulseekClient {
         }
     }
 
-    pub async fn download(&self, req: Vec<TrackResult>) -> Result<Vec<DownloadResponse>> {
-        // Group by (username, destination) so every slskd batch can carry one
-        // explicit destination directory for all of its files.
-        let mut groups: HashMap<(String, Option<String>), Vec<DownloadRequestFile>> =
-            HashMap::new();
-
-        info!("Attempting to download: {} files...", req.len());
-
-        for req in req {
-            let destination = enqueue_destination(&req.base.filename);
-            let list = groups.entry((req.base.username, destination)).or_default();
-            if !list.iter().any(|f| f.filename == req.base.filename) {
-                list.push(DownloadRequestFile {
-                    filename: req.base.filename,
-                    size: req.base.size,
-                });
-            }
-        }
+    /// Enqueue `req` into `destination`, a folder under slskd's download
+    /// directory that every file of the call shares.
+    pub async fn download(
+        &self,
+        req: Vec<TrackResult>,
+        destination: &str,
+    ) -> Result<Vec<DownloadResponse>> {
+        info!(
+            "Attempting to download: {} files into {:?}",
+            req.len(),
+            destination
+        );
+        let config = &self.download_config;
+        let wanted = req
+            .into_iter()
+            .map(|r| {
+                (
+                    r.base.username,
+                    DownloadRequestFile {
+                        filename: r.base.filename,
+                        size: r.base.size,
+                    },
+                )
+            })
+            .collect();
 
         let mut results = Vec::new();
-        let config = &self.download_config;
-
-        for ((username, destination), file_requests) in groups {
-            let batches: Vec<_> = file_requests
-                .chunks(config.batch_size)
-                .map(|c| c.to_vec())
-                .collect();
-
-            info!(
-                "Downloading {} files from '{}' into {:?} in {} batches (batch size: {})",
-                file_requests.len(),
-                username,
-                destination,
-                batches.len(),
-                config.batch_size
-            );
-
-            for (batch_idx, batch) in batches.into_iter().enumerate() {
-                if batch_idx > 0 {
-                    debug!("Waiting {}ms before next batch", config.batch_delay_ms);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(config.batch_delay_ms))
-                        .await;
-                }
-
-                let batch_results = self
-                    .download_batch_with_retry(&username, destination.as_deref(), batch, batch_idx)
-                    .await;
-                results.extend(batch_results);
+        for batch in plan_batches(wanted, destination, config.batch_size) {
+            if batch.index > 0 {
+                debug!("Waiting {}ms before next batch", config.batch_delay_ms);
+                tokio::time::sleep(tokio::time::Duration::from_millis(config.batch_delay_ms)).await;
             }
+            results.extend(retry_batch(config, &batch, |b| self.send_download_batch(b)).await);
         }
-
         Ok(results)
     }
 
-    async fn download_batch_with_retry(
-        &self,
-        username: &str,
-        destination: Option<&str>,
-        batch: Vec<DownloadRequestFile>,
-        batch_idx: usize,
-    ) -> Vec<DownloadResponse> {
-        let config = &self.download_config;
-        // Cap exponential backoff at 30 seconds to prevent excessive waits
-        const MAX_BACKOFF_MS: u64 = 30_000;
-
-        let mut last_error: Option<SoulseekError> = None;
-
-        for attempt in 0..=config.max_retries {
-            if attempt > 0 {
-                let delay = std::cmp::min(
-                    config.retry_base_delay_ms * (1 << (attempt - 1)),
-                    MAX_BACKOFF_MS,
-                );
-                warn!(
-                    "Retrying batch {} for '{}' (attempt {}/{}), waiting {}ms",
-                    batch_idx, username, attempt, config.max_retries, delay
-                );
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
-            }
-
-            match self
-                .send_download_batch(username, destination, &batch, batch_idx)
-                .await
-            {
-                Ok(responses) => return responses,
-                Err(e) => {
-                    warn!(
-                        "Batch {} for '{}' attempt {} failed: {}",
-                        batch_idx, username, attempt, e
-                    );
-                    // Stop retrying for non-retryable errors (e.g. user offline)
-                    if !e.is_retryable() {
-                        warn!(
-                            "Batch {} for '{}': error is non-retryable, stopping",
-                            batch_idx, username
-                        );
-                        return batch
-                            .iter()
-                            .map(|f| DownloadResponse {
-                                username: username.to_string(),
-                                filename: f.filename.clone(),
-                                size: f.size as u64,
-                                error: Some(e.to_string()),
-                            })
-                            .collect();
-                    }
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        // All retries exhausted - return error responses for all files in batch
-        let error_msg = last_error
-            .map(|e| format!("Failed after {} retries: {}", config.max_retries, e))
-            .unwrap_or_else(|| format!("Failed after {} retries", config.max_retries));
-
-        warn!(
-            "Batch {} for '{}' failed after all retries: {}",
-            batch_idx, username, error_msg
-        );
-
-        batch
-            .iter()
-            .map(|f| DownloadResponse {
-                username: username.to_string(),
-                filename: f.filename.clone(),
-                size: f.size as u64,
-                error: Some(error_msg.clone()),
-            })
-            .collect()
-    }
-
-    async fn send_download_batch(
-        &self,
-        username: &str,
-        destination: Option<&str>,
-        batch: &[DownloadRequestFile],
-        batch_idx: usize,
-    ) -> Result<Vec<DownloadResponse>> {
+    async fn send_download_batch(&self, batch: &PendingBatch) -> Result<Vec<DownloadResponse>> {
         let url = self.base_url.join("api/v0/transfers/downloads/batches")?;
 
         info!(
-            "Sending batch {} to '{}': {} files",
-            batch_idx,
-            username,
-            batch.len()
+            "Sending batch {} ({}) to '{}': {} files",
+            batch.index,
+            batch.id,
+            batch.username,
+            batch.files.len()
         );
-        debug!("Batch payload: {:?}", batch);
-
-        let request = BatchEnqueueRequest {
-            username,
-            files: batch,
-            options: BatchEnqueueOptions {
-                destination: destination.map(str::to_string),
-            },
-        };
+        debug!("Batch payload: {:?}", batch.files);
 
         let response = self
             .client
             .post(url)
             .header("X-API-Key", self.api_key.as_deref().unwrap_or(""))
-            .json(&request)
+            .json(&batch.request())
             .send()
             .await?;
 
@@ -644,7 +537,7 @@ impl SoulseekClient {
 
         info!(
             "Batch {} response: status={}, body_len={}",
-            batch_idx,
+            batch.index,
             status,
             resp_text.len()
         );
@@ -654,9 +547,9 @@ impl SoulseekClient {
             // deliberately for blacklisted ones too. Matched on any status so
             // classification survives a future status-code change.
             if resp_text.to_lowercase().contains("appears to be offline") {
-                warn!("User '{}' is offline, not retrying", username);
+                warn!("User '{}' is offline, not retrying", batch.username);
                 return Err(SoulseekError::UserOffline {
-                    username: username.to_string(),
+                    username: batch.username.clone(),
                 });
             }
 
@@ -670,30 +563,26 @@ impl SoulseekClient {
                 });
             }
 
+            // An earlier attempt created this batch and its answer was lost.
+            if status.as_u16() == 409 {
+                warn!(
+                    "Batch {} already exists in slskd, reading its transfers back",
+                    batch.id
+                );
+                let listing = self
+                    .get_downloads_for_users(std::slice::from_ref(&batch.username))
+                    .await?;
+                return Ok(replayed_batch_responses(batch, &listing));
+            }
+
             return Err(SoulseekError::Api {
                 status: status.as_u16(),
                 message: resp_text,
             });
         }
 
-        parse_batch_enqueue_response(username, batch, &resp_text)
+        parse_batch_enqueue_response(&batch.username, &batch.files, &resp_text)
     }
-
-    /// Everything that cannot appear literally in one URL path segment.
-    /// Soulseek usernames are free-form, so a peer called `a/b` or `x?y`
-    /// would otherwise re-point the request at a different route.
-    const PATH_SEGMENT: &'static AsciiSet = &CONTROLS
-        .add(b' ')
-        .add(b'"')
-        .add(b'#')
-        .add(b'%')
-        .add(b'/')
-        .add(b'<')
-        .add(b'>')
-        .add(b'?')
-        .add(b'`')
-        .add(b'{')
-        .add(b'}');
 
     /// Every transfer slskd holds, across every peer.
     ///
@@ -750,10 +639,7 @@ impl SoulseekClient {
         let mut errors: Vec<String> = Vec::new();
 
         for username in requested {
-            let endpoint = format!(
-                "transfers/downloads/{}",
-                utf8_percent_encode(username, Self::PATH_SEGMENT)
-            );
+            let endpoint = user_downloads_endpoint(username);
             let flattened: FlattenedFiles =
                 match self.make_request(Method::GET, &endpoint, None::<()>).await {
                     Ok(flattened) => flattened,
@@ -775,10 +661,13 @@ impl SoulseekClient {
         download_id: &str,
         remove: bool,
     ) -> Result<()> {
-        let endpoint = format!("transfers/downloads/{username}/{download_id}?remove={remove}");
         info!("Cancelling download: {}", download_id);
-        self.make_request(Method::DELETE, &endpoint, None::<()>)
-            .await
+        self.make_request(
+            Method::DELETE,
+            &transfer_endpoint(username, download_id, remove),
+            None::<()>,
+        )
+        .await
     }
 
     pub async fn delete_search(&self, search_id: &str) -> Result<()> {
@@ -886,23 +775,210 @@ impl SoulseekClient {
     }
 }
 
-/// The explicit slskd batch destination for a remote file: the sanitized name
-/// of its parent directory. Pinning it at enqueue time puts the file at
-/// `<downloads>/<destination>/<file>` regardless of the server's
-/// `transfers.download.destination.subdirectory` pattern, which is exactly
-/// where `resolve_download_path`'s primary strategy looks.
-fn enqueue_destination(filename: &str) -> Option<String> {
-    let normalized = filename.replace('\\', "/");
-    let components: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-    if components.len() >= 2 {
-        // slskd rejects an empty destination, so a bare filename sends none
-        // and falls back to the server-side pattern.
-        Some(shared::slskd::sanitize_filename(
-            components[components.len() - 2],
-        ))
-    } else {
-        None
+/// Everything that cannot appear literally in one URL path segment.
+/// Soulseek usernames are free-form, so a peer called `a/b` or `x?y`
+/// would otherwise re-point the request at a different route.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
+
+/// slskd's exact answer for a file it already has an unfinished transfer
+/// of (`DownloadService.EnqueueAsync`).
+const ALREADY_IN_PROGRESS: &str = "Skipped: Already in progress";
+
+fn user_downloads_endpoint(username: &str) -> String {
+    format!(
+        "transfers/downloads/{}",
+        utf8_percent_encode(username, PATH_SEGMENT)
+    )
+}
+
+fn transfer_endpoint(username: &str, id: &str, remove: bool) -> String {
+    format!(
+        "{}/{}?remove={remove}",
+        user_downloads_endpoint(username),
+        utf8_percent_encode(id, PATH_SEGMENT)
+    )
+}
+
+/// One POST to slskd's batch endpoint. The id is fixed when the batch is
+/// planned, so every retry of it sends the same one.
+struct PendingBatch {
+    id: String,
+    username: String,
+    destination: String,
+    files: Vec<DownloadRequestFile>,
+    /// Position among this user's batches; the first is sent without delay.
+    index: usize,
+}
+
+impl PendingBatch {
+    fn request(&self) -> BatchEnqueueRequest<'_> {
+        BatchEnqueueRequest {
+            id: &self.id,
+            username: &self.username,
+            files: &self.files,
+            options: BatchEnqueueOptions {
+                destination: &self.destination,
+            },
+        }
     }
+
+    /// The same answer for every file of the batch.
+    fn responses(&self, status: EnqueueStatus) -> Vec<DownloadResponse> {
+        self.files
+            .iter()
+            .map(|f| DownloadResponse {
+                username: self.username.clone(),
+                filename: f.filename.clone(),
+                size: f.size as u64,
+                transfer_id: None,
+                status: status.clone(),
+            })
+            .collect()
+    }
+}
+
+/// Split one call into slskd batches: one user per batch, at most
+/// `batch_size` files each, all into `destination`. Users keep the order of
+/// their first file, and a file asked for twice is sent once.
+fn plan_batches(
+    wanted: Vec<(String, DownloadRequestFile)>,
+    destination: &str,
+    batch_size: usize,
+) -> Vec<PendingBatch> {
+    let mut per_user: Vec<(String, Vec<DownloadRequestFile>)> = Vec::new();
+    for (username, file) in wanted {
+        let at = match per_user.iter().position(|(u, _)| *u == username) {
+            Some(at) => at,
+            None => {
+                per_user.push((username, Vec::new()));
+                per_user.len() - 1
+            }
+        };
+        let files = &mut per_user[at].1;
+        if !files.iter().any(|f| f.filename == file.filename) {
+            files.push(file);
+        }
+    }
+
+    per_user
+        .into_iter()
+        .flat_map(|(username, files)| {
+            files
+                .chunks(batch_size.max(1))
+                .enumerate()
+                .map(|(index, chunk)| PendingBatch {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    username: username.clone(),
+                    destination: destination.to_string(),
+                    files: chunk.to_vec(),
+                    index,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Send `batch` through `send`, retrying retryable errors with exponential
+/// backoff. Every attempt sends the same batch, so the same client id.
+async fn retry_batch<'b, F, Fut>(
+    config: &DownloadConfig,
+    batch: &'b PendingBatch,
+    mut send: F,
+) -> Vec<DownloadResponse>
+where
+    F: FnMut(&'b PendingBatch) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<DownloadResponse>>>,
+{
+    // Cap exponential backoff at 30 seconds to prevent excessive waits
+    const MAX_BACKOFF_MS: u64 = 30_000;
+
+    let mut last_error: Option<SoulseekError> = None;
+
+    for attempt in 0..=config.max_retries {
+        if attempt > 0 {
+            let delay = std::cmp::min(
+                config.retry_base_delay_ms * (1 << (attempt - 1)),
+                MAX_BACKOFF_MS,
+            );
+            warn!(
+                "Retrying batch {} for '{}' (attempt {}/{}), waiting {}ms",
+                batch.index, batch.username, attempt, config.max_retries, delay
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+        }
+
+        match send(batch).await {
+            Ok(responses) => return responses,
+            Err(e) => {
+                warn!(
+                    "Batch {} for '{}' attempt {} failed: {}",
+                    batch.index, batch.username, attempt, e
+                );
+                // Stop retrying for non-retryable errors (e.g. user offline)
+                if !e.is_retryable() {
+                    warn!(
+                        "Batch {} for '{}': error is non-retryable, stopping",
+                        batch.index, batch.username
+                    );
+                    return batch.responses(EnqueueStatus::Failed(e.to_string()));
+                }
+                last_error = Some(e);
+            }
+        }
+    }
+
+    let error_msg = last_error
+        .map(|e| format!("Failed after {} retries: {}", config.max_retries, e))
+        .unwrap_or_else(|| format!("Failed after {} retries", config.max_retries));
+
+    warn!(
+        "Batch {} for '{}' failed after all retries: {}",
+        batch.index, batch.username, error_msg
+    );
+
+    batch.responses(EnqueueStatus::Failed(error_msg))
+}
+
+/// Answers for a batch slskd already holds (409 on a retried POST): its own
+/// transfers, found by batch id and exact filename, are enqueued. A file the
+/// first attempt did not enqueue cannot be told apart from one that failed,
+/// so it is reported failed.
+fn replayed_batch_responses(batch: &PendingBatch, listing: &[FileEntry]) -> Vec<DownloadResponse> {
+    batch
+        .files
+        .iter()
+        .map(|file| {
+            let transfer = listing.iter().find(|t| {
+                t.filename == file.filename
+                    && t.batch_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&batch.id))
+            });
+            DownloadResponse {
+                username: batch.username.clone(),
+                filename: file.filename.clone(),
+                size: file.size as u64,
+                transfer_id: transfer.map(|t| t.id.clone()),
+                status: match transfer {
+                    Some(_) => EnqueueStatus::Enqueued,
+                    None => EnqueueStatus::Failed(
+                        "Not found in slskd after a retried enqueue".to_string(),
+                    ),
+                },
+            }
+        })
+        .collect()
 }
 
 /// Map slskd's batch enqueue response (201 all enqueued, 207 partial,
@@ -922,35 +998,30 @@ fn parse_batch_enqueue_response(
     Ok(batch
         .iter()
         .map(|file| {
-            let enqueued = parsed
+            let transfer = parsed
                 .batch
                 .transfers
                 .iter()
-                .any(|t| t.filename == file.filename);
-            let failure = parsed
-                .failures
-                .iter()
-                .find(|f| f.filename == file.filename);
+                .find(|t| t.filename == file.filename);
+            let failure = parsed.failures.iter().find(|f| f.filename == file.filename);
 
-            let error = if enqueued {
-                None
-            } else if let Some(failure) = failure {
-                // slskd reports an already-queued file as a per-file failure,
-                // but for Soulful that transfer is live and will be monitored.
-                if failure.message.contains("Already in progress") {
-                    None
-                } else {
-                    Some(failure.message.clone())
+            let status = match (transfer, failure) {
+                (Some(_), _) => EnqueueStatus::Enqueued,
+                (None, Some(f)) if f.message == ALREADY_IN_PROGRESS => {
+                    EnqueueStatus::AlreadyInFlight
                 }
-            } else {
-                Some("Not reported in slskd enqueue response".to_string())
+                (None, Some(f)) => EnqueueStatus::Failed(f.message.clone()),
+                (None, None) => {
+                    EnqueueStatus::Failed("Not reported in slskd enqueue response".to_string())
+                }
             };
 
             DownloadResponse {
                 username: username.to_string(),
                 filename: file.filename.clone(),
                 size: file.size as u64,
-                error,
+                transfer_id: transfer.map(|t| t.id.clone()),
+                status,
             }
         })
         .collect())
@@ -985,13 +1056,14 @@ impl crate::DownloadBackend for SoulseekClient {
     async fn download(
         &self,
         items: Vec<shared::download::DownloadableItem>,
+        destination: &str,
     ) -> Result<Vec<shared::download::QueuedDownload>> {
         let tracks: Vec<TrackResult> = items
             .into_iter()
             .filter_map(|item| item.to_slskd_track())
             .collect();
 
-        let responses = self.download(tracks).await?;
+        let responses = self.download(tracks, destination).await?;
         Ok(responses.into_iter().map(Into::into).collect())
     }
 
@@ -1031,6 +1103,7 @@ impl crate::DownloadBackend for SoulseekClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::download::EnqueueStatus;
 
     fn batch(files: &[&str]) -> Vec<DownloadRequestFile> {
         files
@@ -1043,11 +1116,12 @@ mod tests {
     }
 
     /// Response shape as slskd 0.26 emits it: batch record with the enqueued
-    /// transfers attached, failures as real {filename, message} records.
-    fn body(transfers: &[&str], failures: &[(&str, &str)]) -> String {
+    /// `(filename, transfer id)` pairs attached, failures as real
+    /// {filename, message} records.
+    fn body(transfers: &[(&str, &str)], failures: &[(&str, &str)]) -> String {
         let transfers: Vec<_> = transfers
             .iter()
-            .map(|f| serde_json::json!({ "id": "11111111-2222-3333-4444-555555555555", "filename": f }))
+            .map(|(f, id)| serde_json::json!({ "id": id, "filename": f }))
             .collect();
         let failures: Vec<_> = failures
             .iter()
@@ -1073,10 +1147,10 @@ mod tests {
         let results = parse_batch_enqueue_response(
             "peer",
             &files,
-            &body(&[r"a\album\1.mp3", r"a\album\2.mp3"], &[]),
+            &body(&[(r"a\album\1.mp3", "t1"), (r"a\album\2.mp3", "t2")], &[]),
         )
         .unwrap();
-        assert!(results.iter().all(|r| r.error.is_none()));
+        assert!(results.iter().all(|r| r.status == EnqueueStatus::Enqueued));
         assert_eq!(results.len(), 2);
     }
 
@@ -1087,14 +1161,18 @@ mod tests {
             "peer",
             &files,
             &body(
-                &[r"a\album\1.mp3"],
+                &[(r"a\album\1.mp3", "t1")],
                 &[(r"a\album\2.mp3", "Error: something broke")],
             ),
         )
         .unwrap();
-        assert!(results[0].error.is_none());
+        assert_eq!(results[0].status, EnqueueStatus::Enqueued);
         assert_eq!(results[1].filename, r"a\album\2.mp3");
-        assert_eq!(results[1].error.as_deref(), Some("Error: something broke"));
+        assert_eq!(
+            results[1].status,
+            EnqueueStatus::Failed("Error: something broke".into())
+        );
+        assert_eq!(results[1].transfer_id, None);
     }
 
     #[test]
@@ -1106,11 +1184,14 @@ mod tests {
             &body(&[], &[(r"a\album\1.mp3", "Error: rejected")]),
         )
         .unwrap();
-        assert_eq!(results[0].error.as_deref(), Some("Error: rejected"));
+        assert_eq!(
+            results[0].status,
+            EnqueueStatus::Failed("Error: rejected".into())
+        );
     }
 
     #[test]
-    fn already_in_progress_is_success() {
+    fn already_in_progress_is_already_in_flight() {
         let files = batch(&[r"a\album\1.mp3"]);
         let results = parse_batch_enqueue_response(
             "peer",
@@ -1118,7 +1199,33 @@ mod tests {
             &body(&[], &[(r"a\album\1.mp3", "Skipped: Already in progress")]),
         )
         .unwrap();
-        assert!(results[0].error.is_none());
+        assert_eq!(results[0].status, EnqueueStatus::AlreadyInFlight);
+        assert_eq!(results[0].transfer_id, None);
+    }
+
+    #[test]
+    fn a_near_miss_message_is_a_failure() {
+        let files = batch(&[r"a\album\1.mp3"]);
+        let results = parse_batch_enqueue_response(
+            "peer",
+            &files,
+            &body(&[], &[(r"a\album\1.mp3", "Already in progress")]),
+        )
+        .unwrap();
+        assert_eq!(
+            results[0].status,
+            EnqueueStatus::Failed("Already in progress".into())
+        );
+    }
+
+    #[test]
+    fn enqueued_transfer_carries_its_id() {
+        let files = batch(&[r"a\album\1.mp3"]);
+        let results =
+            parse_batch_enqueue_response("peer", &files, &body(&[(r"a\album\1.mp3", "abc")], &[]))
+                .unwrap();
+        assert_eq!(results[0].status, EnqueueStatus::Enqueued);
+        assert_eq!(results[0].transfer_id.as_deref(), Some("abc"));
     }
 
     #[test]
@@ -1126,8 +1233,8 @@ mod tests {
         let files = batch(&[r"a\album\1.mp3"]);
         let results = parse_batch_enqueue_response("peer", &files, &body(&[], &[])).unwrap();
         assert_eq!(
-            results[0].error.as_deref(),
-            Some("Not reported in slskd enqueue response")
+            results[0].status,
+            EnqueueStatus::Failed("Not reported in slskd enqueue response".into())
         );
     }
 
@@ -1141,7 +1248,7 @@ mod tests {
         })
         .to_string();
         let results = parse_batch_enqueue_response("peer", &files, &body).unwrap();
-        assert_eq!(results[0].error.as_deref(), Some("Error: x"));
+        assert_eq!(results[0].status, EnqueueStatus::Failed("Error: x".into()));
     }
 
     #[test]
@@ -1152,15 +1259,127 @@ mod tests {
     }
 
     #[test]
-    fn destination_is_the_sanitized_parent_directory() {
+    fn transfer_endpoint_encodes_the_username() {
         assert_eq!(
-            enqueue_destination(r"@@abcde\Music\Artist - Album\01 - track.mp3"),
-            Some("Artist - Album".to_string())
+            transfer_endpoint("a/b c", "id1", true),
+            "transfers/downloads/a%2Fb%20c/id1?remove=true"
         );
         assert_eq!(
-            enqueue_destination(r"music\AC: DC\1.mp3"),
-            Some("AC_ DC".to_string())
+            user_downloads_endpoint("a/b c"),
+            "transfers/downloads/a%2Fb%20c"
         );
-        assert_eq!(enqueue_destination("loose_track.mp3"), None);
+    }
+
+    fn wanted(username: &str, filename: &str) -> (String, DownloadRequestFile) {
+        (
+            username.to_string(),
+            DownloadRequestFile {
+                filename: filename.to_string(),
+                size: 1000,
+            },
+        )
+    }
+
+    #[test]
+    fn every_file_of_a_call_shares_the_destination() {
+        let batches = plan_batches(
+            vec![
+                wanted("peer", r"music\Album A\01.flac"),
+                wanted("peer", r"other\Album B\02.flac"),
+            ],
+            "Album A [12345678]",
+            3,
+        );
+
+        assert_eq!(
+            batches.len(),
+            1,
+            "one batch per user, not per remote folder"
+        );
+        let request = serde_json::to_value(batches[0].request()).unwrap();
+        assert_eq!(request["username"], "peer");
+        assert_eq!(request["files"].as_array().unwrap().len(), 2);
+        assert_eq!(request["options"]["destination"], "Album A [12345678]");
+    }
+
+    #[tokio::test]
+    async fn a_retried_batch_reuses_its_client_id() {
+        let batches = plan_batches(vec![wanted("peer", r"music\A\01.flac")], "A [1]", 3);
+        let config = DownloadConfig {
+            batch_size: 3,
+            batch_delay_ms: 0,
+            max_retries: 3,
+            retry_base_delay_ms: 0,
+        };
+        let mut sent: Vec<serde_json::Value> = Vec::new();
+
+        let results = retry_batch(&config, &batches[0], |b| {
+            sent.push(serde_json::to_value(b.request()).unwrap());
+            let first = sent.len() == 1;
+            async move {
+                if first {
+                    Err(SoulseekError::Api {
+                        status: 502,
+                        message: "bad gateway".into(),
+                    })
+                } else {
+                    Ok(vec![])
+                }
+            }
+        })
+        .await;
+
+        assert!(results.is_empty());
+        assert_eq!(sent.len(), 2, "the transport error was retried");
+        assert!(sent[0]["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(sent[0]["id"], sent[1]["id"]);
+    }
+
+    fn listed(id: &str, filename: &str, batch_id: Option<&str>) -> FileEntry {
+        let mut entry = serde_json::json!({
+            "id": id,
+            "username": "peer",
+            "direction": "Download",
+            "filename": filename,
+            "size": 1000,
+            "state": "InProgress",
+            "requestedAt": "2026-07-26T00:00:00Z",
+            "bytesTransferred": 0,
+            "percentComplete": 0.0
+        });
+        if let Some(batch_id) = batch_id {
+            entry["batchId"] = batch_id.into();
+        }
+        serde_json::from_value(entry).unwrap()
+    }
+
+    #[test]
+    fn a_replayed_batch_takes_only_its_own_transfers() {
+        let batches = plan_batches(
+            vec![
+                wanted("peer", r"music\A\01.flac"),
+                wanted("peer", r"music\A\02.flac"),
+            ],
+            "A [1]",
+            3,
+        );
+        let ours = batches[0].id.to_uppercase();
+        // 01 was enqueued by the attempt whose answer was lost. 02 failed in
+        // that attempt because another batch was already fetching it.
+        let listing = vec![
+            listed("t-01", r"music\A\01.flac", Some(&ours)),
+            listed(
+                "t-other",
+                r"music\A\02.flac",
+                Some("ffffffff-0000-0000-0000-000000000000"),
+            ),
+        ];
+
+        let results = replayed_batch_responses(&batches[0], &listing);
+
+        assert_eq!(results[0].status, EnqueueStatus::Enqueued);
+        assert_eq!(results[0].transfer_id.as_deref(), Some("t-01"));
+        assert!(matches!(results[1].status, EnqueueStatus::Failed(_)));
+        assert_eq!(results[1].transfer_id, None);
     }
 }

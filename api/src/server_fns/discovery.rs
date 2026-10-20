@@ -49,6 +49,8 @@ use crate::server_fns::download::failover::{self, SourcePool};
 #[cfg(feature = "server")]
 use crate::server_fns::download::monitor::{best_match, FAILED_STATE_CONFIRM};
 #[cfg(feature = "server")]
+use crate::server_fns::download::not_enqueued_reason;
+#[cfg(feature = "server")]
 use crate::AuthSession;
 
 #[cfg(feature = "server")]
@@ -299,6 +301,9 @@ struct QueuedTrack {
     /// every retry.
     slskd_source: String,
     slskd_filename: String,
+    /// The folder under slskd's download directory this track's transfers
+    /// are enqueued into, its own for every attempt.
+    destination: String,
     /// When this track's transfer was first seen failed, cleared the moment
     /// it is seen in any other state.
     failing_since: Option<tokio::time::Instant>,
@@ -397,7 +402,7 @@ async fn settle_poll(
             }
             Outcome::Failed => {
                 let qt = &mut queued[*idx];
-                let retried = match qt.pool.enqueue_next(0, backend).await {
+                let retried = match qt.pool.enqueue_next(0, backend, &qt.destination).await {
                     Some(next) => {
                         info!(
                             "Discovery: '{}' - {} failed from {}, retrying from {}",
@@ -703,31 +708,39 @@ pub async fn generate_discovery_playlist_internal(
                 // Keep the sources this track is allowed to try: the one
                 // enqueued here plus the alternates phase 2 fails over to.
                 ranked_items.truncate(failover::MAX_SOURCES_PER_TRACK);
+                let destination = shared::download::batch_folder(
+                    &format!("{} - {}", candidate.artist, candidate.track),
+                    &uuid::Uuid::new_v4().to_string(),
+                );
                 let mut downloaded = false;
                 for (attempt_idx, item) in ranked_items.iter().enumerate() {
-                    let download_results = match backend.download(vec![item.clone()]).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            if attempt_idx + 1 < ranked_items.len() {
-                                info!(
-                                    "Download source {} failed for '{}' - {}, trying next: {}",
-                                    attempt_idx + 1,
-                                    candidate.artist,
-                                    candidate.track,
-                                    e
-                                );
-                            } else {
-                                warn!(
-                                    "Download failed for '{}' - {} (all sources exhausted): {}",
-                                    candidate.artist, candidate.track, e
-                                );
+                    let download_results =
+                        match backend.download(vec![item.clone()], &destination).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                if attempt_idx + 1 < ranked_items.len() {
+                                    info!(
+                                        "Download source {} failed for '{}' - {}, trying next: {}",
+                                        attempt_idx + 1,
+                                        candidate.artist,
+                                        candidate.track,
+                                        e
+                                    );
+                                } else {
+                                    warn!(
+                                        "Download failed for '{}' - {} (all sources exhausted): {}",
+                                        candidate.artist, candidate.track, e
+                                    );
+                                }
+                                stats.downloads_failed += 1;
+                                continue;
                             }
-                            stats.downloads_failed += 1;
-                            continue;
-                        }
-                    };
+                        };
 
-                    if let Some(dl) = download_results.iter().find(|dl| dl.error.is_none()) {
+                    if let Some(dl) = download_results
+                        .iter()
+                        .find(|dl| dl.status == shared::download::EnqueueStatus::Enqueued)
+                    {
                         stats.downloads_queued += 1;
                         seen.insert(key.clone());
                         queued.push(QueuedTrack {
@@ -736,6 +749,7 @@ pub async fn generate_discovery_playlist_internal(
                             album: candidate.album.clone(),
                             slskd_source: dl.source.clone(),
                             slskd_filename: dl.item.clone(),
+                            destination: destination.clone(),
                             failing_since: None,
                             // Start the pool at the source that actually
                             // enqueued: earlier entries were already tried and
@@ -752,14 +766,19 @@ pub async fn generate_discovery_playlist_internal(
                         downloaded = true;
                         break;
                     }
-                    // This source returned an error in the response
+                    // This source refused the file in its response
                     stats.downloads_failed += 1;
                     if attempt_idx + 1 < ranked_items.len() {
+                        let reason = download_results
+                            .iter()
+                            .find_map(|dl| not_enqueued_reason(&dl.status))
+                            .unwrap_or_else(|| "nothing enqueued".to_string());
                         info!(
-                            "Download source {} errored for '{}' - {}, trying next",
+                            "Download source {} refused '{}' - {} ({}), trying next",
                             attempt_idx + 1,
                             candidate.artist,
-                            candidate.track
+                            candidate.track,
+                            reason
                         );
                     }
                 }
@@ -887,11 +906,14 @@ pub async fn generate_discovery_playlist_internal(
                 )
                 .await;
 
-                let resolved = crate::server_fns::download::utils::resolve_download_path(
+                let resolved = crate::server_fns::download::process::resolve_on_disk(
                     &qt.slskd_filename,
                     &download_base,
-                );
-                let src_path = match resolved {
+                    Some(&qt.destination),
+                    &std::collections::HashSet::new(),
+                )
+                .await;
+                let src = match resolved {
                     Some(p) => p,
                     None => {
                         warn!(
@@ -903,7 +925,6 @@ pub async fn generate_discovery_playlist_internal(
                     }
                 };
 
-                let src = std::path::PathBuf::from(&src_path);
                 let outcome = IMPORT_QUEUE
                     .submit(ImportJob {
                         sources: vec![src.clone()],
@@ -1490,6 +1511,7 @@ mod tests {
             album: Some("Come Over".to_string()),
             slskd_source: items[0].source.clone(),
             slskd_filename: items[0].id.clone(),
+            destination: "Kowloon - Wake Up [12345678]".to_string(),
             failing_since: None,
             pool: SourcePool::single(items),
         }

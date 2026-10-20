@@ -44,7 +44,13 @@ pub trait DownloadBackend: Send + Sync {
 
     async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String>;
     async fn poll_search(&self, search_id: &str) -> Result<SearchResult>;
-    async fn download(&self, items: Vec<DownloadableItem>) -> Result<Vec<QueuedDownload>>;
+    /// Enqueue `items` into `destination`, a folder under the backend's
+    /// download directory shared by every item of the call.
+    async fn download(
+        &self,
+        items: Vec<DownloadableItem>,
+        destination: &str,
+    ) -> Result<Vec<QueuedDownload>>;
     /// Transfers held for the given peers. Scoped rather than global: the
     /// backend's full list grows with its whole history, and every caller
     /// here is waiting on a specific batch (#78). This is the polling path.

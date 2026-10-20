@@ -4,18 +4,19 @@
 //! handles per-track timeouts, and triggers processing when downloads complete.
 
 use dioxus::logger::tracing::{debug, info, warn};
-use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
+use shared::download::{batch_folder, DownloadEvent, DownloadProgress, DownloadState};
 use soulbeet::error::SoulseekError;
 use soulbeet::DownloadBackend;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
-use super::process::submit_imports;
+use super::process::{submit_imports, Handoff};
 use crate::config::CONFIG;
 use crate::services::download_backend;
 
@@ -104,6 +105,10 @@ impl TrackState {
 struct TrackedFile {
     source: String,
     filename: String,
+    /// The batch folder the transfer was enqueued into, or `None` for a
+    /// transfer this batch adopted from another peer, which slskd saves
+    /// wherever its own enqueue said.
+    destination: Option<String>,
 }
 
 /// Monitors download progress from slskd and triggers processing on completion.
@@ -125,9 +130,16 @@ pub struct DownloadMonitor {
     /// Whose rows these are; imports report to this user's channel.
     username: String,
     /// Batch identifier for grouping downloads.
-    batch_id: Option<String>,
+    batch_id: String,
     /// Human-readable batch label (album name).
-    batch_label: Option<String>,
+    batch_label: String,
+    /// The batch's folder under the download directory, which every
+    /// transfer of the batch is enqueued into.
+    destination: String,
+    /// slskd's download directory as this server sees it.
+    download_base: PathBuf,
+    /// Files already handed to the import queue.
+    claimed: Arc<Mutex<HashSet<PathBuf>>>,
     /// When slskd's transfer list was last read successfully. Every other
     /// deadline is evaluated from a readable list, so this one bounds the
     /// case where no list is readable at all.
@@ -135,7 +147,8 @@ pub struct DownloadMonitor {
 }
 
 impl DownloadMonitor {
-    /// Create a new download monitor.
+    /// Create a new download monitor. The transfers must have been enqueued
+    /// into `batch_folder(&batch_label, &batch_id)`.
     pub fn new(
         sources: Vec<String>,
         filenames: Vec<String>,
@@ -143,13 +156,18 @@ impl DownloadMonitor {
         tx: broadcast::Sender<DownloadEvent>,
         cancellation_token: CancellationToken,
         username: String,
-        batch_id: Option<String>,
-        batch_label: Option<String>,
+        batch_id: String,
+        batch_label: String,
     ) -> Self {
+        let destination = batch_folder(&batch_label, &batch_id);
         let tracked_files: Vec<TrackedFile> = sources
             .into_iter()
             .zip(filenames.iter().cloned())
-            .map(|(source, filename)| TrackedFile { source, filename })
+            .map(|(source, filename)| TrackedFile {
+                source,
+                filename,
+                destination: Some(destination.clone()),
+            })
             .collect();
 
         let track_states = (0..tracked_files.len())
@@ -167,7 +185,20 @@ impl DownloadMonitor {
             username,
             batch_id,
             batch_label,
+            destination,
+            download_base: CONFIG.download_path().clone(),
+            claimed: Arc::new(Mutex::new(HashSet::new())),
             last_readable_poll: Instant::now(),
+        }
+    }
+
+    /// Where this batch's finished files go next.
+    fn handoff(&self) -> Handoff {
+        Handoff {
+            target: self.target_path.clone(),
+            username: self.username.clone(),
+            download_base: self.download_base.clone(),
+            claimed: Arc::clone(&self.claimed),
         }
     }
 
@@ -244,7 +275,7 @@ impl DownloadMonitor {
         let Some(pool) = self.pool.as_mut() else {
             return false;
         };
-        let Some(queued) = pool.enqueue_next(slot, backend).await else {
+        let Some(queued) = pool.enqueue_next(slot, backend, &self.destination).await else {
             return false;
         };
 
@@ -270,13 +301,14 @@ impl DownloadMonitor {
             TrackedFile {
                 source: queued.source.clone(),
                 filename: queued.item.clone(),
+                destination: Some(self.destination.clone()),
             },
         )
         .filename;
         self.track_states[slot] = TrackState::bound_now();
 
         let entry = DownloadProgress::queued(queued.id, queued.source, queued.item, queued.size);
-        let entry = self.stamp_batch(vec![entry]).remove(0);
+        let entry = self.stamp(entry);
         // One slot is still one download, so the panel replaces the abandoned
         // peer's row instead of gaining a second one for the same track.
         let _ = self.tx.send(DownloadEvent::Replaced {
@@ -603,6 +635,7 @@ impl DownloadMonitor {
                 tracked.filename, new_source, tracked.source
             );
             tracked.source = new_source;
+            tracked.destination = None;
             // Reset state so the retried transfer is monitored and imported
             self.track_states[idx] = TrackState::bound_now();
         }
@@ -638,15 +671,14 @@ impl DownloadMonitor {
         }
     }
 
+    /// Apply batch_id and batch_label to a progress entry.
+    fn stamp(&self, entry: DownloadProgress) -> DownloadProgress {
+        entry.with_batch(self.batch_id.clone(), self.batch_label.clone())
+    }
+
     /// Apply batch_id and batch_label to a set of progress entries.
-    fn stamp_batch(&self, mut entries: Vec<DownloadProgress>) -> Vec<DownloadProgress> {
-        if self.batch_id.is_some() || self.batch_label.is_some() {
-            for entry in &mut entries {
-                entry.batch_id.clone_from(&self.batch_id);
-                entry.batch_label.clone_from(&self.batch_label);
-            }
-        }
-        entries
+    fn stamp_batch(&self, entries: Vec<DownloadProgress>) -> Vec<DownloadProgress> {
+        entries.into_iter().map(|entry| self.stamp(entry)).collect()
     }
 
     /// Process each track, handling timeouts and completions.
@@ -701,12 +733,9 @@ impl DownloadMonitor {
                     download.item
                 );
                 self.track_states[slot].processed = true;
-                let rows = self.stamp_batch(vec![download.clone()]);
-                tokio::spawn(submit_imports(
-                    rows,
-                    self.target_path.clone(),
-                    self.username.clone(),
-                ));
+                let row = self.stamp(download.clone());
+                let destination = self.tracked_files[slot].destination.clone();
+                tokio::spawn(submit_imports(vec![(row, destination)], self.handoff()));
             }
 
             // Mark terminal failures (errored/cancelled/aborted) as
@@ -886,16 +915,14 @@ impl DownloadMonitor {
 
     /// Process all successful downloads together in album mode.
     async fn process_album_mode(&mut self, batch_status: &[DownloadProgress]) {
-        let successful: Vec<_> = batch_status
+        let successful: Vec<(DownloadProgress, Option<String>)> = batch_status
             .iter()
-            .filter(|d| {
-                is_completed(&d.state)
-                    && self
-                        .slot_for_item(&d.item)
-                        .map(|slot| !self.track_states[slot].processed)
-                        .unwrap_or(false)
+            .filter(|d| is_completed(&d.state))
+            .filter_map(|d| {
+                let slot = self.slot_for_item(&d.item)?;
+                (!self.track_states[slot].processed)
+                    .then(|| (d.clone(), self.tracked_files[slot].destination.clone()))
             })
-            .cloned()
             .collect();
 
         if !successful.is_empty() {
@@ -903,8 +930,11 @@ impl DownloadMonitor {
                 "Album mode: Processing {} successful downloads together",
                 successful.len()
             );
-            let rows = self.stamp_batch(successful);
-            submit_imports(rows, self.target_path.clone(), self.username.clone()).await;
+            let rows = successful
+                .into_iter()
+                .map(|(row, destination)| (self.stamp(row), destination))
+                .collect();
+            submit_imports(rows, self.handoff()).await;
         } else {
             info!("Album mode: No successful downloads to process");
         }
@@ -1016,7 +1046,7 @@ pub fn filenames_match(a: &str, b: &str) -> bool {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use crate::server_fns::download::test_support::{item, ScriptedOutcome, StubBackend};
+    use crate::server_fns::download::test_support::{item, transfer, ScriptedOutcome, StubBackend};
     use tokio::sync::broadcast;
 
     /// An instant `d` in the past, so a test can reach the monitor's
@@ -1087,8 +1117,8 @@ mod tests {
             tx,
             CancellationToken::new(),
             "tester".to_string(),
-            None,
-            None,
+            "12345678-aaaa-bbbb-cccc-ddddeeeeffff".to_string(),
+            "X".to_string(),
         )
     }
 
@@ -1122,6 +1152,70 @@ mod tests {
         assert_eq!(
             stub.cancelled(),
             vec![("peer_a".to_string(), "dirA/aaa.flac".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failover_enqueues_into_the_batch_folder_and_its_row_carries_the_transfer_id() {
+        let (mut m, mut rx) = failover_monitor();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        let dead = transfer(
+            "peer_a",
+            "dirA/aaa.flac",
+            "t-1",
+            DownloadState::Failed("peer went away".into()),
+        );
+        m.process_tracks(&[dead], &backend).await;
+
+        assert_eq!(stub.destinations(), vec!["X [12345678]".to_string()]);
+        assert_eq!(
+            m.tracked_files[0].destination.as_deref(),
+            Some("X [12345678]")
+        );
+        match rx.try_recv().expect("an event for the retry") {
+            DownloadEvent::Replaced { entry, .. } => {
+                // A cancel from this row must reach slskd by transfer id.
+                assert_eq!(entry.id, "t-dirB/bbb.flac");
+                assert_eq!(
+                    entry.batch_id.as_deref(),
+                    Some("12345678-aaaa-bbbb-cccc-ddddeeeeffff")
+                );
+            }
+            other => panic!("expected a row replacement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_adopted_transfer_is_not_looked_for_in_the_batch_folder() {
+        // Another peer's live transfer of the file was not enqueued by this
+        // batch, so slskd saves it wherever its own enqueue said.
+        let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let retried = transfer("peer_b", "dirA/aaa.flac", "t-b", DownloadState::InProgress);
+
+        m.find_matching_downloads(&[retried]);
+
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+        assert_eq!(m.tracked_files[0].destination, None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_this_batchs_finished_transfers_by_id() {
+        let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        stub.set_listing(vec![
+            transfer("peer_a", "dirA/aaa.flac", "t-1", DownloadState::Completed),
+            transfer("peer_z", "dirA/aaa.flac", "t-9", DownloadState::Completed),
+        ]);
+
+        m.remove_batch_transfers(&backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![("peer_a".to_string(), "t-1".to_string())]
         );
     }
 

@@ -29,21 +29,21 @@ pub(crate) struct DownloadRequestFile {
 }
 
 // Wire types for POST /api/v0/transfers/downloads/batches (slskd 0.26+).
-// `id`/`searchId` are deliberately absent from the request: slskd generates
-// the batch id, so a Soulful-side retry can never 409 on a duplicate.
+// `id` is generated here, not by slskd, so a retry after a lost answer sends
+// the same id and gets 409 instead of enqueueing a second batch.
 #[derive(Debug, Serialize)]
 pub(crate) struct BatchEnqueueRequest<'a> {
+    pub id: &'a str,
     pub username: &'a str,
     pub files: &'a [DownloadRequestFile],
-    pub options: BatchEnqueueOptions,
+    pub options: BatchEnqueueOptions<'a>,
 }
 
-// slskd NREs into a 500 when it receives `"options": null`, so the field is
-// always an object; only `destination` may be omitted.
+// slskd NREs into a 500 when it receives `"options": null`, and rejects an
+// empty destination.
 #[derive(Debug, Serialize)]
-pub(crate) struct BatchEnqueueOptions {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub destination: Option<String>,
+pub(crate) struct BatchEnqueueOptions<'a> {
+    pub destination: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +62,7 @@ pub(crate) struct EnqueuedBatch {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EnqueuedTransfer {
+    pub id: String,
     pub filename: String,
 }
 

@@ -1,6 +1,8 @@
 #[cfg(feature = "server")]
 use shared::slskd::{sanitize_filename, sanitize_filename_unix};
 #[cfg(feature = "server")]
+use std::collections::HashSet;
+#[cfg(feature = "server")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "server")]
 use tracing::warn;
@@ -108,6 +110,64 @@ pub fn resolve_download_path(filename: &str, download_base: &Path) -> Option<Str
         download_base.display()
     );
     None
+}
+
+/// Find a finished download in its batch folder `base/destination`.
+///
+/// slskd keeps the remote basename (sanitized) and, when that name is already
+/// taken, writes `<stem>_<ticks><ext>` with 18-digit ticks. Two files of one
+/// batch with the same basename therefore land as the plain name and its
+/// copies. The plain name is tried first, then the copies oldest first, and
+/// paths in `exclude` (already handed off) are skipped.
+#[cfg(feature = "server")]
+pub fn resolve_in_destination(
+    filename: &str,
+    base: &Path,
+    destination: &str,
+    exclude: &HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    let normalized = filename.replace('\\', "/");
+    let remote_name = normalized.rsplit('/').find(|s| !s.is_empty())?;
+    let folder = base.join(destination);
+    let names = basename_candidates(remote_name);
+
+    let usable = |path: &PathBuf| path.is_file() && !exclude.contains(path);
+    if let Some(plain) = names.iter().map(|n| folder.join(n)).find(usable) {
+        return Some(plain);
+    }
+
+    let mut copies: Vec<PathBuf> = std::fs::read_dir(&folder)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| names.iter().any(|want| is_ticks_copy(n, want)))
+        })
+        .filter(usable)
+        .collect();
+    // Equal-width ticks, so name order is age order.
+    copies.sort();
+    copies.into_iter().next()
+}
+
+/// Whether `name` is slskd's renamed copy of `original`: `<stem>_<18 digits><ext>`.
+#[cfg(feature = "server")]
+fn is_ticks_copy(name: &str, original: &str) -> bool {
+    let original = Path::new(original);
+    let Some(stem) = original.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let ext = original
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    name.strip_prefix(stem)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .and_then(|rest| rest.strip_suffix(ext.as_str()))
+        .is_some_and(|ticks| ticks.len() == 18 && ticks.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The on-disk basename variants slskd may have produced for a remote
@@ -270,6 +330,57 @@ mod tests {
 
         let resolved = resolve_download_path(r"music\Album\AC: DC - 01.mp3", &base).unwrap();
         assert!(resolved.ends_with("AC: DC - 01.mp3"));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn resolves_inside_the_batch_folder_and_skips_claimed_copies() {
+        let base = temp_base("batch");
+        let folder = base.join("F");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("01.flac"), b"x").unwrap();
+        std::fs::write(folder.join("01_639097129778484198.flac"), b"x").unwrap();
+        // Same name one folder up: outside the batch, never a candidate.
+        std::fs::write(base.join("01.flac"), b"x").unwrap();
+
+        let mut claimed = HashSet::new();
+        let first = resolve_in_destination(r"music\A\01.flac", &base, "F", &claimed).unwrap();
+        assert_eq!(first, folder.join("01.flac"));
+
+        claimed.insert(first);
+        let second = resolve_in_destination(r"other\B\01.flac", &base, "F", &claimed).unwrap();
+        assert_eq!(second, folder.join("01_639097129778484198.flac"));
+
+        claimed.insert(second);
+        assert_eq!(
+            resolve_in_destination(r"music\A\01.flac", &base, "F", &claimed),
+            None
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn collision_copies_resolve_oldest_first_and_need_exact_ticks() {
+        let base = temp_base("ticks-order");
+        let folder = base.join("F");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("01_639097129778484199.flac"), b"x").unwrap();
+        std::fs::write(folder.join("01_639097129778484198.flac"), b"x").unwrap();
+        // Not slskd's pattern: wrong digit count, or a different track.
+        std::fs::write(folder.join("01_123.flac"), b"x").unwrap();
+        std::fs::write(folder.join("01_x.flac"), b"x").unwrap();
+
+        let claimed = HashSet::new();
+        assert_eq!(
+            resolve_in_destination("01.flac", &base, "F", &claimed),
+            Some(folder.join("01_639097129778484198.flac"))
+        );
+        assert_eq!(
+            resolve_in_destination("02.flac", &base, "F", &claimed),
+            None
+        );
 
         std::fs::remove_dir_all(&base).unwrap();
     }

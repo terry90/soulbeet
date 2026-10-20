@@ -262,40 +262,25 @@ pub fn batch_folder(label: &str, batch_id: &str) -> String {
     format!("{label} [{short}]")
 }
 
+/// What the backend did with one file of an enqueue request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnqueueStatus {
+    Enqueued,
+    /// The backend already has an unfinished transfer of this file from this
+    /// peer and did not start another one.
+    AlreadyInFlight,
+    Failed(String),
+}
+
 /// Response from queueing downloads
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedDownload {
+    /// The backend's transfer id when `Enqueued`, else the remote filename.
     pub id: String,
     pub source: String,
     pub item: String,
     pub size: u64,
-    pub error: Option<String>,
-}
-
-impl QueuedDownload {
-    pub fn success(id: String, source: String, item: String, size: u64) -> Self {
-        Self {
-            id,
-            source,
-            item,
-            size,
-            error: None,
-        }
-    }
-
-    pub fn failed(id: String, source: String, item: String, error: String) -> Self {
-        Self {
-            id,
-            source,
-            item,
-            size: 0,
-            error: Some(error),
-        }
-    }
-
-    pub fn is_success(&self) -> bool {
-        self.error.is_none()
-    }
+    pub status: EnqueueStatus,
 }
 
 /// Wrapper for all download-related WebSocket events

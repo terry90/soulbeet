@@ -6,7 +6,8 @@
 
 use async_trait::async_trait;
 use shared::download::{
-    DownloadProgress, DownloadableGroup, DownloadableItem, QueuedDownload, SearchResult,
+    DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, EnqueueStatus,
+    QueuedDownload, SearchResult,
 };
 use shared::metadata::{Album, Track};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
@@ -42,21 +43,25 @@ pub fn group(source: &str, items: Vec<DownloadableItem>, score: f64) -> Download
     }
 }
 
-/// What a scripted `download` call does: accept the item, accept the call but
-/// mark the item rejected (peer offline, already queued elsewhere), or fail
-/// the call itself (transport error).
+/// What a scripted `download` call does: accept the item (transfer id
+/// `t-{item.id}`), refuse it because the backend is already fetching it,
+/// accept the call but mark the item rejected (peer offline), or fail the
+/// call itself (transport error).
 pub enum ScriptedOutcome {
     Enqueued,
+    AlreadyInFlight,
     Rejected,
     TransportError,
 }
 
 /// Answers each enqueue from a scripted list, then rejects everything after
-/// the script runs out. Records every cancellation so tests can assert on the
-/// transfers a failover left behind.
+/// the script runs out. Records every destination and cancellation, and
+/// lists whatever transfers the test sets.
 pub struct StubBackend {
     script: Mutex<Vec<ScriptedOutcome>>,
     cancelled: Mutex<Vec<(String, String)>>,
+    destinations: Mutex<Vec<String>>,
+    listing: Mutex<Vec<DownloadProgress>>,
 }
 
 impl StubBackend {
@@ -64,6 +69,8 @@ impl StubBackend {
         Arc::new(Self {
             script: Mutex::new(script),
             cancelled: Mutex::new(Vec::new()),
+            destinations: Mutex::new(Vec::new()),
+            listing: Mutex::new(Vec::new()),
         })
     }
 
@@ -71,6 +78,22 @@ impl StubBackend {
     pub fn cancelled(&self) -> Vec<(String, String)> {
         self.cancelled.lock().unwrap().clone()
     }
+
+    /// The destination of every `download` call, in order.
+    pub fn destinations(&self) -> Vec<String> {
+        self.destinations.lock().unwrap().clone()
+    }
+
+    /// What `get_downloads_for` (filtered by peer) and `get_downloads` return.
+    pub fn set_listing(&self, listing: Vec<DownloadProgress>) {
+        *self.listing.lock().unwrap() = listing;
+    }
+}
+
+/// A transfer as the backend lists it.
+pub fn transfer(source: &str, filename: &str, id: &str, state: DownloadState) -> DownloadProgress {
+    DownloadProgress::queued(id.to_string(), source.to_string(), filename.to_string(), 0)
+        .with_state(state)
 }
 
 #[async_trait]
@@ -87,7 +110,15 @@ impl DownloadBackend for StubBackend {
     async fn poll_search(&self, _search_id: &str) -> SoulResult<SearchResult> {
         unreachable!("failover never searches")
     }
-    async fn download(&self, items: Vec<DownloadableItem>) -> SoulResult<Vec<QueuedDownload>> {
+    async fn download(
+        &self,
+        items: Vec<DownloadableItem>,
+        destination: &str,
+    ) -> SoulResult<Vec<QueuedDownload>> {
+        self.destinations
+            .lock()
+            .unwrap()
+            .push(destination.to_string());
         let item = items.into_iter().next().expect("one item per enqueue");
         let outcome = {
             let mut script = self.script.lock().unwrap();
@@ -97,32 +128,42 @@ impl DownloadBackend for StubBackend {
                 script.remove(0)
             }
         };
+        let answer = |id: String, status: EnqueueStatus| {
+            Ok(vec![QueuedDownload {
+                id,
+                source: item.source.clone(),
+                item: item.id.clone(),
+                size: item.size.unwrap_or(0),
+                status,
+            }])
+        };
         match outcome {
-            ScriptedOutcome::Enqueued => Ok(vec![QueuedDownload {
-                id: item.id.clone(),
-                source: item.source.clone(),
-                item: item.id.clone(),
-                size: item.size.unwrap_or(0),
-                error: None,
-            }]),
-            ScriptedOutcome::Rejected => Ok(vec![QueuedDownload {
-                id: item.id.clone(),
-                source: item.source.clone(),
-                item: item.id.clone(),
-                size: item.size.unwrap_or(0),
-                error: Some("peer offline".to_string()),
-            }]),
+            ScriptedOutcome::Enqueued => answer(format!("t-{}", item.id), EnqueueStatus::Enqueued),
+            ScriptedOutcome::AlreadyInFlight => {
+                answer(item.id.clone(), EnqueueStatus::AlreadyInFlight)
+            }
+            ScriptedOutcome::Rejected => answer(
+                item.id.clone(),
+                EnqueueStatus::Failed("peer offline".to_string()),
+            ),
             // LockError stands in for any transport-level failure; its
             // meaning doesn't matter here, only that `download` itself
             // errors rather than returning an Ok with a rejected item.
             ScriptedOutcome::TransportError => Err(SoulseekError::LockError),
         }
     }
-    async fn get_downloads_for(&self, _sources: &[String]) -> SoulResult<Vec<DownloadProgress>> {
-        Ok(Vec::new())
+    async fn get_downloads_for(&self, sources: &[String]) -> SoulResult<Vec<DownloadProgress>> {
+        Ok(self
+            .listing
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| sources.contains(&t.source))
+            .cloned()
+            .collect())
     }
     async fn get_downloads(&self) -> SoulResult<Vec<DownloadProgress>> {
-        Ok(Vec::new())
+        Ok(self.listing.lock().unwrap().clone())
     }
     async fn cancel_download(&self, username: &str, id: &str, _remove: bool) -> SoulResult<()> {
         self.cancelled

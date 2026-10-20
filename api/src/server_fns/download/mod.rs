@@ -1,9 +1,9 @@
 use dioxus::fullstack::{WebSocketOptions, Websocket};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
-use shared::download::{DownloadEvent, DownloadableItem, QueuedDownload};
 #[cfg(feature = "server")]
-use shared::download::DownloadProgress;
+use shared::download::{batch_folder, DownloadProgress, EnqueueStatus};
+use shared::download::{DownloadEvent, DownloadableItem, QueuedDownload};
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
@@ -48,13 +48,38 @@ use self::monitor::DownloadMonitor;
 #[cfg(feature = "server")]
 async fn do_download(
     items: Vec<DownloadableItem>,
+    destination: &str,
     backend_id: Option<&str>,
 ) -> Result<Vec<QueuedDownload>, ServerFnError> {
     let backend = download_backend(backend_id)
         .await
         .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
 
-    backend.download(items).await.map_err(server_error)
+    backend
+        .download(items, destination)
+        .await
+        .map_err(server_error)
+}
+
+/// Why a file was not enqueued, as its row shows it; `None` when it was.
+#[cfg(feature = "server")]
+pub(crate) fn not_enqueued_reason(status: &EnqueueStatus) -> Option<String> {
+    match status {
+        EnqueueStatus::Enqueued => None,
+        EnqueueStatus::AlreadyInFlight => Some("already downloading in slskd".to_string()),
+        EnqueueStatus::Failed(message) => Some(message.clone()),
+    }
+}
+
+/// Name for a manual download's batch: the album its items share, or the
+/// first item's title when they span albums.
+#[cfg(feature = "server")]
+fn manual_batch_label(items: &[DownloadableItem]) -> String {
+    match items.split_first() {
+        Some((first, rest)) if rest.iter().all(|i| i.album == first.album) => first.album.clone(),
+        Some((first, _)) => first.title.clone(),
+        None => String::new(),
+    }
 }
 
 /// WebSocket endpoint for real-time download updates.
@@ -201,31 +226,34 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         )));
     }
 
-    let res = do_download(req.items, req.backend.as_deref()).await?;
-
-    let (failed, successful): (Vec<_>, Vec<_>) =
-        res.iter().cloned().partition(|d| d.error.is_some());
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let batch_label = manual_batch_label(&req.items);
+    let destination = batch_folder(&batch_label, &batch_id);
+    let res = do_download(req.items, &destination, req.backend.as_deref()).await?;
 
     let (tx, _) = get_or_create_user_channel(&username).await;
 
     let backend_id = req.backend;
 
-    if !failed.is_empty() {
-        let failed_entries: Vec<DownloadProgress> = failed
-            .iter()
-            .map(|d| {
-                let mut p = DownloadProgress::failed(
-                    d.id.clone(),
-                    d.source.clone(),
-                    d.item.clone(),
-                    d.error.clone().unwrap_or_default(),
-                );
-                p.backend = backend_id.clone();
-                p
-            })
-            .collect();
+    let failed_entries: Vec<DownloadProgress> = res
+        .iter()
+        .filter_map(|d| {
+            let reason = not_enqueued_reason(&d.status)?;
+            let mut p =
+                DownloadProgress::failed(d.id.clone(), d.source.clone(), d.item.clone(), reason)
+                    .with_batch(batch_id.clone(), batch_label.clone());
+            p.backend = backend_id.clone();
+            Some(p)
+        })
+        .collect();
+    if !failed_entries.is_empty() {
         let _ = tx.send(DownloadEvent::Progress(failed_entries));
     }
+
+    let successful: Vec<&QueuedDownload> = res
+        .iter()
+        .filter(|d| d.status == EnqueueStatus::Enqueued)
+        .collect();
 
     let download_sources: Vec<String> = successful.iter().map(|d| d.source.clone()).collect();
     let download_filenames: Vec<String> = successful.iter().map(|d| d.item.clone()).collect();
@@ -240,7 +268,8 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         .iter()
         .map(|d| {
             let mut p =
-                DownloadProgress::queued(d.id.clone(), d.source.clone(), d.item.clone(), d.size);
+                DownloadProgress::queued(d.id.clone(), d.source.clone(), d.item.clone(), d.size)
+                    .with_batch(batch_id.clone(), batch_label.clone());
             p.backend = backend_id.clone();
             p
         })
@@ -262,8 +291,8 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
             tx,
             task_cancellation,
             task_username.clone(),
-            None, // batch_id - will be set by auto_download in Plan 02
-            None, // batch_label - will be set by auto_download in Plan 02
+            batch_id,
+            batch_label,
         );
         monitor.run().await;
         unregister_user_task(&task_username).await;
@@ -285,4 +314,26 @@ pub async fn retry_import(item: String) -> Result<(), ServerFnError> {
 pub async fn forget_import_retries(items: Vec<String>) -> Result<(), ServerFnError> {
     crate::import_queue::forget_retries(&auth.0.username, &items);
     Ok(())
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use test_support::item;
+
+    #[test]
+    fn manual_label_is_the_shared_album_else_the_first_title() {
+        let same_album = vec![item("p", "One", "1.flac"), item("p", "Two", "2.flac")];
+        assert_eq!(manual_batch_label(&same_album), "Come Over");
+
+        let mut mixed = same_album;
+        mixed[1].album = "Other".to_string();
+        assert_eq!(manual_batch_label(&mixed), "One");
+
+        assert_eq!(not_enqueued_reason(&EnqueueStatus::Enqueued), None);
+        assert_eq!(
+            not_enqueued_reason(&EnqueueStatus::AlreadyInFlight).as_deref(),
+            Some("already downloading in slskd")
+        );
+    }
 }
