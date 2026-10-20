@@ -11,6 +11,7 @@ services:
       - DOWNLOAD_PATH=/downloads
       - SECRET_KEY=a_secret_key # Change this to a secure random key
       - NAVIDROME_URL=http://localhost:4533 # Your Navidrome server URL
+      # - BEETS_CONFIG=/config/config.yaml # Needs the ./beets:/config volume below
     volumes:
       - soulbeet_data:/data
       # Map the download folder.
@@ -20,7 +21,6 @@ services:
       - /path/to/your/music:/music
       # Custom beets config. BEETS_CONFIG replaces the shipped /app/beets_config.yaml,
       # so start from a copy of it (see README). Leave commented to use the shipped one.
-      # Also add: - BEETS_CONFIG=/config/config.yaml
       # - ./beets:/config
       # Drop-in pure-Python beets plugins (see docs/beets-plugins.md):
       # - ./my-plugins:/data/beets-plugins:ro

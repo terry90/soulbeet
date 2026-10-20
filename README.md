@@ -147,7 +147,7 @@ Soulbeet uses `beets` to import music. The image ships a config at `/app/beets_c
 -   `incremental: yes` makes beets skip folders it has already skipped once, so "Retry import" on such a folder reports "Nothing left to import".
 
 Default `beet import` flags used:
--   `-v`: Verbose output, shown under "beets output" for rows that did not import
+-   `-v`: Verbose output. The last lines of it (20 lines, 2 KiB) are shown under "beets output" on rows that carry a note: skipped, failed, or imported with a warning
 -   `-c [config]`: The config file
 -   `-q`: Quiet mode (no user interaction)
 -   `-s`: Singleton mode (Default behavior unless `BEETS_ALBUM_MODE` is set)
