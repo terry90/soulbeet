@@ -1,0 +1,63 @@
+overlaying configuration: /work/config.yaml
+no user configuration found at /work/beetsdir/config.yaml
+data directory: /work/beetsdir
+plugin paths: ['/plugins']
+Loading plugins: fakesrc
+Sending event: pluginload
+library database: /music/.beets_library.db
+library directory: /music
+Sending event: library_opened
+Sending event: import_begin
+Sending event: import_task_created
+Sending event: import_task_start
+Looking up: /src
+Tagging Zzqx Artist - Qzz Album
+No album ID found.
+Album ID match recommendation is 0
+Search terms: Zzqx Artist - Qzz Album
+Album might be VA: False
+Sending event: albuminfo_received
+Candidate: Zzqx Artist - Qzz Album (fake-a-1) from FakeSrc
+Computing track assignment...
+...done.
+Success. Distance: 0.00
+Sending event: album_matched
+Evaluating 1 candidates.
+Sending event: import_task_before_choice
+Sending event: import_task_choice
+found duplicates: [1]
+default action for duplicates: k
+Sending event: import_task_apply
+0 of 2 items replaced
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Parsed query: AndQuery([NoneQuery('album_id', True)])
+Parsed sort: NullSort()
+Parsed query: AndQuery([BooleanQuery('comp', 1, fast=True)])
+Parsed sort: NullSort()
+Sending event: before_item_moved
+Sending event: item_moved
+Sending event: database_change
+Sending event: database_change
+Sending event: write
+Sending event: after_write
+Parsed query: AndQuery([NoneQuery('album_id', True)])
+Parsed sort: NullSort()
+Parsed query: AndQuery([BooleanQuery('comp', 1, fast=True)])
+Parsed sort: NullSort()
+Sending event: before_item_moved
+Sending event: item_moved
+Sending event: database_change
+Sending event: database_change
+Sending event: write
+Sending event: after_write
+Sending event: database_change
+Sending event: database_change
+Sending event: import_task_files
+Sending event: album_imported
+Sending event: import
+Sending event: cli_exit

@@ -1,0 +1,11 @@
+
+/src/a1 (2 items)
+
+  Match (100.0%):
+  Zzqx Artist - Qzz Album
+  FakeSrc, None, None, None, None, None, None
+  * Artist: Zzqx Artist
+  * Album: Qzz Album
+
+/src/a2 (2 items)
+Skipping.

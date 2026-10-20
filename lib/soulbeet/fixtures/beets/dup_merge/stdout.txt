@@ -1,0 +1,28 @@
+
+/src (2 items)
+
+  Match (100.0%):
+  Zzqx Artist - Qzz Album
+  FakeSrc, None, None, None, None, None, None
+  * Artist: Zzqx Artist
+  * Album: Qzz Album
+
+/src
+/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3
+/music/Zzqx Artist/Qzz Album/02 Song Number 2.mp3 (4 items)
+
+  Match (95.2%):
+  Zzqx Artist - Qzz Album
+  ≠ tracks
+  FakeSrc, None, None, None, None, None, None
+  * Artist: Zzqx Artist
+  * Album: Qzz Album
+     ≠ (#1) Song Number 1 (0:02) -> (#3) Song Number 1 (0:02)
+     ≠ (#2) Song Number 2 (0:02) -> (#4) Song Number 2 (0:02)
+
+/src
+/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3
+/music/Zzqx Artist/Qzz Album/02 Song Number 2.mp3
+Zzqx Artist/Qzz Album/01 Song Number 1.mp3
+Zzqx Artist/Qzz Album/02 Song Number 2.mp3 (6 items)
+Skipping.

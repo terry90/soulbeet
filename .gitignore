@@ -15,3 +15,6 @@ soulbeet.db-wal
 
 # Env files
 **/.env
+
+# Python bytecode (beets fixture capture plugin)
+**/__pycache__

@@ -1,0 +1,13 @@
+overlaying configuration: /work/config.yaml
+no user configuration found at /work/beetsdir/config.yaml
+data directory: /work/beetsdir
+plugin paths: ['/plugins']
+Loading plugins: fakesrc
+Sending event: pluginload
+library database: /music/.beets_library.db
+library directory: /music
+Sending event: library_opened
+Sending event: import_begin
+No files imported from /src
+Sending event: import
+Sending event: cli_exit

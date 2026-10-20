@@ -1,3 +1,6 @@
+// Unused outside tests until import() switches to it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod classify;
 mod runner;
 
 pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
@@ -441,7 +444,7 @@ impl crate::MusicImporter for BeetsImporter {
         sources: &[&Path],
         target: &Path,
         as_album: bool,
-    ) -> crate::error::Result<crate::ImportResult> {
+    ) -> crate::error::Result<crate::LegacyImportResult> {
         let sources_str: Vec<String> = sources
             .iter()
             .map(|p| p.to_string_lossy().to_string())
@@ -449,10 +452,10 @@ impl crate::MusicImporter for BeetsImporter {
 
         match import(sources_str, target, as_album).await {
             Ok(result) => Ok(match result {
-                ImportResult::Success => crate::ImportResult::Success,
-                ImportResult::Skipped(reason) => crate::ImportResult::Skipped(reason),
-                ImportResult::Failed(msg) => crate::ImportResult::Failed(msg),
-                ImportResult::TimedOut => crate::ImportResult::TimedOut,
+                ImportResult::Success => crate::LegacyImportResult::Success,
+                ImportResult::Skipped(reason) => crate::LegacyImportResult::Skipped(reason),
+                ImportResult::Failed(msg) => crate::LegacyImportResult::Failed(msg),
+                ImportResult::TimedOut => crate::LegacyImportResult::TimedOut,
             }),
             Err(e) => Err(crate::error::SoulseekError::Api {
                 status: 500,

@@ -1,0 +1,16 @@
+
+/src/01 - Song Number 1.mp3
+
+  Match (100.0%):
+  Zzqx Artist - Song Number 1
+  FakeSrc, Index None, Track None, 
+  * Artist: Zzqx Artist
+  * Track: Song Number 1
+
+/src/02 - Song Number 2.mp3
+
+  Match (100.0%):
+  Zzqx Artist - Song Number 2
+  FakeSrc, Index None, Track None, 
+  * Artist: Zzqx Artist
+  * Track: Song Number 2

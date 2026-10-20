@@ -1,0 +1,86 @@
+overlaying configuration: /work/config.yaml
+no user configuration found at /work/beetsdir/config.yaml
+data directory: /work/beetsdir
+plugin paths: ['/plugins']
+Loading plugins: fakesrc, nosuchplugin
+** error loading plugin nosuchplugin
+Traceback (most recent call last):
+  File "/venv/lib/python3.11/site-packages/beets/plugins.py", line 455, in _get_plugin
+    namespace = import_module(f"{PLUGIN_NAMESPACE}.{name}")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/python/lib/python3.11/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1204, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1176, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1140, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'beetsplug.nosuchplugin'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/venv/lib/python3.11/site-packages/beets/plugins.py", line 457, in _get_plugin
+    raise PluginImportError(name) from exc
+beets.plugins.PluginImportError: Could not import plugin nosuchplugin
+Sending event: pluginload
+library database: /music/.beets_library.db
+library directory: /music
+Sending event: library_opened
+Sending event: import_begin
+Sending event: import_task_created
+Sending event: import_task_start
+Looking up: /src
+Tagging Zzqx Artist - Qzz Album
+No album ID found.
+Album ID match recommendation is 0
+Search terms: Zzqx Artist - Qzz Album
+Album might be VA: False
+Sending event: albuminfo_received
+Candidate: Zzqx Artist - Qzz Album (fake-a-1) from FakeSrc
+Computing track assignment...
+...done.
+Success. Distance: 0.00
+Sending event: album_matched
+Evaluating 1 candidates.
+Sending event: import_task_before_choice
+Sending event: import_task_choice
+Sending event: import_task_apply
+0 of 2 items replaced
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Traceback (most recent call last):
+  File "/venv/bin/beet", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/venv/lib/python3.11/site-packages/beets/ui/__init__.py", line 1009, in main
+    _raw_main(args)
+  File "/venv/lib/python3.11/site-packages/beets/ui/__init__.py", line 990, in _raw_main
+    subcommand.func(lib, suboptions, subargs)
+  File "/venv/lib/python3.11/site-packages/beets/ui/commands/import_/__init__.py", line 131, in import_func
+    import_files(lib, byte_paths, query)
+  File "/venv/lib/python3.11/site-packages/beets/ui/commands/import_/__init__.py", line 75, in import_files
+    session.run()
+  File "/venv/lib/python3.11/site-packages/beets/importer/session.py", line 237, in run
+    pl.run_parallel(QUEUE_SIZE)
+  File "/venv/lib/python3.11/site-packages/beets/util/pipeline.py", line 489, in run_parallel
+    raise exc_info[1].with_traceback(exc_info[2])
+  File "/venv/lib/python3.11/site-packages/beets/util/pipeline.py", line 343, in run
+    out = self._run_in_context(self.coro.send, msg)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beets/util/pipeline.py", line 252, in _run_in_context
+    return self.ctx.run(func, *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beets/util/pipeline.py", line 220, in coro
+    func(*args, task)
+  File "/venv/lib/python3.11/site-packages/beets/importer/stages.py", line 250, in plugin_stage
+    func(session, task)
+  File "/venv/lib/python3.11/site-packages/beets/plugins.py", line 337, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/plugins/fakesrc.py", line 47, in crash
+    raise TypeError("simulated crash in import stage")
+TypeError: simulated crash in import stage

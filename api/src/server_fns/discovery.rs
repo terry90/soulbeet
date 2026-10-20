@@ -903,14 +903,14 @@ pub async fn generate_discovery_playlist_internal(
                 let src = std::path::Path::new(&src_path);
                 let imported = if let Ok(ref imp) = importer {
                     match imp.import(&[src], &discovery_target, false).await {
-                        Ok(soulbeet::ImportResult::Success) => {
+                        Ok(soulbeet::LegacyImportResult::Success) => {
                             info!(
                                 "Imported '{}' - {} into Discovery/{}",
                                 qt.artist, qt.track, profile_name
                             );
                             true
                         }
-                        Ok(soulbeet::ImportResult::Skipped(reason)) => {
+                        Ok(soulbeet::LegacyImportResult::Skipped(reason)) => {
                             warn!(
                                 "Beets skipped '{}' - {}: {}",
                                 qt.artist, qt.track, reason
@@ -1235,8 +1235,8 @@ fn find_new_files(
 pub async fn import_or_move(src: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
     match crate::services::music_importer(None).await {
         Ok(imp) => match imp.import(&[src], target, false).await {
-            Ok(soulbeet::ImportResult::Success) => Ok(()),
-            Ok(soulbeet::ImportResult::Skipped(reason)) => {
+            Ok(soulbeet::LegacyImportResult::Success) => Ok(()),
+            Ok(soulbeet::LegacyImportResult::Skipped(reason)) => {
                 Err(format!("Beets skipped track: {reason}"))
             }
             Ok(other) => Err(format!("Import issue: {:?}", other)),

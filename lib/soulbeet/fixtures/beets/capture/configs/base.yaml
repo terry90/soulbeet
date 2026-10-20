@@ -1,0 +1,14 @@
+plugins: fakesrc
+pluginpath: ['@PLUGINPATH@']
+import:
+  copy: no
+  move: yes
+  resume: no
+  duplicate_action: remove
+paths:
+  default: $albumartist/$album%aunique{}/$track $title
+  singleton: $albumartist/$album%aunique{}/$title
+match:
+  strong_rec_thresh: 0.10
+  max_rec:
+    missing_tracks: low

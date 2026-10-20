@@ -8,7 +8,9 @@ use shared::{
         SignalReport, SimilarArtist, SimilarTrack, TimePeriod, UserMusicProfile, WeightedTag,
     },
 };
+use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::Result;
 
@@ -57,12 +59,169 @@ pub trait DownloadBackend: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ImportResult {
+pub enum LegacyImportResult {
     Success,
     /// The importer declined to import, with the reason it gave.
     Skipped(String),
     Failed(String),
     TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    Album,
+    Singleton,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportOutcome {
+    Imported {
+        untagged: bool,
+        warnings: Vec<String>,
+    },
+    Skipped(SkipReason),
+    LookupFailed {
+        source: String,
+        message: String,
+    },
+    Failed {
+        message: String,
+    },
+    TimedOut {
+        limit: TimeoutKind,
+        last_line: Option<String>,
+    },
+    /// Not attempted, because the importer is known to be broken.
+    Refused {
+        issue: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    AlreadyInLibrary,
+    /// No candidate was close enough. The count is the number of candidates
+    /// beets weighed, when every task in the run saw the same number.
+    NoMatch {
+        candidates: Option<u32>,
+    },
+    NothingToImport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    Idle(Duration),
+    Total(Duration),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskCount {
+    pub imported: u32,
+    pub total: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportResult {
+    pub outcome: ImportOutcome,
+    /// The last lines beets printed, for the row's disclosure.
+    pub output_tail: String,
+    pub tasks: TaskCount,
+}
+
+impl ImportResult {
+    fn without_run(outcome: ImportOutcome) -> Self {
+        ImportResult {
+            outcome,
+            output_tail: String::new(),
+            tasks: TaskCount::default(),
+        }
+    }
+
+    pub fn refused(issue: String) -> Self {
+        Self::without_run(ImportOutcome::Refused { issue })
+    }
+
+    pub fn failed(message: String) -> Self {
+        Self::without_run(ImportOutcome::Failed { message })
+    }
+
+    pub fn nothing_to_import() -> Self {
+        Self::without_run(ImportOutcome::Skipped(SkipReason::NothingToImport))
+    }
+}
+
+/// Whole minutes when the duration is a whole number of minutes.
+fn minutes(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs % 60.0 == 0.0 {
+        format!("{}", secs as u64 / 60)
+    } else {
+        format!("{:.1}", secs / 60.0)
+    }
+}
+
+impl fmt::Display for ImportOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImportOutcome::Imported { untagged, warnings } => {
+                f.write_str(if *untagged {
+                    "Imported as-is (untagged)"
+                } else {
+                    "Imported"
+                })?;
+                warnings.iter().try_for_each(|w| write!(f, "; {w}"))
+            }
+            ImportOutcome::Skipped(SkipReason::AlreadyInLibrary) => {
+                f.write_str("Already in library")
+            }
+            ImportOutcome::Skipped(SkipReason::NoMatch {
+                candidates: Some(n),
+            }) => {
+                write!(f, "No close match ({n} candidates)")
+            }
+            ImportOutcome::Skipped(SkipReason::NoMatch { candidates: None }) => {
+                f.write_str("No close match")
+            }
+            ImportOutcome::Skipped(SkipReason::NothingToImport) => {
+                f.write_str("Nothing left to import")
+            }
+            ImportOutcome::LookupFailed { source, message } => {
+                write!(f, "Lookup failed in {source}: {message}")
+            }
+            ImportOutcome::Failed { message } => f.write_str(message),
+            ImportOutcome::TimedOut {
+                limit: TimeoutKind::Idle(d),
+                last_line: Some(line),
+            } => write!(
+                f,
+                "No output from beets for {} min (last: {line})",
+                minutes(*d)
+            ),
+            ImportOutcome::TimedOut {
+                limit: TimeoutKind::Idle(d),
+                last_line: None,
+            } => write!(f, "No output from beets for {} min", minutes(*d)),
+            ImportOutcome::TimedOut {
+                limit: TimeoutKind::Total(d),
+                ..
+            } => write!(f, "Import exceeded {} min", minutes(*d)),
+            ImportOutcome::Refused { issue } => f.write_str(issue),
+        }
+    }
+}
+
+impl fmt::Display for ImportResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.outcome)?;
+        if self.tasks.total > 1 {
+            write!(
+                f,
+                " ({} of {} imported)",
+                self.tasks.imported, self.tasks.total
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -75,7 +234,7 @@ pub trait MusicImporter: Send + Sync {
         sources: &[&Path],
         target: &Path,
         as_album: bool,
-    ) -> Result<ImportResult>;
+    ) -> Result<LegacyImportResult>;
 
     async fn find_duplicates(&self, libraries: &[&Path]) -> Result<DuplicateReport>;
     async fn health_check(&self) -> bool;

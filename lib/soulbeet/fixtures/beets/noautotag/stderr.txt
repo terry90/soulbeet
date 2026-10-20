@@ -1,0 +1,38 @@
+overlaying configuration: /work/config.yaml
+no user configuration found at /work/beetsdir/config.yaml
+data directory: /work/beetsdir
+plugin paths: ['/plugins']
+Loading plugins: fakesrc
+Sending event: pluginload
+library database: /music/.beets_library.db
+library directory: /music
+Sending event: library_opened
+Sending event: import_begin
+Sending event: import_task_created
+/src
+0 of 2 items replaced
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Parsed query: AndQuery([NoneQuery('album_id', True)])
+Parsed sort: NullSort()
+Parsed query: AndQuery([BooleanQuery('comp', 1, fast=True)])
+Parsed sort: NullSort()
+Sending event: before_item_moved
+Sending event: item_moved
+Sending event: database_change
+Sending event: database_change
+Parsed query: AndQuery([NoneQuery('album_id', True)])
+Parsed sort: NullSort()
+Parsed query: AndQuery([BooleanQuery('comp', 1, fast=True)])
+Parsed sort: NullSort()
+Sending event: before_item_moved
+Sending event: item_moved
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Sending event: database_change
+Sending event: import_task_files
+Sending event: album_imported
+Sending event: import
+Sending event: cli_exit

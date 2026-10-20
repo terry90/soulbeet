@@ -1,0 +1,128 @@
+overlaying configuration: /work/config.yaml
+no user configuration found at /work/beetsdir/config.yaml
+data directory: /work/beetsdir
+plugin paths: []
+Loading plugins: musicbrainz
+Sending event: pluginload
+library database: /music/.beets_library.db
+library directory: /music
+Sending event: library_opened
+Sending event: import_begin
+Sending event: import_task_created
+Sending event: import_task_start
+Looking up: /src
+Tagging Zzqx Artist - Qzz Album
+No album ID found.
+Album ID match recommendation is 0
+Search terms: Zzqx Artist - Qzz Album
+Album might be VA: False
+musicbrainz: Searching for '' with {'release': 'qzz album', 'artist': 'zzqx artist'}
+Searching for MusicBrainz releases with: 'release:(qzz album) artist:(zzqx artist)'
+musicbrainz: Error searching MusicBrainz: HTTPConnectionPool(host='127.0.0.1', port=9): Max retries exceeded with url: /ws/2/release?limit=5&query=release%3A%28qzz+album%29+artist%3A%28zzqx+artist%29&fmt=json (Caused by NewConnectionError("HTTPConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 111] Connection refused"))
+Traceback (most recent call last):
+  File "/venv/lib/python3.11/site-packages/urllib3/connection.py", line 239, in _new_conn
+    sock = connection.create_connection(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/urllib3/util/connection.py", line 85, in create_connection
+    raise err
+  File "/venv/lib/python3.11/site-packages/urllib3/util/connection.py", line 73, in create_connection
+    sock.connect(sa)
+ConnectionRefusedError: [Errno 111] Connection refused
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/venv/lib/python3.11/site-packages/urllib3/connectionpool.py", line 793, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/urllib3/connectionpool.py", line 499, in _make_request
+    conn.request(
+  File "/venv/lib/python3.11/site-packages/urllib3/connection.py", line 567, in request
+    self.endheaders()
+  File "/python/lib/python3.11/http/client.py", line 1318, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+  File "/python/lib/python3.11/http/client.py", line 1078, in _send_output
+    self.send(msg)
+  File "/python/lib/python3.11/http/client.py", line 1016, in send
+    self.connect()
+  File "/venv/lib/python3.11/site-packages/urllib3/connection.py", line 398, in connect
+    self.sock = self._new_conn()
+                ^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/urllib3/connection.py", line 254, in _new_conn
+    raise NewConnectionError(
+urllib3.exceptions.NewConnectionError: HTTPConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 111] Connection refused
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/venv/lib/python3.11/site-packages/requests/adapters.py", line 696, in send
+    resp = conn.urlopen(
+           ^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/urllib3/connectionpool.py", line 886, in urlopen
+    return self.urlopen(
+           ^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/urllib3/connectionpool.py", line 886, in urlopen
+    return self.urlopen(
+           ^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/urllib3/connectionpool.py", line 886, in urlopen
+    return self.urlopen(
+           ^^^^^^^^^^^^^
+  [Previous line repeated 3 more times]
+  File "/venv/lib/python3.11/site-packages/urllib3/connectionpool.py", line 847, in urlopen
+    retries = retries.increment(
+              ^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/urllib3/util/retry.py", line 555, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+urllib3.exceptions.MaxRetryError: HTTPConnectionPool(host='127.0.0.1', port=9): Max retries exceeded with url: /ws/2/release?limit=5&query=release%3A%28qzz+album%29+artist%3A%28zzqx+artist%29&fmt=json (Caused by NewConnectionError("HTTPConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 111] Connection refused"))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/venv/lib/python3.11/site-packages/beets/metadata_plugins.py", line 427, in _search_api
+    response_data = self.get_search_response(params)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beetsplug/musicbrainz.py", line 770, in get_search_response
+    return self.mb_api.search(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beetsplug/_utils/musicbrainz.py", line 658, in search
+    return self._get_resource(entity, **kwargs)[f"{normalised_entity}s"]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beetsplug/_utils/musicbrainz.py", line 610, in _get_resource
+    return self.get_json(f"{self.api_root}/{resource}", params=kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beetsplug/_utils/musicbrainz.py", line 596, in get_json
+    return self._normalize_data(super().get_json(*args, **kwargs))
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beetsplug/_utils/requests.py", line 228, in get_json
+    return self.get(*args, **kwargs).json()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beetsplug/_utils/requests.py", line 216, in get
+    return self.request("get", *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beetsplug/_utils/musicbrainz.py", line 592, in request
+    return super().request(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beetsplug/_utils/requests.py", line 212, in request
+    return self.session.request(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beetsplug/_utils/requests.py", line 101, in request
+    r = super().request(*args, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/requests/sessions.py", line 651, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/requests_ratelimiter/requests_ratelimiter.py", line 104, in send
+    response = super().send(request, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/requests/sessions.py", line 784, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/requests/adapters.py", line 729, in send
+    raise ConnectionError(e, request=request)
+requests.exceptions.ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=9): Max retries exceeded with url: /ws/2/release?limit=5&query=release%3A%28qzz+album%29+artist%3A%28zzqx+artist%29&fmt=json (Caused by NewConnectionError("HTTPConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 111] Connection refused"))
+Evaluating 0 candidates.
+Sending event: import_task_before_choice
+Sending event: import_task_choice
+Sending event: import
+Sending event: cli_exit

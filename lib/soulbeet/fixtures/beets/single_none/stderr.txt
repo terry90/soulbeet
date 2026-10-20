@@ -1,0 +1,24 @@
+overlaying configuration: /work/config.yaml
+no user configuration found at /work/beetsdir/config.yaml
+data directory: /work/beetsdir
+plugin paths: ['/plugins']
+Loading plugins: fakesrc
+Sending event: pluginload
+library database: /music/.beets_library.db
+library directory: /music
+Sending event: library_opened
+Sending event: import_begin
+Sending event: import_task_created
+Sending event: import_task_start
+Looking up: /src/01 - Song Number 1.mp3
+Item search terms: Zzqx Artist - Song Number 1
+Found 0 candidates.
+Sending event: import_task_created
+Sending event: import_task_choice
+Sending event: import_task_start
+Looking up: /src/02 - Song Number 2.mp3
+Item search terms: Zzqx Artist - Song Number 2
+Found 0 candidates.
+Sending event: import_task_choice
+Sending event: import
+Sending event: cli_exit

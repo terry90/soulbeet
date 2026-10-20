@@ -3,7 +3,7 @@ use dioxus::logger::tracing::{info, warn};
 #[cfg(feature = "server")]
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
 #[cfg(feature = "server")]
-use soulbeet::ImportResult;
+use soulbeet::LegacyImportResult;
 #[cfg(feature = "server")]
 use std::path::Path;
 #[cfg(feature = "server")]
@@ -65,7 +65,7 @@ pub async fn import_group(
 
     let source = Path::new(&source_path);
     match importer.import(&[source], &target_path, as_album).await {
-        Ok(ImportResult::Success) => {
+        Ok(LegacyImportResult::Success) => {
             info!("Import successful");
             let imported_entries: Vec<_> = entries
                 .iter()
@@ -76,7 +76,7 @@ pub async fn import_group(
                 .collect();
             let _ = tx.send(DownloadEvent::Progress(imported_entries));
         }
-        Ok(ImportResult::Skipped(reason)) => {
+        Ok(LegacyImportResult::Skipped(reason)) => {
             info!("Import skipped items: {}", reason);
             let skipped_entries: Vec<_> = entries
                 .iter()
@@ -94,7 +94,7 @@ pub async fn import_group(
                 cleanup_failed_file(&entry.item).await;
             }
         }
-        Ok(ImportResult::Failed(err)) => {
+        Ok(LegacyImportResult::Failed(err)) => {
             info!("Import failed: {}", err);
             let failed_entries: Vec<_> = entries
                 .iter()
@@ -110,7 +110,7 @@ pub async fn import_group(
                 cleanup_failed_file(&entry.item).await;
             }
         }
-        Ok(ImportResult::TimedOut) => {
+        Ok(LegacyImportResult::TimedOut) => {
             warn!("Import timed out for: {}", source_path);
             let failed_entries: Vec<_> = entries
                 .iter()

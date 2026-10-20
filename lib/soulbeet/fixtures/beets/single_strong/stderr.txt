@@ -1,0 +1,52 @@
+overlaying configuration: /work/config.yaml
+no user configuration found at /work/beetsdir/config.yaml
+data directory: /work/beetsdir
+plugin paths: ['/plugins']
+Loading plugins: fakesrc
+Sending event: pluginload
+library database: /music/.beets_library.db
+library directory: /music
+Sending event: library_opened
+Sending event: import_begin
+Sending event: import_task_created
+Sending event: import_task_start
+Looking up: /src/01 - Song Number 1.mp3
+Item search terms: Zzqx Artist - Song Number 1
+Sending event: trackinfo_received
+Found 1 candidates.
+Sending event: import_task_choice
+Sending event: import_task_created
+Sending event: import_task_start
+Looking up: /src/02 - Song Number 2.mp3
+Item search terms: Zzqx Artist - Song Number 2
+Sending event: trackinfo_received
+Found 1 candidates.
+Sending event: import_task_apply
+0 of 1 items replaced
+Sending event: database_change
+Parsed query: AndQuery([NoneQuery('album_id', True)])
+Sending event: import_task_choice
+Parsed sort: NullSort()
+Sending event: import_task_apply
+0 of 1 items replaced
+Sending event: before_item_moved
+Sending event: item_moved
+Sending event: database_change
+Sending event: database_change
+Sending event: write
+Sending event: after_write
+Sending event: database_change
+Sending event: import_task_files
+Sending event: item_imported
+Parsed query: AndQuery([NoneQuery('album_id', True)])
+Parsed sort: NullSort()
+Sending event: before_item_moved
+Sending event: item_moved
+Sending event: database_change
+Sending event: write
+Sending event: after_write
+Sending event: database_change
+Sending event: import_task_files
+Sending event: item_imported
+Sending event: import
+Sending event: cli_exit

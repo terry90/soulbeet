@@ -1,0 +1,9 @@
+plugins: musicbrainz
+import:
+  copy: no
+  move: yes
+  resume: no
+  duplicate_action: remove
+musicbrainz:
+  # Nothing listens here, so every lookup fails after beets' retries.
+  host: 127.0.0.1:9

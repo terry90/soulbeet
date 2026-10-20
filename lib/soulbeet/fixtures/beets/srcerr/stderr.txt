@@ -1,0 +1,45 @@
+overlaying configuration: /work/config.yaml
+no user configuration found at /work/beetsdir/config.yaml
+data directory: /work/beetsdir
+plugin paths: ['/plugins']
+Loading plugins: fakesrc
+Sending event: pluginload
+library database: /music/.beets_library.db
+library directory: /music
+Sending event: library_opened
+Sending event: import_begin
+Sending event: import_task_created
+Sending event: import_task_start
+Looking up: /src
+Tagging Zzqx Artist - Qzz Album
+No album ID found.
+Album ID match recommendation is 0
+Search terms: Zzqx Artist - Qzz Album
+Album might be VA: False
+Error in 'FakeSrc.candidates': simulated network failure
+Exception details:
+Traceback (most recent call last):
+  File "/venv/lib/python3.11/site-packages/beets/metadata_plugins.py", line 68, in maybe_handle_plugin_error
+    yield
+  File "/venv/lib/python3.11/site-packages/beets/metadata_plugins.py", line 107, in wrapper
+    yield from filter(None, future.result())
+                            ^^^^^^^^^^^^^^^
+  File "/python/lib/python3.11/concurrent/futures/_base.py", line 449, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/python/lib/python3.11/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+  File "/python/lib/python3.11/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/lib/python3.11/site-packages/beets/metadata_plugins.py", line 85, in materialize
+    return list(method(*args, **kwargs))
+                ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/plugins/fakesrc.py", line 60, in candidates
+    raise RuntimeError("simulated network failure")
+RuntimeError: simulated network failure
+Evaluating 0 candidates.
+Sending event: import_task_before_choice
+Sending event: import_task_choice
+Sending event: import
+Sending event: cli_exit
