@@ -8,7 +8,7 @@ use crate::{
     },
 };
 use chrono::{DateTime, Duration, Utc};
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
@@ -639,7 +639,14 @@ impl SoulseekClient {
         let mut errors: Vec<String> = Vec::new();
 
         for username in requested {
-            let endpoint = user_downloads_endpoint(username);
+            let endpoint = match user_downloads_endpoint(username) {
+                Ok(endpoint) => endpoint,
+                // Its transfers cannot be listed, so they read as missing.
+                Err(e) => {
+                    warn!("{e}");
+                    continue;
+                }
+            };
             let flattened: FlattenedFiles =
                 match self.make_request(Method::GET, &endpoint, None::<()>).await {
                     Ok(flattened) => flattened,
@@ -664,7 +671,7 @@ impl SoulseekClient {
         info!("Cancelling download: {}", download_id);
         self.make_request(
             Method::DELETE,
-            &transfer_endpoint(username, download_id, remove),
+            &transfer_endpoint(username, download_id, remove)?,
             None::<()>,
         )
         .await
@@ -775,39 +782,36 @@ impl SoulseekClient {
     }
 }
 
-/// Everything that cannot appear literally in one URL path segment.
-/// Soulseek usernames are free-form, so a peer called `a/b` or `x?y`
-/// would otherwise re-point the request at a different route.
-const PATH_SEGMENT: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'#')
-    .add(b'%')
-    .add(b'/')
-    .add(b'<')
-    .add(b'>')
-    .add(b'?')
-    .add(b'`')
-    .add(b'{')
-    .add(b'}');
+/// Everything but unreserved characters, `.` included. Soulseek usernames
+/// are free-form, so a peer called `a/b`, `a\b` or `x?y` would otherwise
+/// re-point the request at a different route.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'~');
 
 /// slskd's exact answer for a file it already has an unfinished transfer
 /// of (`DownloadService.EnqueueAsync`).
 const ALREADY_IN_PROGRESS: &str = "Skipped: Already in progress";
 
-fn user_downloads_endpoint(username: &str) -> String {
-    format!(
-        "transfers/downloads/{}",
-        utf8_percent_encode(username, PATH_SEGMENT)
-    )
+/// `value` as one path segment. URL parsing resolves `.` and `..` as dot
+/// segments even when percent-encoded, so those cannot be sent at all.
+fn path_segment(value: &str) -> Result<String> {
+    if matches!(value, "" | "." | "..") {
+        return Err(SoulseekError::UnaddressablePeer {
+            username: value.to_string(),
+        });
+    }
+    Ok(utf8_percent_encode(value, PATH_SEGMENT).to_string())
 }
 
-fn transfer_endpoint(username: &str, id: &str, remove: bool) -> String {
-    format!(
+fn user_downloads_endpoint(username: &str) -> Result<String> {
+    Ok(format!("transfers/downloads/{}", path_segment(username)?))
+}
+
+fn transfer_endpoint(username: &str, id: &str, remove: bool) -> Result<String> {
+    Ok(format!(
         "{}/{}?remove={remove}",
-        user_downloads_endpoint(username),
-        utf8_percent_encode(id, PATH_SEGMENT)
-    )
+        user_downloads_endpoint(username)?,
+        path_segment(id)?
+    ))
 }
 
 /// One POST to slskd's batch endpoint. The id is fixed when the batch is
@@ -1261,13 +1265,41 @@ mod tests {
     #[test]
     fn transfer_endpoint_encodes_the_username() {
         assert_eq!(
-            transfer_endpoint("a/b c", "id1", true),
+            transfer_endpoint("a/b c", "id1", true).unwrap(),
             "transfers/downloads/a%2Fb%20c/id1?remove=true"
         );
         assert_eq!(
-            user_downloads_endpoint("a/b c"),
+            user_downloads_endpoint("a/b c").unwrap(),
             "transfers/downloads/a%2Fb%20c"
         );
+
+        // What the request actually hits once the URL is parsed.
+        let base = Url::parse("http://slskd:5030").unwrap();
+        let path = |endpoint: String| {
+            base.join(&format!("api/v0/{endpoint}"))
+                .unwrap()
+                .path()
+                .to_string()
+        };
+        assert_eq!(
+            path(transfer_endpoint("a\\b", "id1", false).unwrap()),
+            "/api/v0/transfers/downloads/a%5Cb/id1"
+        );
+        assert_eq!(
+            path(user_downloads_endpoint("..a.").unwrap()),
+            "/api/v0/transfers/downloads/%2E%2Ea%2E"
+        );
+        for name in [".", "..", ""] {
+            assert!(
+                matches!(
+                    user_downloads_endpoint(name),
+                    Err(SoulseekError::UnaddressablePeer { .. })
+                ),
+                "{name:?}"
+            );
+            assert!(transfer_endpoint(name, "id1", false).is_err(), "{name:?}");
+        }
+        assert!(transfer_endpoint("peer", "..", false).is_err());
     }
 
     fn wanted(username: &str, filename: &str) -> (String, DownloadRequestFile) {

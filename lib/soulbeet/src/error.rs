@@ -28,6 +28,9 @@ pub enum SoulseekError {
 
     #[error("Unparseable slskd response: {0}")]
     InvalidResponse(String),
+
+    #[error("Peer name '{username}' cannot be sent in a URL path")]
+    UnaddressablePeer { username: String },
 }
 
 impl SoulseekError {
@@ -37,6 +40,7 @@ impl SoulseekError {
         match self {
             SoulseekError::UserOffline { .. } => false,
             SoulseekError::NotConfigured => false,
+            SoulseekError::UnaddressablePeer { .. } => false,
             // 400 and 404 are definitive: a rejected request body or a
             // missing route (slskd older than 0.26) will not heal on retry.
             SoulseekError::Api {
