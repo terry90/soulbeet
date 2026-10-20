@@ -571,9 +571,10 @@ impl DownloadMonitor {
         }
     }
 
-    /// Remove the terminal slskd records this batch owns and nobody else
-    /// removes: those of slots that ended without a file, and of transfers
-    /// it abandoned. A handed-off slot's record was removed by its handoff.
+    /// Remove the records of this batch's transfers, watched or abandoned,
+    /// that ended without a file. A succeeded record is only ever removed
+    /// by the handoff or album finish that found its file on disk: removing
+    /// it before that can strand the file in slskd's incomplete folder.
     /// Only this batch's ids: another batch's record of the same file is
     /// that batch's to remove.
     async fn remove_batch_transfers(&mut self, backend: &Arc<dyn DownloadBackend>) {
@@ -593,7 +594,7 @@ impl DownloadMonitor {
 
         for entry in downloads
             .iter()
-            .filter(|entry| is_terminal_state(&entry.state) && self.removable(entry))
+            .filter(|entry| is_failed(&entry.state) && self.owns(entry))
         {
             if let Err(e) = backend
                 .cancel_download(&entry.source, &entry.id, true)
@@ -605,25 +606,6 @@ impl DownloadMonitor {
                 );
             }
         }
-    }
-
-    /// Whether the batch's cleanup may remove `entry`'s record.
-    fn removable(&self, entry: &DownloadProgress) -> bool {
-        let abandoned = self
-            .abandoned
-            .iter()
-            .any(|(peer, id)| *peer == entry.source && *id == entry.id);
-        abandoned
-            || (0..self.tracked_files.len()).any(|slot| {
-                self.is_current(slot, entry)
-                    && match self.track_states[slot].phase {
-                        SlotPhase::HandedOff => false,
-                        // Finished but never found on disk: slskd may still
-                        // be moving the file.
-                        SlotPhase::Watching => !is_completed(&entry.state),
-                        SlotPhase::TimedOut | SlotPhase::Settled => true,
-                    }
-            })
     }
 
     /// Process a poll result from slskd.
@@ -648,12 +630,17 @@ impl DownloadMonitor {
 
         let matched = self.find_matching_downloads(&downloads, backend);
 
-        if poll_count <= 3 || matched.len() != self.tracked_files.len() {
+        let watched = (0..self.tracked_files.len())
+            .filter(|slot| self.watching(*slot))
+            .count();
+        let found = matched
+            .iter()
+            .filter(|(slot, _)| self.watching(*slot))
+            .count();
+        if poll_count <= 3 || found != watched {
             info!(
-                "Matched {} of {} downloads from slskd (poll {})",
-                matched.len(),
-                self.tracked_files.len(),
-                poll_count
+                "Matched {} of {} watched downloads from slskd (poll {})",
+                found, watched, poll_count
             );
             self.log_unmatched_files(&matched);
         }
@@ -731,8 +718,8 @@ impl DownloadMonitor {
     /// When a watched slot's own transfer is unusable (gone, or failed) but
     /// another peer has a live transfer of the same file, the download was
     /// retried from a different source: the slot adopts it. Only a transfer
-    /// no batch owns may be adopted; another batch's, even the same user's,
-    /// has its own monitor.
+    /// no batch owns, or one this batch already owns, may be adopted;
+    /// another batch's, even the same user's, has its own monitor.
     fn find_matching_downloads(
         &mut self,
         downloads: &[DownloadProgress],
@@ -773,7 +760,7 @@ impl DownloadMonitor {
             dl.source != tracked.source
                 && !is_terminal_state(&dl.state)
                 && filenames_match(&dl.item, &tracked.filename)
-                && !self.knows(dl)
+                && !self.owns(dl)
                 && registry.may_adopt(
                     &transfer_key(backend, &dl.source, &dl.item),
                     &self.batch.owner,
@@ -782,7 +769,7 @@ impl DownloadMonitor {
     }
 
     /// Whether `dl` is a transfer this batch watches or abandoned.
-    fn knows(&self, dl: &DownloadProgress) -> bool {
+    fn owns(&self, dl: &DownloadProgress) -> bool {
         (0..self.tracked_files.len()).any(|slot| self.is_current(slot, dl))
             || self
                 .abandoned
@@ -1347,9 +1334,10 @@ fn is_completed(state: &DownloadState) -> bool {
     matches!(state, DownloadState::Completed)
 }
 
-/// Whether a transfer ended without its file.
+/// Whether a transfer ended without its file: failed, errored, rejected,
+/// timed out or cancelled in slskd.
 fn is_failed(state: &DownloadState) -> bool {
-    is_terminal_state(state) && !is_completed(state)
+    matches!(state, DownloadState::Failed(_) | DownloadState::Cancelled)
 }
 
 /// Normalize a filename for comparison purposes.
@@ -1704,13 +1692,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_removes_this_batchs_finished_transfers_by_id() {
+    async fn cleanup_removes_this_batchs_failed_transfers_by_id() {
         let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].phase = SlotPhase::Settled;
+        m.abandoned.push(("peer_q".to_string(), "t-q".to_string()));
         stub.set_listing(vec![
             failed_transfer("peer_a", "dirA/aaa.flac"),
+            transfer("peer_q", "q.flac", "t-q", DownloadState::Cancelled),
             transfer(
                 "peer_a",
                 "dirA/aaa.flac",
@@ -1724,7 +1714,36 @@ mod tests {
 
         assert_eq!(
             stub.cancelled(),
-            vec![("peer_a".to_string(), id_of("dirA/aaa.flac"))]
+            vec![
+                ("peer_a".to_string(), id_of("dirA/aaa.flac")),
+                ("peer_q".to_string(), "t-q".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_transfer_that_succeeded_late_keeps_its_record() {
+        // slskd finished it between the listing and the cancel. Its file may
+        // still be on its way out of the incomplete folder.
+        let mut m = monitor(vec!["peer_a"], vec!["one.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].first_seen = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(60)));
+        poll_tracks(
+            &mut m,
+            &[listed("peer_a", "one.flac", DownloadState::InProgress)],
+            &backend,
+        )
+        .await;
+        assert_eq!(phase(&m, 0), SlotPhase::TimedOut);
+
+        stub.set_listing(vec![listed("peer_a", "one.flac", DownloadState::Completed)]);
+        m.remove_batch_transfers(&backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![("peer_a".to_string(), id_of("one.flac"))],
+            "only the timeout's cancel, no removal of the succeeded record"
         );
     }
 
@@ -2162,6 +2181,42 @@ mod tests {
             stub.cancelled(),
             vec![("peer_a".to_string(), id_of("dirA/01.flac"))]
         );
+    }
+
+    // Paused, so the resolve retries of a file that never shows up take no
+    // real time.
+    #[tokio::test(start_paused = true)]
+    async fn an_album_file_that_never_appears_keeps_its_completed_record() {
+        let (mut m, _base, mut imports) =
+            disk_monitor("monitor-album-missing", &["01.flac"], &[]).await;
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let held = key(&backend, "peer_a", "01.flac");
+        TransferRegistry::global().claim(std::slice::from_ref(&held), &m.batch);
+        let listing = vec![listed("peer_a", "01.flac", DownloadState::Completed)];
+        stub.set_listing(listing.clone());
+
+        let mut empty = 0;
+        assert!(
+            m.process_poll_result(listing, &mut empty, 1, &backend)
+                .await
+        );
+        m.remove_batch_transfers(&backend).await;
+
+        assert_eq!(phase(&m, 0), SlotPhase::Settled);
+        assert!(
+            stub.cancelled().is_empty(),
+            "a succeeded record was removed although its file was never found"
+        );
+        assert_eq!(
+            import_events(&mut imports)
+                .into_iter()
+                .flatten()
+                .map(|r| r.state)
+                .collect::<Vec<_>>(),
+            vec![DownloadState::Failed("Could not resolve file path".into())]
+        );
+        assert!(TransferRegistry::global().may_adopt(&held, &batch("Y").owner));
     }
 
     #[tokio::test]

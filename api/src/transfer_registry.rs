@@ -120,20 +120,35 @@ impl TransferRegistry {
         self.owners().retain(|_, batch| batch.owner != *owner);
     }
 
-    /// Moves a claim from `old` to `new` and gives it to `batch`. Refused,
-    /// with nothing changed, when another user holds `new`. `old` is only
-    /// released when `batch`'s user holds it.
+    /// Moves `batch`'s claim from `old` to `new`. Refused, with nothing
+    /// changed, when another batch holds `new`, even the same user's: that
+    /// batch has its own monitor. `old` is only released when `batch` holds
+    /// it.
     pub fn rebind(&self, old: &TransferKey, new: TransferKey, batch: &BatchRef) -> bool {
         let mut owners = self.owners();
-        let same_user = |held: &BatchRef| held.owner.user_id == batch.owner.user_id;
-        if owners.get(&new).is_some_and(|held| !same_user(held)) {
+        let own = |held: &BatchRef| held.owner == batch.owner;
+        if owners.get(&new).is_some_and(|held| !own(held)) {
             return false;
         }
-        if owners.get(old).is_some_and(same_user) {
+        if owners.get(old).is_some_and(own) {
             owners.remove(old);
         }
         owners.insert(new, batch.clone());
         true
+    }
+
+    /// Gives `key` from batch `from` to batch `to`, for a request that joins
+    /// a running batch with the keys it just claimed. Refused, with nothing
+    /// changed, when `from` does not hold `key`.
+    pub fn hand_over(&self, key: &TransferKey, from: &TransferOwner, to: &BatchRef) -> bool {
+        let mut owners = self.owners();
+        match owners.get_mut(key) {
+            Some(held) if held.owner == *from => {
+                *held = to.clone();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Whether a batch may start watching a transfer it did not enqueue:
@@ -389,16 +404,35 @@ mod tests {
     }
 
     #[test]
-    fn rebind_moves_a_key_to_another_batch_of_the_same_user() {
+    fn rebind_refuses_a_key_of_another_batch_of_the_same_user() {
+        let registry = TransferRegistry::default();
+        let mine = batch("alice", "a1");
+        let other = batch("alice", "a2");
+        registry.claim(&[key("01.flac")], &mine);
+        registry.claim(&[key("02.flac")], &other);
+
+        assert!(!registry.rebind(&key("01.flac"), key("02.flac"), &mine));
+        assert!(registry.may_adopt(&key("01.flac"), &mine.owner));
+        assert!(registry.may_adopt(&key("02.flac"), &other.owner));
+
+        // Nor does it free an old key that another batch holds.
+        assert!(registry.rebind(&key("02.flac"), key("03.flac"), &mine));
+        assert!(registry.may_adopt(&key("02.flac"), &other.owner));
+    }
+
+    #[test]
+    fn hand_over_moves_a_key_to_another_batch_of_the_same_user() {
         let registry = TransferRegistry::default();
         let fresh = batch("alice", "a2");
         let running = batch("alice", "a1");
         registry.claim(&[key("01.flac")], &fresh);
 
-        assert!(registry.rebind(&key("01.flac"), key("01.flac"), &running));
+        assert!(!registry.hand_over(&key("01.flac"), &running.owner, &fresh));
+        assert!(registry.hand_over(&key("01.flac"), &fresh.owner, &running));
 
         assert!(registry.may_adopt(&key("01.flac"), &running.owner));
         assert!(!registry.may_adopt(&key("01.flac"), &fresh.owner));
+        assert!(!registry.hand_over(&key("02.flac"), &fresh.owner, &running));
     }
 
     #[test]

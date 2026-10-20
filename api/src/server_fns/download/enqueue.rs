@@ -167,7 +167,7 @@ pub async fn enqueue_request(
     let (batch, watcher) = match joined {
         Some((running, reservation)) => {
             for key in &claim.claimed {
-                let moved = registry.rebind(key, key.clone(), &running);
+                let moved = registry.hand_over(key, &fresh.owner, &running);
                 debug_assert!(moved, "a key this request just claimed");
             }
             (running, Watcher::Joined(reservation))
