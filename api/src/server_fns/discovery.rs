@@ -727,6 +727,7 @@ pub async fn generate_discovery_playlist_internal(
                         batch_id: uuid::Uuid::new_v4().to_string(),
                     },
                     format!("{} - {}", candidate.artist, candidate.track),
+                    std::path::PathBuf::from(folder.discovery_profile_path(&profile_name)),
                 );
                 // Discovery watches its own transfers, so nothing may join it.
                 track_batch.inbox.close();

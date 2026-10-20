@@ -52,6 +52,10 @@ use self::enqueue::{
 use self::monitor::DownloadMonitor;
 #[cfg(feature = "server")]
 use crate::transfer_registry::{BatchRef, TransferOwner};
+#[cfg(feature = "server")]
+use soulbeet::{error::SoulseekError, DownloadBackend};
+#[cfg(feature = "server")]
+use std::sync::Arc;
 
 /// Name for a manual download's batch: the album its items share, or the
 /// first item's title when they span albums.
@@ -221,16 +225,51 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
             batch_id: uuid::Uuid::new_v4().to_string(),
         },
         manual_batch_label(&req.items),
+        target_path_buf,
     );
+    let (results, error) = queue_detached(backend, req.items, fresh, username, req.backend)
+        .await
+        .map_err(server_error)?;
+    match error {
+        Some(e) => Err(server_error(e)),
+        None => Ok(results),
+    }
+}
+
+/// Runs `queue_and_watch` as its own task. Registry keys are claimed from
+/// its start, and the client may disconnect at any await and drop the
+/// handler: dropping the task's handle does not stop it, so the request
+/// always gets as far as a monitor or a release.
+#[cfg(feature = "server")]
+async fn queue_detached(
+    backend: Arc<dyn DownloadBackend>,
+    items: Vec<DownloadableItem>,
+    fresh: BatchRef,
+    username: String,
+    backend_id: Option<String>,
+) -> Result<(Vec<QueuedDownload>, Option<SoulseekError>), tokio::task::JoinError> {
+    tokio::spawn(queue_and_watch(backend, items, fresh, username, backend_id)).await
+}
+
+/// Claims and enqueues a manual request's files, shows their rows, and hands
+/// the enqueued ones to a monitor: the running batch's when the request
+/// joined one, else a new one.
+#[cfg(feature = "server")]
+async fn queue_and_watch(
+    backend: Arc<dyn DownloadBackend>,
+    items: Vec<DownloadableItem>,
+    fresh: BatchRef,
+    username: String,
+    backend_id: Option<String>,
+) -> (Vec<QueuedDownload>, Option<SoulseekError>) {
     let RequestEnqueue {
         batch,
         results,
         watcher,
         error,
-    } = enqueue_request(&backend, req.items, fresh).await;
+    } = enqueue_request(&backend, items, fresh).await;
 
     let (tx, _) = get_or_create_user_channel(&username).await;
-    let backend_id = req.backend;
     let row = |p: DownloadProgress| {
         let mut p = p.with_batch(batch.owner.batch_id.clone(), batch.label.clone());
         p.backend = backend_id.clone();
@@ -282,7 +321,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
                 enqueued.len(),
                 batch.owner.batch_id
             );
-            let lost = deliver(reservation, &enqueued, backend.id());
+            let lost = deliver(reservation, &enqueued, backend.id(), &batch);
             if !lost.is_empty() {
                 let _ = tx.send(DownloadEvent::Progress(stopped_rows(&lost, &batch)));
             }
@@ -303,7 +342,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
                 let mut monitor = DownloadMonitor::new(
                     sources,
                     filenames,
-                    target_path_buf,
+                    batch.target.clone(),
                     tx,
                     task_cancellation,
                     task_username.clone(),
@@ -315,10 +354,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         }
     }
 
-    match error {
-        Some(e) => Err(server_error(e)),
-        None => Ok(results),
-    }
+    (results, error)
 }
 
 /// Imports a failed or skipped row again, from the job kept for it.
@@ -355,5 +391,55 @@ mod tests {
             i.album = " ".to_string();
         }
         assert_eq!(manual_batch_label(&no_album), "One");
+    }
+
+    #[tokio::test]
+    async fn a_request_dropped_mid_enqueue_still_hands_its_transfers_over() {
+        use crate::transfer_registry::TransferRegistry;
+        use test_support::{batch, key, ScriptedOutcome, StubBackend};
+
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let (reached, release) = stub.hold_downloads();
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = batch("Come Over");
+        TransferRegistry::global().claim(&[key(&backend, "p", "1.flac")], &running);
+        let fresh = BatchRef::new(
+            TransferOwner {
+                user_id: running.owner.user_id.clone(),
+                batch_id: uuid::Uuid::new_v4().to_string(),
+            },
+            "Come Over".to_string(),
+            running.target.clone(),
+        );
+        let items = vec![item("p", "One", "1.flac"), item("p", "Two", "2.flac")];
+
+        // The handler is dropped while slskd is still answering the enqueue,
+        // as when the client disconnects.
+        let handler = tokio::spawn(queue_detached(
+            backend,
+            items,
+            fresh,
+            "detached-request".to_string(),
+            None,
+        ));
+        reached.notified().await;
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+        release.notify_one();
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let slots = running.inbox.take();
+                if !slots.is_empty() {
+                    break slots;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the enqueued transfer never reached the running batch");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].filename, "2.flac");
+        assert_eq!(delivered[0].transfer_id, "t-2.flac");
     }
 }

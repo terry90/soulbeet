@@ -16,6 +16,9 @@ use crate::transfer_registry::{
 pub const OTHER_USER: &str = "already being downloaded by another user";
 /// Row text for a file slskd is already fetching outside any batch.
 pub const ALREADY_IN_SLSKD: &str = "already downloading in slskd";
+/// Row text for a file the same user is downloading into another library
+/// folder.
+pub const ANOTHER_FOLDER: &str = "already downloading into another folder";
 /// Row text for a file that joined a batch whose monitor had stopped.
 pub const MONITOR_STOPPED: &str = "Download monitoring stopped";
 
@@ -53,7 +56,8 @@ pub async fn enqueue_claimed(
     let mut queued = match backend.download(items, &batch.destination).await {
         Ok(queued) => queued,
         Err(e) => {
-            keys.iter().for_each(|key| registry.release(key));
+            keys.iter()
+                .for_each(|key| registry.release(key, &batch.owner));
             return Err(e);
         }
     };
@@ -68,7 +72,7 @@ pub async fn enqueue_claimed(
             q.status == EnqueueStatus::Enqueued && q.source == key.peer && q.item == key.filename
         });
         if !enqueued {
-            registry.release(key);
+            registry.release(key, &batch.owner);
         }
     }
     Ok(queued)
@@ -127,10 +131,19 @@ pub async fn enqueue_request(
         }
     };
 
+    // A batch importing elsewhere neither takes this request's files nor
+    // lets it import the shared ones here.
+    let same_folder = |running: &BatchRef| running.target == fresh.target;
     let mut results: Vec<QueuedDownload> = claim
         .mine
         .iter()
-        .map(|(key, _)| not_enqueued(key, EnqueueStatus::AlreadyInFlight))
+        .map(|(key, running)| {
+            if same_folder(running) {
+                not_enqueued(key, EnqueueStatus::AlreadyInFlight)
+            } else {
+                not_enqueued(key, EnqueueStatus::Failed(ANOTHER_FOLDER.to_string()))
+            }
+        })
         .chain(
             claim
                 .other_user
@@ -139,12 +152,17 @@ pub async fn enqueue_request(
         )
         .collect();
 
-    let joined = match claim.mine.first() {
-        Some((_, running)) if !claim.claimed.is_empty() => running
-            .inbox
-            .reserve()
-            .map(|reservation| (running.clone(), reservation)),
-        _ => None,
+    let joined = if claim.claimed.is_empty() {
+        None
+    } else {
+        claim
+            .mine
+            .iter()
+            .filter(|(_, running)| same_folder(running))
+            .find_map(|(_, running)| {
+                let reservation = running.inbox.reserve()?;
+                Some((running.clone(), reservation))
+            })
     };
     let (batch, watcher) = match joined {
         Some((running, reservation)) => {
@@ -173,13 +191,14 @@ pub async fn enqueue_request(
     }
 }
 
-/// Hands a joining request's enqueued transfers to the running batch's
-/// monitor. Returns the ones nobody will watch because that monitor stopped
-/// first, with their keys released.
+/// Hands a joining request's enqueued transfers to `batch`'s monitor.
+/// Returns the ones nobody will watch because that monitor stopped first,
+/// with their keys released.
 pub fn deliver(
     reservation: InboxReservation,
     enqueued: &[QueuedDownload],
     backend: &'static str,
+    batch: &BatchRef,
 ) -> Vec<AddedSlot> {
     let slots = enqueued
         .iter()
@@ -194,7 +213,10 @@ pub fn deliver(
         Err(lost) => {
             let registry = TransferRegistry::global();
             for slot in &lost {
-                registry.release(&transfer_key(backend, &slot.source, &slot.filename));
+                registry.release(
+                    &transfer_key(backend, &slot.source, &slot.filename),
+                    &batch.owner,
+                );
             }
             lost
         }
@@ -224,15 +246,21 @@ mod tests {
         batch, item, key, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferOwner;
+    use std::path::PathBuf;
 
-    /// Another batch of `running`'s user.
+    /// Another batch of `running`'s user, importing into the same folder.
     fn same_user(running: &BatchRef) -> BatchRef {
+        same_user_into(running, running.target.clone())
+    }
+
+    fn same_user_into(running: &BatchRef, target: PathBuf) -> BatchRef {
         BatchRef::new(
             TransferOwner {
                 user_id: running.owner.user_id.clone(),
                 batch_id: uuid::Uuid::new_v4().to_string(),
             },
             "Come Over".to_string(),
+            target,
         )
     }
 
@@ -281,7 +309,7 @@ mod tests {
             .into_iter()
             .filter(|q| q.status == EnqueueStatus::Enqueued)
             .collect();
-        assert!(deliver(reservation, &enqueued, backend.id()).is_empty());
+        assert!(deliver(reservation, &enqueued, backend.id(), &running).is_empty());
         assert_eq!(
             running.inbox.take(),
             vec![AddedSlot {
@@ -289,6 +317,71 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02.flac".to_string(),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_request_for_another_folder_does_not_join() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = batch("Come Over");
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
+        let fresh = same_user_into(&running, PathBuf::from("/other-library"));
+        let items = vec![
+            item("peer_a", "One", "01.flac"),
+            item("peer_a", "Two", "02.flac"),
+        ];
+
+        let enq = enqueue_request(&backend, items, fresh.clone()).await;
+
+        assert_eq!(
+            statuses(&enq.results),
+            vec![
+                (
+                    "01.flac".to_string(),
+                    EnqueueStatus::Failed(ANOTHER_FOLDER.to_string())
+                ),
+                ("02.flac".to_string(), EnqueueStatus::Enqueued),
+            ]
+        );
+        assert!(matches!(enq.watcher, Watcher::Own));
+        assert_eq!(enq.batch.owner, fresh.owner);
+        assert_eq!(stub.destinations(), vec![fresh.destination.clone()]);
+        assert!(
+            running.inbox.close_if_idle(),
+            "the running batch was not joined"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_request_joins_the_batch_importing_into_its_folder() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let elsewhere = batch("Come Over");
+        let here = same_user_into(&elsewhere, PathBuf::from("/other-library"));
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &elsewhere);
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "02.flac")], &here);
+        let items = vec![
+            item("peer_a", "One", "01.flac"),
+            item("peer_a", "Two", "02.flac"),
+            item("peer_a", "Three", "03.flac"),
+        ];
+
+        let enq = enqueue_request(&backend, items, same_user(&here)).await;
+
+        assert!(matches!(enq.watcher, Watcher::Joined(_)));
+        assert_eq!(enq.batch.owner, here.owner);
+        assert_eq!(stub.destinations(), vec![here.destination.clone()]);
+        assert_eq!(
+            statuses(&enq.results),
+            vec![
+                (
+                    "01.flac".to_string(),
+                    EnqueueStatus::Failed(ANOTHER_FOLDER.to_string())
+                ),
+                ("02.flac".to_string(), EnqueueStatus::AlreadyInFlight),
+                ("03.flac".to_string(), EnqueueStatus::Enqueued),
+            ]
         );
     }
 
@@ -409,7 +502,7 @@ mod tests {
         let enqueued = enqueue_claimed_for(&backend, &running).await;
         running.inbox.close();
 
-        let lost = deliver(reservation, &enqueued, backend.id());
+        let lost = deliver(reservation, &enqueued, backend.id(), &running);
 
         assert_eq!(lost.len(), 1);
         assert!(TransferRegistry::global()

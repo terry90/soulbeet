@@ -251,6 +251,23 @@ impl DownloadMonitor {
         any
     }
 
+    /// Stop taking slots, and write off the ones delivered but never taken.
+    /// Idempotent.
+    fn close_inbox(&self) {
+        let unwatched = self.batch.inbox.close();
+        if !unwatched.is_empty() {
+            warn!(
+                "Batch {} stopped before watching {} added downloads",
+                self.batch.owner.batch_id,
+                unwatched.len()
+            );
+            let _ = self.tx.send(DownloadEvent::Progress(stopped_rows(
+                &unwatched,
+                &self.batch,
+            )));
+        }
+    }
+
     /// Give up when slskd's transfer list has been unreadable for too long.
     ///
     /// Transport errors are deliberately not fused by count, because a slskd
@@ -481,6 +498,9 @@ impl DownloadMonitor {
 
             interval.tick().await;
         }
+
+        // Joiners must not enqueue into a batch that is only cleaning up.
+        self.close_inbox();
 
         // Remove this batch's terminal transfers from slskd so they don't
         // interfere with future downloads of the same files. Only this
@@ -979,18 +999,7 @@ impl Drop for DownloadMonitor {
     /// Whatever ended the monitor, its batch takes no more slots, and its
     /// files may be downloaded again by anyone.
     fn drop(&mut self) {
-        let unwatched = self.batch.inbox.close();
-        if !unwatched.is_empty() {
-            warn!(
-                "Batch {} stopped before watching {} added downloads",
-                self.batch.owner.batch_id,
-                unwatched.len()
-            );
-            let _ = self.tx.send(DownloadEvent::Progress(stopped_rows(
-                &unwatched,
-                &self.batch,
-            )));
-        }
+        self.close_inbox();
         TransferRegistry::global().release_batch(&self.batch.owner);
     }
 }

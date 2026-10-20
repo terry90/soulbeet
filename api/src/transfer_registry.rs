@@ -12,6 +12,7 @@
 
 use shared::download::batch_folder;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 /// Who started a batch.
@@ -22,23 +23,27 @@ pub struct TransferOwner {
 }
 
 /// A running batch: who owns it, its name, the folder its transfers are
-/// enqueued into and the inbox that takes more of them.
+/// enqueued into, the library folder they are imported into and the inbox
+/// that takes more of them.
 #[derive(Clone, Debug)]
 pub struct BatchRef {
     pub owner: TransferOwner,
     pub label: String,
     pub destination: String,
+    pub target: PathBuf,
     pub inbox: Arc<BatchInbox>,
 }
 
 impl BatchRef {
-    /// A new batch downloading into `batch_folder(label, batch_id)`.
-    pub fn new(owner: TransferOwner, label: String) -> Self {
+    /// A new batch downloading into `batch_folder(label, batch_id)` and
+    /// importing into `target`.
+    pub fn new(owner: TransferOwner, label: String, target: PathBuf) -> Self {
         let destination = batch_folder(&label, &owner.batch_id);
         Self {
             owner,
             label,
             destination,
+            target,
             inbox: BatchInbox::new(),
         }
     }
@@ -101,8 +106,13 @@ impl TransferRegistry {
         claim
     }
 
-    pub fn release(&self, key: &TransferKey) {
-        self.owners().remove(key);
+    /// Releases `key` if `owner` still holds it. A key released and claimed
+    /// again by someone else meanwhile stays theirs.
+    pub fn release(&self, key: &TransferKey, owner: &TransferOwner) {
+        let mut owners = self.owners();
+        if owners.get(key).is_some_and(|held| held.owner == *owner) {
+            owners.remove(key);
+        }
     }
 
     /// Releases every key the batch still holds.
@@ -247,6 +257,7 @@ mod tests {
                 batch_id: batch_id.to_string(),
             },
             "Come Over".to_string(),
+            PathBuf::from("/music"),
         )
     }
 
@@ -318,12 +329,28 @@ mod tests {
     #[test]
     fn release_lets_the_key_be_claimed_again() {
         let registry = TransferRegistry::default();
-        registry.claim(&[key("01.flac")], &batch("alice", "a1"));
+        let alice = batch("alice", "a1");
+        registry.claim(&[key("01.flac")], &alice);
 
-        registry.release(&key("01.flac"));
+        registry.release(&key("01.flac"), &alice.owner);
 
         let claim = registry.claim(&[key("01.flac")], &batch("bob", "b1"));
         assert_eq!(claim.claimed, vec![key("01.flac")]);
+    }
+
+    #[test]
+    fn a_late_release_leaves_a_key_someone_else_claimed_since() {
+        let registry = TransferRegistry::default();
+        let alice = batch("alice", "a1");
+        registry.claim(&[key("01.flac")], &alice);
+        registry.release(&key("01.flac"), &alice.owner);
+        let bob = batch("bob", "b1");
+        registry.claim(&[key("01.flac")], &bob);
+
+        registry.release(&key("01.flac"), &alice.owner);
+
+        assert!(registry.may_adopt(&key("01.flac"), &bob.owner));
+        assert!(!registry.may_adopt(&key("01.flac"), &alice.owner));
     }
 
     #[test]

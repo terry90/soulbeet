@@ -14,6 +14,7 @@ use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::DownloadBackend;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner};
 
@@ -47,7 +48,8 @@ pub fn group(source: &str, items: Vec<DownloadableItem>, score: f64) -> Download
 }
 
 /// A batch of its own user, so tests sharing the process-wide registry never
-/// see each other's claims. Its folder is `<label> [12345678]`.
+/// see each other's claims. Its folder is `<label> [12345678]`, and it
+/// imports into `/music`.
 pub fn batch(label: &str) -> BatchRef {
     let unique = uuid::Uuid::new_v4();
     BatchRef::new(
@@ -56,6 +58,7 @@ pub fn batch(label: &str) -> BatchRef {
             batch_id: format!("12345678-{unique}"),
         },
         label.to_string(),
+        std::path::PathBuf::from("/music"),
     )
 }
 
@@ -89,6 +92,14 @@ pub struct StubBackend {
     cancelled: Mutex<Vec<(String, String)>>,
     destinations: Mutex<Vec<String>>,
     listing: Mutex<Vec<DownloadProgress>>,
+    hold: Mutex<Option<Hold>>,
+}
+
+/// Holds every `download` call until released, after announcing it.
+#[derive(Clone)]
+struct Hold {
+    reached: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 impl StubBackend {
@@ -101,6 +112,7 @@ impl StubBackend {
             cancelled: Mutex::new(Vec::new()),
             destinations: Mutex::new(Vec::new()),
             listing: Mutex::new(Vec::new()),
+            hold: Mutex::new(None),
         })
     }
 
@@ -112,6 +124,17 @@ impl StubBackend {
     /// The destination of every `download` call, in order.
     pub fn destinations(&self) -> Vec<String> {
         self.destinations.lock().unwrap().clone()
+    }
+
+    /// Makes each `download` call wait: the first notifier fires when a call
+    /// arrives, and the call answers once the second one is notified.
+    pub fn hold_downloads(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let hold = Hold {
+            reached: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self.hold.lock().unwrap() = Some(hold.clone());
+        (hold.reached, hold.release)
     }
 
     /// What `get_downloads_for` (filtered by peer) and `get_downloads` return.
@@ -145,6 +168,11 @@ impl DownloadBackend for StubBackend {
         items: Vec<DownloadableItem>,
         destination: &str,
     ) -> SoulResult<Vec<QueuedDownload>> {
+        let hold = self.hold.lock().unwrap().clone();
+        if let Some(hold) = hold {
+            hold.reached.notify_one();
+            hold.release.notified().await;
+        }
         self.destinations
             .lock()
             .unwrap()

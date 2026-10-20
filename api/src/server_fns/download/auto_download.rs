@@ -331,6 +331,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                 batch_id: batch_id.clone(),
             },
             batch_label,
+            target_path_buf,
         );
         let RequestEnqueue {
             batch,
@@ -408,7 +409,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                     query_desc,
                     batch.owner.batch_id
                 );
-                let lost = deliver(reservation, &successful, backend.id());
+                let lost = deliver(reservation, &successful, backend.id(), &batch);
                 if !lost.is_empty() {
                     let _ = tx.send(DownloadEvent::Progress(stopped_rows(&lost, &batch)));
                 }
@@ -442,7 +443,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         let mut monitor = DownloadMonitor::new(
             download_sources,
             download_filenames,
-            target_path_buf,
+            batch.target.clone(),
             tx,
             task_cancellation,
             task_username.clone(),
