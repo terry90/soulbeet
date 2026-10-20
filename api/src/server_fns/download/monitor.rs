@@ -29,9 +29,7 @@ use crate::config::CONFIG;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
 use crate::services::download_backend;
-use crate::transfer_registry::{
-    AddedSlot, BatchRef, TransferKey, TransferOwner, TransferRegistry,
-};
+use crate::transfer_registry::{AddedSlot, BatchRef, TransferKey, TransferOwner, TransferRegistry};
 
 /// Poll interval for checking download status (2 seconds).
 const POLL_INTERVAL_SECS: u64 = 2;

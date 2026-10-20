@@ -401,10 +401,16 @@ mod tests {
         )
         .await;
 
-        assert!(enq.results.is_empty(), "no row would replace the running one");
+        assert!(
+            enq.results.is_empty(),
+            "no row would replace the running one"
+        );
         assert_eq!(enq.refusal(), Some(ANOTHER_FOLDER));
         assert!(stub.destinations().is_empty());
-        assert!(running.inbox.close_if_idle(), "the running batch was not joined");
+        assert!(
+            running.inbox.close_if_idle(),
+            "the running batch was not joined"
+        );
     }
 
     #[tokio::test]

@@ -98,13 +98,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         .query
         .album
         .as_ref()
-        .map(|a| {
-            format!(
-                "{} - {}",
-                &a.artist,
-                &a.title
-            )
-        })
+        .map(|a| format!("{} - {}", &a.artist, &a.title))
         .unwrap_or_else(|| {
             req.query
                 .tracks
@@ -244,8 +238,11 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         }
 
         // Sort by score descending
-        all_groups
-            .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all_groups.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let best_score = all_groups[0].score;
 
@@ -391,9 +388,11 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             }));
         } else {
             // Send Downloading event
-            let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Downloading {
-                batch_id: batch_id.clone(),
-            }));
+            let _ = tx.send(DownloadEvent::AutoDownload(
+                AutoDownloadEvent::Downloading {
+                    batch_id: batch_id.clone(),
+                },
+            ));
         }
 
         // Send initial Queued progress for each track (with batch fields per D-10, D-11)

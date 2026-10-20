@@ -60,8 +60,7 @@ pub trait DownloadBackend: Send + Sync {
     /// needs peers outside the batch: adopting a file retried from a source
     /// nobody is tracking.
     async fn get_downloads(&self) -> Result<Vec<DownloadProgress>>;
-    async fn cancel_download(&self, username: &str, download_id: &str, remove: bool)
-        -> Result<()>;
+    async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()>;
     async fn health_check(&self) -> bool;
 }
 

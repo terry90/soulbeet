@@ -256,8 +256,10 @@ fn truncated(value: &Value) -> String {
 
 fn collect_user_files(user: &Value, out: &mut FlattenedFiles) {
     let Some(directories) = user.get("directories").and_then(|d| d.as_array()) else {
-        out.errors
-            .push(format!("user entry without directories: {}", truncated(user)));
+        out.errors.push(format!(
+            "user entry without directories: {}",
+            truncated(user)
+        ));
         return;
     };
     for dir in directories {

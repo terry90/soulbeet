@@ -244,9 +244,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         .await
         .map_err(server_error)?;
     match queued {
-        Queued {
-            error: Some(e), ..
-        } => Err(server_error(e)),
+        Queued { error: Some(e), .. } => Err(server_error(e)),
         Queued {
             refusal: Some(reason),
             ..

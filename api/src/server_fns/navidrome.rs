@@ -419,7 +419,9 @@ async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), PromoteEr
         // File missing -- revert to Pending so expiry can handle it
         let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
         warn!("Promote of '{}': {} is gone", track.title, track.path);
-        return Err(PromoteError::Refused("The downloaded file is gone".to_string()));
+        return Err(PromoteError::Refused(
+            "The downloaded file is gone".to_string(),
+        ));
     }
 
     let target = std::path::PathBuf::from(&folder.path);

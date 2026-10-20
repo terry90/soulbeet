@@ -1,8 +1,8 @@
 use auth::{use_auth, AuthProvider};
 use dioxus::prelude::*;
-use shared::download::DownloadProgress;
 #[cfg(feature = "web")]
 use shared::download::DownloadEvent;
+use shared::download::DownloadProgress;
 use shared::system::NavidromeStatus;
 use std::collections::HashMap;
 
@@ -127,25 +127,23 @@ fn WebNavbar() -> Element {
     #[cfg(feature = "web")]
     use_resilient_websocket(
         || api::download_updates_ws(WebSocketOptions::new()),
-        move |event: DownloadEvent| {
-            match event {
-                DownloadEvent::Progress(data) => {
-                    let mut map = downloads.write();
-                    for file in data {
-                        map.insert(file.item.clone(), file);
-                    }
+        move |event: DownloadEvent| match event {
+            DownloadEvent::Progress(data) => {
+                let mut map = downloads.write();
+                for file in data {
+                    map.insert(file.item.clone(), file);
                 }
-                DownloadEvent::Replaced {
-                    previous_item,
-                    entry,
-                } => {
-                    let mut map = downloads.write();
-                    map.remove(&previous_item);
-                    map.insert(entry.item.clone(), entry);
-                }
-                DownloadEvent::AutoDownload(auto_event) => {
-                    auto_download_signal.set(Some(auto_event));
-                }
+            }
+            DownloadEvent::Replaced {
+                previous_item,
+                entry,
+            } => {
+                let mut map = downloads.write();
+                map.remove(&previous_item);
+                map.insert(entry.item.clone(), entry);
+            }
+            DownloadEvent::AutoDownload(auto_event) => {
+                auto_download_signal.set(Some(auto_event));
             }
         },
     );

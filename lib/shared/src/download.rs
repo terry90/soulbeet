@@ -330,9 +330,7 @@ pub enum AutoDownloadEvent {
         track_count: usize,
     },
     /// Download queued with the picked source
-    Downloading {
-        batch_id: String,
-    },
+    Downloading { batch_id: String },
     /// Best score below threshold, client should show manual source picker
     FallbackToManual {
         batch_id: String,
@@ -341,10 +339,7 @@ pub enum AutoDownloadEvent {
         threshold: f64,
     },
     /// Auto-download pipeline failed
-    Failed {
-        batch_id: String,
-        error: String,
-    },
+    Failed { batch_id: String, error: String },
 }
 
 #[cfg(test)]
@@ -363,7 +358,10 @@ mod tests {
     #[test]
     fn import_queued_round_trips_and_sorts_between_completed_and_importing() {
         let s = DownloadState::ImportQueued(2);
-        assert_eq!(serde_json::to_value(&s).unwrap(), serde_json::json!({"ImportQueued":2}));
+        assert_eq!(
+            serde_json::to_value(&s).unwrap(),
+            serde_json::json!({"ImportQueued":2})
+        );
         assert!(DownloadState::Completed < DownloadState::ImportQueued(1));
         assert!(DownloadState::ImportQueued(1) < DownloadState::ImportQueued(3));
         assert!(DownloadState::ImportQueued(9) < DownloadState::Importing);

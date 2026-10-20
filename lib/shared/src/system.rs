@@ -139,9 +139,19 @@ mod tests {
         let h = ImporterHealth::default();
         assert_eq!(h.level, HealthLevel::Checking);
         assert_eq!(HealthLevel::Degraded.chip(), "WARN");
-        let issue = |s, t: &str| HealthIssue { severity: s, title: t.into(), detail: String::new() };
-        let h = ImporterHealth { level: HealthLevel::Broken,
-            issues: vec![issue(HealthLevel::Degraded, "w"), issue(HealthLevel::Broken, "b")], facts: vec![] };
+        let issue = |s, t: &str| HealthIssue {
+            severity: s,
+            title: t.into(),
+            detail: String::new(),
+        };
+        let h = ImporterHealth {
+            level: HealthLevel::Broken,
+            issues: vec![
+                issue(HealthLevel::Degraded, "w"),
+                issue(HealthLevel::Broken, "b"),
+            ],
+            facts: vec![],
+        };
         assert_eq!(h.blocking_issue().unwrap().title, "b");
     }
 
