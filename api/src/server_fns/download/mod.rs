@@ -11,7 +11,10 @@ use dioxus::logger::tracing::{info, warn};
 use tokio::sync::broadcast;
 
 #[cfg(feature = "server")]
-use crate::{server_fns::server_error, AuthSession};
+use crate::{
+    server_fns::{refusal_error, server_error},
+    AuthSession,
+};
 
 #[cfg(feature = "server")]
 use crate::globals::{
@@ -184,12 +187,13 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
     let username = auth.0.username;
 
     if let Some(issue) = crate::importer_health::broken_issue().await {
-        return Err(server_error(issue.title));
+        return Err(refusal_error(issue.title));
     }
-    let folder = crate::models::folder::Folder::find_for_user_by_path(&auth.0.sub, &req.target_folder)
-        .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("Folder not found"))?;
+    let folder =
+        crate::models::folder::Folder::find_for_user_by_path(&auth.0.sub, &req.target_folder)
+            .await
+            .map_err(server_error)?
+            .ok_or_else(|| refusal_error("Folder not found"))?;
 
     let target_path_buf = std::path::Path::new(&folder.path).to_path_buf();
     if let Err(e) = tokio::fs::create_dir_all(&target_path_buf).await {

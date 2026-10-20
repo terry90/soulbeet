@@ -30,6 +30,18 @@ pub fn server_error<E: std::fmt::Display>(e: E) -> ServerFnError {
     }
 }
 
+/// Status of a request refused for a reason the user can act on. Its message
+/// is written for display, unlike a 500's.
+pub const REFUSAL_CODE: u16 = 409;
+
+pub fn refusal_error<E: std::fmt::Display>(e: E) -> ServerFnError {
+    ServerFnError::ServerError {
+        message: e.to_string(),
+        code: REFUSAL_CODE,
+        details: None,
+    }
+}
+
 pub fn unauthorized_error<E: std::fmt::Display>(e: E) -> ServerFnError {
     ServerFnError::ServerError {
         message: e.to_string(),

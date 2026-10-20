@@ -454,7 +454,7 @@ pub fn Search() -> Element {
             Ok(_res) => info!("Downloads started"),
             Err(e) => {
                 warn!("Failed to start downloads: {:?}", e);
-                download_error.set(refusal_text(&e));
+                download_error.set(crate::friendly_error(&e));
             }
         }
         is_downloading.set(false);
@@ -859,16 +859,5 @@ pub fn Search() -> Element {
           }
         }
       }
-    }
-}
-
-/// A refused download carries its reason in the server message, which the
-/// generic mapping would hide.
-fn refusal_text(e: &ServerFnError) -> String {
-    match e {
-        ServerFnError::ServerError {
-            code: 500, message, ..
-        } => message.clone(),
-        _ => crate::friendly_error(e),
     }
 }
