@@ -1,6 +1,6 @@
 //! Reads tracks back out of soulbeet's per-folder beets libraries.
 
-use super::runner::{run_beet, RunEnd, RunSpec, Stream};
+use super::runner::{run_beet, RunEnd, RunLimits, RunSpec, Stream};
 use super::BeetsSettings;
 use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 use std::collections::{HashMap, HashSet};
@@ -71,7 +71,7 @@ pub(crate) async fn query_library(
         let spec = RunSpec {
             program: &s.beet,
             args,
-            limits: s.limits,
+            limits: RunLimits::LIBRARY_LS,
         };
         let outcome = run_beet(spec, &mut on_line).await;
 

@@ -10,11 +10,11 @@ pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 use crate::audio::count_audio_files;
 use crate::{ImportMode, ImportOutcome, ImportResult, MusicImporter};
 use classify::{parse_run_log, Classifier};
-use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeReport};
+use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
 use shared::system::ImporterHealth;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Where beets is and how to run it. Resolved once at startup.
@@ -38,13 +38,20 @@ struct HealthState {
     fingerprint: Option<Fingerprint>,
     /// Bumped by every finished check.
     generation: u64,
+    /// When the last check timed out. None if it finished.
+    timed_out_at: Option<Instant>,
 }
+
+/// A timed-out check says nothing about the config, so it is repeated after
+/// this long even when no file changed.
+const TIMEOUT_RECHECK: Duration = Duration::from_secs(5 * 60);
 
 pub struct BeetsImporter {
     settings: BeetsSettings,
     state: std::sync::Mutex<HealthState>,
     /// Held for the whole of a config check, so only one runs at a time.
     refresh_gate: tokio::sync::Mutex<()>,
+    timeout_recheck: Duration,
 }
 
 impl BeetsImporter {
@@ -53,6 +60,7 @@ impl BeetsImporter {
             settings,
             state: Default::default(),
             refresh_gate: Default::default(),
+            timeout_recheck: TIMEOUT_RECHECK,
         }
     }
 
@@ -224,6 +232,7 @@ impl MusicImporter for BeetsImporter {
         let before = fingerprint(&s.config, last_report.as_ref()).await;
         let probe = run_probe(s.python.as_deref(), &s.config).await;
         let health = assess(&s.config, &probe);
+        let timed_out = matches!(probe, Err(ProbeFailure::Timeout));
         // A failed check says nothing about which files matter, so the last
         // report keeps naming them.
         let report = probe.ok().or(last_report);
@@ -248,6 +257,7 @@ impl MusicImporter for BeetsImporter {
         state.health = health.clone();
         state.report = report;
         state.fingerprint = Some(after);
+        state.timed_out_at = timed_out.then(Instant::now);
         state.generation += 1;
         health
     }
@@ -256,10 +266,17 @@ impl MusicImporter for BeetsImporter {
         if self.refresh_gate.try_lock().is_err() {
             return false;
         }
-        let (stored, report) = {
+        let (stored, report, timed_out_at) = {
             let state = self.state();
-            (state.fingerprint.clone(), state.report.clone())
+            (
+                state.fingerprint.clone(),
+                state.report.clone(),
+                state.timed_out_at,
+            )
         };
+        if timed_out_at.is_some_and(|at| at.elapsed() >= self.timeout_recheck) {
+            return true;
+        }
         match stored {
             None => true,
             Some(stored) => fingerprint(&self.settings.config, report.as_ref()).await != stored,
@@ -272,7 +289,6 @@ mod tests {
     use super::*;
     use crate::SkipReason;
     use shared::system::HealthLevel;
-    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
     const SHORT: RunLimits = RunLimits {
@@ -500,6 +516,23 @@ mod tests {
         assert!(!importer.health_stale().await);
         std::fs::write(dir.path().join("plugins/new.py"), "").unwrap();
         assert!(importer.health_stale().await);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_check_goes_stale_after_the_recheck_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut importer = importer_with_python(dir.path(), "0").await;
+        importer.timeout_recheck = Duration::from_millis(50);
+        importer.refresh_health().await;
+        assert!(!importer.health_stale().await);
+
+        importer.state().timed_out_at = Some(Instant::now());
+        assert!(!importer.health_stale().await);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(importer.health_stale().await);
+
+        importer.refresh_health().await;
+        assert!(!importer.health_stale().await);
     }
 
     #[tokio::test]
