@@ -400,11 +400,11 @@ mod tests {
     async fn idle_resets_on_bytes_without_newline() {
         // Each gap is under the idle limit, both together are over it.
         let limits = RunLimits {
-            idle: Duration::from_secs(2),
+            idle: Duration::from_secs(4),
             ..SHORT
         };
         let (out, lines) = run(
-            "printf 'a'; sleep 1.2; printf 'b'; sleep 1.2; printf 'c\\n'; exit 0",
+            "printf 'a'; sleep 2.5; printf 'b'; sleep 2.5; printf 'c\\n'; exit 0",
             limits,
         )
         .await;
@@ -415,10 +415,10 @@ mod tests {
     #[tokio::test]
     async fn silence_ends_as_idle() {
         let limits = RunLimits {
-            idle: Duration::from_millis(300),
+            idle: Duration::from_secs(1),
             ..SHORT
         };
-        let (out, _) = run("echo start; sleep 5", limits).await;
+        let (out, _) = run("echo start; sleep 30", limits).await;
         assert!(matches!(out.end, RunEnd::Idle), "{:?}", out.end);
         assert!(out.tail.ends_with("start"), "{:?}", out.tail);
     }
@@ -486,11 +486,51 @@ mod tests {
         assert!(matches!(out.end, RunEnd::SpawnFailed(_)), "{:?}", out.end);
     }
 
+    /// Puts an open pipe on this process's stdin until dropped, so a child
+    /// that inherited stdin would see a pipe, not whatever the harness gave.
+    struct PipeOnStdin {
+        saved: i32,
+        write_end: i32,
+    }
+
+    impl PipeOnStdin {
+        fn new() -> Self {
+            let mut fds = [0; 2];
+            // SAFETY: plain fd calls on fds this test owns; fd 0 is restored on drop.
+            unsafe {
+                assert_eq!(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                let saved = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3);
+                assert!(saved >= 0);
+                assert_eq!(libc::dup2(fds[0], 0), 0);
+                libc::close(fds[0]);
+                PipeOnStdin {
+                    saved,
+                    write_end: fds[1],
+                }
+            }
+        }
+    }
+
+    impl Drop for PipeOnStdin {
+        fn drop(&mut self) {
+            // SAFETY: as in new.
+            unsafe {
+                libc::dup2(self.saved, 0);
+                libc::close(self.saved);
+                libc::close(self.write_end);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_prompt_on_closed_stdin_ends_fast() {
+        let _stdin = PipeOnStdin::new();
         let start = Instant::now();
+        // Exit 7 if stdin is not /dev/null, as it would be if inherited.
         let (out, _) = run(
-            "read x || { echo 'error: stdin stream ended while input required' >&2; exit 1; }",
+            "in=$(readlink /proc/self/fd/0); \
+             [ \"$in\" = /dev/null ] || { echo \"stdin is $in\" >&2; exit 7; }; \
+             read x || { echo 'error: stdin stream ended while input required' >&2; exit 1; }",
             SHORT,
         )
         .await;

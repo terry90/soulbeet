@@ -87,11 +87,12 @@ services:
       - "5030:5030"
 ```
 
-2.  Seed the beets config. `BEETS_CONFIG` replaces the config shipped in the image, so start from a copy of it:
+2.  Seed the beets config. `BEETS_CONFIG` replaces the config shipped in the image, so start from a copy of it. Use the same tag as the `image:` line above, since the shipped `plugins:` line depends on the tier (see [Image Tiers](#image-tiers)), and copy it again after you change tier:
 
 ```bash
+TAG=latest # the tag on your image: line (latest, light, medium or full)
 mkdir -p beets
-docker create --name sb docker.io/docccccc/soulbeet:latest
+docker create --name sb "docker.io/docccccc/soulbeet:$TAG"
 docker cp sb:/app/beets_config.yaml ./beets/config.yaml
 docker rm sb
 ```
@@ -143,13 +144,14 @@ Soulbeet uses `beets` to import music. The image ships a config at `/app/beets_c
 -   `include:` is ignored in the file you point `BEETS_CONFIG` at.
 -   `mbtwopass` lives in `/opt/beets-plugins`. To keep it, set `pluginpath: [/opt/beets-plugins, /data/beets-plugins]`.
 -   `discogs` needs `discogs.user_token`.
--   Soulbeet passes `--log`, which overrides `import.log`.
--   `incremental: yes` makes beets skip folders it has already skipped once, so "Retry import" on such a folder reports "Nothing left to import".
+-   Soulbeet passes `--log`, which overrides `import.log`, and `--noincremental` and `--noresume`, which override `import.incremental` and `import.resume`.
 
 Default `beet import` flags used:
 -   `-v`: Verbose output. The last lines of it (20 lines, 2 KiB) are shown under "beets output" on rows that carry a note: skipped, failed, or imported with a warning
 -   `-c [config]`: The config file
 -   `-q`: Quiet mode (no user interaction)
+-   `--noincremental`: Import a folder again even if beets saw it before, so "Retry import" always runs
+-   `--noresume`: Ignore beets' saved progress from an interrupted run
 -   `-s`: Singleton mode (Default behavior unless `BEETS_ALBUM_MODE` is set)
 -   `-l [library_path]`: Library database path (per-folder)
 -   `-d [target_path]`: Import to the specific folder selected in the web UI.

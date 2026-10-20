@@ -51,7 +51,6 @@ pub struct BeetsImporter {
     state: std::sync::Mutex<HealthState>,
     /// Held for the whole of a config check, so only one runs at a time.
     refresh_gate: tokio::sync::Mutex<()>,
-    timeout_recheck: Duration,
 }
 
 impl BeetsImporter {
@@ -60,7 +59,6 @@ impl BeetsImporter {
             settings,
             state: Default::default(),
             refresh_gate: Default::default(),
-            timeout_recheck: TIMEOUT_RECHECK,
         }
     }
 
@@ -117,6 +115,10 @@ fn import_args(
         target.into(),
         "import".into(),
         "-q".into(),
+        // Every source is a batch folder only a retry imports again, so the
+        // user's import history and resume state could only make beets skip it.
+        "--noincremental".into(),
+        "--noresume".into(),
         "--log".into(),
         run_log.into(),
     ];
@@ -274,7 +276,7 @@ impl MusicImporter for BeetsImporter {
                 state.timed_out_at,
             )
         };
-        if timed_out_at.is_some_and(|at| at.elapsed() >= self.timeout_recheck) {
+        if timed_out_at.is_some_and(|at| at.elapsed() >= TIMEOUT_RECHECK) {
             return true;
         }
         match stored {
@@ -411,12 +413,14 @@ mod tests {
                 &target.to_string_lossy(),
                 "import",
                 "-q",
+                "--noincremental",
+                "--noresume",
                 "--log",
             ]
             .map(str::to_string);
-            assert_eq!(args[..10], expected_head);
+            assert_eq!(args[..12], expected_head);
 
-            let log = PathBuf::from(&args[10]);
+            let log = PathBuf::from(&args[12]);
             assert_eq!(log.parent(), Some(std::env::temp_dir().as_path()));
             let name = log.file_name().unwrap().to_string_lossy().into_owned();
             assert!(
@@ -425,7 +429,7 @@ mod tests {
             );
             assert!(!log.exists(), "run log left behind");
 
-            let rest = &args[11..];
+            let rest = &args[13..];
             let src = src.to_string_lossy().into_owned();
             match mode {
                 ImportMode::Singleton => assert_eq!(rest, ["-s".to_string(), src]),
@@ -521,14 +525,16 @@ mod tests {
     #[tokio::test]
     async fn a_timed_out_check_goes_stale_after_the_recheck_time() {
         let dir = tempfile::tempdir().unwrap();
-        let mut importer = importer_with_python(dir.path(), "0").await;
-        importer.timeout_recheck = Duration::from_millis(50);
+        let importer = importer_with_python(dir.path(), "0").await;
         importer.refresh_health().await;
         assert!(!importer.health_stale().await);
 
         importer.state().timed_out_at = Some(Instant::now());
         assert!(!importer.health_stale().await);
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let long_ago = Instant::now()
+            .checked_sub(TIMEOUT_RECHECK + Duration::from_secs(1))
+            .expect("uptime shorter than the recheck time");
+        importer.state().timed_out_at = Some(long_ago);
         assert!(importer.health_stale().await);
 
         importer.refresh_health().await;
