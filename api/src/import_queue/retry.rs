@@ -3,11 +3,14 @@
 //! lost on restart.
 
 use super::{ImportJob, ImportQueue, IMPORT_QUEUE};
-use soulbeet::{ImportOutcome, ImportResult};
+use soulbeet::audio::count_audio_files;
+use soulbeet::{ImportOutcome, ImportResult, SkipReason};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 const NOTHING_TO_RETRY: &str = "Nothing to retry";
+const FILES_GONE: &str = "The kept files are gone";
 
 /// username -> row item -> job
 #[derive(Default)]
@@ -20,16 +23,20 @@ impl RetryStore {
         self.jobs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Keeps the job for each of its rows unless it imported.
+    /// Keeps the job for each of its rows unless it imported or its files
+    /// are gone, which no retry can fix.
     pub(super) fn record(&self, job: &ImportJob, result: &ImportResult) {
         let Some(owner) = &job.owner else {
             return;
         };
-        let imported = matches!(result.outcome, ImportOutcome::Imported { .. });
+        let settled = matches!(
+            result.outcome,
+            ImportOutcome::Imported { .. } | ImportOutcome::Skipped(SkipReason::NothingToImport)
+        );
         let mut jobs = self.jobs();
         let user = jobs.entry(owner.username.clone()).or_default();
         for row in &owner.rows {
-            if imported {
+            if settled {
                 user.remove(&row.item);
             } else {
                 user.insert(row.item.clone(), job.clone());
@@ -74,6 +81,10 @@ impl ImportQueue {
             .retries
             .take(username, item)
             .ok_or_else(|| NOTHING_TO_RETRY.to_string())?;
+        let sources: Vec<&Path> = job.sources.iter().map(PathBuf::as_path).collect();
+        if count_audio_files(&sources).await == 0 {
+            return Err(FILES_GONE.to_string());
+        }
         self.submit(job).await;
         Ok(())
     }
@@ -101,6 +112,7 @@ mod tests {
     use std::time::Duration;
 
     const NOTHING: &str = "Nothing to retry";
+    const FILES_GONE: &str = "The kept files are gone";
 
     async fn until_imported(deps: &RecordingDeps, item: &str) {
         let done = || {
@@ -161,6 +173,39 @@ mod tests {
         assert_eq!(queue.retry("u", "a").await, Ok(()));
         assert_eq!(queue.retry("u", "a").await, Err(NOTHING.into()));
         until_imported(&deps, "a").await;
+        assert_eq!(stub.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retry_whose_files_are_gone_is_refused_without_importing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = file(tmp.path(), "dl/a.flac");
+        let (queue, stub, _) = queue(StubImporter::new());
+        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        let failing = owned(job(source.clone(), &tmp.path().join("lib")), "u", &["a"]);
+        finish(queue.submit(failing).await).await;
+        std::fs::remove_file(&source).unwrap();
+
+        assert_eq!(queue.retry("u", "a").await, Err(FILES_GONE.into()));
+        assert_eq!(queue.retry("u", "a").await, Err(NOTHING.into()));
+        assert_eq!(stub.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn nothing_to_import_is_not_kept_for_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let source = file(tmp.path(), "dl/a.flac");
+        let (queue, stub, _) = queue(StubImporter::new());
+        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        let failing = owned(job(source.clone(), &lib), "u", &["a"]);
+        finish(queue.submit(failing.clone()).await).await;
+        std::fs::remove_file(&source).unwrap();
+
+        // The same job again, now with nothing on disk, drops the stored one.
+        finish(queue.submit(failing).await).await;
+
+        assert_eq!(queue.retry("u", "a").await, Err(NOTHING.into()));
         assert_eq!(stub.calls(), 1);
     }
 
