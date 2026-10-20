@@ -7,69 +7,109 @@ use soulbeet::audio::count_audio_files;
 use soulbeet::{ImportOutcome, ImportResult, SkipReason};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 const NOTHING_TO_RETRY: &str = "Nothing to retry";
 const FILES_GONE: &str = "The kept files are gone";
 
-/// username -> row item -> job
+/// Rows a client loses on reload are never forgotten by it, so each user
+/// keeps at most this many, the oldest dropped first.
+const MAX_PER_USER: usize = 200;
+
+/// Whether a job that ended with `outcome` is kept for a retry. Not when it
+/// imported, or when nothing was left to import, which no retry can fix.
+pub(super) fn keeps_retry(outcome: &ImportOutcome) -> bool {
+    !matches!(
+        outcome,
+        ImportOutcome::Imported { .. } | ImportOutcome::Skipped(SkipReason::NothingToImport)
+    )
+}
+
+struct Kept {
+    /// Order of recording, for dropping the oldest.
+    seq: u64,
+    /// Shared by all rows of the job.
+    job: Arc<ImportJob>,
+}
+
+#[derive(Default)]
+struct Store {
+    next_seq: u64,
+    /// username -> row item -> job
+    users: HashMap<String, HashMap<String, Kept>>,
+}
+
 #[derive(Default)]
 pub(super) struct RetryStore {
-    jobs: Mutex<HashMap<String, HashMap<String, ImportJob>>>,
+    store: Mutex<Store>,
 }
 
 impl RetryStore {
-    fn jobs(&self) -> MutexGuard<'_, HashMap<String, HashMap<String, ImportJob>>> {
-        self.jobs.lock().unwrap_or_else(|e| e.into_inner())
+    fn store(&self) -> MutexGuard<'_, Store> {
+        self.store.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Keeps the job for each of its rows unless it imported or its files
-    /// are gone, which no retry can fix.
+    /// Keeps the job for each of its rows when `keeps_retry` says so, and
+    /// drops what its rows kept before otherwise.
     pub(super) fn record(&self, job: &ImportJob, result: &ImportResult) {
         let Some(owner) = &job.owner else {
             return;
         };
-        let settled = matches!(
-            result.outcome,
-            ImportOutcome::Imported { .. } | ImportOutcome::Skipped(SkipReason::NothingToImport)
-        );
-        let mut jobs = self.jobs();
-        let user = jobs.entry(owner.username.clone()).or_default();
+        let keep = keeps_retry(&result.outcome);
+        let mut store = self.store();
+        let seq = store.next_seq;
+        store.next_seq += 1;
+        let shared = Arc::new(job.clone());
+        let user = store.users.entry(owner.username.clone()).or_default();
         for row in &owner.rows {
-            if settled {
-                user.remove(&row.item);
+            if keep {
+                let kept = Kept {
+                    seq,
+                    job: shared.clone(),
+                };
+                user.insert(row.item.clone(), kept);
             } else {
-                user.insert(row.item.clone(), job.clone());
+                user.remove(&row.item);
             }
         }
+        while user.len() > MAX_PER_USER {
+            let oldest = user
+                .iter()
+                .min_by_key(|(_, kept)| kept.seq)
+                .map(|(item, _)| item.clone());
+            match oldest {
+                Some(item) => user.remove(&item),
+                None => break,
+            };
+        }
         if user.is_empty() {
-            jobs.remove(&owner.username);
+            store.users.remove(&owner.username);
         }
     }
 
     /// Removes and returns the job of `item`, along with its other rows'
     /// entries, so no row of it can resubmit it a second time.
-    fn take(&self, username: &str, item: &str) -> Option<ImportJob> {
-        let mut jobs = self.jobs();
-        let user = jobs.get_mut(username)?;
-        let job = user.remove(item)?;
-        user.retain(|_, stored| stored.sources != job.sources);
+    fn take(&self, username: &str, item: &str) -> Option<Arc<ImportJob>> {
+        let mut store = self.store();
+        let user = store.users.get_mut(username)?;
+        let job = user.remove(item)?.job;
+        user.retain(|_, kept| kept.job.sources != job.sources);
         if user.is_empty() {
-            jobs.remove(username);
+            store.users.remove(username);
         }
         Some(job)
     }
 
     fn forget(&self, username: &str, items: &[String]) {
-        let mut jobs = self.jobs();
-        let Some(user) = jobs.get_mut(username) else {
+        let mut store = self.store();
+        let Some(user) = store.users.get_mut(username) else {
             return;
         };
         for item in items {
             user.remove(item);
         }
         if user.is_empty() {
-            jobs.remove(username);
+            store.users.remove(username);
         }
     }
 }
@@ -85,7 +125,7 @@ impl ImportQueue {
         if count_audio_files(&sources).await == 0 {
             return Err(FILES_GONE.to_string());
         }
-        self.submit(job).await;
+        self.submit(Arc::unwrap_or_clone(job)).await;
         Ok(())
     }
 
@@ -207,6 +247,41 @@ mod tests {
 
         assert_eq!(queue.retry("u", "a").await, Err(NOTHING.into()));
         assert_eq!(stub.calls(), 1);
+    }
+
+    #[test]
+    fn each_user_keeps_only_the_newest_retries() {
+        use super::{RetryStore, MAX_PER_USER};
+        use crate::import_queue::test_support::row;
+        use crate::import_queue::{ImportJob, JobOwner};
+        use std::path::PathBuf;
+
+        let store = RetryStore::default();
+        let failed = ImportResult::failed("beets exited with code 1".into());
+        let record = |username: &str, item: &str| {
+            let job = ImportJob {
+                sources: vec![PathBuf::from(format!("/dl/{item}.flac"))],
+                target: PathBuf::from("/music"),
+                mode: ImportMode::Singleton,
+                owner: Some(JobOwner {
+                    username: username.into(),
+                    rows: vec![row(item)],
+                }),
+                snapshot_target: false,
+                cleanup_root: None,
+            };
+            store.record(&job, &failed);
+        };
+        for i in 0..=MAX_PER_USER {
+            record("u", &format!("{i}"));
+        }
+        record("v", "0");
+
+        assert!(store.take("u", "0").is_none());
+        for i in 1..=MAX_PER_USER {
+            assert!(store.take("u", &format!("{i}")).is_some(), "row {i}");
+        }
+        assert!(store.take("v", "0").is_some());
     }
 
     #[tokio::test]

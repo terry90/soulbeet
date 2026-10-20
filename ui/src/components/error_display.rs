@@ -38,6 +38,17 @@ pub fn friendly_error(error: &ServerFnError) -> String {
     }
 }
 
+/// Whether the server refused the request for a reason it gave for display.
+pub fn is_refusal(error: &ServerFnError) -> bool {
+    matches!(
+        error,
+        ServerFnError::ServerError {
+            code: api::REFUSAL_CODE,
+            ..
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +67,8 @@ mod tests {
         assert_eq!(friendly_error(&e), "beets cannot start");
         let e = server_error(api::REFUSAL_CODE, "Folder not found");
         assert_eq!(friendly_error(&e), "Folder not found");
+        assert!(is_refusal(&e));
+        assert!(!is_refusal(&server_error(500, "Nothing to retry")));
     }
 
     #[test]

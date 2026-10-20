@@ -193,6 +193,7 @@ pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnE
         batch_label: None,
         local_path: None,
         import_output: None,
+        retryable: false,
     };
     let _ = tx.send(DownloadEvent::Progress(vec![cancelled]));
 

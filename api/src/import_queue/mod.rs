@@ -79,10 +79,6 @@ pub struct ImportHandle {
 }
 
 impl ImportHandle {
-    pub fn state(&self) -> JobState {
-        self.rx.borrow().clone()
-    }
-
     pub async fn wait(mut self) -> JobOutcome {
         let done = match self.rx.wait_for(|s| matches!(s, JobState::Done(_))).await {
             Ok(state) => match &*state {
@@ -503,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn jobs_on_two_targets_run_in_parallel() {
         let tmp = tempfile::tempdir().unwrap();
-        let (queue, stub, _) = queue(StubImporter::new().with_delay(Duration::from_millis(200)));
+        let (queue, stub, _) = queue(StubImporter::new().held());
 
         let a = queue
             .submit(job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib1")))
@@ -511,6 +507,16 @@ mod tests {
         let b = queue
             .submit(job(file(tmp.path(), "dl/b.flac"), &tmp.path().join("lib2")))
             .await;
+        // Both imports are held inside the importer, so they can only meet
+        // there if the two targets run at once.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stub.active() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the second target never started while the first ran");
+        stub.release(2);
         finish(a).await;
         finish(b).await;
 

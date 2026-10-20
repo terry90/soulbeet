@@ -57,6 +57,8 @@ pub fn row(item: &str) -> DownloadProgress {
 pub struct StubImporter {
     results: Mutex<VecDeque<ImportResult>>,
     delay: Duration,
+    /// When set, each import waits here for a permit.
+    gate: Option<tokio::sync::Semaphore>,
     moves_files: bool,
     panic_next: AtomicBool,
     health: Mutex<ImporterHealth>,
@@ -71,6 +73,7 @@ impl StubImporter {
         StubImporter {
             results: Mutex::new(VecDeque::new()),
             delay: Duration::ZERO,
+            gate: None,
             moves_files: false,
             panic_next: AtomicBool::new(false),
             health: Mutex::new(ready()),
@@ -84,6 +87,21 @@ impl StubImporter {
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
         self
+    }
+
+    /// Holds every import inside the importer until `release` lets it go.
+    pub fn held(mut self) -> Self {
+        self.gate = Some(tokio::sync::Semaphore::new(0));
+        self
+    }
+
+    pub fn release(&self, imports: usize) {
+        self.gate.as_ref().expect("not held").add_permits(imports);
+    }
+
+    /// Imports inside the importer right now.
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
     }
 
     /// Moves each source file (or each file directly inside a source
@@ -163,6 +181,9 @@ impl MusicImporter for StubImporter {
         let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         let _active = ActiveGuard(&self.active);
         self.max_active.fetch_max(now, Ordering::SeqCst);
+        if let Some(gate) = &self.gate {
+            gate.acquire().await.unwrap().forget();
+        }
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
         }

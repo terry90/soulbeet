@@ -575,6 +575,7 @@ impl From<FileEntry> for crate::download::DownloadProgress {
             batch_label: None,
             local_path: None,
             import_output: None,
+            retryable: false,
         }
     }
 }

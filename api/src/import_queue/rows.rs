@@ -1,5 +1,6 @@
 //! What a job's rows show for each state it goes through.
 
+use super::retry::keeps_retry;
 use super::{ImportJob, JobOutcome};
 use shared::download::{DownloadProgress, DownloadState};
 use soulbeet::{ImportMode, ImportOutcome};
@@ -25,8 +26,8 @@ pub fn rows_with_state(rows: &[DownloadProgress], state: DownloadState) -> Vec<D
 }
 
 /// The rows of a finished job: the outcome text as the error, the folder the
-/// files were kept in when they were not imported, and the output tail on the
-/// first row only.
+/// files were kept in when a retry is kept for them, and the output tail on
+/// the first row only.
 pub fn rows_for_done(
     rows: &[DownloadProgress],
     job: &ImportJob,
@@ -35,21 +36,20 @@ pub fn rows_for_done(
     let result = &done.result;
     // The result's text, unlike the outcome's, carries the task count.
     let text = result.to_string();
-    let (state, error, local_path) = match row_state(&result.outcome) {
+    let (state, error) = match row_state(&result.outcome) {
         DownloadState::Imported => {
             let notable = matches!(
                 &result.outcome,
                 ImportOutcome::Imported { untagged, warnings } if *untagged || !warnings.is_empty()
             );
-            (DownloadState::Imported, notable.then_some(text), None)
+            (DownloadState::Imported, notable.then_some(text))
         }
-        DownloadState::Failed(_) => (
-            DownloadState::Failed(text.clone()),
-            Some(text),
-            kept_in(job),
-        ),
-        state => (state, Some(text), kept_in(job)),
+        DownloadState::Failed(_) => (DownloadState::Failed(text.clone()), Some(text)),
+        state => (state, Some(text)),
     };
+    // Same rule as the retry store, so a row offers Retry only when one is kept.
+    let retryable = keeps_retry(&result.outcome);
+    let local_path = retryable.then(|| kept_in(job)).flatten();
     let output = (!result.output_tail.is_empty()).then(|| result.output_tail.clone());
     rows.iter()
         .enumerate()
@@ -57,6 +57,7 @@ pub fn rows_for_done(
             DownloadProgress {
                 state: state.clone(),
                 error: error.clone(),
+                retryable,
                 ..row.clone()
             }
             .with_import_details(local_path.clone(), output.clone().filter(|_| i == 0))
@@ -174,6 +175,7 @@ mod tests {
                 Some("No close match (3 candidates) (0 of 2 imported)")
             );
             assert_eq!(r.local_path.as_deref(), Some("/dl/X [12345678]"));
+            assert!(r.retryable);
         }
         assert_eq!(album[0].import_output.as_deref(), Some("tail"));
         assert_eq!(album[1].import_output, None);
@@ -194,6 +196,7 @@ mod tests {
             DownloadState::Failed("beets exited with code 1 (0 of 2 imported)".into())
         );
         assert_eq!(single[0].local_path.as_deref(), Some("/dl/X [12345678]"));
+        assert!(single[0].retryable);
 
         let ok = rows_for_done(
             &rows,
@@ -204,6 +207,7 @@ mod tests {
             assert_eq!(r.state, DownloadState::Imported);
             assert_eq!(r.error, None);
             assert_eq!(r.local_path, None);
+            assert!(!r.retryable);
         }
         assert_eq!(ok[0].import_output.as_deref(), Some("imported tail"));
         assert_eq!(ok[1].import_output, None);
@@ -224,6 +228,19 @@ mod tests {
             ok[0].error.as_deref(),
             Some("Imported as-is (untagged); 1 file(s) were not imported")
         );
+    }
+
+    #[test]
+    fn nothing_to_import_rows_offer_no_retry_and_no_folder() {
+        let rows = rows_for_done(
+            &[row("a")],
+            &job("/dl/X [12345678]", ImportMode::Album),
+            &done(ImportResult::nothing_to_import()),
+        );
+        assert_eq!(rows[0].state, DownloadState::ImportSkipped);
+        assert_eq!(rows[0].error.as_deref(), Some("Nothing left to import"));
+        assert_eq!(rows[0].local_path, None);
+        assert!(!rows[0].retryable);
     }
 
     #[test]

@@ -161,6 +161,9 @@ pub struct DownloadProgress {
     /// Tail of the importer's output for this row
     #[serde(default)]
     pub import_output: Option<String>,
+    /// The server keeps this row's import job, so Retry import can resubmit it
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 impl DownloadProgress {
@@ -180,6 +183,7 @@ impl DownloadProgress {
             batch_label: None,
             local_path: None,
             import_output: None,
+            retryable: false,
         }
     }
 
@@ -199,6 +203,7 @@ impl DownloadProgress {
             batch_label: None,
             local_path: None,
             import_output: None,
+            retryable: false,
         }
     }
 

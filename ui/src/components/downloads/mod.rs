@@ -10,7 +10,7 @@ mod item;
 use api::CancelDownloadRequest;
 use item::DownloadItem;
 
-use crate::friendly_error;
+use crate::{friendly_error, is_refusal};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct DownloadsProps {
@@ -95,6 +95,10 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
                     Err(e) => {
                         if let Some(entry) = downloads_signal.write().get_mut(&file.item) {
                             entry.error = Some(friendly_error(&e));
+                            // A refusal means the server kept nothing to retry.
+                            if is_refusal(&e) {
+                                entry.retryable = false;
+                            }
                         }
                         false
                     }

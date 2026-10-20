@@ -98,12 +98,13 @@ fn waiting_text(ahead: u32) -> String {
     format!("Waiting for library ({ahead} ahead)")
 }
 
-/// Only import outcomes set `local_path`, so a failed download never offers a retry.
+/// Only rows whose import job the server kept are `retryable`, so a failed
+/// download or a row with nothing left to import never offers a retry.
 fn shows_retry(row: &DownloadProgress) -> bool {
     matches!(
         row.state,
         DownloadState::ImportSkipped | DownloadState::Failed(_)
-    ) && row.local_path.is_some()
+    ) && row.retryable
 }
 
 #[component]
@@ -205,7 +206,7 @@ pub fn DownloadItem(
         if let Some((note_class, note)) = note {
           div { class: "text-xs {note_class} mt-1 break-words", "{note}" }
         }
-        if let Some(kept) = &file.local_path {
+        if let (true, Some(kept)) = (file.retryable, &file.local_path) {
           div { class: "text-xs text-gray-500 font-mono mt-1 break-all", "Kept in {kept}" }
         }
         if let (Some(_), Some(tail)) = (note, &file.import_output) {
@@ -283,10 +284,13 @@ fn format_size(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    fn row(state: DownloadState, local_path: Option<&str>) -> DownloadProgress {
-        DownloadProgress::queued("1".into(), "peer".into(), "a\\b\\01.flac".into(), 10)
-            .with_state(state)
-            .with_import_details(local_path.map(str::to_string), None)
+    fn row(state: DownloadState, kept: Option<&str>) -> DownloadProgress {
+        DownloadProgress {
+            retryable: kept.is_some(),
+            ..DownloadProgress::queued("1".into(), "peer".into(), "a\\b\\01.flac".into(), 10)
+                .with_state(state)
+                .with_import_details(kept.map(str::to_string), None)
+        }
     }
 
     #[test]
@@ -339,5 +343,10 @@ mod tests {
         )));
         assert!(!shows_retry(&row(DownloadState::Failed("x".into()), None)));
         assert!(!shows_retry(&row(DownloadState::Imported, Some("/dl/X"))));
+        let nothing_kept = DownloadProgress {
+            retryable: false,
+            ..row(DownloadState::ImportSkipped, Some("/dl/X"))
+        };
+        assert!(!shows_retry(&nothing_kept));
     }
 }
