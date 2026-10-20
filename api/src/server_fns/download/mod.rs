@@ -76,7 +76,11 @@ pub(crate) fn not_enqueued_reason(status: &EnqueueStatus) -> Option<String> {
 #[cfg(feature = "server")]
 fn manual_batch_label(items: &[DownloadableItem]) -> String {
     match items.split_first() {
-        Some((first, rest)) if rest.iter().all(|i| i.album == first.album) => first.album.clone(),
+        Some((first, rest))
+            if !first.album.trim().is_empty() && rest.iter().all(|i| i.album == first.album) =>
+        {
+            first.album.clone()
+        }
         Some((first, _)) => first.title.clone(),
         None => String::new(),
     }
@@ -326,9 +330,15 @@ mod tests {
         let same_album = vec![item("p", "One", "1.flac"), item("p", "Two", "2.flac")];
         assert_eq!(manual_batch_label(&same_album), "Come Over");
 
-        let mut mixed = same_album;
+        let mut mixed = same_album.clone();
         mixed[1].album = "Other".to_string();
         assert_eq!(manual_batch_label(&mixed), "One");
+
+        let mut no_album = same_album;
+        for i in &mut no_album {
+            i.album = " ".to_string();
+        }
+        assert_eq!(manual_batch_label(&no_album), "One");
 
         assert_eq!(not_enqueued_reason(&EnqueueStatus::Enqueued), None);
         assert_eq!(

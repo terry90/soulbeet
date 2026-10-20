@@ -910,7 +910,7 @@ pub async fn generate_discovery_playlist_internal(
                     &qt.slskd_filename,
                     &download_base,
                     Some(&qt.destination),
-                    &std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .await;
                 let src = match resolved {

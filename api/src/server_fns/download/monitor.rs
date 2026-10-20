@@ -10,13 +10,15 @@ use soulbeet::DownloadBackend;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::{submit_imports, Handoff};
+use super::utils::FileId;
 use crate::config::CONFIG;
 use crate::services::download_backend;
 
@@ -139,7 +141,7 @@ pub struct DownloadMonitor {
     /// slskd's download directory as this server sees it.
     download_base: PathBuf,
     /// Files already handed to the import queue.
-    claimed: Arc<Mutex<HashSet<PathBuf>>>,
+    claimed: Arc<Mutex<HashSet<FileId>>>,
     /// When slskd's transfer list was last read successfully. Every other
     /// deadline is evaluated from a readable list, so this one bounds the
     /// case where no list is readable at all.

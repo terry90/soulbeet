@@ -112,26 +112,50 @@ pub fn resolve_download_path(filename: &str, download_base: &Path) -> Option<Str
     None
 }
 
+/// A file's identity on disk, independent of its name: beets can move a
+/// handed-off file away and slskd can then write the next download under the
+/// same name, which must not count as the file already handed off. Birth
+/// time, where the file system records it, tells a reused inode number apart.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    dev: u64,
+    ino: u64,
+    born: Option<std::time::SystemTime>,
+}
+
+#[cfg(feature = "server")]
+pub fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        born: meta.created().ok(),
+    })
+}
+
 /// Find a finished download in its batch folder `base/destination`.
 ///
 /// slskd keeps the remote basename (sanitized) and, when that name is already
 /// taken, writes `<stem>_<ticks><ext>` with 18-digit ticks. Two files of one
 /// batch with the same basename therefore land as the plain name and its
 /// copies. The plain name is tried first, then the copies oldest first, and
-/// paths in `exclude` (already handed off) are skipped.
+/// files in `exclude` (already handed off) are skipped.
 #[cfg(feature = "server")]
 pub fn resolve_in_destination(
     filename: &str,
     base: &Path,
     destination: &str,
-    exclude: &HashSet<PathBuf>,
+    exclude: &HashSet<FileId>,
 ) -> Option<PathBuf> {
     let normalized = filename.replace('\\', "/");
     let remote_name = normalized.rsplit('/').find(|s| !s.is_empty())?;
     let folder = base.join(destination);
     let names = basename_candidates(remote_name);
 
-    let usable = |path: &PathBuf| path.is_file() && !exclude.contains(path);
+    let usable =
+        |path: &PathBuf| path.is_file() && file_id(path).is_some_and(|id| !exclude.contains(&id));
     if let Some(plain) = names.iter().map(|n| folder.join(n)).find(usable) {
         return Some(plain);
     }
@@ -348,14 +372,40 @@ mod tests {
         let first = resolve_in_destination(r"music\A\01.flac", &base, "F", &claimed).unwrap();
         assert_eq!(first, folder.join("01.flac"));
 
-        claimed.insert(first);
+        claimed.insert(file_id(&first).unwrap());
         let second = resolve_in_destination(r"other\B\01.flac", &base, "F", &claimed).unwrap();
         assert_eq!(second, folder.join("01_639097129778484198.flac"));
 
-        claimed.insert(second);
+        claimed.insert(file_id(&second).unwrap());
         assert_eq!(
             resolve_in_destination(r"music\A\01.flac", &base, "F", &claimed),
             None
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_new_file_under_a_handed_off_name_resolves() {
+        // beets moved the first 01.flac away, and the batch's second 01.flac
+        // then landed under the free plain name.
+        let base = temp_base("reused-name");
+        let folder = base.join("F");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("01.flac");
+        std::fs::write(&path, b"disc 1").unwrap();
+        let claimed = HashSet::from([file_id(&path).unwrap()]);
+        assert_eq!(
+            resolve_in_destination("01.flac", &base, "F", &claimed),
+            None
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"disc 2").unwrap();
+
+        assert_eq!(
+            resolve_in_destination("01.flac", &base, "F", &claimed),
+            Some(path)
         );
 
         std::fs::remove_dir_all(&base).unwrap();

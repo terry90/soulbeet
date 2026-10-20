@@ -3,10 +3,9 @@ use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
 use soulbeet::ImportMode;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use super::utils::{resolve_download_path, resolve_in_destination};
+use super::utils::{file_id, resolve_download_path, resolve_in_destination, FileId};
 use crate::config::CONFIG;
 use crate::globals::send_user_event;
 use crate::import_queue::{ImportJob, JobOwner, IMPORT_QUEUE};
@@ -22,19 +21,23 @@ const FILE_RESOLVE_INITIAL_DELAY_MS: u64 = 500;
 /// slskd can report completion before the file is visible through a shared
 /// volume mount. `destination` is the batch folder the file was enqueued
 /// into; `None` (a transfer this batch did not enqueue) falls back to
-/// searching the whole download folder. Paths in `exclude` were already
-/// handed off and are never returned.
+/// searching the whole download folder. Files in `claimed` were already
+/// handed off and are never returned; the file found is added to it. The
+/// lock is held only while one attempt looks, never across a wait.
 pub async fn resolve_on_disk(
     filename: &str,
     base: &Path,
     destination: Option<&str>,
-    exclude: &HashSet<PathBuf>,
+    claimed: &Mutex<HashSet<FileId>>,
 ) -> Option<PathBuf> {
-    let attempt = || match destination {
-        Some(destination) => resolve_in_destination(filename, base, destination, exclude),
-        None => resolve_download_path(filename, base)
-            .map(PathBuf::from)
-            .filter(|path| !exclude.contains(path)),
+    let attempt = || {
+        let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
+        let path = match destination {
+            Some(destination) => resolve_in_destination(filename, base, destination, &claimed),
+            None => resolve_download_path(filename, base).map(PathBuf::from),
+        }?;
+        let id = file_id(&path)?;
+        claimed.insert(id).then_some(path)
     };
     if let Some(path) = attempt() {
         return Some(path);
@@ -71,7 +74,7 @@ pub struct Handoff {
     pub download_base: PathBuf,
     /// Shared by every handoff of one monitor, so two slots of a batch with
     /// the same basename resolve to different files.
-    pub claimed: Arc<Mutex<HashSet<PathBuf>>>,
+    pub claimed: Arc<Mutex<HashSet<FileId>>>,
 }
 
 /// Finds the finished downloads on disk and queues their imports. Returns
@@ -83,12 +86,8 @@ pub async fn submit_imports(rows: Vec<(DownloadProgress, Option<String>)>, hando
     let mut resolved = Vec::new();
     let mut unresolved = Vec::new();
     for (row, destination) in rows {
-        let mut claimed = handoff.claimed.lock().await;
-        match resolve_on_disk(&row.item, base, destination.as_deref(), &claimed).await {
-            Some(path) => {
-                claimed.insert(path.clone());
-                resolved.push((row, path, destination));
-            }
+        match resolve_on_disk(&row.item, base, destination.as_deref(), &handoff.claimed).await {
+            Some(path) => resolved.push((row, path, destination)),
             None => unresolved.push(DownloadProgress {
                 state: DownloadState::Failed("Could not resolve file path".into()),
                 error: Some("Could not resolve file path".into()),
@@ -237,9 +236,28 @@ mod tests {
             r"music\A\01.flac",
             base.path(),
             Some("X [12345678]"),
-            &HashSet::new(),
+            &Mutex::new(HashSet::new()),
         )
         .await;
         assert_eq!(found, Some(folder.join("01.flac")));
+    }
+
+    #[tokio::test]
+    async fn a_resolved_file_is_claimed_and_not_returned_twice() {
+        let base = tempfile::tempdir().unwrap();
+        let folder = base.path().join("X [12345678]");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("01.flac"), b"x").unwrap();
+        std::fs::write(folder.join("01_639097129778484198.flac"), b"x").unwrap();
+        let claimed = Mutex::new(HashSet::new());
+
+        let first = resolve_on_disk("a/01.flac", base.path(), Some("X [12345678]"), &claimed);
+        assert_eq!(first.await, Some(folder.join("01.flac")));
+        let second = resolve_on_disk("b/01.flac", base.path(), Some("X [12345678]"), &claimed);
+        assert_eq!(
+            second.await,
+            Some(folder.join("01_639097129778484198.flac"))
+        );
+        assert_eq!(claimed.lock().unwrap().len(), 2);
     }
 }
