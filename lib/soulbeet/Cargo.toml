@@ -4,7 +4,7 @@ version = "0.7.1"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["sync", "time", "process"] }
+tokio = { version = "1", features = ["sync", "time", "process", "io-util", "rt", "macros", "fs"] }
 reqwest = { version = "0.12.25", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,3 +23,7 @@ futures = "0.3.31"
 md5 = "0.7"
 rand = "0.9"
 sha2 = "0.10"
+libc = "0.2.175"
+
+[dev-dependencies]
+tempfile = "3"

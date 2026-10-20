@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod beets;
 pub mod engine;
 pub mod error;

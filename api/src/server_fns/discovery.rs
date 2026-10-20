@@ -1214,16 +1214,10 @@ fn find_new_files(
     before: &std::collections::HashSet<std::path::PathBuf>,
     after: &std::collections::HashSet<std::path::PathBuf>,
 ) -> Vec<String> {
-    let audio_ext = ["flac", "mp3", "m4a", "ogg", "aac", "wav", "wma", "opus"];
     let new_files: Vec<_> = after.difference(before).collect();
     let audio_files: Vec<String> = new_files
         .iter()
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| audio_ext.contains(&e.to_lowercase().as_str()))
-                .unwrap_or(false)
-        })
+        .filter(|p| soulbeet::audio::is_audio_path(p))
         .map(|p| p.to_string_lossy().to_string())
         .collect();
     if audio_files.is_empty() {

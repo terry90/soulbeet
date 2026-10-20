@@ -1,8 +1,9 @@
 use super::utils;
+use crate::audio::is_audio_path;
 use crate::slskd::models::SearchResponse;
 use itertools::Itertools;
 use shared::slskd::{AlbumResult, MatchResult, SearchResult, TrackResult};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub fn process_search_responses(
@@ -12,25 +13,13 @@ pub fn process_search_responses(
     expected_tracks: &[&str],
 ) -> Vec<AlbumResult> {
     const MIN_SCORE_THRESHOLD: f64 = 0.6;
-    let audio_extensions: HashSet<&str> = ["flac", "wav", "m4a", "ogg", "aac", "wma", "mp3"]
-        .iter()
-        .copied()
-        .collect();
-
     let scored_files: Vec<(MatchResult, SearchResult)> = responses
         .iter()
         .flat_map(|resp| {
             resp.files.iter().filter_map(|file| {
                 let path = Path::new(&file.filename);
-                let ext = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_lowercase());
-
-                if let Some(ext) = ext {
-                    if !audio_extensions.contains(ext.as_str()) {
-                        return None;
-                    }
+                if path.extension().is_some() && !is_audio_path(path) {
+                    return None;
                 }
 
                 let rank_result = utils::rank_match(

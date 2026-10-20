@@ -1,3 +1,7 @@
+mod runner;
+
+pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
+
 pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 use std::{
     collections::HashMap,
