@@ -300,7 +300,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             query_desc
         );
 
-        let batch_label = picked.title.clone();
+        let batch_label = super::auto_batch_label(&picked);
 
         // Create target directory
         let target_path_buf = std::path::Path::new(&folder_path).to_path_buf();

@@ -72,6 +72,18 @@ fn manual_batch_label(items: &[DownloadableItem]) -> String {
     }
 }
 
+/// Name for an auto download's batch: the picked group's title, which a
+/// track search leaves empty since no album was searched for, else the same
+/// name a manual download of its items gets.
+#[cfg(feature = "server")]
+fn auto_batch_label(group: &shared::download::DownloadableGroup) -> String {
+    if group.title.trim().is_empty() {
+        manual_batch_label(&group.items)
+    } else {
+        group.title.clone()
+    }
+}
+
 /// WebSocket endpoint for real-time download updates.
 /// Uses WebSocket instead of HTTP streaming for more reliable delivery.
 #[get("/api/downloads/updates", auth: AuthSession)]
@@ -374,6 +386,28 @@ pub async fn forget_import_retries(items: Vec<String>) -> Result<(), ServerFnErr
 mod tests {
     use super::*;
     use test_support::item;
+
+    #[test]
+    fn auto_label_is_the_group_title_else_its_items_name() {
+        let mut group = shared::download::DownloadableGroup {
+            source: "p".to_string(),
+            group_id: "g".to_string(),
+            title: "Glass Atlas".to_string(),
+            artist: None,
+            item_count: 1,
+            total_size: 0,
+            items: vec![item("p", "Northern Line", "1.flac")],
+            quality: "flac".to_string(),
+            score: 1.0,
+        };
+        assert_eq!(auto_batch_label(&group), "Glass Atlas");
+
+        // A track search: no album was searched for, so neither the group
+        // nor its items name one.
+        group.title = String::new();
+        group.items[0].album = String::new();
+        assert_eq!(auto_batch_label(&group), "Northern Line");
+    }
 
     #[test]
     fn manual_label_is_the_shared_album_else_the_first_title() {
