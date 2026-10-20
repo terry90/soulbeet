@@ -832,11 +832,16 @@ impl DownloadMonitor {
 
     /// Send the rows of the slots still being watched to the UI. A slot the
     /// import queue took over would otherwise have its import row
-    /// overwritten with slskd's Completed every poll.
+    /// overwritten with slskd's Completed every poll. A failed transfer is
+    /// not shown while its failure is being confirmed: its key is still held
+    /// then, so a retry from its row would be refused. The row goes out when
+    /// the slot settles.
     fn send_status_update(&self, matched: &[(usize, DownloadProgress)]) {
         let entries: Vec<DownloadProgress> = matched
             .iter()
-            .filter(|(slot, dl)| self.watching(*slot) && self.is_current(*slot, dl))
+            .filter(|(slot, dl)| {
+                self.watching(*slot) && self.is_current(*slot, dl) && !is_failed(&dl.state)
+            })
             .map(|(_, dl)| self.stamp(dl.clone()))
             .collect();
         if entries.is_empty() {
@@ -925,6 +930,8 @@ impl DownloadMonitor {
                     let retryable = !matches!(download.state, DownloadState::Cancelled);
                     if !retryable || !self.try_failover(slot, backend, "Transfer failed").await {
                         self.settle(slot, SlotPhase::Settled, backend.id());
+                        let row = self.stamp(download.clone());
+                        let _ = self.tx.send(DownloadEvent::Progress(vec![row]));
                     }
                 }
             } else {
@@ -1430,7 +1437,8 @@ mod tests {
         )
     }
 
-    /// The track handling of one poll, as `process_poll_result` runs it.
+    /// The track handling and row updates of one poll, as
+    /// `process_poll_result` runs them.
     async fn poll_tracks(
         m: &mut DownloadMonitor,
         listing: &[DownloadProgress],
@@ -1439,6 +1447,7 @@ mod tests {
         let matched = m.find_matching_downloads(listing, backend);
         m.process_tracks(&matched, backend).await;
         m.handle_absent_tracks(&matched, backend).await;
+        m.send_status_update(&matched);
     }
 
     /// The states the monitor sent for `item`, in order.
@@ -1916,6 +1925,33 @@ mod tests {
 
         assert!(stop);
         assert_eq!(phase(&m, 0), SlotPhase::Settled);
+    }
+
+    #[tokio::test]
+    async fn a_failed_row_is_only_shown_once_its_key_is_free() {
+        // A retry from a failed row re-requests the same file, and the
+        // registry refuses it while this batch still holds the key.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec!["dirA/fail.flac"]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let own = key(&backend, "peer_a", "dirA/fail.flac");
+        TransferRegistry::global().claim(std::slice::from_ref(&own), &m.batch);
+        let other = batch("Y");
+        let listing = [failed_transfer("peer_a", "dirA/fail.flac")];
+
+        poll_tracks(&mut m, &listing, &backend).await;
+        assert_eq!(states_for(&mut rx, "dirA/fail.flac"), vec![]);
+        assert!(!TransferRegistry::global().may_adopt(&own, &other.owner));
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
+
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+        poll_tracks(&mut m, &listing, &backend).await;
+        assert_eq!(
+            states_for(&mut rx, "dirA/fail.flac"),
+            vec![DownloadState::Failed("peer went away".into())]
+        );
+        assert_eq!(phase(&m, 0), SlotPhase::Settled);
+        assert!(TransferRegistry::global().may_adopt(&own, &other.owner));
     }
 
     #[tokio::test]
