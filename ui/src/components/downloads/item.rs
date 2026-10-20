@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use dioxus::prelude::*;
 use shared::download::{DownloadProgress, DownloadState};
 
@@ -77,14 +80,19 @@ fn badge(state: &DownloadState) -> Badge {
     }
 }
 
-/// Text class of the reason line; only finished rows that did not import have one.
-fn reason_class(state: &DownloadState) -> Option<&'static str> {
-    match state {
-        DownloadState::ImportSkipped => Some("text-yellow-400"),
-        DownloadState::Failed(_) => Some("text-red-400"),
-        _ => None,
-    }
+/// The row's note and its text class: why it was skipped or failed, or what to
+/// know about an import that went through (untagged, warnings).
+fn reason(row: &DownloadProgress) -> Option<(&'static str, &str)> {
+    let class = match row.state {
+        DownloadState::ImportSkipped | DownloadState::Imported => "text-yellow-400",
+        DownloadState::Failed(_) => "text-red-400",
+        _ => return None,
+    };
+    row.error.as_deref().map(|note| (class, note))
 }
+
+/// Resolves to whether the server accepted the retry.
+pub type RetryHandler = Callback<DownloadProgress, Pin<Box<dyn Future<Output = bool>>>>;
 
 fn waiting_text(ahead: u32) -> String {
     format!("Waiting for library ({ahead} ahead)")
@@ -102,9 +110,15 @@ fn shows_retry(row: &DownloadProgress) -> bool {
 pub fn DownloadItem(
     file: DownloadProgress,
     on_cancel: EventHandler<DownloadProgress>,
-    on_retry: EventHandler<DownloadProgress>,
+    on_retry: RetryHandler,
 ) -> Element {
+    // Set while a retry request is in flight, and kept after an accepted one
+    // until the row changes state, so a second click cannot race the first.
+    let mut retrying = use_signal(|| false);
+    use_effect(use_reactive(&file.state, move |_| retrying.set(false)));
+
     let state = &file.state;
+    let note = reason(&file);
     let is_cancellable = matches!(state, DownloadState::Queued | DownloadState::InProgress);
     let Badge {
         title: status_text,
@@ -188,13 +202,13 @@ pub fn DownloadItem(
           div { class: "text-xs text-gray-300 font-mono mt-2", "{waiting_text(*n)}" }
         }
         // The only element holding the reason: e2e matches it by text.
-        if let (Some(reason_class), Some(err)) = (reason_class(state), &file.error) {
-          div { class: "text-xs {reason_class} mt-1 break-words", "{err}" }
+        if let Some((note_class, note)) = note {
+          div { class: "text-xs {note_class} mt-1 break-words", "{note}" }
         }
         if let Some(kept) = &file.local_path {
           div { class: "text-xs text-gray-500 font-mono mt-1 break-all", "Kept in {kept}" }
         }
-        if let Some(tail) = &file.import_output {
+        if let (Some(_), Some(tail)) = (note, &file.import_output) {
           Disclosure { class: "mt-2", label: "beets output",
             pre { class: "mt-1 max-h-48 overflow-y-auto text-xs font-mono text-gray-400 whitespace-pre-wrap break-all", "{tail}" }
           }
@@ -203,10 +217,20 @@ pub fn DownloadItem(
           { let file_clone = file.clone();
           rsx! {
             button {
-              class: "mt-2 text-xs font-mono px-2 py-1 rounded border border-white/10 text-gray-300 hover:border-beet-accent/50 hover:text-white transition-colors cursor-pointer",
+              class: "mt-2 text-xs font-mono px-2 py-1 rounded border border-white/10 text-gray-300 hover:border-beet-accent/50 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-wait",
+              disabled: retrying(),
               onclick: move |evt: Event<MouseData>| {
                   evt.stop_propagation();
-                  on_retry.call(file_clone.clone());
+                  if retrying() {
+                      return;
+                  }
+                  retrying.set(true);
+                  let row = file_clone.clone();
+                  spawn(async move {
+                      if !on_retry.call(row).await {
+                          retrying.set(false);
+                      }
+                  });
               },
               "Retry import"
             }
@@ -270,6 +294,37 @@ mod tests {
         let b = badge(&DownloadState::ImportQueued(2));
         assert_eq!(b.text, "WAIT");
         assert_eq!(b.title, "Waiting for library (2 ahead)");
+    }
+
+    #[test]
+    fn reason_covers_failures_and_notable_imports() {
+        let with_error = |state, error: Option<&str>| DownloadProgress {
+            error: error.map(str::to_string),
+            ..row(state, None)
+        };
+        let untagged = with_error(DownloadState::Imported, Some("Imported as-is (untagged)"));
+        assert_eq!(
+            reason(&untagged),
+            Some(("text-yellow-400", "Imported as-is (untagged)"))
+        );
+        assert_eq!(reason(&with_error(DownloadState::Imported, None)), None);
+        let skipped = with_error(DownloadState::ImportSkipped, Some("No close match"));
+        assert_eq!(
+            reason(&skipped),
+            Some(("text-yellow-400", "No close match"))
+        );
+        let failed = with_error(
+            DownloadState::Failed("x".into()),
+            Some("beets exited with code 1"),
+        );
+        assert_eq!(
+            reason(&failed),
+            Some(("text-red-400", "beets exited with code 1"))
+        );
+        assert_eq!(
+            reason(&with_error(DownloadState::InProgress, Some("stale"))),
+            None
+        );
     }
 
     #[test]

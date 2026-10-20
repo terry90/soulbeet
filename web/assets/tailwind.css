@@ -1890,8 +1890,14 @@
   .disabled\:cursor-not-allowed:disabled {
     cursor: not-allowed;
   }
+  .disabled\:cursor-wait:disabled {
+    cursor: wait;
+  }
   .disabled\:bg-gray-600:disabled {
     background-color: var(--color-gray-600);
+  }
+  .disabled\:opacity-50:disabled {
+    opacity: 50%;
   }
   .disabled\:shadow-none:disabled {
     --tw-shadow: 0 0 #0000;

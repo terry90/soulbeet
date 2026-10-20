@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
@@ -85,16 +87,21 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
         });
     };
 
-    let retry_import = move |file: DownloadProgress| {
-        let item = file.item;
-        spawn(async move {
-            if let Err(e) = api::retry_import(item.clone()).await {
-                if let Some(entry) = downloads_signal.write().get_mut(&item) {
-                    entry.error = Some(friendly_error(&e));
+    let retry_import = use_callback(
+        move |file: DownloadProgress| -> Pin<Box<dyn Future<Output = bool>>> {
+            Box::pin(async move {
+                match api::retry_import(file.item.clone()).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        if let Some(entry) = downloads_signal.write().get_mut(&file.item) {
+                            entry.error = Some(friendly_error(&e));
+                        }
+                        false
+                    }
                 }
-            }
-        });
-    };
+            })
+        },
+    );
 
     let close_modal = move |_| props.is_open.set(false);
 
