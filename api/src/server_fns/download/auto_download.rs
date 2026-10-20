@@ -33,7 +33,7 @@ use super::enqueue::{
 #[cfg(feature = "server")]
 use super::failover::{align_pool_tracks, SourcePool};
 #[cfg(feature = "server")]
-use super::monitor::DownloadMonitor;
+use super::monitor::{DownloadMonitor, WatchedTransfer};
 
 /// Score threshold for automatic source selection (per D-04).
 /// Below this, the client gets FallbackToManual with results attached.
@@ -421,10 +421,8 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             Watcher::Own => {}
         }
 
-        let download_sources: Vec<String> =
-            successful.iter().map(|d| d.source.clone()).collect();
-        let download_filenames: Vec<String> =
-            successful.iter().map(|d| d.item.clone()).collect();
+        let transfers: Vec<WatchedTransfer> =
+            successful.iter().map(WatchedTransfer::from).collect();
 
         // Pool slots must line up with the monitor's slots, which follow
         // `successful`, not `picked.items`.
@@ -433,7 +431,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
 
         info!(
             "Auto-download: queued {} tracks, starting monitor for '{}'",
-            download_filenames.len(),
+            transfers.len(),
             query_desc
         );
 
@@ -441,8 +439,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         let task_cancellation = register_user_task(&task_username).await;
 
         let mut monitor = DownloadMonitor::new(
-            download_sources,
-            download_filenames,
+            transfers,
             batch.target.clone(),
             tx,
             task_cancellation,

@@ -49,7 +49,7 @@ use self::enqueue::{
     deliver, enqueue_request, failed_reason, stopped_rows, RequestEnqueue, Watcher,
 };
 #[cfg(feature = "server")]
-use self::monitor::DownloadMonitor;
+use self::monitor::{DownloadMonitor, WatchedTransfer};
 #[cfg(feature = "server")]
 use crate::transfer_registry::{BatchRef, TransferOwner};
 #[cfg(feature = "server")]
@@ -334,14 +334,12 @@ async fn queue_and_watch(
                 "Started monitoring downloads: {:?}",
                 enqueued.iter().map(|d| &d.item).collect::<Vec<_>>()
             );
-            let sources = enqueued.iter().map(|d| d.source.clone()).collect();
-            let filenames = enqueued.iter().map(|d| d.item.clone()).collect();
+            let transfers = enqueued.iter().map(WatchedTransfer::from).collect();
             let task_username = username.clone();
             let task_cancellation = register_user_task(&username).await;
             tokio::spawn(async move {
                 let mut monitor = DownloadMonitor::new(
-                    sources,
-                    filenames,
+                    transfers,
                     batch.target.clone(),
                     tx,
                     task_cancellation,

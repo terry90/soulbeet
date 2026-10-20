@@ -1,14 +1,12 @@
 use dioxus::logger::tracing::{info, warn};
-use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
+use shared::download::{DownloadProgress, DownloadState};
 use soulbeet::ImportMode;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use super::utils::{file_id, resolve_download_path, resolve_in_destination, FileId};
-use crate::config::CONFIG;
-use crate::globals::send_user_event;
-use crate::import_queue::{ImportJob, JobOwner, IMPORT_QUEUE};
+use crate::import_queue::{ImportJob, JobOwner};
 
 /// Maximum number of retries when waiting for a downloaded file to appear on disk.
 /// With exponential backoff (500ms, 1s, 2s, 4s, 8s), this covers ~15.5s total.
@@ -65,69 +63,37 @@ pub async fn resolve_on_disk(
     None
 }
 
-/// Where a monitor's finished downloads are and which of them it already
-/// handed to the import queue.
-#[derive(Clone)]
-pub struct Handoff {
-    pub target: PathBuf,
-    pub username: String,
-    pub download_base: PathBuf,
-    /// Shared by every handoff of one monitor, so two slots of a batch with
-    /// the same basename resolve to different files.
-    pub claimed: Arc<Mutex<HashSet<FileId>>>,
-}
+/// Row text for a finished download whose file was not found on disk.
+const UNRESOLVED: &str = "Could not resolve file path";
 
-/// Finds the finished downloads on disk and queues their imports. Returns
-/// once they are queued: the queue reports each row's progress itself.
-/// `rows` are already stamped with their batch and paired with the batch
-/// folder they were enqueued into.
-pub async fn submit_imports(rows: Vec<(DownloadProgress, Option<String>)>, handoff: Handoff) {
-    let base = &handoff.download_base;
-    let mut resolved = Vec::new();
-    let mut unresolved = Vec::new();
-    for (row, destination) in rows {
-        match resolve_on_disk(&row.item, base, destination.as_deref(), &handoff.claimed).await {
-            Some(path) => resolved.push((row, path, destination)),
-            None => unresolved.push(DownloadProgress {
-                state: DownloadState::Failed("Could not resolve file path".into()),
-                error: Some("Could not resolve file path".into()),
-                ..row
-            }),
-        }
-    }
-    if !unresolved.is_empty() {
-        send_user_event(&handoff.username, DownloadEvent::Progress(unresolved)).await;
-    }
-
-    let jobs = plan_jobs(
-        resolved,
-        CONFIG.is_album_mode(),
-        &handoff.target,
-        &handoff.username,
-        base,
-    );
-    info!(
-        "Queueing {} import(s) into {:?}",
-        jobs.len(),
-        handoff.target
-    );
-    for job in jobs {
-        IMPORT_QUEUE.submit(job).await;
+/// The Failed row of a finished download whose file was not found.
+pub fn unresolved_row(row: DownloadProgress) -> DownloadProgress {
+    DownloadProgress {
+        state: DownloadState::Failed(UNRESOLVED.into()),
+        error: Some(UNRESOLVED.into()),
+        ..row
     }
 }
 
-/// Album mode imports each batch folder as one album. A file found outside
-/// any batch folder (a transfer the batch did not enqueue) is imported on its
-/// own, since its folder may hold anything. Singleton mode imports each file
-/// on its own.
-fn plan_jobs(
-    resolved: Vec<(DownloadProgress, PathBuf, Option<String>)>,
-    album_mode: bool,
+/// A finished slot whose file was found on disk. `destination` is the batch
+/// folder it was enqueued into, `None` for an adopted transfer.
+pub struct ResolvedSlot {
+    pub row: DownloadProgress,
+    pub path: PathBuf,
+    pub destination: Option<String>,
+}
+
+/// An import of `source` reporting to `username` through `rows`, which are
+/// already stamped with their batch.
+pub fn import_job(
+    source: PathBuf,
+    mode: ImportMode,
+    rows: Vec<DownloadProgress>,
     target: &Path,
     username: &str,
     base: &Path,
-) -> Vec<ImportJob> {
-    let job = |source: PathBuf, mode: ImportMode, rows: Vec<DownloadProgress>| ImportJob {
+) -> ImportJob {
+    ImportJob {
         sources: vec![source],
         target: target.to_path_buf(),
         mode,
@@ -137,25 +103,42 @@ fn plan_jobs(
         }),
         snapshot_target: false,
         cleanup_root: Some(base.to_path_buf()),
-    };
+    }
+}
 
+/// The imports of an album batch: its folder as one album, and each file
+/// found outside it (an adopted transfer) on its own, since that file's
+/// folder may hold anything.
+pub fn album_jobs(
+    resolved: Vec<ResolvedSlot>,
+    target: &Path,
+    username: &str,
+    base: &Path,
+) -> Vec<ImportJob> {
     let mut albums: Vec<(PathBuf, Vec<DownloadProgress>)> = Vec::new();
     let mut jobs = Vec::new();
-    for (row, path, destination) in resolved {
-        match destination.filter(|_| album_mode) {
+    for slot in resolved {
+        match slot.destination {
             Some(destination) => {
                 let folder = base.join(destination);
                 match albums.iter_mut().find(|(f, _)| *f == folder) {
-                    Some((_, rows)) => rows.push(row),
-                    None => albums.push((folder, vec![row])),
+                    Some((_, rows)) => rows.push(slot.row),
+                    None => albums.push((folder, vec![slot.row])),
                 }
             }
-            None => jobs.push(job(path, ImportMode::Singleton, vec![row])),
+            None => jobs.push(import_job(
+                slot.path,
+                ImportMode::Singleton,
+                vec![slot.row],
+                target,
+                username,
+                base,
+            )),
         }
     }
     let album_jobs = albums
         .into_iter()
-        .map(|(folder, rows)| job(folder, ImportMode::Album, rows));
+        .map(|(folder, rows)| import_job(folder, ImportMode::Album, rows, target, username, base));
     album_jobs.chain(jobs).collect()
 }
 
@@ -164,43 +147,42 @@ mod tests {
     use super::*;
     use crate::import_queue::test_support::row;
 
-    fn plan(album_mode: bool) -> Vec<(Vec<PathBuf>, ImportMode, Vec<String>)> {
+    #[test]
+    fn an_album_imports_its_batch_folder_once_and_adopted_files_alone() {
         let batch = Some("X [12345678]".to_string());
         let resolved = vec![
-            (
-                row("a"),
-                PathBuf::from("/dl/X [12345678]/a.flac"),
-                batch.clone(),
-            ),
-            (row("foreign"), PathBuf::from("/dl/Other/f.flac"), None),
-            (
-                row("b"),
-                PathBuf::from("/dl/X [12345678]/b_639097129778484198.flac"),
-                batch,
-            ),
+            ResolvedSlot {
+                row: row("a"),
+                path: PathBuf::from("/dl/X [12345678]/a.flac"),
+                destination: batch.clone(),
+            },
+            ResolvedSlot {
+                row: row("adopted"),
+                path: PathBuf::from("/dl/Other/f.flac"),
+                destination: None,
+            },
+            ResolvedSlot {
+                row: row("b"),
+                path: PathBuf::from("/dl/X [12345678]/b_639097129778484198.flac"),
+                destination: batch,
+            },
         ];
-        plan_jobs(
-            resolved,
-            album_mode,
-            Path::new("/music"),
-            "u",
-            Path::new("/dl"),
-        )
-        .into_iter()
-        .map(|job| {
-            assert_eq!(job.cleanup_root.as_deref(), Some(Path::new("/dl")));
-            let owner = job.owner.unwrap();
-            assert_eq!(owner.username, "u");
-            let items = owner.rows.into_iter().map(|r| r.item).collect();
-            (job.sources, job.mode, items)
-        })
-        .collect()
-    }
 
-    #[test]
-    fn album_mode_imports_the_batch_folder_once_and_foreign_files_alone() {
+        let jobs: Vec<(Vec<PathBuf>, ImportMode, Vec<String>)> =
+            album_jobs(resolved, Path::new("/music"), "u", Path::new("/dl"))
+                .into_iter()
+                .map(|job| {
+                    assert_eq!(job.cleanup_root.as_deref(), Some(Path::new("/dl")));
+                    assert_eq!(job.target, Path::new("/music"));
+                    let owner = job.owner.unwrap();
+                    assert_eq!(owner.username, "u");
+                    let items = owner.rows.into_iter().map(|r| r.item).collect();
+                    (job.sources, job.mode, items)
+                })
+                .collect();
+
         assert_eq!(
-            plan(true),
+            jobs,
             vec![
                 (
                     vec![PathBuf::from("/dl/X [12345678]")],
@@ -210,19 +192,10 @@ mod tests {
                 (
                     vec![PathBuf::from("/dl/Other/f.flac")],
                     ImportMode::Singleton,
-                    vec!["foreign".to_string()]
+                    vec!["adopted".to_string()]
                 ),
             ]
         );
-    }
-
-    #[test]
-    fn singleton_mode_imports_each_file_alone() {
-        let jobs = plan(false);
-        assert_eq!(jobs.len(), 3);
-        assert!(jobs
-            .iter()
-            .all(|(_, mode, items)| *mode == ImportMode::Singleton && items.len() == 1));
     }
 
     #[tokio::test]
