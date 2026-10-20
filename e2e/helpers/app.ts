@@ -4,7 +4,7 @@
 // instance.
 
 import { randomUUID } from 'node:crypto';
-import type { APIRequestContext, BrowserContext, Page } from '@playwright/test';
+import type { APIRequestContext, BrowserContext, Locator, Page } from '@playwright/test';
 import { expect } from '@playwright/test';
 import { musicDirForApp } from './env.js';
 
@@ -82,6 +82,16 @@ export async function performSearch(
   await page.getByPlaceholder('Search artist, album or track...').fill(query);
   await page.getByRole('button', { name: 'SEARCH', exact: true }).filter({ visible: true }).click();
   await expect(page.getByText('Search Results')).toBeVisible({ timeout: 45_000 });
+}
+
+export async function openDownloadsPanel(page: Page): Promise<void> {
+  await page.getByRole('button', { name: 'Downloads', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Active Transfers' })).toBeVisible();
+}
+
+/** The transfer row in the downloads panel, located by its remote path. */
+export function transferRow(page: Page, remotePath: string): Locator {
+  return page.locator('div.group').filter({ has: page.getByTitle(remotePath, { exact: true }) });
 }
 
 /** A registered, logged-in user with their own folder: the common baseline. */

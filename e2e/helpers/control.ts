@@ -17,6 +17,8 @@ export interface StubTransfer {
 
 export interface StubState {
   outage: boolean;
+  /** Enqueues answered with "Skipped: Already in progress" (per file) or 429. */
+  rejections: { alreadyInProgress: number; throttled: number };
   transfers: StubTransfer[];
 }
 

@@ -2,25 +2,14 @@
 // slskd stub delivers real FLACs -> the monitor picks them up -> real beets
 // autotags against the MusicBrainz stub -> files land in the library tree.
 
-import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { freshSession, performSearch } from '../helpers/app.js';
+import { freshSession, openDownloadsPanel, performSearch, transferRow } from '../helpers/app.js';
 import { expectFileAppears, importedTrackPath, listFilesRecursive } from '../helpers/files.js';
 import { glassAtlas, senders } from '../fixtures/dataset.js';
 import { basename } from 'node:path';
 import { downloadsDirOnHost } from '../helpers/env.js';
 
 test.describe.configure({ timeout: 180_000 });
-
-async function openDownloadsPanel(page: Page) {
-  await page.getByRole('button', { name: 'Downloads', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Active Transfers' })).toBeVisible();
-}
-
-/** The transfer row in the downloads panel, located by its remote path. */
-function transferRow(page: Page, remotePath: string) {
-  return page.locator('div.group').filter({ has: page.getByTitle(remotePath, { exact: true }) });
-}
 
 test('downloads and imports a single track', async ({ context, page }) => {
   const { folder } = await freshSession(context, page, 'happy-track');

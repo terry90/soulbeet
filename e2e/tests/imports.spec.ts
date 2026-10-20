@@ -8,7 +8,7 @@
 import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
 import { basename } from 'node:path';
-import { freshSession, performSearch } from '../helpers/app.js';
+import { freshSession, openDownloadsPanel, performSearch, transferRow } from '../helpers/app.js';
 import { resetStubs, setMbMode, stubState } from '../helpers/control.js';
 import { downloadsDirOnHost } from '../helpers/env.js';
 import { expectFileAppears, importedTrackPath, listFilesRecursive } from '../helpers/files.js';
@@ -46,18 +46,8 @@ function downloadButton(page: Page, title: string) {
     .getByRole('button', { name: 'Download' });
 }
 
-async function openDownloadsPanel(page: Page) {
-  await page.getByRole('button', { name: 'Downloads', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Active Transfers' })).toBeVisible();
-}
-
 function drawer(page: Page) {
   return page.locator('div.bg-beet-panel').filter({ hasText: 'Active Transfers' });
-}
-
-/** The transfer row in the downloads panel, located by its remote path. */
-function transferRow(page: Page, remotePath: string) {
-  return page.locator('div.group').filter({ has: page.getByTitle(remotePath, { exact: true }) });
 }
 
 async function expectAllInLibrary(page: Page, release: FixtureRelease, folderName: string) {
@@ -109,17 +99,28 @@ test('rapid re-clicks give one transfer and no tick copies', async ({ context, p
   const { folder } = await freshSession(context, page, 'imports-reclick');
 
   await performSearch(page, tinMoons.title, 'ALBUM');
+  let requests = 0;
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && request.url().endsWith('/api/auto-download')) {
+      requests++;
+    }
+  });
   // The icon disables itself once it re-renders, so a user's fast clicks are
   // dispatched in one go: each reaches the handler and sends a request.
-  await downloadButton(page, tinMoons.title).evaluate((button) => {
+  await downloadButton(page, tinMoons.title).evaluate((button: HTMLElement) => {
     button.click();
     button.click();
     button.click();
   });
+  await expect.poll(() => requests).toBe(3);
   await openDownloadsPanel(page);
   await expectAllInLibrary(page, tinMoons, folder.name);
 
-  const { transfers } = await stubState();
+  // slskd itself refuses a second enqueue of an unfinished file, so one
+  // transfer per file alone would not show the app joined the repeats: it
+  // must never have asked slskd twice.
+  const { rejections, transfers } = await stubState();
+  expect(rejections).toEqual({ alreadyInProgress: 0, throttled: 0 });
   for (const share of sharesOf(tinMoons)) {
     expect(
       transfers.filter((t) => t.filename === share.remotePath),
@@ -147,7 +148,8 @@ test('a skipped row shows the reason, the kept folder and the beets output', asy
   const row = transferRow(page, share!.remotePath);
   await expect(row.getByText('SKIP', { exact: true })).toBeVisible({ timeout: 120_000 });
   await expect(row.getByText(/^No close match/)).toBeVisible();
-  await expect(row.getByText(/^Kept in /)).toBeVisible();
+  // A track search names its batch folder after the track.
+  await expect(row.getByText(/^Kept in .*Vesper Bells \[[0-9a-z]{8}\]/)).toBeVisible();
   await row.getByRole('button', { name: 'Show beets output' }).click();
   await expect(row.locator('pre')).not.toBeEmpty();
 

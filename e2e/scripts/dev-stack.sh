@@ -82,12 +82,12 @@ up() {
 
   local venv="$RUNTIME/beets-venv"
   if [[ ! -x "$venv/bin/python" ]]; then
-    "${PYTHON:-python3}" -c 'import sys; sys.exit(sys.version_info < (3, 11))' || {
-      echo "beets needs Python 3.11 or newer; set PYTHON to one" >&2
-      exit 1
-    }
     "${PYTHON:-python3}" -m venv "$venv"
   fi
+  "$venv/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' || {
+    echo "beets needs Python 3.11 or newer; remove $venv and set PYTHON to one" >&2
+    exit 1
+  }
   "$venv/bin/pip" install --quiet -c "$REPO_DIR/build/requirements-beets.txt" \
     beets requests musicbrainzngs
   export PATH="$venv/bin:$PATH"

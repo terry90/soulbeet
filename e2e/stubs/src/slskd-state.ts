@@ -215,6 +215,8 @@ export class SlskdState {
   private rejectedOnce = new Set<string>();
   private batchIds = new Set<string>();
   private enqueuesInFlight = 0;
+  /** Enqueues slskd turned away, so specs can tell the app never asked twice. */
+  private rejections = { alreadyInProgress: 0, throttled: 0 };
   outage = false;
 
   constructor(
@@ -245,11 +247,12 @@ export class SlskdState {
     this.resetBehaviors();
     this.rejectedOnce.clear();
     this.batchIds.clear();
+    this.rejections = { alreadyInProgress: 0, throttled: 0 };
     // enqueuesInFlight is left alone: running requests release their own slot.
     this.outage = false;
   }
 
-  /** Any other record of a file blocks a new enqueue of it (DownloadService.EnqueueAsync). */
+  /** Records not finished block a new enqueue of the same file (DownloadService.EnqueueAsync). */
   private static isFinished(transfer: TransferRecord): boolean {
     return transfer.endedAtMs !== null && transfer.state.startsWith('Completed');
   }
@@ -386,6 +389,7 @@ export class SlskdState {
     }
     if (this.enqueuesInFlight >= ENQUEUE_SLOTS) {
       console.log(`[slskd] batch enqueue from ${parsed.username} throttled`);
+      this.rejections.throttled++;
       return { status: 429, body: ENQUEUE_THROTTLED };
     }
     this.enqueuesInFlight++;
@@ -463,6 +467,7 @@ export class SlskdState {
         (t) => t.username === username && t.filename === filename,
       );
       if (previous.some((t) => !SlskdState.isFinished(t))) {
+        this.rejections.alreadyInProgress++;
         failures.push({ filename, message: 'Skipped: Already in progress' });
         continue;
       }
@@ -702,6 +707,7 @@ export class SlskdState {
   snapshot(): Record<string, unknown> {
     return {
       outage: this.outage,
+      rejections: { ...this.rejections },
       behaviors: Object.fromEntries(this.behaviors),
       searches: Array.from(this.searches.values()).map((s) => this.searchJson(s)),
       transfers: this.transfers.map((t) => this.transferJson(t)),
