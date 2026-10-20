@@ -189,11 +189,14 @@ pub async fn music_importer(id: Option<&str>) -> Result<Arc<dyn MusicImporter>, 
         return Ok(importer.clone());
     }
 
+    // Built under the write lock, so concurrent first callers share one
+    // instance and its health.
+    let mut importers = MUSIC_IMPORTERS.write().await;
+    if let Some(importer) = importers.get(requested) {
+        return Ok(importer.clone());
+    }
     let importer = init_importer(requested)?;
-    MUSIC_IMPORTERS
-        .write()
-        .await
-        .insert(requested.to_string(), importer.clone());
+    importers.insert(requested.to_string(), importer.clone());
     Ok(importer)
 }
 
@@ -239,7 +242,8 @@ pub async fn evict_navidrome_client(user_id: &str) {
 pub async fn reload_providers() {
     METADATA_PROVIDERS.write().await.clear();
     DOWNLOAD_BACKENDS.write().await.clear();
-    MUSIC_IMPORTERS.write().await.clear();
+    // MUSIC_IMPORTERS stays: importers are built from the environment only,
+    // and dropping one would drop its cached health.
     NAVIDROME_CLIENTS.write().await.clear();
 }
 
@@ -248,4 +252,29 @@ pub async fn is_slskd_configured() -> bool {
     let url = AppConfig::get(keys::SLSKD_URL).await.ok().flatten();
     let api_key = AppConfig::get(keys::SLSKD_API_KEY).await.ok().flatten();
     matches!((url, api_key), (Some(u), Some(k)) if !u.is_empty() && !k.is_empty())
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_importer_and_its_health_survive_a_provider_reload() {
+        let first = music_importer(None).await.unwrap();
+        reload_providers().await;
+        let second = music_importer(None).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callers_share_one_importer() {
+        let callers: Vec<_> = (0..16)
+            .map(|_| tokio::spawn(music_importer(None)))
+            .collect();
+        let mut importers = Vec::new();
+        for caller in callers {
+            importers.push(caller.await.unwrap().unwrap());
+        }
+        assert!(importers.iter().all(|i| Arc::ptr_eq(i, &importers[0])));
+    }
 }

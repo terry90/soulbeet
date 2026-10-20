@@ -1,7 +1,7 @@
 //! Importer health for the startup check, the health poll and the gates. The
 //! importer keeps the cached result; these only decide when to check again.
 
-use shared::system::{HealthIssue, ImporterHealth};
+use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::MusicImporter;
 use std::sync::Once;
 use tracing::error;
@@ -55,9 +55,13 @@ pub async fn broken_issue() -> Option<HealthIssue> {
 }
 
 /// Why `importer` must not run a job, if it must not. A Broken importer is
-/// checked again first, so a fixed config does not wait for the next poll.
+/// checked again first, so a fixed config does not wait for the next poll,
+/// and one not checked yet is checked before its first job.
 pub async fn refusal(importer: &dyn MusicImporter) -> Option<String> {
-    if !importer.health().is_broken() {
+    if !matches!(
+        importer.health().level,
+        HealthLevel::Broken | HealthLevel::Checking
+    ) {
         return None;
     }
     importer
@@ -71,7 +75,6 @@ pub async fn refusal(importer: &dyn MusicImporter) -> Option<String> {
 mod tests {
     use super::*;
     use shared::library::DuplicateReport;
-    use shared::system::HealthLevel;
     use soulbeet::{ImportMode, ImportResult};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -151,6 +154,23 @@ mod tests {
             Some("No metadata source plugin loaded")
         );
         assert_eq!(stub.refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_importer_not_checked_yet_is_checked_before_a_job() {
+        let stub = Stub::new(health(HealthLevel::Checking), health(HealthLevel::Broken));
+        assert_eq!(
+            refusal(&stub).await.as_deref(),
+            Some("No metadata source plugin loaded")
+        );
+        assert_eq!(stub.refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_degraded_importer_is_not_checked_again() {
+        let stub = Stub::new(health(HealthLevel::Degraded), health(HealthLevel::Broken));
+        assert_eq!(refusal(&stub).await, None);
+        assert_eq!(stub.refreshes.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

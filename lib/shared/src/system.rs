@@ -109,10 +109,6 @@ pub struct ImporterHealth {
 }
 
 impl ImporterHealth {
-    pub fn is_broken(&self) -> bool {
-        self.level == HealthLevel::Broken
-    }
-
     /// The first issue that keeps imports from running.
     pub fn blocking_issue(&self) -> Option<&HealthIssue> {
         self.issues
@@ -146,7 +142,6 @@ mod tests {
         let issue = |s, t: &str| HealthIssue { severity: s, title: t.into(), detail: String::new() };
         let h = ImporterHealth { level: HealthLevel::Broken,
             issues: vec![issue(HealthLevel::Degraded, "w"), issue(HealthLevel::Broken, "b")], facts: vec![] };
-        assert!(h.is_broken());
         assert_eq!(h.blocking_issue().unwrap().title, "b");
     }
 
