@@ -80,7 +80,7 @@ If the plugin is in `:full` but you're on `:light`, just pull `:full`. See above
 
 For one-off plugins that are a single `.py` file with no extra pip dependencies, for example a custom `BeetsPlugin` you wrote yourself, or one of the [single-file community plugins](https://beets.readthedocs.io/en/stable/plugins/index.html#other-plugins), you can drop them in without rebuilding the image.
 
-Soulbeet's default config sets `pluginpath: /data/beets-plugins`, and the runtime image pre-creates `/data/beets-plugins/`. Mount your plugin directory there and list the plugin in `plugins:`.
+Soulbeet's default config sets `pluginpath: [/opt/beets-plugins, /data/beets-plugins]`, and the runtime image pre-creates `/data/beets-plugins/`. Mount your plugin directory there and list the plugin in `plugins:`.
 
 1. Put your plugin file on the host. Example:
    ```
@@ -95,7 +95,7 @@ Soulbeet's default config sets `pluginpath: /data/beets-plugins`, and the runtim
      - ./my-beets-plugins:/data/beets-plugins:ro
    ```
 
-3. Add the plugin name to the `plugins:` line in your mounted `beets_config.yaml`:
+3. Add the plugin name to the `plugins:` line in your config file:
    ```yaml
    plugins: chroma musicbrainz fetchart hello
    ```
@@ -134,7 +134,7 @@ services:
     image: my-soulbeet:latest  # was docker.io/docccccc/soulbeet:medium
 ```
 
-Then enable the new plugin in your mounted `beets_config.yaml` as usual.
+Then enable the new plugin in your config file as usual.
 
 You'll rebuild this image each time you bump the base Soulbeet version.
 
@@ -149,7 +149,7 @@ The runtime image is distroless: no shell, no apt, no pip, and a read-only files
 
 ## Per-plugin configuration
 
-All beets plugin config goes in your mounted `beets_config.yaml`. Pass the path via `BEETS_CONFIG` if it differs from the default:
+All beets plugin config goes in your config file. `BEETS_CONFIG` replaces the shipped `/app/beets_config.yaml`, so start from a copy of it. Point `BEETS_CONFIG` at your file:
 
 ```yaml
 services:
@@ -163,7 +163,7 @@ services:
 Sensitive values (Discogs token, Last.fm username, Genius API key, AcoustID submit key) live in that YAML. `chmod 600` on the host file is a reasonable baseline. The default AcoustID lookup key shipped with beets is sufficient for `chroma` to work; you only need your own AcoustID key if you want to submit fingerprints back.
 
 - **`mbtwopass` (all tiers, ships with the image):** No configuration. It changes how single tracks are looked up in MusicBrainz. Beets sends `alias: <title>` alongside `recording: <title>`, which does not narrow the search but adds tokens to it, and MusicBrainz ranks a recording higher the more often it repeats them. A short title loses to a long repetitive one: searching Kowloon's "Wake Up" returns "Up Up Up Up Up Up" at 37.9% ahead of the exact recording, far enough off that a quiet import skips the file without saying why. The plugin searches without the alias term first and only retries with it when nothing came back close enough to import, so the alternate-title case it exists for still works. Measured over 25 real downloads, the alias term helped 4 files and hurt 1; running both passes takes the better of the two every time. The plugin lives at `/opt/beets-plugins`, not `/data/beets-plugins`, because deployments bind-mount `/data` and would hide it. If you replace `pluginpath`, keep `/opt/beets-plugins` in the list.
-- **`replaygain` (full tier only):** Soulbeet's `full` tier ships `replaygain: { backend: ffmpeg, overwrite: yes }` baked into the default `beets_config.yaml`. The distroless runtime does not include GStreamer (which the replaygain plugin would otherwise use as a default backend), so the ffmpeg backend is required. If you mount your own `beets_config.yaml`, preserve this block or `beet replaygain` will fail to load with `No module named 'gi'`.
+- **`replaygain` (full tier only):** Soulbeet's `full` tier ships `replaygain: { backend: ffmpeg, overwrite: yes }` baked into the default `beets_config.yaml`. The distroless runtime does not include GStreamer (which the replaygain plugin would otherwise use as a default backend), so the ffmpeg backend is required. If you set your own `BEETS_CONFIG`, preserve this block or `beet replaygain` will fail to load with `No module named 'gi'`.
 
 ## Reference
 

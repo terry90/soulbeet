@@ -59,6 +59,7 @@ services:
       - BEETS_CONFIG=/config/config.yaml
     volumes:
       - ./data:/data
+      - ./beets:/config
       - /path/to/slskd/downloads:/downloads
       - /path/to/music:/music
     depends_on:
@@ -86,9 +87,18 @@ services:
       - "5030:5030"
 ```
 
-2.  **Important**: The `/downloads` volume must match between `slskd` and `soulbeet` so Soulbeet can see the files `slskd` downloaded. The `/music` volume must match between `soulbeet` and `navidrome` so Navidrome can see the organized library. Soulbeet requires **slskd 0.26 or newer** (downloads are enqueued through the batches API introduced in 0.26).
+2.  Seed the beets config. `BEETS_CONFIG` replaces the config shipped in the image, so start from a copy of it:
 
-3.  Run:
+```bash
+mkdir -p beets
+docker create --name sb docker.io/docccccc/soulbeet:latest
+docker cp sb:/app/beets_config.yaml ./beets/config.yaml
+docker rm sb
+```
+
+3.  **Important**: The `/downloads` volume must match between `slskd` and `soulbeet` so Soulbeet can see the files `slskd` downloaded. The `/music` volume must match between `soulbeet` and `navidrome` so Navidrome can see the organized library. Soulbeet requires **slskd 0.26 or newer** (downloads are enqueued through the batches API introduced in 0.26).
+
+4.  Run:
 
 ```bash
 docker-compose up -d
@@ -115,8 +125,10 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `DOWNLOAD_PATH` | Path where slskd saves downloads | `/downloads` |
 | `SECRET_KEY` | Encryption key for tokens and credentials | |
 | `NAVIDROME_URL` | Your Navidrome server URL. Optional: without it you log in with local accounts, and discovery playlists, rating sync and auto-delete are unavailable | |
-| `BEETS_CONFIG` | Path to custom beets config file | `beets_config.yaml` |
+| `BEETS_CONFIG` | Path to your beets config file. Replaces the shipped `/app/beets_config.yaml` (beets defaults still apply underneath) | `beets_config.yaml` |
+| `BEETS_PYTHON` | Python interpreter that runs beets and the config check. By default it is read from the `#!` line of `beet` (`/usr/bin/python3` in the image) | |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
+| `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
 **Note**: Local passwords always work. If Navidrome rejects your credentials or can't be reached, Soulbeet checks the password stored in its own database, which is updated to your Navidrome password on every successful Navidrome login.
 
@@ -124,13 +136,24 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 
 ### Beets Configuration
 
-Soulbeet uses `beets` to import music. You can mount a custom `config.yaml` to `/config/config.yaml` (or wherever you point `BEETS_CONFIG` to) to customize how beets behaves (plugins, naming formats, etc.).
+Soulbeet uses `beets` to import music. The image ships a config at `/app/beets_config.yaml`, with the `plugins:` line set for your image tier. Setting `BEETS_CONFIG` to another file **replaces** it, it does not merge with it. Copy the shipped file (see Quick Start) and edit the copy.
+
+-   Which plugins each tier installs is listed in [docs/beets-plugins.md](./docs/beets-plugins.md). A plugin in `plugins:` that the tier does not install shows as a warning in Settings.
+-   `plugins:` must contain `musicbrainz`. Without a metadata source plugin, Soulbeet marks beets as broken.
+-   `include:` is ignored in the file you point `BEETS_CONFIG` at.
+-   `mbtwopass` lives in `/opt/beets-plugins`. To keep it, set `pluginpath: [/opt/beets-plugins, /data/beets-plugins]`.
+-   `discogs` needs `discogs.user_token`.
+-   Soulbeet passes `--log`, which overrides `import.log`.
+-   `incremental: yes` makes beets skip folders it has already skipped once, so "Retry import" on such a folder reports "Nothing left to import".
 
 Default `beet import` flags used:
+-   `-v`: Verbose output, shown under "beets output" for rows that did not import
+-   `-c [config]`: The config file
 -   `-q`: Quiet mode (no user interaction)
 -   `-s`: Singleton mode (Default behavior unless `BEETS_ALBUM_MODE` is set)
 -   `-l [library_path]`: Library database path (per-folder)
 -   `-d [target_path]`: Import to the specific folder selected in the web UI.
+-   `--log [file]`: Where beets writes its import log
 
 ### Image Tiers
 
@@ -166,14 +189,14 @@ For more beets commands, see the [beets documentation](https://beets.readthedocs
 
 #### Album Mode (`BEETS_ALBUM_MODE`)
 
-By setting `BEETS_ALBUM_MODE=true`, Soulbeet will attempt to group downloaded files by their parent directory and import them as an album instead of singletons.
+By setting `BEETS_ALBUM_MODE=true`, Soulbeet imports each download batch as an album instead of as singletons. Every batch is saved in its own folder named `<label> [<id>]` under the download path, and that folder is the album import.
 
 This flag is only needed when you want album tags on your tracks. E.g: `albumartist` `mb_albumid` and so on..
 
 **Important for Album Mode:**
-Since `beets` is run in quiet mode (`-q`), it will skip any imports that require user intervention (e.g., if the metadata doesn't match confidently). To ensure partial albums or less popular releases are imported correctly, you **must** configure your `beets_config.yaml` to be more permissive.
+Since `beets` is run in quiet mode (`-q`), it will skip any imports that require user intervention (e.g., if the metadata doesn't match confidently). To ensure partial albums or less popular releases are imported correctly, you **must** configure your config file to be more permissive.
 
-Recommended additions to your `beets_config.yaml` for Album Mode:
+Recommended additions to your config file for Album Mode:
 
 ```yaml
 import:
@@ -231,6 +254,12 @@ When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from 
 3.  Run the app:
     ```bash
     dx serve --platform web
+    ```
+4.  Run the tests (the probe tests need Python 3.11+ with beets and pytest installed):
+    ```bash
+    cargo test --workspace --features server,dioxus/server --lib
+    cargo test -p soulbeet --lib
+    python -m pytest -q lib/soulbeet/tests/probe
     ```
 
 ## Roadmap

@@ -149,8 +149,16 @@ RUN --mount=type=bind,from=ffmpeg-stage,target=/ffmpeg-src \
        && chmod 0755 /out/usr/local/bin/ffmpeg /out/usr/local/bin/ffprobe ; \
      fi
 
+# --- tini: PID 1 reaps beet and plugin subprocesses and forwards signals ---
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS tini
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
 # --- RUNTIME STAGE ---
 FROM gcr.io/distroless/python3-debian12
+
+COPY --from=tini /usr/bin/tini-static /tini
 
 # Native binaries for chroma (fpcalc + libchromaprint + libav* shared libs)
 # plus static ffmpeg + ffprobe at /usr/local/bin/ when TIER=full.
@@ -195,4 +203,4 @@ ENV HOME=/tmp
 # Expose the port
 EXPOSE 9765
 
-ENTRYPOINT ["/app/server/server"]
+ENTRYPOINT ["/tini", "--", "/app/server/server"]

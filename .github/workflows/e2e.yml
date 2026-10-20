@@ -55,6 +55,19 @@ jobs:
             type=gha,scope=e2e
           cache-to: type=gha,mode=max,scope=e2e
 
+      - name: Probe the shipped beets config
+        shell: bash
+        run: |
+          set -e
+          probe=$(docker run --rm --entrypoint=/usr/bin/python3 soulbeet:e2e \
+            -P -c "$(cat lib/soulbeet/src/beets/probe.py)" /app/beets_config.yaml)
+          echo "$probe"
+          jq -e '.fatal == null and (.plugin_errors | length) == 0
+                 and ([.metadata_sources[] | select(. != "Acoustid")] | length) > 0' \
+            <<<"$probe" >/dev/null \
+            || { echo "FAIL: shipped beets config does not probe clean"; exit 1; }
+          docker run --rm --entrypoint=/tini soulbeet:e2e --version
+
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 

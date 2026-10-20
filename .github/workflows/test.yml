@@ -1,0 +1,60 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      # One soulbeet test runs the real probe.py with python3.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Same version as the Dockerfile builder image.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test the workspace
+        run: cargo test --workspace --features server,dioxus/server --lib --locked
+
+      # Without feature unification from the other crates, to catch missing features.
+      - name: Test soulbeet on its own
+        run: cargo test -p soulbeet --lib --locked
+
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # The image interpreter is 3.11, and probe.py needs -P (3.11+).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install beets and pytest
+        run: python -m pip install -c build/requirements-beets.txt "beets[chroma,discogs]" requests musicbrainzngs pytest==8.3.5
+
+      - name: Test the beets config probe
+        run: python -m pytest -q lib/soulbeet/tests/probe

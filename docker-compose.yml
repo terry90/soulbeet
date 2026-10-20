@@ -18,9 +18,10 @@ services:
       - /path/to/your/downloads:/downloads
       # Map your music libraries where beets will move files
       - /path/to/your/music:/music
-      # Mount the beets config
-      # Leave commented to use the default configuration
-      # - ./beets_config.yaml:/app/beets_config.yaml
+      # Custom beets config. BEETS_CONFIG replaces the shipped /app/beets_config.yaml,
+      # so start from a copy of it (see README). Leave commented to use the shipped one.
+      # Also add: - BEETS_CONFIG=/config/config.yaml
+      # - ./beets:/config
       # Drop-in pure-Python beets plugins (see docs/beets-plugins.md):
       # - ./my-plugins:/data/beets-plugins:ro
       # depends_on:
