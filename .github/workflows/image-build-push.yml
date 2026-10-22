@@ -25,6 +25,7 @@ jobs:
     outputs:
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
+      rolling: ${{ steps.rolling.outputs.rolling }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -40,6 +41,21 @@ jobs:
             ${{ inputs.tags }}
             type=semver,pattern={{version}}
             type=ref,event=branch
+
+      # Only master and release tags re-point the rolling :light/:medium/:full
+      # tags and their per-arch tags. Feature branches and prerelease tags
+      # (v1.2.3-rc.1) publish their own tags only.
+      - name: Decide whether this ref moves the rolling tags
+        id: rolling
+        shell: bash
+        run: |
+          case "$GITHUB_REF" in
+            refs/heads/master) rolling=true ;;
+            refs/tags/v*-*) rolling=false ;;
+            refs/tags/v*) rolling=true ;;
+            *) rolling=false ;;
+          esac
+          echo "rolling=$rolling" >> "$GITHUB_OUTPUT"
 
   build:
     needs: metadata
@@ -92,9 +108,10 @@ jobs:
           unset IFS
           # Rolling per-tier per-arch tag (e.g. light-amd64). The merge job
           # uses these to compose the rolling :light/:medium/:full multi-arch
-          # manifests; that step guards itself against feature-branch refs so
-          # the rolling image is only re-published on master / v* tags.
-          SUFFIXED_TAGS="${SUFFIXED_TAGS},${{ env.IMAGE_NAME }}:${TIER}-${SUFFIX}"
+          # manifests.
+          if [[ "${{ needs.metadata.outputs.rolling }}" == true ]]; then
+            SUFFIXED_TAGS="${SUFFIXED_TAGS},${{ env.IMAGE_NAME }}:${TIER}-${SUFFIX}"
+          fi
           SUFFIXED_TAGS="${SUFFIXED_TAGS#,}"
           echo "tags=$SUFFIXED_TAGS" >> $GITHUB_OUTPUT
           echo "Generated tags: $SUFFIXED_TAGS"
@@ -125,7 +142,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          IMG="${{ env.IMAGE_NAME }}:${{ matrix.tier }}-amd64"
+          IMG="${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
           docker pull "$IMG"
           # beets itself must run on every tier. Soulful's runtime health check
           # shells out to `beet --version`; that triggers beets' full command
@@ -226,15 +243,12 @@ jobs:
           unset IFS
 
           # Rolling per-tier multi-arch manifests (:light, :medium, :full).
-          # Only re-publish on master pushes or semver tag pushes so feature
-          # branches do not silently re-point the rolling :light/:medium/:full
-          # tags on Docker Hub.
-          if [[ "$GITHUB_REF" == "refs/heads/master" || "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "${{ needs.metadata.outputs.rolling }}" == true ]]; then
             for TIER in "${TIERS[@]}"; do
               docker buildx imagetools create -t ${{ env.IMAGE_NAME }}:${TIER} ${{ env.IMAGE_NAME }}:${TIER}-amd64 ${{ env.IMAGE_NAME }}:${TIER}-arm64
             done
           else
-            echo "::notice::Skipping rolling per-tier manifests (ref=$GITHUB_REF is not master or a v* tag)"
+            echo "::notice::Skipping rolling per-tier manifests (ref=$GITHUB_REF is not master or a release tag)"
           fi
 
   # NFR-16-01 size guard: warn (but do not block, per D-CI-03) if the new
@@ -247,7 +261,7 @@ jobs:
   size-check:
     needs: [metadata, merge]
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && needs.metadata.outputs.rolling == 'true'
     steps:
       - name: Log in to Docker Hub
         uses: docker/login-action@v4

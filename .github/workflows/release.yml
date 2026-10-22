@@ -65,9 +65,13 @@ jobs:
       - name: Create GitHub Release
         run: |
           TAG="${{ needs.bump-version.outputs.tag || github.ref_name }}"
+          flags=()
+          # v1.2.3-rc.1 and the like are test builds, not the latest release.
+          [[ "$TAG" == *-* ]] && flags+=(--prerelease)
           gh release create "$TAG" \
             --title "$TAG" \
-            --generate-notes
+            --generate-notes \
+            "${flags[@]}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -79,5 +83,5 @@ jobs:
       ref: ${{ needs.bump-version.outputs.tag || github.ref_name }}
       tags: |
         type=raw,value=${{ needs.bump-version.outputs.tag || github.ref_name }}
-        type=raw,value=latest
+        type=raw,value=latest,enable=${{ !contains(needs.bump-version.outputs.tag || github.ref_name, '-') }}
     secrets: inherit
