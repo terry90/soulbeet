@@ -342,7 +342,7 @@ mod tests {
 
     fn ready_report(pluginpath: &str) -> String {
         format!(
-            r#"{{"fatal": null, "loaded": ["musicbrainz"], "plugin_errors": [], "metadata_sources": ["MusicBrainz"], "user_config_path": null, "pluginpath": ["{pluginpath}"], "autotag": true}}"#
+            r#"{{"fatal": null, "loaded": ["musicbrainz"], "plugin_errors": [], "metadata_sources": ["MusicBrainz"], "user_config_path": null, "pluginpath": ["{pluginpath}"], "autotag": true, "import_hook": true}}"#
         )
     }
 

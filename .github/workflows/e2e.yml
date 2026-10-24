@@ -64,7 +64,7 @@ jobs:
           probe=$(docker run --rm --entrypoint=/usr/bin/python3 soulbeet:e2e \
             -P -c "$script" /app/beets_config.yaml)
           echo "$probe"
-          jq -e '.fatal == null and (.plugin_errors | length) == 0
+          jq -e '.fatal == null and (.plugin_errors | length) == 0 and .import_hook
                  and ([.metadata_sources[] | select(. != "Acoustid")] | length) > 0' \
             <<<"$probe" >/dev/null \
             || { echo "FAIL: shipped beets config does not probe clean"; exit 1; }

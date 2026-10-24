@@ -41,6 +41,7 @@ def test_shipped_config_is_clean(run_probe, tmp_path):
     assert "MusicBrainz" in report["metadata_sources"]
     assert report["pluginpath"] == [str(REPO_PLUGINS)]
     assert report["autotag"] is True
+    assert report["import_hook"] is True
     assert report["user_config_path"] == str(run_probe.beetsdir / "config.yaml")
 
 
@@ -142,3 +143,9 @@ def test_a_bad_value_read_after_load_is_a_configuration_error(run_probe, tmp_pat
     path.write_text(yaml.safe_dump({"plugins": "musicbrainz", "import": {"autotag": [1, 2]}}))
     report = run_probe(path)
     assert report["fatal"].startswith("configuration error:"), report["fatal"]
+
+
+def test_import_hook_is_reported_after_a_fatal_error(run_probe, tmp_path):
+    report = run_probe(tmp_path / "missing.yaml")
+    assert report["fatal"] is not None
+    assert report["import_hook"] is True

@@ -35,6 +35,8 @@ pub struct ProbeReport {
     /// Absolute, resolved against the cwd the way beets resolves them.
     pub pluginpath: Vec<String>,
     pub autotag: bool,
+    /// Whether import.py can swap beets' import session (beets 2.11 or newer).
+    pub import_hook: bool,
 }
 
 #[derive(Debug)]
@@ -164,6 +166,13 @@ pub(crate) fn assess(config: &Path, probe: &Result<ProbeReport, ProbeFailure>) -
                             "BEETS_CONFIG replaces /app/beets_config.yaml. Add musicbrainz to plugins: in {}.",
                             config.display()
                         ),
+                    ));
+                }
+                if !report.import_hook {
+                    issues.push(issue(
+                        Broken,
+                        "soulbeet needs beets 2.11 or newer to import",
+                        "Upgrade beets in the environment that runs beet, for example with pip install --upgrade beets.",
                     ));
                 }
                 for e in &report.plugin_errors {
@@ -323,6 +332,7 @@ mod tests {
             user_config_path: Some("/tmp/.config/beets/config.yaml".into()),
             pluginpath: vec![],
             autotag: true,
+            import_hook: true,
         }
     }
 
@@ -409,6 +419,27 @@ mod tests {
         assert_eq!(h.level, HealthLevel::Degraded);
         assert_eq!(titles(&h), ["import.autotag is off"]);
         assert_eq!(h.issues[0].detail, "Imports will not be tagged.");
+    }
+
+    #[test]
+    fn missing_import_hook_is_broken() {
+        let mut r = report(&["MusicBrainz"]);
+        r.import_hook = false;
+        let h = assess_ok(r);
+        assert_eq!(h.level, HealthLevel::Broken);
+        assert_eq!(titles(&h), ["soulbeet needs beets 2.11 or newer to import"]);
+        assert_eq!(
+            h.issues[0].detail,
+            "Upgrade beets in the environment that runs beet, for example with pip install --upgrade beets."
+        );
+    }
+
+    #[test]
+    fn fatal_hides_a_missing_import_hook() {
+        let mut r = report(&["MusicBrainz"]);
+        r.fatal = Some("ModuleNotFoundError: No module named 'beets'".into());
+        r.import_hook = false;
+        assert_eq!(titles(&assess_ok(r)), ["beets cannot start"]);
     }
 
     #[test]
@@ -599,7 +630,7 @@ mod tests {
         probe_with(Some(Path::new(BASH)), script, Path::new(CFG), SHORT).await
     }
 
-    const REPORT_JSON: &str = r#"{"fatal": null, "loaded": ["musicbrainz"], "plugin_errors": [{"plugin": "web", "error": "boom"}], "metadata_sources": ["MusicBrainz"], "user_config_path": "/b/config.yaml", "pluginpath": ["/p"], "autotag": false}"#;
+    const REPORT_JSON: &str = r#"{"fatal": null, "loaded": ["musicbrainz"], "plugin_errors": [{"plugin": "web", "error": "boom"}], "metadata_sources": ["MusicBrainz"], "user_config_path": "/b/config.yaml", "pluginpath": ["/p"], "autotag": false, "import_hook": false}"#;
 
     #[tokio::test]
     async fn run_probe_parses_the_last_stdout_line() {
@@ -618,6 +649,7 @@ mod tests {
         assert_eq!(r.user_config_path.as_deref(), Some("/b/config.yaml"));
         assert_eq!(r.pluginpath, ["/p"]);
         assert!(!r.autotag);
+        assert!(!r.import_hook);
     }
 
     #[tokio::test]

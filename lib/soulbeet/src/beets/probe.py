@@ -3,7 +3,7 @@
 #
 # Run as `python -P -c <this file> CFG`, with the same env and cwd as beet.
 # Output keys: fatal, loaded, plugin_errors, metadata_sources,
-# user_config_path, pluginpath, autotag.
+# user_config_path, pluginpath, autotag, import_hook.
 import json
 import logging
 import optparse
@@ -62,6 +62,7 @@ report = {
     "user_config_path": None,
     "pluginpath": [],
     "autotag": True,
+    "import_hook": False,
 }
 
 try:
@@ -90,6 +91,24 @@ try:
     report["metadata_sources"] = [
         p.data_source for p in metadata_plugins.find_metadata_source_plugins()
     ]
+except BaseException:
+    pass
+
+
+def import_hook():
+    """Whether beets builds its import session from a module global that
+    import.py can replace. import.py runs the same check."""
+    from beets.ui.commands import import_
+    from beets.ui.commands.import_.session import TerminalImportSession
+
+    return (
+        import_.TerminalImportSession is TerminalImportSession
+        and "TerminalImportSession" in import_.import_files.__code__.co_names
+    )
+
+
+try:
+    report["import_hook"] = import_hook()
 except BaseException:
     pass
 
