@@ -164,8 +164,8 @@ pub struct DownloadProgress {
     /// The server keeps this row's import job, so Retry import can resubmit it
     #[serde(default)]
     pub retryable: bool,
-    /// The kept job skipped for want of a close match, so the user can pick
-    /// one of its matches or import it as-is
+    /// The kept job has the matches of a skipped automatic import, so the
+    /// user can pick one or import it as-is
     #[serde(default)]
     pub can_choose_import: bool,
 }
@@ -251,6 +251,19 @@ pub enum ImportChoice {
     Candidate { data_source: String, id: String },
     /// A MusicBrainz link or ID as the user typed it.
     MusicBrainz(String),
+}
+
+/// What the server still keeps for a row after it refused a retry or a
+/// matches request. A refusal carries it as its details, so the row offers
+/// only what the server can still do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeptImport {
+    /// Nothing: the kept import is gone.
+    Gone,
+    /// The import, with no matches to pick from.
+    WithoutMatches,
+    /// The import and its matches. Only the choice sent was refused.
+    WithMatches,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

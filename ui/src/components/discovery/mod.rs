@@ -311,6 +311,7 @@ fn EngineReportView() -> Element {
                 text: format!("Failed to load reports: {e}"),
             }]),
         }
+        true
     });
 
     rsx! {

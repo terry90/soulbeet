@@ -5,6 +5,7 @@ use dioxus::prelude::*;
 use shared::download::{DownloadProgress, DownloadState, ImportChoice};
 
 use super::picker::{ChoicesLoader, MatchPicker};
+use super::Failure;
 use crate::{Disclosure, RowAction};
 
 /// How a row's state is shown: badge text and tooltip, plus row and badge classes.
@@ -92,9 +93,10 @@ fn reason(row: &DownloadProgress) -> Option<(&'static str, &str)> {
     row.error.as_deref().map(|note| (class, note))
 }
 
-/// Imports the row's item again the way the choice says. Resolves to whether
+/// Imports the row's item again the way the choice says. Resolves to Ok once
 /// the server accepted it.
-pub type ImportHandler = Callback<(String, ImportChoice), Pin<Box<dyn Future<Output = bool>>>>;
+pub type ImportHandler =
+    Callback<(String, ImportChoice), Pin<Box<dyn Future<Output = Result<(), Failure>>>>>;
 
 fn waiting_text(ahead: u32) -> String {
     format!("Waiting for library ({ahead} ahead)")
@@ -125,17 +127,26 @@ pub fn DownloadItem(
     // Set while an import request is in flight, and kept after an accepted one
     // until the row changes state, so a second click cannot race the first.
     let mut busy = use_signal(|| false);
-    use_effect(use_reactive(&file.state, move |_| busy.set(false)));
+    // Why the picker's last load or pick failed, shown in the picker.
+    let mut picker_notice = use_signal(|| None::<String>);
+    use_effect(use_reactive(&file.state, move |_| {
+        busy.set(false);
+        picker_notice.set(None);
+    }));
     let item = file.item.clone();
     let import = use_callback(move |choice: ImportChoice| {
         if busy() {
             return;
         }
         busy.set(true);
+        picker_notice.set(None);
         let item = item.clone();
         spawn(async move {
-            if !on_import.call((item, choice)).await {
+            if let Err(failure) = on_import.call((item, choice)).await {
                 busy.set(false);
+                if let Failure::InPicker(message) = failure {
+                    picker_notice.set(Some(message));
+                }
             }
         });
     });
@@ -250,6 +261,7 @@ pub fn DownloadItem(
             busy: busy(),
             on_load: on_load_choices,
             on_choose: import,
+            notice: picker_notice,
           }
         }
         if matches!(state, DownloadState::Importing) {

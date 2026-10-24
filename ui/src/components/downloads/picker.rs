@@ -4,11 +4,13 @@ use std::pin::Pin;
 use dioxus::prelude::*;
 use shared::download::{ImportChoice, MatchCandidate, MatchChoices, MatchKind};
 
+use super::Failure;
 use crate::{use_open_handler, Choice, ChoiceList, Disclosure, RowAction, TextInput};
 
-/// Resolves to the matches of the row's item, or None when the server did
-/// not give them.
-pub type ChoicesLoader = Callback<String, Pin<Box<dyn Future<Output = Option<MatchChoices>>>>>;
+/// Resolves to the matches of the row's item, or to where the failure to
+/// load them shows.
+pub type ChoicesLoader =
+    Callback<String, Pin<Box<dyn Future<Output = Result<MatchChoices, Failure>>>>>;
 
 /// "71.4%" for 714 per mille.
 fn percent(per_mille: u16) -> String {
@@ -94,6 +96,8 @@ pub struct MatchPickerProps {
     pub busy: bool,
     pub on_load: ChoicesLoader,
     pub on_choose: Callback<ImportChoice>,
+    /// Why the last load or pick failed. The picker sets it for loads.
+    pub notice: Signal<Option<String>>,
 }
 
 /// The matches beets weighed for a skipped import, loaded on open, and a
@@ -106,10 +110,26 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
     let mut typed = use_signal(String::new);
 
     let on_load = props.on_load;
+    let mut notice = props.notice;
     let item = props.item.clone();
     let load = use_open_handler(move || {
         let item = item.clone();
-        async move { found.set(on_load.call(item).await) }
+        async move {
+            match on_load.call(item).await {
+                Ok(choices) => {
+                    found.set(Some(choices));
+                    notice.set(None);
+                    true
+                }
+                // A failed reopen still shows the list it loaded before.
+                Err(Failure::InPicker(message)) => {
+                    notice.set(Some(message));
+                    found.read().is_some()
+                }
+                // The row took the picker away and says why.
+                Err(Failure::OnRow) => false,
+            }
+        }
     });
 
     let label = match &*found.read() {
@@ -119,70 +139,81 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
     let on_choose = props.on_choose;
 
     rsx! {
-        Disclosure { class: "mt-2", label, on_open: load,
-            if let Some(choices) = found() {
-                {
-                    let keys: Vec<(String, String)> = choices
-                        .candidates
-                        .iter()
-                        .map(|c| (c.data_source.clone(), c.id.clone()))
-                        .collect();
-                    let selected = picked.read().as_ref().and_then(|p| keys.iter().position(|k| k == p));
-                    let name_source = keys.windows(2).any(|pair| pair[0].0 != pair[1].0);
-                    let list: Vec<Choice> = choices
-                        .candidates
-                        .iter()
-                        .map(|c| choice(c, name_source))
-                        .collect();
-                    let choice = chosen(&choices.candidates, picked.read().as_ref(), &typed.read());
-                    let on_enter = choice.clone();
-                    let id_label = id_label(choices.kind);
-                    rsx! {
-                        div { class: "mt-2 space-y-2",
-                            if list.is_empty() {
-                                p { class: "text-xs font-mono text-gray-500", "beets found no matches." }
-                            } else {
-                                ChoiceList {
-                                    class: "max-h-80 overflow-y-auto",
-                                    name: "matches-{props.item}",
-                                    label: "Matches beets found",
-                                    choices: list,
-                                    selected,
-                                    on_select: move |i: usize| {
-                                        picked.set(keys.get(i).cloned());
-                                        typed.set(String::new());
+        div { class: "mt-2",
+            Disclosure { label, on_open: load,
+                if let Some(choices) = found() {
+                    {
+                        let keys: Vec<(String, String)> = choices
+                            .candidates
+                            .iter()
+                            .map(|c| (c.data_source.clone(), c.id.clone()))
+                            .collect();
+                        let selected = picked.read().as_ref().and_then(|p| keys.iter().position(|k| k == p));
+                        let name_source = keys.windows(2).any(|pair| pair[0].0 != pair[1].0);
+                        let list: Vec<Choice> = choices
+                            .candidates
+                            .iter()
+                            .map(|c| choice(c, name_source))
+                            .collect();
+                        let choice = chosen(&choices.candidates, picked.read().as_ref(), &typed.read());
+                        let on_enter = choice.clone();
+                        let id_label = id_label(choices.kind);
+                        rsx! {
+                            div { class: "mt-2 space-y-2",
+                                if list.is_empty() {
+                                    p { class: "text-xs font-mono text-gray-500", "beets found no matches." }
+                                } else {
+                                    ChoiceList {
+                                        class: "max-h-80 overflow-y-auto",
+                                        name: "matches-{props.item}",
+                                        label: "Matches beets found",
+                                        choices: list,
+                                        selected,
+                                        on_select: move |i: usize| {
+                                            picked.set(keys.get(i).cloned());
+                                            typed.set(String::new());
+                                        },
+                                    }
+                                }
+                                TextInput {
+                                    class: "text-sm placeholder-gray-600",
+                                    placeholder: id_label,
+                                    aria_label: id_label,
+                                    value: typed(),
+                                    oninput: move |text: String| {
+                                        if !text.trim().is_empty() {
+                                            picked.set(None);
+                                        }
+                                        typed.set(text);
+                                    },
+                                    on_enter: move |_| {
+                                        if let Some(choice) = on_enter.clone() {
+                                            on_choose.call(choice);
+                                        }
                                     },
                                 }
-                            }
-                            TextInput {
-                                class: "text-sm placeholder-gray-600",
-                                placeholder: id_label,
-                                aria_label: id_label,
-                                value: typed(),
-                                oninput: move |text: String| {
-                                    if !text.trim().is_empty() {
-                                        picked.set(None);
-                                    }
-                                    typed.set(text);
-                                },
-                                on_enter: move |_| {
-                                    if let Some(choice) = on_enter.clone() {
-                                        on_choose.call(choice);
-                                    }
-                                },
-                            }
-                            RowAction {
-                                busy: props.busy,
-                                disabled: choice.is_none(),
-                                onclick: move |_| {
-                                    if let Some(choice) = choice.clone() {
-                                        on_choose.call(choice);
-                                    }
-                                },
-                                "Import with this match"
+                                RowAction {
+                                    busy: props.busy,
+                                    disabled: choice.is_none(),
+                                    onclick: move |_| {
+                                        if let Some(choice) = choice.clone() {
+                                            on_choose.call(choice);
+                                        }
+                                    },
+                                    "Import with this match"
+                                }
                             }
                         }
                     }
+                }
+            }
+            // Always present, so a screen reader announces the text it gets.
+            p {
+                class: if notice.read().is_some() { "mt-2 text-xs font-mono text-red-400 break-words" },
+                role: "status",
+                aria_live: "polite",
+                if let Some(text) = notice() {
+                    "{text}"
                 }
             }
         }
@@ -209,6 +240,38 @@ mod tests {
             length_secs: Some(222),
             tracks: None,
         }
+    }
+
+    fn render_picker(notice: Option<&'static str>) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |notice: Option<&'static str>| {
+                let notice = use_signal(|| notice.map(str::to_string));
+                let on_load: ChoicesLoader = Callback::new(|_: String| {
+                    Box::pin(async { Err(Failure::OnRow) })
+                        as Pin<Box<dyn Future<Output = Result<MatchChoices, Failure>>>>
+                });
+                rsx! {
+                    MatchPicker { item: "a", busy: false, on_load, on_choose: |_| {}, notice }
+                }
+            },
+            notice,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_notice_is_a_live_region_present_before_it_has_text() {
+        let quiet = render_picker(None);
+        assert!(quiet.contains("role=\"status\""), "{quiet}");
+        assert!(quiet.contains("aria-live=\"polite\""), "{quiet}");
+
+        let text = "Could not reach the server. Check your connection.";
+        let told = render_picker(Some(text));
+        assert!(told.contains(text), "{told}");
+        // Closed, the picker shows only its toggle and the notice.
+        assert!(told.contains("Show matches"), "{told}");
+        assert!(!told.contains("Import with this match"), "{told}");
     }
 
     #[test]

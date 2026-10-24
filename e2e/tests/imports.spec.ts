@@ -299,9 +299,11 @@ test('a typed MusicBrainz recording link imports with it, and a release link is 
   const asked = (await mbRequests()).length;
   await field.fill(`https://musicbrainz.org/release/${thimbleHymn.releaseMbid}`);
   await importButton.click();
-  await expect(
-    row.getByText('Track imports need a MusicBrainz recording, not a release', { exact: true }),
-  ).toBeVisible();
+  // The refusal shows in the picker, and the skip reason stays.
+  await expect(row.getByRole('status')).toHaveText(
+    'Track imports need a MusicBrainz recording, not a release',
+  );
+  await expect(row.getByText(/^No close match/)).toBeVisible();
   await expect(row.getByText('SKIP', { exact: true })).toBeVisible();
   expect(await mbPathsSince(asked)).toEqual([]);
 

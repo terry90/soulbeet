@@ -2,10 +2,12 @@
 //! runs, refusing anything the kept job does not allow.
 
 use super::ImportJob;
-use shared::download::ImportChoice;
+use shared::download::{ImportChoice, KeptImport};
 use soulbeet::{DriverChoice, ImportMode};
 
-pub(super) const NO_CHOICES: &str = "This import has no matches to pick from";
+const NOTHING_TO_RETRY: &str = "Nothing to retry";
+const FILES_GONE: &str = "The kept files are gone";
+const NO_CHOICES: &str = "This import has no matches to pick from";
 const UNKNOWN_CANDIDATE: &str = "That match is not one beets found for this import";
 const NOT_AN_ID: &str = "That is not a MusicBrainz link or ID";
 
@@ -31,10 +33,49 @@ const MUSICBRAINZ_ENTITIES: [&str; 15] = [
     "work",
 ];
 
+/// A retry or matches request the server refused: the text for the user and
+/// what stays kept for the row, which the client applies as is. Every such
+/// refusal is built here, so each text says one thing about what is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub message: String,
+    pub kept: KeptImport,
+}
+
+impl Refusal {
+    fn new(message: impl Into<String>, kept: KeptImport) -> Self {
+        Refusal {
+            message: message.into(),
+            kept,
+        }
+    }
+
+    /// The row has no kept job: none was kept, it was lost on restart or
+    /// dropped as the oldest, or a retry from another row of it took it.
+    pub(super) fn nothing_to_retry() -> Self {
+        Self::new(NOTHING_TO_RETRY, KeptImport::Gone)
+    }
+
+    /// The kept files were deleted. The retry took the job, so it is gone too.
+    pub(super) fn files_gone() -> Self {
+        Self::new(FILES_GONE, KeptImport::Gone)
+    }
+
+    /// The job is kept, but no automatic run of it left matches to pick from.
+    pub(super) fn no_choices() -> Self {
+        Self::new(NO_CHOICES, KeptImport::WithoutMatches)
+    }
+
+    /// The job and its matches stay kept; only this choice cannot be imported.
+    fn bad_choice(message: impl Into<String>) -> Self {
+        Self::new(message, KeptImport::WithMatches)
+    }
+}
+
 /// The importer's choice for `choice` on `job`. Anything but Auto needs the
 /// matches of a skipped automatic run, and a listed match must be one of them.
-pub(super) fn resolve(choice: &ImportChoice, job: &ImportJob) -> Result<DriverChoice, String> {
-    let choices = || job.choices.as_deref().ok_or_else(|| NO_CHOICES.to_string());
+pub(super) fn resolve(choice: &ImportChoice, job: &ImportJob) -> Result<DriverChoice, Refusal> {
+    let choices = || job.choices.as_deref().ok_or_else(Refusal::no_choices);
     match choice {
         ImportChoice::Auto => Ok(DriverChoice::Auto),
         ImportChoice::AsIs => choices().map(|_| DriverChoice::AsIs),
@@ -48,14 +89,14 @@ pub(super) fn resolve(choice: &ImportChoice, job: &ImportJob) -> Result<DriverCh
                     data_source: data_source.clone(),
                     id: id.clone(),
                 }),
-                false => Err(UNKNOWN_CANDIDATE.to_string()),
+                false => Err(Refusal::bad_choice(UNKNOWN_CANDIDATE)),
             }
         }
         ImportChoice::MusicBrainz(text) => {
             choices()?;
             Ok(DriverChoice::Pick {
                 data_source: MUSICBRAINZ.to_string(),
-                id: musicbrainz_id(text, job.mode)?,
+                id: musicbrainz_id(text, job.mode).map_err(Refusal::bad_choice)?,
             })
         }
     }
@@ -163,7 +204,7 @@ mod tests {
         ] {
             assert_eq!(
                 resolve(&choice, &plain),
-                Err(NO_CHOICES.into()),
+                Err(Refusal::no_choices()),
                 "{choice:?}"
             );
         }
@@ -194,8 +235,9 @@ mod tests {
         assert_eq!(choose("FakeSrc", "a"), Ok(pick("FakeSrc", "a")));
         assert_eq!(choose("OtherSrc", "b"), Ok(pick("OtherSrc", "b")));
         // Same id under another source, and an id nobody listed.
-        assert_eq!(choose("OtherSrc", "a"), Err(UNKNOWN_CANDIDATE.into()));
-        assert_eq!(choose("FakeSrc", "c"), Err(UNKNOWN_CANDIDATE.into()));
+        let unknown = Refusal::bad_choice(UNKNOWN_CANDIDATE);
+        assert_eq!(choose("OtherSrc", "a"), Err(unknown.clone()));
+        assert_eq!(choose("FakeSrc", "c"), Err(unknown));
     }
 
     #[test]
@@ -310,7 +352,38 @@ mod tests {
                 &ImportChoice::MusicBrainz(format!("https://musicbrainz.org/recording/{MBID}")),
                 &kept
             ),
-            Err("Album imports need a MusicBrainz release, not a recording".into())
+            Err(Refusal::bad_choice(
+                "Album imports need a MusicBrainz release, not a recording"
+            ))
         );
+    }
+
+    #[test]
+    fn each_refusal_says_what_stays_kept() {
+        let refusals = [
+            (
+                Refusal::nothing_to_retry(),
+                "Nothing to retry",
+                KeptImport::Gone,
+            ),
+            (
+                Refusal::files_gone(),
+                "The kept files are gone",
+                KeptImport::Gone,
+            ),
+            (
+                Refusal::no_choices(),
+                "This import has no matches to pick from",
+                KeptImport::WithoutMatches,
+            ),
+            (
+                Refusal::bad_choice(NOT_AN_ID),
+                "That is not a MusicBrainz link or ID",
+                KeptImport::WithMatches,
+            ),
+        ];
+        for (refusal, message, kept) in refusals {
+            assert_eq!(refusal, Refusal::new(message, kept));
+        }
     }
 }

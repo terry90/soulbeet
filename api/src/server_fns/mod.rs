@@ -42,6 +42,19 @@ pub fn refusal_error<E: std::fmt::Display>(e: E) -> ServerFnError {
     }
 }
 
+/// A refusal that also tells the client, as `details`, what it changed on
+/// the server, so the client can follow it instead of guessing.
+pub fn refusal_error_with<E: std::fmt::Display, D: serde::Serialize>(
+    e: E,
+    details: D,
+) -> ServerFnError {
+    ServerFnError::ServerError {
+        message: e.to_string(),
+        code: REFUSAL_CODE,
+        details: Some(serde_json::json!(details)),
+    }
+}
+
 pub fn unauthorized_error<E: std::fmt::Display>(e: E) -> ServerFnError {
     ServerFnError::ServerError {
         message: e.to_string(),

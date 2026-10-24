@@ -3,15 +3,15 @@ use std::pin::Pin;
 
 use dioxus::prelude::*;
 
-/// Awaited before the body opens.
-pub type OpenHandler = Callback<(), Pin<Box<dyn Future<Output = ()>>>>;
+/// Awaited before the body opens. Resolves to whether to open it.
+pub type OpenHandler = Callback<(), Pin<Box<dyn Future<Output = bool>>>>;
 
 /// An `on_open` handler that runs `load` on every open.
 pub fn use_open_handler<F>(mut load: impl FnMut() -> F + 'static) -> OpenHandler
 where
-    F: Future<Output = ()> + 'static,
+    F: Future<Output = bool> + 'static,
 {
-    use_callback(move |()| Box::pin(load()) as Pin<Box<dyn Future<Output = ()>>>)
+    use_callback(move |()| Box::pin(load()) as Pin<Box<dyn Future<Output = bool>>>)
 }
 
 #[derive(Props, Clone, PartialEq)]
@@ -20,7 +20,7 @@ pub struct DisclosureProps {
     #[props(into)]
     pub label: String,
     /// Runs on every open; the toggle reads "Loading..." and is disabled
-    /// until it finishes.
+    /// until it finishes, and the body opens only if it says so.
     #[props(default)]
     pub on_open: Option<OpenHandler>,
     #[props(default, into)]
@@ -44,9 +44,9 @@ pub fn Disclosure(props: DisclosureProps) -> Element {
             Some(load) => {
                 loading.set(true);
                 spawn(async move {
-                    load.call(()).await;
+                    let opens = load.call(()).await;
                     loading.set(false);
-                    open.set(true);
+                    open.set(opens);
                 });
             }
             None => open.set(true),

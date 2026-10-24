@@ -4,14 +4,14 @@ use std::pin::Pin;
 
 use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
-use shared::download::{DownloadProgress, DownloadState, ImportChoice, MatchChoices};
+use shared::download::{DownloadProgress, DownloadState, ImportChoice, KeptImport, MatchChoices};
 
 mod item;
 mod picker;
 use api::CancelDownloadRequest;
 use item::DownloadItem;
 
-use crate::{friendly_error, is_refusal};
+use crate::friendly_error;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct DownloadsProps {
@@ -88,35 +88,30 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
         });
     };
 
-    let mut fail = move |item: &str, error: &ServerFnError, gone: Gone| {
-        if let Some(entry) = downloads_signal.write().get_mut(item) {
-            show_failure(entry, error, gone);
-        }
-    };
+    let mut fail =
+        move |item: &str, error: &ServerFnError, from_picker: bool| match downloads_signal
+            .write()
+            .get_mut(item)
+        {
+            Some(entry) => show_failure(entry, error, from_picker),
+            None => Failure::OnRow,
+        };
     let import_again = use_callback(
-        move |(item, choice): (String, ImportChoice)| -> Pin<Box<dyn Future<Output = bool>>> {
+        move |(item, choice): (String, ImportChoice)| -> Pin<Box<dyn Future<Output = Result<(), Failure>>>> {
             Box::pin(async move {
-                let gone = gone_on_refusal(&choice);
-                match api::retry_import(item.clone(), choice).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        fail(&item, &e, gone);
-                        false
-                    }
-                }
+                let from_picker = sent_by_picker(&choice);
+                api::retry_import(item.clone(), choice)
+                    .await
+                    .map_err(|e| fail(&item, &e, from_picker))
             })
         },
     );
     let load_choices = use_callback(
-        move |item: String| -> Pin<Box<dyn Future<Output = Option<MatchChoices>>>> {
+        move |item: String| -> Pin<Box<dyn Future<Output = Result<MatchChoices, Failure>>>> {
             Box::pin(async move {
-                match api::import_choices(item.clone()).await {
-                    Ok(choices) => Some(choices),
-                    Err(e) => {
-                        fail(&item, &e, Gone::Matches);
-                        None
-                    }
-                }
+                api::import_choices(item.clone())
+                    .await
+                    .map_err(|e| fail(&item, &e, true))
             })
         },
     );
@@ -199,40 +194,54 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
     }
 }
 
-/// What a refused request says the server no longer keeps for its row.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Gone {
-    /// The kept import, and with it the matches.
-    Job,
-    Matches,
-    Nothing,
+/// Where a failed request from a row shows why.
+#[derive(Debug, Clone, PartialEq)]
+enum Failure {
+    /// On the row's reason line.
+    OnRow,
+    /// In the picker that sent it, which stays.
+    InPicker(String),
 }
 
-/// A refused retry means nothing is kept, and a refused as-is the same as no
-/// matches. A refused pick says what to change, so the picker stays.
-fn gone_on_refusal(choice: &ImportChoice) -> Gone {
-    match choice {
-        ImportChoice::Auto => Gone::Job,
-        ImportChoice::AsIs => Gone::Matches,
-        ImportChoice::Candidate { .. } | ImportChoice::MusicBrainz(_) => Gone::Nothing,
+/// Picks and match loads come from the picker; Retry and as-is from the row.
+fn sent_by_picker(choice: &ImportChoice) -> bool {
+    matches!(
+        choice,
+        ImportChoice::Candidate { .. } | ImportChoice::MusicBrainz(_)
+    )
+}
+
+/// What a refusal says the server still keeps for the row. None when the
+/// request was not refused, or the refusal does not say.
+fn kept_after(error: &ServerFnError) -> Option<KeptImport> {
+    match error {
+        ServerFnError::ServerError {
+            code: api::REFUSAL_CODE,
+            details: Some(details),
+            ..
+        } => serde_json::from_value(details.clone()).ok(),
+        _ => None,
     }
 }
 
-/// Puts a failed request's text on its row and, when the server refused it,
-/// takes away what `gone` names.
-fn show_failure(row: &mut DownloadProgress, error: &ServerFnError, gone: Gone) {
-    row.error = Some(friendly_error(error));
-    if !is_refusal(error) {
-        return;
-    }
-    match gone {
-        Gone::Job => {
+/// Takes away what the server says it no longer keeps for the row, and
+/// puts why on the reason line, unless the picker sent the request and
+/// stays, which then shows it so the skip reason stays readable.
+fn show_failure(row: &mut DownloadProgress, error: &ServerFnError, from_picker: bool) -> Failure {
+    match kept_after(error) {
+        Some(KeptImport::Gone) => {
             row.retryable = false;
             row.can_choose_import = false;
         }
-        Gone::Matches => row.can_choose_import = false,
-        Gone::Nothing => {}
+        Some(KeptImport::WithoutMatches) => row.can_choose_import = false,
+        Some(KeptImport::WithMatches) | None => {}
     }
+    let message = friendly_error(error);
+    if from_picker && row.retryable && row.can_choose_import {
+        return Failure::InPicker(message);
+    }
+    row.error = Some(message);
+    Failure::OnRow
 }
 
 /// Rows by state, then by item so rows with the same state keep their place.
@@ -282,67 +291,96 @@ mod tests {
         }
     }
 
-    fn refusal(message: &str) -> ServerFnError {
-        ServerFnError::ServerError {
-            message: message.to_string(),
-            code: api::REFUSAL_CODE,
-            details: None,
+    /// A refusal as the client gets it: built by the server's helper and
+    /// sent through JSON.
+    fn refused(message: &str, kept: KeptImport) -> ServerFnError {
+        let sent = serde_json::to_value(api::refusal_error_with(message, kept)).unwrap();
+        serde_json::from_value(sent).unwrap()
+    }
+
+    fn every_choice() -> [ImportChoice; 4] {
+        [
+            ImportChoice::Auto,
+            ImportChoice::AsIs,
+            ImportChoice::Candidate {
+                data_source: "MusicBrainz".into(),
+                id: "r1".into(),
+            },
+            ImportChoice::MusicBrainz("https://musicbrainz.org/release/x".into()),
+        ]
+    }
+
+    fn after(choice: &ImportChoice, error: &ServerFnError) -> (DownloadProgress, Failure) {
+        let mut row = kept_skip();
+        let failure = show_failure(&mut row, error, sent_by_picker(choice));
+        (row, failure)
+    }
+
+    #[test]
+    fn the_server_says_what_a_refusal_keeps() {
+        let kept = KeptImport::WithoutMatches;
+        assert_eq!(kept_after(&refused("x", kept)), Some(kept));
+        let plain = api::refusal_error("Folder not found");
+        assert_eq!(kept_after(&plain), None);
+    }
+
+    #[test]
+    fn a_refusal_that_dropped_the_job_takes_every_action_away() {
+        for message in ["Nothing to retry", "The kept files are gone"] {
+            for choice in every_choice() {
+                let (row, failure) = after(&choice, &refused(message, KeptImport::Gone));
+                assert_eq!(failure, Failure::OnRow, "{choice:?}");
+                assert_eq!(row.error.as_deref(), Some(message));
+                assert!(!row.retryable && !row.can_choose_import, "{choice:?}");
+            }
         }
     }
 
-    fn after(choice: ImportChoice, error: &ServerFnError) -> DownloadProgress {
+    #[test]
+    fn a_refusal_without_matches_keeps_only_retry() {
+        let message = "This import has no matches to pick from";
+        for choice in every_choice() {
+            let (row, failure) = after(&choice, &refused(message, KeptImport::WithoutMatches));
+            assert_eq!(failure, Failure::OnRow, "{choice:?}");
+            assert_eq!(row.error.as_deref(), Some(message));
+            assert!(row.retryable && !row.can_choose_import, "{choice:?}");
+        }
+        // A match load refused the same way takes the picker too.
         let mut row = kept_skip();
-        show_failure(&mut row, error, gone_on_refusal(&choice));
-        row
-    }
-
-    #[test]
-    fn a_refused_retry_takes_every_action_away() {
-        let row = after(ImportChoice::Auto, &refusal("Nothing to retry"));
-        assert_eq!(row.error.as_deref(), Some("Nothing to retry"));
-        assert!(!row.retryable && !row.can_choose_import);
-    }
-
-    #[test]
-    fn a_refused_as_is_takes_the_matches_but_keeps_retry() {
-        let row = after(
-            ImportChoice::AsIs,
-            &refusal("This import has no matches to pick from"),
-        );
-        assert_eq!(
-            row.error.as_deref(),
-            Some("This import has no matches to pick from")
+        show_failure(
+            &mut row,
+            &refused(message, KeptImport::WithoutMatches),
+            true,
         );
         assert!(row.retryable && !row.can_choose_import);
     }
 
     #[test]
-    fn a_refused_pick_keeps_the_picker() {
+    fn a_refused_pick_keeps_every_action_and_shows_why_in_the_picker() {
         let text = "Track imports need a MusicBrainz recording, not a release";
-        for choice in [
-            ImportChoice::MusicBrainz("https://musicbrainz.org/release/x".into()),
-            ImportChoice::Candidate {
-                data_source: "MusicBrainz".into(),
-                id: "r1".into(),
-            },
-        ] {
-            let row = after(choice, &refusal(text));
-            assert_eq!(row.error.as_deref(), Some(text));
+        for choice in every_choice().into_iter().filter(sent_by_picker) {
+            let (row, failure) = after(&choice, &refused(text, KeptImport::WithMatches));
+            assert_eq!(failure, Failure::InPicker(text.into()), "{choice:?}");
+            assert_eq!(row.error.as_deref(), Some("No close match (2 candidates)"));
             assert!(row.retryable && row.can_choose_import);
         }
     }
 
     #[test]
-    fn an_unreachable_server_changes_only_the_text() {
+    fn an_unreachable_server_changes_no_action() {
         let error = ServerFnError::Request(RequestError::Request("connection refused".into()));
-        let row = after(ImportChoice::Auto, &error);
-        assert_eq!(
-            row.error.as_deref(),
-            Some("Could not reach the server. Check your connection.")
-        );
+        let text = "Could not reach the server. Check your connection.";
+        let (row, failure) = after(&ImportChoice::Auto, &error);
+        assert_eq!(failure, Failure::OnRow);
+        assert_eq!(row.error.as_deref(), Some(text));
         assert!(row.retryable && row.can_choose_import);
+
+        // A failed pick or match load keeps the skip reason.
         let mut row = kept_skip();
-        show_failure(&mut row, &refusal("Nothing to retry"), Gone::Matches);
-        assert!(row.retryable && !row.can_choose_import);
+        assert_eq!(
+            show_failure(&mut row, &error, true),
+            Failure::InPicker(text.into())
+        );
+        assert_eq!(row, kept_skip());
     }
 }

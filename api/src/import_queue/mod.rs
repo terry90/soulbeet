@@ -8,6 +8,7 @@ mod rows;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use choice::Refusal;
 pub use retry::{forget_retries, import_choices_for, retry_import_for};
 
 use async_trait::async_trait;
