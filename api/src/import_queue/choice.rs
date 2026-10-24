@@ -12,6 +12,25 @@ const NOT_AN_ID: &str = "That is not a MusicBrainz link or ID";
 /// beets' name for its MusicBrainz source.
 const MUSICBRAINZ: &str = "MusicBrainz";
 
+/// The entities of musicbrainz.org links, by their path segment.
+const MUSICBRAINZ_ENTITIES: [&str; 15] = [
+    "area",
+    "artist",
+    "collection",
+    "event",
+    "genre",
+    "instrument",
+    "label",
+    "place",
+    "recording",
+    "release",
+    "release-group",
+    "series",
+    "track",
+    "url",
+    "work",
+];
+
 /// The importer's choice for `choice` on `job`. Anything but Auto needs the
 /// matches of a skipped automatic run, and a listed match must be one of them.
 pub(super) fn resolve(choice: &ImportChoice, job: &ImportJob) -> Result<DriverChoice, String> {
@@ -56,12 +75,16 @@ fn musicbrainz_id(text: &str, mode: ImportMode) -> Result<String, String> {
     let path = link.split(['?', '#']).next().unwrap_or_default();
     let mut parts = path.split('/');
     let host = parts.next().unwrap_or_default();
+    let host = match host.split_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        Some(_) => return Err(NOT_AN_ID.to_string()),
+        None => host,
+    };
     let on_musicbrainz = host == "musicbrainz.org" || host.ends_with(".musicbrainz.org");
     let (Some(entity), Some(id)) = (parts.next(), parts.next()) else {
         return Err(NOT_AN_ID.to_string());
     };
-    let is_entity =
-        !entity.is_empty() && entity.chars().all(|c| c.is_ascii_lowercase() || c == '-');
+    let is_entity = MUSICBRAINZ_ENTITIES.contains(&entity);
     let id = match (on_musicbrainz && is_entity, mbid(id)) {
         (true, Some(id)) => id,
         _ => return Err(NOT_AN_ID.to_string()),
@@ -71,8 +94,8 @@ fn musicbrainz_id(text: &str, mode: ImportMode) -> Result<String, String> {
         ImportMode::Singleton => ("Track", "recording"),
     };
     if entity != needed {
-        // MusicBrainz entity names that start with a vowel sound: area,
-        // artist, event, instrument.
+        // The entity names that start with a vowel sound: area, artist,
+        // event, instrument.
         let article = match entity.starts_with(['a', 'e', 'i', 'o']) {
             true => "an",
             false => "a",
@@ -195,6 +218,10 @@ mod tests {
                 format!("https://musicbrainz.org/release/{MBID}/disc/1"),
                 Album,
             ),
+            (
+                format!("https://musicbrainz.org:443/recording/{MBID}"),
+                Singleton,
+            ),
         ];
         for (text, mode) in ok {
             assert_eq!(musicbrainz_id(&text, mode), Ok(MBID.to_string()), "{text}");
@@ -236,6 +263,11 @@ mod tests {
                 Album,
                 "Album imports need a MusicBrainz release, not an artist",
             ),
+            (
+                "url",
+                Singleton,
+                "Track imports need a MusicBrainz recording, not a url",
+            ),
         ];
         for (entity, mode, text) in refused {
             let link = format!("https://musicbrainz.org/{entity}/{MBID}");
@@ -255,6 +287,12 @@ mod tests {
             "https://musicbrainz.org/recording/nope".into(),
             format!("https://musicbrainz.org/{MBID}"),
             format!("https://musicbrainz.org/Recording!/{MBID}"),
+            // Not a MusicBrainz entity.
+            format!("https://musicbrainz.org/foo/{MBID}"),
+            format!("https://musicbrainz.org/doc/{MBID}"),
+            format!("https://musicbrainz.org:/recording/{MBID}"),
+            format!("https://musicbrainz.org:https/recording/{MBID}"),
+            format!("https://example.com:443/recording/{MBID}"),
         ] {
             assert_eq!(
                 musicbrainz_id(&text, ImportMode::Singleton),
