@@ -223,19 +223,13 @@ impl MusicImporter for BeetsImporter {
             }
         };
         drop(run_log);
-        let report = match tokio::fs::read_to_string(&report_file.0).await {
-            Ok(text) => Report::parse(&text).map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
+        let report = read_report(&run.end, &report_file.0).await;
         drop(report_file);
 
         let result = classifier.finish(&run.end, &s.limits, &entries, run.tail);
         let result = match report {
-            Ok(report) => report.apply(result, mode, choice),
-            Err(e) => {
-                warn!("No usable report from the beets import, judging it by its output: {e}");
-                result
-            }
+            Some(report) => report.apply(result, mode, choice),
+            None => result,
         };
         info!(
             "beets import into {} {} after {:.1}s: {result}",
@@ -330,6 +324,24 @@ impl MusicImporter for BeetsImporter {
             Some(stored) => fingerprint(&self.settings.config, report.as_ref()).await != stored,
         }
     }
+}
+
+/// The driver's report of a run that exited on its own. A driver that was
+/// killed or never started writes none, so only a missing or invalid report
+/// after an exit is worth a warning.
+async fn read_report(end: &RunEnd, path: &Path) -> Option<Report> {
+    if !matches!(end, RunEnd::Exited(status) if status.code().is_some()) {
+        return None;
+    }
+    let report = match tokio::fs::read_to_string(path).await {
+        Ok(text) => Report::parse(&text).map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    report
+        .inspect_err(|e| {
+            warn!("No usable report from the beets import, judging it by its output: {e}")
+        })
+        .ok()
 }
 
 #[cfg(test)]
@@ -736,6 +748,34 @@ mod tests {
                 .await;
             assert_eq!(result.outcome, no_match, "{report:?}");
             assert_eq!(result.choices, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_run_that_exited_has_its_report_read() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
+        tokio::fs::write(
+            &path,
+            r#"{"tasks": [], "pick_missing": false, "refused": null}"#,
+        )
+        .await
+        .unwrap();
+
+        let exited = |raw| RunEnd::Exited(std::process::ExitStatus::from_raw(raw));
+        // Exit code 1, as after a beets crash, still comes with a report.
+        for code in [0, 1] {
+            assert!(read_report(&exited(code << 8), &path).await.is_some());
+        }
+        for end in [
+            // Killed by SIGKILL.
+            exited(9),
+            RunEnd::Idle,
+            RunEnd::Total,
+            RunEnd::SpawnFailed(std::io::Error::other("no python")),
+        ] {
+            assert!(read_report(&end, &path).await.is_none(), "{end:?}");
         }
     }
 
