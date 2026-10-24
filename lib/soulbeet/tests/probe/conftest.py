@@ -6,10 +6,7 @@ from pathlib import Path
 
 import pytest
 
-HERE = Path(__file__).resolve().parent
-CONFIGS = HERE / "configs"
-CRATE = HERE.parents[1]
-REPO = CRATE.parents[1]
+CRATE = Path(__file__).resolve().parents[2]
 PROBE_SRC = (CRATE / "src" / "beets" / "probe.py").read_text()
 
 

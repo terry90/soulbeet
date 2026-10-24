@@ -47,7 +47,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      # The image interpreter is 3.11, and probe.py needs -P (3.11+).
+      # The image interpreter is 3.11, and probe.py and import.py need -P (3.11+).
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -56,5 +56,5 @@ jobs:
       - name: Install beets and pytest
         run: python -m pip install -c build/requirements-beets.txt "beets[chroma,discogs]" requests musicbrainzngs pytest==8.3.5
 
-      - name: Test the beets config probe
-        run: python -m pytest -q lib/soulbeet/tests/probe
+      - name: Test the beets config probe and import driver
+        run: python -m pytest -q lib/soulbeet/tests/probe lib/soulbeet/tests/import

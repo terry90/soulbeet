@@ -1,11 +1,15 @@
 import os
 import shlex
+from pathlib import Path
 
 import pytest
 import yaml
 
-from conftest import CONFIGS, HERE, REPO
-
+# Defined here, not imported from conftest: with tests/import in the same run,
+# that module name is ambiguous.
+HERE = Path(__file__).resolve().parent
+CONFIGS = HERE / "configs"
+REPO = HERE.parents[3]
 REPO_PLUGINS = REPO / "beets_plugins"
 
 

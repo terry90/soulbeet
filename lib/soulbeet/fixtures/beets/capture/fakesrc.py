@@ -7,12 +7,18 @@ FAKESRC_MODE picks what every lookup returns:
   error   raises, so beets logs "Error in 'FakeSrc.<method>': ..."
 An artist containing "Weakband" is always weak, so one run can mix outcomes.
 FAKESRC_CRASH=1 adds an import stage that raises, an uncaught pipeline crash.
+
+Lookups by id (`-S`) serve the weak candidates in any mode. Without the items
+to build from, a weak album has LOOKUP_TRACKS tracks and nothing has a length.
 """
 
 import os
 
 from beets.autotag.hooks import AlbumInfo, TrackInfo
 from beets.metadata_plugins import MetadataSourcePlugin
+
+WEAK_COUNT = 3
+LOOKUP_TRACKS = 2
 
 
 def _mode(artist):
@@ -21,21 +27,68 @@ def _mode(artist):
     return os.environ.get("FAKESRC_MODE", "none")
 
 
+def _album_track(i, total, title, artist, length, track_id):
+    return TrackInfo(
+        title=title,
+        track_id=track_id,
+        artist=artist,
+        length=length,
+        index=i,
+        medium=1,
+        medium_index=i,
+        medium_total=total,
+        data_source="FakeSrc",
+    )
+
+
+def _weak_album_track(i, total, length):
+    return _album_track(
+        i, total, f"Totally Different {i}", "Some Other Artist", length, f"fake-t-{i}g"
+    )
+
+
 def _tracks(items, garble):
+    total = len(items)
+    if garble:
+        return [
+            _weak_album_track(i, total, it.length + 200)
+            for i, it in enumerate(items, 1)
+        ]
     return [
-        TrackInfo(
-            title=f"Totally Different {i}" if garble else it.title,
-            track_id=f"fake-t-{i}{'g' if garble else ''}",
-            artist="Some Other Artist" if garble else it.artist,
-            length=it.length + (200 if garble else 0),
-            index=i,
-            medium=1,
-            medium_index=i,
-            medium_total=len(items),
-            data_source="FakeSrc",
-        )
+        _album_track(i, total, it.title, it.artist, it.length, f"fake-t-{i}")
         for i, it in enumerate(items, 1)
     ]
+
+
+def _weak_album(k, tracks):
+    return AlbumInfo(
+        tracks,
+        album=f"Other Album {k}",
+        album_id=f"fake-a-w{k}",
+        artist="Some Other Artist",
+        artist_id="fake-ar-2",
+        data_source="FakeSrc",
+        mediums=1,
+    )
+
+
+def _weak_track(k, length):
+    return TrackInfo(
+        title=f"Totally Different {k}",
+        artist="Some Other Artist",
+        track_id=f"fake-t-w{k}",
+        length=length,
+        data_source="FakeSrc",
+    )
+
+
+def _weak_index(id_, prefix):
+    """k for an id `<prefix>k` naming one of the weak candidates, else None."""
+    if id_.startswith(prefix) and id_[len(prefix):].isdigit():
+        k = int(id_[len(prefix):])
+        if k < WEAK_COUNT:
+            return k
+    return None
 
 
 class FakeSrcPlugin(MetadataSourcePlugin):
@@ -49,10 +102,18 @@ class FakeSrcPlugin(MetadataSourcePlugin):
             self.import_stages = [crash]
 
     def album_for_id(self, album_id):
-        return None
+        k = _weak_index(album_id, "fake-a-w")
+        if k is None:
+            return None
+        tracks = [
+            _weak_album_track(i, LOOKUP_TRACKS, None)
+            for i in range(1, LOOKUP_TRACKS + 1)
+        ]
+        return _weak_album(k, tracks)
 
     def track_for_id(self, track_id):
-        return None
+        k = _weak_index(track_id, "fake-t-w")
+        return None if k is None else _weak_track(k, None)
 
     def candidates(self, items, artist, album, va_likely):
         mode = _mode(artist)
@@ -71,18 +132,7 @@ class FakeSrcPlugin(MetadataSourcePlugin):
                 )
             ]
         if mode == "weak":
-            return [
-                AlbumInfo(
-                    _tracks(items, True),
-                    album=f"Other Album {k}",
-                    album_id=f"fake-a-w{k}",
-                    artist="Some Other Artist",
-                    artist_id="fake-ar-2",
-                    data_source="FakeSrc",
-                    mediums=1,
-                )
-                for k in range(3)
-            ]
+            return [_weak_album(k, _tracks(items, True)) for k in range(WEAK_COUNT)]
         return []
 
     def item_candidates(self, item, artist, title):
@@ -100,14 +150,5 @@ class FakeSrcPlugin(MetadataSourcePlugin):
                 )
             ]
         if mode == "weak":
-            return [
-                TrackInfo(
-                    title=f"Totally Different {k}",
-                    artist="Some Other Artist",
-                    track_id=f"fake-t-w{k}",
-                    length=item.length + 200,
-                    data_source="FakeSrc",
-                )
-                for k in range(3)
-            ]
+            return [_weak_track(k, item.length + 200) for k in range(WEAK_COUNT)]
         return []
