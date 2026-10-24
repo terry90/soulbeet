@@ -45,8 +45,8 @@ except (ImportError, AttributeError):
     hooked = False
 if not hooked:
     print(
-        "error: soulbeet needs beets 2.8 or newer to import"
-        f" (found {beets.__version__})",
+        "error: soulbeet cannot hook into this beets version's import"
+        f" (found {beets.__version__}); it supports beets 2.8 to 2.11",
         file=sys.stderr,
     )
     sys.exit(1)

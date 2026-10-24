@@ -35,7 +35,7 @@ pub struct ProbeReport {
     /// Absolute, resolved against the cwd the way beets resolves them.
     pub pluginpath: Vec<String>,
     pub autotag: bool,
-    /// Whether beets has what import.py hooks into (beets 2.8 or newer).
+    /// Whether beets has what import.py hooks into (beets 2.8 to 2.11).
     pub import_hook: bool,
 }
 
@@ -171,8 +171,8 @@ pub(crate) fn assess(config: &Path, probe: &Result<ProbeReport, ProbeFailure>) -
                 if !report.import_hook {
                     issues.push(issue(
                         Broken,
-                        "soulbeet needs beets 2.8 or newer to import",
-                        "Upgrade beets in the environment that runs beet, for example with pip install --upgrade beets.",
+                        "soulbeet cannot hook into this beets version's import",
+                        "Soulbeet supports beets 2.8 to 2.11. Install one of those in the environment that runs beet, for example with pip install beets==2.11.0.",
                     ));
                 }
                 for e in &report.plugin_errors {
@@ -427,10 +427,13 @@ mod tests {
         r.import_hook = false;
         let h = assess_ok(r);
         assert_eq!(h.level, HealthLevel::Broken);
-        assert_eq!(titles(&h), ["soulbeet needs beets 2.8 or newer to import"]);
+        assert_eq!(
+            titles(&h),
+            ["soulbeet cannot hook into this beets version's import"]
+        );
         assert_eq!(
             h.issues[0].detail,
-            "Upgrade beets in the environment that runs beet, for example with pip install --upgrade beets."
+            "Soulbeet supports beets 2.8 to 2.11. Install one of those in the environment that runs beet, for example with pip install beets==2.11.0."
         );
     }
 

@@ -146,7 +146,7 @@ Soulbeet uses `beets` to import music. The image ships a config at `/app/beets_c
 -   `discogs` needs `discogs.user_token`.
 -   Soulbeet passes `--log`, which overrides `import.log`, and `--noincremental` and `--noresume`, which override `import.incremental` and `import.resume`.
 
-Soulbeet runs every import through a small driver, `lib/soulbeet/src/beets/import.py`, with the Python that runs beets. The driver runs beets' own `beet` command line with the flags below and notes the matches beets weighed, so a skipped import can be finished with one of them (see [Skipped Imports](#skipped-imports)). It needs beets 2.8 or newer; with an older beets, Soulbeet marks beets as broken.
+Soulbeet runs every import through a small driver, `lib/soulbeet/src/beets/import.py`, with the Python that runs beets. The driver runs beets' own `beet` command line with the flags below and notes the matches beets weighed, so a skipped import can be finished with one of them (see [Skipped Imports](#skipped-imports)). It supports beets 2.8 to 2.11; with a beets it cannot hook into, Soulbeet marks beets as broken.
 
 Default `beet import` flags used:
 -   `-v`: Verbose output. The last lines of it (20 lines, 2 KiB) are shown under "beets output" on rows that carry a note: skipped, failed, or imported with a warning

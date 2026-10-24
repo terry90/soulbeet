@@ -448,7 +448,8 @@ def test_beets_without_the_hook_is_refused(beets_env, layout, version):
 
     assert run.code == 1, run
     assert run.stderr == (
-        f"error: soulbeet needs beets 2.8 or newer to import (found {version})\n"
+        "error: soulbeet cannot hook into this beets version's import"
+        f" (found {version}); it supports beets 2.8 to 2.11\n"
     )
     assert run.report is None
     assert beets_env.files_under(beets_env.src) == ["one.mp3"]
