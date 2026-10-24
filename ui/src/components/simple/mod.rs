@@ -8,6 +8,8 @@ mod text_input;
 pub use button::Button;
 pub use checkbox::Checkbox;
 pub use choice_list::{Choice, ChoiceList};
+#[cfg(test)]
+pub(crate) use disclosure::ToggleDriver;
 pub use disclosure::{use_open_handler, Disclosure};
 pub use row_action::RowAction;
 pub use text_input::{TextInput, FIELD_CLASS};

@@ -4831,6 +4831,7 @@ dependencies = [
  "api",
  "chrono",
  "dioxus",
+ "dioxus-html",
  "dioxus-ssr",
  "futures",
  "gloo-timers",

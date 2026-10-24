@@ -223,6 +223,7 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::simple::ToggleDriver;
     use shared::download::TrackFit;
 
     fn track(source: &str, id: &str) -> MatchCandidate {
@@ -242,22 +243,69 @@ mod tests {
         }
     }
 
-    fn render_picker(notice: Option<&'static str>) -> String {
-        let mut dom = VirtualDom::new_with_props(
-            |notice: Option<&'static str>| {
+    const LOAD_FAILED: &str = "Could not reach the server. Check your connection.";
+
+    /// A picker whose first `good_loads` loads find one match and whose
+    /// later loads fail in the picker.
+    fn picker(notice: Option<&'static str>, good_loads: u32) -> VirtualDom {
+        VirtualDom::new_with_props(
+            |(notice, good_loads): (Option<&'static str>, u32)| {
                 let notice = use_signal(|| notice.map(str::to_string));
-                let on_load: ChoicesLoader = Callback::new(|_: String| {
-                    Box::pin(async { Err(Failure::OnRow) })
+                let loads = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0)));
+                let on_load: ChoicesLoader = Callback::new(move |_: String| {
+                    loads.set(loads.get() + 1);
+                    let result = match loads.get() <= good_loads {
+                        true => Ok(MatchChoices {
+                            kind: MatchKind::Track,
+                            candidates: vec![track("MusicBrainz", "r1")],
+                        }),
+                        false => Err(Failure::InPicker(LOAD_FAILED.to_string())),
+                    };
+                    Box::pin(async move { result })
                         as Pin<Box<dyn Future<Output = Result<MatchChoices, Failure>>>>
                 });
                 rsx! {
                     MatchPicker { item: "a", busy: false, on_load, on_choose: |_| {}, notice }
                 }
             },
-            notice,
-        );
+            (notice, good_loads),
+        )
+    }
+
+    fn render_picker(notice: Option<&'static str>) -> String {
+        let mut dom = picker(notice, 0);
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn a_failed_first_load_stays_closed_and_says_why() {
+        let mut picker = ToggleDriver::new(picker(None, 0));
+        picker.click();
+        let html = picker.html();
+        assert!(html.contains(LOAD_FAILED), "{html}");
+        assert!(html.contains("Show matches<"), "{html}");
+        assert!(!html.contains("Import with this match"), "{html}");
+    }
+
+    #[test]
+    fn a_failed_reload_opens_with_the_list_loaded_before_and_says_why() {
+        let mut picker = ToggleDriver::new(picker(None, 1));
+        picker.click();
+        let html = picker.html();
+        assert!(html.contains("Hide matches (1)"), "{html}");
+        assert!(!html.contains(LOAD_FAILED), "{html}");
+        picker.click();
+        assert!(picker.html().contains("Show matches (1)"));
+        picker.click();
+        let html = picker.html();
+        assert!(html.contains(LOAD_FAILED), "{html}");
+        assert!(html.contains("Hide matches (1)"), "{html}");
+        assert!(
+            html.contains("Marrow Choir - Vesper Bells (Live)"),
+            "{html}"
+        );
+        assert!(html.contains("Import with this match"), "{html}");
     }
 
     #[test]
@@ -266,9 +314,8 @@ mod tests {
         assert!(quiet.contains("role=\"status\""), "{quiet}");
         assert!(quiet.contains("aria-live=\"polite\""), "{quiet}");
 
-        let text = "Could not reach the server. Check your connection.";
-        let told = render_picker(Some(text));
-        assert!(told.contains(text), "{told}");
+        let told = render_picker(Some(LOAD_FAILED));
+        assert!(told.contains(LOAD_FAILED), "{told}");
         // Closed, the picker shows only its toggle and the notice.
         assert!(told.contains("Show matches"), "{told}");
         assert!(!told.contains("Import with this match"), "{told}");

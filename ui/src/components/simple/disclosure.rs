@@ -76,3 +76,92 @@ pub fn Disclosure(props: DisclosureProps) -> Element {
         }
     }
 }
+
+/// Clicks a rendered Disclosure's toggle in tests.
+#[cfg(test)]
+pub(crate) struct ToggleDriver {
+    dom: VirtualDom,
+    toggle: dioxus::core::ElementId,
+}
+
+#[cfg(test)]
+impl ToggleDriver {
+    /// Renders `dom`, whose only click listener must be the toggle.
+    pub(crate) fn new(mut dom: VirtualDom) -> Self {
+        use dioxus::core::Mutation;
+        dioxus::html::set_event_converter(Box::new(dioxus::html::SerializedHtmlEventConverter));
+        let clicks: Vec<dioxus::core::ElementId> = dom
+            .rebuild_to_vec()
+            .edits
+            .into_iter()
+            .filter_map(|edit| match edit {
+                Mutation::NewEventListener { name, id } if name == "click" => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            clicks.len(),
+            1,
+            "expected only the toggle to listen for clicks"
+        );
+        Self {
+            dom,
+            toggle: clicks[0],
+        }
+    }
+
+    /// Clicks the toggle and runs what that starts until nothing is left to do.
+    pub(crate) fn click(&mut self) {
+        use dioxus::html::{PlatformEventData, SerializedMouseData};
+        use futures::FutureExt;
+        use std::{any::Any, rc::Rc};
+        let data = PlatformEventData::new(Box::<SerializedMouseData>::default());
+        let event = Event::new(Rc::new(data) as Rc<dyn Any>, true);
+        self.dom.runtime().handle_event("click", event, self.toggle);
+        loop {
+            self.dom.render_immediate(&mut dioxus::core::NoOpMutations);
+            if self.dom.wait_for_work().now_or_never().is_none() {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn html(&self) -> String {
+        dioxus_ssr::render(&self.dom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver(opens: bool) -> ToggleDriver {
+        ToggleDriver::new(VirtualDom::new_with_props(
+            |opens: bool| {
+                let on_open = use_open_handler(move || async move { opens });
+                rsx! {
+                    Disclosure { label: "matches", on_open,
+                        p { "the body" }
+                    }
+                }
+            },
+            opens,
+        ))
+    }
+
+    #[test]
+    fn the_body_opens_only_when_the_handler_says_so() {
+        let mut kept_shut = driver(false);
+        kept_shut.click();
+        let html = kept_shut.html();
+        assert!(!html.contains("the body"), "{html}");
+        assert!(html.contains("Show matches"), "{html}");
+        assert!(html.contains("aria-expanded=false"), "{html}");
+
+        let mut opened = driver(true);
+        opened.click();
+        let html = opened.html();
+        assert!(html.contains("the body"), "{html}");
+        assert!(html.contains("Hide matches"), "{html}");
+    }
+}
