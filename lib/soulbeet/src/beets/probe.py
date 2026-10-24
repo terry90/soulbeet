@@ -107,6 +107,8 @@ def import_hook():
     return (
         import_.TerminalImportSession is TerminalImportSession
         and "TerminalImportSession" in import_.import_files.__code__.co_names
+        # Looked up in the package itself, where import.py swaps it.
+        and import_.import_files.__globals__ is vars(import_)
         and all(
             isinstance(getattr(info, "id", None), property)
             for info in (AlbumInfo, TrackInfo)

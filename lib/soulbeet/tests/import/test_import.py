@@ -8,7 +8,7 @@ import pytest
 SRC = Path(__file__).resolve().parents[2] / "src" / "beets"
 DRIVER_SRC = (SRC / "import.py").read_text()
 PROBE_SRC = (SRC / "probe.py").read_text()
-OLD_BEETS = SRC.parents[1] / "tests" / "oldbeets"
+FAKE_BEETS = SRC.parents[1] / "tests" / "fakebeets"
 
 WEAK = {"FAKESRC_MODE": "weak"}
 
@@ -435,17 +435,20 @@ def test_the_probe_holds_the_same_hook_check():
     assert hook(DRIVER_SRC) == hook(PROBE_SRC)
 
 
-# Layouts of older beets that the hook check must refuse: 1.6 has no
-# swappable import session, 2.6 and 2.7 have one but no id on a match.
-@pytest.mark.parametrize("version", ["1.6", "2.6"])
-def test_older_beets_is_refused(beets_env, version):
+# Layouts of beets that the hook check must refuse: 1.6 has no swappable
+# import session, 2.6 and 2.7 have one but no id on a match, and "moved"
+# re-exports an import_files that would not see the swapped session.
+@pytest.mark.parametrize(
+    "layout, version", [("1.6", "1.6.0"), ("2.6", "2.6.0"), ("moved", "2.99.0")]
+)
+def test_beets_without_the_hook_is_refused(beets_env, layout, version):
     one_track(beets_env)
 
-    run = beets_env.driver("auto", env={"PYTHONPATH": str(OLD_BEETS / version)})
+    run = beets_env.driver("auto", env={"PYTHONPATH": str(FAKE_BEETS / layout)})
 
     assert run.code == 1, run
     assert run.stderr == (
-        f"error: soulbeet needs beets 2.8 or newer to import (found {version}.0)\n"
+        f"error: soulbeet needs beets 2.8 or newer to import (found {version})\n"
     )
     assert run.report is None
     assert beets_env.files_under(beets_env.src) == ["one.mp3"]

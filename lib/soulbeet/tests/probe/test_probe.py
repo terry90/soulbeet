@@ -11,7 +11,7 @@ HERE = Path(__file__).resolve().parent
 CONFIGS = HERE / "configs"
 REPO = HERE.parents[3]
 REPO_PLUGINS = REPO / "beets_plugins"
-OLD_BEETS = HERE.parent / "oldbeets"
+FAKE_BEETS = HERE.parent / "fakebeets"
 
 
 def errors_by_plugin(report):
@@ -152,7 +152,7 @@ def test_import_hook_is_reported_after_a_fatal_error(run_probe, tmp_path):
     assert report["import_hook"] is True
 
 
-@pytest.mark.parametrize("version", ["1.6", "2.6"])
-def test_older_beets_has_no_import_hook(run_probe, version):
-    report = run_probe(CONFIGS / "empty.yaml", env={"PYTHONPATH": str(OLD_BEETS / version)})
+@pytest.mark.parametrize("layout", ["1.6", "2.6", "moved"])
+def test_beets_without_the_hook_has_no_import_hook(run_probe, layout):
+    report = run_probe(CONFIGS / "empty.yaml", env={"PYTHONPATH": str(FAKE_BEETS / layout)})
     assert report["import_hook"] is False
