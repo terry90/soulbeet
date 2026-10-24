@@ -163,6 +163,8 @@ Default `beet import` flags used:
 
 In quiet mode beets skips files it cannot match closely, and the row says "No close match". Soulbeet keeps the downloaded files and the row offers:
 -   **Retry import**: the same import again, for example after you changed the beets config.
+
+When beets handled the import as one task (one track, or one album folder that beets reads as one album) and the driver recorded the matches beets weighed, the row also offers the two choices below. Otherwise it offers only Retry import.
 -   **Show matches**: the matches beets weighed for that import, with their score and what differs. Pick one, or paste a MusicBrainz link or ID (a recording for singletons, a release in album mode), then click **Import with this match**. beets applies exactly that match (`-S <id>`), however low its score.
 -   **Import as-is**: beets imports the files with their own tags (`-A`) and looks nothing up. Every file needs artist and title tags, and in album mode an album tag too. If one lacks them, nothing is imported and the row names the files that lack them: beets would file untagged music under empty names, and with `duplicate_action: remove` a second untagged import would replace the first.
 
@@ -205,7 +207,7 @@ By setting `BEETS_ALBUM_MODE=true`, Soulbeet imports each download batch as an a
 This flag is only needed when you want album tags on your tracks. E.g: `albumartist` `mb_albumid` and so on..
 
 **Important for Album Mode:**
-Since `beets` is run in quiet mode (`-q`), it will skip any imports that require user intervention (e.g., if the metadata doesn't match confidently). A skipped album can still be imported with a match you pick or as-is (see [Skipped Imports](#skipped-imports)). To ensure partial albums or less popular releases are imported correctly, you **must** configure your config file to be more permissive.
+Since `beets` is run in quiet mode (`-q`), it will skip any imports that require user intervention (e.g., if the metadata doesn't match confidently). A skipped album that beets read as one album can still be imported with a match you pick or as-is (see [Skipped Imports](#skipped-imports)). To ensure partial albums or less popular releases are imported correctly, you **must** configure your config file to be more permissive.
 
 Recommended additions to your config file for Album Mode:
 
