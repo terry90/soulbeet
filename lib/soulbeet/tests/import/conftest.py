@@ -20,6 +20,14 @@ MP3_FRAME = b"\xff\xfb\x90\xc4" + bytes(413)
 TWO_SECONDS = 77
 
 
+def strict_json(raw):
+    """Parses the report the way serde_json reads it in soulbeet: strict UTF-8,
+    and no lone surrogates behind \\u escapes."""
+    report = json.loads(raw.decode("utf-8"))
+    json.dumps(report, ensure_ascii=False).encode("utf-8")
+    return report
+
+
 class Beets:
     """One isolated beets setup, run the way soulbeet runs it."""
 
@@ -128,7 +136,7 @@ class Beets:
         args = self.beet_args(*sources, singleton=singleton)
         argv = [sys.executable, "-P", "-c", DRIVER_SRC, str(report), *choice]
         run = self._run([*argv, "--", *args], env)
-        run.report = json.loads(report.read_text()) if report.exists() else None
+        run.report = strict_json(report.read_bytes()) if report.exists() else None
         return run
 
     def plain(self, *sources, singleton=False, env=None):

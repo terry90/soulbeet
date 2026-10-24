@@ -1,4 +1,13 @@
+import ast
+import os
+import zipfile
+from pathlib import Path
+
 import pytest
+
+SRC = Path(__file__).resolve().parents[2] / "src" / "beets"
+DRIVER_SRC = (SRC / "import.py").read_text()
+PROBE_SRC = (SRC / "probe.py").read_text()
 
 WEAK = {"FAKESRC_MODE": "weak"}
 
@@ -191,22 +200,33 @@ def test_pick_of_an_unknown_id_moves_nothing(beets_env, singleton, wanted):
     assert beets_env.music_files() == []
 
 
-@pytest.mark.parametrize(
-    "source, title",
-    [("FakeSrc", "Totally Different 0"), ("OtherSrc", "Other Source Song 1")],
-)
-def test_pick_keeps_only_the_named_source(beets_env, source, title):
-    beets_env.configure(plugins=("fakesrc", "othersrc"))
-    track = one_track(beets_env)
+# What each source's lookup of the id names, read from the library row.
+PICKED = {
+    "singleton": ("fake-t-w0", 0, {"FakeSrc": "Totally Different 0",
+                                   "OtherSrc": "Other Source Song 1"}),
+    "album": ("fake-a-w0", 2, {"FakeSrc": "Other Album 0",
+                               "OtherSrc": "Other Source Album"}),
+}
 
-    run = beets_env.driver(
-        "pick", source, "fake-t-w0", sources=[track], singleton=True, env=WEAK
-    )
+
+@pytest.mark.parametrize("source", ["FakeSrc", "OtherSrc"])
+@pytest.mark.parametrize("mode", ["singleton", "album"])
+def test_pick_keeps_only_the_named_source(beets_env, mode, source):
+    wanted, column, names = PICKED[mode]
+    beets_env.configure(plugins=("fakesrc", "othersrc"))
+    singleton = mode == "singleton"
+    if singleton:
+        one_track(beets_env)
+    else:
+        beets_env.album(beets_env.src)
+
+    run = beets_env.driver("pick", source, wanted, singleton=singleton, env=WEAK)
 
     assert run.code == 0, run
     assert run.report["pick_missing"] is False
-    [(got_title, *_)] = beets_env.library()
-    assert got_title == title
+    rows = beets_env.library()
+    assert len(rows) == (1 if singleton else 2)
+    assert {row[column] for row in rows} == {names[source]}
 
 
 @pytest.mark.parametrize("singleton", [False, True], ids=["album", "singleton"])
@@ -272,6 +292,92 @@ def test_asis_refuses_an_album_when_any_file_lacks_tags(beets_env):
     assert beets_env.music_files() == []
 
 
+def test_asis_reads_inside_an_archive(beets_env, tmp_path):
+    staged = tmp_path / "staged"
+    beets_env.album(staged)
+    beets_env.mp3(staged / "03.mp3")
+    archive = beets_env.src / "album.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        for f in sorted(staged.iterdir()):
+            z.write(f, f.name)
+    extract_to = tmp_path / "extract"
+    extract_to.mkdir()
+
+    run = beets_env.driver(
+        "asis", sources=[archive], env={"TMPDIR": str(extract_to)}
+    )
+
+    assert run.code == 0, run
+    assert run.report["refused"] == (
+        "Import as-is needs album, artist and title tags, and 1 file lacks them:"
+        " 03.mp3"
+    )
+    assert beets_env.files_under(beets_env.src) == ["album.zip"]
+    assert beets_env.music_files() == []
+    # The check's extraction is removed again.
+    assert list(extract_to.iterdir()) == []
+
+
+def test_asis_imports_a_tagged_archive(beets_env, tmp_path):
+    staged = tmp_path / "staged"
+    beets_env.album(staged)
+    archive = beets_env.src / "album.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        for f in sorted(staged.iterdir()):
+            z.write(f, f.name)
+
+    run = beets_env.driver("asis", sources=[archive], env={"FAKESRC_MODE": "error"})
+
+    assert run.code == 0, run
+    assert run.report["refused"] is None
+    assert beets_env.music_files() == [
+        "Zzqx Artist/Qzz Album/01 Song Number 1.mp3",
+        "Zzqx Artist/Qzz Album/02 Song Number 2.mp3",
+    ]
+
+
+# A Latin-1 name, which is not valid UTF-8.
+LATIN1_NAME = os.fsdecode(b"caf\xe9.mp3")
+
+
+def test_auto_reports_a_non_utf8_path_as_text(beets_env):
+    track = beets_env.mp3(
+        beets_env.src / LATIN1_NAME, artist="Zzqx Artist", title="Song Number 1"
+    )
+
+    run = beets_env.driver("auto", singleton=True, env=WEAK)
+
+    assert run.code == 0, run
+    [task] = run.report["tasks"]
+    assert task["paths"] == [str(track.parent / "caf\ufffd.mp3")]
+
+
+def test_asis_refusal_names_a_non_utf8_file_as_text(beets_env):
+    beets_env.mp3(beets_env.src / LATIN1_NAME, title="Only A Title")
+
+    run = beets_env.driver("asis", singleton=True)
+
+    assert run.code == 0, run
+    assert run.report["refused"] == (
+        "Import as-is needs artist and title tags, and 1 file lacks them:"
+        " caf\ufffd.mp3"
+    )
+
+
+def test_a_lone_surrogate_from_a_source_is_written_as_utf8(beets_env):
+    beets_env.configure(plugins=("fakesrc", "othersrc"))
+    one_track(beets_env)
+
+    run = beets_env.driver(
+        "auto", singleton=True, env={**WEAK, "OTHERSRC_ARTIST": LATIN1_NAME}
+    )
+
+    assert run.code == 0, run
+    [task] = run.report["tasks"]
+    [other] = [c for c in task["candidates"] if c["data_source"] == "OtherSrc"]
+    assert other["artist"] == "caf?.mp3"
+
+
 def test_the_report_is_written_when_beets_crashes(beets_env):
     beets_env.album(beets_env.src)
 
@@ -283,6 +389,18 @@ def test_the_report_is_written_when_beets_crashes(beets_env):
     assert "simulated crash in import stage" in run.stderr
     [task] = run.report["tasks"]
     assert task["candidates"][0]["id"] == "fake-a-1"
+
+
+def test_the_probe_holds_the_same_hook_check():
+    def hook(src):
+        [fn] = [
+            node
+            for node in ast.parse(src).body
+            if isinstance(node, ast.FunctionDef) and node.name == "import_hook"
+        ]
+        return ast.get_source_segment(src, fn)
+
+    assert hook(DRIVER_SRC) == hook(PROBE_SRC)
 
 
 def test_older_beets_is_refused(beets_env, tmp_path):

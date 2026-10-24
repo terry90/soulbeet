@@ -1,14 +1,19 @@
 """A second metadata source that answers every id lookup, the way deezer and
-tidal answer an MBID whose leading digits fit their id pattern."""
+tidal answer an MBID whose leading digits fit their id pattern.
+
+OTHERSRC_ARTIST, when set, makes track searches return one track by that
+artist."""
+
+import os
 
 from beets.autotag.hooks import AlbumInfo, TrackInfo
 from beets.metadata_plugins import MetadataSourcePlugin
 
 
-def _track(track_id, i=None):
+def _track(track_id, i=None, artist="Other Source Artist"):
     return TrackInfo(
         title=f"Other Source Song {i or 1}",
-        artist="Other Source Artist",
+        artist=artist,
         track_id=track_id if i is None else f"{track_id}-{i}",
         index=i,
         medium=1 if i else None,
@@ -35,4 +40,5 @@ class OtherSrcPlugin(MetadataSourcePlugin):
         return []
 
     def item_candidates(self, item, artist, title):
-        return []
+        found = os.environ.get("OTHERSRC_ARTIST")
+        return [_track("other-t-1", artist=found)] if found else []

@@ -19,8 +19,9 @@ import beets
 
 
 def import_hook():
-    """Whether beets builds its import session from a module global this
-    script can replace. probe.py runs the same check."""
+    """Whether beets builds its import session from a module global that
+    import.py can replace. probe.py and import.py each hold this function,
+    and a test keeps the two equal."""
     from beets.ui.commands import import_
     from beets.ui.commands.import_.session import TerminalImportSession
 
@@ -43,17 +44,22 @@ if not hooked:
     sys.exit(1)
 
 import beets.ui
-from beets import config, library
+from beets import config
 from beets.autotag.hooks import AlbumMatch
 from beets.autotag.match import Recommendation
 from beets.importer import Action
-from beets.importer.tasks import albums_in_dir
+from beets.importer.tasks import ImportTaskFactory
 from beets.ui.commands import import_ as import_cmd
-from beets.util import displayable_path, syspath
 
 USAGE = "usage: import.py REPORT (auto | asis | pick SOURCE ID) -- BEET_ARGS"
 
 report = {"tasks": [], "pick_missing": False, "refused": None}
+
+
+def path_text(path):
+    """A path as report text. The report is read as strict UTF-8, so bytes
+    that do not decode become U+FFFD."""
+    return os.fsencode(path).decode("utf-8", "replace")
 
 
 def penalty_name(key):
@@ -98,7 +104,7 @@ class AutoSession(Session):
     def _record(self, task):
         report["tasks"].append(
             {
-                "paths": [displayable_path(p) for p in task.paths],
+                "paths": [path_text(p) for p in task.paths],
                 "album": task.is_album,
                 "candidates": [describe(m) for m in task.candidates],
             }
@@ -144,13 +150,26 @@ class PickSession(Session):
         return super().choose_item(task) if self._pin(task) else Action.SKIP
 
 
-def audio_paths(toppath):
-    """The files beets reads for one source, walked the way beets walks it."""
-    if not os.path.isdir(syspath(toppath)):
-        yield toppath
-        return
-    for _dirs, paths in albums_in_dir(toppath):
-        yield from paths
+def source_items(session, toppath):
+    """The items beets imports from one source, read by beets' own task
+    factory, so archives, flat, ignore and extension fixes apply as in the
+    import itself."""
+    factory = ImportTaskFactory(toppath, session)
+    archive = None
+    if factory.is_archive:
+        archive = factory.unarchive()
+        if archive is None:
+            # beets imports nothing from an archive it cannot extract.
+            return
+    try:
+        for _dirs, paths in factory.paths():
+            for path in paths:
+                item = factory.read_item(path)
+                if item is not None:
+                    yield item
+    finally:
+        if archive is not None:
+            archive.cleanup()
 
 
 def missing_tags(item, singleton):
@@ -165,21 +184,18 @@ def missing_tags(item, singleton):
     return [name for name, value in tags.items() if not value.strip()]
 
 
-def untagged_refusal(toppaths, singleton):
-    """Why an as-is import of these sources is refused, or None.
+def untagged_refusal(session):
+    """Why an as-is import of the session's sources is refused, or None.
 
     beets files untagged music under empty names, and with duplicate_action
     remove a second untagged import deletes the first one."""
-    lacking = []
-    for toppath in toppaths:
-        for path in audio_paths(toppath):
-            try:
-                item = library.Item.from_path(path)
-            except library.ReadError:
-                # beets skips files it cannot read, so they are not imported.
-                continue
-            if missing_tags(item, singleton):
-                lacking.append(os.path.basename(displayable_path(path)))
+    singleton = session.config["singletons"].get(bool)
+    lacking = [
+        path_text(os.path.basename(item.path))
+        for toppath in session.paths
+        for item in source_items(session, toppath)
+        if missing_tags(item, singleton)
+    ]
     if not lacking:
         return None
     need = "artist and title" if singleton else "album, artist and title"
@@ -192,9 +208,10 @@ def untagged_refusal(toppaths, singleton):
 
 class AsIsSession(Session):
     def run(self):
-        refused = untagged_refusal(
-            self.paths, config["import"]["singletons"].get(bool)
-        )
+        # The task factory reads the session config, which run() sets only
+        # after it opens the run log.
+        self.set_config(config["import"])
+        refused = untagged_refusal(self)
         if refused is not None:
             report["refused"] = refused
             print(f"soulbeet: {refused}", file=sys.stderr)
@@ -223,5 +240,7 @@ import_cmd.TerminalImportSession = session
 try:
     beets.ui.main(beet_args)
 finally:
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(report, f)
+    # A lone surrogate in a plugin's text would make the report invalid UTF-8,
+    # so it is written as "?".
+    with open(report_path, "w", encoding="utf-8", errors="replace") as f:
+        json.dump(report, f, ensure_ascii=False)

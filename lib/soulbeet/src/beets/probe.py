@@ -97,7 +97,8 @@ except BaseException:
 
 def import_hook():
     """Whether beets builds its import session from a module global that
-    import.py can replace. import.py runs the same check."""
+    import.py can replace. probe.py and import.py each hold this function,
+    and a test keeps the two equal."""
     from beets.ui.commands import import_
     from beets.ui.commands.import_.session import TerminalImportSession
 
