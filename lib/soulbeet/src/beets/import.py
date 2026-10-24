@@ -113,9 +113,11 @@ class AutoSession(Session):
             {
                 "paths": [path_text(p) for p in task.paths],
                 "album": task.is_album,
-                # A candidate without an id cannot be picked.
+                # A candidate without an id or a source cannot be picked.
                 "candidates": [
-                    describe(m) for m in task.candidates if m.info.id is not None
+                    describe(m)
+                    for m in task.candidates
+                    if m.info.id is not None and m.info.data_source
                 ],
             }
         )

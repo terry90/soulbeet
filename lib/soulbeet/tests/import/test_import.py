@@ -393,7 +393,7 @@ def test_a_lone_surrogate_from_a_source_is_written_as_utf8(beets_env):
     assert other["artist"] == "caf?.mp3"
 
 
-def test_candidate_ids_are_reported_as_text(beets_env):
+def test_candidates_are_reported_with_a_text_id_and_a_source(beets_env):
     beets_env.configure(plugins=("fakesrc", "othersrc"))
     one_track(beets_env)
 
@@ -403,7 +403,9 @@ def test_candidate_ids_are_reported_as_text(beets_env):
 
     assert run.code == 0, run
     [task] = run.report["tasks"]
-    # The numeric id comes back as text; the one without an id is left out.
+    # The numeric id comes back as text. The ones without an id or a data
+    # source are left out, so every candidate has both.
+    assert all(c["data_source"] and c["id"] for c in task["candidates"])
     others = [c["id"] for c in task["candidates"] if c["data_source"] == "OtherSrc"]
     assert others == ["3135556"]
 

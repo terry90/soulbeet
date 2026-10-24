@@ -2,8 +2,8 @@
 tidal answer an MBID whose leading digits fit their id pattern.
 
 OTHERSRC_ARTIST, when set, makes track searches return one track by that
-artist. OTHERSRC_ODD_IDS adds two tracks, one with a numeric id and one
-with none."""
+artist. OTHERSRC_ODD_IDS adds three tracks: one with a numeric id, one
+with none and one with no data source."""
 
 import os
 
@@ -11,7 +11,7 @@ from beets.autotag.hooks import AlbumInfo, TrackInfo
 from beets.metadata_plugins import MetadataSourcePlugin
 
 
-def _track(track_id, i=None, artist="Other Source Artist"):
+def _track(track_id, i=None, artist="Other Source Artist", data_source="OtherSrc"):
     return TrackInfo(
         title=f"Other Source Song {i or 1}",
         artist=artist,
@@ -19,7 +19,7 @@ def _track(track_id, i=None, artist="Other Source Artist"):
         index=i,
         medium=1 if i else None,
         medium_index=i,
-        data_source="OtherSrc",
+        data_source=data_source,
     )
 
 
@@ -45,5 +45,9 @@ class OtherSrcPlugin(MetadataSourcePlugin):
         if artist_name := os.environ.get("OTHERSRC_ARTIST"):
             found.append(_track("other-t-1", artist=artist_name))
         if os.environ.get("OTHERSRC_ODD_IDS"):
-            found += [_track(3135556), _track(None)]
+            found += [
+                _track(3135556),
+                _track(None),
+                _track("no-source", data_source=None),
+            ]
         return found
