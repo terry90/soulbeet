@@ -259,6 +259,17 @@
   .visible {
     visibility: visible;
   }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border-width: 0;
+  }
   .absolute {
     position: absolute;
   }
@@ -523,6 +534,9 @@
   .max-h-48 {
     max-height: calc(var(--spacing) * 48);
   }
+  .max-h-80 {
+    max-height: calc(var(--spacing) * 80);
+  }
   .max-h-96 {
     max-height: calc(var(--spacing) * 96);
   }
@@ -685,6 +699,9 @@
   }
   .cursor-pointer {
     cursor: pointer;
+  }
+  .cursor-wait {
+    cursor: wait;
   }
   .scrollbar-thin {
     scrollbar-width: thin;
@@ -1887,6 +1904,19 @@
     --tw-outline-style: none;
     outline-style: none;
   }
+  @media (hover: hover) {
+    .enabled\:hover\:border-beet-accent\/50:enabled:hover {
+      border-color: color-mix(in srgb, #ff00ff 50%, transparent);
+    }
+    @supports (color: color-mix(in lab, red, red)) {
+      .enabled\:hover\:border-beet-accent\/50:enabled:hover {
+        border-color: color-mix(in oklab, var(--color-beet-accent) 50%, transparent);
+      }
+    }
+    .enabled\:hover\:text-white:enabled:hover {
+      color: var(--color-white);
+    }
+  }
   .disabled\:cursor-not-allowed:disabled {
     cursor: not-allowed;
   }
@@ -1902,6 +1932,9 @@
   .disabled\:shadow-none:disabled {
     --tw-shadow: 0 0 #0000;
     box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow);
+  }
+  .has-focus-visible\:border-beet-accent:has(:focus-visible) {
+    border-color: var(--color-beet-accent);
   }
   @media (width >= 40rem) {
     .sm\:mx-6 {

@@ -2,9 +2,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use dioxus::prelude::*;
-use shared::download::{DownloadProgress, DownloadState};
+use shared::download::{DownloadProgress, DownloadState, ImportChoice};
 
-use crate::Disclosure;
+use super::picker::{ChoicesLoader, MatchPicker};
+use crate::{Disclosure, RowAction};
 
 /// How a row's state is shown: badge text and tooltip, plus row and badge classes.
 #[derive(Debug, PartialEq)]
@@ -91,8 +92,9 @@ fn reason(row: &DownloadProgress) -> Option<(&'static str, &str)> {
     row.error.as_deref().map(|note| (class, note))
 }
 
-/// Resolves to whether the server accepted the retry.
-pub type RetryHandler = Callback<DownloadProgress, Pin<Box<dyn Future<Output = bool>>>>;
+/// Imports the row's item again the way the choice says. Resolves to whether
+/// the server accepted it.
+pub type ImportHandler = Callback<(String, ImportChoice), Pin<Box<dyn Future<Output = bool>>>>;
 
 fn waiting_text(ahead: u32) -> String {
     format!("Waiting for library ({ahead} ahead)")
@@ -107,16 +109,36 @@ fn shows_retry(row: &DownloadProgress) -> bool {
     ) && row.retryable
 }
 
+/// A kept row whose last automatic import recorded matches can also import
+/// as-is or with a picked match.
+fn shows_choices(row: &DownloadProgress) -> bool {
+    shows_retry(row) && row.can_choose_import
+}
+
 #[component]
 pub fn DownloadItem(
     file: DownloadProgress,
     on_cancel: EventHandler<DownloadProgress>,
-    on_retry: RetryHandler,
+    on_import: ImportHandler,
+    on_load_choices: ChoicesLoader,
 ) -> Element {
-    // Set while a retry request is in flight, and kept after an accepted one
+    // Set while an import request is in flight, and kept after an accepted one
     // until the row changes state, so a second click cannot race the first.
-    let mut retrying = use_signal(|| false);
-    use_effect(use_reactive(&file.state, move |_| retrying.set(false)));
+    let mut busy = use_signal(|| false);
+    use_effect(use_reactive(&file.state, move |_| busy.set(false)));
+    let item = file.item.clone();
+    let import = use_callback(move |choice: ImportChoice| {
+        if busy() {
+            return;
+        }
+        busy.set(true);
+        let item = item.clone();
+        spawn(async move {
+            if !on_import.call((item, choice)).await {
+                busy.set(false);
+            }
+        });
+    });
 
     let state = &file.state;
     let note = reason(&file);
@@ -215,27 +237,20 @@ pub fn DownloadItem(
           }
         }
         if shows_retry(&file) {
-          { let file_clone = file.clone();
-          rsx! {
-            button {
-              class: "mt-2 text-xs font-mono px-2 py-1 rounded border border-white/10 text-gray-300 hover:border-beet-accent/50 hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-wait",
-              disabled: retrying(),
-              onclick: move |evt: Event<MouseData>| {
-                  evt.stop_propagation();
-                  if retrying() {
-                      return;
-                  }
-                  retrying.set(true);
-                  let row = file_clone.clone();
-                  spawn(async move {
-                      if !on_retry.call(row).await {
-                          retrying.set(false);
-                      }
-                  });
-              },
-              "Retry import"
+          div { class: "mt-2 flex flex-wrap gap-2",
+            RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::Auto), "Retry import" }
+            if shows_choices(&file) {
+              RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::AsIs), "Import as-is" }
             }
-          }}
+          }
+        }
+        if shows_choices(&file) {
+          MatchPicker {
+            item: file.item.clone(),
+            busy: busy(),
+            on_load: on_load_choices,
+            on_choose: import,
+          }
         }
         if matches!(state, DownloadState::Importing) {
           div { class: "flex items-center gap-2 text-xs text-gray-300 font-mono mt-2",
@@ -348,5 +363,28 @@ mod tests {
             ..row(DownloadState::ImportSkipped, Some("/dl/X"))
         };
         assert!(!shows_retry(&nothing_kept));
+    }
+
+    #[test]
+    fn choices_show_only_on_kept_rows_with_matches() {
+        let with_choices = |state| DownloadProgress {
+            can_choose_import: true,
+            ..row(state, Some("/dl/X"))
+        };
+        assert!(shows_choices(&with_choices(DownloadState::ImportSkipped)));
+        // A failed pick keeps the matches.
+        assert!(shows_choices(&with_choices(DownloadState::Failed(
+            "MusicBrainz has no recording x".into()
+        ))));
+        assert!(!shows_choices(&with_choices(DownloadState::Importing)));
+        assert!(!shows_choices(&row(
+            DownloadState::ImportSkipped,
+            Some("/dl/X")
+        )));
+        let nothing_kept = DownloadProgress {
+            retryable: false,
+            ..with_choices(DownloadState::ImportSkipped)
+        };
+        assert!(!shows_choices(&nothing_kept));
     }
 }
