@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Runs one real beets import the way soulbeet runs it and stores the transcript
-# as a classifier fixture in ../<CASE>/.
+# Runs one real beets import with the args soulbeet's import_args builds and
+# stores the transcript as a classifier fixture in ../<CASE>/. soulbeet passes
+# those args unchanged to import.py, which runs beets' own CLI with them, so
+# without CHOICE this runs beet itself.
 #
 # usage: BEETS_VENV=DIR FIXTURE_WORK=DIR capture.sh CASE CONFIG [extra import args]
 #   BEETS_VENV    a beets 2.11.0 venv
