@@ -52,11 +52,15 @@ function sharesOf(release: FixtureRelease): PeerShare[] {
   );
 }
 
+/**
+ * The Download button of the search result titled exactly `title`: "Cinder
+ * Psalm" is also part of the MB-only "Cinder Psalm (Choir Version)", which no
+ * peer shares.
+ */
 function downloadButton(page: Page, title: string) {
   return page
     .locator('li')
-    .filter({ hasText: title })
-    .first()
+    .filter({ has: page.getByText(title, { exact: true }) })
     .getByRole('button', { name: 'Download' });
 }
 
@@ -93,13 +97,7 @@ async function skippedRow(
   const { folder } = await freshSession(context, page, folderName);
 
   await performSearch(page, release.title, 'TRACK');
-  // By the exact title: "Cinder Psalm" is also part of the MB-only "Cinder
-  // Psalm (Choir Version)", which no peer shares.
-  await page
-    .locator('li')
-    .filter({ has: page.getByText(release.tracks[0]!.title, { exact: true }) })
-    .getByRole('button', { name: 'Download' })
-    .click();
+  await downloadButton(page, release.tracks[0]!.title).click();
   await openDownloadsPanel(page);
 
   const [share] = sharesOf(release);
