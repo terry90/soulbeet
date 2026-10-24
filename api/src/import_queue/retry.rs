@@ -358,6 +358,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_automatic_retry_the_importer_never_ran_keeps_the_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps, _) = skipped(tmp.path()).await;
+
+        stub.set_health(broken());
+        assert_eq!(queue.retry("u", "a", ImportChoice::Auto).await, Ok(()));
+        let refused = done_row(&deps, "a", 2).await;
+        assert!(refused.retryable && refused.can_choose_import);
+        assert_eq!(queue.import_choices("u", "a"), Ok(found()));
+
+        stub.set_health(ready());
+        stub.panic_next();
+        assert_eq!(queue.retry("u", "a", ImportChoice::Auto).await, Ok(()));
+        let stopped = done_row(&deps, "a", 3).await;
+        assert!(stopped.retryable && stopped.can_choose_import);
+        assert_eq!(queue.import_choices("u", "a"), Ok(found()));
+    }
+
+    #[tokio::test]
     async fn a_musicbrainz_link_picks_its_id() {
         let tmp = tempfile::tempdir().unwrap();
         let (queue, stub, deps, _) = skipped(tmp.path()).await;

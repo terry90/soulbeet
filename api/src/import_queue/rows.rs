@@ -151,6 +151,7 @@ mod tests {
         JobOutcome {
             result,
             new_files: vec![],
+            ran: true,
         }
     }
 

@@ -58,13 +58,18 @@ pub struct JobOutcome {
     /// Audio files the run added, relative to the target. Only filled for
     /// `snapshot_target` jobs.
     pub new_files: Vec<PathBuf>,
+    /// The importer ran. Only then does an automatic run's result say what
+    /// can be picked.
+    ran: bool,
 }
 
 impl JobOutcome {
+    /// The outcome of a job the importer never ran.
     fn of(result: ImportResult) -> Self {
         JobOutcome {
             result,
             new_files: vec![],
+            ran: false,
         }
     }
 }
@@ -318,7 +323,11 @@ impl Shared {
             }
             None => vec![],
         };
-        JobOutcome { result, new_files }
+        JobOutcome {
+            result,
+            new_files,
+            ran: true,
+        }
     }
 
     async fn finish(&self, job: &ImportJob, outcome: JobOutcome, state: &watch::Sender<JobState>) {
@@ -350,10 +359,11 @@ impl Shared {
                 }
             }
         }
-        // An automatic run finds what can be picked. A chosen run keeps it,
-        // so a pick that failed still offers the others.
-        let choices = match job.choice {
-            DriverChoice::Auto => outcome.result.choices.clone().map(Arc::new),
+        // An automatic run of the importer finds what can be picked. A chosen
+        // run keeps it, so a pick that failed still offers the others, and so
+        // does a run the importer never got (broken, unavailable, panicked).
+        let choices = match (&job.choice, outcome.ran) {
+            (DriverChoice::Auto, true) => outcome.result.choices.clone().map(Arc::new),
             _ => job.choices.clone(),
         };
         let job = Arc::new(ImportJob {
