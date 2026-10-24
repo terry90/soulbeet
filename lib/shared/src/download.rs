@@ -164,6 +164,10 @@ pub struct DownloadProgress {
     /// The server keeps this row's import job, so Retry import can resubmit it
     #[serde(default)]
     pub retryable: bool,
+    /// The kept job skipped for want of a close match, so the user can pick
+    /// one of its matches or import it as-is
+    #[serde(default)]
+    pub can_choose_import: bool,
 }
 
 impl DownloadProgress {
@@ -184,6 +188,7 @@ impl DownloadProgress {
             local_path: None,
             import_output: None,
             retryable: false,
+            can_choose_import: false,
         }
     }
 
@@ -204,6 +209,7 @@ impl DownloadProgress {
             local_path: None,
             import_output: None,
             retryable: false,
+            can_choose_import: false,
         }
     }
 

@@ -4,7 +4,7 @@ use std::pin::Pin;
 
 use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
-use shared::download::{DownloadProgress, DownloadState};
+use shared::download::{DownloadProgress, DownloadState, ImportChoice};
 
 mod item;
 use api::CancelDownloadRequest;
@@ -90,7 +90,7 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
     let retry_import = use_callback(
         move |file: DownloadProgress| -> Pin<Box<dyn Future<Output = bool>>> {
             Box::pin(async move {
-                match api::retry_import(file.item.clone()).await {
+                match api::retry_import(file.item.clone(), ImportChoice::Auto).await {
                     Ok(()) => true,
                     Err(e) => {
                         if let Some(entry) = downloads_signal.write().get_mut(&file.item) {

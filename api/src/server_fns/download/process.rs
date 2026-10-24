@@ -1,6 +1,6 @@
 use dioxus::logger::tracing::{info, warn};
 use shared::download::{DownloadProgress, DownloadState};
-use soulbeet::ImportMode;
+use soulbeet::{DriverChoice, ImportMode};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -103,6 +103,8 @@ pub fn import_job(
         }),
         snapshot_target: false,
         cleanup_root: Some(base.to_path_buf()),
+        choice: DriverChoice::Auto,
+        choices: None,
     }
 }
 

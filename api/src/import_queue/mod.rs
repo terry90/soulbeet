@@ -2,16 +2,17 @@
 //! import through here, so a row waiting for another job's import says so
 //! instead of reading "Importing".
 
+mod choice;
 mod retry;
 mod rows;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use retry::{forget_retries, retry_import_for};
+pub use retry::{forget_retries, import_choices_for, retry_import_for};
 
 use async_trait::async_trait;
 use futures::FutureExt;
-use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
+use shared::download::{DownloadEvent, DownloadProgress, DownloadState, MatchChoices};
 use soulbeet::audio::{count_audio_files, is_audio_path};
 use soulbeet::{DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -45,6 +46,10 @@ pub struct ImportJob {
     pub snapshot_target: bool,
     /// Prune the emptied source folders up to (not including) this root.
     pub cleanup_root: Option<PathBuf>,
+    /// How this run decides on a match.
+    pub choice: DriverChoice,
+    /// What the last automatic run of these files left to pick from.
+    pub choices: Option<Arc<MatchChoices>>,
 }
 
 #[derive(Debug, Clone)]
@@ -299,7 +304,7 @@ impl Shared {
             false => None,
         };
         let result = importer
-            .import(&sources, target, job.mode, &DriverChoice::Auto)
+            .import(&sources, target, job.mode, &job.choice)
             .await;
         let new_files = match before {
             Some(before) => {
@@ -345,11 +350,21 @@ impl Shared {
                 }
             }
         }
+        // An automatic run finds what can be picked. A chosen run keeps it,
+        // so a pick that failed still offers the others.
+        let choices = match job.choice {
+            DriverChoice::Auto => outcome.result.choices.clone().map(Arc::new),
+            _ => job.choices.clone(),
+        };
+        let job = Arc::new(ImportJob {
+            choices,
+            ..job.clone()
+        });
         // Stored before the rows go out, so their Retry button always finds it.
-        self.retries.record(job, &outcome.result);
+        self.retries.record(&job, &outcome.result);
         let _emit = self.emit_lock.lock().await;
         if let Some(owner) = &job.owner {
-            let rows = rows_for_done(&owner.rows, job, &outcome);
+            let rows = rows_for_done(&owner.rows, &job, &outcome);
             self.deps
                 .emit(&owner.username, DownloadEvent::Progress(rows))
                 .await;
@@ -397,6 +412,8 @@ pub async fn import_to_library(src: &Path, target: &Path) -> Result<(), String> 
             owner: None,
             snapshot_target: false,
             cleanup_root: None,
+            choice: DriverChoice::Auto,
+            choices: None,
         })
         .await
         .wait()
@@ -455,6 +472,8 @@ mod tests {
             owner: None,
             snapshot_target: false,
             cleanup_root: None,
+            choice: DriverChoice::Auto,
+            choices: None,
         }
     }
 

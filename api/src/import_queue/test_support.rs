@@ -2,10 +2,14 @@
 
 use super::QueueDeps;
 use async_trait::async_trait;
-use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
+use shared::download::{
+    DownloadEvent, DownloadProgress, DownloadState, MatchCandidate, MatchChoices, MatchKind,
+};
 use shared::library::DuplicateReport;
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
-use soulbeet::{DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter, TaskCount};
+use soulbeet::{
+    DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter, SkipReason, TaskCount,
+};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,6 +28,45 @@ pub fn imported() -> ImportResult {
             total: 1,
         },
         choices: None,
+    }
+}
+
+/// A skipped single-task run that found `candidates`, with no choices.
+pub fn no_match(candidates: u32) -> ImportResult {
+    ImportResult {
+        outcome: ImportOutcome::Skipped(SkipReason::NoMatch {
+            candidates: Some(candidates),
+        }),
+        output_tail: "skipped tail".into(),
+        tasks: TaskCount {
+            imported: 0,
+            total: 1,
+        },
+        choices: None,
+    }
+}
+
+pub fn candidate(data_source: &str, id: &str) -> MatchCandidate {
+    MatchCandidate {
+        data_source: data_source.into(),
+        id: id.into(),
+        artist: "Artist".into(),
+        title: "Title".into(),
+        album: None,
+        year: None,
+        country: None,
+        disambig: None,
+        per_mille: 500,
+        differs: vec![],
+        length_secs: None,
+        tracks: None,
+    }
+}
+
+pub fn track_choices(candidates: Vec<MatchCandidate>) -> MatchChoices {
+    MatchChoices {
+        kind: MatchKind::Track,
+        candidates,
     }
 }
 
@@ -67,6 +110,7 @@ pub struct StubImporter {
     active: AtomicUsize,
     max_active: AtomicUsize,
     seen: Mutex<Vec<(Vec<PathBuf>, PathBuf)>>,
+    choices: Mutex<Vec<DriverChoice>>,
 }
 
 impl StubImporter {
@@ -82,6 +126,7 @@ impl StubImporter {
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
             seen: Mutex::new(vec![]),
+            choices: Mutex::new(vec![]),
         }
     }
 
@@ -137,6 +182,11 @@ impl StubImporter {
         self.seen.lock().unwrap().clone()
     }
 
+    /// The choice of every import, in call order.
+    pub fn choices(&self) -> Vec<DriverChoice> {
+        self.choices.lock().unwrap().clone()
+    }
+
     fn move_into(sources: &[&Path], target: &Path) {
         for source in sources {
             let files = if source.is_dir() {
@@ -178,9 +228,10 @@ impl MusicImporter for StubImporter {
         sources: &[&Path],
         target: &Path,
         _: ImportMode,
-        _: &DriverChoice,
+        choice: &DriverChoice,
     ) -> ImportResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.choices.lock().unwrap().push(choice.clone());
         self.seen.lock().unwrap().push((
             sources.iter().map(|s| s.to_path_buf()).collect(),
             target.to_path_buf(),

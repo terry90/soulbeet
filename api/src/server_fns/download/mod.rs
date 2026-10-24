@@ -1,7 +1,9 @@
 use dioxus::fullstack::{WebSocketOptions, Websocket};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
-use shared::download::{DownloadEvent, DownloadableItem, QueuedDownload};
+use shared::download::{
+    DownloadEvent, DownloadableItem, ImportChoice, MatchChoices, QueuedDownload,
+};
 #[cfg(feature = "server")]
 use shared::download::{DownloadProgress, EnqueueStatus};
 
@@ -194,6 +196,7 @@ pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnE
         local_path: None,
         import_output: None,
         retryable: false,
+        can_choose_import: false,
     };
     let _ = tx.send(DownloadEvent::Progress(vec![cancelled]));
 
@@ -389,12 +392,19 @@ async fn queue_and_watch(
     }
 }
 
-/// Imports a failed or skipped row again, from the job kept for it.
+/// Imports a failed or skipped row again, from the job kept for it, the way
+/// `choice` says.
 #[post("/api/downloads/retry-import", auth: AuthSession)]
-pub async fn retry_import(item: String) -> Result<(), ServerFnError> {
-    crate::import_queue::retry_import_for(&auth.0.username, &item)
+pub async fn retry_import(item: String, choice: ImportChoice) -> Result<(), ServerFnError> {
+    crate::import_queue::retry_import_for(&auth.0.username, &item, choice)
         .await
         .map_err(refusal_error)
+}
+
+/// The matches a skipped row can be imported with.
+#[post("/api/downloads/import-choices", auth: AuthSession)]
+pub async fn import_choices(item: String) -> Result<MatchChoices, ServerFnError> {
+    crate::import_queue::import_choices_for(&auth.0.username, &item).map_err(refusal_error)
 }
 
 /// Drops the stored imports of rows the user cleared.

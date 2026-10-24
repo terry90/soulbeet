@@ -26,8 +26,8 @@ pub fn rows_with_state(rows: &[DownloadProgress], state: DownloadState) -> Vec<D
 }
 
 /// The rows of a finished job: the outcome text as the error, the folder the
-/// files were kept in when a retry is kept for them, and the output tail on
-/// the first row only.
+/// files were kept in when a retry is kept for them, whether that retry can
+/// pick a match, and the output tail on the first row only.
 pub fn rows_for_done(
     rows: &[DownloadProgress],
     job: &ImportJob,
@@ -49,6 +49,7 @@ pub fn rows_for_done(
     };
     // Same rule as the retry store, so a row offers Retry only when one is kept.
     let retryable = keeps_retry(&result.outcome);
+    let can_choose_import = retryable && job.choices.is_some();
     let local_path = retryable.then(|| kept_in(job)).flatten();
     let output = (!result.output_tail.is_empty()).then(|| result.output_tail.clone());
     rows.iter()
@@ -58,6 +59,7 @@ pub fn rows_for_done(
                 state: state.clone(),
                 error: error.clone(),
                 retryable,
+                can_choose_import,
                 ..row.clone()
             }
             .with_import_details(local_path.clone(), output.clone().filter(|_| i == 0))
@@ -78,10 +80,11 @@ fn kept_in(job: &ImportJob) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::import_queue::test_support::{imported, row};
+    use crate::import_queue::test_support::{candidate, imported, no_match, row, track_choices};
     use crate::import_queue::{ImportJob, JobOutcome};
-    use soulbeet::{ImportMode, ImportResult, SkipReason, TaskCount, TimeoutKind};
+    use soulbeet::{DriverChoice, ImportMode, ImportResult, SkipReason, TaskCount, TimeoutKind};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -139,6 +142,8 @@ mod tests {
             owner: None,
             snapshot_target: false,
             cleanup_root: None,
+            choice: DriverChoice::Auto,
+            choices: None,
         }
     }
 
@@ -229,6 +234,27 @@ mod tests {
             ok[0].error.as_deref(),
             Some("Imported as-is (untagged); 1 file(s) were not imported")
         );
+    }
+
+    #[test]
+    fn rows_offer_choices_only_while_a_kept_job_has_them() {
+        let with_choices = ImportJob {
+            choices: Some(Arc::new(track_choices(vec![candidate("FakeSrc", "w1")]))),
+            ..job("/dl/a.flac", ImportMode::Singleton)
+        };
+        let choosable = |job: &ImportJob, result: ImportResult| {
+            rows_for_done(&[row("a")], job, &done(result))[0].can_choose_import
+        };
+        assert!(choosable(&with_choices, no_match(1)));
+        assert!(choosable(
+            &with_choices,
+            ImportResult::failed("FakeSrc has no recording w1".into())
+        ));
+        assert!(!choosable(&with_choices, imported()));
+        assert!(!choosable(
+            &job("/dl/a.flac", ImportMode::Singleton),
+            no_match(1)
+        ));
     }
 
     #[test]

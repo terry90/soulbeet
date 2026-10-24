@@ -972,6 +972,8 @@ pub async fn generate_discovery_playlist_internal(
                         owner: None,
                         snapshot_target: true,
                         cleanup_root: Some(download_base.clone()),
+                        choice: soulbeet::DriverChoice::Auto,
+                        choices: None,
                     })
                     .await
                     .wait()
