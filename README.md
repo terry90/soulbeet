@@ -164,7 +164,7 @@ Default `beet import` flags used:
 In quiet mode beets skips files it cannot match closely, and the row says "No close match". Soulbeet keeps the downloaded files and the row offers:
 -   **Retry import**: the same import again, for example after you changed the beets config.
 
-When beets handled the import as one task (one track, or one album folder that beets reads as one album) and the driver recorded the matches beets weighed, the row also offers the two choices below. Otherwise it offers only Retry import.
+When beets handled the import as one task (one track, or one album folder that beets reads as one album) and Soulbeet could read the matches beets weighed for it, the row also offers the two choices below. Otherwise it offers only Retry import.
 -   **Show matches**: the matches beets weighed for that import, with their score and what differs. Pick one, or paste a MusicBrainz link or ID (a recording for singletons, a release in album mode), then click **Import with this match**. beets applies exactly that match (`-S <id>`), however low its score.
 -   **Import as-is**: beets imports the files with their own tags (`-A`) and looks nothing up. Every file needs artist and title tags, and in album mode an album tag too. If one lacks them, nothing is imported and the row names the files that lack them: beets would file untagged music under empty names, and with `duplicate_action: remove` a second untagged import would replace the first.
 
