@@ -2,6 +2,7 @@ use api::{delete_user, get_users, register, update_user_password, update_usernam
 use dioxus::prelude::*;
 
 use crate::auth::use_auth;
+use crate::TextInput;
 
 #[derive(Clone, PartialEq)]
 enum EditMode {
@@ -124,24 +125,21 @@ pub fn UserManager() -> Element {
             label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
               "New Username"
             }
-            input {
-              class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
-              value: "{new_username}",
-              oninput: move |e| new_username.set(e.value()),
+            TextInput {
+              value: new_username(),
+              oninput: move |v| new_username.set(v),
               placeholder: "Username",
-              "type": "text",
             }
           }
           div {
             label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
               "New Password"
             }
-            input {
-              class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
-              value: "{new_password}",
-              oninput: move |e| new_password.set(e.value()),
+            TextInput {
+              value: new_password(),
+              oninput: move |v| new_password.set(v),
               placeholder: "Password",
-              "type": "password",
+              password: true,
             }
           }
         }

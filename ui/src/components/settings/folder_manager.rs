@@ -2,7 +2,7 @@ use api::{create_user_folder, delete_folder, get_user_folders, update_folder};
 use dioxus::prelude::*;
 
 use crate::auth::use_auth;
-use crate::friendly_error;
+use crate::{friendly_error, TextInput};
 
 #[component]
 pub fn FolderManager() -> Element {
@@ -189,24 +189,20 @@ pub fn FolderManager() -> Element {
                     label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
                         "Folder Name (e.g., 'Music/Common')"
                     }
-                    input {
-                        class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
-                        value: "{folder_name}",
-                        oninput: move |e| folder_name.set(e.value()),
+                    TextInput {
+                        value: folder_name(),
+                        oninput: move |v| folder_name.set(v),
                         placeholder: "My Music",
-                        "type": "text",
                     }
                 }
                 div {
                     label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
                         "Folder Path"
                     }
-                    input {
-                        class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
-                        value: "{folder_path}",
-                        oninput: move |e| folder_path.set(e.value()),
+                    TextInput {
+                        value: folder_path(),
+                        oninput: move |v| folder_path.set(v),
                         placeholder: "/home/user/Music",
-                        "type": "text",
                     }
                 }
             }

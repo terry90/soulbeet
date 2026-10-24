@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use shared::download::{DownloadableGroup, DownloadableItem};
 use std::collections::HashSet;
 
-use crate::{use_auth, Checkbox};
+use crate::{use_auth, Checkbox, FIELD_CLASS};
 
 /// Format a sample rate in Hz as kHz, trimming a trailing .0 (44100 -> "44.1", 48000 -> "48").
 fn format_khz(hz: i32) -> String {
@@ -294,7 +294,7 @@ pub fn DownloadResults(props: Props) -> Element {
                 }
                 select {
                     name: "dl_folder",
-                    class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
+                    class: FIELD_CLASS,
                     value: "{selected_folder}",
                     onchange: move |e| selected_folder.set(e.value()),
                     option { value: "", disabled: true, "Select a folder" }

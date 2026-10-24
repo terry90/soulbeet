@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
-use crate::friendly_error;
 use crate::settings_context::use_settings;
+use crate::{friendly_error, FIELD_CLASS};
 
 #[component]
 pub fn PreferencesManager() -> Element {
@@ -83,7 +83,7 @@ pub fn PreferencesManager() -> Element {
                         "Default Metadata Provider"
                     }
                     select {
-                        class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
+                        class: FIELD_CLASS,
                         value: "{selected_provider}",
                         onchange: move |e| selected_provider.set(e.value()),
                         for provider in providers.iter() {

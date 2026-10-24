@@ -4,7 +4,7 @@ use shared::system::NavidromeStatus;
 use super::connection_status_row::{beets_row, ConnectionStatusRow, ImporterDetails};
 use crate::friendly_error;
 use crate::settings_context::use_settings;
-use crate::{use_auth, use_system_health};
+use crate::{use_auth, use_system_health, TextInput};
 
 #[component]
 pub fn AppConfigManager() -> Element {
@@ -86,21 +86,19 @@ pub fn AppConfigManager() -> Element {
                     div { class: "space-y-4",
                         div {
                             label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider", "slskd URL" }
-                            input {
-                                class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
-                                value: "{slskd_url}",
-                                oninput: move |e| slskd_url.set(e.value()),
+                            TextInput {
+                                value: slskd_url(),
+                                oninput: move |v| slskd_url.set(v),
                                 placeholder: "http://localhost:5030",
                             }
                         }
                         div {
                             label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider", "slskd API Key" }
-                            input {
-                                class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono",
-                                value: "{slskd_api_key}",
-                                oninput: move |e| slskd_api_key.set(e.value()),
+                            TextInput {
+                                value: slskd_api_key(),
+                                oninput: move |v| slskd_api_key.set(v),
                                 placeholder: "Enter slskd API key",
-                                "type": "password",
+                                password: true,
                             }
                         }
                     }

@@ -4,7 +4,7 @@ use std::pin::Pin;
 use dioxus::prelude::*;
 use shared::download::{ImportChoice, MatchCandidate, MatchChoices, MatchKind};
 
-use crate::{use_open_handler, Choice, ChoiceList, Disclosure, RowAction};
+use crate::{use_open_handler, Choice, ChoiceList, Disclosure, RowAction, TextInput};
 
 /// Resolves to the matches of the row's item, or None when the server did
 /// not give them.
@@ -154,21 +154,19 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
                                     },
                                 }
                             }
-                            input {
-                                class: "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm placeholder-gray-600",
-                                r#type: "text",
+                            TextInput {
+                                class: "text-sm placeholder-gray-600",
                                 placeholder: id_label,
                                 aria_label: id_label,
                                 value: typed(),
-                                oninput: move |evt: Event<FormData>| {
-                                    let text = evt.value();
+                                oninput: move |text: String| {
                                     if !text.trim().is_empty() {
                                         picked.set(None);
                                     }
                                     typed.set(text);
                                 },
-                                onkeydown: move |evt: Event<KeyboardData>| {
-                                    if let (Key::Enter, Some(choice)) = (evt.key(), on_enter.clone()) {
+                                on_enter: move |_| {
+                                    if let Some(choice) = on_enter.clone() {
                                         on_choose.call(choice);
                                     }
                                 },
