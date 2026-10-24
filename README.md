@@ -127,7 +127,7 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `SECRET_KEY` | Encryption key for tokens and credentials | |
 | `NAVIDROME_URL` | Your Navidrome server URL. Optional: without it you log in with local accounts, and discovery playlists, rating sync and auto-delete are unavailable | |
 | `BEETS_CONFIG` | Path to your beets config file. Replaces the shipped `/app/beets_config.yaml` (beets defaults still apply underneath) | `beets_config.yaml` |
-| `BEETS_PYTHON` | Python interpreter that runs beets and the config check. By default it is read from the `#!` line of `beet` (`/usr/bin/python3` in the image) | |
+| `BEETS_PYTHON` | Python interpreter that runs beets imports and the config check. By default it is read from the `#!` line of `beet` (`/usr/bin/python3` in the image) | |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
@@ -146,6 +146,8 @@ Soulbeet uses `beets` to import music. The image ships a config at `/app/beets_c
 -   `discogs` needs `discogs.user_token`.
 -   Soulbeet passes `--log`, which overrides `import.log`, and `--noincremental` and `--noresume`, which override `import.incremental` and `import.resume`.
 
+Soulbeet runs every import through a small driver, `lib/soulbeet/src/beets/import.py`, with the Python that runs beets. The driver runs beets' own `beet` command line with the flags below and notes the matches beets weighed, so a skipped import can be finished with one of them (see [Skipped Imports](#skipped-imports)). It needs beets 2.11 or newer; with an older beets, Soulbeet marks beets as broken.
+
 Default `beet import` flags used:
 -   `-v`: Verbose output. The last lines of it (20 lines, 2 KiB) are shown under "beets output" on rows that carry a note: skipped, failed, or imported with a warning
 -   `-c [config]`: The config file
@@ -156,6 +158,13 @@ Default `beet import` flags used:
 -   `-l [library_path]`: Library database path (per-folder)
 -   `-d [target_path]`: Import to the specific folder selected in the web UI.
 -   `--log [file]`: Where beets writes its import log
+
+#### Skipped Imports
+
+In quiet mode beets skips files it cannot match closely, and the row says "No close match". Soulbeet keeps the downloaded files and the row offers:
+-   **Retry import**: the same import again, for example after you changed the beets config.
+-   **Show matches**: the matches beets weighed for that import, with their score and what differs. Pick one, or paste a MusicBrainz link or ID (a recording for singletons, a release in album mode), then click **Import with this match**. beets applies exactly that match (`-S <id>`), however low its score.
+-   **Import as-is**: beets imports the files with their own tags (`-A`) and looks nothing up. Every file needs artist and title tags, and in album mode an album tag too. If one lacks them, nothing is imported and the row names the files that lack them: beets would file untagged music under empty names, and with `duplicate_action: remove` a second untagged import would replace the first.
 
 ### Image Tiers
 
@@ -196,7 +205,7 @@ By setting `BEETS_ALBUM_MODE=true`, Soulbeet imports each download batch as an a
 This flag is only needed when you want album tags on your tracks. E.g: `albumartist` `mb_albumid` and so on..
 
 **Important for Album Mode:**
-Since `beets` is run in quiet mode (`-q`), it will skip any imports that require user intervention (e.g., if the metadata doesn't match confidently). To ensure partial albums or less popular releases are imported correctly, you **must** configure your config file to be more permissive.
+Since `beets` is run in quiet mode (`-q`), it will skip any imports that require user intervention (e.g., if the metadata doesn't match confidently). A skipped album can still be imported with a match you pick or as-is (see [Skipped Imports](#skipped-imports)). To ensure partial albums or less popular releases are imported correctly, you **must** configure your config file to be more permissive.
 
 Recommended additions to your config file for Album Mode:
 
@@ -257,11 +266,11 @@ When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from 
     ```bash
     dx serve --platform web
     ```
-4.  Run the tests (the probe tests need Python 3.11+ with beets and pytest installed):
+4.  Run the tests (the Python tests need Python 3.11+ with beets and pytest installed):
     ```bash
     cargo test --workspace --features server,dioxus/server --lib
     cargo test -p soulbeet --lib
-    python -m pytest -q lib/soulbeet/tests/probe
+    python -m pytest -q lib/soulbeet/tests/probe lib/soulbeet/tests/import
     ```
 
 ## Roadmap
