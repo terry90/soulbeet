@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use dioxus::prelude::*;
 
-use crate::Logo;
+use crate::{FieldLook, Logo, TextInput};
 
 type LoginCallback = Callback<(String, String), Pin<Box<dyn Future<Output = Result<(), String>>>>>;
 
@@ -64,11 +64,10 @@ pub fn Login(props: Props) -> Element {
               label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
                 "Username"
               }
-              input {
-                class: "w-full bg-beet-dark border border-white/10 rounded p-3 text-white focus:outline-none focus:border-beet-accent focus:shadow-[0_0_10px_rgba(217,70,239,0.3)] transition-all font-mono",
-                value: "{username}",
-                oninput: move |e| username.set(e.value()),
-                "type": "text",
+              TextInput {
+                look: FieldLook::Login,
+                value: username(),
+                oninput: move |v| username.set(v),
                 placeholder: "Enter username",
               }
             }
@@ -76,12 +75,12 @@ pub fn Login(props: Props) -> Element {
               label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
                 "Password"
               }
-              input {
-                class: "w-full bg-beet-dark border border-white/10 rounded p-3 text-white focus:outline-none focus:border-beet-accent focus:shadow-[0_0_10px_rgba(217,70,239,0.3)] transition-all font-mono",
-                value: "{password}",
-                oninput: move |e| password.set(e.value()),
-                "type": "password",
+              TextInput {
+                look: FieldLook::Login,
+                value: password(),
+                oninput: move |v| password.set(v),
                 placeholder: "Enter password",
+                password: true,
               }
             }
 

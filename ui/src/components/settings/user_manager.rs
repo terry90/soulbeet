@@ -2,7 +2,7 @@ use api::{delete_user, get_users, register, update_user_password, update_usernam
 use dioxus::prelude::*;
 
 use crate::auth::use_auth;
-use crate::TextInput;
+use crate::{FieldLook, TextInput};
 
 #[derive(Clone, PartialEq)]
 enum EditMode {
@@ -174,12 +174,12 @@ pub fn UserManager() -> Element {
                               div { class: "flex flex-col gap-2",
                                 div { class: "font-bold text-white font-display", "{user.username}" }
                                 if edit_mode() == EditMode::Password {
-                                  input {
-                                    class: "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
-                                    value: "{edit_user_password}",
-                                    oninput: move |e| edit_user_password.set(e.value()),
+                                  TextInput {
+                                    look: FieldLook::Compact,
+                                    value: edit_user_password(),
+                                    oninput: move |v| edit_user_password.set(v),
                                     placeholder: "New password",
-                                    "type": "password",
+                                    password: true,
                                   }
                                   div { class: "flex gap-2 mt-1",
                                     button {
@@ -194,12 +194,11 @@ pub fn UserManager() -> Element {
                                     }
                                   }
                                 } else {
-                                  input {
-                                    class: "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
-                                    value: "{edit_user_username}",
-                                    oninput: move |e| edit_user_username.set(e.value()),
+                                  TextInput {
+                                    look: FieldLook::Compact,
+                                    value: edit_user_username(),
+                                    oninput: move |v| edit_user_username.set(v),
                                     placeholder: "New username",
-                                    "type": "text",
                                   }
                                   div { class: "flex gap-2 mt-1",
                                     button {

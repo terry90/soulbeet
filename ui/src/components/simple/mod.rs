@@ -12,4 +12,4 @@ pub use choice_list::{Choice, ChoiceList};
 pub(crate) use disclosure::ToggleDriver;
 pub use disclosure::{use_open_handler, Disclosure};
 pub use row_action::RowAction;
-pub use text_input::{TextInput, FIELD_CLASS};
+pub use text_input::{FieldLook, TextInput, FIELD_CLASS};
