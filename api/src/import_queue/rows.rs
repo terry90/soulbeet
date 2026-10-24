@@ -161,6 +161,7 @@ mod tests {
                 imported: 0,
                 total: 2,
             },
+            choices: None,
         };
 
         let album = rows_for_done(

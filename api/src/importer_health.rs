@@ -75,7 +75,7 @@ pub async fn refusal(importer: &dyn MusicImporter) -> Option<String> {
 mod tests {
     use super::*;
     use shared::library::DuplicateReport;
-    use soulbeet::{ImportMode, ImportResult};
+    use soulbeet::{DriverChoice, ImportMode, ImportResult};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -104,7 +104,13 @@ mod tests {
         fn name(&self) -> &'static str {
             "Stub"
         }
-        async fn import(&self, _: &[&Path], _: &Path, _: ImportMode) -> ImportResult {
+        async fn import(
+            &self,
+            _: &[&Path],
+            _: &Path,
+            _: ImportMode,
+            _: &DriverChoice,
+        ) -> ImportResult {
             unreachable!()
         }
         async fn find_duplicates(&self, _: &[&Path]) -> Result<DuplicateReport, String> {

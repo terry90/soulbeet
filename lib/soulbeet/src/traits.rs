@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use shared::{
-    download::{DownloadProgress, DownloadableItem, QueuedDownload, SearchResult},
+    download::{DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult},
     library::DuplicateReport,
     metadata::{Album, AlbumWithTracks, SearchResult as MetadataSearchResult, Track},
     recommendation::{
@@ -70,6 +70,17 @@ pub enum ImportMode {
     Singleton,
 }
 
+/// How the importer decides on a match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverChoice {
+    /// As a quiet import does: apply a strong match, skip the rest.
+    Auto,
+    /// No lookup; the files keep their own tags.
+    AsIs,
+    /// Apply what `data_source` returns for `id`, however close it is.
+    Pick { data_source: String, id: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportOutcome {
     Imported {
@@ -123,6 +134,9 @@ pub struct ImportResult {
     /// The last lines beets printed, for the row's disclosure.
     pub output_tail: String,
     pub tasks: TaskCount,
+    /// What a user can pick from after an automatic import skipped its only
+    /// task for want of a close match.
+    pub choices: Option<MatchChoices>,
 }
 
 impl ImportResult {
@@ -131,6 +145,7 @@ impl ImportResult {
             outcome,
             output_tail: String::new(),
             tasks: TaskCount::default(),
+            choices: None,
         }
     }
 
@@ -237,7 +252,13 @@ pub trait MusicImporter: Send + Sync {
     fn id(&self) -> &'static str;
     fn name(&self) -> &'static str;
 
-    async fn import(&self, sources: &[&Path], target: &Path, mode: ImportMode) -> ImportResult;
+    async fn import(
+        &self,
+        sources: &[&Path],
+        target: &Path,
+        mode: ImportMode,
+        choice: &DriverChoice,
+    ) -> ImportResult;
 
     async fn find_duplicates(
         &self,

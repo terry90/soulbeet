@@ -259,6 +259,7 @@ impl Classifier {
             outcome,
             output_tail: tail,
             tasks,
+            choices: None,
         }
     }
 
@@ -530,6 +531,36 @@ mod tests {
         assert_eq!(
             classify(fixture!("noautotag"), false).outcome,
             imported(false, &[])
+        );
+    }
+
+    /// Import as-is runs `beet import -A`, which leaves no marker either, so
+    /// the importer passes `autotag_off` for it.
+    #[test]
+    fn minus_a_imports_are_untagged_when_the_importer_says_so() {
+        let album = classify(fixture!("asis"), true);
+        assert_eq!(album.outcome, imported(true, &[]));
+        assert_eq!(
+            album.tasks,
+            TaskCount {
+                imported: 1,
+                total: 1
+            }
+        );
+        assert_eq!(album.to_string(), "Imported as-is (untagged)");
+        assert_eq!(
+            classify(fixture!("asis"), false).outcome,
+            imported(false, &[])
+        );
+
+        let single = classify(fixture!("asis_single"), true);
+        assert_eq!(single.outcome, imported(true, &[]));
+        assert_eq!(
+            single.tasks,
+            TaskCount {
+                imported: 2,
+                total: 2
+            }
         );
     }
 

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
 use shared::library::DuplicateReport;
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
-use soulbeet::{ImportMode, ImportOutcome, ImportResult, MusicImporter, TaskCount};
+use soulbeet::{DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter, TaskCount};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -23,6 +23,7 @@ pub fn imported() -> ImportResult {
             imported: 1,
             total: 1,
         },
+        choices: None,
     }
 }
 
@@ -172,7 +173,13 @@ impl MusicImporter for StubImporter {
         "Stub"
     }
 
-    async fn import(&self, sources: &[&Path], target: &Path, _: ImportMode) -> ImportResult {
+    async fn import(
+        &self,
+        sources: &[&Path],
+        target: &Path,
+        _: ImportMode,
+        _: &DriverChoice,
+    ) -> ImportResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.seen.lock().unwrap().push((
             sources.iter().map(|s| s.to_path_buf()).collect(),

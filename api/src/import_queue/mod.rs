@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState};
 use soulbeet::audio::{count_audio_files, is_audio_path};
-use soulbeet::{ImportMode, ImportOutcome, ImportResult, MusicImporter};
+use soulbeet::{DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -298,7 +298,9 @@ impl Shared {
             true => Some(audio_files_under(target).await),
             false => None,
         };
-        let result = importer.import(&sources, target, job.mode).await;
+        let result = importer
+            .import(&sources, target, job.mode, &DriverChoice::Auto)
+            .await;
         let new_files = match before {
             Some(before) => {
                 let mut new: Vec<PathBuf> = audio_files_under(target)

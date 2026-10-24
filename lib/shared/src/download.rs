@@ -234,6 +234,62 @@ impl DownloadProgress {
     }
 }
 
+/// How a skipped import is run again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportChoice {
+    /// Let beets decide, as the first import did.
+    Auto,
+    /// Import with the files' own tags.
+    AsIs,
+    /// One of the candidates beets found for this import.
+    Candidate { data_source: String, id: String },
+    /// A MusicBrainz link or ID as the user typed it.
+    MusicBrainz(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MatchKind {
+    Track,
+    Album,
+}
+
+/// A match beets weighed for a skipped import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchCandidate {
+    pub data_source: String,
+    pub id: String,
+    pub artist: String,
+    /// The track title, or the album name for an album match.
+    pub title: String,
+    /// The album a track match belongs to.
+    pub album: Option<String>,
+    pub year: Option<u32>,
+    pub country: Option<String>,
+    pub disambig: Option<String>,
+    /// How close the match is, 1000 being exact.
+    pub per_mille: u16,
+    /// What differs, by beets' penalty names, the weightiest first.
+    pub differs: Vec<String>,
+    pub length_secs: Option<u32>,
+    /// How the files fit an album match's tracks.
+    pub tracks: Option<TrackFit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackFit {
+    pub matched: u32,
+    pub total: u32,
+    /// Files no track matched, which an import of this match leaves behind.
+    pub extra_files: u32,
+}
+
+/// The matches an import skipped for, best first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchChoices {
+    pub kind: MatchKind,
+    pub candidates: Vec<MatchCandidate>,
+}
+
 const MAX_LABEL_BYTES: usize = 200;
 
 /// Folder name for a download batch: `<label> [<first 8 alphanumerics of batch_id>]`,

@@ -56,6 +56,9 @@ run_case() {
       PRIME=1 FAKESRC_MODE=weak "$capture" "$1" asis_dup.yaml
       ;;
     noautotag) fresh "$1"; mkalbum "$w/src" 2; FAKESRC_MODE=strong "$capture" "$1" noautotag.yaml ;;
+    # Import as-is: -A runs no lookup, which a failing source would show.
+    asis) fresh "$1"; mkalbum "$w/src" 2; FAKESRC_MODE=error "$capture" "$1" base.yaml -A ;;
+    asis_single) fresh "$1"; mkalbum "$w/src" 2; FAKESRC_MODE=error "$capture" "$1" base.yaml -s -A ;;
     empty) fresh "$1"; FAKESRC_MODE=strong "$capture" "$1" base.yaml ;;
     nonmusic)
       fresh "$1"; echo "liner notes" >"$w/src/notes.txt"; head -c 2048 /dev/zero >"$w/src/cover.jpg"
@@ -92,7 +95,7 @@ run_case() {
 
 all=(album_strong single_strong album_weak single_weak album_none single_none
   dup_ask_album dup_ask_single dup_skip dup_merge dup_remove dup_keep
-  asis_weak asis_dup noautotag empty nonmusic corrupt_one mbdown srcerr
+  asis_weak asis_dup noautotag asis asis_single empty nonmusic corrupt_one mbdown srcerr
   missing_path timid missing_config readonly_target pipeline_crash bad_plugin multi_task)
 
 [ $# -gt 0 ] || set -- "${all[@]}"
