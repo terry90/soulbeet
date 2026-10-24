@@ -4,7 +4,8 @@
 // - beets 2.x (musicbrainz plugin): recording search for candidate ids,
 //   then per-id recording lookups
 // Everything is served from the shared fixture dataset. A control API sets
-// how beets is answered (see MbControl); soulbeet is always answered normally.
+// how beets is answered and lists what beets asked for (see MbControl);
+// soulbeet is always answered normally.
 
 import type { IncomingMessage, Server } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -32,10 +33,13 @@ export class MbControl {
   mode: MbMode = 'normal';
   /** delay before every answer to beets */
   latencyMs = 0;
+  /** paths beets asked for since the last reset, oldest first */
+  requests: string[] = [];
 
   reset(): void {
     this.mode = 'normal';
     this.latencyMs = 0;
+    this.requests = [];
   }
 }
 
@@ -44,15 +48,19 @@ function isBeets(req: IncomingMessage): boolean {
   return req.headers['user-agent']?.startsWith('beets/') ?? false;
 }
 
-const WEAK_SUFFIX = ' (Live at Somewhere)';
 const WEAK_LENGTH_FACTOR = 3;
+
+/** A track's title as weak mode serves it to beets. */
+export function weakTitle(title: string): string {
+  return `${title} (Live at Somewhere)`;
+}
 
 function weakened(release: FixtureRelease): FixtureRelease {
   return {
     ...release,
     tracks: release.tracks.map((track) => ({
       ...track,
-      title: `${track.title}${WEAK_SUFFIX}`,
+      title: weakTitle(track.title),
       lengthMs: track.lengthMs * WEAK_LENGTH_FACTOR,
     })),
   };
@@ -266,8 +274,9 @@ function releaseWithRecordingsJson(release: FixtureRelease): Record<string, unkn
 // ---- server -----------------------------------------------------------------
 
 /**
- * Applies the control to beets requests: latency, then a 503 when
- * unavailable. The handler gets whether to weaken what it serves.
+ * Applies the control to beets requests: logs them, waits the latency, then
+ * answers 503 when unavailable. The handler gets whether to weaken what it
+ * serves.
  */
 function served(
   control: MbControl,
@@ -278,6 +287,7 @@ function served(
       handler(ctx, false);
       return;
     }
+    control.requests.push(ctx.url.pathname);
     if (control.latencyMs > 0) {
       await sleep(control.latencyMs);
     }
@@ -379,6 +389,13 @@ export function createMusicBrainzServer(control: MbControl): Server {
           control.latencyMs = latencyMs ?? control.latencyMs;
           console.log(`[mb] mode ${control.mode}, beets latency ${control.latencyMs} ms`);
           sendJson(res, 200, { ok: true, mode: control.mode, latencyMs: control.latencyMs });
+        },
+      },
+      {
+        method: 'GET',
+        pattern: '/_control/requests',
+        handler: ({ res }) => {
+          sendJson(res, 200, control.requests);
         },
       },
       {

@@ -3,6 +3,7 @@
 
 import { existsSync, readdirSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { expect } from '@playwright/test';
 import { musicDirOnHost } from './env.js';
 
@@ -51,4 +52,27 @@ export function listFilesRecursive(dir: string): string[] {
     }
     return entry.isFile() ? [path] : [];
   });
+}
+
+/** A track as a folder's beets library records it. */
+export interface LibraryItem {
+  title: string;
+  /** empty when beets did not match it to a recording */
+  mbTrackId: string;
+}
+
+/** Every track in the folder's beets library (`.beets_library.db` at its root). */
+export function libraryItems(folderName: string): LibraryItem[] {
+  const db = new DatabaseSync(join(musicDirOnHost, folderName, '.beets_library.db'), {
+    readOnly: true,
+  });
+  try {
+    const rows = db.prepare('SELECT title, mb_trackid FROM items').all() as {
+      title: string;
+      mb_trackid: string;
+    }[];
+    return rows.map((row) => ({ title: row.title, mbTrackId: row.mb_trackid }));
+  } finally {
+    db.close();
+  }
 }

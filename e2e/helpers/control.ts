@@ -1,6 +1,6 @@
 // Client for the stubs' /_control APIs: scripts slskd peer behavior and
-// outages and how MusicBrainz answers beets per spec, and resets shared stub
-// state between destructive tests.
+// outages and how MusicBrainz answers beets per spec, reads what beets asked
+// MusicBrainz for, and resets shared stub state between destructive tests.
 
 import type { PeerBehavior } from '../fixtures/dataset.js';
 import type { MbMode } from '../stubs/src/mb-server.js';
@@ -41,6 +41,15 @@ export async function resetStubs(): Promise<void> {
 /** How the MusicBrainz stub answers beets from now on; soulbeet is unaffected. */
 export async function setMbMode(mode: MbMode, latencyMs = 0): Promise<void> {
   await post('/_control/mode', { mode, latencyMs }, mbControlUrl);
+}
+
+/** The paths beets asked the MusicBrainz stub for since the last reset, oldest first. */
+export async function mbRequests(): Promise<string[]> {
+  const response = await fetch(`${mbControlUrl}/_control/requests`);
+  if (!response.ok) {
+    throw new Error(`control requests failed: ${response.status}`);
+  }
+  return (await response.json()) as string[];
 }
 
 export async function setPeerBehavior(username: string, behavior: PeerBehavior): Promise<void> {

@@ -46,6 +46,9 @@ export const musicDirOnHost = join(e2eRoot, '.runtime', 'music');
 /** The shared downloads directory on the host. */
 export const downloadsDirOnHost = join(e2eRoot, '.runtime', 'downloads');
 
+/** Where specs save screenshots of the screens they reach; unset saves none. */
+export const shotsDir = process.env.E2E_SHOTS_DIR;
+
 /** Navidrome-dependent specs only run when the stack includes one. */
 export const navidromeEnabled = process.env.E2E_NAVIDROME === '1';
 
