@@ -19,15 +19,21 @@ import beets
 
 
 def import_hook():
-    """Whether beets builds its import session from a module global that
-    import.py can replace. probe.py and import.py each hold this function,
-    and a test keeps the two equal."""
+    """Whether this beets has what import.py hooks into: an import session
+    built from a module global it can replace (beets 2.6), and an id on every
+    match (2.8). probe.py and import.py each hold this function, and a test
+    keeps the two equal."""
+    from beets.autotag.hooks import AlbumInfo, TrackInfo
     from beets.ui.commands import import_
     from beets.ui.commands.import_.session import TerminalImportSession
 
     return (
         import_.TerminalImportSession is TerminalImportSession
         and "TerminalImportSession" in import_.import_files.__code__.co_names
+        and all(
+            isinstance(getattr(info, "id", None), property)
+            for info in (AlbumInfo, TrackInfo)
+        )
     )
 
 
@@ -37,7 +43,7 @@ except (ImportError, AttributeError):
     hooked = False
 if not hooked:
     print(
-        "error: soulbeet needs beets 2.11 or newer to import"
+        "error: soulbeet needs beets 2.8 or newer to import"
         f" (found {beets.__version__})",
         file=sys.stderr,
     )
