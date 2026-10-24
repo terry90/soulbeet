@@ -1,0 +1,13 @@
+
+/src (3 items)
+
+  Match (40.3%):
+  Some Other Artist - Other Album 2
+  ≠ artist, album, tracks, unmatched tracks
+  FakeSrc, None, None, None, None, None, None
+  ≠ Artist: Zzqx Artist -> Some Other Artist
+  ≠ Album: Qzz Album -> Other Album 2
+     ≠ (#1) Song Number 1 (0:02) -> (#1) Totally Different 1 (0:00)
+     ≠ (#2) Song Number 2 (0:02) -> (#2) Totally Different 2 (0:00)
+Unmatched tracks (1):
+ ! Song Number 3 (#3) (0:02)

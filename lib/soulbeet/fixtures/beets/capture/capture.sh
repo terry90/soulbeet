@@ -11,6 +11,9 @@
 #   SRC=path  imports that path instead (for a missing source).
 #   PRIME=1   first imports $FIXTURE_WORK/CASE/prime with the same config, so
 #             the captured run meets a duplicate.
+#   CHOICE=...  runs the captured import through import.py with this choice,
+#             such as "pick FakeSrc fake-a-w2" (beet itself prints what the
+#             driver's auto choice prints).
 #   FAKESRC_MODE, FAKESRC_CRASH are read by fakesrc.py.
 set -euo pipefail
 
@@ -25,6 +28,7 @@ shift 2
 w=$work/$case_name
 src=${SRC:-$w/src}
 out=$fixtures/$case_name
+driver=$(dirname "$(dirname "$fixtures")")/src/beets/import.py
 
 if [ -f "$here/configs/$cfg_name" ]; then
   cfg=$w/config.yaml
@@ -34,9 +38,10 @@ else
 fi
 
 mkdir -p "$w/home" "$w/beetsdir" "$w/music"
+beet_cmd=("$venv/bin/beet")
 beet() {
   env HOME="$w/home" BEETSDIR="$w/beetsdir" NO_COLOR=1 PYTHONUNBUFFERED=1 \
-    "$venv/bin/beet" -v -c "$cfg" -l "$w/music/.beets_library.db" -d "$w/music" "$@" </dev/null
+    "${beet_cmd[@]}" -v -c "$cfg" -l "$w/music/.beets_library.db" -d "$w/music" "$@" </dev/null
 }
 
 if [ "${PRIME:-0}" = 1 ]; then
@@ -51,6 +56,11 @@ submitted=0
 if [ -e "$src" ]; then
   submitted=$(find "$src" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \
     -o -iname '*.ogg' -o -iname '*.aac' -o -iname '*.wav' -o -iname '*.wma' -o -iname '*.opus' \) | wc -l)
+fi
+
+if [ -n "${CHOICE:-}" ]; then
+  read -ra choice <<<"$CHOICE"
+  beet_cmd=("$venv/bin/python" -P -c "$(cat "$driver")" "$w/report.json" "${choice[@]}" --)
 fi
 
 rm -f "$w/runlog.txt"

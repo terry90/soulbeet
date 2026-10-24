@@ -174,6 +174,20 @@ def test_pick_applies_a_weak_album_and_tags_it(beets_env):
     assert beets_env.files_under(beets_env.src) == []
 
 
+def test_pick_of_a_shorter_release_leaves_the_extra_file(beets_env):
+    beets_env.album(beets_env.src, n=3)
+
+    run = beets_env.driver("pick", "FakeSrc", "fake-a-w2", env=WEAK)
+
+    assert run.code == 0, run
+    # The classifier counts the files left behind from these two lines.
+    lines = run.stdout.splitlines()
+    assert f"{beets_env.src} (3 items)" in lines
+    assert "Unmatched tracks (1):" in lines
+    assert len(beets_env.music_files()) == 2
+    assert beets_env.files_under(beets_env.src) == ["03 - Song Number 3.mp3"]
+
+
 @pytest.mark.parametrize(
     "singleton, wanted",
     [(True, "fake-t-w9"), (False, "fake-a-w9")],
