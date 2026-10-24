@@ -3,9 +3,9 @@
 
 import { existsSync, readdirSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { expect } from '@playwright/test';
 import { musicDirOnHost } from './env.js';
+import { DatabaseSync } from './sqlite.js';
 
 /**
  * Path of an imported singleton on the host, following the shipped beets

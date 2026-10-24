@@ -93,7 +93,13 @@ async function skippedRow(
   const { folder } = await freshSession(context, page, folderName);
 
   await performSearch(page, release.title, 'TRACK');
-  await downloadButton(page, release.title).click();
+  // By the exact title: "Cinder Psalm" is also part of the MB-only "Cinder
+  // Psalm (Choir Version)", which no peer shares.
+  await page
+    .locator('li')
+    .filter({ has: page.getByText(release.tracks[0]!.title, { exact: true }) })
+    .getByRole('button', { name: 'Download' })
+    .click();
   await openDownloadsPanel(page);
 
   const [share] = sharesOf(release);
@@ -232,9 +238,15 @@ test('a skipped row imports with the match picked from what beets found', async 
   await expect(row.getByRole('radio', { name: option })).toBeChecked();
   await shot(row, '02-picker-open');
 
-  // The picker fits a phone without scrolling sideways.
+  // The picker fits a phone without scrolling sideways, and so do the
+  // drawer's list and the page.
   await page.setViewportSize({ width: 412, height: 839 });
   await expect.poll(() => row.evaluate((el) => el.scrollWidth - el.clientWidth)).toBe(0);
+  const list = drawer(page).locator(':scope > div.overflow-y-auto');
+  await expect.poll(() => list.evaluate((el) => el.scrollWidth - el.clientWidth)).toBe(0);
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth))
+    .toBeLessThanOrEqual(0);
   const box = await row.boundingBox();
   expect(box!.x + box!.width).toBeLessThanOrEqual(412);
   await shot(drawer(page), '03-picker-phone');
