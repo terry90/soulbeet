@@ -45,7 +45,9 @@ pub fn ChoiceList(props: ChoiceListProps) -> Element {
                         ("border-white/10 hover:bg-white/5", "border-gray-500")
                     };
                     rsx! {
-                        label { class: "flex items-start gap-2 p-2 rounded border cursor-pointer transition-colors has-focus-visible:border-beet-accent {row}",
+                        // relative keeps the sr-only radio inside its option, so
+                        // focusing it scrolls this option into view.
+                        label { class: "relative flex items-start gap-2 p-2 rounded border cursor-pointer transition-colors has-focus-visible:border-beet-accent {row}",
                             input {
                                 class: "sr-only",
                                 r#type: "radio",
@@ -131,6 +133,21 @@ mod tests {
             assert!(html.contains(text), "{text} missing from {html}");
         }
         assert!(!html.contains("checked=true"));
+    }
+
+    #[test]
+    fn each_hidden_radio_is_positioned_inside_its_option() {
+        let html = render(None);
+        let labels: Vec<&str> = html.split("<label ").skip(1).collect();
+        assert_eq!(labels.len(), 2);
+        for label in labels {
+            let class = label
+                .strip_prefix(r#"class=""#)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_default();
+            assert!(class.split(' ').any(|c| c == "relative"), "{label}");
+            assert!(label.contains(r#"<input class="sr-only""#), "{label}");
+        }
     }
 
     #[test]
