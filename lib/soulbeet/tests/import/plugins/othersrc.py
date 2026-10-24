@@ -2,7 +2,8 @@
 tidal answer an MBID whose leading digits fit their id pattern.
 
 OTHERSRC_ARTIST, when set, makes track searches return one track by that
-artist."""
+artist. OTHERSRC_ODD_IDS adds two tracks, one with a numeric id and one
+with none."""
 
 import os
 
@@ -40,5 +41,9 @@ class OtherSrcPlugin(MetadataSourcePlugin):
         return []
 
     def item_candidates(self, item, artist, title):
-        found = os.environ.get("OTHERSRC_ARTIST")
-        return [_track("other-t-1", artist=found)] if found else []
+        found = []
+        if artist_name := os.environ.get("OTHERSRC_ARTIST"):
+            found.append(_track("other-t-1", artist=artist_name))
+        if os.environ.get("OTHERSRC_ODD_IDS"):
+            found += [_track(3135556), _track(None)]
+        return found

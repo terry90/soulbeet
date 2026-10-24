@@ -71,7 +71,8 @@ def describe(match):
     info, dist = match.info, match.distance
     out = {
         "data_source": info.data_source,
-        "id": info.id,
+        # Some sources (deezer, tidal) give numeric ids.
+        "id": str(info.id),
         "artist": info.artist or "",
         "year": info.get("year") or None,
         "country": info.get("country") or None,
@@ -106,7 +107,10 @@ class AutoSession(Session):
             {
                 "paths": [path_text(p) for p in task.paths],
                 "album": task.is_album,
-                "candidates": [describe(m) for m in task.candidates],
+                # A candidate without an id cannot be picked.
+                "candidates": [
+                    describe(m) for m in task.candidates if m.info.id is not None
+                ],
             }
         )
 
