@@ -3,9 +3,11 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use crate::{
-    auth, models,
+    auth,
     base_url::{request_base, DerivedBase},
-    server_fns::{refusal_error, server_error, unauthorized_error},
+    login_limiter::LOGIN_LIMITER,
+    models,
+    server_fns::{rate_limited_error, refusal_error, server_error, unauthorized_error},
     AuthSession,
 };
 
@@ -150,6 +152,16 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
     use crate::services::evict_navidrome_client;
     use models::user::User;
     use shared::system::NavidromeStatus;
+    use std::time::Instant;
+
+    LOGIN_LIMITER
+        .check(&username, Instant::now())
+        .map_err(rate_limited_error)?;
+
+    let rejected = || {
+        LOGIN_LIMITER.record_failure(&username, Instant::now());
+        unauthorized_error("Invalid username or password")
+    };
 
     match try_navidrome_auth(&username, &password).await {
         NavidromeAuthResult::Success => {
@@ -186,6 +198,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             evict_navidrome_client(&user.id).await;
 
             let user = start_session(&cookies, &headers, &user.id).await?;
+            LOGIN_LIMITER.record_success(&username);
 
             Ok(AuthResponse {
                 username: user.username,
@@ -199,12 +212,12 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             let user = User::get_by_username(&username)
                 .await
                 .map_err(server_error)?
-                .ok_or_else(|| unauthorized_error("Invalid username or password"))?;
+                .ok_or_else(rejected)?;
 
             // Verify local password
             let _ = User::verify(&username, &password)
                 .await
-                .map_err(|_| unauthorized_error("Invalid username or password"))?;
+                .map_err(|_| rejected())?;
 
             // Mark Navidrome status as invalid_credentials
             User::update_navidrome_token(
@@ -219,6 +232,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             evict_navidrome_client(&user.id).await;
 
             let user = start_session(&cookies, &headers, &user.id).await?;
+            LOGIN_LIMITER.record_success(&username);
 
             Ok(AuthResponse {
                 username: user.username,
@@ -237,7 +251,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             };
             let user = User::verify(&username, &password)
                 .await
-                .map_err(|_| unauthorized_error("Invalid username or password"))?;
+                .map_err(|_| rejected())?;
 
             // Keep the existing token so it works again once Navidrome is back
             User::update_navidrome_token(
@@ -249,6 +263,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             .map_err(server_error)?;
 
             let user = start_session(&cookies, &headers, &user.id).await?;
+            LOGIN_LIMITER.record_success(&username);
 
             Ok(AuthResponse {
                 username: user.username,
@@ -262,7 +277,9 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
 
 #[post("/api/auth/refresh", auth: AuthSession, cookies: Cookies, headers: HeaderMap)]
 pub async fn refresh_token() -> Result<(), ServerFnError> {
-    start_session(&cookies, &headers, &auth.0.user_id).await.map(|_| ())
+    start_session(&cookies, &headers, &auth.0.user_id)
+        .await
+        .map(|_| ())
 }
 
 #[post("/api/auth/logout", cookies: Cookies)]

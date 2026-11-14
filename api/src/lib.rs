@@ -9,6 +9,8 @@ pub mod globals;
 pub mod import_queue;
 #[cfg(feature = "server")]
 pub mod importer_health;
+#[cfg(feature = "server")]
+pub mod login_limiter;
 pub mod models;
 pub mod security;
 pub mod services;

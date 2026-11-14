@@ -63,6 +63,17 @@ pub fn unauthorized_error<E: std::fmt::Display>(e: E) -> ServerFnError {
     }
 }
 
+/// Status of a request refused because of too many failed sign-ins.
+pub const RATE_LIMITED_CODE: u16 = 429;
+
+pub fn rate_limited_error<E: std::fmt::Display>(e: E) -> ServerFnError {
+    ServerFnError::ServerError {
+        message: e.to_string(),
+        code: RATE_LIMITED_CODE,
+        details: None,
+    }
+}
+
 /// Remove `dir` if empty, then each empty parent above it, stopping below
 /// `root`. `root` itself is never removed, and a `dir` outside `root` is left
 /// alone, so the walk can never climb out of the tree the caller owns (the
