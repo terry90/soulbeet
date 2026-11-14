@@ -250,9 +250,16 @@ impl UserSettings {
     }
 
     pub async fn reset_navidrome_banner(user_id: &str) -> Result<(), String> {
+        Self::reset_navidrome_banner_in(&DB, user_id).await
+    }
+
+    pub async fn reset_navidrome_banner_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+    ) -> Result<(), String> {
         sqlx::query("UPDATE user_settings SET navidrome_banner_dismissed = 0 WHERE user_id = ?")
             .bind(user_id)
-            .execute(&*DB)
+            .execute(db)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())

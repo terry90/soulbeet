@@ -10,6 +10,7 @@ pub mod import_queue;
 #[cfg(feature = "server")]
 pub mod importer_health;
 pub mod models;
+pub mod security;
 pub mod services;
 #[cfg(feature = "server")]
 pub mod transfer_registry;

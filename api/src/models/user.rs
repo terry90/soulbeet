@@ -139,11 +139,20 @@ impl User {
         token: Option<&str>,
         status: &str,
     ) -> Result<(), String> {
+        Self::update_navidrome_token_in(&DB, id, token, status).await
+    }
+
+    pub async fn update_navidrome_token_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+        token: Option<&str>,
+        status: &str,
+    ) -> Result<(), String> {
         sqlx::query("UPDATE users SET navidrome_token = ?, navidrome_status = ? WHERE id = ?")
             .bind(token)
             .bind(status)
             .bind(id)
-            .execute(&*DB)
+            .execute(db)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())

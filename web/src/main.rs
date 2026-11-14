@@ -52,6 +52,11 @@ fn main() {
             // Check the beets config in the background; never awaited here.
             api::importer_health::start_startup_probe();
 
+            api::security::check_seeded_admin().await;
+            for reason in api::security::gate_reasons() {
+                dioxus::logger::tracing::warn!("MCP stays off: {}", reason.message);
+            }
+
             Ok(dioxus::server::router(App).layer(CookieManagerLayer::new()))
         });
     }

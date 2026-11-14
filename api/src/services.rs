@@ -213,7 +213,21 @@ pub async fn navidrome_client_for_user(user_id: &str) -> Result<Arc<NavidromeCli
         .navidrome_token
         .ok_or("Navidrome not configured for user")?;
 
-    let password = crate::crypto::decrypt(&encrypted_token)?;
+    let password = match crate::crypto::decrypt(&encrypted_token) {
+        Ok(password) => password,
+        Err(_) => {
+            tracing::warn!("Stored Navidrome password of user {user_id} cannot be decrypted");
+            if user.navidrome_status != shared::system::NavidromeStatus::InvalidCredentials.as_str()
+            {
+                if let Err(e) =
+                    mark_password_unreadable(&crate::db::DB, user_id, &encrypted_token).await
+                {
+                    tracing::warn!("Could not mark user {user_id} for a new sign-in: {e}");
+                }
+            }
+            return Err(STORED_PASSWORD_UNREADABLE.to_string());
+        }
+    };
 
     let url = std::env::var("NAVIDROME_URL")
         .map_err(|_| "NAVIDROME_URL environment variable not set".to_string())?;
@@ -231,6 +245,26 @@ pub async fn navidrome_client_for_user(user_id: &str) -> Result<Arc<NavidromeCli
         .await
         .insert(user_id.to_string(), client.clone());
     Ok(client)
+}
+
+#[cfg(feature = "server")]
+pub const STORED_PASSWORD_UNREADABLE: &str = "The stored Navidrome password cannot be decrypted, probably because SECRET_KEY changed. Sign in again to store it.";
+
+/// Keeps the undecryptable token and asks the user to sign in again.
+#[cfg(feature = "server")]
+pub(crate) async fn mark_password_unreadable(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+    encrypted_token: &str,
+) -> Result<(), String> {
+    crate::models::user::User::update_navidrome_token_in(
+        db,
+        user_id,
+        Some(encrypted_token),
+        shared::system::NavidromeStatus::InvalidCredentials.as_str(),
+    )
+    .await?;
+    crate::models::user_settings::UserSettings::reset_navidrome_banner_in(db, user_id).await
 }
 
 #[cfg(feature = "server")]
@@ -257,6 +291,51 @@ pub async fn is_slskd_configured() -> bool {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::db::test_db;
+    use crate::security::SEEDED_ADMIN_ID;
+
+    #[tokio::test]
+    async fn an_unreadable_password_marks_the_user_and_resets_the_banner() {
+        let db = test_db::migrated().await;
+        sqlx::query("UPDATE users SET navidrome_token = 'cipher', navidrome_status = 'connected' WHERE id = ?")
+            .bind(SEEDED_ADMIN_ID)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO user_settings (user_id, navidrome_banner_dismissed) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET navidrome_banner_dismissed = 1",
+        )
+        .bind(SEEDED_ADMIN_ID)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        mark_password_unreadable(&db, SEEDED_ADMIN_ID, "cipher")
+            .await
+            .unwrap();
+
+        let user: (Option<String>, String) =
+            sqlx::query_as("SELECT navidrome_token, navidrome_status FROM users WHERE id = ?")
+                .bind(SEEDED_ADMIN_ID)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            user,
+            (
+                Some("cipher".to_string()),
+                "invalid_credentials".to_string()
+            )
+        );
+        let dismissed: i64 = sqlx::query_scalar(
+            "SELECT navidrome_banner_dismissed FROM user_settings WHERE user_id = ?",
+        )
+        .bind(SEEDED_ADMIN_ID)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(dismissed, 0);
+    }
 
     #[tokio::test]
     async fn the_importer_and_its_health_survive_a_provider_reload() {

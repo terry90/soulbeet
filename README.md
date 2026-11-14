@@ -124,7 +124,7 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 |----------|-------------|---------|
 | `DATABASE_URL` | Connection string for SQLite | `sqlite:soulbeet.db` |
 | `DOWNLOAD_PATH` | Path where slskd saves downloads | `/downloads` |
-| `SECRET_KEY` | Encryption key for tokens and credentials | |
+| `SECRET_KEY` | Signs sessions and encrypts stored Navidrome passwords. Use at least 32 random bytes (`openssl rand -hex 32`). Changing it makes stored Navidrome passwords unreadable until each user signs in again | |
 | `NAVIDROME_URL` | Your Navidrome server URL. Optional: without it you log in with local accounts, and discovery playlists, rating sync and auto-delete are unavailable | |
 | `BEETS_CONFIG` | Path to your beets config file. Replaces the shipped `/app/beets_config.yaml` (beets defaults still apply underneath) | `beets_config.yaml` |
 | `BEETS_PYTHON` | Python interpreter that runs beets imports and the config check. By default it is read from the `#!` line of `beet` (`/usr/bin/python3` in the image) | |
