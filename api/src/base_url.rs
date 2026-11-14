@@ -63,21 +63,8 @@ impl BaseUrl {
         })
     }
 
-    pub fn scheme(&self) -> Scheme {
-        self.scheme
-    }
-
     pub fn is_https(&self) -> bool {
         self.scheme == Scheme::Https
-    }
-
-    /// `localhost`, 127.0.0.0/8 or `::1`.
-    pub fn is_loopback(&self) -> bool {
-        match &self.host {
-            Host::Domain(d) => d == "localhost",
-            Host::Ipv4(ip) => ip.is_loopback(),
-            Host::Ipv6(ip) => ip.is_loopback(),
-        }
     }
 }
 
@@ -374,19 +361,5 @@ mod tests {
             BaseUrl::parse("https://x.example/").unwrap().to_string(),
             "https://x.example"
         );
-    }
-
-    #[test]
-    fn loopback_hosts() {
-        for h in ["localhost", "127.0.0.1", "[::1]"] {
-            assert!(BaseUrl::parse(&format!("http://{h}"))
-                .unwrap()
-                .is_loopback());
-        }
-        for h in ["192.168.1.5", "music.example.com"] {
-            assert!(!BaseUrl::parse(&format!("https://{h}"))
-                .unwrap()
-                .is_loopback());
-        }
     }
 }

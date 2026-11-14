@@ -4,9 +4,13 @@ use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use crate::{
     auth, models,
-    server_fns::{server_error, unauthorized_error},
+    base_url::{request_base, DerivedBase},
+    server_fns::{refusal_error, server_error, unauthorized_error},
     AuthSession,
 };
+
+#[cfg(feature = "server")]
+use axum::http::HeaderMap;
 
 #[cfg(feature = "server")]
 use tower_cookies::{
@@ -18,30 +22,60 @@ pub const AUTH_COOKIE_NAME: &str = "auth_token";
 
 /// Helper to configure the auth cookie consistently
 #[cfg(feature = "server")]
-fn build_auth_cookie(token: String) -> Cookie<'static> {
+fn build_auth_cookie(token: String, secure: bool) -> Cookie<'static> {
     use crate::auth::EXPIRATION_DAYS;
 
     let mut cookie = Cookie::new(AUTH_COOKIE_NAME, token);
     cookie.set_path("/");
     cookie.set_http_only(true);
+    cookie.set_secure(secure);
     cookie.set_same_site(SameSite::Lax);
     cookie.set_expires(time::OffsetDateTime::now_utc() + time::Duration::days(EXPIRATION_DAYS));
     cookie
 }
 
+/// Whether the session cookie gets the Secure flag: the request came in over
+/// https, unless the browser's `Origin` says it is on plain http and would drop
+/// a Secure cookie.
+#[cfg(feature = "server")]
+pub(crate) fn secure_for(derived: &DerivedBase, origin: Option<&str>) -> bool {
+    let browser_on_http = origin.is_some_and(|o| {
+        o.split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http"))
+    });
+    derived.base.is_https() && !browser_on_http
+}
+
+/// Sets the session cookie for the user's current credentials version.
+#[cfg(feature = "server")]
+pub(crate) fn issue_session_cookie(
+    cookies: &Cookies,
+    headers: &HeaderMap,
+    user: &models::user::User,
+) -> Result<(), ServerFnError> {
+    let derived = request_base(headers)
+        .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    let token = auth::create_token(&user.id, user.credentials_version).map_err(server_error)?;
+    cookies.add(build_auth_cookie(token, secure_for(&derived, origin)));
+    Ok(())
+}
+
 /// Reads the user's row as it stands now and sets a cookie for its current
 /// credentials version.
 #[cfg(feature = "server")]
-async fn start_session(
+pub(crate) async fn start_session(
     cookies: &Cookies,
+    headers: &HeaderMap,
     user_id: &str,
 ) -> Result<models::user::User, ServerFnError> {
     let user = models::user::User::find_by_id(user_id)
         .await
         .map_err(server_error)?
         .ok_or_else(|| server_error("User not found"))?;
-    let token = auth::create_token(&user.id, user.credentials_version).map_err(server_error)?;
-    cookies.add(build_auth_cookie(token));
+    issue_session_cookie(cookies, headers, &user)?;
     Ok(user)
 }
 
@@ -110,7 +144,7 @@ async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResu
     }
 }
 
-#[post("/api/auth/login", cookies: Cookies)]
+#[post("/api/auth/login", cookies: Cookies, headers: HeaderMap)]
 pub async fn login(username: String, password: String) -> Result<AuthResponse, ServerFnError> {
     use crate::crypto;
     use crate::services::evict_navidrome_client;
@@ -151,7 +185,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             // Evict any cached client so it picks up the new token
             evict_navidrome_client(&user.id).await;
 
-            let user = start_session(&cookies, &user.id).await?;
+            let user = start_session(&cookies, &headers, &user.id).await?;
 
             Ok(AuthResponse {
                 username: user.username,
@@ -184,7 +218,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             // Evict cached client with stale credentials
             evict_navidrome_client(&user.id).await;
 
-            let user = start_session(&cookies, &user.id).await?;
+            let user = start_session(&cookies, &headers, &user.id).await?;
 
             Ok(AuthResponse {
                 username: user.username,
@@ -214,7 +248,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             .await
             .map_err(server_error)?;
 
-            let user = start_session(&cookies, &user.id).await?;
+            let user = start_session(&cookies, &headers, &user.id).await?;
 
             Ok(AuthResponse {
                 username: user.username,
@@ -226,9 +260,9 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
     }
 }
 
-#[post("/api/auth/refresh", auth: AuthSession, cookies: Cookies)]
+#[post("/api/auth/refresh", auth: AuthSession, cookies: Cookies, headers: HeaderMap)]
 pub async fn refresh_token() -> Result<(), ServerFnError> {
-    start_session(&cookies, &auth.0.user_id).await.map(|_| ())
+    start_session(&cookies, &headers, &auth.0.user_id).await.map(|_| ())
 }
 
 #[post("/api/auth/logout", cookies: Cookies)]
@@ -258,4 +292,42 @@ pub async fn get_current_user() -> Result<Option<AuthResponse>, ServerFnError> {
         navidrome_status: status,
         role: user.role,
     }))
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use crate::base_url::{BaseUrl, HostSource, SchemeSource};
+
+    fn derived(base: &str) -> DerivedBase {
+        DerivedBase {
+            base: BaseUrl::parse(base).unwrap(),
+            host_from: HostSource::Host,
+            scheme_from: SchemeSource::HostKind,
+        }
+    }
+
+    #[test]
+    fn cookie_is_secure_for_an_https_base() {
+        assert_eq!(build_auth_cookie("t".into(), true).secure(), Some(true));
+        assert!(secure_for(
+            &derived("https://music.example.com"),
+            Some("https://music.example.com")
+        ));
+        assert!(secure_for(&derived("https://music.example.com"), None));
+    }
+
+    #[test]
+    fn cookie_is_not_secure_for_an_http_base() {
+        assert!(!secure_for(&derived("http://192.168.1.5:9765"), None));
+    }
+
+    #[test]
+    fn cookie_is_not_secure_when_the_browser_origin_is_http() {
+        // http://nas:9765 typed in the browser: base derives https, Origin says http
+        assert!(!secure_for(
+            &derived("https://nas:9765"),
+            Some("http://nas:9765")
+        ));
+    }
 }

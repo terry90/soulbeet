@@ -1,5 +1,9 @@
 #[cfg(feature = "server")]
-use super::server_error;
+use super::{auth::start_session, server_error};
+#[cfg(feature = "server")]
+use axum::http::HeaderMap;
+#[cfg(feature = "server")]
+use tower_cookies::Cookies;
 use crate::models;
 #[cfg(feature = "server")]
 use crate::AuthSession;
@@ -20,11 +24,16 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
         .map_err(server_error)
 }
 
-#[post("/api/users/password", _: AuthSession)]
+#[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap)]
 pub async fn update_user_password(user_id: String, password: String) -> Result<(), ServerFnError> {
     models::user::User::update_password(&user_id, &password)
         .await
-        .map_err(server_error)
+        .map_err(server_error)?;
+    // The bump ended every session of this user; keep the caller signed in.
+    if user_id == auth.0.user_id {
+        start_session(&cookies, &headers, &user_id).await?;
+    }
+    Ok(())
 }
 
 #[delete("/api/users/delete", _: AuthSession)]
