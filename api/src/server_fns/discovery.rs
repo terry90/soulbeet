@@ -63,7 +63,9 @@ use super::{refusal_error, server_error};
 /// Get the current user's discovery configuration
 #[get("/api/discovery/config", auth: AuthSession)]
 pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
-    let settings = UserSettings::get(&auth.0.sub).await.map_err(server_error)?;
+    let settings = UserSettings::get(&auth.0.user_id)
+        .await
+        .map_err(server_error)?;
     let folder_name = if let Some(ref fid) = settings.discovery_folder_id {
         Folder::get_by_id(fid).await.ok().flatten().map(|f| f.name)
     } else {
@@ -88,7 +90,9 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
 /// Get discovery tracks for the current user's configured folder
 #[get("/api/discovery/tracks", auth: AuthSession)]
 pub async fn get_discovery_tracks() -> Result<Vec<DiscoveryTrack>, ServerFnError> {
-    let settings = UserSettings::get(&auth.0.sub).await.map_err(server_error)?;
+    let settings = UserSettings::get(&auth.0.user_id)
+        .await
+        .map_err(server_error)?;
     if let Some(ref folder_id) = settings.discovery_folder_id {
         DiscoveryTrackRow::get_by_folder(folder_id)
             .await
@@ -115,12 +119,12 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
         .map_err(server_error)?
         .ok_or_else(|| server_error("Folder not found"))?;
 
-    if folder.user_id != auth.0.sub {
+    if folder.user_id != auth.0.user_id {
         return Err(server_error("Not authorized to modify this track"));
     }
 
     use super::navidrome::PromoteError;
-    super::navidrome::promote_discovery_track_internal(&req.track_id, &auth.0.sub)
+    super::navidrome::promote_discovery_track_internal(&req.track_id, &auth.0.user_id)
         .await
         .map_err(|e| match e {
             PromoteError::Refused(reason) => refusal_error(reason),
@@ -143,7 +147,7 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
         .map_err(server_error)?
         .ok_or_else(|| server_error("Folder not found"))?;
 
-    if folder.user_id != auth.0.sub {
+    if folder.user_id != auth.0.user_id {
         return Err(server_error("Not authorized to modify this track"));
     }
 
@@ -165,7 +169,7 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
         .map_err(server_error)?;
 
     if let Err(e) =
-        DiscoveryHistoryRow::update_outcome(&auth.0.sub, &track.artist, &track.title, "removed")
+        DiscoveryHistoryRow::update_outcome(&auth.0.user_id, &track.artist, &track.title, "removed")
             .await
     {
         warn!(
@@ -182,7 +186,7 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
 pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
     use shared::navidrome::{DiscoveryProgress, GenerationStatus, ProfilePhase, ProfileProgress};
 
-    let user_id = auth.0.sub.clone();
+    let user_id = auth.0.user_id.clone();
 
     // Check if already running
     {
@@ -279,7 +283,7 @@ pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
 pub async fn get_discovery_progress(
 ) -> Result<Option<shared::navidrome::DiscoveryProgress>, ServerFnError> {
     let progress = crate::globals::DISCOVERY_PROGRESS.read().await;
-    match progress.get(&auth.0.sub) {
+    match progress.get(&auth.0.user_id) {
         Some(p) => {
             // Return None for terminal states older than 5 minutes
             if p.is_terminal() {
@@ -1203,7 +1207,7 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
 
 #[post("/api/discovery/generate-recommendations", auth: AuthSession)]
 pub async fn generate_recommendations() -> Result<u32, ServerFnError> {
-    generate_recommendations_internal(&auth.0.sub)
+    generate_recommendations_internal(&auth.0.user_id)
         .await
         .map_err(server_error)
 }
@@ -1417,7 +1421,7 @@ pub async fn get_engine_report() -> Result<String, ServerFnError> {
     {
         use crate::models::engine_report::EngineReportRow;
         // Try new history table first, fall back to legacy user_profiles.last_report
-        let rows = EngineReportRow::get_history(&auth.0.sub, 1)
+        let rows = EngineReportRow::get_history(&auth.0.user_id, 1)
             .await
             .map_err(server_error)?;
         if let Some(row) = rows.into_iter().next() {
@@ -1427,7 +1431,7 @@ pub async fn get_engine_report() -> Result<String, ServerFnError> {
         }
         // Legacy fallback
         use crate::models::user_profile::UserProfileRow;
-        let report_json = UserProfileRow::get_report(&auth.0.sub)
+        let report_json = UserProfileRow::get_report(&auth.0.user_id)
             .await
             .map_err(server_error)?;
         match report_json {
@@ -1456,7 +1460,7 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
     #[cfg(feature = "server")]
     {
         use crate::models::engine_report::EngineReportRow;
-        let rows = EngineReportRow::get_history(&auth.0.sub, 30)
+        let rows = EngineReportRow::get_history(&auth.0.user_id, 30)
             .await
             .map_err(server_error)?;
         let mut entries = Vec::new();

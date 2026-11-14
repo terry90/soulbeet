@@ -74,7 +74,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
     }
     let folder = match Folder::get_by_id(&req.folder_id).await {
         Ok(Some(f))
-            if f.user_id == auth.0.sub
+            if f.user_id == auth.0.user_id
                 && std::path::Path::new(&req.folder_path) == std::path::Path::new(&f.path) =>
         {
             f
@@ -144,7 +144,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
     let album = req.query.album.clone();
     let tracks = req.query.tracks.clone();
     let task_username = username.clone();
-    let user_id = auth.0.sub;
+    let user_id = auth.0.user_id;
 
     tokio::spawn(async move {
         // Send Searching event

@@ -219,7 +219,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         return Err(refusal_error(issue.title));
     }
     let folder =
-        crate::models::folder::Folder::find_for_user_by_path(&auth.0.sub, &req.target_folder)
+        crate::models::folder::Folder::find_for_user_by_path(&auth.0.user_id, &req.target_folder)
             .await
             .map_err(server_error)?
             .ok_or_else(|| refusal_error("Folder not found"))?;
@@ -237,7 +237,7 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
     let fresh = BatchRef::new(
         TransferOwner {
-            user_id: auth.0.sub.clone(),
+            user_id: auth.0.user_id.clone(),
             batch_id: uuid::Uuid::new_v4().to_string(),
         },
         manual_batch_label(&req.items),

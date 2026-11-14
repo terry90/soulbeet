@@ -24,7 +24,7 @@ use super::server_error;
 
 #[post("/api/navidrome/sync-ratings", auth: AuthSession)]
 pub async fn sync_ratings() -> Result<SyncResult, ServerFnError> {
-    sync_ratings_internal(&auth.0.sub)
+    sync_ratings_internal(&auth.0.user_id)
         .await
         .map_err(server_error)
 }
@@ -216,7 +216,7 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
 
 #[get("/api/navidrome/deletion-history", auth: AuthSession)]
 pub async fn get_deletion_history() -> Result<Vec<DeletionReview>, ServerFnError> {
-    DeletionReviewRow::get_history(&auth.0.sub, 50)
+    DeletionReviewRow::get_history(&auth.0.user_id, 50)
         .await
         .map_err(server_error)
 }
@@ -290,7 +290,7 @@ fn resolve_navidrome_path(
 
 #[get("/api/navidrome/library-stats", auth: AuthSession)]
 pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
-    let client = navidrome_client_for_user(&auth.0.sub)
+    let client = navidrome_client_for_user(&auth.0.user_id)
         .await
         .map_err(server_error)?;
     let songs = client

@@ -29,6 +29,22 @@ fn build_auth_cookie(token: String) -> Cookie<'static> {
     cookie
 }
 
+/// Reads the user's row as it stands now and sets a cookie for its current
+/// credentials version.
+#[cfg(feature = "server")]
+async fn start_session(
+    cookies: &Cookies,
+    user_id: &str,
+) -> Result<models::user::User, ServerFnError> {
+    let user = models::user::User::find_by_id(user_id)
+        .await
+        .map_err(server_error)?
+        .ok_or_else(|| server_error("User not found"))?;
+    let token = auth::create_token(&user.id, user.credentials_version).map_err(server_error)?;
+    cookies.add(build_auth_cookie(token));
+    Ok(user)
+}
+
 #[post("/api/auth/register")]
 pub async fn register(username: String, password: String) -> Result<(), ServerFnError> {
     models::user::User::create(&username, &password)
@@ -135,14 +151,13 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             // Evict any cached client so it picks up the new token
             evict_navidrome_client(&user.id).await;
 
-            let token =
-                auth::create_token(user.id.clone(), user.username.clone()).map_err(server_error)?;
-            cookies.add(build_auth_cookie(token));
+            let user = start_session(&cookies, &user.id).await?;
 
             Ok(AuthResponse {
                 username: user.username,
                 user_id: user.id,
                 navidrome_status: NavidromeStatus::Connected,
+                role: user.role,
             })
         }
         NavidromeAuthResult::AuthFailed => {
@@ -169,14 +184,13 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             // Evict cached client with stale credentials
             evict_navidrome_client(&user.id).await;
 
-            let token =
-                auth::create_token(user.id.clone(), user.username.clone()).map_err(server_error)?;
-            cookies.add(build_auth_cookie(token));
+            let user = start_session(&cookies, &user.id).await?;
 
             Ok(AuthResponse {
                 username: user.username,
                 user_id: user.id,
                 navidrome_status: NavidromeStatus::InvalidCredentials,
+                role: user.role,
             })
         }
         result @ (NavidromeAuthResult::Unreachable | NavidromeAuthResult::NotConfigured) => {
@@ -200,14 +214,13 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             .await
             .map_err(server_error)?;
 
-            let token =
-                auth::create_token(user.id.clone(), user.username.clone()).map_err(server_error)?;
-            cookies.add(build_auth_cookie(token));
+            let user = start_session(&cookies, &user.id).await?;
 
             Ok(AuthResponse {
                 username: user.username,
                 user_id: user.id,
                 navidrome_status: status,
+                role: user.role,
             })
         }
     }
@@ -215,18 +228,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
 
 #[post("/api/auth/refresh", auth: AuthSession, cookies: Cookies)]
 pub async fn refresh_token() -> Result<(), ServerFnError> {
-    let claims = auth.0;
-
-    models::user::User::find_by_id(&claims.sub)
-        .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("User not found"))?;
-
-    let token = auth::create_token(claims.sub, claims.username).map_err(server_error)?;
-
-    cookies.add(build_auth_cookie(token));
-
-    Ok(())
+    start_session(&cookies, &auth.0.user_id).await.map(|_| ())
 }
 
 #[post("/api/auth/logout", cookies: Cookies)]
@@ -241,9 +243,9 @@ pub async fn logout() -> Result<(), ServerFnError> {
 
 #[get("/api/auth/me", auth: AuthSession)]
 pub async fn get_current_user() -> Result<Option<AuthResponse>, ServerFnError> {
-    let claims = auth.0;
+    let user = auth.0;
 
-    let status = models::user::User::find_by_id(&claims.sub)
+    let status = models::user::User::find_by_id(&user.user_id)
         .await
         .ok()
         .flatten()
@@ -251,8 +253,9 @@ pub async fn get_current_user() -> Result<Option<AuthResponse>, ServerFnError> {
         .unwrap_or_default();
 
     Ok(Some(AuthResponse {
-        username: claims.username,
-        user_id: claims.sub,
+        username: user.username,
+        user_id: user.user_id,
         navidrome_status: status,
+        role: user.role,
     }))
 }

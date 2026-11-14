@@ -13,7 +13,9 @@ use super::server_error;
 /// Get current user's settings
 #[get("/api/settings", auth: AuthSession)]
 pub async fn get_user_settings() -> Result<UserSettings, ServerFnError> {
-    UserSettings::get(&auth.0.sub).await.map_err(server_error)
+    UserSettings::get(&auth.0.user_id)
+        .await
+        .map_err(server_error)
 }
 
 /// Update current user's settings
@@ -23,11 +25,13 @@ pub async fn update_user_settings(
 ) -> Result<UserSettings, ServerFnError> {
     #[cfg(feature = "server")]
     {
-        let old = UserSettings::get(&auth.0.sub).await.map_err(server_error)?;
-        let result = UserSettings::upsert(&auth.0.sub, update.clone())
+        let old = UserSettings::get(&auth.0.user_id)
             .await
             .map_err(server_error)?;
-        cleanup_stale_discovery_playlists(&auth.0.sub, &old, &update).await;
+        let result = UserSettings::upsert(&auth.0.user_id, update.clone())
+            .await
+            .map_err(server_error)?;
+        cleanup_stale_discovery_playlists(&auth.0.user_id, &old, &update).await;
 
         Ok(result)
     }
@@ -129,7 +133,9 @@ async fn cleanup_stale_discovery_playlists(
 pub async fn get_metadata_providers() -> Result<Vec<ProviderInfo>, ServerFnError> {
     use crate::services::{available_metadata_providers, metadata_provider};
 
-    let user_settings = UserSettings::get(&auth.0.sub).await.map_err(server_error)?;
+    let user_settings = UserSettings::get(&auth.0.user_id)
+        .await
+        .map_err(server_error)?;
     let mut providers = Vec::new();
     for (id, name) in available_metadata_providers() {
         let available = metadata_provider(Some(id), user_settings.lastfm_api_key.as_deref())

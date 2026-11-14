@@ -13,9 +13,7 @@ use std::path::Path;
 
 #[get("/api/folders", auth: AuthSession)]
 pub async fn get_user_folders() -> Result<Vec<models::folder::Folder>, ServerFnError> {
-    let claims = auth.0;
-
-    models::folder::Folder::get_all_by_user(&claims.sub)
+    models::folder::Folder::get_all_by_user(&auth.0.user_id)
         .await
         .map_err(server_error)
 }
@@ -25,13 +23,11 @@ pub async fn create_user_folder(
     name: String,
     path: String,
 ) -> Result<models::folder::Folder, ServerFnError> {
-    let claims = auth.0;
-
     if let Err(e) = tokio::fs::create_dir_all(&path).await {
         return Err(server_error(format!("Failed to create directory: {}", e)));
     }
 
-    models::folder::Folder::create(&claims.sub, &name, &path)
+    models::folder::Folder::create(&auth.0.user_id, &name, &path)
         .await
         .map_err(server_error)
 }
@@ -58,9 +54,7 @@ pub async fn delete_folder(folder_id: String) -> Result<(), ServerFnError> {
 /// Returns tracks that exist in multiple libraries (same artist + title).
 #[get("/api/folders/duplicates", auth: AuthSession)]
 pub async fn get_folder_duplicates() -> Result<DuplicateReport, ServerFnError> {
-    let claims = auth.0;
-
-    let folders = models::folder::Folder::get_all_by_user(&claims.sub)
+    let folders = models::folder::Folder::get_all_by_user(&auth.0.user_id)
         .await
         .map_err(server_error)?;
 

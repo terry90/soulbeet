@@ -15,7 +15,7 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
     if new_username.trim().is_empty() {
         return Err(server_error("Username cannot be empty"));
     }
-    models::user::User::update_username(&auth.0.sub, new_username.trim())
+    models::user::User::update_username(&auth.0.user_id, new_username.trim())
         .await
         .map_err(server_error)
 }

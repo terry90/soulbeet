@@ -25,7 +25,7 @@ pub async fn get_system_health() -> Result<SystemHealth, ServerFnError> {
 
         let importer = crate::importer_health::snapshot().await;
 
-        let navidrome_online = match navidrome_client_for_user(&auth.0.sub).await {
+        let navidrome_online = match navidrome_client_for_user(&auth.0.user_id).await {
             Ok(client) => match client.ping().await {
                 Ok(()) => true,
                 Err(e) => {
@@ -33,9 +33,9 @@ pub async fn get_system_health() -> Result<SystemHealth, ServerFnError> {
                     if err_str.contains("Circuit breaker open") {
                         debug!(
                             "Evicted stale Navidrome client for user {} after circuit-breaker-open ping",
-                            auth.0.sub
+                            auth.0.user_id
                         );
-                        evict_navidrome_client(&auth.0.sub).await;
+                        evict_navidrome_client(&auth.0.user_id).await;
                     }
                     false
                 }
