@@ -217,9 +217,10 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
 pub async fn refresh_token() -> Result<(), ServerFnError> {
     let claims = auth.0;
 
-    let _ = models::user::User::get_by_id(&claims.sub)
+    models::user::User::find_by_id(&claims.sub)
         .await
-        .map_err(server_error)?;
+        .map_err(server_error)?
+        .ok_or_else(|| server_error("User not found"))?;
 
     let token = auth::create_token(claims.sub, claims.username).map_err(server_error)?;
 
@@ -242,8 +243,10 @@ pub async fn logout() -> Result<(), ServerFnError> {
 pub async fn get_current_user() -> Result<Option<AuthResponse>, ServerFnError> {
     let claims = auth.0;
 
-    let status = models::user::User::get_by_id(&claims.sub)
+    let status = models::user::User::find_by_id(&claims.sub)
         .await
+        .ok()
+        .flatten()
         .map(|u| shared::system::NavidromeStatus::from(u.navidrome_status))
         .unwrap_or_default();
 

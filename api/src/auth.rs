@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 use shared::system::NavidromeStatus;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(
+    feature = "server",
+    derive(sqlx::Type),
+    sqlx(type_name = "TEXT", rename_all = "lowercase")
+)]
+pub enum Role {
+    Admin,
+    #[default]
+    User,
+}
+
+impl Role {
+    pub fn is_admin(self) -> bool {
+        self == Role::Admin
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthResponse {
     pub username: String,

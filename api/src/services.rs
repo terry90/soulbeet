@@ -207,7 +207,9 @@ pub async fn navidrome_client_for_user(user_id: &str) -> Result<Arc<NavidromeCli
         return Ok(client.clone());
     }
 
-    let user = crate::models::user::User::get_by_id(user_id).await?;
+    let user = crate::models::user::User::find_by_id(user_id)
+        .await?
+        .ok_or("User not found")?;
 
     let encrypted_token = user
         .navidrome_token
