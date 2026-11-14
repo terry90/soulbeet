@@ -25,6 +25,7 @@ use super::enqueue::{stopped_rows, transfer_key};
 use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::{album_jobs, import_job, resolve_on_disk, unresolved_row, ResolvedSlot};
 use super::utils::FileId;
+use crate::auth::UserId;
 use crate::config::CONFIG;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
@@ -174,8 +175,6 @@ pub struct DownloadMonitor {
     album_mode: bool,
     /// Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
-    /// Whose rows these are; imports report to this user's channel.
-    username: String,
     /// The batch this monitor watches: its rows, its folder under the
     /// download directory, and the inbox joining requests deliver to.
     batch: BatchRef,
@@ -204,7 +203,6 @@ impl DownloadMonitor {
         target_path: PathBuf,
         tx: broadcast::Sender<DownloadEvent>,
         cancellation_token: CancellationToken,
-        username: String,
         batch: BatchRef,
     ) -> Self {
         let tracked_files: Vec<TrackedFile> = transfers
@@ -229,7 +227,6 @@ impl DownloadMonitor {
             pool: None,
             album_mode: CONFIG.is_album_mode(),
             cancellation_token,
-            username,
             batch,
             download_base: CONFIG.download_path().clone(),
             claimed: Arc::new(Mutex::new(HashSet::new())),
@@ -582,7 +579,7 @@ impl DownloadMonitor {
 
         info!(
             "Download monitoring task completed for user: {}",
-            self.username
+            self.batch.owner.user_id
         );
     }
 
@@ -981,7 +978,7 @@ impl DownloadMonitor {
             key: self.slot_key(slot, backend.id()),
             owner: self.batch.owner.clone(),
             target: self.target_path.clone(),
-            username: self.username.clone(),
+            user_id: self.batch.owner.user_id.clone(),
             download_base: self.download_base.clone(),
             claimed: Arc::clone(&self.claimed),
         };
@@ -1190,7 +1187,7 @@ impl DownloadMonitor {
             }
         }
         if !missing.is_empty() {
-            send_user_event(&self.username, DownloadEvent::Progress(missing)).await;
+            send_user_event(&self.batch.owner.user_id, DownloadEvent::Progress(missing)).await;
         }
 
         for slot in &resolved_slots {
@@ -1210,7 +1207,7 @@ impl DownloadMonitor {
         let jobs = album_jobs(
             resolved,
             &self.target_path,
-            &self.username,
+            &self.batch.owner.user_id,
             &self.download_base,
         );
         info!(
@@ -1251,7 +1248,7 @@ struct Handoff {
     key: TransferKey,
     owner: TransferOwner,
     target: PathBuf,
-    username: String,
+    user_id: UserId,
     download_base: PathBuf,
     claimed: Arc<Mutex<HashSet<FileId>>>,
 }
@@ -1270,7 +1267,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
     .await
     else {
         send_user_event(
-            &h.username,
+            &h.user_id,
             DownloadEvent::Progress(vec![unresolved_row(h.row)]),
         )
         .await;
@@ -1291,7 +1288,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
         ImportMode::Singleton,
         vec![h.row],
         &h.target,
-        &h.username,
+        &h.user_id,
         &h.download_base,
     );
     IMPORT_QUEUE.submit(job).await.wait().await;
@@ -1455,7 +1452,6 @@ mod tests {
             PathBuf::from("/music"),
             tx,
             CancellationToken::new(),
-            "tester".to_string(),
             batch("X"),
         )
     }
@@ -1603,11 +1599,11 @@ mod tests {
         // own monitor, whether it is another user's or the same user's.
         for owner in [batch("Theirs"), {
             let mut mine = batch("Mine");
-            mine.owner.user_id = "tester".to_string();
+            mine.owner.user_id = UserId::new("tester");
             mine
         }] {
             let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
-            m.batch.owner.user_id = "tester".to_string();
+            m.batch.owner.user_id = UserId::new("tester");
             let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
             TransferRegistry::global().claim(&[key(&backend, "peer_b", "dirB/aaa.flac")], &owner);
             let theirs = transfer("peer_b", "dirB/aaa.flac", "t-b", DownloadState::InProgress);
@@ -1996,13 +1992,13 @@ mod tests {
         assert_eq!(phase(&m, 0), SlotPhase::Settled);
     }
 
-    /// A monitor of `username` watching `watched` from peer_a, whose finished
+    /// A monitor of `user` watching `watched` from peer_a, whose finished
     /// files are found in a temporary download folder holding `on_disk`, and
     /// whose import target cannot be created, so a handed-off row comes
     /// straight back from the import queue as Failed on the user's channel
     /// without beets ever running.
     async fn disk_monitor(
-        username: &str,
+        user: &UserId,
         watched: &[&str],
         on_disk: &[&str],
     ) -> (
@@ -2022,8 +2018,8 @@ mod tests {
         for file in on_disk {
             std::fs::write(folder.join(file), b"x").unwrap();
         }
-        let (user_tx, _) = crate::globals::get_or_create_user_channel(username).await;
-        m.username = username.to_string();
+        let (user_tx, _) = crate::globals::get_or_create_user_channel(user).await;
+        m.batch.owner.user_id = user.clone();
         (m, base, user_tx.subscribe())
     }
 
@@ -2053,7 +2049,7 @@ mod tests {
     async fn a_handed_off_slot_is_not_resent() {
         let (tx, mut rx) = broadcast::channel(64);
         let (mut m, _base, _imports) = disk_monitor(
-            "monitor-handed-off",
+            &UserId::new("monitor-handed-off"),
             &["one.flac", "two.flac"],
             &["one.flac"],
         )
@@ -2089,8 +2085,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_singleton_handoff_removes_the_record_only_once_the_file_is_found() {
-        let (mut m, base, _imports) =
-            disk_monitor("monitor-singleton-on-disk", &["one.flac"], &[]).await;
+        let (mut m, base, _imports) = disk_monitor(
+            &UserId::new("monitor-singleton-on-disk"),
+            &["one.flac"],
+            &[],
+        )
+        .await;
         m.album_mode = false;
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
@@ -2132,7 +2132,7 @@ mod tests {
     #[tokio::test]
     async fn album_mode_deletes_nothing_until_every_file_is_on_disk() {
         let (mut m, base, mut imports) = disk_monitor(
-            "monitor-album-on-disk",
+            &UserId::new("monitor-album-on-disk"),
             &["01.flac", "02.flac"],
             &["01.flac"],
         )
@@ -2185,8 +2185,12 @@ mod tests {
 
     #[tokio::test]
     async fn album_mode_removes_only_its_own_ids() {
-        let (mut m, _base, _imports) =
-            disk_monitor("monitor-own-ids", &["dirA/01.flac"], &["01.flac"]).await;
+        let (mut m, _base, _imports) = disk_monitor(
+            &UserId::new("monitor-own-ids"),
+            &["dirA/01.flac"],
+            &["01.flac"],
+        )
+        .await;
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let listing = vec![
@@ -2219,7 +2223,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_album_file_that_never_appears_keeps_its_completed_record() {
         let (mut m, _base, mut imports) =
-            disk_monitor("monitor-album-missing", &["01.flac"], &[]).await;
+            disk_monitor(&UserId::new("monitor-album-missing"), &["01.flac"], &[]).await;
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let held = key(&backend, "peer_a", "01.flac");
@@ -2251,11 +2255,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_rows_reach_the_channel_of_the_batch_owner_id() {
+        let alice = UserId::new("id-alice-monitor");
+        let (mut m, _base, mut imports) = disk_monitor(&alice, &["01.flac"], &["01.flac"]).await;
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+
+        let mut empty = 0;
+        m.process_poll_result(
+            vec![listed("peer_a", "01.flac", DownloadState::Completed)],
+            &mut empty,
+            1,
+            &backend,
+        )
+        .await;
+        m.join_handoffs().await;
+
+        let rows: Vec<DownloadProgress> =
+            import_events(&mut imports).into_iter().flatten().collect();
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r.state, DownloadState::Failed(_))),
+            "{rows:?}"
+        );
+        assert!(
+            !send_user_event(
+                &UserId::new("alice-monitor"),
+                DownloadEvent::Progress(vec![])
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
     async fn import_rows_carry_the_batch_id() {
         for album_mode in [false, true] {
-            let username = format!("monitor-batch-rows-{album_mode}");
-            let (mut m, _base, mut imports) =
-                disk_monitor(&username, &["01.flac"], &["01.flac"]).await;
+            let user = UserId::new(&format!("monitor-batch-rows-{album_mode}"));
+            let (mut m, _base, mut imports) = disk_monitor(&user, &["01.flac"], &["01.flac"]).await;
             m.album_mode = album_mode;
             let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
 
@@ -2284,8 +2319,12 @@ mod tests {
 
     #[tokio::test]
     async fn added_slots_are_monitored() {
-        let (mut m, _base, mut imports) =
-            disk_monitor("monitor-added-slots", &["01.flac"], &["01.flac", "02.flac"]).await;
+        let (mut m, _base, mut imports) = disk_monitor(
+            &UserId::new("monitor-added-slots"),
+            &["01.flac"],
+            &["01.flac", "02.flac"],
+        )
+        .await;
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         m.batch
             .inbox
@@ -2320,8 +2359,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_monitor_waits_for_reserved_slots_before_finishing_an_album() {
-        let (mut m, _base, mut imports) =
-            disk_monitor("monitor-reserved-slots", &["01.flac"], &["01.flac"]).await;
+        let (mut m, _base, mut imports) = disk_monitor(
+            &UserId::new("monitor-reserved-slots"),
+            &["01.flac"],
+            &["01.flac"],
+        )
+        .await;
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let listing = || vec![listed("peer_a", "01.flac", DownloadState::Completed)];
         let reservation = m.batch.inbox.reserve().expect("open inbox");

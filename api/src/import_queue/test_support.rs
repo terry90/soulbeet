@@ -1,6 +1,7 @@
 //! A scripted importer and recording deps for the queue's tests.
 
 use super::QueueDeps;
+use crate::auth::UserId;
 use async_trait::async_trait;
 use shared::download::{
     DownloadEvent, DownloadProgress, DownloadState, MatchCandidate, MatchChoices, MatchKind,
@@ -275,10 +276,10 @@ impl MusicImporter for StubImporter {
     }
 }
 
-/// Hands out one importer and records every event per username.
+/// Hands out one importer and records every event per user id.
 pub struct RecordingDeps {
     importer: Arc<StubImporter>,
-    events: Mutex<Vec<(String, DownloadEvent)>>,
+    events: Mutex<Vec<(UserId, DownloadEvent)>>,
 }
 
 impl RecordingDeps {
@@ -289,20 +290,20 @@ impl RecordingDeps {
         })
     }
 
-    /// Each Progress event sent to `username`, as (item, state) pairs.
-    pub fn progress_for(&self, username: &str) -> Vec<Vec<(String, DownloadState)>> {
-        self.rows_for(username)
+    /// Each Progress event sent to `user`, as (item, state) pairs.
+    pub fn progress_for(&self, user: &UserId) -> Vec<Vec<(String, DownloadState)>> {
+        self.rows_for(user)
             .into_iter()
             .map(|rows| rows.into_iter().map(|r| (r.item, r.state)).collect())
             .collect()
     }
 
-    pub fn rows_for(&self, username: &str) -> Vec<Vec<DownloadProgress>> {
+    pub fn rows_for(&self, user: &UserId) -> Vec<Vec<DownloadProgress>> {
         self.events
             .lock()
             .unwrap()
             .iter()
-            .filter(|(user, _)| user == username)
+            .filter(|(owner, _)| owner == user)
             .filter_map(|(_, event)| match event {
                 DownloadEvent::Progress(rows) => Some(rows.clone()),
                 _ => None,
@@ -317,10 +318,16 @@ impl QueueDeps for RecordingDeps {
         Ok(self.importer.clone())
     }
 
-    async fn emit(&self, username: &str, event: DownloadEvent) {
-        self.events
-            .lock()
-            .unwrap()
-            .push((username.to_string(), event));
+    async fn emit(&self, user: &UserId, event: DownloadEvent) {
+        self.events.lock().unwrap().push((user.clone(), event));
     }
+}
+
+/// Two users whose ids differ from any display name they could have.
+pub fn alice() -> UserId {
+    UserId::new("id-alice")
+}
+
+pub fn bob() -> UserId {
+    UserId::new("id-bob")
 }

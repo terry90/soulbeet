@@ -67,7 +67,7 @@ pub enum AutoDownloadResult {
 
 #[post("/api/auto-download", auth: AuthSession)]
 pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResult, ServerFnError> {
-    let username = auth.0.username;
+    let user = auth.0.id();
 
     if let Some(issue) = crate::importer_health::broken_issue().await {
         return Ok(AutoDownloadResult::Error(issue.title));
@@ -86,7 +86,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         }
     };
 
-    let (tx, _) = get_or_create_user_channel(&username).await;
+    let (tx, _) = get_or_create_user_channel(&user).await;
 
     let mut req = req;
     if let Err(e) = crate::server_fns::search::hydrate_album_tracks(&mut req.query).await {
@@ -143,8 +143,6 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
     let folder_path = folder.path;
     let album = req.query.album.clone();
     let tracks = req.query.tracks.clone();
-    let task_username = username.clone();
-    let user_id = auth.0.user_id;
 
     tokio::spawn(async move {
         // Send Searching event
@@ -327,7 +325,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
 
         let fresh = BatchRef::new(
             TransferOwner {
-                user_id,
+                user_id: user.clone(),
                 batch_id: batch_id.clone(),
             },
             batch_label,
@@ -446,19 +444,18 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         );
 
         // Register task and run monitor (per D-05: normal DownloadProgress takes over)
-        let task_cancellation = register_user_task(&task_username).await;
+        let task_cancellation = register_user_task(&user).await;
 
         let mut monitor = DownloadMonitor::new(
             transfers,
             batch.target.clone(),
             tx,
             task_cancellation,
-            task_username.clone(),
             batch,
         )
         .with_failover(pool);
         monitor.run().await;
-        unregister_user_task(&task_username).await;
+        unregister_user_task(&user).await;
     });
 
     Ok(AutoDownloadResult::Accepted {

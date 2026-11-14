@@ -11,6 +11,7 @@ pub(crate) mod test_support;
 pub use choice::Refusal;
 pub use retry::{forget_retries, import_choices_for, retry_import_for};
 
+use crate::auth::UserId;
 use async_trait::async_trait;
 use futures::FutureExt;
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, MatchChoices};
@@ -32,7 +33,7 @@ const WORKER_STOPPED: &str = "import worker stopped";
 /// Who a job reports to. The rows are already stamped with their batch.
 #[derive(Debug, Clone)]
 pub struct JobOwner {
-    pub username: String,
+    pub user_id: UserId,
     pub rows: Vec<DownloadProgress>,
 }
 
@@ -105,7 +106,7 @@ impl ImportHandle {
 #[async_trait]
 pub trait QueueDeps: Send + Sync {
     async fn importer(&self) -> Result<Arc<dyn MusicImporter>, String>;
-    async fn emit(&self, username: &str, event: DownloadEvent);
+    async fn emit(&self, user: &UserId, event: DownloadEvent);
 }
 
 struct Waiting {
@@ -121,8 +122,8 @@ struct TargetEntry {
     queue: VecDeque<Waiting>,
 }
 
-/// Rows to send, grouped by username in first-seen order.
-type UserRows = Vec<(String, Vec<DownloadProgress>)>;
+/// Rows to send, grouped by user in first-seen order.
+type UserRows = Vec<(UserId, Vec<DownloadProgress>)>;
 
 struct Shared {
     targets: Mutex<HashMap<PathBuf, TargetEntry>>,
@@ -194,7 +195,7 @@ impl ImportQueue {
                 let rows = rows_with_state(&owner.rows, DownloadState::ImportQueued(position));
                 self.shared
                     .deps
-                    .emit(&owner.username, DownloadEvent::Progress(rows))
+                    .emit(&owner.user_id, DownloadEvent::Progress(rows))
                     .await;
             }
         }
@@ -234,14 +235,11 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                 let rows = rows_with_state(&owner.rows, DownloadState::Importing);
                 shared
                     .deps
-                    .emit(&owner.username, DownloadEvent::Progress(rows))
+                    .emit(&owner.user_id, DownloadEvent::Progress(rows))
                     .await;
             }
-            for (username, rows) in moved {
-                shared
-                    .deps
-                    .emit(&username, DownloadEvent::Progress(rows))
-                    .await;
+            for (user, rows) in moved {
+                shared.deps.emit(&user, DownloadEvent::Progress(rows)).await;
             }
         }
         let outcome = AssertUnwindSafe(shared.execute(&key, &job))
@@ -284,9 +282,9 @@ impl Shared {
             waiting.state.send_replace(JobState::Queued { position });
             if let (true, Some(owner)) = (moved_up, &waiting.job.owner) {
                 let rows = rows_with_state(&owner.rows, DownloadState::ImportQueued(position));
-                match moved.iter_mut().find(|(user, _)| *user == owner.username) {
+                match moved.iter_mut().find(|(user, _)| *user == owner.user_id) {
                     Some((_, user_rows)) => user_rows.extend(rows),
-                    None => moved.push((owner.username.clone(), rows)),
+                    None => moved.push((owner.user_id.clone(), rows)),
                 }
             }
         }
@@ -377,7 +375,7 @@ impl Shared {
         if let Some(owner) = &job.owner {
             let rows = rows_for_done(&owner.rows, &job, &outcome);
             self.deps
-                .emit(&owner.username, DownloadEvent::Progress(rows))
+                .emit(&owner.user_id, DownloadEvent::Progress(rows))
                 .await;
         }
         state.send_replace(JobState::Done(outcome));
@@ -443,8 +441,8 @@ impl QueueDeps for LiveDeps {
         crate::services::music_importer(None).await
     }
 
-    async fn emit(&self, username: &str, event: DownloadEvent) {
-        crate::globals::send_user_event(username, event).await;
+    async fn emit(&self, user: &UserId, event: DownloadEvent) {
+        crate::globals::send_user_event(user, event).await;
     }
 }
 
@@ -453,7 +451,7 @@ pub static IMPORT_QUEUE: LazyLock<ImportQueue> =
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{broken, row, RecordingDeps, StubImporter};
+    use super::test_support::{alice, broken, row, RecordingDeps, StubImporter};
     use super::*;
     use shared::download::DownloadState;
     use soulbeet::{ImportOutcome, SkipReason};
@@ -488,9 +486,9 @@ mod tests {
         }
     }
 
-    pub(super) fn owned(mut job: ImportJob, username: &str, items: &[&str]) -> ImportJob {
+    pub(super) fn owned(mut job: ImportJob, user: &UserId, items: &[&str]) -> ImportJob {
         job.owner = Some(JobOwner {
-            username: username.into(),
+            user_id: user.clone(),
             rows: items.iter().map(|i| row(i)).collect(),
         });
         job
@@ -567,7 +565,11 @@ mod tests {
         let mut handles = vec![slow];
         for name in ["a", "b", "c"] {
             let source = file(tmp.path(), &format!("dl/{name}.flac"));
-            handles.push(queue.submit(owned(job(source, &lib), "u", &[name])).await);
+            handles.push(
+                queue
+                    .submit(owned(job(source, &lib), &alice(), &[name]))
+                    .await,
+            );
         }
         for handle in handles {
             finish(handle).await;
@@ -576,7 +578,7 @@ mod tests {
         use DownloadState::{ImportQueued, Imported, Importing};
         let s = |item: &str, state: DownloadState| (item.to_string(), state);
         assert_eq!(
-            deps.progress_for("u"),
+            deps.progress_for(&alice()),
             vec![
                 vec![s("a", ImportQueued(1))],
                 vec![s("b", ImportQueued(2))],
@@ -715,6 +717,23 @@ mod tests {
 
         assert!(!base.join("X").exists());
         assert!(base.exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_import_reports_to_the_owners_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        let alice = alice();
+        let failing = owned(
+            job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
+            &alice,
+            &["a"],
+        );
+        finish(queue.submit(failing).await).await;
+
+        assert!(!deps.progress_for(&alice).is_empty());
+        assert!(deps.progress_for(&UserId::new("alice")).is_empty());
     }
 
     #[tokio::test]

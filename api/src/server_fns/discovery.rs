@@ -37,6 +37,8 @@ async fn update_progress(
 }
 
 #[cfg(feature = "server")]
+use crate::auth::UserId;
+#[cfg(feature = "server")]
 use crate::import_queue::{ImportJob, IMPORT_QUEUE};
 #[cfg(feature = "server")]
 use crate::models::discovery_playlist::DiscoveryTrackRow;
@@ -729,7 +731,7 @@ pub async fn generate_discovery_playlist_internal(
                 ranked_items.truncate(failover::MAX_SOURCES_PER_TRACK);
                 let track_batch = BatchRef::new(
                     TransferOwner {
-                        user_id: user_id.to_string(),
+                        user_id: UserId::new(user_id),
                         batch_id: uuid::Uuid::new_v4().to_string(),
                     },
                     format!("{} - {}", candidate.artist, candidate.track),

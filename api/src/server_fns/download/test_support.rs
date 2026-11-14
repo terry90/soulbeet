@@ -4,6 +4,7 @@
 //! `failover` and `monitor` drive the same stub instead of keeping two
 //! copies of it in step.
 
+use crate::auth::UserId;
 use async_trait::async_trait;
 use shared::download::{
     DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, EnqueueStatus,
@@ -54,7 +55,7 @@ pub fn batch(label: &str) -> BatchRef {
     let unique = uuid::Uuid::new_v4();
     BatchRef::new(
         TransferOwner {
-            user_id: format!("tester-{unique}"),
+            user_id: UserId::new(&format!("tester-{unique}")),
             batch_id: format!("12345678-{unique}"),
         },
         label.to_string(),

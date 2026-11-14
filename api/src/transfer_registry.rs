@@ -10,6 +10,7 @@
 //! delivers the accepted transfers, which the batch's monitor then watches.
 //! The monitor only finishes once no reservation is outstanding.
 
+use crate::auth::UserId;
 use shared::download::batch_folder;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 /// Who started a batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferOwner {
-    pub user_id: String,
+    pub user_id: UserId,
     pub batch_id: String,
 }
 
@@ -96,20 +97,20 @@ impl TransferRegistry {
         self.owners.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Sorts `keys` by who holds them, from `user_id`'s point of view, and
+    /// Sorts `keys` by who holds them, from `user`'s point of view, and
     /// lists the free ones in `claimed` without claiming them. A key repeated
     /// in `keys` is reported once.
     fn classify(
         owners: &HashMap<TransferKey, BatchRef>,
         keys: &[TransferKey],
-        user_id: &str,
+        user: &UserId,
     ) -> Claim {
         let mut claim = Claim::default();
         let mut seen = HashSet::new();
         for key in keys.iter().filter(|key| seen.insert(*key)) {
             match owners.get(key) {
                 None => claim.claimed.push(key.clone()),
-                Some(running) if running.owner.user_id == user_id => {
+                Some(running) if &running.owner.user_id == user => {
                     claim.mine.push((key.clone(), running.clone()));
                 }
                 Some(_) => claim.other_user.push(key.clone()),
@@ -307,7 +308,7 @@ mod tests {
     fn batch(user_id: &str, batch_id: &str) -> BatchRef {
         BatchRef::new(
             TransferOwner {
-                user_id: user_id.to_string(),
+                user_id: UserId::new(user_id),
                 batch_id: batch_id.to_string(),
             },
             "Come Over".to_string(),

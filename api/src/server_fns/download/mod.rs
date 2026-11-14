@@ -53,6 +53,8 @@ use self::enqueue::{
 #[cfg(feature = "server")]
 use self::monitor::{DownloadMonitor, WatchedTransfer};
 #[cfg(feature = "server")]
+use crate::auth::UserId;
+#[cfg(feature = "server")]
 use crate::transfer_registry::{BatchRef, TransferOwner};
 #[cfg(feature = "server")]
 use soulbeet::{error::SoulseekError, DownloadBackend};
@@ -92,17 +94,17 @@ fn auto_batch_label(group: &shared::download::DownloadableGroup) -> String {
 pub async fn download_updates_ws(
     options: WebSocketOptions,
 ) -> Result<Websocket<(), DownloadEvent>, ServerFnError> {
-    let username = auth.0.username;
+    let user = auth.0.id();
 
     let rx = {
         let map = USER_CHANNELS.read().await;
-        if let Some(channel) = map.get(&username) {
+        if let Some(channel) = map.get(&user) {
             channel.sender.subscribe()
         } else {
             drop(map);
             let mut map = USER_CHANNELS.write().await;
             let channel = map
-                .entry(username.clone())
+                .entry(user.clone())
                 .or_insert_with(crate::globals::UserChannel::new);
             channel.sender.subscribe()
         }
@@ -110,7 +112,7 @@ pub async fn download_updates_ws(
 
     Ok(options.on_upgrade(move |mut socket| async move {
         let mut rx = rx;
-        info!("WebSocket connected for user: {}", username);
+        info!("WebSocket connected for user: {}", user);
 
         loop {
             // handle both broadcast messages and potential socket closure
@@ -145,7 +147,7 @@ pub async fn download_updates_ws(
             }
         }
 
-        info!("WebSocket disconnected for user: {}", username);
+        info!("WebSocket disconnected for user: {}", user);
 
         // Trigger cleanup of stale channels periodically
         cleanup_stale_channels().await;
@@ -162,7 +164,7 @@ pub struct CancelDownloadRequest {
 
 #[post("/api/downloads/cancel", auth: AuthSession)]
 pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnError> {
-    let username = auth.0.username;
+    let user = auth.0.id();
 
     let backend = download_backend(req.backend.as_deref())
         .await
@@ -175,11 +177,11 @@ pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnE
 
     info!(
         "User {} cancelled download {} from {}",
-        username, req.id, req.source
+        user, req.id, req.source
     );
 
     // Send cancelled state to UI via broadcast channel
-    let (tx, _) = get_or_create_user_channel(&username).await;
+    let (tx, _) = get_or_create_user_channel(&user).await;
     let cancelled = DownloadProgress {
         id: req.id,
         source: req.source,
@@ -213,7 +215,7 @@ pub struct DownloadRequest {
 
 #[post("/api/downloads/queue", auth: AuthSession)]
 pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, ServerFnError> {
-    let username = auth.0.username;
+    let user = auth.0.id();
 
     if let Some(issue) = crate::importer_health::broken_issue().await {
         return Err(refusal_error(issue.title));
@@ -237,13 +239,13 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
         .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
     let fresh = BatchRef::new(
         TransferOwner {
-            user_id: auth.0.user_id.clone(),
+            user_id: user.clone(),
             batch_id: uuid::Uuid::new_v4().to_string(),
         },
         manual_batch_label(&req.items),
         target_path_buf,
     );
-    let queued = queue_detached(backend, req.items, fresh, username, req.backend)
+    let queued = queue_detached(backend, req.items, fresh, user, req.backend)
         .await
         .map_err(server_error)?;
     match queued {
@@ -275,10 +277,10 @@ async fn queue_detached(
     backend: Arc<dyn DownloadBackend>,
     items: Vec<DownloadableItem>,
     fresh: BatchRef,
-    username: String,
+    user: UserId,
     backend_id: Option<String>,
 ) -> Result<Queued, tokio::task::JoinError> {
-    tokio::spawn(queue_and_watch(backend, items, fresh, username, backend_id)).await
+    tokio::spawn(queue_and_watch(backend, items, fresh, user, backend_id)).await
 }
 
 /// Claims and enqueues a manual request's files, shows their rows, and hands
@@ -289,7 +291,7 @@ async fn queue_and_watch(
     backend: Arc<dyn DownloadBackend>,
     items: Vec<DownloadableItem>,
     fresh: BatchRef,
-    username: String,
+    user: UserId,
     backend_id: Option<String>,
 ) -> Queued {
     let enq = enqueue_request(&backend, items, fresh).await;
@@ -302,7 +304,7 @@ async fn queue_and_watch(
         ..
     } = enq;
 
-    let (tx, _) = get_or_create_user_channel(&username).await;
+    let (tx, _) = get_or_create_user_channel(&user).await;
     let row = |p: DownloadProgress| {
         let mut p = p.with_batch(batch.owner.batch_id.clone(), batch.label.clone());
         p.backend = backend_id.clone();
@@ -368,19 +370,17 @@ async fn queue_and_watch(
                 enqueued.iter().map(|d| &d.item).collect::<Vec<_>>()
             );
             let transfers = enqueued.iter().map(WatchedTransfer::from).collect();
-            let task_username = username.clone();
-            let task_cancellation = register_user_task(&username).await;
+            let task_cancellation = register_user_task(&user).await;
             tokio::spawn(async move {
                 let mut monitor = DownloadMonitor::new(
                     transfers,
                     batch.target.clone(),
                     tx,
                     task_cancellation,
-                    task_username.clone(),
                     batch,
                 );
                 monitor.run().await;
-                unregister_user_task(&task_username).await;
+                unregister_user_task(&user).await;
             });
         }
     }
@@ -396,7 +396,7 @@ async fn queue_and_watch(
 /// `choice` says.
 #[post("/api/downloads/retry-import", auth: AuthSession)]
 pub async fn retry_import(item: String, choice: ImportChoice) -> Result<(), ServerFnError> {
-    crate::import_queue::retry_import_for(&auth.0.username, &item, choice)
+    crate::import_queue::retry_import_for(&auth.0.id(), &item, choice)
         .await
         .map_err(kept_import_refusal)
 }
@@ -404,7 +404,7 @@ pub async fn retry_import(item: String, choice: ImportChoice) -> Result<(), Serv
 /// The matches a skipped row can be imported with.
 #[post("/api/downloads/import-choices", auth: AuthSession)]
 pub async fn import_choices(item: String) -> Result<MatchChoices, ServerFnError> {
-    crate::import_queue::import_choices_for(&auth.0.username, &item).map_err(kept_import_refusal)
+    crate::import_queue::import_choices_for(&auth.0.id(), &item).map_err(kept_import_refusal)
 }
 
 /// A refused retry or matches request, with what stays kept for the row.
@@ -416,7 +416,7 @@ fn kept_import_refusal(refusal: crate::import_queue::Refusal) -> ServerFnError {
 /// Drops the stored imports of rows the user cleared.
 #[post("/api/downloads/forget-retries", auth: AuthSession)]
 pub async fn forget_import_retries(items: Vec<String>) -> Result<(), ServerFnError> {
-    crate::import_queue::forget_retries(&auth.0.username, &items);
+    crate::import_queue::forget_retries(&auth.0.id(), &items);
     Ok(())
 }
 
@@ -489,7 +489,7 @@ mod tests {
             backend,
             items,
             fresh,
-            "detached-request".to_string(),
+            UserId::new("detached-request"),
             None,
         ));
         reached.notified().await;

@@ -6,6 +6,8 @@ use std::sync::{LazyLock, Once};
 use std::time::Duration;
 
 #[cfg(feature = "server")]
+use crate::auth::UserId;
+#[cfg(feature = "server")]
 use shared::download::DownloadEvent;
 #[cfg(feature = "server")]
 use tokio::sync::{broadcast, RwLock};
@@ -103,7 +105,7 @@ impl Default for UserChannel {
 }
 
 #[cfg(feature = "server")]
-pub static USER_CHANNELS: LazyLock<RwLock<HashMap<String, UserChannel>>> =
+pub static USER_CHANNELS: LazyLock<RwLock<HashMap<UserId, UserChannel>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[cfg(feature = "server")]
@@ -114,12 +116,10 @@ pub static DISCOVERY_PROGRESS: LazyLock<
 /// Get or create a user channel, returning the sender and cancellation token
 #[cfg(feature = "server")]
 pub async fn get_or_create_user_channel(
-    username: &str,
+    user: &UserId,
 ) -> (broadcast::Sender<DownloadEvent>, CancellationToken) {
     let mut map = USER_CHANNELS.write().await;
-    let channel = map
-        .entry(username.to_string())
-        .or_insert_with(UserChannel::new);
+    let channel = map.entry(user.clone()).or_insert_with(UserChannel::new);
     (channel.sender.clone(), channel.cancellation_token.clone())
 }
 
@@ -127,9 +127,9 @@ pub async fn get_or_create_user_channel(
 /// have replaced the one a long-running job saw at its start. Without a
 /// channel nobody is listening, so none is created.
 #[cfg(feature = "server")]
-pub async fn send_user_event(username: &str, event: DownloadEvent) -> bool {
+pub async fn send_user_event(user: &UserId, event: DownloadEvent) -> bool {
     let channels = USER_CHANNELS.read().await;
-    let Some(channel) = channels.get(username) else {
+    let Some(channel) = channels.get(user) else {
         return false;
     };
     channel.touch();
@@ -138,21 +138,19 @@ pub async fn send_user_event(username: &str, event: DownloadEvent) -> bool {
 
 /// Register a new task for a user and return the cancellation token
 #[cfg(feature = "server")]
-pub async fn register_user_task(username: &str) -> CancellationToken {
+pub async fn register_user_task(user: &UserId) -> CancellationToken {
     let mut map = USER_CHANNELS.write().await;
-    let channel = map
-        .entry(username.to_string())
-        .or_insert_with(UserChannel::new);
+    let channel = map.entry(user.clone()).or_insert_with(UserChannel::new);
     channel.add_task();
     channel.cancellation_token.clone()
 }
 
 /// Unregister a task for a user and clean up if no tasks remain
 #[cfg(feature = "server")]
-pub async fn unregister_user_task(username: &str) {
+pub async fn unregister_user_task(user: &UserId) {
     let should_cleanup = {
         let map = USER_CHANNELS.read().await;
-        if let Some(channel) = map.get(username) {
+        if let Some(channel) = map.get(user) {
             channel.remove_task()
         } else {
             false
@@ -163,11 +161,11 @@ pub async fn unregister_user_task(username: &str) {
     // Note: We keep the channel around for a bit in case new connections come in
     if should_cleanup {
         let map = USER_CHANNELS.read().await;
-        if let Some(channel) = map.get(username) {
+        if let Some(channel) = map.get(user) {
             if channel.sender.receiver_count() == 0 && channel.task_count() == 0 {
                 info!(
                     "User {} has no active tasks or receivers, eligible for cleanup",
-                    username
+                    user
                 );
                 // We don't immediately remove to avoid race conditions
                 // A background cleanup task could periodically clean stale channels
@@ -209,18 +207,18 @@ pub async fn cleanup_stale_progress() {
 #[cfg(feature = "server")]
 pub async fn cleanup_stale_channels() {
     let mut map = USER_CHANNELS.write().await;
-    let stale_users: Vec<String> = map
+    let stale_users: Vec<UserId> = map
         .iter()
         .filter(|(_, channel)| {
             let no_activity = channel.sender.receiver_count() == 0 && channel.task_count() == 0;
             no_activity && channel.is_stale()
         })
-        .map(|(username, _)| username.clone())
+        .map(|(user, _)| user.clone())
         .collect();
 
-    for username in stale_users {
-        info!("Cleaning up stale channel for user: {}", username);
-        map.remove(&username);
+    for user in stale_users {
+        info!("Cleaning up stale channel for user: {}", user);
+        map.remove(&user);
     }
 }
 

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::utils::{file_id, resolve_download_path, resolve_in_destination, FileId};
+use crate::auth::UserId;
 use crate::import_queue::{ImportJob, JobOwner};
 
 /// Maximum number of retries when waiting for a downloaded file to appear on disk.
@@ -83,14 +84,14 @@ pub struct ResolvedSlot {
     pub destination: Option<String>,
 }
 
-/// An import of `source` reporting to `username` through `rows`, which are
+/// An import of `source` reporting to `user` through `rows`, which are
 /// already stamped with their batch.
 pub fn import_job(
     source: PathBuf,
     mode: ImportMode,
     rows: Vec<DownloadProgress>,
     target: &Path,
-    username: &str,
+    user: &UserId,
     base: &Path,
 ) -> ImportJob {
     ImportJob {
@@ -98,7 +99,7 @@ pub fn import_job(
         target: target.to_path_buf(),
         mode,
         owner: Some(JobOwner {
-            username: username.to_string(),
+            user_id: user.clone(),
             rows,
         }),
         snapshot_target: false,
@@ -114,7 +115,7 @@ pub fn import_job(
 pub fn album_jobs(
     resolved: Vec<ResolvedSlot>,
     target: &Path,
-    username: &str,
+    user: &UserId,
     base: &Path,
 ) -> Vec<ImportJob> {
     let mut albums: Vec<(PathBuf, Vec<DownloadProgress>)> = Vec::new();
@@ -133,14 +134,14 @@ pub fn album_jobs(
                 ImportMode::Singleton,
                 vec![slot.row],
                 target,
-                username,
+                user,
                 base,
             )),
         }
     }
     let album_jobs = albums
         .into_iter()
-        .map(|(folder, rows)| import_job(folder, ImportMode::Album, rows, target, username, base));
+        .map(|(folder, rows)| import_job(folder, ImportMode::Album, rows, target, user, base));
     album_jobs.chain(jobs).collect()
 }
 
@@ -170,18 +171,22 @@ mod tests {
             },
         ];
 
-        let jobs: Vec<(Vec<PathBuf>, ImportMode, Vec<String>)> =
-            album_jobs(resolved, Path::new("/music"), "u", Path::new("/dl"))
-                .into_iter()
-                .map(|job| {
-                    assert_eq!(job.cleanup_root.as_deref(), Some(Path::new("/dl")));
-                    assert_eq!(job.target, Path::new("/music"));
-                    let owner = job.owner.unwrap();
-                    assert_eq!(owner.username, "u");
-                    let items = owner.rows.into_iter().map(|r| r.item).collect();
-                    (job.sources, job.mode, items)
-                })
-                .collect();
+        let jobs: Vec<(Vec<PathBuf>, ImportMode, Vec<String>)> = album_jobs(
+            resolved,
+            Path::new("/music"),
+            &UserId::new("u"),
+            Path::new("/dl"),
+        )
+        .into_iter()
+        .map(|job| {
+            assert_eq!(job.cleanup_root.as_deref(), Some(Path::new("/dl")));
+            assert_eq!(job.target, Path::new("/music"));
+            let owner = job.owner.unwrap();
+            assert_eq!(owner.user_id, UserId::new("u"));
+            let items = owner.rows.into_iter().map(|r| r.item).collect();
+            (job.sources, job.mode, items)
+        })
+        .collect();
 
         assert_eq!(
             jobs,

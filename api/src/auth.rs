@@ -28,6 +28,38 @@ pub struct UserCtx {
     pub role: Role,
 }
 
+/// A `users.id`, the only key of per-user runtime state. No `From<String>`
+/// or `From<&str>`, so a username cannot be passed where an id is wanted.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct UserId(String);
+
+#[cfg(feature = "server")]
+impl UserId {
+    /// Only for values read from `users.id`.
+    pub fn new(users_id: &str) -> UserId {
+        UserId(users_id.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::fmt::Display for UserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "server")]
+impl UserCtx {
+    pub fn id(&self) -> UserId {
+        UserId::new(&self.user_id)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthResponse {
     pub username: String,
