@@ -128,6 +128,7 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `NAVIDROME_URL` | Your Navidrome server URL. Optional: without it you log in with local accounts, and discovery playlists, rating sync and auto-delete are unavailable | |
 | `BEETS_CONFIG` | Path to your beets config file. Replaces the shipped `/app/beets_config.yaml` (beets defaults still apply underneath) | `beets_config.yaml` |
 | `BEETS_PYTHON` | Python interpreter that runs beets imports and the config check. By default it is read from the `#!` line of `beet` (`/usr/bin/python3` in the image) | |
+| `PUBLIC_URL` | Optional. The public address (`https://host[:port]`, no path). When set, Soulful uses it instead of reading the address from request headers | |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 

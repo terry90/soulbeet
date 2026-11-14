@@ -7,6 +7,9 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "server")]
+use crate::base_url::{BaseUrl, BaseUrlError};
+
+#[cfg(feature = "server")]
 const DEFAULT_SECRET_KEY: &str = "secret";
 
 /// Parse a boolean from an environment variable.
@@ -51,6 +54,8 @@ pub struct AppConfig {
     beet_bin: PathBuf,
     /// The Python that runs `beet` (BEETS_PYTHON, else beet's shebang)
     beets_python: Option<PathBuf>,
+    /// `PUBLIC_URL`, parsed once; `None` when unset or empty
+    public_url: Option<Result<BaseUrl, BaseUrlError>>,
     /// HTTP server port (default: 9765)
     pub port: u16,
     /// HTTP server bind address (default: "0.0.0.0")
@@ -100,6 +105,11 @@ impl AppConfig {
             beets_album_mode: parse_bool_env("BEETS_ALBUM_MODE", false),
             beet_bin,
             beets_python,
+            public_url: std::env::var("PUBLIC_URL")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(|v| BaseUrl::parse(&v)),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
@@ -136,6 +146,11 @@ impl AppConfig {
     /// The Python that runs `beet`, when it is known.
     pub fn beets_python(&self) -> Option<&Path> {
         self.beets_python.as_deref()
+    }
+
+    /// The pinned public address, when `PUBLIC_URL` is set.
+    pub fn public_url(&self) -> Option<&Result<BaseUrl, BaseUrlError>> {
+        self.public_url.as_ref()
     }
 
     /// Check if album mode is enabled.

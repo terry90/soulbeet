@@ -1,4 +1,6 @@
 pub mod auth;
+#[cfg(feature = "server")]
+pub mod base_url;
 pub mod config;
 pub mod crypto;
 pub mod db;
