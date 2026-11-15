@@ -1234,7 +1234,7 @@ async fn scan_imports(navi: &soulbeet::navidrome::NavidromeClient, imported: u32
     for _ in 0..40u32 {
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         match navi.get_scan_status().await {
-            Ok(status) if scan_finished(&status, before) => {
+            Ok(status) if status.ended_after(before) => {
                 if !status.error.is_empty() {
                     warn!("Navidrome scan reported an error: {}", status.error);
                 }
@@ -1246,16 +1246,6 @@ async fn scan_imports(navi: &soulbeet::navidrome::NavidromeClient, imported: u32
         }
     }
     true
-}
-
-/// A scan has ended once Navidrome is idle and its last scan is later than
-/// the one recorded before this generation started its own.
-#[cfg(feature = "server")]
-fn scan_finished(
-    status: &soulbeet::navidrome::ScanStatus,
-    before: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    !status.scanning && status.last_scan > before
 }
 
 /// Create or update smart playlists in Navidrome for each discovery profile.
@@ -1644,8 +1634,8 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 mod tests {
     use super::{
         claim_run, discovery_disabled, discovery_folder_not_found, discovery_folder_required,
-        generation_running, run_database_failure, scan_finished, scan_imports, settle_poll,
-        QueuedTrack, FAILED_STATE_CONFIRM,
+        generation_running, run_database_failure, scan_imports, settle_poll, QueuedTrack,
+        FAILED_STATE_CONFIRM,
     };
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
@@ -1741,36 +1731,6 @@ mod tests {
         assert_eq!(claim_run(&mut runs, "user-b", running()), Ok(()));
         runs.get_mut("user-a").unwrap().status = GenerationStatus::Complete;
         assert_eq!(claim_run(&mut runs, "user-a", running()), Ok(()));
-    }
-
-    #[test]
-    fn a_scan_is_finished_once_a_later_one_ended() {
-        use chrono::{DateTime, Utc};
-        use soulbeet::navidrome::ScanStatus;
-        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
-        let status = |scanning, last: &str| ScanStatus {
-            scanning,
-            count: 0,
-            last_scan: at(last),
-            error: String::new(),
-        };
-        let before = at("2026-11-15T10:00:00Z");
-        assert!(!scan_finished(
-            &status(false, "2026-11-15T10:00:00Z"),
-            before
-        ));
-        assert!(!scan_finished(
-            &status(true, "2026-11-15T10:00:05Z"),
-            before
-        ));
-        assert!(scan_finished(
-            &status(false, "2026-11-15T10:00:05Z"),
-            before
-        ));
-        assert!(scan_finished(
-            &status(false, "2026-11-15T10:00:05Z"),
-            at("0001-01-01T00:00:00Z")
-        ));
     }
 
     #[test]

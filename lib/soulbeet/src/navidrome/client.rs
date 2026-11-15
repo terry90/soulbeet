@@ -451,6 +451,34 @@ impl NavidromeClient {
             .collect())
     }
 
+    /// Present songs (missing=false) the native `title` filter matches for `text`, ordered by id,
+    /// rows `start` to `end` (exclusive): a recording MBID matches the MBID columns, other text
+    /// matches every word against title, album and artist names.
+    pub async fn find_songs(&self, text: &str, start: u32, end: u32) -> Result<Vec<NativeSong>> {
+        let url = self.base_url.join("api/song")?;
+
+        let resp = self
+            .native_request(self.client.get(url).query(&[
+                ("_start", start.to_string()),
+                ("_end", end.to_string()),
+                ("_sort", "id".to_string()),
+                ("_order", "ASC".to_string()),
+                ("title", text.to_string()),
+                ("missing", "false".to_string()),
+            ]))
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(NavidromeError::Http {
+                action: "Find songs",
+                status: resp.status().as_u16(),
+                body: None,
+            });
+        }
+
+        resp.json().await.map_err(parse)
+    }
+
     /// List all players visible to the authenticated user via Navidrome's native API.
     /// Non-admin users only see their own players.
     pub async fn get_players(&self) -> Result<Vec<PlayerInfo>> {
@@ -549,6 +577,38 @@ mod tests {
             "2026-11-14T21:03:11.519322+00:00"
         );
         assert_eq!(status.error, "");
+    }
+
+    #[tokio::test]
+    async fn songs_are_found_by_text_among_present_files() {
+        let songs = r#"[{"id":"f2c4d1a8b0e94c37a6d5e8b1c2a3f405","libraryId":1,"libraryPath":"/music",
+        "path":"Zzqx Artist/Qzz Album/01 Song Number 1.mp3","title":"Song Number 1","album":"Qzz Album",
+        "artist":"Zzqx Artist","size":32032,"suffix":"mp3","missing":false}]"#;
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: r#"{"token":"jwt"}"#.into(),
+            },
+            Reply {
+                status: 200,
+                body: songs.into(),
+            },
+        ]);
+        let found = client(&url)
+            .find_songs("Zzqx Artist Song Number 1", 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|s| (s.path.as_str(), s.size))
+                .collect::<Vec<_>>(),
+            vec![("Zzqx Artist/Qzz Album/01 Song Number 1.mp3", 32032)]
+        );
+        assert_eq!(
+            seen.lock().unwrap()[1].target,
+            "/api/song?_start=0&_end=100&_sort=id&_order=ASC&title=Zzqx+Artist+Song+Number+1&missing=false"
+        );
     }
 
     #[tokio::test]

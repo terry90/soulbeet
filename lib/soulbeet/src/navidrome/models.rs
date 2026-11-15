@@ -56,6 +56,28 @@ pub struct ScanStatus {
     pub last_scan: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub error: String,
+    /// Nanoseconds (`int64(status.ElapsedTime)`, server/subsonic/library_scanning.go:31); omitted when zero.
+    #[serde(default)]
+    pub elapsed_time: i64,
+}
+
+impl ScanStatus {
+    /// Navidrome is idle and its last scan ended after `before`.
+    pub fn ended_after(&self, before: chrono::DateTime<chrono::Utc>) -> bool {
+        !self.scanning && self.last_scan > before
+    }
+
+    /// When the last scan began, read while Navidrome is idle: `lastScan - elapsedTime`, since an idle
+    /// Navidrome sends `elapsedTime` as the last scan time less the start it stored
+    /// (scanner/controller.go:131-143, scanner/scanner.go:112). None while scanning, when
+    /// `elapsedTime` counts from that start to now.
+    pub fn last_start(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        if self.scanning {
+            return None;
+        }
+        self.last_scan
+            .checked_sub_signed(chrono::Duration::nanoseconds(self.elapsed_time))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,4 +181,55 @@ pub struct NativeSong {
     pub id: String,
     pub path: String,
     pub title: String,
+    /// bytes (model/mediafile.go `Size`)
+    pub size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_last_scan_began_its_length_before_it_ended() {
+        let parse = |json: &str| serde_json::from_str::<ScanStatus>(json).unwrap();
+        let idle = parse(
+            r#"{"scanning":false,"count":1342,"folderCount":120,"lastScan":"2026-11-15T10:02:00Z","scanType":"quick","elapsedTime":4000000000}"#,
+        );
+        assert_eq!(
+            idle.last_start(),
+            Some("2026-11-15T10:01:56Z".parse().unwrap())
+        );
+        let failed = parse(
+            r#"{"scanning":false,"count":1342,"folderCount":120,"lastScan":"2026-11-15T10:02:00Z","error":"running GC: purging empty albums: database is locked","scanType":"quick","elapsedTime":-30000000000}"#,
+        );
+        assert_eq!(
+            failed.last_start(),
+            Some("2026-11-15T10:02:30Z".parse().unwrap())
+        );
+        let never = parse(
+            r#"{"scanning":false,"count":0,"folderCount":0,"lastScan":"0001-01-01T00:00:00Z"}"#,
+        );
+        assert_eq!(never.last_start(), Some(never.last_scan));
+        let running = parse(
+            r#"{"scanning":true,"count":12,"folderCount":3,"lastScan":"2026-11-15T10:02:00Z","scanType":"quick","elapsedTime":9000000000}"#,
+        );
+        assert_eq!(running.last_start(), None);
+    }
+
+    #[test]
+    fn a_scan_has_ended_once_a_later_one_ended() {
+        let at = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let status = |scanning, last: &str| ScanStatus {
+            scanning,
+            count: 0,
+            last_scan: at(last),
+            error: String::new(),
+            elapsed_time: 0,
+        };
+        let before = at("2026-11-15T10:00:00Z");
+        assert!(!status(false, "2026-11-15T10:00:00Z").ended_after(before));
+        assert!(!status(true, "2026-11-15T10:00:05Z").ended_after(before));
+        assert!(status(false, "2026-11-15T10:00:05Z").ended_after(before));
+        assert!(status(false, "2026-11-15T10:00:05Z").ended_after(at("0001-01-01T00:00:00Z")));
+    }
 }
