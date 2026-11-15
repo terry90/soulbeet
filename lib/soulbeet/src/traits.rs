@@ -3,6 +3,7 @@ use shared::{
     download::{
         DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult, SkipKind,
     },
+    failure::UserAction,
     library::DuplicateReport,
     metadata::{Album, AlbumWithTracks, SearchResult as MetadataSearchResult, Track},
     recommendation::{
@@ -166,6 +167,10 @@ pub struct ImportResult {
     /// What a user can pick from after an automatic import skipped its only
     /// task for want of a close match.
     pub choices: Option<MatchChoices>,
+    /// What a person must do before these files can import, when only a
+    /// person can fix what went wrong. The importer words it, since it names
+    /// the importer's own setup.
+    pub user_action: Option<UserAction>,
 }
 
 impl ImportResult {
@@ -175,6 +180,7 @@ impl ImportResult {
             output_tail: String::new(),
             tasks: TaskCount::default(),
             choices: None,
+            user_action: None,
         }
     }
 
@@ -188,6 +194,11 @@ impl ImportResult {
 
     pub fn nothing_to_import() -> Self {
         Self::without_run(ImportOutcome::Skipped(SkipReason::NothingToImport))
+    }
+
+    pub fn with_user_action(mut self, action: UserAction) -> Self {
+        self.user_action = Some(action);
+        self
     }
 }
 
@@ -288,6 +299,10 @@ pub trait MusicImporter: Send + Sync {
         mode: ImportMode,
         choice: &DriverChoice,
     ) -> ImportResult;
+
+    /// The result of a job not run because of `issue`, the title of one of
+    /// this importer's blocking health issues.
+    fn refused(&self, issue: String) -> ImportResult;
 
     async fn find_duplicates(
         &self,

@@ -3,7 +3,7 @@
 use super::retry::keeps_retry;
 use super::{ImportJob, JobOutcome};
 use shared::download::{DownloadProgress, DownloadState, SkipKind};
-use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage, UserAction};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use soulbeet::{FailKind, ImportMode, ImportOutcome, ImportResult, SkipReason, TimeoutKind};
 
 pub fn row_state(outcome: &ImportOutcome) -> DownloadState {
@@ -18,7 +18,8 @@ pub fn row_state(outcome: &ImportOutcome) -> DownloadState {
 }
 
 /// The typed failure for an import outcome that is not a success. Its message
-/// is the result's text, so a row shows what it always showed.
+/// is the result's text, so a row shows what it always showed; its user
+/// action is the importer's.
 fn import_failure(result: &ImportResult) -> Option<Failure> {
     let (code, retry) = match &result.outcome {
         ImportOutcome::Imported { .. } => return None,
@@ -66,17 +67,9 @@ fn import_failure(result: &ImportResult) -> Option<Failure> {
             }
         },
     };
-    let message = result.to_string();
-    let mut failure = Failure::new(code, Stage::Import, retry, message.clone());
-    match code {
-        FailureCode::ImporterBroken => {
-            failure = failure.with_user_action(UserAction::fix_importer(&message));
-        }
-        // Once there is space, the same files import.
-        FailureCode::ImportDiskFull => {
-            failure = failure.with_user_action(UserAction::free_disk_space(&message));
-        }
-        _ => {}
+    let mut failure = Failure::new(code, Stage::Import, retry, result.to_string());
+    if let Some(action) = &result.user_action {
+        failure = failure.with_user_action(action.clone());
     }
     if !result.output_tail.is_empty() {
         failure = failure.with_cause(Service::Beets, None, result.output_tail.clone());
@@ -157,7 +150,7 @@ mod tests {
     use super::*;
     use crate::import_queue::test_support::{candidate, imported, no_match, row, track_choices};
     use crate::import_queue::{ImportJob, JobOutcome};
-    use shared::failure::UserActionCode;
+    use shared::failure::{UserAction, UserActionCode};
     use soulbeet::{DriverChoice, TaskCount};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -245,6 +238,7 @@ mod tests {
                 total: 2,
             },
             choices: None,
+            user_action: None,
         };
 
         let album = rows_for_done(
@@ -337,6 +331,7 @@ mod tests {
                 total: 1,
             },
             choices: None,
+            user_action: None,
         };
         let cases = [
             (
@@ -451,23 +446,23 @@ mod tests {
             assert_eq!(f.cause.unwrap().raw, "tail");
         }
         assert_eq!(import_failure(&imported()), None);
-        let refused = import_failure(&run(ImportOutcome::Refused {
-            issue: "No metadata source plugin loaded".into(),
-        }))
-        .unwrap();
-        assert_eq!(
-            refused.user_action.unwrap().code,
-            UserActionCode::FixImporter
+    }
+
+    /// The importer words what a person does; the row mapping adds none of
+    /// its own.
+    #[test]
+    fn an_import_failure_carries_the_importers_user_action() {
+        let refused = ImportResult::refused("No metadata source plugin loaded".into());
+        assert_eq!(import_failure(&refused).unwrap().user_action, None);
+
+        let action = UserAction::new(
+            UserActionCode::FixImporter,
+            "Fix the beets setup: No metadata source plugin loaded",
+            "Settings > Config",
         );
-        let full = import_failure(&run(ImportOutcome::Failed {
-            kind: FailKind::DiskFull,
-            message: "Error: No space left on device while creating /music/A".into(),
-        }))
-        .unwrap();
-        assert_eq!(
-            full.user_action.unwrap().code,
-            UserActionCode::FreeDiskSpace
-        );
+        let f = import_failure(&refused.with_user_action(action.clone())).unwrap();
+        assert_eq!(f.code, FailureCode::ImporterBroken);
+        assert_eq!(f.user_action, Some(action));
     }
 
     #[test]

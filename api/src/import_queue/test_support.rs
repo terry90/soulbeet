@@ -29,6 +29,7 @@ pub fn imported() -> ImportResult {
             total: 1,
         },
         choices: None,
+        user_action: None,
     }
 }
 
@@ -44,6 +45,7 @@ pub fn no_match(candidates: u32) -> ImportResult {
             total: 1,
         },
         choices: None,
+        user_action: None,
     }
 }
 
@@ -257,6 +259,10 @@ impl MusicImporter for StubImporter {
             .unwrap()
             .pop_front()
             .unwrap_or_else(imported)
+    }
+
+    fn refused(&self, issue: String) -> ImportResult {
+        ImportResult::refused(issue)
     }
 
     async fn find_duplicates(&self, _: &[&Path]) -> Result<DuplicateReport, String> {

@@ -345,6 +345,7 @@ impl Classifier {
             output_tail: tail,
             tasks,
             choices: None,
+            user_action: None,
         }
     }
 

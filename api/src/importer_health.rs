@@ -113,6 +113,9 @@ mod tests {
         ) -> ImportResult {
             unreachable!()
         }
+        fn refused(&self, _: String) -> ImportResult {
+            unreachable!()
+        }
         async fn find_duplicates(&self, _: &[&Path]) -> Result<DuplicateReport, String> {
             unreachable!()
         }

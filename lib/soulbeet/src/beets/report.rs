@@ -215,6 +215,7 @@ mod tests {
                 total: 1,
             },
             choices: None,
+            user_action: None,
         }
     }
 

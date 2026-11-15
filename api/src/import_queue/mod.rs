@@ -305,7 +305,7 @@ impl Shared {
             Err(e) => return JobOutcome::of(ImportResult::failed(FailKind::Setup, e)),
         };
         if let Some(issue) = crate::importer_health::refusal(importer.as_ref()).await {
-            return JobOutcome::of(ImportResult::refused(issue));
+            return JobOutcome::of(importer.refused(issue));
         }
         let before = match job.snapshot_target {
             true => Some(audio_files_under(target).await),

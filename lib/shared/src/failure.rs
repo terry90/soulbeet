@@ -107,21 +107,14 @@ pub struct UserAction {
 }
 
 impl UserAction {
-    /// A backend's own actions name the backend, so its provider builds them.
+    /// A provider's own actions name the provider (slskd, beets), so the
+    /// provider builds them.
     pub fn new(code: UserActionCode, what: impl Into<String>, where_: impl Into<String>) -> Self {
         Self {
             code,
             what: what.into(),
             where_: where_.into(),
         }
-    }
-
-    pub fn fix_importer(message: &str) -> Self {
-        Self::new(
-            UserActionCode::FixImporter,
-            format!("Fix the beets setup: {message}"),
-            "Settings > Config",
-        )
     }
 
     /// The file a finished download was saved as is not where Soulful looks:
@@ -134,15 +127,6 @@ impl UserAction {
                 download_path.display()
             ),
             "DOWNLOAD_PATH and the volume mounted there",
-        )
-    }
-
-    /// beets' line naming what it could not write: `message`.
-    pub fn free_disk_space(message: &str) -> Self {
-        Self::new(
-            UserActionCode::FreeDiskSpace,
-            format!("Free disk space: {message}"),
-            "The disk that holds the path in the message",
         )
     }
 }
@@ -472,28 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn user_actions_name_what_to_fix() {
+    fn fix_download_path_names_the_folder() {
         let path = UserAction::fix_download_path(std::path::Path::new("/downloads"));
         assert_eq!(path.code, UserActionCode::FixDownloadPath);
         assert_eq!(
             path.what,
             "Make the folder the download backend saves into readable by Soulful at /downloads"
         );
-        let full = "Error: No space left on device while creating /music/A";
-        let disk = UserAction::free_disk_space(full);
-        assert_eq!(disk.code, UserActionCode::FreeDiskSpace);
-        assert_eq!(disk.what, format!("Free disk space: {full}"));
-    }
-
-    #[test]
-    fn fix_importer_carries_the_message() {
-        let a = UserAction::fix_importer("No metadata source plugin loaded");
-        assert_eq!(a.code, UserActionCode::FixImporter);
-        assert_eq!(
-            a.what,
-            "Fix the beets setup: No metadata source plugin loaded"
-        );
-        assert_eq!(a.where_, "Settings > Config");
     }
 
     fn raw_of(raw: String) -> String {

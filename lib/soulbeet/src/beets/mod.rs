@@ -13,6 +13,7 @@ use crate::{DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, Mus
 use classify::{parse_run_log, Classifier};
 use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
 use report::Report;
+use shared::failure::{UserAction, UserActionCode};
 use shared::system::ImporterHealth;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -71,106 +72,9 @@ impl BeetsImporter {
         // a plain field assignment.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
-}
 
-/// A file of one import run in the temp dir, removed when dropped.
-struct TempFile(PathBuf);
-
-impl TempFile {
-    fn create(extension: &str) -> std::io::Result<TempFile> {
-        let dir = std::env::temp_dir();
-        loop {
-            let name = format!("soulbeet-import-{}.{extension}", rand::random::<u64>());
-            let path = dir.join(name);
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(TempFile(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.0) {
-            warn!("Could not remove {}: {e}", self.0.display());
-        }
-    }
-}
-
-fn import_args(
-    s: &BeetsSettings,
-    sources: &[&Path],
-    target: &Path,
-    mode: ImportMode,
-    run_log: &Path,
-) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec![
-        "-v".into(),
-        "-c".into(),
-        s.config.clone().into(),
-        "-l".into(),
-        library::library_db(target).into(),
-        "-d".into(),
-        target.into(),
-        "import".into(),
-        "-q".into(),
-        // Every source is a batch folder only a retry imports again, so the
-        // user's import history and resume state could only make beets skip it.
-        "--noincremental".into(),
-        "--noresume".into(),
-        "--log".into(),
-        run_log.into(),
-    ];
-    if mode == ImportMode::Singleton {
-        args.push("-s".into());
-    }
-    args.extend(sources.iter().map(|p| p.as_os_str().to_owned()));
-    args
-}
-
-/// Runs import.py, which runs beets' own CLI with `beet_args`.
-fn driver_args(report: &Path, choice: &DriverChoice, beet_args: Vec<OsString>) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec!["-P".into(), "-c".into(), IMPORT_PY.into(), report.into()];
-    match choice {
-        DriverChoice::Auto => args.push("auto".into()),
-        DriverChoice::AsIs => args.push("asis".into()),
-        DriverChoice::Pick { data_source, id } => {
-            args.extend(["pick".into(), data_source.into(), id.into()])
-        }
-    }
-    args.push("--".into());
-    args.extend(beet_args);
-    args
-}
-
-fn outcome_kind(outcome: &ImportOutcome) -> &'static str {
-    match outcome {
-        ImportOutcome::Imported { .. } => "imported",
-        ImportOutcome::Skipped(_) => "skipped",
-        ImportOutcome::LookupFailed { .. } => "lookup failed",
-        ImportOutcome::Failed { .. } => "failed",
-        ImportOutcome::TimedOut { .. } => "timed out",
-        ImportOutcome::Refused { .. } => "refused",
-    }
-}
-
-#[async_trait::async_trait]
-impl MusicImporter for BeetsImporter {
-    fn id(&self) -> &'static str {
-        "beets"
-    }
-
-    fn name(&self) -> &'static str {
-        "Beets"
-    }
-
-    async fn import(
+    /// One import run, before `with_own_action`.
+    async fn run_import(
         &self,
         sources: &[&Path],
         target: &Path,
@@ -250,6 +154,157 @@ impl MusicImporter for BeetsImporter {
             warn!("beets output tail:\n{}", result.output_tail);
         }
         result
+    }
+}
+
+/// A file of one import run in the temp dir, removed when dropped.
+struct TempFile(PathBuf);
+
+impl TempFile {
+    fn create(extension: &str) -> std::io::Result<TempFile> {
+        let dir = std::env::temp_dir();
+        loop {
+            let name = format!("soulbeet-import-{}.{extension}", rand::random::<u64>());
+            let path = dir.join(name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(TempFile(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            warn!("Could not remove {}: {e}", self.0.display());
+        }
+    }
+}
+
+fn import_args(
+    s: &BeetsSettings,
+    sources: &[&Path],
+    target: &Path,
+    mode: ImportMode,
+    run_log: &Path,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "-v".into(),
+        "-c".into(),
+        s.config.clone().into(),
+        "-l".into(),
+        library::library_db(target).into(),
+        "-d".into(),
+        target.into(),
+        "import".into(),
+        "-q".into(),
+        // Every source is a batch folder only a retry imports again, so the
+        // user's import history and resume state could only make beets skip it.
+        "--noincremental".into(),
+        "--noresume".into(),
+        "--log".into(),
+        run_log.into(),
+    ];
+    if mode == ImportMode::Singleton {
+        args.push("-s".into());
+    }
+    args.extend(sources.iter().map(|p| p.as_os_str().to_owned()));
+    args
+}
+
+/// Runs import.py, which runs beets' own CLI with `beet_args`.
+fn driver_args(report: &Path, choice: &DriverChoice, beet_args: Vec<OsString>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["-P".into(), "-c".into(), IMPORT_PY.into(), report.into()];
+    match choice {
+        DriverChoice::Auto => args.push("auto".into()),
+        DriverChoice::AsIs => args.push("asis".into()),
+        DriverChoice::Pick { data_source, id } => {
+            args.extend(["pick".into(), data_source.into(), id.into()])
+        }
+    }
+    args.push("--".into());
+    args.extend(beet_args);
+    args
+}
+
+/// `result` with what a person does about it, for the failures only a person
+/// can fix: beets' own setup, and a full disk. The action quotes the result's
+/// text.
+fn with_own_action(result: ImportResult) -> ImportResult {
+    let action = match &result.outcome {
+        ImportOutcome::Failed {
+            kind: FailKind::Setup,
+            ..
+        } => fix_beets(&result.to_string()),
+        // Once there is space, the same files import.
+        ImportOutcome::Failed {
+            kind: FailKind::DiskFull,
+            ..
+        } => free_disk_space(&result.to_string()),
+        _ => return result,
+    };
+    result.with_user_action(action)
+}
+
+/// What a person fixes in the beets setup, `problem` saying what is wrong.
+fn fix_beets(problem: &str) -> UserAction {
+    UserAction::new(
+        UserActionCode::FixImporter,
+        format!("Fix the beets setup: {problem}"),
+        "Settings > Config",
+    )
+}
+
+/// Space for what beets could not write, which `message`, the row's text,
+/// names.
+fn free_disk_space(message: &str) -> UserAction {
+    UserAction::new(
+        UserActionCode::FreeDiskSpace,
+        format!("Free disk space: {message}"),
+        "The disk that holds the path in the message",
+    )
+}
+
+fn outcome_kind(outcome: &ImportOutcome) -> &'static str {
+    match outcome {
+        ImportOutcome::Imported { .. } => "imported",
+        ImportOutcome::Skipped(_) => "skipped",
+        ImportOutcome::LookupFailed { .. } => "lookup failed",
+        ImportOutcome::Failed { .. } => "failed",
+        ImportOutcome::TimedOut { .. } => "timed out",
+        ImportOutcome::Refused { .. } => "refused",
+    }
+}
+
+#[async_trait::async_trait]
+impl MusicImporter for BeetsImporter {
+    fn id(&self) -> &'static str {
+        "beets"
+    }
+
+    fn name(&self) -> &'static str {
+        "Beets"
+    }
+
+    async fn import(
+        &self,
+        sources: &[&Path],
+        target: &Path,
+        mode: ImportMode,
+        choice: &DriverChoice,
+    ) -> ImportResult {
+        with_own_action(self.run_import(sources, target, mode, choice).await)
+    }
+
+    fn refused(&self, issue: String) -> ImportResult {
+        let action = fix_beets(&issue);
+        ImportResult::refused(issue).with_user_action(action)
     }
 
     async fn find_duplicates(&self, libraries: &[&Path]) -> Result<DuplicateReport, String> {
@@ -996,6 +1051,92 @@ mod tests {
 
         let tracks = library::query_library(&s, d).await.unwrap();
         assert_eq!(tracks.len(), 1);
+    }
+
+    /// beets words what a person does about its own setup and a full disk,
+    /// quoting the row's text; it has nothing to ask for other failures.
+    #[test]
+    fn a_setup_failure_and_a_full_disk_say_what_to_do() {
+        let start = "Could not start beets: No such file or directory (os error 2)";
+        let setup = with_own_action(ImportResult::failed(FailKind::Setup, start.into()));
+        assert_eq!(
+            setup.user_action,
+            Some(UserAction::new(
+                UserActionCode::FixImporter,
+                format!("Fix the beets setup: {start}"),
+                "Settings > Config",
+            ))
+        );
+
+        let full =
+            "Error: No space left on device while copying /src/01.flac to /music/A/B/01.flac";
+        let mut disk = ImportResult::failed(FailKind::DiskFull, full.into());
+        disk.tasks = crate::TaskCount {
+            imported: 1,
+            total: 3,
+        };
+        let disk = with_own_action(disk);
+        assert_eq!(
+            disk.user_action,
+            Some(UserAction::new(
+                UserActionCode::FreeDiskSpace,
+                format!("Free disk space: {full} (1 of 3 imported)"),
+                "The disk that holds the path in the message",
+            ))
+        );
+
+        for (kind, message) in [
+            (FailKind::Beets, "beets exited with code 1"),
+            (
+                FailKind::TargetUnwritable,
+                "Error: Permission denied while creating /music/A",
+            ),
+        ] {
+            let result = with_own_action(ImportResult::failed(kind, message.into()));
+            assert_eq!(result.user_action, None, "{kind:?}");
+        }
+    }
+
+    /// The production path: `import` and `refused` carry beets' action.
+    #[tokio::test]
+    async fn an_import_beets_cannot_run_asks_for_the_beets_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let importer = BeetsImporter::new(settings(
+            dir.path(),
+            PathBuf::from("/nonexistent/beet"),
+            None,
+        ));
+        let result = importer
+            .import(
+                &[dir.path()],
+                dir.path(),
+                ImportMode::Album,
+                &DriverChoice::Auto,
+            )
+            .await;
+        assert_eq!(
+            result.user_action.map(|a| a.what),
+            Some(
+                "Fix the beets setup: Cannot determine the Python that runs beet. Set BEETS_PYTHON."
+                    .to_string()
+            )
+        );
+
+        let refused = importer.refused("No metadata source plugin loaded".into());
+        assert_eq!(
+            refused.outcome,
+            ImportOutcome::Refused {
+                issue: "No metadata source plugin loaded".into()
+            }
+        );
+        assert_eq!(
+            refused.user_action,
+            Some(UserAction::new(
+                UserActionCode::FixImporter,
+                "Fix the beets setup: No metadata source plugin loaded",
+                "Settings > Config",
+            ))
+        );
     }
 
     #[tokio::test]
