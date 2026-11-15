@@ -1,9 +1,13 @@
 use dioxus::prelude::*;
-use shared::navidrome::{DeletionReview, LibraryStats, SyncResult};
+use shared::navidrome::{
+    BlockedDeletion, DeletionReview, LibraryStats, SyncResult, UnreadableListener,
+};
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
 
+#[cfg(feature = "server")]
+use super::failure_error;
 #[cfg(feature = "server")]
 use crate::auth::UserId;
 #[cfg(feature = "server")]
@@ -25,11 +29,13 @@ use crate::models::discovery_playlist::DiscoveryTrackRow;
 #[cfg(feature = "server")]
 use crate::models::folder::Folder;
 #[cfg(feature = "server")]
+use crate::models::navidrome_read_failure::NavidromeReadFailureRow;
+#[cfg(feature = "server")]
 use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
 use crate::services::navidrome_client_for_user;
 #[cfg(feature = "server")]
-use crate::AuthSession;
+use crate::{AdminSession, AuthSession};
 #[cfg(feature = "server")]
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 #[cfg(feature = "server")]
@@ -299,6 +305,22 @@ pub async fn get_deletion_history() -> Result<Vec<DeletionReview>, ServerFnError
     DeletionReviewRow::history(&auth.0.user_id, 50)
         .await
         .map_err(server_error)
+}
+
+/// The tracks auto-delete kept at the caller's last rating sync, and why.
+#[get("/api/navidrome/deletion-blocks", auth: AuthSession)]
+pub async fn get_deletion_blocks() -> Result<Vec<BlockedDeletion>, ServerFnError> {
+    DeletionBlockRow::for_user_in(&crate::db::DB, &auth.0.user_id)
+        .await
+        .map_err(|e| failure_error(database_failure(Stage::Delete, e)))
+}
+
+/// The accounts the delete guard cannot read, which keeps every file they might have rated.
+#[get("/api/navidrome/unreadable-listeners", _: AdminSession)]
+pub async fn get_unreadable_listeners() -> Result<Vec<UnreadableListener>, ServerFnError> {
+    NavidromeReadFailureRow::all_in(&crate::db::DB)
+        .await
+        .map_err(|e| failure_error(database_failure(Stage::Delete, e)))
 }
 
 /// Check if the Soulbeet player in Navidrome has ReportRealPath enabled.

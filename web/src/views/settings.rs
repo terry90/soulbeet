@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use ui::settings::{
-    AccountPanel, AppConfigManager, ConnectionStatusPanel, FolderAdminPanel, FolderManager,
-    PreferencesManager, SecurityStatusPanel, UserManager,
+    AccountPanel, AppConfigManager, ConnectionStatusPanel, DeletionChecksPanel, FolderAdminPanel,
+    FolderManager, PreferencesManager, SecurityStatusPanel, UserManager,
 };
 
 #[derive(PartialEq, Clone, Copy, Default)]
@@ -77,6 +77,7 @@ pub fn SettingsPage() -> Element {
                     SettingsTab::Library => rsx! {
                         div { class: "space-y-8",
                             FolderManager {}
+                            DeletionChecksPanel {}
                             if auth.is_admin() {
                                 FolderAdminPanel {}
                             }
