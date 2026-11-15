@@ -8,6 +8,8 @@ use shared::download::{
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
 #[cfg(feature = "server")]
+use shared::download::DownloadProgress;
+#[cfg(feature = "server")]
 use tokio::sync::broadcast;
 
 #[cfg(feature = "server")]
@@ -84,12 +86,15 @@ pub(crate) async fn session_still_valid(
         .is_ok_and(|ctx| ctx.id() == *user)
 }
 
-/// Whether a download socket opens with the build frame. A bundle older than
-/// the frame does not ask for it: it cannot decode the variant and would
-/// reconnect on every try.
+/// What a new download socket sends before the live events: the build frame when the client
+/// asked for it (a bundle older than the frame does not ask: it cannot decode the variant and
+/// would reconnect on every try), then the rows of the user's unfinished jobs when there are any.
 #[cfg(feature = "server")]
-fn sends_build_frame(build_frame: Option<bool>) -> bool {
-    build_frame == Some(true)
+fn first_frames(build_frame: Option<bool>, rows: Vec<DownloadProgress>) -> Vec<DownloadEvent> {
+    let build = (build_frame == Some(true))
+        .then(|| DownloadEvent::Build(crate::build_id::BUILD_ID.to_string()));
+    let rows = (!rows.is_empty()).then_some(DownloadEvent::Progress(rows));
+    build.into_iter().chain(rows).collect()
 }
 
 /// WebSocket endpoint for real-time download updates.
@@ -128,14 +133,22 @@ pub async fn download_updates_ws(
         }
     };
 
+    // Read after subscribing, so no row sent meanwhile is lost; a row sent both ways is the same
+    // row twice, which the panel's map keeps once.
+    let rows = match crate::ledger::store::open_rows(&crate::db::DB, &user).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("Could not read the unfinished downloads of user {user}: {e}");
+            Vec::new()
+        }
+    };
+
     Ok(options.on_upgrade(move |mut socket| async move {
         let mut rx = rx;
         info!("WebSocket connected for user: {}", user);
-        if sends_build_frame(build_frame) {
+        for frame in first_frames(build_frame, rows) {
             // A client already gone ends the loop below at its first receive.
-            let _ = socket
-                .send(DownloadEvent::Build(crate::build_id::BUILD_ID.to_string()))
-                .await;
+            let _ = socket.send(frame).await;
         }
         let mut recheck = tokio::time::interval_at(
             tokio::time::Instant::now() + SESSION_RECHECK,
@@ -262,11 +275,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_client_that_asks_gets_the_build_frame() {
-        assert!(sends_build_frame(Some(true)));
-        assert!(!sends_build_frame(Some(false)));
-        // An older bundle does not send the parameter.
-        assert!(!sends_build_frame(None));
+    fn a_socket_opens_with_the_build_then_the_unfinished_rows() {
+        let row = DownloadProgress::queued("t-1".into(), "peer_a".into(), "01.flac".into(), 100);
+        let kinds = |frames: Vec<DownloadEvent>| {
+            frames
+                .into_iter()
+                .map(|f| match f {
+                    DownloadEvent::Build(id) => {
+                        format!("build {}", id == crate::build_id::BUILD_ID)
+                    }
+                    DownloadEvent::Progress(rows) => format!("rows {}", rows.len()),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds(first_frames(Some(true), vec![row.clone()])),
+            vec!["build true", "rows 1"]
+        );
+        assert_eq!(kinds(first_frames(None, vec![row])), vec!["rows 1"]);
+        assert!(first_frames(Some(false), vec![]).is_empty());
     }
 
     #[test]
