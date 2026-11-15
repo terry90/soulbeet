@@ -10,7 +10,7 @@ use shared::download::{
     DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, EnqueueStatus,
     QueuedDownload, SearchResult,
 };
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::metadata::{Album, Track};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::DownloadBackend;
@@ -86,10 +86,13 @@ pub fn key(backend: &Arc<dyn DownloadBackend>, peer: &str, filename: &str) -> Tr
     }
 }
 
+/// The stub's own answer for a file it is already fetching.
+pub const STUB_IN_FLIGHT: &str = "stub is already fetching this file";
+
 /// What a scripted `download` call does: accept the item (transfer id
-/// `t-{item.id}`), refuse it because the backend is already fetching it,
-/// accept the call but mark the item rejected (peer offline), or fail the
-/// call itself (transport error).
+/// `t-{item.id}`), refuse it because the backend is already fetching it
+/// (cause `STUB_IN_FLIGHT`), accept the call but mark the item rejected
+/// (peer offline), or fail the call itself (transport error).
 pub enum ScriptedOutcome {
     Enqueued,
     AlreadyInFlight,
@@ -240,9 +243,10 @@ impl DownloadBackend for StubBackend {
         };
         match outcome {
             ScriptedOutcome::Enqueued => answer(format!("t-{}", item.id), EnqueueStatus::Enqueued),
-            ScriptedOutcome::AlreadyInFlight => {
-                answer(item.id.clone(), EnqueueStatus::AlreadyInFlight)
-            }
+            ScriptedOutcome::AlreadyInFlight => answer(
+                item.id.clone(),
+                EnqueueStatus::AlreadyInFlight(Cause::new(Service::Slskd, None, STUB_IN_FLIGHT)),
+            ),
             ScriptedOutcome::Rejected => answer(
                 item.id.clone(),
                 EnqueueStatus::Failed(Failure::new(

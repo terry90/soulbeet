@@ -40,16 +40,7 @@ impl Failure {
         status: Option<i32>,
         raw: impl Into<String>,
     ) -> Self {
-        let raw: String = raw.into();
-        let raw = match raw.char_indices().nth(RAW_MAX_CHARS) {
-            Some((end, _)) => raw[..end].to_string(),
-            None => raw,
-        };
-        self.cause = Some(Cause {
-            service,
-            status,
-            raw,
-        });
+        self.cause = Some(Cause::new(service, status, raw));
         self
     }
 
@@ -69,6 +60,22 @@ pub struct Cause {
     pub service: Service,
     pub status: Option<i32>,
     pub raw: String,
+}
+
+impl Cause {
+    /// raw is cut to RAW_MAX_CHARS characters on a char boundary.
+    pub fn new(service: Service, status: Option<i32>, raw: impl Into<String>) -> Self {
+        let raw: String = raw.into();
+        let raw = match raw.char_indices().nth(RAW_MAX_CHARS) {
+            Some((end, _)) => raw[..end].to_string(),
+            None => raw,
+        };
+        Self {
+            service,
+            status,
+            raw,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

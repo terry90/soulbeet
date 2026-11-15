@@ -831,8 +831,8 @@ pub async fn generate_discovery_playlist_internal(
                         let reason = download_results
                             .iter()
                             .find_map(|dl| failed_reason(&dl.status))
-                            .map(|f| f.message.as_str())
-                            .unwrap_or(NOTHING_ENQUEUED);
+                            .map(|f| f.message)
+                            .unwrap_or_else(|| NOTHING_ENQUEUED.to_string());
                         info!(
                             "Download source {} refused '{}' - {} ({}), trying next",
                             attempt_idx + 1,

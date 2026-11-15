@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::failure::Failure;
+use crate::failure::{Cause, Failure};
 use crate::metadata::{Album, Track};
 
 #[derive(Serialize, Clone, PartialEq, Deserialize, Debug, Default)]
@@ -361,8 +361,13 @@ pub fn batch_folder(label: &str, batch_id: &str) -> String {
 pub enum EnqueueStatus {
     Enqueued,
     /// The backend already has an unfinished transfer of this file from this
-    /// peer and did not start another one.
-    AlreadyInFlight,
+    /// peer and did not start another one. The cause is the backend's own
+    /// answer.
+    AlreadyInFlight(Cause),
+    /// One of the user's batches is already downloading this file into the
+    /// requested folder, so it was not enqueued again. That batch shows its
+    /// row.
+    AlreadyRunning,
     Failed(Failure),
 }
 

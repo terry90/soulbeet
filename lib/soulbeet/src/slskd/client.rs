@@ -13,7 +13,7 @@ use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
     download::EnqueueStatus,
-    failure::{Failure, FailureCode, RetryAdvice, Service, Stage},
+    failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage},
     metadata::{Album, Track},
     slskd::{AlbumResult, DownloadResponse, FileEntry, FlattenedFiles, SearchState, TrackResult},
 };
@@ -785,7 +785,7 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remo
 
 /// slskd's exact answer for a file it already has an unfinished transfer
 /// of (`DownloadService.EnqueueAsync`).
-pub const ALREADY_IN_PROGRESS: &str = "Skipped: Already in progress";
+const ALREADY_IN_PROGRESS: &str = "Skipped: Already in progress";
 
 /// `value` as one path segment. URL parsing resolves `.` and `..` as dot
 /// segments even when percent-encoded, so those cannot be sent at all.
@@ -1016,7 +1016,11 @@ fn parse_batch_enqueue_response(
             let status = match (transfer, failure) {
                 (Some(_), _) => EnqueueStatus::Enqueued,
                 (None, Some(f)) if f.message == ALREADY_IN_PROGRESS => {
-                    EnqueueStatus::AlreadyInFlight
+                    EnqueueStatus::AlreadyInFlight(Cause::new(
+                        Service::Slskd,
+                        None,
+                        f.message.clone(),
+                    ))
                 }
                 (None, Some(f)) => EnqueueStatus::Failed(
                     Failure::new(
@@ -1232,7 +1236,14 @@ mod tests {
             &body(&[], &[(r"a\album\1.mp3", "Skipped: Already in progress")]),
         )
         .unwrap();
-        assert_eq!(results[0].status, EnqueueStatus::AlreadyInFlight);
+        assert_eq!(
+            results[0].status,
+            EnqueueStatus::AlreadyInFlight(Cause::new(
+                Service::Slskd,
+                None,
+                "Skipped: Already in progress"
+            ))
+        );
         assert_eq!(results[0].transfer_id, None);
     }
 

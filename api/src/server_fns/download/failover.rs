@@ -169,7 +169,6 @@ impl SourcePool {
                         queued
                             .iter()
                             .find_map(|d| failed_reason(&d.status))
-                            .cloned()
                             .unwrap_or_else(|| {
                                 Failure::new(
                                     FailureCode::EnqueueFailed,

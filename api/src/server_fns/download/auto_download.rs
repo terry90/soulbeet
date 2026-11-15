@@ -103,7 +103,7 @@ fn queue_failure(results: &[QueuedDownload]) -> Failure {
     results
         .iter()
         .find_map(|d| failed_reason(&d.status))
-        .map(|f| f.clone().with_message(MESSAGE))
+        .map(|f| f.with_message(MESSAGE))
         .unwrap_or_else(|| {
             Failure::new(
                 FailureCode::EnqueueFailed,
@@ -462,7 +462,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                     d.id.clone(),
                     d.source.clone(),
                     d.item.clone(),
-                    reason.clone(),
+                    reason,
                 )))
             })
             .collect();
@@ -477,7 +477,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             .collect();
         let already_downloading = results
             .iter()
-            .any(|d| d.status == EnqueueStatus::AlreadyInFlight);
+            .any(|d| d.status == EnqueueStatus::AlreadyRunning);
 
         if let Some(e) = error {
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
