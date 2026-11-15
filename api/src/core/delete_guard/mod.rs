@@ -985,6 +985,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rating_changed_during_the_check_is_the_one_re_sent_and_handed_back() {
+        let lib = Library::new().await;
+        lib.fake.rates("alice", "s1", 1);
+        let stale = lib
+            .fake
+            .native_song(&lib.alice(), "s1")
+            .await
+            .unwrap()
+            .unwrap();
+        let path = paths::local_file_in(&lib.db, &stale, None).await.unwrap();
+        lib.fake.rates("alice", "s1", 5);
+        let checked = lib
+            .guard()
+            .check_resolved(&lib.alice(), stale, path, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            lib.fake.ratings_set(),
+            vec![("alice".to_string(), "s1".to_string(), 5)]
+        );
+        assert_eq!(
+            (checked.song.rating, checked.song.average_rating),
+            (5, Some(5.0))
+        );
+    }
+
+    #[tokio::test]
     async fn an_average_above_the_callers_own_share_blocks() {
         let lib = Library::new().await;
         lib.fake.rates("alice", "s1", 3);
