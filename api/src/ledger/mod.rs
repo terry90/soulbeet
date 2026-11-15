@@ -308,6 +308,9 @@ impl Ledger {
         .await
     }
 
+    /// Records `search` as its user's for SEARCH_KEPT_SECS. A search of the same
+    /// id is renewed instead: kept SEARCH_KEPT_SECS from now, its candidates
+    /// dropped until it ends again.
     pub async fn record_search(&self, search: NewSearch) -> Result<(), LedgerError> {
         self.write(|reply| Write::RecordSearch {
             search: Box::new(search),
@@ -494,6 +497,34 @@ mod tests {
                 .unwrap()
                 .candidates,
             Some(groups)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_recorded_again_is_renewed_without_its_candidates() {
+        let (ledger, db, _, _) = ledger().await;
+        ledger.record_search(search("s1", "alice")).await.unwrap();
+        ledger
+            .store_candidates(
+                "s1",
+                vec![group(
+                    "peer_a",
+                    vec![item("peer_a", "One", "a/01.flac")],
+                    0.9,
+                )],
+            )
+            .await
+            .unwrap();
+        ledger.record_search(search("s1", "alice")).await.unwrap();
+        let renewed = store::search_of(&db, "s1", &UserId::new("alice"))
+            .await
+            .unwrap()
+            .expect("alice's");
+        assert_eq!(renewed.candidates, None);
+        let left = renewed.expires_at - chrono::Utc::now().timestamp();
+        assert!(
+            (SEARCH_KEPT_SECS - 5..=SEARCH_KEPT_SECS).contains(&left),
+            "{left}"
         );
     }
 

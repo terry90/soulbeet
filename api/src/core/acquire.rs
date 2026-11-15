@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 /// Name for a manual download's batch: the album its items share, or the
 /// first item's title when they span albums.
-fn manual_batch_label(items: &[DownloadableItem]) -> String {
+pub(crate) fn manual_batch_label(items: &[DownloadableItem]) -> String {
     match items.split_first() {
         Some((first, rest))
             if !first.album.trim().is_empty() && rest.iter().all(|i| i.album == first.album) =>
@@ -513,6 +513,9 @@ pub(crate) struct AutoRun {
     pub job: String,
     pub search_id: String,
     pub import_mode: ImportMode,
+    /// Candidates the search already stored: the pipeline picks from them
+    /// without hydrating the query or searching again.
+    pub found: Option<Vec<DownloadableGroup>>,
 }
 
 /// Searches every backend for `query`, picks the best source when it scores
@@ -550,6 +553,7 @@ pub async fn auto_download(
         job: uuid::Uuid::new_v4().to_string(),
         search_id: uuid::Uuid::new_v4().to_string(),
         import_mode: CONFIG.import_mode(),
+        found: None,
     };
     LEDGER
         .create(
@@ -591,7 +595,7 @@ pub async fn auto_download(
 /// The spawned part of `auto_download`: searches, stores what it found as
 /// the search's candidates, then waits for a choice from them when no source
 /// scores well enough, else downloads the best one with the rest as
-/// alternates.
+/// alternates. Given `run.found`, it picks from those instead of searching.
 pub(crate) async fn run_search(
     ledger: Ledger,
     ctx: UserCtx,
@@ -599,7 +603,7 @@ pub(crate) async fn run_search(
     mut query: DownloadQuery,
     lastfm_key: Option<String>,
     backends: (Searched, Vec<Searched>),
-    run: AutoRun,
+    mut run: AutoRun,
 ) {
     let (first, rest) = backends;
     let tx = get_or_create_user_channel(&ctx.id()).await;
@@ -626,42 +630,48 @@ pub(crate) async fn run_search(
         backend_count: 1 + rest.len(),
     });
 
-    if let Err(failure) = hydrate_album_tracks(&mut query, lastfm_key.as_deref()).await {
-        info!(
-            "Auto-download: no tracklist for '{}': {}",
-            query_desc, failure.message
-        );
-        return fail_job(&ledger, &ctx, &run, failure).await;
-    }
-    let (album, tracks) = (query.album, query.tracks);
+    let mut all_groups = match run.found.take() {
+        Some(groups) => groups,
+        None => {
+            if let Err(failure) = hydrate_album_tracks(&mut query, lastfm_key.as_deref()).await {
+                info!(
+                    "Auto-download: no tracklist for '{}': {}",
+                    query_desc, failure.message
+                );
+                return fail_job(&ledger, &ctx, &run, failure).await;
+            }
+            let (album, tracks) = (query.album, query.tracks);
 
-    info!(
-        "Auto-download: searching {} backends for '{}'",
-        1 + rest.len(),
-        query_desc
-    );
+            info!(
+                "Auto-download: searching {} backends for '{}'",
+                1 + rest.len(),
+                query_desc
+            );
 
-    // Search all backends in parallel (per D-06), best score first (per D-07)
-    let mut all_groups = match sources::search_ranked(&first, &rest, album.as_ref(), &tracks).await
-    {
-        Ok(groups) => groups,
-        Err(failure) => {
-            info!("Auto-download: no results for '{}'", query_desc);
-            return fail_job(&ledger, &ctx, &run, failure).await;
+            // Search all backends in parallel (per D-06), best score first (per D-07)
+            let groups = match sources::search_ranked(&first, &rest, album.as_ref(), &tracks).await
+            {
+                Ok(groups) => groups,
+                Err(failure) => {
+                    info!("Auto-download: no results for '{}'", query_desc);
+                    return fail_job(&ledger, &ctx, &run, failure).await;
+                }
+            };
+            if let Err(e) = ledger
+                .store_candidates(&run.search_id, groups.clone())
+                .await
+            {
+                return fail_job(
+                    &ledger,
+                    &ctx,
+                    &run,
+                    database_failure(Stage::SourceSearch, e),
+                )
+                .await;
+            }
+            groups
         }
     };
-    if let Err(e) = ledger
-        .store_candidates(&run.search_id, all_groups.clone())
-        .await
-    {
-        return fail_job(
-            &ledger,
-            &ctx,
-            &run,
-            database_failure(Stage::SourceSearch, e),
-        )
-        .await;
-    }
 
     let best_score = all_groups[0].score;
 
@@ -1679,6 +1689,7 @@ mod tests {
             job: "j1".into(),
             search_id: "s1".into(),
             import_mode: ImportMode::Singleton,
+            found: None,
         };
 
         run_search(
@@ -1702,6 +1713,61 @@ mod tests {
             _ => None,
         });
         assert_eq!(fallback, Some("s1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_auto_download_given_stored_candidates_picks_from_them_without_searching() {
+        let (ledger, mut recorded) = Ledger::recording();
+        let ctx = test_ctx("auto-found");
+        let mut rx = crate::globals::get_or_create_user_channel(&ctx.id())
+            .await
+            .subscribe();
+        let folder = Folder {
+            id: "f1".into(),
+            user_id: ctx.user_id.clone(),
+            name: "Music".into(),
+            path: "/music".into(),
+            shared: false,
+        };
+        let stored = vec![group(
+            "peer_a",
+            vec![item("peer_a", "Wake Up", "a/07.flac")],
+            0.2,
+        )];
+        // A search of this backend would fail: starting one is refused.
+        let stub = StubBackend::new(vec![]);
+        stub.fail_search_start(SoulseekError::InvalidResponse("refused".into()));
+        let a: Arc<dyn DownloadBackend> = stub;
+        let run = AutoRun {
+            batch_id: "b1".into(),
+            job: "j1".into(),
+            search_id: "s1".into(),
+            import_mode: ImportMode::Singleton,
+            found: Some(stored.clone()),
+        };
+
+        run_search(
+            ledger,
+            ctx,
+            folder,
+            DownloadQuery::new(vec![]),
+            None,
+            (("a".into(), a), vec![]),
+            run,
+        )
+        .await;
+
+        assert_eq!(
+            recorded.events(),
+            vec![JobEvent::NeedsSourceChoice { job: "j1".into() }]
+        );
+        let offered = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|e| match e {
+            DownloadEvent::AutoDownload(AutoDownloadEvent::FallbackToManual {
+                results, ..
+            }) => Some(results),
+            _ => None,
+        });
+        assert_eq!(offered, Some(stored));
     }
 
     #[test]

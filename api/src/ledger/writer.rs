@@ -437,7 +437,7 @@ fn import_mode_name(mode: ImportMode) -> &'static str {
     }
 }
 
-fn import_mode_named(name: &str) -> Result<ImportMode, LedgerError> {
+pub(super) fn import_mode_named(name: &str) -> Result<ImportMode, LedgerError> {
     match name {
         "album" => Ok(ImportMode::Album),
         "singleton" => Ok(ImportMode::Singleton),
@@ -445,12 +445,15 @@ fn import_mode_named(name: &str) -> Result<ImportMode, LedgerError> {
     }
 }
 
+/// Records `search`, renewing a search of the same id: it expires a day from
+/// now and has no candidates until it ends again.
 async fn insert_search(
     db: impl sqlx::Executor<'_, Database = Sqlite>,
     search: NewSearch,
 ) -> Result<(), LedgerError> {
     sqlx::query(
-        "INSERT INTO searches (id, user_id, backend, expires_at, query) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO searches (id, user_id, backend, expires_at, query) VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT (id) DO UPDATE SET expires_at = excluded.expires_at, candidates = NULL",
     )
     .bind(search.id)
     .bind(search.user.to_string())

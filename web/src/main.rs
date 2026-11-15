@@ -54,6 +54,7 @@ fn main() {
             }
             api::ledger::start_server_ledger();
             api::core::index::start();
+            api::core::reconcile::start();
             // Start background cleanup task for user channels
             api::globals::start_channel_cleanup_task();
             // Check the beets config in the background; never awaited here.

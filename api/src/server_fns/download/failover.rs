@@ -81,6 +81,20 @@ impl SourcePool {
         });
     }
 
+    /// A pool resumed after a restart: per slot its untried alternates and
+    /// the sources it used.
+    pub fn resumed(slots: Vec<(Vec<DownloadableItem>, usize)>) -> Self {
+        Self {
+            slots: slots
+                .into_iter()
+                .map(|(alternates, used)| Slot {
+                    alternates: alternates.into(),
+                    used,
+                })
+                .collect(),
+        }
+    }
+
     /// Single track, N ranked sources. `items[0]` is the source already
     /// enqueued; the rest are its alternates.
     pub fn single(items: Vec<DownloadableItem>) -> Self {
@@ -294,6 +308,20 @@ mod tests {
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_b".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_c".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_d".into()));
+        assert!(pool.take_next(0).is_none());
+    }
+
+    #[test]
+    fn a_resumed_pool_keeps_its_budget() {
+        // Three sources used: one more is left of MAX_SOURCES_PER_TRACK, not two.
+        let mut pool = SourcePool::resumed(vec![(
+            vec![
+                item("peer_c", "One", "c/01.flac"),
+                item("peer_d", "One", "d/01.flac"),
+            ],
+            3,
+        )]);
+        assert_eq!(pool.take_next(0).map(|i| i.id), Some("c/01.flac".into()));
         assert!(pool.take_next(0).is_none());
     }
 
