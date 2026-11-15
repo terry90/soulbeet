@@ -7,13 +7,13 @@ use dioxus::logger::tracing::{info, warn};
 #[cfg(feature = "server")]
 use crate::auth::UserId;
 #[cfg(feature = "server")]
-use crate::core::database_failure;
-#[cfg(feature = "server")]
 use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
 #[cfg(feature = "server")]
 use crate::core::delete_guard::{ForgetVia, Guard, Origin, Verdict};
 #[cfg(feature = "server")]
 use crate::core::folders::folder_not_found;
+#[cfg(feature = "server")]
+use crate::core::{database_failure, logged};
 #[cfg(feature = "server")]
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
 #[cfg(feature = "server")]
@@ -95,7 +95,14 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
         .await;
         let mut by_code = std::collections::BTreeMap::<&str, u32>::new();
         for kept in &run.kept {
-            *by_code.entry(kept.failure.code.as_str()).or_default() += 1;
+            let code = kept.failure.code.as_str();
+            *by_code.entry(code).or_default() += 1;
+            let (artist, title, text) = (&kept.artist, &kept.title, logged(&kept.failure));
+            if kept.failure.cause.is_some() {
+                warn!("Auto-delete kept {artist} - {title}: {code}: {text}");
+            } else {
+                info!("Auto-delete kept {artist} - {title}: {code}: {text}");
+            }
         }
         for (code, n) in by_code {
             info!("Auto-delete kept {n}: {code}");
@@ -188,7 +195,7 @@ pub(crate) async fn remove_disliked_pending_in(
         };
         match result {
             Ok(()) => removed += 1,
-            Err(f) => warn!("Failed to remove track {}: {}", track.title, f.message),
+            Err(f) => warn!("Failed to remove track {}: {}", track.title, logged(&f)),
         }
     }
     removed

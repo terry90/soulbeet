@@ -437,7 +437,9 @@ async fn run_automation() {
                     Ok(()) => expired_count += 1,
                     Err(f) => warn!(
                         "Automation: could not expire {} for user {}: {}",
-                        track.title, user.username, f.message
+                        track.title,
+                        user.username,
+                        crate::core::logged(&f)
                     ),
                 }
             }

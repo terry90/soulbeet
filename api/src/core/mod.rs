@@ -26,6 +26,26 @@ pub(crate) fn database_failure(stage: Stage, e: impl std::fmt::Display) -> Failu
     .with_cause(Service::Database, None, e.to_string())
 }
 
+/// `f`'s message for a log line, followed by its upstream cause when it has one:
+/// "{message} (cause: {service}[ {status}]: {raw})".
+pub(crate) fn logged(f: &Failure) -> String {
+    let Some(cause) = &f.cause else {
+        return f.message.clone();
+    };
+    let service = match cause.service {
+        Service::Slskd => "slskd",
+        Service::Beets => "beets",
+        Service::Navidrome => "navidrome",
+        Service::Musicbrainz => "musicbrainz",
+        Service::Lastfm => "lastfm",
+        Service::Listenbrainz => "listenbrainz",
+        Service::Filesystem => "filesystem",
+        Service::Database => "database",
+    };
+    let status = cause.status.map(|s| format!(" {s}")).unwrap_or_default();
+    format!("{} (cause: {service}{status}: {})", f.message, cause.raw)
+}
+
 /// `e`'s own failure at `stage`, shown as "Download backend not available: {e}".
 pub(crate) fn backend_unavailable(stage: Stage, e: &BackendLookupError) -> Failure {
     e.failure(stage, format!("Download backend not available: {e}"))
@@ -91,6 +111,33 @@ mod tests {
             )
         );
         assert_eq!(f.cause, Some(Cause::new(Service::Database, None, raw)));
+    }
+
+    #[test]
+    fn a_logged_failure_carries_its_cause() {
+        let raw = "error returned from database: (code: 5) database is locked";
+        assert_eq!(
+            logged(&database_failure(Stage::Delete, raw)),
+            format!("Soulful's database is unavailable (cause: database: {raw})")
+        );
+        let with_status = Failure::new(
+            FailureCode::NavidromeUnreachable,
+            Stage::Delete,
+            RetryAdvice::SameSourceLater,
+            "Navidrome could not be read",
+        )
+        .with_cause(Service::Navidrome, Some(500), "Internal Server Error");
+        assert_eq!(
+            logged(&with_status),
+            "Navidrome could not be read (cause: navidrome 500: Internal Server Error)"
+        );
+        let bare = Failure::new(
+            FailureCode::NotOwner,
+            Stage::Delete,
+            RetryAdvice::NotRetryable,
+            "Not your track",
+        );
+        assert_eq!(logged(&bare), "Not your track");
     }
 
     #[test]
