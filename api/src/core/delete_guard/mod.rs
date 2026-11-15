@@ -258,9 +258,10 @@ impl Guard<'_> {
     /// while the transaction is open, so the row is built before it begins. The unlink, the
     /// commit, its warning, the info line and the spawn of a queued forget run in one spawned
     /// task, which a dropped caller does not cancel. A removal that stops without saying whether
-    /// it unlinked is settled by lost_removal: when the file is gone the removal is done and goes
-    /// on to its forget and pruning; when it is still there it is Kept; when it cannot be looked
-    /// at it is Unconfirmed.
+    /// it unlinked is settled by lost_removal: when nothing is at the path the removal is done
+    /// and goes on to its forget and pruning; when another file is there it is done without
+    /// them (Left::AnotherFile); when the file is still there it is Kept; when it cannot be
+    /// looked at it is Unconfirmed.
     pub async fn carry_out(
         &self,
         actor: &UserId,
@@ -301,15 +302,18 @@ impl Guard<'_> {
         // A refusal drops the transaction, which rolls the row back.
         let removal = tokio::spawn(async move {
             let unlinking = target.clone();
-            let unrecorded =
+            let (unrecorded, left) =
                 match tokio::task::spawn_blocking(move || unlink::unlink_if_same(&unlinking, id))
                     .await
                 {
-                    Ok(Ok(())) => tx.commit().await.err().map(|e| {
-                        let warning = not_recorded(&target, &e.to_string());
-                        warn!("{warning}");
-                        warning
-                    }),
+                    Ok(Ok(())) => (
+                        tx.commit().await.err().map(|e| {
+                            let warning = not_recorded(&target, &e.to_string());
+                            warn!("{warning}");
+                            warning
+                        }),
+                        Left::Nothing,
+                    ),
                     Ok(Err(UnlinkError::Changed)) => {
                         return Err(NotRemoved::Kept(changed_since_check()))
                     }
@@ -328,25 +332,29 @@ impl Guard<'_> {
                 origin.as_str()
             );
             if let Some(queue) = queued {
-                tokio::spawn(forget_queued(queue, target, root));
+                tokio::spawn(forget_queued(queue, target, root, left));
             }
-            Ok(unrecorded)
+            Ok((unrecorded, left))
         });
         let mut warnings = Vec::new();
-        match removal.await {
-            Ok(Ok(unrecorded)) => warnings.extend(unrecorded),
+        let left = match removal.await {
+            Ok(Ok((unrecorded, left))) => {
+                warnings.extend(unrecorded);
+                left
+            }
             Ok(Err(f)) => return Err(f),
             Err(e) => {
-                warnings.extend(lost_removal(self.db, &record, &path, id, &e.to_string()).await?);
+                let (unrecorded, left) =
+                    lost_removal(self.db, &record, &path, id, &e.to_string()).await?;
+                warnings.extend(unrecorded);
                 if let Some(queue) = requeue {
-                    tokio::spawn(forget_queued(queue, path.clone(), folder.clone()));
+                    tokio::spawn(forget_queued(queue, path.clone(), folder.clone(), left));
                 }
+                left
             }
-        }
+        };
         if let Some((importer, library)) = in_worker {
-            let outcome = importer.forget(library, &path).await;
-            warnings.extend(forget_note(&outcome, &path, library));
-            prune(&path, &folder).await;
+            warnings.extend(forget_in_worker(importer, library, &path, &folder, left).await);
         }
         Ok(warnings)
     }
@@ -454,54 +462,97 @@ impl NotRemoved {
     }
 }
 
+/// What a removal left at the path of its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Left {
+    /// Nothing: the file's beets item is forgotten and the folders left empty are pruned.
+    Nothing,
+    /// Another file, which a removal that stopped finds there: beets' item at the path may be
+    /// that file's, so it is not forgotten, and nothing is pruned.
+    AnotherFile,
+}
+
 /// Settles a removal of the checked file `path` (identity `id`) that stopped (`error`) without
 /// saying whether its unlink ran, and makes the audit match the file (unlink::look): when the
 /// file is still there nothing was removed, no row stays, and it is Kept with delete_failed;
-/// when it is gone the removal is done and its row is recorded once (`record` keeps its id), and
-/// Ok holds the warning when that row could not be stored (logged here); when the path cannot
-/// be read nothing is recorded and it is Unconfirmed: the file may have been deleted.
+/// when it is gone, with nothing or another file at its path, the removal is done and its row
+/// is recorded once (`record` keeps its id), and Ok holds the warning when that row could not
+/// be stored (logged here) and what is at the path; when the path cannot be read nothing is
+/// recorded and it is Unconfirmed: the file may have been deleted.
 async fn lost_removal(
     db: &SqlitePool,
     record: &DeletionRecord,
     path: &Path,
     id: unlink::FileId,
     error: &str,
-) -> Result<Option<String>, NotRemoved> {
+) -> Result<(Option<String>, Left), NotRemoved> {
     warn!(
         "The removal of {} stopped before it reported: {error}",
         path.display()
     );
-    match unlink::look(path, id) {
-        unlink::Look::There => Err(NotRemoved::Kept(delete_failed(
-            path,
-            &std::io::Error::other(error),
-        ))),
-        unlink::Look::Gone => {
-            let recorded = match db.acquire().await {
-                Ok(mut conn) => DeletionReviewRow::insert_in(&mut conn, record).await,
-                Err(e) => Err(e.to_string()),
-            };
-            Ok(recorded.err().map(|e| {
-                let warning = not_recorded(path, &e);
-                warn!("{warning}");
-                warning
-            }))
+    let left = match unlink::look(path, id) {
+        unlink::Look::There => {
+            return Err(NotRemoved::Kept(delete_failed(
+                path,
+                &std::io::Error::other(error),
+            )))
+        }
+        unlink::Look::Gone => Left::Nothing,
+        unlink::Look::Replaced => {
+            warn!(
+                "Another file is at {} now, so its item stays in beets' library",
+                path.display()
+            );
+            Left::AnotherFile
         }
         unlink::Look::Unreadable(e) => {
             warn!("Could not look at {} after that: {e}", path.display());
-            Err(NotRemoved::Unconfirmed(removal_unconfirmed(path, error)))
+            return Err(NotRemoved::Unconfirmed(removal_unconfirmed(path, error)));
         }
-    }
+    };
+    let recorded = match db.acquire().await {
+        Ok(mut conn) => DeletionReviewRow::insert_in(&mut conn, record).await,
+        Err(e) => Err(e.to_string()),
+    };
+    let unrecorded = recorded.err().map(|e| {
+        let warning = not_recorded(path, &e);
+        warn!("{warning}");
+        warning
+    });
+    Ok((unrecorded, left))
 }
 
-/// Queues the forget of the removed `path` on the worker of `folder`'s library, logs a forget
-/// that did not remove one item, and prunes the empty parents up to `folder`.
-async fn forget_queued(queue: ImportQueue, path: PathBuf, folder: PathBuf) {
+/// When the removal of `path` left nothing there (`left`): queues its forget on the worker of
+/// `folder`'s library, logs a forget that did not remove one item, and prunes the empty parents
+/// up to `folder`.
+async fn forget_queued(queue: ImportQueue, path: PathBuf, folder: PathBuf, left: Left) {
+    if left == Left::AnotherFile {
+        return;
+    }
     let outcome = queue.forget(&folder, &path).await;
     if let Some(note) = forget_note(&outcome, &path, &folder) {
         warn!("{note}");
     }
     prune(&path, &folder).await;
+}
+
+/// When the removal of `path` left nothing there (`left`): forgets it through `importer` in
+/// `library`, from inside its worker, and prunes the empty parents up to `folder`; the warning
+/// of a forget that did not remove one item.
+async fn forget_in_worker(
+    importer: &dyn MusicImporter,
+    library: &Path,
+    path: &Path,
+    folder: &Path,
+    left: Left,
+) -> Option<String> {
+    if left == Left::AnotherFile {
+        return None;
+    }
+    let outcome = importer.forget(library, path).await;
+    let warning = forget_note(&outcome, path, library);
+    prune(path, folder).await;
+    warning
 }
 
 /// Removes the directories the removal of `path` left empty, up to (not including) `folder`.
@@ -2046,17 +2097,56 @@ mod tests {
         }
         assert_eq!(rows().await, 0);
 
-        // Gone: the removal is done. The task and its caller may both settle it: the row is
-        // recorded once.
+        // Another file at the path: the checked one is gone, so the removal is done and
+        // recorded, but beets' item at the path may be the new file's.
         std::fs::remove_file(&album).unwrap();
         std::fs::remove_dir_all(&moved).unwrap();
+        std::fs::create_dir(&album).unwrap();
+        std::fs::write(&path, b"a new file").unwrap();
+        assert!(matches!(
+            lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await,
+            Ok((None, Left::AnotherFile))
+        ));
+        assert_eq!(rows().await, 1);
+
+        // Nothing at the path: the removal is done. The task and its caller may both settle
+        // it: the row is recorded once.
+        std::fs::remove_file(&path).unwrap();
         for _ in 0..2 {
             assert!(matches!(
                 lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await,
-                Ok(None)
+                Ok((None, Left::Nothing))
             ));
         }
         assert_eq!(rows().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_removal_forgets_and_prunes_only_when_nothing_is_left_at_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("alice");
+        let path = folder.join("A/x.flac");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // Another file at the path: its beets item stays, and so does its folder.
+        std::fs::write(&path, b"a new file").unwrap();
+        let stub = StubImporter::new();
+        assert_eq!(
+            forget_in_worker(&stub, &folder, &path, &folder, Left::AnotherFile).await,
+            None
+        );
+        assert!(stub.forgets().is_empty());
+        assert!(path.exists());
+
+        // Nothing there: the item is forgotten and the empty folder pruned.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            forget_in_worker(&stub, &folder, &path, &folder, Left::Nothing).await,
+            None
+        );
+        assert_eq!(stub.forgets(), vec![(folder.clone(), path.clone())]);
+        assert!(!folder.join("A").exists());
+        assert!(folder.is_dir());
     }
 
     #[tokio::test]

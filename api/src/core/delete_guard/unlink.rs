@@ -78,8 +78,10 @@ pub(super) fn unlink_if_same(path: &Path, expected: FileId) -> Result<(), Unlink
 pub(super) enum Look {
     /// The checked file (its device and inode), whether it changed since or not.
     There,
-    /// Nothing is at the path, or another file is.
+    /// Nothing is at the path.
     Gone,
+    /// Another file (another device or inode) is at the path: the checked file is gone.
+    Replaced,
     /// The path cannot be read without following a link (ELOOP, ENOTDIR), or reading it failed.
     Unreadable(std::io::Error),
 }
@@ -88,7 +90,8 @@ pub(super) enum Look {
 pub(super) fn look(path: &Path, expected: FileId) -> Look {
     match located(path) {
         Ok((_, _, found)) if (found.dev, found.ino) == (expected.dev, expected.ino) => Look::There,
-        Ok(_) | Err(Located::Errno(Errno::NOENT)) => Look::Gone,
+        Ok(_) => Look::Replaced,
+        Err(Located::Errno(Errno::NOENT)) => Look::Gone,
         Err(e) => Look::Unreadable(e.into()),
     }
 }
