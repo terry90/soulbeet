@@ -10,10 +10,22 @@ pub struct SubsonicEnvelope<T> {
 
 #[derive(Debug, Deserialize)]
 pub struct SubsonicResponse<T> {
-    pub status: String,
-    pub error: Option<SubsonicError>,
     #[serde(flatten)]
     pub body: T,
+}
+
+/// The status and error of an answer, read before its body so that a refusal
+/// is reported whatever body the endpoint would have had.
+#[derive(Debug, Deserialize)]
+pub struct SubsonicAnswer {
+    #[serde(rename = "subsonic-response")]
+    pub response: SubsonicOutcome,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubsonicOutcome {
+    pub status: String,
+    pub error: Option<SubsonicError>,
 }
 
 #[derive(Debug, Deserialize)]

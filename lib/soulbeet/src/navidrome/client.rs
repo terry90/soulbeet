@@ -171,17 +171,22 @@ impl NavidromeClient {
 
         self.circuit_breaker.record_success().await;
 
-        let envelope: SubsonicEnvelope<T> = response.json().await.map_err(parse)?;
+        let bytes = response.bytes().await.map_err(parse)?;
+        let answer: SubsonicAnswer =
+            serde_json::from_slice(&bytes).map_err(|e| NavidromeError::Parse(e.to_string()))?;
 
-        if envelope.response.status != "ok" {
-            return Err(match envelope.response.error {
+        if answer.response.status != "ok" {
+            return Err(match answer.response.error {
                 Some(SubsonicError { code, message }) => NavidromeError::Subsonic { code, message },
                 None => NavidromeError::Parse(format!(
                     "status '{}' without an error",
-                    envelope.response.status
+                    answer.response.status
                 )),
             });
         }
+
+        let envelope: SubsonicEnvelope<T> =
+            serde_json::from_slice(&bytes).map_err(|e| NavidromeError::Parse(e.to_string()))?;
 
         Ok(envelope.response.body)
     }
@@ -544,6 +549,20 @@ mod tests {
             "2026-11-14T21:03:11.519322+00:00"
         );
         assert_eq!(status.error, "");
+    }
+
+    #[tokio::test]
+    async fn a_failed_answer_is_navidromes_own_error() {
+        let (url, _) = serve(vec![Reply {
+            status: 200,
+            body: r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Internal Error"}}}"#.into(),
+        }]);
+        let err = client(&url).get_scan_status().await.unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Subsonic { code: 0, message } if message == "Internal Error"),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "Navidrome error 0: Internal Error");
     }
 
     #[tokio::test]
