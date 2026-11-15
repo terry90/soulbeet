@@ -101,6 +101,10 @@ fn RequestRow(request: LoggedRequest) -> Element {
         (None, None) => String::new(),
     };
     let time = utc_time(request.at, "%Y-%m-%d %H:%M:%S");
+    let status = match request.status {
+        Some(status) => status.to_string(),
+        None => "no answer: the client left first".to_string(),
+    };
 
     rsx! {
         tr { class: "border-t border-white/5",
@@ -114,7 +118,7 @@ fn RequestRow(request: LoggedRequest) -> Element {
                 }
             }
             td { class: CELL_CLASS,
-                "{request.status}"
+                "{status}"
                 if let Some(refusal) = &request.refusal {
                     div { class: "text-yellow-400", "{refusal}" }
                 }
@@ -135,21 +139,38 @@ mod tests {
             host_from: "host".into(),
             scheme_from: "local_host_is_http".into(),
             advice: vec!["Claude cannot use this address: it is plain http.".into()],
-            recent: vec![LoggedRequest {
-                at: 1_800_000_000,
-                method: "GET".into(),
-                path: "/.well-known/oauth-protected-resource/mcp".into(),
-                base: Some("http://192.168.1.5:9765".into()),
-                base_problem: None,
-                host_from: "host".into(),
-                scheme_from: "local_host_is_http".into(),
-                host_header: Some("192.168.1.5:9765".into()),
-                x_forwarded_host: None,
-                x_forwarded_proto: None,
-                forwarded: None,
-                status: 403,
-                refusal: Some("https_required".into()),
-            }],
+            recent: vec![
+                LoggedRequest {
+                    at: 1_800_000_000,
+                    method: "GET".into(),
+                    path: "/.well-known/oauth-protected-resource/mcp".into(),
+                    base: Some("http://192.168.1.5:9765".into()),
+                    base_problem: None,
+                    host_from: "host".into(),
+                    scheme_from: "local_host_is_http".into(),
+                    host_header: Some("192.168.1.5:9765".into()),
+                    x_forwarded_host: None,
+                    x_forwarded_proto: None,
+                    forwarded: None,
+                    status: Some(403),
+                    refusal: Some("https_required".into()),
+                },
+                LoggedRequest {
+                    at: 1_800_000_000,
+                    method: "GET".into(),
+                    path: "/oauth/authorize".into(),
+                    base: Some("https://music.example.com".into()),
+                    base_problem: None,
+                    host_from: "host".into(),
+                    scheme_from: "named_host_is_https".into(),
+                    host_header: Some("music.example.com".into()),
+                    x_forwarded_host: None,
+                    x_forwarded_proto: None,
+                    forwarded: None,
+                    status: None,
+                    refusal: None,
+                },
+            ],
         };
         let mut dom = VirtualDom::new_with_props(
             |access: RemoteAccess| rsx! { RemoteAccessView { access } },
@@ -165,6 +186,7 @@ mod tests {
             "403",
             "https_required",
             "Host: 192.168.1.5:9765",
+            "no answer: the client left first",
         ] {
             assert!(html.contains(text), "{text}");
         }

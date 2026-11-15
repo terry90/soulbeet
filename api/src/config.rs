@@ -37,18 +37,22 @@ pub(crate) fn parse_registration(
 }
 
 /// Reads `MCP`: `on` or `off` in any case. Unset is on; an unknown value is
-/// off, as an unknown `REGISTRATION` closes registration.
+/// off, as an unknown `REGISTRATION` closes registration. None when on,
+/// else why it is off, as the value is set.
 #[cfg(feature = "server")]
-pub(crate) fn parse_mcp_switch(value: Option<&str>) -> bool {
+pub(crate) fn parse_mcp_switch(value: Option<&str>) -> Option<String> {
     match value.map(str::to_lowercase).as_deref() {
-        None | Some("on") => true,
-        Some("off") => false,
-        Some(other) => {
+        None | Some("on") => None,
+        Some("off") => Some("MCP=off is set".to_string()),
+        Some(_) => {
+            let value = value.unwrap_or_default();
             tracing::warn!(
                 "Invalid MCP value '{}' (expected on or off), using off",
-                other
+                value
             );
-            false
+            Some(format!(
+                "MCP is set to '{value}', which is neither on nor off"
+            ))
         }
     }
 }
@@ -115,8 +119,8 @@ pub struct AppConfig {
     navidrome_music_path: Option<PathBuf>,
     /// Who can create accounts (`REGISTRATION`)
     registration: RegistrationMode,
-    /// Whether Claude (MCP) access is switched on (`MCP`)
-    mcp_enabled: bool,
+    /// Why `MCP` switches Claude (MCP) access off; None when it is on
+    mcp_off: Option<String>,
     /// HTTP server port (default: 9765)
     pub port: u16,
     /// HTTP server bind address (default: "0.0.0.0")
@@ -174,7 +178,7 @@ impl AppConfig {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             registration,
-            mcp_enabled: parse_mcp_switch(
+            mcp_off: parse_mcp_switch(
                 std::env::var("MCP")
                     .ok()
                     .as_deref()
@@ -239,9 +243,9 @@ impl AppConfig {
         self.registration
     }
 
-    /// Whether Claude (MCP) access is switched on.
-    pub fn mcp_enabled(&self) -> bool {
-        self.mcp_enabled
+    /// Why `MCP` switches Claude (MCP) access off; None when it is on.
+    pub fn mcp_off(&self) -> Option<&str> {
+        self.mcp_off.as_deref()
     }
 
     /// The mode every batch of this run imports in.
@@ -283,14 +287,17 @@ mod tests {
     #[test]
     fn mcp_is_on_unless_switched_off() {
         for (value, want) in [
-            (None, true),
-            (Some("on"), true),
-            (Some("ON"), true),
-            (Some("off"), false),
-            (Some("Off"), false),
-            (Some("disabled"), false),
+            (None, None),
+            (Some("on"), None),
+            (Some("ON"), None),
+            (Some("off"), Some("MCP=off is set")),
+            (Some("Off"), Some("MCP=off is set")),
+            (
+                Some("Disabled"),
+                Some("MCP is set to 'Disabled', which is neither on nor off"),
+            ),
         ] {
-            assert_eq!(parse_mcp_switch(value), want, "{value:?}");
+            assert_eq!(parse_mcp_switch(value).as_deref(), want, "{value:?}");
         }
     }
 

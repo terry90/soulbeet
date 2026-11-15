@@ -48,10 +48,15 @@ pub(crate) struct McpCaller {
 /// An `Origin` a page that DNS rebinding points at this server cannot send:
 /// an `https` origin (a page on another host needs a certificate for its own
 /// name), a loopback one, or `base` itself, scheme, host and port alike.
-/// `null` and anything that is not `scheme://host[:port]` are refused.
+/// `null` and anything that is not `scheme://host[:port]`, a trailing `/`
+/// included (RFC 6454 section 6.1), are refused.
 pub(crate) fn origin_allowed(origin: &str, base: &BaseUrl) -> bool {
-    BaseUrl::parse(origin)
-        .is_ok_and(|origin| origin.is_https() || origin.is_loopback() || origin == *base)
+    let only_authority = origin
+        .split_once("://")
+        .is_some_and(|(_, authority)| !authority.contains(['/', '?', '#']));
+    only_authority
+        && BaseUrl::parse(origin)
+            .is_ok_and(|origin| origin.is_https() || origin.is_loopback() || origin == *base)
 }
 
 /// The `WWW-Authenticate` challenge of a `/mcp` 401 (RFC 6750 section 3,
@@ -149,7 +154,7 @@ fn invalid_token(base: &BaseUrl, description: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
-    use axum::http::{Method, Request, StatusCode};
+    use axum::http::{HeaderMap, Method, Request, StatusCode};
     use serde_json::{from_str, json, Value};
 
     use super::server::INSTRUCTIONS;
@@ -183,6 +188,10 @@ mod tests {
             "null",
             "not an origin",
             "http://192.168.1.5:9765",
+            "https://claude.ai/",
+            "https://claude.ai/x",
+            "https://claude.ai?x",
+            "https://claude.ai#x",
         ] {
             assert!(!origin_allowed(o, &public), "{o}");
         }
@@ -206,6 +215,7 @@ mod tests {
             body,
             json!({"error": "invalid_token", "error_description": "No access token was sent"})
         );
+        assert_uncached_by_origin_and_address(&headers);
         let (status, headers, _) = post_rpc(
             app,
             &[("host", HOST), ("authorization", "Basic dTpw")],
@@ -284,11 +294,24 @@ mod tests {
         );
     }
 
+    /// The headers every `/mcp` answer carries: uncached, and varying on
+    /// `Origin` and on the headers its address is read from.
+    fn assert_uncached_by_origin_and_address(headers: &HeaderMap) {
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(
+            headers.get_all("vary").iter().collect::<Vec<_>>(),
+            [
+                "Origin",
+                "Forwarded, X-Forwarded-Host, X-Forwarded-Proto, Host"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn a_rebinding_origin_is_forbidden_even_with_a_token() {
         let (_, app, token) = mcp_app().await;
         let bearer = format!("Bearer {token}");
-        let (status, _, body) = post_rpc(
+        let (status, headers, body) = post_rpc(
             app.clone(),
             &[
                 ("host", HOST),
@@ -303,6 +326,7 @@ mod tests {
             body,
             json!({"error": "origin_not_allowed", "message": "Requests from http://evil.example are not accepted"})
         );
+        assert_uncached_by_origin_and_address(&headers);
         let (status, _, _) = post_rpc(
             app,
             &[
@@ -356,15 +380,7 @@ mod tests {
         );
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["instructions"], INSTRUCTIONS);
-        assert_eq!(headers["cache-control"], "no-store");
-        let vary: Vec<_> = headers.get_all("vary").iter().collect();
-        assert_eq!(
-            vary,
-            [
-                "Origin",
-                "Forwarded, X-Forwarded-Host, X-Forwarded-Proto, Host"
-            ]
-        );
+        assert_uncached_by_origin_and_address(&headers);
     }
 
     #[tokio::test]

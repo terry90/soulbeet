@@ -24,13 +24,9 @@ pub struct SecurityStatus {
     pub mcp_blocked_by: Vec<GateReason>,
     /// Why every sign-in is refused, when the configuration makes it so.
     pub sign_in_problem: Option<String>,
-    /// False when `MCP` switches Claude (MCP) access off.
-    #[serde(default = "enabled")]
-    pub mcp_enabled: bool,
-}
-
-fn enabled() -> bool {
-    true
+    /// Why `MCP` switches Claude (MCP) access off; None when it is on.
+    #[serde(default)]
+    pub mcp_off: Option<String>,
 }
 
 #[cfg(feature = "server")]

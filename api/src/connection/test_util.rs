@@ -43,7 +43,7 @@ impl ConnectionState {
     /// `test_key()`, no client metadata documents, and `sample_facts()`.
     pub(crate) fn for_test(db: SqlitePool) -> ConnectionState {
         ConnectionState {
-            mcp_enabled: true,
+            mcp_off: None,
             public_url: None,
             gate: Vec::new,
             db,

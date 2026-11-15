@@ -28,7 +28,10 @@ pub fn SecurityStatusPanel() -> Element {
 
 #[component]
 fn SecurityChecks(status: SecurityStatus) -> Element {
-    if status.mcp_enabled && status.sign_in_problem.is_none() && status.mcp_blocked_by.is_empty() {
+    if status.mcp_off.is_none()
+        && status.sign_in_problem.is_none()
+        && status.mcp_blocked_by.is_empty()
+    {
         return rsx! {
             p { class: "text-sm font-mono text-gray-300", "All security checks pass." }
         };
@@ -37,9 +40,9 @@ fn SecurityChecks(status: SecurityStatus) -> Element {
         if let Some(problem) = status.sign_in_problem {
             p { class: "text-sm font-mono text-red-400 mb-3", "{problem}" }
         }
-        if !status.mcp_enabled {
+        if let Some(why) = status.mcp_off {
             p { class: "text-sm font-mono text-gray-300 mb-3",
-                "Claude (MCP) access is turned off: MCP=off is set."
+                "Claude (MCP) access is turned off: {why}."
             }
         }
         if !status.mcp_blocked_by.is_empty() {
@@ -73,7 +76,7 @@ mod tests {
         SecurityStatus {
             mcp_blocked_by,
             sign_in_problem: sign_in_problem.map(Into::into),
-            mcp_enabled: true,
+            mcp_off: None,
         }
     }
 
@@ -82,10 +85,18 @@ mod tests {
         let html = render(SecurityStatus {
             mcp_blocked_by: vec![],
             sign_in_problem: None,
-            mcp_enabled: false,
+            mcp_off: Some("MCP=off is set".into()),
         });
         assert!(html.contains("Claude (MCP) access is turned off: MCP=off is set."));
         assert!(!html.contains("All security checks pass."));
+        let html = render(SecurityStatus {
+            mcp_blocked_by: vec![],
+            sign_in_problem: None,
+            mcp_off: Some("MCP is set to 'disabled', which is neither on nor off".into()),
+        });
+        assert!(html.contains(
+            "Claude (MCP) access is turned off: MCP is set to &#39;disabled&#39;, which is neither on nor off."
+        ));
     }
 
     #[test]

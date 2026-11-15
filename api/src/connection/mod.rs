@@ -12,7 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
-use serde_json::json;
+use serde_json::{json, Map};
 
 use crate::base_url::{explain_request, BaseExplanation, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
@@ -21,7 +21,7 @@ use crate::mcp::status::{LiveStatus, StatusSource};
 use crate::oauth::cimd::{CimdFetcher, ClientDocuments, UnbuiltFetcher};
 use crate::oauth::limits::Limits;
 use crate::security::GateReason;
-use log::{base_and_problem, header_value, RequestLog, LIVE_LOG};
+use log::{base_and_problem, cut, header_value, Recording, RequestLog, LIVE_LOG};
 
 #[cfg(test)]
 mod flow_tests;
@@ -31,7 +31,8 @@ pub(crate) mod test_util;
 
 /// What the connection router reads about the instance, a seam for tests.
 pub struct ConnectionState {
-    pub(crate) mcp_enabled: bool,
+    /// Why `MCP` switches the endpoints off; None when it is on.
+    pub(crate) mcp_off: Option<String>,
     pub(crate) public_url: Option<Result<BaseUrl, BaseUrlError>>,
     pub(crate) gate: fn() -> Vec<GateReason>,
     pub(crate) db: sqlx::SqlitePool,
@@ -50,7 +51,7 @@ impl ConnectionState {
     /// The running instance's configuration and security checks.
     pub fn live() -> ConnectionState {
         ConnectionState {
-            mcp_enabled: CONFIG.mcp_enabled(),
+            mcp_off: CONFIG.mcp_off().map(str::to_string),
             public_url: CONFIG.public_url().cloned(),
             gate: crate::security::gate_reasons,
             db: (*crate::db::DB).clone(),
@@ -97,19 +98,37 @@ async fn not_found() -> Response {
 
 /// Refuses the request or runs the route with its `RequestBase`, then marks
 /// the answer uncached and dependent on the headers its address was read
-/// from, next to any `Vary` the route set, and records the request and its
-/// answer in the log.
+/// from, next to any `Vary` the route set. The request is recorded in the
+/// log with its answer, or without one when the client leaves first and
+/// the route's future is dropped.
 async fn guard(
     State(state): State<Arc<ConnectionState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
     let explained = explain_request(request.headers(), request.uri(), state.public_url.as_ref());
-    let method = request.method().to_string();
-    let path = request.uri().path().to_string();
     let [host_header, x_forwarded_host, x_forwarded_proto, forwarded] =
         ["host", "x-forwarded-host", "x-forwarded-proto", "forwarded"]
             .map(|name| header_value(request.headers(), name));
+    let (base, base_problem) = base_and_problem(&explained.result);
+    let recording = Recording::start(
+        state.log.clone(),
+        LoggedRequest {
+            at: crate::oauth::now_unix(),
+            method: request.method().to_string(),
+            path: cut(request.uri().path()),
+            base,
+            base_problem,
+            host_from: explained.host_from.as_str().into(),
+            scheme_from: explained.scheme_from.as_str().into(),
+            host_header,
+            x_forwarded_host,
+            x_forwarded_proto,
+            forwarded,
+            status: None,
+            refusal: None,
+        },
+    );
     let mut response = match admit(&state, &explained) {
         Err(refused) => refused,
         Ok(base) => {
@@ -123,44 +142,34 @@ async fn guard(
         VARY,
         HeaderValue::from_static("Forwarded, X-Forwarded-Host, X-Forwarded-Proto, Host"),
     );
-    let (base, base_problem) = base_and_problem(&explained.result);
-    state.log.record(LoggedRequest {
-        at: crate::oauth::now_unix(),
-        method,
-        path,
-        base,
-        base_problem,
-        host_from: explained.host_from.as_str().into(),
-        scheme_from: explained.scheme_from.as_str().into(),
-        host_header,
-        x_forwarded_host,
-        x_forwarded_proto,
-        forwarded,
-        status: response.status().as_u16(),
-        refusal: response
+    recording.answered(
+        response.status().as_u16(),
+        response
             .extensions()
             .get::<RefusalCode>()
             .map(|RefusalCode(code)| code.to_string()),
-    });
+    );
     response
 }
 
 /// The request's address, or the refusal of the request.
 fn admit(state: &ConnectionState, explained: &BaseExplanation) -> Result<BaseUrl, Response> {
-    if !state.mcp_enabled {
+    if let Some(why) = &state.mcp_off {
         return Err(refusal(
             StatusCode::NOT_FOUND,
             "mcp_disabled",
-            "Claude (MCP) access is turned off: MCP=off is set",
+            format!("Claude (MCP) access is turned off: {why}"),
         ));
     }
     let reasons = (state.gate)();
     if !reasons.is_empty() {
+        let mut extra = Map::new();
+        extra.insert("reasons".into(), json!(reasons));
         return Err(refusal_with(
             StatusCode::SERVICE_UNAVAILABLE,
             "mcp_unavailable",
-            "Claude (MCP) access stays off until the security checks in Settings pass",
-            json!({ "reasons": reasons }),
+            GATE_CLOSED,
+            extra,
         ));
     }
     let base = match &explained.result {
@@ -174,6 +183,10 @@ fn admit(state: &ConnectionState, explained: &BaseExplanation) -> Result<BaseUrl
         }
     };
     if !base.is_https() && !base.is_loopback() {
+        let mut extra = Map::new();
+        extra.insert("derived_base".into(), base.to_string().into());
+        extra.insert("host_from".into(), explained.host_from.as_str().into());
+        extra.insert("scheme_from".into(), explained.scheme_from.as_str().into());
         return Err(refusal_with(
             StatusCode::FORBIDDEN,
             "https_required",
@@ -182,15 +195,15 @@ fn admit(state: &ConnectionState, explained: &BaseExplanation) -> Result<BaseUrl
                  over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: \
                  proto=https), or set PUBLIC_URL."
             ),
-            json!({
-                "derived_base": base.to_string(),
-                "host_from": explained.host_from.as_str(),
-                "scheme_from": explained.scheme_from.as_str(),
-            }),
+            extra,
         ));
     }
     Ok(base)
 }
+
+/// What the endpoints answer while a security check fails.
+pub(crate) const GATE_CLOSED: &str =
+    "Claude (MCP) access stays off until the security checks in Settings pass";
 
 /// Keeps a page from being framed by another site: sets
 /// `Content-Security-Policy: frame-ancestors 'none'` on a response that has
@@ -214,20 +227,17 @@ pub(crate) fn refusal(
     code: &'static str,
     message: impl Into<String>,
 ) -> Response {
-    refusal_with(status, code, message, json!({}))
+    refusal_with(status, code, message, Map::new())
 }
 
-/// `refusal` with the members of `extra`, a JSON object, added to the body.
+/// `refusal` with the members of `extra` added to the body.
 pub(crate) fn refusal_with(
     status: StatusCode,
     code: &'static str,
     message: impl Into<String>,
-    extra: serde_json::Value,
+    extra: Map<String, serde_json::Value>,
 ) -> Response {
-    let serde_json::Value::Object(extra) = extra else {
-        unreachable!("a refusal's extra members are a JSON object");
-    };
-    let mut body = serde_json::Map::new();
+    let mut body = Map::new();
     body.insert("error".into(), code.into());
     body.insert("message".into(), message.into().into());
     body.extend(extra);
@@ -244,21 +254,64 @@ mod tests {
 
     #[tokio::test]
     async fn the_endpoints_answer_404_while_mcp_is_off() {
-        let state = ConnectionState {
-            mcp_enabled: false,
-            ..ConnectionState::for_test(test_db::migrated().await)
-        };
-        let (status, _, body) = get_json(
-            router(state),
-            "/.well-known/oauth-protected-resource/mcp",
-            &[("host", HOST)],
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(
-            body,
-            json!({"error": "mcp_disabled", "message": "Claude (MCP) access is turned off: MCP=off is set"})
-        );
+        for (switch, message) in [
+            (
+                "off",
+                "Claude (MCP) access is turned off: MCP=off is set",
+            ),
+            (
+                "disabled",
+                "Claude (MCP) access is turned off: MCP is set to 'disabled', which is neither on nor off",
+            ),
+        ] {
+            let state = ConnectionState {
+                mcp_off: crate::config::parse_mcp_switch(Some(switch)),
+                ..ConnectionState::for_test(test_db::migrated().await)
+            };
+            let (status, _, body) = get_json(
+                router(state),
+                "/.well-known/oauth-protected-resource/mcp",
+                &[("host", HOST)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{switch}");
+            assert_eq!(
+                body,
+                json!({"error": "mcp_disabled", "message": message}),
+                "{switch}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_guard_names_the_first_check_that_fails() {
+        fn failing() -> Vec<GateReason> {
+            crate::security::gate_reasons_from(true, false)
+        }
+        // Each request fails every check from its row on: the switch, the
+        // gate, the address, then plain http.
+        let unreadable: &[(&str, &str)] = &[("host", HOST), ("x-forwarded-proto", "gopher")];
+        let plain_lan: &[(&str, &str)] = &[("host", "192.168.1.5:9765")];
+        for (mcp_off, gate, headers, want) in [
+            (true, true, unreadable, "mcp_disabled"),
+            (true, false, plain_lan, "mcp_disabled"),
+            (false, true, unreadable, "mcp_unavailable"),
+            (false, true, plain_lan, "mcp_unavailable"),
+            (false, false, unreadable, "address_unreadable"),
+            (false, false, plain_lan, "https_required"),
+        ] {
+            let state = ConnectionState {
+                mcp_off: mcp_off.then(|| "MCP=off is set".to_string()),
+                gate: if gate { failing } else { Vec::new },
+                ..ConnectionState::for_test(test_db::migrated().await)
+            };
+            let (_, _, body) = get_json(router(state), "/oauth/token", headers).await;
+            assert_eq!(
+                body["error"].as_str(),
+                Some(want),
+                "{mcp_off} {gate} {headers:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -401,18 +454,24 @@ mod tests {
                 entry.refusal.as_deref(),
                 entry.base.as_deref()
             ),
-            ("/oauth/nothing", 400, Some("address_unreadable"), None)
+            (
+                "/oauth/nothing",
+                Some(400),
+                Some("address_unreadable"),
+                None
+            )
         );
-        assert!(entry
-            .base_problem
-            .as_deref()
-            .unwrap()
-            .ends_with("is not http or https"));
+        // "'aaa...' is not http or https", cut to 200 characters.
+        assert_eq!(
+            entry.base_problem.as_deref(),
+            Some(format!("'{}", "a".repeat(199)).as_str())
+        );
         assert_eq!(
             (entry.host_from.as_str(), entry.scheme_from.as_str()),
             ("host", "x_forwarded_proto")
         );
         assert_eq!(entry.x_forwarded_proto.as_ref().map(String::len), Some(200));
+        assert_eq!(entry.status, Some(400));
         let state = ConnectionState::for_test(test_db::migrated().await);
         let log = state.log.clone();
         get_json(
@@ -432,7 +491,7 @@ mod tests {
             (
                 "/oauth/nothing",
                 Some("http://192.168.1.5:9765"),
-                403,
+                Some(403),
                 Some("https_required")
             )
         );
@@ -469,19 +528,84 @@ mod tests {
             (
                 (
                     "/.well-known/oauth-protected-resource/mcp",
-                    200,
+                    Some(200),
                     None,
                     Some("https://music.example.com"),
                     Some(HOST)
                 ),
                 (
                     "/oauth/nothing",
-                    404,
+                    Some(404),
                     Some("not_found"),
                     Some("https://music.example.com"),
                     Some(HOST)
                 )
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_path_and_address_problem_are_cut_in_the_log() {
+        let state = ConnectionState::for_test(test_db::migrated().await);
+        let log = state.log.clone();
+        let path = format!("/oauth/{}", "p".repeat(300));
+        let proto = "x".repeat(300);
+        get_json(
+            router(state),
+            &path,
+            &[("host", HOST), ("x-forwarded-proto", &proto)],
+        )
+        .await;
+        let entry = &log.recent()[0];
+        assert_eq!(entry.path, path[..200]);
+        assert_eq!(
+            entry.base_problem.as_deref().map(|p| p.chars().count()),
+            Some(200)
+        );
+    }
+
+    /// Fetches no document: the client leaves while it waits.
+    struct NeverAnswers;
+
+    #[async_trait::async_trait]
+    impl crate::oauth::cimd::ClientDocuments for NeverAnswers {
+        async fn fetch(
+            &self,
+            _url: &url::Url,
+        ) -> Result<crate::oauth::cimd::ClientDocument, crate::oauth::cimd::CimdError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_the_client_leaves_is_logged_without_a_status() {
+        use tower::ServiceExt;
+        let db = test_db::migrated().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let state = ConnectionState {
+            documents: Arc::new(NeverAnswers),
+            ..ConnectionState::for_test(db)
+        };
+        let log = state.log.clone();
+        let app = router(state).layer(tower_cookies::CookieManagerLayer::new());
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("client_id", CLAUDE_CODE_ID)
+            .finish();
+        let req = axum::http::Request::get(format!("/oauth/authorize?{query}"))
+            .header("host", HOST)
+            .header("cookie", cookie)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let left =
+            tokio::time::timeout(std::time::Duration::from_millis(100), app.oneshot(req)).await;
+        assert!(left.is_err(), "the fetch never answers");
+        let recent = log.recent();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|e| (e.path.as_str(), e.status, e.base.as_deref()))
+                .collect::<Vec<_>>(),
+            [("/oauth/authorize", None, Some("https://music.example.com"))]
         );
     }
 

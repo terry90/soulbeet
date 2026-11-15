@@ -9,11 +9,12 @@ pub struct LoggedRequest {
     /// Unix seconds.
     pub at: i64,
     pub method: String,
-    /// The path without its query, which can carry codes and state.
+    /// The path without its query, which can carry codes and state, cut to
+    /// 200 characters.
     pub path: String,
     /// The address derived for the request, when it could be.
     pub base: Option<String>,
-    /// Why no address could be derived.
+    /// Why no address could be derived, cut to 200 characters.
     pub base_problem: Option<String>,
     /// Which header or rule gave the host, as `HostSource::as_str` names it.
     pub host_from: String,
@@ -24,7 +25,8 @@ pub struct LoggedRequest {
     pub x_forwarded_host: Option<String>,
     pub x_forwarded_proto: Option<String>,
     pub forwarded: Option<String>,
-    pub status: u16,
+    /// None when the client left before the answer.
+    pub status: Option<u16>,
     /// The `error` code of a connection layer refusal.
     pub refusal: Option<String>,
 }

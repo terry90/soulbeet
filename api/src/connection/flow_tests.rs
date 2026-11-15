@@ -15,6 +15,9 @@ use super::test_util::{request_id_of, serve_on_loopback, signed_in, text_of, INI
 use super::{router, ConnectionState};
 use crate::db::test_db;
 
+/// The loopback redirect URI the test client registers; nothing listens there.
+const CALLBACK: &str = "http://127.0.0.1:1/callback";
+
 async fn serve(state: ConnectionState) -> (String, tokio::task::JoinHandle<()>) {
     let (addr, server) = serve_on_loopback(router(state).layer(CookieManagerLayer::new())).await;
     (format!("http://{addr}"), server)
@@ -97,7 +100,7 @@ async fn an_mcp_client_signs_in_lists_tools_calls_get_status_and_refreshes() {
     let mut oauth = OAuthState::new(&mcp, None).await.unwrap();
     oauth
         .start_authorization(
-            AuthorizationRequest::new("http://127.0.0.1:1/callback")
+            AuthorizationRequest::new(CALLBACK)
                 .with_client_name("flow test")
                 .with_challenge(challenge),
         )
@@ -137,7 +140,7 @@ async fn an_mcp_client_signs_in_lists_tools_calls_get_status_and_refreshes() {
     assert_eq!(r.status(), 303);
     let callback = r.headers()["location"].to_str().unwrap().to_string();
     assert!(
-        callback.starts_with("http://127.0.0.1:1/callback?code="),
+        callback.starts_with(&format!("{CALLBACK}?code=")),
         "{callback}"
     );
     assert!(
@@ -247,7 +250,7 @@ async fn an_mcp_client_signs_in_lists_tools_calls_get_status_and_refreshes() {
     .await;
     assert_eq!(r.status(), 401);
     assert!(r.headers()["www-authenticate"].to_str().unwrap().contains(
-        r#"error_description="The access token was issued for another address of this server", resource_metadata="https://tunnel.example.net/.well-known/oauth-protected-resource/mcp""#
+        r#"error="invalid_token", error_description="The access token was issued for another address of this server", resource_metadata="https://tunnel.example.net/.well-known/oauth-protected-resource/mcp""#
     ));
 
     // 9. A password change ends the connection.
