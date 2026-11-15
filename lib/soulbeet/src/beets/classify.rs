@@ -356,7 +356,9 @@ impl Classifier {
             return ImportOutcome::LookupFailed { source, message };
         }
         if self.already_in_library || has(RunLogAction::DuplicateSkip) {
-            return ImportOutcome::Skipped(SkipReason::AlreadyInLibrary);
+            return ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+                existing: Vec::new(),
+            });
         }
         if self.nothing_imported_from && self.tasks.imported == 0 {
             return ImportOutcome::Skipped(SkipReason::NothingToImport);
@@ -398,6 +400,7 @@ impl Classifier {
         ImportOutcome::Imported {
             untagged: self.autotag_off || self.stdout_asis || has(RunLogAction::Asis),
             warnings,
+            items: Vec::new(),
         }
     }
 }
@@ -491,6 +494,7 @@ mod tests {
         ImportOutcome::Imported {
             untagged,
             warnings: warnings.iter().map(|w| w.to_string()).collect(),
+            items: Vec::new(),
         }
     }
 
@@ -498,7 +502,9 @@ mod tests {
         ImportOutcome::Skipped(SkipReason::NoMatch { candidates })
     }
 
-    const ALREADY: ImportOutcome = ImportOutcome::Skipped(SkipReason::AlreadyInLibrary);
+    const ALREADY: ImportOutcome = ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+        existing: Vec::new(),
+    });
     const NOTHING: ImportOutcome = ImportOutcome::Skipped(SkipReason::NothingToImport);
 
     /// The fixture's fatal line, which the Failed message must repeat.

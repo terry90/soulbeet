@@ -163,7 +163,11 @@ def test_a_path_query_finds_the_one_file_at_that_path(beets_env):
     assert len(ids(first.parent)) == 2
 
 
-REPORTED_STATUS = {"duplicate-replace": "replaced", "duplicate-keep": "kept"}
+REPORTED_STATUS = {
+    "duplicate-replace": "replaced",
+    "duplicate-keep": "kept",
+    "duplicate-skip": "skipped",
+}
 
 
 def import_twice(beets_env, duplicate_action):
@@ -179,7 +183,7 @@ def import_twice(beets_env, duplicate_action):
 
 @pytest.mark.parametrize(
     "action,statuses,reported",
-    [("skip", ["duplicate-skip"], []), ("keep", ["duplicate-keep"], ["kept"])],
+    [("skip", ["duplicate-skip"], ["skipped"]), ("keep", ["duplicate-keep"], ["kept"])],
 )
 def test_a_duplicate_decision_is_reported_as_beets_logged_it(
     beets_env, action, statuses, reported
@@ -204,6 +208,48 @@ def test_a_merge_is_reported_as_the_keep_beets_logs(beets_env):
     assert set(actions) == {"kept"}, run
 
 
+def test_a_skipped_duplicate_names_the_library_files_it_kept(beets_env):
+    run = import_twice(beets_env, "skip")
+
+    [dup] = run.report["duplicates"]
+    assert dup["action"] == "skipped", run
+    assert sorted(dup["existing"]) == sorted(
+        str(beets_env.music / f) for f in beets_env.music_files()
+    )
+    assert run.report["items"] == []
+
+
+@pytest.mark.parametrize("singleton", [False, True], ids=["album", "singleton"])
+def test_imported_items_are_reported_as_beets_stored_them(beets_env, singleton):
+    beets_env.album(beets_env.src)
+    run = beets_env.driver("auto", singleton=singleton, env={"FAKESRC_MODE": "strong"})
+
+    assert run.code == 0, run
+    reported = sorted(
+        (i["path"], i["recording_mbid"], i["artist"], i["title"])
+        for i in run.report["items"]
+    )
+    stored = sorted(
+        (str(beets_env.music / path), trackid or None, artist, title)
+        for title, artist, _album, trackid, path in beets_env.library()
+    )
+    assert reported == stored
+    assert len(reported) == 2
+
+
+def test_an_as_is_import_reports_its_items_without_a_recording(beets_env):
+    one_track(beets_env)
+    run = beets_env.driver("asis", singleton=True)
+
+    assert run.code == 0, run
+    assert run.report["items"] == [{
+        "path": str(beets_env.music / "Zzqx Artist/Song Number 1.mp3"),
+        "recording_mbid": None,
+        "artist": "Zzqx Artist",
+        "title": "Song Number 1",
+    }]
+
+
 def test_pick_applies_a_weak_track_and_tags_it(beets_env):
     track = one_track(beets_env)
     skipped = beets_env.driver("auto", singleton=True, env=WEAK)
@@ -221,6 +267,14 @@ def test_pick_applies_a_weak_track_and_tags_it(beets_env):
         "pick_missing": False,
         "refused": None,
         "duplicates": [],
+        "items": [
+            {
+                "path": str(beets_env.music / "Some Other Artist/Totally Different 1.mp3"),
+                "recording_mbid": "fake-t-w1",
+                "artist": "Some Other Artist",
+                "title": "Totally Different 1",
+            }
+        ],
     }
     assert not track.exists()
     assert beets_env.music_files() == ["Some Other Artist/Totally Different 1.mp3"]
@@ -353,7 +407,7 @@ def test_asis_imports_with_the_files_own_tags(beets_env, singleton):
 
     assert run.code == 0, run
     assert "Error in 'FakeSrc" not in run.stderr
-    assert run.report == {
+    assert {k: v for k, v in run.report.items() if k != "items"} == {
         "tasks": [],
         "pick_missing": False,
         "refused": None,

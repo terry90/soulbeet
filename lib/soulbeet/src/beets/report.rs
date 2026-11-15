@@ -1,11 +1,13 @@
 //! The report import.py writes after every run: the candidates beets weighed
-//! for each task, what kept a pick or an as-is import from running, and what
-//! beets did with each duplicate it kept or replaced.
+//! for each task, what kept a pick or an as-is import from running, what
+//! beets did with each duplicate it found, and each file it imported.
 
-use crate::{DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, SkipReason};
+use crate::{
+    DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, ImportedItem, SkipReason,
+};
 use serde::Deserialize;
 use shared::download::{MatchCandidate, MatchChoices, MatchKind, TrackFit};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub(crate) struct Report {
@@ -15,9 +17,11 @@ pub(crate) struct Report {
     pick_missing: bool,
     /// Why an as-is import was not run.
     refused: Option<String>,
-    /// One entry per duplicate decision beets logged as replace or keep. A
-    /// skip is read from the run log.
+    /// One entry per duplicate decision beets logged as replace, keep or
+    /// skip.
     duplicates: Vec<RawDuplicate>,
+    /// One entry per file beets imported, once it was in place.
+    items: Vec<RawItem>,
 }
 
 #[derive(Deserialize)]
@@ -26,6 +30,7 @@ struct RawReport {
     pick_missing: bool,
     refused: Option<String>,
     duplicates: Vec<RawDuplicate>,
+    items: Vec<RawItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +38,7 @@ struct RawReport {
 enum DuplicateAction {
     Replaced,
     Kept,
+    Skipped,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,24 +48,36 @@ struct RawDuplicate {
     existing: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawItem {
+    /// Where beets stored the file.
+    path: String,
+    recording_mbid: Option<String>,
+    artist: String,
+    title: String,
+}
+
+/// A file beets reported, relative to `target` when it is inside it.
+fn in_library(path: &str, target: &Path) -> PathBuf {
+    let path = Path::new(path);
+    path.strip_prefix(target).unwrap_or(path).to_path_buf()
+}
+
 /// The note an imported row gets for one duplicate decision, each library
-/// file named relative to `target` when it is inside it.
-fn duplicate_warning(d: &RawDuplicate, target: &Path) -> String {
+/// file named relative to `target` when it is inside it. A skipped decision
+/// gets none: it is the outcome's own reason, since a run that logs one is
+/// `Skipped(AlreadyInLibrary)` (`classify.rs` `exited_cleanly`).
+fn duplicate_warning(d: &RawDuplicate, target: &Path) -> Option<String> {
     let files = d
         .existing
         .iter()
-        .map(|p| {
-            let path = Path::new(p);
-            path.strip_prefix(target)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .into_owned()
-        })
+        .map(|p| in_library(p, target).to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(", ");
     match d.action {
-        DuplicateAction::Replaced => format!("replaced the library's earlier copy {files}"),
-        DuplicateAction::Kept => format!("kept the library's earlier copy {files} too"),
+        DuplicateAction::Replaced => Some(format!("replaced the library's earlier copy {files}")),
+        DuplicateAction::Kept => Some(format!("kept the library's earlier copy {files} too")),
+        DuplicateAction::Skipped => None,
     }
 }
 
@@ -168,6 +186,7 @@ impl Report {
             pick_missing: raw.pick_missing,
             refused: raw.refused,
             duplicates: raw.duplicates,
+            items: raw.items,
         })
     }
 
@@ -187,8 +206,35 @@ impl Report {
             };
             return result;
         }
-        if let ImportOutcome::Imported { warnings, .. } = &mut result.outcome {
-            warnings.extend(self.duplicates.iter().map(|d| duplicate_warning(d, target)));
+        if let ImportOutcome::Imported {
+            warnings, items, ..
+        } = &mut result.outcome
+        {
+            warnings.extend(
+                self.duplicates
+                    .iter()
+                    .filter_map(|d| duplicate_warning(d, target)),
+            );
+            *items = self
+                .items
+                .into_iter()
+                .map(|i| ImportedItem {
+                    path: in_library(&i.path, target),
+                    recording_mbid: i.recording_mbid,
+                    artist: i.artist,
+                    title: i.title,
+                })
+                .collect();
+            return result;
+        }
+        if let ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { .. }) = result.outcome {
+            let existing = self
+                .duplicates
+                .iter()
+                .filter(|d| matches!(d.action, DuplicateAction::Skipped))
+                .flat_map(|d| d.existing.iter().map(|p| in_library(p, target)))
+                .collect();
+            result.outcome = ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing });
             return result;
         }
         // A pick that found nothing and a weak automatic match both end in a
@@ -224,7 +270,8 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TaskCount;
+    use crate::{ImportedItem, TaskCount};
+    use std::path::PathBuf;
 
     const ALBUM_TASK: &str = r#"{"paths": ["/src/a"], "album": true, "candidates": [
         {"data_source": "MusicBrainz", "id": "6a09041b-0f79-3278-88d9-0552dd28d37f",
@@ -250,6 +297,7 @@ mod tests {
             "pick_missing": pick_missing,
             "refused": refused,
             "duplicates": [],
+            "items": [],
         });
         Report::parse(&text.to_string()).unwrap()
     }
@@ -396,8 +444,11 @@ mod tests {
         let imported = result(ImportOutcome::Imported {
             untagged: false,
             warnings: vec![],
+            items: vec![],
         });
-        let already = result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary));
+        let already = result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+            existing: vec![],
+        }));
         for other in [imported, already] {
             let applied = report(&[ALBUM_TASK], false, None).apply(
                 other.clone(),
@@ -479,24 +530,29 @@ mod tests {
             ],
         };
         assert_eq!(
-            duplicate_warning(&dup(DuplicateAction::Replaced), target),
-            "replaced the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3, /elsewhere/02.mp3"
+            duplicate_warning(&dup(DuplicateAction::Replaced), target).as_deref(),
+            Some("replaced the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3, /elsewhere/02.mp3")
         );
         assert_eq!(
-            duplicate_warning(&dup(DuplicateAction::Kept), target),
-            "kept the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3, /elsewhere/02.mp3 too"
+            duplicate_warning(&dup(DuplicateAction::Kept), target).as_deref(),
+            Some("kept the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3, /elsewhere/02.mp3 too")
+        );
+        assert_eq!(
+            duplicate_warning(&dup(DuplicateAction::Skipped), target),
+            None
         );
     }
 
     #[test]
     fn a_replacing_import_says_so_in_its_text() {
-        let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "duplicates": [
+        let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "items": [], "duplicates": [
             {"action": "replaced",
              "existing": ["/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3"]}]}"#;
         let target = Path::new("/music");
         let imported = result(ImportOutcome::Imported {
             untagged: false,
             warnings: vec![],
+            items: vec![],
         });
         let applied = Report::parse(text).unwrap().apply(
             imported,
@@ -510,7 +566,9 @@ mod tests {
         );
 
         // A merge ends in a skip with no match.
-        let already = result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary));
+        let already = result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+            existing: vec![],
+        }));
         let merged = result(ImportOutcome::Skipped(SkipReason::NoMatch {
             candidates: None,
         }));
@@ -523,6 +581,77 @@ mod tests {
             );
             assert_eq!(applied, other);
         }
+    }
+
+    #[test]
+    fn a_skipped_duplicate_names_the_library_files_it_kept() {
+        let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "items": [], "duplicates": [
+            {"action": "skipped", "existing": ["/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3"]}]}"#;
+        let skipped = result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+            existing: vec![],
+        }));
+        let applied = Report::parse(text).unwrap().apply(
+            skipped,
+            ImportMode::Album,
+            &DriverChoice::Auto,
+            Path::new("/music"),
+        );
+        assert_eq!(
+            applied.outcome,
+            ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+                existing: vec![PathBuf::from("Zzqx Artist/Qzz Album/01 Song Number 1.mp3")],
+            })
+        );
+        assert_eq!(
+            applied.to_string(),
+            "Already in library: Zzqx Artist/Qzz Album/01 Song Number 1.mp3"
+        );
+        assert_eq!(
+            result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+                existing: vec![]
+            }))
+            .to_string(),
+            "Already in library"
+        );
+    }
+
+    #[test]
+    fn an_imported_result_lists_its_items_relative_to_the_library() {
+        let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "duplicates": [], "items": [
+            {"path": "/music/Zzqx Artist/Song Number 1.mp3", "recording_mbid": "dfeb96a7-f78a-4b04-93ce-c39e28c9a173",
+             "artist": "Zzqx Artist", "title": "Song Number 1"},
+            {"path": "/elsewhere/02.mp3", "recording_mbid": null, "artist": "Zzqx Artist", "title": "Song Number 2"}]}"#;
+        let imported = result(ImportOutcome::Imported {
+            untagged: false,
+            warnings: vec![],
+            items: vec![],
+        });
+        let applied = Report::parse(text).unwrap().apply(
+            imported,
+            ImportMode::Singleton,
+            &DriverChoice::Auto,
+            Path::new("/music"),
+        );
+        let ImportOutcome::Imported { items, .. } = applied.outcome else {
+            panic!("{applied:?}")
+        };
+        assert_eq!(
+            items,
+            vec![
+                ImportedItem {
+                    path: "Zzqx Artist/Song Number 1.mp3".into(),
+                    recording_mbid: Some("dfeb96a7-f78a-4b04-93ce-c39e28c9a173".into()),
+                    artist: "Zzqx Artist".into(),
+                    title: "Song Number 1".into(),
+                },
+                ImportedItem {
+                    path: "/elsewhere/02.mp3".into(),
+                    recording_mbid: None,
+                    artist: "Zzqx Artist".into(),
+                    title: "Song Number 2".into(),
+                },
+            ]
+        );
     }
 
     #[test]

@@ -1384,9 +1384,9 @@ fn classify_discovery(outcome: &soulbeet::ImportOutcome) -> DiscoveryImport {
     use soulbeet::{ImportOutcome, SkipReason};
     match outcome {
         ImportOutcome::Imported { .. } => DiscoveryImport::Imported,
-        ImportOutcome::Skipped(SkipReason::NoMatch { .. } | SkipReason::AlreadyInLibrary) => {
-            DiscoveryImport::Permanent
-        }
+        ImportOutcome::Skipped(
+            SkipReason::NoMatch { .. } | SkipReason::AlreadyInLibrary { .. },
+        ) => DiscoveryImport::Permanent,
         ImportOutcome::Skipped(SkipReason::NothingToImport)
         | ImportOutcome::LookupFailed { .. }
         | ImportOutcome::Failed { .. }
@@ -1784,6 +1784,7 @@ mod tests {
                 ImportOutcome::Imported {
                     untagged: false,
                     warnings: vec![],
+                    items: vec![],
                 },
                 DiscoveryImport::Imported,
             ),
@@ -1792,7 +1793,7 @@ mod tests {
                 DiscoveryImport::Permanent,
             ),
             (
-                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary),
+                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing: vec![] }),
                 DiscoveryImport::Permanent,
             ),
             (

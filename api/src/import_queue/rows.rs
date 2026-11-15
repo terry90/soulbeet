@@ -23,7 +23,7 @@ pub fn row_state(outcome: &ImportOutcome) -> DownloadState {
 pub(crate) fn import_failure(result: &ImportResult) -> Option<Failure> {
     let (code, retry) = match &result.outcome {
         ImportOutcome::Imported { .. } => return None,
-        ImportOutcome::Skipped(SkipReason::AlreadyInLibrary) => (
+        ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { .. }) => (
             FailureCode::ImportAlreadyInLibrary,
             RetryAdvice::NotRetryable,
         ),
@@ -99,9 +99,9 @@ pub fn rows_for_done(
     let state = row_state(&result.outcome);
     // The note on an imported row is not a failure; with_failure writes the rest.
     let error = match &result.outcome {
-        ImportOutcome::Imported { untagged, warnings } if *untagged || !warnings.is_empty() => {
-            Some(text)
-        }
+        ImportOutcome::Imported {
+            untagged, warnings, ..
+        } if *untagged || !warnings.is_empty() => Some(text),
         _ => None,
     };
     // Same rule as the retry store, so a row offers Retry only when one is kept.
@@ -161,11 +161,12 @@ mod tests {
                 ImportOutcome::Imported {
                     untagged: true,
                     warnings: vec![],
+                    items: vec![],
                 },
                 DownloadState::Imported,
             ),
             (
-                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary),
+                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing: vec![] }),
                 DownloadState::ImportSkipped,
             ),
             (
@@ -303,6 +304,7 @@ mod tests {
             outcome: ImportOutcome::Imported {
                 untagged: true,
                 warnings: vec!["1 file(s) were not imported".into()],
+                items: vec![],
             },
             ..imported()
         };
@@ -332,7 +334,7 @@ mod tests {
         };
         let cases = [
             (
-                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary),
+                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing: vec![] }),
                 FailureCode::ImportAlreadyInLibrary,
                 RetryAdvice::NotRetryable,
             ),

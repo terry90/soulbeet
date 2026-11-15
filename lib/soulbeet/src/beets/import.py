@@ -9,10 +9,11 @@
 #   pick SOURCE ID  apply what SOURCE returns for ID (-S ID), whatever its distance
 #
 # REPORT gets {"tasks": [...], "pick_missing": bool, "refused": str or null,
-# "duplicates": [...]}, also when beets fails. Tasks are recorded in auto mode
-# only. "duplicates" holds each duplicate decision beets logs as replace or
-# keep, with the library files it is about. stdout carries nothing but beets'
-# own output.
+# "duplicates": [...], "items": [...]}, also when beets fails. Tasks are
+# recorded in auto mode only. "duplicates" holds each duplicate decision beets
+# logs as replace, keep or skip, with the library files it is about. "items"
+# holds each file beets imported, as it stored it. stdout carries nothing but
+# beets' own output.
 import json
 import os
 import sys
@@ -58,22 +59,74 @@ from beets import config
 from beets.autotag.hooks import AlbumMatch
 from beets.autotag.match import Recommendation
 from beets.importer import Action
-from beets.importer.tasks import ImportTaskFactory
+from beets.importer.tasks import ImportTask, ImportTaskFactory, SingletonImportTask
+from beets.plugins import BeetsPlugin
 from beets.ui.commands import import_ as import_cmd
 
 USAGE = "usage: import.py REPORT (auto | asis | pick SOURCE ID) -- BEET_ARGS"
 
-report = {"tasks": [], "pick_missing": False, "refused": None, "duplicates": []}
+report = {
+    "tasks": [],
+    "pick_missing": False,
+    "refused": None,
+    "duplicates": [],
+    "items": [],
+}
 
 # The run log statuses of a duplicate decision the report names, as it names
-# them. A skipped duplicate is read from the run log.
-DUPLICATE_ACTIONS = {"duplicate-replace": "replaced", "duplicate-keep": "kept"}
+# them.
+DUPLICATE_ACTIONS = {
+    "duplicate-replace": "replaced",
+    "duplicate-keep": "kept",
+    "duplicate-skip": "skipped",
+}
 
 
 def path_text(path):
     """A path as report text. The report is read as strict UTF-8, so bytes
     that do not decode become U+FFFD."""
     return os.fsencode(path).decode("utf-8", "replace")
+
+
+def remember_duplicates(cls, items_of):
+    """Keeps, on each task, the library files its duplicate check found.
+    beets checks before it decides (importer/stages.py _resolve_duplicates)
+    and a skipped task cannot be asked again: chosen_info() refuses a
+    task whose choice is SKIP (importer/tasks.py:233-244, 689-699)."""
+    find = cls.find_duplicates
+
+    def find_duplicates(self, lib):
+        found = find(self, lib)
+        self.soulbeet_existing = [path_text(i.path) for i in items_of(found)]
+        return found
+
+    cls.find_duplicates = find_duplicates
+
+
+remember_duplicates(ImportTask, lambda albums: [i for a in albums for i in a.items()])
+remember_duplicates(SingletonImportTask, lambda items: items)
+
+
+class Recorder(BeetsPlugin):
+    """Records each item beets imported once its file is in place:
+    import_task_files is sent after the move and the store
+    (importer/tasks.py:468-514), for non-skipped tasks only (stages.py:276-307)."""
+
+    def __init__(self):
+        super().__init__("soulbeet")
+        self.register_listener("import_task_files", self.imported)
+
+    def imported(self, task):
+        for item in task.imported_items():
+            report["items"].append({
+                "path": path_text(item.path),
+                "recording_mbid": item.mb_trackid or None,
+                "artist": item.artist,
+                "title": item.title,
+            })
+
+
+Recorder()
 
 
 def penalty_name(key):
@@ -116,8 +169,8 @@ Session = import_cmd.TerminalImportSession
 
 
 class Reporting(Session):
-    """Reports each duplicate decision as beets logs it. The library items
-    are read here, before the apply stage removes any of them."""
+    """Reports each duplicate decision as beets logs it, with the library
+    files its duplicate check found."""
 
     deciding = None
 
@@ -132,11 +185,10 @@ class Reporting(Session):
 
     def tag_log(self, status, paths):
         if self.deciding is not None and status in DUPLICATE_ACTIONS:
-            items = self.deciding.duplicate_items(self.lib)
             report["duplicates"].append(
                 {
                     "action": DUPLICATE_ACTIONS[status],
-                    "existing": [path_text(i.path) for i in items],
+                    "existing": self.deciding.soulbeet_existing,
                 }
             )
         super().tag_log(status, paths)

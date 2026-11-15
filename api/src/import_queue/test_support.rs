@@ -23,6 +23,7 @@ pub fn imported() -> ImportResult {
         outcome: ImportOutcome::Imported {
             untagged: false,
             warnings: vec![],
+            items: vec![],
         },
         output_tail: "imported tail".into(),
         tasks: TaskCount {

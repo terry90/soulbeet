@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use shared::{
     download::{
         DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult, SkipKind,
@@ -13,7 +14,7 @@ use shared::{
     system::ImporterHealth,
 };
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::Result;
@@ -85,11 +86,23 @@ pub enum DriverChoice {
     Pick { data_source: String, id: String },
 }
 
+/// One file beets imported, as it stored it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedItem {
+    /// Relative to the library folder when inside it, else absolute.
+    pub path: PathBuf,
+    /// The MusicBrainz recording beets stored (mb_trackid); None when it stored none.
+    pub recording_mbid: Option<String>,
+    pub artist: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportOutcome {
     Imported {
         untagged: bool,
         warnings: Vec<String>,
+        items: Vec<ImportedItem>,
     },
     Skipped(SkipReason),
     LookupFailed {
@@ -126,7 +139,11 @@ pub enum FailKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    AlreadyInLibrary,
+    /// The library has it. `existing` names its files, relative to the library
+    /// folder, when beets reported the skip with them; empty when only the run log said so.
+    AlreadyInLibrary {
+        existing: Vec<PathBuf>,
+    },
     /// No candidate was close enough. The count is the number of candidates
     /// beets weighed, when every task in the run saw the same number.
     NoMatch {
@@ -138,7 +155,7 @@ pub enum SkipReason {
 impl From<&SkipReason> for SkipKind {
     fn from(reason: &SkipReason) -> Self {
         match reason {
-            SkipReason::AlreadyInLibrary => SkipKind::AlreadyInLibrary,
+            SkipReason::AlreadyInLibrary { .. } => SkipKind::AlreadyInLibrary,
             SkipReason::NoMatch { candidates } => SkipKind::NoMatch {
                 candidates: *candidates,
             },
@@ -223,7 +240,9 @@ fn clip(s: &str, chars: usize) -> &str {
 impl fmt::Display for ImportOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ImportOutcome::Imported { untagged, warnings } => {
+            ImportOutcome::Imported {
+                untagged, warnings, ..
+            } => {
                 f.write_str(if *untagged {
                     "Imported as-is (untagged)"
                 } else {
@@ -231,8 +250,17 @@ impl fmt::Display for ImportOutcome {
                 })?;
                 warnings.iter().try_for_each(|w| write!(f, "; {w}"))
             }
-            ImportOutcome::Skipped(SkipReason::AlreadyInLibrary) => {
-                f.write_str("Already in library")
+            ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing }) => {
+                f.write_str("Already in library")?;
+                if !existing.is_empty() {
+                    let files = existing
+                        .iter()
+                        .map(|p| p.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(f, ": {files}")?;
+                }
+                Ok(())
             }
             ImportOutcome::Skipped(SkipReason::NoMatch {
                 candidates: Some(1),
