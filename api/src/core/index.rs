@@ -132,7 +132,8 @@ fn lookup_text(item: &ImportedItem) -> Option<String> {
 /// Navidrome keeps, among the NEWEST_PAGES pages of the songs it added last, where a file just
 /// imported is. Each candidate is checked with is_imported_file against the size of
 /// wait.library.join(item.path) on disk. An item whose file cannot be read is not listed. The
-/// song found for an item teaches where its library is on this machine (paths::learn_in).
+/// songs of the page that matched teach where their libraries are on this machine
+/// (paths::learn_in).
 pub(crate) async fn listed(
     db: &SqlitePool,
     navi: &NavidromeClient,
@@ -146,21 +147,20 @@ pub(crate) async fn listed(
         let size = file.len();
         let mut found = match &item.recording_mbid {
             Some(mbid) => lists(navi, mbid, &item.path, size).await?,
-            None => None,
+            None => vec![],
         };
-        if found.is_none() {
+        if found.is_empty() {
             found = match lookup_text(item) {
                 Some(text) => lists(navi, &text, &item.path, size).await?,
                 None => among_newest(navi, &item.path, size).await?,
             };
         }
-        let Some(song) = found else {
+        if found.is_empty() {
             return Ok(false);
-        };
-        if let Err(e) = paths::learn_in(db, &song, &local).await {
+        }
+        if let Err(e) = paths::learn_in(db, &found, &local).await {
             warn!(
-                "Could not learn where Navidrome library {} is on this machine from {}: {e}",
-                song.library_id,
+                "Could not learn where Navidrome's libraries are on this machine from {}: {e}",
                 local.display()
             );
         }
@@ -168,42 +168,46 @@ pub(crate) async fn listed(
     Ok(true)
 }
 
-/// The song among the NEWEST_PAGES pages of LOOKUP_PAGE songs Navidrome added last that is the
-/// file at `item` of `size` bytes.
+/// The songs of the first of the NEWEST_PAGES pages of LOOKUP_PAGE songs Navidrome added last
+/// that holds one that is the file at `item` of `size` bytes: each such song of that page.
 async fn among_newest(
     navi: &NavidromeClient,
     item: &Path,
     size: u64,
-) -> Result<Option<NativeSong>, NavidromeError> {
+) -> Result<Vec<NativeSong>, NavidromeError> {
     for page in 0..NEWEST_PAGES {
         let start = page * LOOKUP_PAGE;
         let songs = navi.newest_songs(start, start + LOOKUP_PAGE).await?;
         let short = songs.len() < LOOKUP_PAGE as usize;
-        if let Some(song) = songs
-            .into_iter()
-            .find(|song| is_imported_file(song, item, size))
-        {
-            return Ok(Some(song));
-        }
-        if short {
-            return Ok(None);
+        let found = imported_files(songs, item, size);
+        if !found.is_empty() || short {
+            return Ok(found);
         }
     }
-    Ok(None)
+    Ok(vec![])
 }
 
-/// The song the native `title` filter matches for `text` that is the file at `item`.
+/// The songs of the first page the native `title` filter matches for `text` that holds one
+/// that is the file at `item`: each such song of that page.
 async fn lists(
     navi: &NavidromeClient,
     text: &str,
     item: &Path,
     size: u64,
-) -> Result<Option<NativeSong>, NavidromeError> {
-    page_through(navi, text, |page| {
-        page.into_iter()
-            .find(|song| is_imported_file(song, item, size))
+) -> Result<Vec<NativeSong>, NavidromeError> {
+    Ok(page_through(navi, text, |page| {
+        let found = imported_files(page, item, size);
+        (!found.is_empty()).then_some(found)
     })
-    .await
+    .await?
+    .unwrap_or_default())
+}
+
+/// The songs of `page` that is_imported_file takes for the file at `item` of `size` bytes.
+fn imported_files(page: Vec<NativeSong>, item: &Path, size: u64) -> Vec<NativeSong> {
+    page.into_iter()
+        .filter(|song| is_imported_file(song, item, size))
+        .collect()
 }
 
 /// Every present song the user of `navi` sees that may be `item`: each page of the native

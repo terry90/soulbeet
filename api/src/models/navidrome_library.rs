@@ -38,4 +38,14 @@ impl NavidromeLibraryRow {
         .map(|_| ())
         .map_err(|e| e.to_string())
     }
+
+    /// Forgets where library `library_id` is.
+    pub(crate) async fn delete_in(db: &SqlitePool, library_id: i64) -> Result<(), String> {
+        sqlx::query("DELETE FROM navidrome_libraries WHERE library_id = ?")
+            .bind(library_id)
+            .execute(db)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }

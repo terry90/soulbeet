@@ -121,7 +121,7 @@ impl Guard<'_> {
                 rating: song.rating,
             });
         }
-        let path = paths::local_file_in(self.db, &song, self.music_path).await?;
+        let (path, id) = paths::local_file_in(self.db, &song, self.music_path).await?;
         for track in pending {
             if tokio::fs::canonicalize(&track.path)
                 .await
@@ -133,15 +133,18 @@ impl Guard<'_> {
                 });
             }
         }
-        self.check_resolved(actor, song, path, &[])
+        self.check_resolved(actor, song, path, id, &[])
             .await
             .map(Verdict::Library)
     }
 
     /// Checks the library item beets reported at `library.join(&item.path)`: its song is the
-    /// song of `actor`'s search for the item's tags whose file (local_file_in) is the canonical
-    /// file; candidates whose file cannot be told are other files. Then check_resolved with
-    /// `exempt_jobs`. A pending discovery track never holds a library item, so this is Checked.
+    /// first song of `actor`'s search for the item's tags whose path on this machine names the
+    /// canonical file (paths::names_file), and that song's own refusal from local_file_in
+    /// stands. When no song names it, the refusal of a song is_imported_file takes for the item
+    /// but whose file cannot be found here says why, else Navidrome has no song for it. Then
+    /// check_resolved with `exempt_jobs`. A pending discovery track never holds a library item,
+    /// so this is Checked.
     pub async fn check_file(
         &self,
         actor: &UserId,
@@ -150,13 +153,15 @@ impl Guard<'_> {
         exempt_jobs: &[String],
     ) -> Result<Checked, Failure> {
         let reported = library.join(&item.path);
-        let path = tokio::fs::canonicalize(&reported).await.map_err(|e| {
+        let no_file = |e: std::io::Error| {
             path_unresolved(format!("No file at {}", reported.display())).with_cause(
                 Service::Filesystem,
                 None,
                 e.to_string(),
             )
-        })?;
+        };
+        let path = tokio::fs::canonicalize(&reported).await.map_err(no_file)?;
+        let size = tokio::fs::metadata(&path).await.map_err(no_file)?.len();
         let candidates = self
             .listeners
             .songs_for_item(actor, item)
@@ -168,27 +173,37 @@ impl Guard<'_> {
                     path.display()
                 ))
             })?;
+        let mut unfound = None;
         for song in candidates {
-            if paths::local_file_in(self.db, &song, self.music_path)
-                .await
-                .is_ok_and(|file| file == path)
-            {
-                return self.check_resolved(actor, song, path, exempt_jobs).await;
+            if paths::names_file(self.db, &song, self.music_path, &path).await? {
+                let (file, id) = paths::local_file_in(self.db, &song, self.music_path).await?;
+                if file != path {
+                    return Err(changed_since_check());
+                }
+                return self
+                    .check_resolved(actor, song, path, id, exempt_jobs)
+                    .await;
+            }
+            if unfound.is_none() && crate::core::index::is_imported_file(&song, &item.path, size) {
+                unfound = paths::local_file_in(self.db, &song, self.music_path)
+                    .await
+                    .err();
             }
         }
-        Err(path_unresolved(format!(
-            "Navidrome has no song for {}",
-            path.display()
-        )))
+        Err(unfound.unwrap_or_else(|| {
+            path_unresolved(format!("Navidrome has no song for {}", path.display()))
+        }))
     }
 
     /// Rules 1, 2, 5, the one-song check, 3 and 4, in that order, for `path`, the canonical
-    /// file local_file_in gave for `song`. Jobs in `exempt_jobs` do not count for rule 5.
+    /// file local_file_in gave for `song`, whose identity it read as `id`. Jobs in
+    /// `exempt_jobs` do not count for rule 5.
     async fn check_resolved(
         &self,
         actor: &UserId,
         song: NativeSong,
         path: PathBuf,
+        id: unlink::FileId,
         exempt_jobs: &[String],
     ) -> Result<Checked, Failure> {
         let rows = PolicyRows::load_in(self.db)
@@ -196,7 +211,7 @@ impl Guard<'_> {
             .map_err(|e| database_failure(Stage::Delete, e))?;
         let (folders, _) = rows.inputs();
         let folder = rules::owning_folders(&path, &folders, actor)?.to_path_buf();
-        let id = rules::track_identity(&path)?;
+        rules::audio_file(&path)?;
         rules::not_in_use_in(
             self.db,
             &rules::holding_folders(&path, &folders),
@@ -314,7 +329,8 @@ impl Guard<'_> {
     }
 
     /// Navidrome lists the canonical file `path` as `song` only, in `actor`'s view: their
-    /// search for its tags finds `song` and no other song that is the same file.
+    /// search for its tags finds `song`, and no other song it finds is or may be the same file
+    /// (another_record).
     async fn one_song(
         &self,
         actor: &UserId,
@@ -336,41 +352,34 @@ impl Guard<'_> {
         if !candidates.iter().any(|c| c.id == song.id) {
             return Err(unsearchable());
         }
-        if self.another_record(song, path, &candidates).await? {
-            return Err(path_unresolved(format!(
+        match self.another_record(song, path, &candidates).await? {
+            paths::Other::Different => Ok(()),
+            paths::Other::Same => Err(path_unresolved(format!(
                 "Navidrome lists {} as more than one song",
                 path.display()
-            )));
+            ))),
+            paths::Other::Unknown => Err(path_unresolved(format!(
+                "Navidrome may list {} as more than one song",
+                path.display()
+            ))),
         }
-        Ok(())
     }
 
-    /// Whether a song of `candidates` other than `song` is its canonical file `path`: its
-    /// library path joined with its path is the song's, or its path cannot be compared (absolute
-    /// or with `..`), or its path on this machine resolves to `path`.
+    /// What the songs of `candidates` other than `song` are to its canonical file `path`
+    /// (paths::other_in): the first that is or may be that file, else Different.
     async fn another_record(
         &self,
         song: &NativeSong,
         path: &Path,
         candidates: &[NativeSong],
-    ) -> Result<bool, Failure> {
-        let listed = Path::new(&song.library_path).join(&song.path);
+    ) -> Result<paths::Other, Failure> {
         for candidate in candidates.iter().filter(|c| c.id != song.id) {
-            let Some(relative) = paths::inside(&candidate.path) else {
-                return Ok(true);
-            };
-            if Path::new(&candidate.library_path).join(relative) == listed {
-                return Ok(true);
-            }
-            let local = paths::local_path_in(self.db, candidate, self.music_path).await?;
-            if tokio::fs::canonicalize(&local)
-                .await
-                .is_ok_and(|resolved| resolved == path)
-            {
-                return Ok(true);
+            let other = paths::other_in(self.db, self.music_path, song, path, candidate).await?;
+            if other != paths::Other::Different {
+                return Ok(other);
             }
         }
-        Ok(false)
+        Ok(paths::Other::Different)
     }
 }
 
@@ -648,6 +657,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_listener_is_read_so_the_admin_list_is_current_whoever_blocks_first() {
+        let lib = Library::new().await;
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, navidrome_token) \
+             VALUES ('dave', 'dave', 'x', 'cipher')",
+        )
+        .execute(&lib.db)
+        .await
+        .unwrap();
+        lib.fake.stars("bob", "s1");
+        lib.fake
+            .unreadable("dave", || NavidromeLookupError::PasswordUnreadable);
+        let unreadable = |lib: &Library| {
+            let db = lib.db.clone();
+            async move {
+                NavidromeReadFailureRow::all_in(&db)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|l| l.username)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await).0,
+            FailureCode::DeleteBlockedByOtherUser
+        );
+        assert_eq!(unreadable(&lib).await, vec!["dave".to_string()]);
+        lib.fake.readable("dave");
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await).0,
+            FailureCode::DeleteBlockedByOtherUser
+        );
+        assert!(unreadable(&lib).await.is_empty());
+        assert_eq!(lib.fake.ratings_set(), vec![]);
+    }
+
+    #[tokio::test]
     async fn an_answer_without_the_rating_fields_is_unreadable() {
         for client in [
             FakeNavidrome::minimal_client as fn(&FakeNavidrome, &str),
@@ -844,15 +891,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let path = paths::local_file_in(&lib.db, &song, None).await.unwrap();
+        let (path, id) = paths::local_file_in(&lib.db, &song, None).await.unwrap();
         let guard = lib.guard();
         let kept = guard
-            .check_resolved(&lib.alice(), song.clone(), path.clone(), &["j2".into()])
+            .check_resolved(&lib.alice(), song.clone(), path.clone(), id, &["j2".into()])
             .await
             .unwrap_err();
         assert_eq!(kept.code, FailureCode::DeleteInUse);
         let checked = guard
-            .check_resolved(&lib.alice(), song, path, &["j1".into()])
+            .check_resolved(&lib.alice(), song, path, id, &["j1".into()])
             .await
             .unwrap();
         assert_eq!(checked.path, canonical(&lib, "music/alice/A/x.flac"));
@@ -1117,6 +1164,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_song_in_a_library_not_on_this_machine_may_be_the_file_and_keeps_it() {
+        // Library 2 is a second Navidrome mount of alice's folder that Soulful does not have.
+        for viewer in ["bob", "alice"] {
+            let lib = Library::new().await;
+            lib.fake.file(
+                NativeSong {
+                    library_path: lib.root.join("music-kids").to_string_lossy().into_owned(),
+                    ..second_record(&lib)
+                },
+                "al1",
+            );
+            lib.fake.sees(viewer, "s1b");
+            if viewer == "bob" {
+                lib.fake.unsee("bob", "s1");
+            }
+            let expected = match viewer {
+                "bob" => (FailureCode::DeleteVetoUnknown, VETO.to_string()),
+                _ => (
+                    FailureCode::DeletePathUnresolved,
+                    format!(
+                        "Navidrome may list {} as more than one song",
+                        canonical(&lib, "music/alice/A/x.flac").display()
+                    ),
+                ),
+            };
+            assert_eq!(
+                refusal(lib.guard().check_song(&lib.alice(), "s1").await),
+                expected,
+                "{viewer}"
+            );
+            assert_eq!(lib.fake.ratings_set(), vec![]);
+        }
+        // Of another size it is another file.
+        let lib = Library::new().await;
+        lib.fake.file(
+            NativeSong {
+                library_path: lib.root.join("music-kids").to_string_lossy().into_owned(),
+                size: 9,
+                ..second_record(&lib)
+            },
+            "al1",
+        );
+        lib.fake.sees("bob", "s1b");
+        library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+    }
+
+    #[tokio::test]
+    async fn a_root_learned_from_another_file_cannot_delete_a_song_under_anothers_id() {
+        // Dave's shared folder is Navidrome's whole library 1; Soulful learned alice's folder as
+        // its root from dave's song "t" of the same size (the index lookup took it for hers).
+        let lib = Library::new().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('dave', 'dave', 'x')")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        lib.folder("dave", "dave-music", "music", true).await;
+        lib.write("A/x.flac", b"audio");
+        lib.fake.file(
+            NativeSong {
+                id: "t".into(),
+                path: "A/x.flac".into(),
+                ..lib.record("s1")
+            },
+            "al1",
+        );
+        lib.fake.sees("alice", "t");
+        lib.fake.rates("alice", "t", 1);
+        crate::models::navidrome_library::NavidromeLibraryRow::upsert_in(
+            &lib.db,
+            &crate::models::navidrome_library::NavidromeLibraryRow {
+                library_id: 1,
+                navidrome_path: lib.record("s1").library_path,
+                local_path: lib.root.join("music/alice").to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "t").await),
+            (
+                FailureCode::DeletePathUnresolved,
+                format!(
+                    "Navidrome may list {} as more than one song",
+                    canonical(&lib, "music/alice/A/x.flac").display()
+                )
+            )
+        );
+        let item = ImportedItem {
+            path: "A/x.flac".into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+        };
+        assert_eq!(
+            lib.guard()
+                .check_file(&lib.alice(), &item, &lib.root.join("music/alice"), &[])
+                .await
+                .unwrap_err()
+                .code,
+            FailureCode::DeletePathUnresolved
+        );
+        assert!(
+            lib.root.join("music/alice/A/x.flac").exists()
+                && lib.root.join("music/A/x.flac").exists()
+        );
+        assert_eq!(lib.fake.ratings_set(), vec![]);
+    }
+
+    #[tokio::test]
     async fn another_users_song_that_links_to_the_file_is_the_same_file() {
         // Navidrome follows links and lists bob's link as a song of its own.
         let lib = Library::new().await;
@@ -1238,11 +1395,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let path = paths::local_file_in(&lib.db, &stale, None).await.unwrap();
+        let (path, id) = paths::local_file_in(&lib.db, &stale, None).await.unwrap();
         lib.fake.rates("alice", "s1", 5);
         let checked = lib
             .guard()
-            .check_resolved(&lib.alice(), stale, path, &[])
+            .check_resolved(&lib.alice(), stale, path, id, &[])
             .await
             .unwrap();
         assert_eq!(
@@ -1611,5 +1768,68 @@ mod tests {
                 )
             )
         );
+    }
+
+    #[tokio::test]
+    async fn the_files_own_song_says_why_it_cannot_be_checked() {
+        let item = ImportedItem {
+            path: "A/x.flac".into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+        };
+        let lib = Library::new().await;
+        let library = lib.root.join("music/alice");
+        let x = canonical(&lib, "music/alice/A/x.flac");
+        let s1 = lib.record("s1");
+        for (record, expected) in [
+            (
+                NativeSong {
+                    size: 9,
+                    ..s1.clone()
+                },
+                format!("{} has 5 bytes, Navidrome's song has 9", x.display()),
+            ),
+            (
+                NativeSong {
+                    missing: true,
+                    ..s1.clone()
+                },
+                "Navidrome lists the file of this song as missing".to_string(),
+            ),
+        ] {
+            lib.fake.file(record, "al1");
+            let f = lib
+                .guard()
+                .check_file(&lib.alice(), &item, &library, &[])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                (f.code, f.message),
+                (FailureCode::DeletePathUnresolved, expected)
+            );
+        }
+        // A song taken for the item whose library is not on this machine says so.
+        lib.fake.file(
+            NativeSong {
+                library_path: lib.root.join("elsewhere").to_string_lossy().into_owned(),
+                ..s1
+            },
+            "al1",
+        );
+        let f = lib
+            .guard()
+            .check_file(&lib.alice(), &item, &library, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            f.message,
+            format!(
+                "No file at {}",
+                lib.root.join("elsewhere/alice/A/x.flac").display()
+            )
+        );
+        assert!(x.exists());
     }
 }

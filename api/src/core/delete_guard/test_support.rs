@@ -428,7 +428,8 @@ impl Library {
         UserId::new("alice")
     }
 
-    fn write(&self, rel: &str, bytes: &[u8]) {
+    /// Writes `bytes` at `{root}/music/{rel}`.
+    pub fn write(&self, rel: &str, bytes: &[u8]) {
         let path = self.root.join("music").join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();

@@ -151,8 +151,9 @@ impl Guard<'_> {
     /// blocked_by_other_user for a track rating above 1, a track star, an album rating above 1
     /// or an album star; veto_unknown when their ratings cannot be read (a read error, a song
     /// answer without albumId, an album answer without userRating, D4, or no album for a song
-    /// they see) or when another song they see is the same file. A failed read is recorded for
-    /// admins, any other answer clears the record.
+    /// they see) or when another song they see is or may be the same file. Every listener is
+    /// read, so each one's record for admins is current: a failed read is recorded, any other
+    /// answer clears it. The refusal is that of the first listener who keeps the file.
     pub(super) async fn others_permit(
         &self,
         actor: &UserId,
@@ -162,7 +163,7 @@ impl Guard<'_> {
         let users = User::linked_to_navidrome_in(self.db)
             .await
             .map_err(|e| database_failure(Stage::Delete, e))?;
-        let (actor, mut ratings) = (actor.to_string(), Vec::new());
+        let (actor, mut ratings, mut refusal) = (actor.to_string(), Vec::new(), None);
         for user in users.iter().filter(|u| u.id != actor) {
             let listener = UserId::new(&user.id);
             let marks = self.marks_of(&listener, song, path).await;
@@ -181,11 +182,18 @@ impl Guard<'_> {
             match marks {
                 Ok(0) => {}
                 Ok(rating) => ratings.push(rating),
-                Err(Keeps::Unreadable(_)) => return Err(veto_unknown()),
-                Err(Keeps::Refused(f)) => return Err(f),
+                Err(keeps) => {
+                    refusal.get_or_insert(match keeps {
+                        Keeps::Unreadable(_) => veto_unknown(),
+                        Keeps::Refused(f) => f,
+                    });
+                }
             }
         }
-        Ok(ratings)
+        match refusal {
+            Some(f) => Err(f),
+            None => Ok(ratings),
+        }
     }
 
     /// `listener`'s rating of `song` (0 when unrated or unseen), or why they keep it.
@@ -234,7 +242,8 @@ impl Guard<'_> {
                 return Err(blocked());
             }
         }
-        // The same file may be another song this listener sees (another library, a link).
+        // The same file may be another song this listener sees (another library, a link), or
+        // one whose file Soulful cannot find.
         let Some(candidates) = self
             .listeners
             .songs_for_item(listener, &item_of(song))
@@ -247,6 +256,7 @@ impl Guard<'_> {
             .another_record(song, path, &candidates)
             .await
             .map_err(Keeps::Refused)?
+            != super::paths::Other::Different
         {
             return Err(Keeps::Refused(veto_unknown()));
         }

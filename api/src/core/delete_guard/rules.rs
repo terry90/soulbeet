@@ -1,14 +1,13 @@
 //! Rules 1, 2 and 5 of design section 13: the file is in the caller's folder, it is a track,
 //! and no unfinished job wants it.
 
-use super::unlink::FileId;
-use super::{in_use, not_a_track, outside_library, path_unresolved};
+use super::{in_use, not_a_track, outside_library};
 use crate::auth::UserId;
 use crate::core::database_failure;
 use crate::folder_policy::PolicyFolder;
 use crate::ledger::{store, JobState};
 use shared::download::DownloadQuery;
-use shared::failure::{Failure, Service, Stage};
+use shared::failure::{Failure, Stage};
 use shared::recommendation::normalize_for_matching;
 use soulbeet::navidrome::models::NativeSong;
 use sqlx::SqlitePool;
@@ -87,28 +86,15 @@ fn lexically_outside(file: &Path, stored: &Path) -> bool {
         && !file.starts_with(stored)
 }
 
-/// Rule 2: the canonical `path` is a regular file with an audio extension; its identity.
-pub(super) fn track_identity(path: &Path) -> Result<FileId, Failure> {
-    let meta = std::fs::symlink_metadata(path).map_err(|e| {
-        path_unresolved(format!("No file at {}", path.display())).with_cause(
-            Service::Filesystem,
-            None,
-            e.to_string(),
-        )
-    })?;
-    if !meta.is_file() {
-        return Err(not_a_track(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
-    }
+/// Rule 2: the canonical `path`, a regular file (local_file_in), has an audio extension.
+pub(super) fn audio_file(path: &Path) -> Result<(), Failure> {
     if !soulbeet::audio::is_audio_path(path) {
         return Err(not_a_track(format!(
             "{} is not an audio file",
             path.display()
         )));
     }
-    Ok(FileId::of(&meta))
+    Ok(())
 }
 
 /// Rule 5: no job in one of `folder_ids` whose state is not terminal wants `song` (D16). Jobs

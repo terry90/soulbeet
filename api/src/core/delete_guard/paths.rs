@@ -1,12 +1,15 @@
 //! Where each Navidrome library is on this machine, and the file behind a song.
 
-use super::path_unresolved;
+use super::unlink::FileId;
+use super::{not_a_track, path_unresolved};
 use crate::core::database_failure;
 use crate::models::navidrome_library::NavidromeLibraryRow;
 use shared::failure::{Failure, Service, Stage};
 use soulbeet::navidrome::models::NativeSong;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use tracing::warn;
 
 /// Navidrome's default library (model/library.go:31).
 pub(crate) const DEFAULT_LIBRARY_ID: i64 = 1;
@@ -25,24 +28,26 @@ pub(super) fn inside(path: &str) -> Option<&Path> {
     named.then_some(path)
 }
 
-/// The canonical file on this machine behind `song`. Its library's root is `music_path` for
-/// the default library when set, else the learned root while Navidrome still reports the
-/// library at the stored `navidrome_path`, else `song.library_path` itself; the file is that
-/// root joined with `song.path`, which must be relative without `..`, and its size must equal
-/// `song.size`. A link below the root is refused: Navidrome follows links by default
-/// (conf/configuration.go:608) and lists a linked file as a song of its own
+/// The canonical file on this machine behind `song`, and its identity as read for the size
+/// check, the one compared at the unlink (rule 6). Its library's root is `music_path` for the
+/// default library when set, else the learned root while Navidrome still reports the library
+/// at the stored `navidrome_path`, else `song.library_path` itself; the file is that root
+/// joined with `song.path`, which must be relative without `..`, and must be a regular file
+/// whose size is `song.size`. A link below the root is refused: Navidrome follows links by
+/// default (conf/configuration.go:608) and lists a linked file as a song of its own
 /// (scanner/walk_dir_tree.go:131-152), so that song is not the file the link leads to.
-pub(crate) async fn local_file_in(
+pub(super) async fn local_file_in(
     db: &SqlitePool,
     song: &NativeSong,
     music_path: Option<&Path>,
-) -> Result<PathBuf, Failure> {
+) -> Result<(PathBuf, FileId), Failure> {
     if song.missing {
         return Err(path_unresolved(
             "Navidrome lists the file of this song as missing",
         ));
     }
-    let (root, relative) = located_in(db, song, music_path).await?;
+    let relative = relative_path(song)?;
+    let root = root_in(db, song, music_path).await?;
     let local = root.join(relative);
     let no_file = |e: std::io::Error| {
         path_unresolved(format!("No file at {}", local.display())).with_cause(
@@ -59,44 +64,107 @@ pub(crate) async fn local_file_in(
             song.path
         )));
     }
-    let size = tokio::fs::metadata(&canonical)
+    let meta = tokio::fs::symlink_metadata(&canonical)
         .await
-        .map_err(no_file)?
-        .len();
-    if size != song.size {
+        .map_err(no_file)?;
+    if !meta.is_file() {
+        return Err(not_a_track(format!(
+            "{} is not a regular file",
+            canonical.display()
+        )));
+    }
+    if meta.len() != song.size {
         return Err(path_unresolved(format!(
-            "{} has {size} bytes, Navidrome's song has {}",
+            "{} has {} bytes, Navidrome's song has {}",
             canonical.display(),
+            meta.len(),
             song.size
         )));
     }
-    Ok(canonical)
+    Ok((canonical, FileId::of(&meta)))
 }
 
-/// The path on this machine `song.path` names, as local_file_in finds its library's root,
-/// not resolved and not checked.
-pub(super) async fn local_path_in(
+/// Whether `song`'s path on this machine, found as local_file_in finds it, is the canonical
+/// file `path`: its library's canonical root joined with `song.path`, or that path resolved.
+/// A song whose path is not inside its library, or whose root is not on this machine, names
+/// no file here.
+pub(super) async fn names_file(
+    db: &SqlitePool,
+    song: &NativeSong,
+    music_path: Option<&Path>,
+    path: &Path,
+) -> Result<bool, Failure> {
+    let Some(relative) = inside(&song.path) else {
+        return Ok(false);
+    };
+    let root = root_in(db, song, music_path).await?;
+    if let Ok(canonical_root) = tokio::fs::canonicalize(&root).await {
+        if canonical_root.join(relative) == path {
+            return Ok(true);
+        }
+    }
+    Ok(tokio::fs::canonicalize(root.join(relative))
+        .await
+        .is_ok_and(|resolved| resolved == path))
+}
+
+/// What a song other than the checked one is to the checked file, on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Other {
+    /// Another file, or none of the checked file's size.
+    Different,
+    /// The checked file itself.
+    Same,
+    /// Its path cannot be compared or found here and it has the checked file's size, so it may
+    /// be that file.
+    Unknown,
+}
+
+/// What `other`, a song other than `song`, is to `path`, the canonical file local_file_in gave
+/// for `song`: Same when Navidrome names the same path (its library path joined with its path)
+/// or its path on this machine (local_file_in's root) resolves to `path`; Unknown when its path
+/// is not inside its library, or does not resolve here while its size is the file's (a library
+/// Soulful does not see, or a root it learned wrong); else Different.
+pub(super) async fn other_in(
+    db: &SqlitePool,
+    music_path: Option<&Path>,
+    song: &NativeSong,
+    path: &Path,
+    other: &NativeSong,
+) -> Result<Other, Failure> {
+    let Some(relative) = inside(&other.path) else {
+        return Ok(Other::Unknown);
+    };
+    let listed = Path::new(&song.library_path).join(&song.path);
+    if Path::new(&other.library_path).join(relative) == listed {
+        return Ok(Other::Same);
+    }
+    let local = root_in(db, other, music_path).await?.join(relative);
+    Ok(match tokio::fs::canonicalize(&local).await {
+        Ok(resolved) if resolved == path => Other::Same,
+        Ok(_) => Other::Different,
+        Err(_) if other.size == song.size => Other::Unknown,
+        Err(_) => Other::Different,
+    })
+}
+
+/// `song.path` when it is relative without `..`.
+fn relative_path(song: &NativeSong) -> Result<&Path, Failure> {
+    inside(&song.path).ok_or_else(|| {
+        path_unresolved(format!(
+            "Navidrome's path for this song is not inside its library: {}",
+            song.path
+        ))
+    })
+}
+
+/// `song`'s library root on this machine, as local_file_in finds it.
+async fn root_in(
     db: &SqlitePool,
     song: &NativeSong,
     music_path: Option<&Path>,
 ) -> Result<PathBuf, Failure> {
-    let (root, relative) = located_in(db, song, music_path).await?;
-    Ok(root.join(relative))
-}
-
-/// `song`'s library root on this machine and its path below it (local_file_in).
-async fn located_in<'s>(
-    db: &SqlitePool,
-    song: &'s NativeSong,
-    music_path: Option<&Path>,
-) -> Result<(PathBuf, &'s Path), Failure> {
-    let Some(relative) = inside(&song.path) else {
-        return Err(path_unresolved(format!(
-            "Navidrome's path for this song is not inside its library: {}",
-            song.path
-        )));
-    };
-    let root = match music_path {
+    Ok(match music_path {
         Some(root) if song.library_id == DEFAULT_LIBRARY_ID => root.to_path_buf(),
         _ => match NavidromeLibraryRow::get_in(db, song.library_id)
             .await
@@ -105,35 +173,87 @@ async fn located_in<'s>(
             Some(row) if row.navidrome_path == song.library_path => PathBuf::from(row.local_path),
             _ => PathBuf::from(&song.library_path),
         },
-    };
-    Ok((root, relative))
+    })
 }
 
-/// Learns where `song`'s library lives from `local`, the absolute path beets gave a file Soulful
-/// imported: when `local` ends with `song.path` by component and its size is `song.size`, the
-/// part before is the library's local root. Ok(false), nothing stored, when it does not match.
+/// Learns where Navidrome's libraries live from `local`, the absolute path beets gave a file
+/// Soulful imported, and `listed`, every song the index lookup took for that file. A library
+/// with more than one of them teaches nothing: all but one are other files of the same size
+/// whose paths end like this one's, and the root each implies differs. The ids of the
+/// libraries learned (learn_one).
 pub(crate) async fn learn_in(
     db: &SqlitePool,
-    song: &NativeSong,
+    listed: &[NativeSong],
     local: &Path,
-) -> Result<bool, String> {
+) -> Result<Vec<i64>, String> {
+    let mut by_library: HashMap<i64, Vec<&NativeSong>> = HashMap::new();
+    for song in listed {
+        by_library.entry(song.library_id).or_default().push(song);
+    }
+    let mut learned = Vec::new();
+    for (library, songs) in by_library {
+        if let [song] = songs.as_slice() {
+            if learn_one(db, song, local).await? {
+                learned.push(library);
+            }
+        }
+    }
+    learned.sort_unstable();
+    Ok(learned)
+}
+
+/// Learns `song`'s library root from `local`: when `local` is a regular file of `song.size`
+/// bytes that ends with `song.path` by whole components, the part before is the root, and the
+/// root's canonical path joined with `song.path` must be the canonical `local` (no link below
+/// the root, as local_file_in refuses one). A root already stored for the same Navidrome path
+/// is replaced only when it no longer resolves here; one that resolves to another directory
+/// means one of the two was learned from another file, so both are forgotten and the conflict
+/// is logged. Ok(true) when a root is stored or already known.
+async fn learn_one(db: &SqlitePool, song: &NativeSong, local: &Path) -> Result<bool, String> {
     let Some(relative) = inside(&song.path) else {
         return Ok(false);
     };
     if !local.is_absolute() || !local.ends_with(relative) {
         return Ok(false);
     }
-    let file = tokio::fs::metadata(local)
+    let unreadable = |e: std::io::Error| format!("{}: {e}", local.display());
+    let file = tokio::fs::symlink_metadata(local)
         .await
-        .map_err(|e| format!("{}: {e}", local.display()))?;
+        .map_err(unreadable)?;
     if !file.is_file() || file.len() != song.size {
         return Ok(false);
     }
     let kept = local.components().count() - relative.components().count();
     let root: PathBuf = local.components().take(kept).collect();
+    let canonical = tokio::fs::canonicalize(local).await.map_err(unreadable)?;
+    let canonical_root = tokio::fs::canonicalize(&root).await.map_err(unreadable)?;
+    if canonical_root.join(relative) != canonical {
+        return Ok(false);
+    }
     let Some(local_path) = root.to_str() else {
         return Err(format!("{} is not valid UTF-8", root.display()));
     };
+    let stored = NavidromeLibraryRow::get_in(db, song.library_id).await?;
+    if let Some(row) = stored.filter(|row| row.navidrome_path == song.library_path) {
+        match tokio::fs::canonicalize(&row.local_path).await {
+            Ok(known) if known == canonical_root => return Ok(true),
+            Ok(_) => {
+                NavidromeLibraryRow::delete_in(db, song.library_id).await?;
+                warn!(
+                    "Navidrome library {} ({}) was learned at {} on this machine, and {} puts it \
+                     at {}: one of the two came from another file, so Soulful forgets both \
+                     until an import shows it again",
+                    song.library_id,
+                    song.library_path,
+                    row.local_path,
+                    local.display(),
+                    local_path
+                );
+                return Ok(false);
+            }
+            Err(_) => {}
+        }
+    }
     NavidromeLibraryRow::upsert_in(
         db,
         &NavidromeLibraryRow {
@@ -154,6 +274,9 @@ mod tests {
     use shared::failure::{FailureCode, RetryAdvice, Stage};
     use soulbeet::navidrome::models::NativeSong;
     use std::path::Path;
+
+    /// No library learned.
+    const NONE: Vec<i64> = Vec::new();
 
     fn native(library_path: &Path, path: &str, size: u64) -> NativeSong {
         NativeSong {
@@ -183,7 +306,7 @@ mod tests {
         let (db, dir) = (test_db::migrated().await, tempfile::tempdir().unwrap());
         let music = dir.path().join("music");
         write(&music.join("Marrow Choir/Winter Songs/03.flac"), b"audio");
-        let found = local_file_in(
+        let (found, _) = local_file_in(
             &db,
             &native(&music, "Marrow Choir/Winter Songs/03.flac", 5),
             None,
@@ -203,14 +326,17 @@ mod tests {
         write(&local.join("Marrow Choir/Winter Songs/03.flac"), b"audio");
         write(&local.join("Marrow Choir/Winter Songs/04.flac"), b"audio!");
         let navi = Path::new("/srv/navidrome/music");
-        assert!(learn_in(
-            &db,
-            &native(navi, "Marrow Choir/Winter Songs/03.flac", 5),
-            &local.join("Marrow Choir/Winter Songs/03.flac")
-        )
-        .await
-        .unwrap());
-        let other = local_file_in(
+        assert_eq!(
+            learn_in(
+                &db,
+                &[native(navi, "Marrow Choir/Winter Songs/03.flac", 5)],
+                &local.join("Marrow Choir/Winter Songs/03.flac")
+            )
+            .await
+            .unwrap(),
+            vec![1]
+        );
+        let (other, _) = local_file_in(
             &db,
             &native(navi, "Marrow Choir/Winter Songs/04.flac", 6),
             None,
@@ -245,18 +371,12 @@ mod tests {
         let local = dir.path().join("music/Marrow Choir/Winter Songs/03.flac");
         write(&local, b"audio");
         let navi = Path::new("/srv/navidrome/music");
-        assert!(
-            !learn_in(&db, &native(navi, "Other/Album/03.flac", 5), &local)
-                .await
-                .unwrap()
-        );
-        assert!(!learn_in(
-            &db,
-            &native(navi, "Marrow Choir/Winter Songs/03.flac", 6),
-            &local
-        )
-        .await
-        .unwrap());
+        for song in [
+            native(navi, "Other/Album/03.flac", 5),
+            native(navi, "Marrow Choir/Winter Songs/03.flac", 6),
+        ] {
+            assert_eq!(learn_in(&db, &[song], &local).await.unwrap(), NONE);
+        }
         assert_eq!(NavidromeLibraryRow::get_in(&db, 1).await.unwrap(), None);
     }
 
@@ -266,7 +386,7 @@ mod tests {
         let here = dir.path().join("here");
         write(&here.join("A/03.flac"), b"audio");
         let navi = Path::new("/srv/navidrome/music");
-        let found = local_file_in(&db, &native(navi, "A/03.flac", 5), Some(&here))
+        let (found, _) = local_file_in(&db, &native(navi, "A/03.flac", 5), Some(&here))
             .await
             .unwrap();
         assert_eq!(
@@ -350,12 +470,197 @@ mod tests {
         // A library root that is itself a link resolves on both sides.
         let linked = dir.path().join("linked");
         std::os::unix::fs::symlink(&music, &linked).unwrap();
-        let found = local_file_in(&db, &native(&linked, "B/03.flac", 5), None)
+        let (found, _) = local_file_in(&db, &native(&linked, "B/03.flac", 5), None)
             .await
             .unwrap();
         assert_eq!(
             found,
             std::fs::canonicalize(music.join("B/03.flac")).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn a_directory_is_not_a_regular_file_and_a_file_has_the_identity_its_size_was_read_from()
+    {
+        let (db, dir) = (test_db::migrated().await, tempfile::tempdir().unwrap());
+        let music = dir.path().join("music");
+        write(&music.join("A/03.flac"), b"audio");
+        std::fs::create_dir_all(music.join("B/dir.flac")).unwrap();
+        let size = std::fs::metadata(music.join("B/dir.flac")).unwrap().len();
+        let f = local_file_in(&db, &native(&music, "B/dir.flac", size), None)
+            .await
+            .unwrap_err();
+        let canonical = std::fs::canonicalize(&music).unwrap();
+        assert_eq!(
+            (f.code, f.message),
+            (
+                FailureCode::DeleteNotATrack,
+                format!(
+                    "{} is not a regular file",
+                    canonical.join("B/dir.flac").display()
+                )
+            )
+        );
+        let (path, id) = local_file_in(&db, &native(&music, "A/03.flac", 5), None)
+            .await
+            .unwrap();
+        assert_eq!(id, FileId::of(&std::fs::symlink_metadata(&path).unwrap()));
+    }
+
+    /// Dave's shared folder `data/music` holds the release alice's `data/music/alice` holds too:
+    /// her imported 03.flac, and dave's copy of the same size.
+    fn shared_parent(dir: &Path) -> PathBuf {
+        let alices = dir.join("data/music/alice/Artist/Album/03.flac");
+        write(&alices, b"audio");
+        write(&dir.join("data/music/Artist/Album/03.flac"), b"audio");
+        alices
+    }
+
+    #[tokio::test]
+    async fn two_songs_of_one_library_that_may_each_be_the_imported_file_teach_nothing() {
+        let (db, dir) = (test_db::migrated().await, tempfile::tempdir().unwrap());
+        let alices = shared_parent(dir.path());
+        let navi = Path::new("/music");
+        let daves_song = native(navi, "Artist/Album/03.flac", 5);
+        let alices_song = native(navi, "alice/Artist/Album/03.flac", 5);
+        assert_eq!(
+            learn_in(&db, &[daves_song.clone(), alices_song.clone()], &alices)
+                .await
+                .unwrap(),
+            NONE
+        );
+        assert_eq!(NavidromeLibraryRow::get_in(&db, 1).await.unwrap(), None);
+        // Another library's song of the same file does not make library 1's ambiguous.
+        let elsewhere = NativeSong {
+            library_id: 2,
+            library_path: "/kids".into(),
+            ..native(navi, "Album/03.flac", 5)
+        };
+        assert_eq!(
+            learn_in(&db, &[alices_song, elsewhere], &alices)
+                .await
+                .unwrap(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            NavidromeLibraryRow::get_in(&db, 1)
+                .await
+                .unwrap()
+                .map(|row| row.local_path),
+            Some(dir.path().join("data/music").to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_learned_root_is_not_replaced_by_another_that_resolves_and_both_are_forgotten() {
+        let (db, dir) = (test_db::migrated().await, tempfile::tempdir().unwrap());
+        let alices = shared_parent(dir.path());
+        let navi = Path::new("/music");
+        let alices_song = native(navi, "alice/Artist/Album/03.flac", 5);
+        assert_eq!(
+            learn_in(&db, std::slice::from_ref(&alices_song), &alices)
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        // Only dave's song listed: it would put library 1 at data/music/alice.
+        assert_eq!(
+            learn_in(&db, &[native(navi, "Artist/Album/03.flac", 5)], &alices)
+                .await
+                .unwrap(),
+            NONE
+        );
+        assert_eq!(NavidromeLibraryRow::get_in(&db, 1).await.unwrap(), None);
+        // The same root again, written another way, is the one already known.
+        learn_in(&db, std::slice::from_ref(&alices_song), &alices)
+            .await
+            .unwrap();
+        let dotted = dir.path().join("data/./music/alice/Artist/Album/03.flac");
+        assert_eq!(
+            learn_in(&db, &[alices_song], &dotted).await.unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            NavidromeLibraryRow::get_in(&db, 1)
+                .await
+                .unwrap()
+                .map(|row| row.local_path),
+            Some(dir.path().join("data/music").to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_learned_root_that_is_gone_is_replaced() {
+        let (db, dir) = (test_db::migrated().await, tempfile::tempdir().unwrap());
+        let alices = shared_parent(dir.path());
+        NavidromeLibraryRow::upsert_in(
+            &db,
+            &NavidromeLibraryRow {
+                library_id: 1,
+                navidrome_path: "/music".into(),
+                local_path: dir.path().join("old-mount").to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            learn_in(
+                &db,
+                &[native(Path::new("/music"), "alice/Artist/Album/03.flac", 5)],
+                &alices
+            )
+            .await
+            .unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            NavidromeLibraryRow::get_in(&db, 1)
+                .await
+                .unwrap()
+                .map(|row| row.local_path),
+            Some(dir.path().join("data/music").to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_reached_through_a_link_below_the_root_teaches_nothing() {
+        let (db, dir) = (test_db::migrated().await, tempfile::tempdir().unwrap());
+        let music = dir.path().join("music");
+        write(&music.join("B/03.flac"), b"audio");
+        std::os::unix::fs::symlink(music.join("B"), music.join("A")).unwrap();
+        assert_eq!(
+            learn_in(
+                &db,
+                &[native(Path::new("/music"), "A/03.flac", 5)],
+                &music.join("A/03.flac")
+            )
+            .await
+            .unwrap(),
+            NONE
+        );
+        assert_eq!(NavidromeLibraryRow::get_in(&db, 1).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn learning_from_a_file_that_cannot_be_read_or_named_is_an_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let (db, dir) = (test_db::migrated().await, tempfile::tempdir().unwrap());
+        let gone = dir.path().join("music/A/03.flac");
+        let navi = Path::new("/music");
+        assert_eq!(
+            learn_in(&db, &[native(navi, "A/03.flac", 5)], &gone).await,
+            Err(format!(
+                "{}: {}",
+                gone.display(),
+                std::io::Error::from_raw_os_error(2) // ENOENT
+            ))
+        );
+        let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"m\xffsic"));
+        write(&odd.join("A/03.flac"), b"audio");
+        assert_eq!(
+            learn_in(&db, &[native(navi, "A/03.flac", 5)], &odd.join("A/03.flac")).await,
+            Err(format!("{} is not valid UTF-8", odd.display()))
+        );
+        assert_eq!(NavidromeLibraryRow::get_in(&db, 1).await.unwrap(), None);
     }
 }
