@@ -1,9 +1,11 @@
 //! The report import.py writes after every run: the candidates beets weighed
-//! for each task, and what kept a pick or an as-is import from running.
+//! for each task, what kept a pick or an as-is import from running, and what
+//! beets did with each duplicate it kept or replaced.
 
 use crate::{DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, SkipReason};
 use serde::Deserialize;
 use shared::download::{MatchCandidate, MatchChoices, MatchKind, TrackFit};
+use std::path::Path;
 
 #[derive(Debug)]
 pub(crate) struct Report {
@@ -13,6 +15,9 @@ pub(crate) struct Report {
     pick_missing: bool,
     /// Why an as-is import was not run.
     refused: Option<String>,
+    /// One entry per duplicate decision beets logged as replace or keep. A
+    /// skip is read from the run log.
+    duplicates: Vec<RawDuplicate>,
 }
 
 #[derive(Deserialize)]
@@ -20,6 +25,42 @@ struct RawReport {
     tasks: Vec<RawTask>,
     pick_missing: bool,
     refused: Option<String>,
+    duplicates: Vec<RawDuplicate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DuplicateAction {
+    Replaced,
+    Kept,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDuplicate {
+    action: DuplicateAction,
+    /// The library files the decision is about.
+    existing: Vec<String>,
+}
+
+/// The note an imported row gets for one duplicate decision, each library
+/// file named relative to `target` when it is inside it.
+fn duplicate_warning(d: &RawDuplicate, target: &Path) -> String {
+    let files = d
+        .existing
+        .iter()
+        .map(|p| {
+            let path = Path::new(p);
+            path.strip_prefix(target)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match d.action {
+        DuplicateAction::Replaced => format!("replaced the library's earlier copy {files}"),
+        DuplicateAction::Kept => format!("kept the library's earlier copy {files} too"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -126,22 +167,28 @@ impl Report {
             tasks,
             pick_missing: raw.pick_missing,
             refused: raw.refused,
+            duplicates: raw.duplicates,
         })
     }
 
     /// Completes the result read from beets' output with what only the
-    /// driver knows.
+    /// driver knows, `target` being the library folder.
     pub(crate) fn apply(
         self,
         mut result: ImportResult,
         mode: ImportMode,
         choice: &DriverChoice,
+        target: &Path,
     ) -> ImportResult {
         if let Some(message) = self.refused {
             result.outcome = ImportOutcome::Failed {
                 kind: FailKind::AsIsMissingTags,
                 message,
             };
+            return result;
+        }
+        if let ImportOutcome::Imported { warnings, .. } = &mut result.outcome {
+            warnings.extend(self.duplicates.iter().map(|d| duplicate_warning(d, target)));
             return result;
         }
         // A pick that found nothing and a weak automatic match both end in a
@@ -202,6 +249,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             "pick_missing": pick_missing,
             "refused": refused,
+            "duplicates": [],
         });
         Report::parse(&text.to_string()).unwrap()
     }
@@ -296,6 +344,7 @@ mod tests {
             no_match(),
             ImportMode::Singleton,
             &DriverChoice::Auto,
+            Path::new("/music"),
         );
         assert_eq!(applied.outcome, no_match().outcome);
         let choices = applied.choices.expect("no choices");
@@ -304,8 +353,12 @@ mod tests {
 
         // No candidates at all still leaves a manual ID and as-is.
         let empty = r#"{"paths": ["/src/a"], "album": true, "candidates": []}"#;
-        let applied =
-            report(&[empty], false, None).apply(no_match(), ImportMode::Album, &DriverChoice::Auto);
+        let applied = report(&[empty], false, None).apply(
+            no_match(),
+            ImportMode::Album,
+            &DriverChoice::Auto,
+            Path::new("/music"),
+        );
         assert_eq!(
             applied.choices,
             Some(MatchChoices {
@@ -319,14 +372,24 @@ mod tests {
     fn choices_need_one_skipped_task_from_an_automatic_import() {
         let two = report(&[ALBUM_TASK, ALBUM_TASK], false, None);
         assert_eq!(
-            two.apply(no_match(), ImportMode::Album, &DriverChoice::Auto)
-                .choices,
+            two.apply(
+                no_match(),
+                ImportMode::Album,
+                &DriverChoice::Auto,
+                Path::new("/music")
+            )
+            .choices,
             None
         );
         let none = report(&[], false, None);
         assert_eq!(
-            none.apply(no_match(), ImportMode::Album, &DriverChoice::Auto)
-                .choices,
+            none.apply(
+                no_match(),
+                ImportMode::Album,
+                &DriverChoice::Auto,
+                Path::new("/music")
+            )
+            .choices,
             None
         );
 
@@ -340,6 +403,7 @@ mod tests {
                 other.clone(),
                 ImportMode::Album,
                 &DriverChoice::Auto,
+                Path::new("/music"),
             );
             assert_eq!(applied, other);
         }
@@ -348,8 +412,12 @@ mod tests {
             DriverChoice::AsIs,
             pick("6a09041b-0f79-3278-88d9-0552dd28d37f"),
         ] {
-            let applied =
-                report(&[ALBUM_TASK], false, None).apply(no_match(), ImportMode::Album, &choice);
+            let applied = report(&[ALBUM_TASK], false, None).apply(
+                no_match(),
+                ImportMode::Album,
+                &choice,
+                Path::new("/music"),
+            );
             assert_eq!(applied, no_match());
         }
     }
@@ -357,7 +425,12 @@ mod tests {
     #[test]
     fn a_pick_that_found_nothing_names_the_source_and_id() {
         let id = "dfeb96a7-f78a-4b04-93ce-c39e28c9a173";
-        let single = report(&[], true, None).apply(no_match(), ImportMode::Singleton, &pick(id));
+        let single = report(&[], true, None).apply(
+            no_match(),
+            ImportMode::Singleton,
+            &pick(id),
+            Path::new("/music"),
+        );
         assert_eq!(
             single.outcome,
             ImportOutcome::Failed {
@@ -368,7 +441,12 @@ mod tests {
         assert_eq!(single.output_tail, "tail");
         assert_eq!(single.choices, None);
 
-        let album = report(&[], true, None).apply(no_match(), ImportMode::Album, &pick(id));
+        let album = report(&[], true, None).apply(
+            no_match(),
+            ImportMode::Album,
+            &pick(id),
+            Path::new("/music"),
+        );
         assert_eq!(
             album.to_string(),
             format!("MusicBrainz has no release {id}")
@@ -381,9 +459,70 @@ mod tests {
             source: "MusicBrainz".into(),
             message: "400 Client Error".into(),
         });
-        let applied =
-            report(&[], true, None).apply(failed.clone(), ImportMode::Singleton, &pick("x"));
+        let applied = report(&[], true, None).apply(
+            failed.clone(),
+            ImportMode::Singleton,
+            &pick("x"),
+            Path::new("/music"),
+        );
         assert_eq!(applied, failed);
+    }
+
+    #[test]
+    fn an_imported_result_names_the_library_files_its_duplicates_touched() {
+        let target = Path::new("/music");
+        let dup = |action| RawDuplicate {
+            action,
+            existing: vec![
+                "/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3".into(),
+                "/elsewhere/02.mp3".into(),
+            ],
+        };
+        assert_eq!(
+            duplicate_warning(&dup(DuplicateAction::Replaced), target),
+            "replaced the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3, /elsewhere/02.mp3"
+        );
+        assert_eq!(
+            duplicate_warning(&dup(DuplicateAction::Kept), target),
+            "kept the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3, /elsewhere/02.mp3 too"
+        );
+    }
+
+    #[test]
+    fn a_replacing_import_says_so_in_its_text() {
+        let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "duplicates": [
+            {"action": "replaced",
+             "existing": ["/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3"]}]}"#;
+        let target = Path::new("/music");
+        let imported = result(ImportOutcome::Imported {
+            untagged: false,
+            warnings: vec![],
+        });
+        let applied = Report::parse(text).unwrap().apply(
+            imported,
+            ImportMode::Album,
+            &DriverChoice::Auto,
+            target,
+        );
+        assert_eq!(
+            applied.to_string(),
+            "Imported; replaced the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3"
+        );
+
+        // A merge ends in a skip with no match.
+        let already = result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary));
+        let merged = result(ImportOutcome::Skipped(SkipReason::NoMatch {
+            candidates: None,
+        }));
+        for other in [already, merged] {
+            let applied = Report::parse(text).unwrap().apply(
+                other.clone(),
+                ImportMode::Album,
+                &DriverChoice::Auto,
+                target,
+            );
+            assert_eq!(applied, other);
+        }
     }
 
     #[test]
@@ -393,6 +532,7 @@ mod tests {
             result(ImportOutcome::Skipped(SkipReason::NothingToImport)),
             ImportMode::Singleton,
             &DriverChoice::AsIs,
+            Path::new("/music"),
         );
         assert_eq!(
             applied.outcome,

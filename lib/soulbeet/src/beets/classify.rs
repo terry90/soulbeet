@@ -105,8 +105,6 @@ pub(crate) enum RunLogAction {
     Skip,
     Asis,
     DuplicateSkip,
-    DuplicateKeep,
-    DuplicateReplace,
 }
 
 /// One line of `beet import --log`: a task beets did not simply apply.
@@ -124,8 +122,6 @@ pub(crate) fn parse_run_log(text: &str) -> Vec<RunLogEntry> {
                 "skip" => RunLogAction::Skip,
                 "asis" => RunLogAction::Asis,
                 "duplicate-skip" => RunLogAction::DuplicateSkip,
-                "duplicate-keep" => RunLogAction::DuplicateKeep,
-                "duplicate-replace" => RunLogAction::DuplicateReplace,
                 _ => return None,
             };
             Some(RunLogEntry {
@@ -1117,6 +1113,22 @@ mod tests {
                 action: RunLogAction::Skip,
                 paths: vec!["/src/a".to_string(), "/src/b".to_string()],
             }]
+        );
+    }
+
+    #[test]
+    fn the_run_log_keeps_only_what_classify_reads() {
+        let actions = |text| {
+            parse_run_log(text)
+                .into_iter()
+                .map(|e| e.action)
+                .collect::<Vec<_>>()
+        };
+        // Its two duplicate-keep lines parse to nothing.
+        assert_eq!(actions(fixture!("dup_merge").runlog), [RunLogAction::Skip]);
+        assert_eq!(
+            actions("duplicate-skip /src\n"),
+            [RunLogAction::DuplicateSkip]
         );
     }
 

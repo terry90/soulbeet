@@ -136,7 +136,7 @@ impl BeetsImporter {
 
         let result = classifier.finish(&run.end, &s.limits, &entries, run.tail);
         let result = match report {
-            Some(report) => report.apply(result, mode, choice),
+            Some(report) => report.apply(result, mode, choice, target),
             None => result,
         };
         info!(
@@ -560,7 +560,7 @@ mod tests {
         {"data_source": "MusicBrainz", "id": "dfeb96a7-f78a-4b04-93ce-c39e28c9a173",
          "artist": "Radiohead", "title": "Karma Police", "album": null, "year": null,
          "country": null, "disambig": null, "per_mille": 714, "differs": ["length"],
-         "length": 263}]}], "pick_missing": false, "refused": null}"#;
+         "length": 263}]}], "pick_missing": false, "refused": null, "duplicates": []}"#;
 
     fn file_name(path: &str) -> String {
         Path::new(path)
@@ -718,7 +718,9 @@ mod tests {
                 stdout: "",
                 stderr: "Sending event: import_task_created\n\
                          soulbeet: MusicBrainz has no single match for dfeb96a7 (0 found)\n",
-                report: Some(r#"{"tasks": [], "pick_missing": true, "refused": null}"#),
+                report: Some(
+                    r#"{"tasks": [], "pick_missing": true, "refused": null, "duplicates": []}"#,
+                ),
                 ..SKIPPED
             },
         );
@@ -753,7 +755,9 @@ mod tests {
             d,
             DriverRun {
                 stderr: "Sending event: import_task_created\nSending event: item_imported\n",
-                report: Some(r#"{"tasks": [], "pick_missing": false, "refused": null}"#),
+                report: Some(
+                    r#"{"tasks": [], "pick_missing": false, "refused": null, "duplicates": []}"#,
+                ),
                 ..Default::default()
             },
         );
@@ -767,7 +771,9 @@ mod tests {
         assert_eq!(result.to_string(), "Imported");
 
         let why = "Import as-is needs artist and title tags, and 1 file lacks them: a.mp3";
-        let refused = format!(r#"{{"tasks": [], "pick_missing": false, "refused": "{why}"}}"#);
+        let refused = format!(
+            r#"{{"tasks": [], "pick_missing": false, "refused": "{why}", "duplicates": []}}"#
+        );
         stage(
             d,
             DriverRun {
@@ -819,7 +825,7 @@ mod tests {
         let path = dir.path().join("report.json");
         tokio::fs::write(
             &path,
-            r#"{"tasks": [], "pick_missing": false, "refused": null}"#,
+            r#"{"tasks": [], "pick_missing": false, "refused": null, "duplicates": []}"#,
         )
         .await
         .unwrap();

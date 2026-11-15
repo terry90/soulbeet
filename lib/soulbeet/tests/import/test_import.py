@@ -4,6 +4,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "beets"
 DRIVER_SRC = (SRC / "import.py").read_text()
@@ -122,6 +123,61 @@ def test_auto_records_an_applied_match(beets_env):
     assert len(beets_env.music_files()) == 2
 
 
+def test_a_replaced_duplicate_is_reported_with_the_file_it_replaced(beets_env):
+    beets_env.album(beets_env.src)
+    first = beets_env.driver("auto", env={"FAKESRC_MODE": "strong"})
+    assert first.report["duplicates"] == []
+    old = sorted(str(beets_env.music / f) for f in beets_env.music_files())
+
+    beets_env.album(beets_env.src)
+    second = beets_env.driver("auto", env={"FAKESRC_MODE": "strong"})
+
+    [dup] = second.report["duplicates"]
+    assert (dup["action"], sorted(dup["existing"])) == ("replaced", old), second
+    assert any(line.startswith("duplicate-replace ") for line in second.runlog_lines)
+
+
+def test_replaced_singletons_are_reported_with_the_tracks_they_replaced(beets_env):
+    beets_env.album(beets_env.src)
+    beets_env.driver("auto", singleton=True, env={"FAKESRC_MODE": "strong"})
+    old = sorted(str(beets_env.music / f) for f in beets_env.music_files())
+
+    beets_env.album(beets_env.src)
+    run = beets_env.driver("auto", singleton=True, env={"FAKESRC_MODE": "strong"})
+
+    assert [d["action"] for d in run.report["duplicates"]] == ["replaced", "replaced"], run
+    assert [len(d["existing"]) for d in run.report["duplicates"]] == [1, 1]
+    assert sorted(p for d in run.report["duplicates"] for p in d["existing"]) == old
+
+
+REPORTED_STATUS = {"duplicate-replace": "replaced", "duplicate-keep": "kept"}
+
+
+# How many times merge logs duplicate-keep depends on beets: 2.11 logs it twice
+# and ends in a skip (fixture dup_merge/runlog.txt), 2.8 finds no duplicate of
+# the merged task and imports it after one.
+@pytest.mark.parametrize(
+    "action,reported", [("skip", set()), ("keep", {"kept"}), ("merge", {"kept"})]
+)
+def test_a_duplicate_decision_is_reported_as_beets_logged_it(
+    beets_env, action, reported
+):
+    cfg = yaml.safe_load(beets_env.config.read_text())
+    cfg["import"]["duplicate_action"] = action
+    beets_env.config.write_text(yaml.safe_dump(cfg))
+    beets_env.album(beets_env.src)
+    beets_env.driver("auto", env={"FAKESRC_MODE": "strong"})
+    beets_env.album(beets_env.src)
+    run = beets_env.driver("auto", env={"FAKESRC_MODE": "strong"})
+
+    actions = [d["action"] for d in run.report["duplicates"]]
+    statuses = [line.split(" ", 1)[0] for line in run.runlog_lines]
+    # merge logs its decision as keep.
+    assert statuses[0] == ("duplicate-skip" if action == "skip" else "duplicate-keep")
+    assert actions == [REPORTED_STATUS[s] for s in statuses if s in REPORTED_STATUS]
+    assert set(actions) == reported, run
+
+
 def test_pick_applies_a_weak_track_and_tags_it(beets_env):
     track = one_track(beets_env)
     skipped = beets_env.driver("auto", singleton=True, env=WEAK)
@@ -134,7 +190,12 @@ def test_pick_applies_a_weak_track_and_tags_it(beets_env):
     assert run.code == 0, run
     assert run.runlog_lines == []
     assert "Match (" in run.stdout
-    assert run.report == {"tasks": [], "pick_missing": False, "refused": None}
+    assert run.report == {
+        "tasks": [],
+        "pick_missing": False,
+        "refused": None,
+        "duplicates": [],
+    }
     assert not track.exists()
     assert beets_env.music_files() == ["Some Other Artist/Totally Different 1.mp3"]
     assert beets_env.library() == [
@@ -266,7 +327,12 @@ def test_asis_imports_with_the_files_own_tags(beets_env, singleton):
 
     assert run.code == 0, run
     assert "Error in 'FakeSrc" not in run.stderr
-    assert run.report == {"tasks": [], "pick_missing": False, "refused": None}
+    assert run.report == {
+        "tasks": [],
+        "pick_missing": False,
+        "refused": None,
+        "duplicates": [],
+    }
     assert run.runlog_lines == []
     assert run.stdout == ""
     assert beets_env.music_files() == expected

@@ -8,9 +8,11 @@
 #   asis            import with the files' own tags (-A); refused when one lacks them
 #   pick SOURCE ID  apply what SOURCE returns for ID (-S ID), whatever its distance
 #
-# REPORT gets {"tasks": [...], "pick_missing": bool, "refused": str or null},
-# also when beets fails. Tasks are recorded in auto mode only. stdout carries
-# nothing but beets' own output.
+# REPORT gets {"tasks": [...], "pick_missing": bool, "refused": str or null,
+# "duplicates": [...]}, also when beets fails. Tasks are recorded in auto mode
+# only. "duplicates" holds each duplicate decision beets logs as replace or
+# keep, with the library files it is about. stdout carries nothing but beets'
+# own output.
 import json
 import os
 import sys
@@ -61,7 +63,11 @@ from beets.ui.commands import import_ as import_cmd
 
 USAGE = "usage: import.py REPORT (auto | asis | pick SOURCE ID) -- BEET_ARGS"
 
-report = {"tasks": [], "pick_missing": False, "refused": None}
+report = {"tasks": [], "pick_missing": False, "refused": None, "duplicates": []}
+
+# The run log statuses of a duplicate decision the report names, as it names
+# them. A skipped duplicate is read from the run log.
+DUPLICATE_ACTIONS = {"duplicate-replace": "replaced", "duplicate-keep": "kept"}
 
 
 def path_text(path):
@@ -109,7 +115,34 @@ def describe(match):
 Session = import_cmd.TerminalImportSession
 
 
-class AutoSession(Session):
+class Reporting(Session):
+    """Reports each duplicate decision as beets logs it. The library items
+    are read here, before the apply stage removes any of them."""
+
+    deciding = None
+
+    def log_choice(self, task, duplicate=False):
+        if not duplicate:
+            return super().log_choice(task, duplicate)
+        self.deciding = task
+        try:
+            super().log_choice(task, duplicate)
+        finally:
+            self.deciding = None
+
+    def tag_log(self, status, paths):
+        if self.deciding is not None and status in DUPLICATE_ACTIONS:
+            items = self.deciding.duplicate_items(self.lib)
+            report["duplicates"].append(
+                {
+                    "action": DUPLICATE_ACTIONS[status],
+                    "existing": [path_text(i.path) for i in items],
+                }
+            )
+        super().tag_log(status, paths)
+
+
+class AutoSession(Reporting):
     def _record(self, task):
         report["tasks"].append(
             {
@@ -135,7 +168,7 @@ class AutoSession(Session):
         return choice
 
 
-class PickSession(Session):
+class PickSession(Reporting):
     """Makes the picked candidate the only, strong one, so beets' own quiet
     path applies it with its usual output, events and duplicate handling."""
 
@@ -220,7 +253,7 @@ def untagged_refusal(session):
     return f"Import as-is needs {need} tags, and {files} them: {shown}"
 
 
-class AsIsSession(Session):
+class AsIsSession(Reporting):
     def run(self):
         # The task factory reads the session config, which run() sets only
         # after it opens the run log.
