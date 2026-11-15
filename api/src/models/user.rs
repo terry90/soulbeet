@@ -90,9 +90,17 @@ impl User {
     }
 
     pub async fn verify(username: &str, password: &str) -> Result<User, String> {
+        Self::verify_in(&DB, username, password).await
+    }
+
+    pub(crate) async fn verify_in(
+        db: &SqlitePool,
+        username: &str,
+        password: &str,
+    ) -> Result<User, String> {
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
             .bind(username)
-            .fetch_optional(&*DB)
+            .fetch_optional(db)
             .await
             .map_err(|e| e.to_string())?
             .ok_or("User not found")?;

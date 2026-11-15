@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 use crate::{
     auth,
     base_url::{request_base, DerivedBase},
-    login_limiter::LOGIN_LIMITER,
+    login_limiter::{LoginLimiter, LOGIN_LIMITER},
     models,
     server_fns::{rate_limited_error, refusal_error, server_error, unauthorized_error},
     AuthSession,
@@ -146,25 +146,83 @@ async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResu
     }
 }
 
+/// Who the credentials belong to, once the limiter has let the attempt through.
+#[cfg(feature = "server")]
+enum Credentials {
+    /// Navidrome accepted them.
+    Navidrome,
+    /// The local password matched; `status` is what Navidrome's answer means.
+    Local {
+        user: models::user::User,
+        status: shared::system::NavidromeStatus,
+    },
+}
+
+/// Decides a sign-in. The limiter is checked before Navidrome is asked, every
+/// failed local verification is recorded, and a success clears the account.
+#[cfg(feature = "server")]
+async fn authenticate_in(
+    db: &sqlx::SqlitePool,
+    limiter: &LoginLimiter,
+    username: &str,
+    password: &str,
+    now: std::time::Instant,
+    navidrome: impl std::future::Future<Output = NavidromeAuthResult>,
+) -> Result<Credentials, ServerFnError> {
+    use shared::system::NavidromeStatus;
+
+    limiter.check(username, now).map_err(rate_limited_error)?;
+
+    let rejected = || {
+        limiter.record_failure(username, now);
+        unauthorized_error("Invalid username or password")
+    };
+
+    let result = navidrome.await;
+    if matches!(result, NavidromeAuthResult::Success) {
+        limiter.record_success(username);
+        return Ok(Credentials::Navidrome);
+    }
+
+    // Navidrome rejected the credentials, is down, or is not set up: fall back
+    // to the local password.
+    let user = models::user::User::verify_in(db, username, password)
+        .await
+        .map_err(|_| rejected())?;
+    limiter.record_success(username);
+    // Without Navidrome the status stays Unknown ("not configured") so the UI
+    // does not report a server that is down.
+    let status = match result {
+        NavidromeAuthResult::AuthFailed => NavidromeStatus::InvalidCredentials,
+        NavidromeAuthResult::Unreachable => NavidromeStatus::Offline,
+        NavidromeAuthResult::NotConfigured | NavidromeAuthResult::Success => {
+            NavidromeStatus::Unknown
+        }
+    };
+    Ok(Credentials::Local { user, status })
+}
+
 #[post("/api/auth/login", cookies: Cookies, headers: HeaderMap)]
 pub async fn login(username: String, password: String) -> Result<AuthResponse, ServerFnError> {
     use crate::crypto;
+    use crate::db::DB;
     use crate::services::evict_navidrome_client;
     use models::user::User;
     use shared::system::NavidromeStatus;
     use std::time::Instant;
 
-    LOGIN_LIMITER
-        .check(&username, Instant::now())
-        .map_err(rate_limited_error)?;
+    let credentials = authenticate_in(
+        &DB,
+        &LOGIN_LIMITER,
+        &username,
+        &password,
+        Instant::now(),
+        try_navidrome_auth(&username, &password),
+    )
+    .await?;
 
-    let rejected = || {
-        LOGIN_LIMITER.record_failure(&username, Instant::now());
-        unauthorized_error("Invalid username or password")
-    };
-
-    match try_navidrome_auth(&username, &password).await {
-        NavidromeAuthResult::Success => {
+    match credentials {
+        Credentials::Navidrome => {
             // Look up or create user
             let user = match User::get_by_username(&username)
                 .await
@@ -198,7 +256,6 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             evict_navidrome_client(&user.id).await;
 
             let user = start_session(&cookies, &headers, &user.id).await?;
-            LOGIN_LIMITER.record_success(&username);
 
             Ok(AuthResponse {
                 username: user.username,
@@ -207,52 +264,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
                 role: user.role,
             })
         }
-        NavidromeAuthResult::AuthFailed => {
-            // Navidrome rejected the credentials. Fall back to local auth.
-            let user = User::get_by_username(&username)
-                .await
-                .map_err(server_error)?
-                .ok_or_else(rejected)?;
-
-            // Verify local password
-            let _ = User::verify(&username, &password)
-                .await
-                .map_err(|_| rejected())?;
-
-            // Mark Navidrome status as invalid_credentials
-            User::update_navidrome_token(
-                &user.id,
-                user.navidrome_token.as_deref(),
-                NavidromeStatus::InvalidCredentials.as_str(),
-            )
-            .await
-            .map_err(server_error)?;
-
-            // Evict cached client with stale credentials
-            evict_navidrome_client(&user.id).await;
-
-            let user = start_session(&cookies, &headers, &user.id).await?;
-            LOGIN_LIMITER.record_success(&username);
-
-            Ok(AuthResponse {
-                username: user.username,
-                user_id: user.id,
-                navidrome_status: NavidromeStatus::InvalidCredentials,
-                role: user.role,
-            })
-        }
-        result @ (NavidromeAuthResult::Unreachable | NavidromeAuthResult::NotConfigured) => {
-            // Navidrome is down or not set up. Fall back to local password
-            // verification. Without Navidrome the status stays Unknown ("not
-            // configured") so the UI does not report a server that is down.
-            let status = match result {
-                NavidromeAuthResult::NotConfigured => NavidromeStatus::Unknown,
-                _ => NavidromeStatus::Offline,
-            };
-            let user = User::verify(&username, &password)
-                .await
-                .map_err(|_| rejected())?;
-
+        Credentials::Local { user, status } => {
             // Keep the existing token so it works again once Navidrome is back
             User::update_navidrome_token(
                 &user.id,
@@ -262,8 +274,12 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             .await
             .map_err(server_error)?;
 
+            if status == NavidromeStatus::InvalidCredentials {
+                // Evict cached client with stale credentials
+                evict_navidrome_client(&user.id).await;
+            }
+
             let user = start_session(&cookies, &headers, &user.id).await?;
-            LOGIN_LIMITER.record_success(&username);
 
             Ok(AuthResponse {
                 username: user.username,
@@ -346,5 +362,155 @@ mod tests {
             &derived("https://nas:9765"),
             Some("http://nas:9765")
         ));
+    }
+
+    use crate::db::test_db;
+    use crate::login_limiter::{LoginBlock, FREE_FAILURES};
+    use crate::models::user::User;
+    use crate::server_fns::RATE_LIMITED_CODE;
+    use std::time::Instant;
+
+    fn code(e: &ServerFnError) -> u16 {
+        match e {
+            ServerFnError::ServerError { code, .. } => *code,
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    async fn sign_in(
+        db: &sqlx::SqlitePool,
+        limiter: &LoginLimiter,
+        name: &str,
+        password: &str,
+        now: Instant,
+        result: NavidromeAuthResult,
+    ) -> Result<Credentials, ServerFnError> {
+        authenticate_in(db, limiter, name, password, now, async { result }).await
+    }
+
+    #[tokio::test]
+    async fn not_configured_with_a_wrong_password_records_a_failure() {
+        let db = test_db::migrated().await;
+        User::create_in(&db, "ann", "right").await.unwrap();
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..=FREE_FAILURES {
+            let err = sign_in(
+                &db,
+                &limiter,
+                "ann",
+                "wrong",
+                now,
+                NavidromeAuthResult::NotConfigured,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(code(&err), 401);
+        }
+        assert!(matches!(
+            limiter.check("ann", now),
+            Err(LoginBlock::Account { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_user_records_a_failure() {
+        let db = test_db::migrated().await;
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..=FREE_FAILURES {
+            let err = sign_in(
+                &db,
+                &limiter,
+                "ghost",
+                "pw",
+                now,
+                NavidromeAuthResult::AuthFailed,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(code(&err), 401);
+        }
+        assert!(matches!(
+            limiter.check("ghost", now),
+            Err(LoginBlock::Account { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_account_is_refused_before_navidrome_is_asked() {
+        let db = test_db::migrated().await;
+        User::create_in(&db, "ann", "right").await.unwrap();
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..=FREE_FAILURES {
+            limiter.record_failure("ann", now);
+        }
+        let asked = std::cell::Cell::new(false);
+        let err = authenticate_in(&db, &limiter, "ann", "right", now, async {
+            asked.set(true);
+            NavidromeAuthResult::NotConfigured
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(code(&err), RATE_LIMITED_CODE);
+        assert!(err.to_string().contains("for this account"));
+        assert!(!asked.get());
+    }
+
+    #[tokio::test]
+    async fn a_success_clears_the_failure_count() {
+        let db = test_db::migrated().await;
+        User::create_in(&db, "ann", "right").await.unwrap();
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..FREE_FAILURES {
+            limiter.record_failure("ann", now);
+        }
+        let ok = sign_in(
+            &db,
+            &limiter,
+            "ann",
+            "right",
+            now,
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            ok,
+            Credentials::Local {
+                status: shared::system::NavidromeStatus::Unknown,
+                ..
+            }
+        ));
+        limiter.record_failure("ann", now);
+        assert_eq!(limiter.check("ann", now), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_navidrome_success_clears_the_failure_count() {
+        let db = test_db::migrated().await;
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..FREE_FAILURES {
+            limiter.record_failure("ann", now);
+        }
+        let ok = sign_in(
+            &db,
+            &limiter,
+            "ann",
+            "pw",
+            now,
+            NavidromeAuthResult::Success,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(ok, Credentials::Navidrome));
+        limiter.record_failure("ann", now);
+        assert_eq!(limiter.check("ann", now), Ok(()));
     }
 }
