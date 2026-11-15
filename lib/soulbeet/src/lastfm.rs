@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde::Deserialize;
 use shared::failure::{Service, UserAction, UserActionCode};
-use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
+use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, Track};
 use shared::recommendation::{
     ArtistPopularity, Listen, RankedArtist, RankedTrack, SimilarArtist, SimilarTrack, TimePeriod,
     WeightedTag,
@@ -902,8 +902,8 @@ fn nonempty_mbid(mbid: Option<String>) -> Option<String> {
 
 #[async_trait::async_trait]
 impl crate::MetadataProvider for LastFmProvider {
-    fn id(&self) -> &'static str {
-        "lastfm"
+    fn id(&self) -> Provider {
+        Provider::LastFm
     }
 
     fn name(&self) -> &'static str {

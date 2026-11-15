@@ -613,21 +613,22 @@ mod tests {
 
     #[test]
     fn a_lastfm_lookup_without_a_key_is_answered_by_musicbrainz() {
+        use shared::metadata::Provider;
         assert_eq!(
             metadata_provider(
                 Some(providers::LASTFM),
                 Some("0123456789abcdef0123456789abcdef")
             )
             .id(),
-            "lastfm"
+            Provider::LastFm
         );
         for key in [None, Some("")] {
             assert_eq!(
                 metadata_provider(Some(providers::LASTFM), key).id(),
-                "musicbrainz"
+                Provider::MusicBrainz
             );
         }
-        assert_eq!(metadata_provider(None, None).id(), "musicbrainz");
+        assert_eq!(metadata_provider(None, None).id(), Provider::MusicBrainz);
         assert_eq!(usable_lastfm_key(Some("")), None);
     }
 

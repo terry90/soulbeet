@@ -45,7 +45,7 @@ pub async fn search(
     search_in(&*provider, kind, artist, query).await
 }
 
-/// The search on `provider`, named by its id.
+/// The search on `provider`, the results named by its id.
 async fn search_in(
     provider: &dyn MetadataProvider,
     kind: SearchKind,
@@ -58,7 +58,7 @@ async fn search_in(
     }
     .map_err(|e| provider_failure(&e))?;
     Ok(SearchResults {
-        provider: provider.id().parse().unwrap_or_default(),
+        provider: provider.id(),
         results,
     })
 }
@@ -161,8 +161,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MetadataProvider for Unanswered {
-        fn id(&self) -> &'static str {
-            "musicbrainz"
+        fn id(&self) -> Provider {
+            Provider::MusicBrainz
         }
         fn name(&self) -> &'static str {
             "MusicBrainz"
@@ -185,6 +185,48 @@ mod tests {
         }
         async fn get_album(&self, _: &str) -> Result<AlbumWithTracks, MetadataError> {
             Err(unanswered())
+        }
+    }
+
+    /// Finds nothing, as the provider it names.
+    struct Empty(Provider);
+
+    #[async_trait::async_trait]
+    impl MetadataProvider for Empty {
+        fn id(&self) -> Provider {
+            self.0
+        }
+        fn name(&self) -> &'static str {
+            "Empty"
+        }
+        async fn search_albums(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: usize,
+        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+            Ok(Vec::new())
+        }
+        async fn search_tracks(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: usize,
+        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+            Ok(Vec::new())
+        }
+        async fn get_album(&self, _: &str) -> Result<AlbumWithTracks, MetadataError> {
+            Err(unanswered())
+        }
+    }
+
+    #[tokio::test]
+    async fn search_results_name_the_provider_that_answered() {
+        for provider in [Provider::LastFm, Provider::MusicBrainz] {
+            let found = search_in(&Empty(provider), SearchKind::Albums, None, "Winter Songs")
+                .await
+                .unwrap();
+            assert_eq!(found.provider, provider);
         }
     }
 

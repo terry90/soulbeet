@@ -5,7 +5,7 @@ use shared::{
     },
     failure::UserAction,
     library::DuplicateReport,
-    metadata::{Album, AlbumWithTracks, SearchResult as MetadataSearchResult, Track},
+    metadata::{Album, AlbumWithTracks, Provider, SearchResult as MetadataSearchResult, Track},
     recommendation::{
         ArtistPopularity, CandidateSet, Listen, ProfileConfig, RankedArtist, RankedTrack,
         SignalReport, SimilarArtist, SimilarTrack, TimePeriod, UserMusicProfile, WeightedTag,
@@ -21,7 +21,7 @@ use crate::MetadataError;
 
 #[async_trait]
 pub trait MetadataProvider: Send + Sync {
-    fn id(&self) -> &'static str;
+    fn id(&self) -> Provider;
     fn name(&self) -> &'static str;
 
     async fn search_albums(

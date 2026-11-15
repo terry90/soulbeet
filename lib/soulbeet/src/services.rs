@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use shared::metadata::Provider;
+
 use crate::{DownloadBackend, MetadataProvider, MusicImporter};
 
 pub struct Services {
@@ -28,7 +30,7 @@ impl Services {
         self.importer.get(key)
     }
 
-    pub fn list_metadata(&self) -> Vec<(&str, &str)> {
+    pub fn list_metadata(&self) -> Vec<(Provider, &str)> {
         self.metadata.values().map(|p| (p.id(), p.name())).collect()
     }
 

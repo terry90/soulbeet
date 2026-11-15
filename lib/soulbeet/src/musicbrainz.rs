@@ -8,7 +8,7 @@ use musicbrainz_rs::{
     Fetch, MusicBrainzClient, Search,
 };
 use shared::failure::Service;
-use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
+use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, Track};
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -378,8 +378,8 @@ impl Default for MusicBrainzProvider {
 
 #[async_trait::async_trait]
 impl crate::MetadataProvider for MusicBrainzProvider {
-    fn id(&self) -> &'static str {
-        "musicbrainz"
+    fn id(&self) -> Provider {
+        Provider::MusicBrainz
     }
 
     fn name(&self) -> &'static str {
