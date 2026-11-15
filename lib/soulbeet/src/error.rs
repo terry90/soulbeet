@@ -62,6 +62,10 @@ pub enum SoulseekError {
 
     #[error("Peer name '{username}' cannot be sent in a URL path")]
     UnaddressablePeer { username: String },
+
+    /// A search without an album names its target by exactly one track.
+    #[error("A search without an album takes exactly one track, not {tracks}")]
+    NoSearchTarget { tracks: usize },
 }
 
 /// A setting the slskd client cannot run without, as Soulful stores it.
@@ -96,6 +100,7 @@ impl SoulseekError {
             SoulseekError::SearchAlreadyRunning { .. } => false,
             SoulseekError::SearchGone { .. } => false,
             SoulseekError::UnknownSearch { .. } => false,
+            SoulseekError::NoSearchTarget { .. } => false,
             // 400 and 404 are definitive: a rejected request body or a
             // missing record will not heal on retry.
             SoulseekError::Api {
@@ -146,6 +151,7 @@ impl SoulseekError {
             }
             | SoulseekError::Request(_) => (BackendUnreachable, SameSourceLater),
             SoulseekError::UnaddressablePeer { .. } => (EnqueueFailed, OtherSource),
+            SoulseekError::NoSearchTarget { .. } => (InvalidInput, NotRetryable),
             // A request slskd refused as malformed: the same files fail
             // again.
             SoulseekError::Api { status: 400, .. } if stage == Stage::Enqueue => {

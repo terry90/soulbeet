@@ -307,18 +307,10 @@ impl SoulseekClient {
         tracks: Vec<Track>,
         timeout: Duration,
     ) -> Result<String> {
+        let query = search_text(album.as_ref(), &tracks)?;
         self.wait_for_rate_limit().await?;
 
         let track_titles: Vec<String> = tracks.iter().map(|t| t.title.clone()).collect();
-
-        let query = match album {
-            Some(ref album) => match tracks.len() {
-                1 => format!("{} {}", album.artist.trim(), tracks[0].title.trim()),
-                _ => format!("{} {}", album.artist.trim(), album.title.trim()),
-            },
-            // No album, should be a single track search
-            None => format!("{} {}", tracks[0].artist.trim(), tracks[0].title.trim()),
-        };
 
         info!(
             "Starting search for: '{}' with timeout {}ms",
@@ -326,20 +318,7 @@ impl SoulseekClient {
             timeout.num_milliseconds()
         );
 
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SearchRequest<'a> {
-            search_text: &'a str,
-            timeout: i64,
-            filter_responses: bool,
-            minimum_peer_upload_speed: u32,
-        }
-        let request_body = SearchRequest {
-            search_text: &query,
-            timeout: timeout.num_milliseconds(),
-            filter_responses: true,
-            minimum_peer_upload_speed: 10,
-        };
+        let request_body = SearchRequest::new(&query);
 
         #[derive(Deserialize)]
         struct SearchId {
@@ -1161,10 +1140,132 @@ impl crate::DownloadBackend for SoulseekClient {
     }
 }
 
+/// slskd's search inactivity timeout, in milliseconds although slskd's DTO
+/// comment says seconds: `SearchRequest.cs:114` passes it unconverted to
+/// Soulseek.NET's `SearchOptions.SearchTimeout`, which is a millisecond count
+/// (`src/Options/SearchOptions.cs:36,53`). The search ends this long after
+/// the last response.
+const SEARCH_INACTIVITY_MS: u32 = 15_000;
+
+/// The query text for a search: one track names itself, an album names the
+/// album, and a search without an album needs exactly one track.
+fn search_text(album: Option<&Album>, tracks: &[Track]) -> Result<String> {
+    match (album, tracks) {
+        (Some(album), [track]) => Ok(format!("{} {}", album.artist.trim(), track.title.trim())),
+        (Some(album), _) => Ok(format!("{} {}", album.artist.trim(), album.title.trim())),
+        (None, [track]) => Ok(format!("{} {}", track.artist.trim(), track.title.trim())),
+        (None, _) => Err(SoulseekError::NoSearchTarget {
+            tracks: tracks.len(),
+        }),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRequest<'a> {
+    search_text: &'a str,
+    search_timeout: u32,
+    filter_responses: bool,
+    minimum_peer_upload_speed: u32,
+}
+
+impl<'a> SearchRequest<'a> {
+    fn new(search_text: &'a str) -> Self {
+        Self {
+            search_text,
+            search_timeout: SEARCH_INACTIVITY_MS,
+            filter_responses: true,
+            minimum_peer_upload_speed: 10,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use shared::download::EnqueueStatus;
+
+    fn track(artist: &str, title: &str) -> Track {
+        Track {
+            id: String::new(),
+            title: title.into(),
+            artist: artist.into(),
+            album_id: None,
+            album_title: None,
+            release_date: None,
+            duration: None,
+            mbid: None,
+            release_mbid: None,
+        }
+    }
+
+    fn album(artist: &str, title: &str) -> Album {
+        Album {
+            id: String::new(),
+            title: title.into(),
+            artist: artist.into(),
+            release_date: None,
+            mbid: None,
+            cover_url: None,
+        }
+    }
+
+    #[test]
+    fn the_search_text_names_one_track_or_the_album() {
+        let night = track("Marrow Choir", " O Holy Night ");
+        let silent = track("Marrow Choir", "Silent Night");
+        let winter = album("Marrow Choir ", "Winter Songs");
+        assert_eq!(
+            search_text(None, &[night.clone()]).unwrap(),
+            "Marrow Choir O Holy Night"
+        );
+        assert_eq!(
+            search_text(Some(&winter), &[night.clone()]).unwrap(),
+            "Marrow Choir O Holy Night"
+        );
+        assert_eq!(
+            search_text(Some(&winter), &[night, silent]).unwrap(),
+            "Marrow Choir Winter Songs"
+        );
+        assert_eq!(
+            search_text(Some(&winter), &[]).unwrap(),
+            "Marrow Choir Winter Songs"
+        );
+    }
+
+    #[test]
+    fn a_search_without_an_album_takes_exactly_one_track() {
+        let two = vec![
+            track("Marrow Choir", "O Holy Night"),
+            track("Marrow Choir", "Silent Night"),
+        ];
+        for tracks in [Vec::new(), two] {
+            let e = search_text(None, &tracks).unwrap_err();
+            assert!(
+                matches!(e, SoulseekError::NoSearchTarget { tracks: n } if n == tracks.len()),
+                "{e:?}"
+            );
+            assert!(!e.is_retryable());
+            let f = e.failure(Stage::SourceSearch, e.to_string());
+            assert_eq!(
+                (f.code, f.retry),
+                (FailureCode::InvalidInput, RetryAdvice::NotRetryable)
+            );
+        }
+        assert_eq!(
+            SoulseekError::NoSearchTarget { tracks: 2 }.to_string(),
+            "A search without an album takes exactly one track, not 2"
+        );
+    }
+
+    #[test]
+    fn the_search_request_sends_slskds_inactivity_timeout_in_milliseconds() {
+        assert_eq!(
+            serde_json::to_value(SearchRequest::new("Marrow Choir O Holy Night")).unwrap(),
+            serde_json::json!({"searchText": "Marrow Choir O Holy Night", "searchTimeout": 15000,
+                               "filterResponses": true, "minimumPeerUploadSpeed": 10})
+        );
+    }
 
     /// `status` is Failed with this code and message.
     fn failed_with(status: &EnqueueStatus, code: FailureCode, message: &str) -> bool {
