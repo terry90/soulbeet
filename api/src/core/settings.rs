@@ -157,6 +157,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn another_users_shared_folder_cannot_be_the_discovery_folder() {
+        // Discovery removes files in its folder as the folder's owner, so a shared folder of
+        // another user must not be one.
+        let db = test_db::migrated().await;
+        let alice_folder = folder_of(&db, "alice").await;
+        folder_of(&db, "bob").await;
+        sqlx::query("UPDATE folders SET shared = 1 WHERE id = ?")
+            .bind(&alice_folder)
+            .execute(&db)
+            .await
+            .unwrap();
+        let update = UpdateUserSettings {
+            discovery_folder_id: Some(alice_folder),
+            ..Default::default()
+        };
+        assert_eq!(
+            check_folder_choices(&db, &test_ctx("bob"), &update).await,
+            Err(folder_not_found())
+        );
+    }
+
+    #[tokio::test]
     async fn own_folders_and_an_empty_choice_are_accepted() {
         let db = test_db::migrated().await;
         let bob_folder = folder_of(&db, "bob").await;
