@@ -1,9 +1,11 @@
 //! The report import.py writes after every run: the candidates beets weighed
 //! for each task, what kept a pick or an as-is import from running, what
-//! beets did with each duplicate it found, and each file it imported.
+//! beets did with each duplicate it found or the removal it wanted instead,
+//! and each file it imported.
 
 use crate::{
     DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, ImportedItem, SkipReason,
+    WantedRemoval,
 };
 use serde::Deserialize;
 use shared::download::{MatchCandidate, MatchChoices, MatchKind, TrackFit};
@@ -18,7 +20,7 @@ pub(crate) struct Report {
     /// Why an as-is import was not run.
     refused: Option<String>,
     /// One entry per duplicate decision beets logged as replace, keep or
-    /// skip.
+    /// skip, or per removal it wanted.
     duplicates: Vec<RawDuplicate>,
     /// One entry per file beets imported, once it was in place.
     items: Vec<RawItem>,
@@ -33,19 +35,25 @@ struct RawReport {
     items: Vec<RawItem>,
 }
 
+/// One duplicate decision, with the library files it is about.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum DuplicateAction {
-    Replaced,
-    Kept,
-    Skipped,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawDuplicate {
-    action: DuplicateAction,
-    /// The library files the decision is about.
-    existing: Vec<String>,
+#[serde(tag = "action", rename_all = "snake_case")]
+enum RawDuplicate {
+    Replaced {
+        existing: Vec<PathBuf>,
+    },
+    Kept {
+        existing: Vec<PathBuf>,
+    },
+    Skipped {
+        existing: Vec<PathBuf>,
+    },
+    /// beets kept the earlier items it would have removed.
+    RemovalWanted {
+        existing: Vec<RawItem>,
+        /// Empty until the task's files were in place.
+        imported: Vec<RawImported>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,27 +66,55 @@ struct RawItem {
     album: String,
 }
 
+impl RawItem {
+    fn imported_item(self, target: &Path) -> ImportedItem {
+        ImportedItem {
+            path: in_library(Path::new(&self.path), target),
+            recording_mbid: self.recording_mbid,
+            artist: self.artist,
+            title: self.title,
+            album: self.album,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawImported {
+    id: u64,
+    path: PathBuf,
+}
+
 /// A file beets reported, relative to `target` when it is inside it.
-fn in_library(path: &str, target: &Path) -> PathBuf {
-    let path = Path::new(path);
+fn in_library(path: &Path, target: &Path) -> PathBuf {
     path.strip_prefix(target).unwrap_or(path).to_path_buf()
 }
 
-/// The note an imported row gets for one duplicate decision, each library
-/// file named relative to `target` when it is inside it. A skipped decision
-/// gets none: it is the outcome's own reason, since a run that logs one is
-/// `Skipped(AlreadyInLibrary)` (`classify.rs` `exited_cleanly`).
-fn duplicate_warning(d: &RawDuplicate, target: &Path) -> Option<String> {
-    let files = d
-        .existing
+/// What became of the library's earlier copy of an import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateNote<'a> {
+    Replaced,
+    Kept,
+    /// Deleted before a later file of the same copy could not be.
+    Removed,
+    /// Kept because its removal was refused, for this reason.
+    Blocked(&'a str),
+}
+
+/// The note an imported row gets about the library's earlier copy
+/// `existing`, each file named relative to `target` when it is inside it.
+pub fn duplicate_note(existing: &[PathBuf], target: &Path, note: DuplicateNote<'_>) -> String {
+    let files = existing
         .iter()
         .map(|p| in_library(p, target).to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(", ");
-    match d.action {
-        DuplicateAction::Replaced => Some(format!("replaced the library's earlier copy {files}")),
-        DuplicateAction::Kept => Some(format!("kept the library's earlier copy {files} too")),
-        DuplicateAction::Skipped => None,
+    match note {
+        DuplicateNote::Replaced => format!("replaced the library's earlier copy {files}"),
+        DuplicateNote::Kept => format!("kept the library's earlier copy {files} too"),
+        DuplicateNote::Removed => format!("removed the library's earlier copy {files}"),
+        DuplicateNote::Blocked(reason) => {
+            format!("kept the library's earlier copy {files}: {reason}")
+        }
     }
 }
 
@@ -200,6 +236,24 @@ impl Report {
         choice: &DriverChoice,
         target: &Path,
     ) -> ImportResult {
+        let mut decisions = Vec::new();
+        for d in self.duplicates {
+            match d {
+                RawDuplicate::RemovalWanted { existing, imported } => {
+                    result.removals.push(WantedRemoval {
+                        existing: existing
+                            .into_iter()
+                            .map(|i| i.imported_item(target))
+                            .collect(),
+                        imported: imported
+                            .into_iter()
+                            .map(|i| (i.id, in_library(&i.path, target)))
+                            .collect(),
+                    })
+                }
+                other => decisions.push(other),
+            }
+        }
         if let Some(message) = self.refused {
             result.outcome = ImportOutcome::Failed {
                 kind: FailKind::AsIsMissingTags,
@@ -211,30 +265,33 @@ impl Report {
             warnings, items, ..
         } = &mut result.outcome
         {
-            warnings.extend(
-                self.duplicates
-                    .iter()
-                    .filter_map(|d| duplicate_warning(d, target)),
-            );
+            // A skipped decision gets no note: it is the outcome's own reason,
+            // since a run that logs one is `Skipped(AlreadyInLibrary)`
+            // (`classify.rs` `exited_cleanly`).
+            warnings.extend(decisions.iter().filter_map(|d| match d {
+                RawDuplicate::Replaced { existing } => {
+                    Some(duplicate_note(existing, target, DuplicateNote::Replaced))
+                }
+                RawDuplicate::Kept { existing } => {
+                    Some(duplicate_note(existing, target, DuplicateNote::Kept))
+                }
+                RawDuplicate::Skipped { .. } | RawDuplicate::RemovalWanted { .. } => None,
+            }));
             *items = self
                 .items
                 .into_iter()
-                .map(|i| ImportedItem {
-                    path: in_library(&i.path, target),
-                    recording_mbid: i.recording_mbid,
-                    artist: i.artist,
-                    title: i.title,
-                    album: i.album,
-                })
+                .map(|i| i.imported_item(target))
                 .collect();
             return result;
         }
         if let ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { .. }) = result.outcome {
-            let existing = self
-                .duplicates
+            let existing = decisions
                 .iter()
-                .filter(|d| matches!(d.action, DuplicateAction::Skipped))
-                .flat_map(|d| d.existing.iter().map(|p| in_library(p, target)))
+                .filter_map(|d| match d {
+                    RawDuplicate::Skipped { existing } => Some(existing),
+                    _ => None,
+                })
+                .flat_map(|existing| existing.iter().map(|p| in_library(p, target)))
                 .collect();
             result.outcome = ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing });
             return result;
@@ -272,8 +329,7 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ImportedItem, TaskCount};
-    use std::path::PathBuf;
+    use crate::{ImportedItem, TaskCount, WantedRemoval};
 
     const ALBUM_TASK: &str = r#"{"paths": ["/src/a"], "album": true, "candidates": [
         {"data_source": "MusicBrainz", "id": "6a09041b-0f79-3278-88d9-0552dd28d37f",
@@ -314,6 +370,7 @@ mod tests {
             },
             choices: None,
             user_action: None,
+            removals: vec![],
         }
     }
 
@@ -523,25 +580,138 @@ mod tests {
 
     #[test]
     fn an_imported_result_names_the_library_files_its_duplicates_touched() {
-        let target = Path::new("/music");
-        let dup = |action| RawDuplicate {
-            action,
-            existing: vec![
-                "/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3".into(),
-                "/elsewhere/02.mp3".into(),
-            ],
+        let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "items": [], "duplicates": [
+            {"action": "replaced", "existing": ["/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3", "/elsewhere/02.mp3"]},
+            {"action": "skipped", "existing": ["/music/Zzqx Artist/Qzz Album/03 Song Number 3.mp3"]},
+            {"action": "kept", "existing": ["/music/Zzqx Artist/Qzz Album/04 Song Number 4.mp3"]}]}"#;
+        let imported = result(ImportOutcome::Imported {
+            untagged: false,
+            warnings: vec![],
+            items: vec![],
+        });
+        let applied = Report::parse(text).unwrap().apply(
+            imported,
+            ImportMode::Singleton,
+            &DriverChoice::Auto,
+            Path::new("/music"),
+        );
+        // A skipped decision is the outcome's own reason in a skipped run, so
+        // it gives an imported row no note.
+        let ImportOutcome::Imported { warnings, .. } = applied.outcome else {
+            panic!("{applied:?}")
         };
         assert_eq!(
-            duplicate_warning(&dup(DuplicateAction::Replaced), target).as_deref(),
-            Some("replaced the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3, /elsewhere/02.mp3")
+            warnings,
+            [
+                "replaced the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3, /elsewhere/02.mp3",
+                "kept the library's earlier copy Zzqx Artist/Qzz Album/04 Song Number 4.mp3 too",
+            ]
+        );
+        assert_eq!(applied.removals, vec![]);
+    }
+
+    #[test]
+    fn a_wanted_removal_is_carried_as_data_and_not_as_a_note() {
+        let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "items": [], "duplicates": [
+            {"action": "removal_wanted", "existing": [{"path": "/music/Marrow Choir/Winter Songs/03 O Holy Night.flac",
+              "recording_mbid": "0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c", "artist": "Marrow Choir", "title": "O Holy Night",
+              "album": "Winter Songs"}],
+             "imported": [{"id": 7, "path": "/music/Marrow Choir/Winter Songs [1]/03 O Holy Night.flac"}]},
+            {"action": "kept", "existing": ["/music/Marrow Choir/Winter Songs/04 Silent Night.flac"]}]}"#;
+        let imported = result(ImportOutcome::Imported {
+            untagged: false,
+            warnings: vec![],
+            items: vec![],
+        });
+        let result = Report::parse(text).unwrap().apply(
+            imported,
+            ImportMode::Singleton,
+            &DriverChoice::Auto,
+            Path::new("/music"),
         );
         assert_eq!(
-            duplicate_warning(&dup(DuplicateAction::Kept), target).as_deref(),
-            Some("kept the library's earlier copy Zzqx Artist/Qzz Album/01 Song Number 1.mp3, /elsewhere/02.mp3 too")
+            result.removals,
+            vec![WantedRemoval {
+                existing: vec![ImportedItem {
+                    path: "Marrow Choir/Winter Songs/03 O Holy Night.flac".into(),
+                    recording_mbid: Some("0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c".into()),
+                    artist: "Marrow Choir".into(),
+                    title: "O Holy Night".into(),
+                    album: "Winter Songs".into(),
+                }],
+                imported: vec![(
+                    7,
+                    PathBuf::from("Marrow Choir/Winter Songs [1]/03 O Holy Night.flac")
+                )],
+            }]
+        );
+        let ImportOutcome::Imported { warnings, .. } = result.outcome else {
+            panic!()
+        };
+        assert_eq!(
+            warnings,
+            vec![
+                "kept the library's earlier copy Marrow Choir/Winter Songs/04 Silent Night.flac too"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wanted_removal_is_carried_whatever_the_outcome() {
+        let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "items": [], "duplicates": [
+            {"action": "removal_wanted", "existing": [{"path": "/music/A/x.flac", "recording_mbid": null,
+              "artist": "A", "title": "x", "album": "B"}], "imported": []}]}"#;
+        let failed = result(ImportOutcome::Failed {
+            kind: FailKind::Beets,
+            message: "beets exited with code 1".into(),
+        });
+        let applied = Report::parse(text).unwrap().apply(
+            failed.clone(),
+            ImportMode::Album,
+            &DriverChoice::Auto,
+            Path::new("/music"),
+        );
+        assert_eq!(applied.outcome, failed.outcome);
+        assert_eq!(
+            applied.removals,
+            vec![WantedRemoval {
+                existing: vec![ImportedItem {
+                    path: "A/x.flac".into(),
+                    recording_mbid: None,
+                    artist: "A".into(),
+                    title: "x".into(),
+                    album: "B".into(),
+                }],
+                imported: vec![],
+            }]
+        );
+    }
+
+    #[test]
+    fn every_duplicate_note_names_its_files_inside_the_library() {
+        let files = [
+            PathBuf::from("/music/A/x.flac"),
+            PathBuf::from("/elsewhere/y.flac"),
+        ];
+        let note = |n| duplicate_note(&files, Path::new("/music"), n);
+        assert_eq!(
+            note(DuplicateNote::Replaced),
+            "replaced the library's earlier copy A/x.flac, /elsewhere/y.flac"
         );
         assert_eq!(
-            duplicate_warning(&dup(DuplicateAction::Skipped), target),
-            None
+            note(DuplicateNote::Kept),
+            "kept the library's earlier copy A/x.flac, /elsewhere/y.flac too"
+        );
+        assert_eq!(
+            note(DuplicateNote::Removed),
+            "removed the library's earlier copy A/x.flac, /elsewhere/y.flac"
+        );
+        assert_eq!(
+            note(DuplicateNote::Blocked(
+                "Another listener rated or starred this track"
+            )),
+            "kept the library's earlier copy A/x.flac, /elsewhere/y.flac: Another listener rated or starred this track"
         );
     }
 

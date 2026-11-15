@@ -6,7 +6,7 @@ use crate::traits::ForgetOutcome;
 use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// Starts every `beet ls` row, so text a plugin prints before it (a prompt
@@ -15,8 +15,9 @@ const ROW_MARKER: &str = "@@sb@@";
 const FIELD_SEP: &str = "|||";
 const LS_FORMAT: &str = "@@sb@@$path|||$artist|||$title|||$album|||$albumartist";
 const ID_FORMAT: &str = "@@sb@@$id";
+const ID_PATH_FORMAT: &str = "@@sb@@$id|||$path";
 
-pub(crate) fn library_db(root: &Path) -> std::path::PathBuf {
+pub(crate) fn library_db(root: &Path) -> PathBuf {
     root.join(".beets_library.db")
 }
 
@@ -92,6 +93,59 @@ pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> 
         Ok(_) => ForgetOutcome::Removed,
         Err(e) => ForgetOutcome::Failed(e),
     }
+}
+
+/// Moves the items with `item_ids` of the library under `root` to the paths
+/// beets gives them, and returns each id with the absolute path its file has
+/// after the move.
+pub(crate) async fn move_items(
+    s: &BeetsSettings,
+    root: &Path,
+    item_ids: &[u64],
+) -> Result<Vec<(u64, PathBuf)>, String> {
+    // `beet move` with no query moves every item of the library.
+    if item_ids.is_empty() {
+        return Err("no items to move".into());
+    }
+    // One query of the ids joined by " , ", which beets reads as OR.
+    let mut query: Vec<OsString> = Vec::new();
+    for id in item_ids {
+        if !query.is_empty() {
+            query.push(",".into());
+        }
+        query.push(format!("id:{id}").into());
+    }
+    let mut command: Vec<OsString> = vec!["move".into()];
+    command.extend(query.iter().cloned());
+    run_library(s, root, command).await?;
+
+    let mut ls: Vec<OsString> = vec!["ls".into(), "-f".into(), ID_PATH_FORMAT.into()];
+    ls.extend(query);
+    let mut moved = Vec::new();
+    for row in run_library(s, root, ls).await? {
+        let parsed = row
+            .split_once(FIELD_SEP)
+            .and_then(|(id, path)| Some((id.parse::<u64>().ok()?, PathBuf::from(path))));
+        match parsed {
+            Some(item) => moved.push(item),
+            None => {
+                return Err(format!(
+                    "beet ls gave a row that is not an id and a path: {row}"
+                ))
+            }
+        }
+    }
+    let mut listed: Vec<u64> = moved.iter().map(|(id, _)| *id).collect();
+    let mut wanted = item_ids.to_vec();
+    listed.sort_unstable();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if listed != wanted {
+        return Err(format!(
+            "beet ls listed items {listed:?} after moving items {wanted:?}"
+        ));
+    }
+    Ok(moved)
 }
 
 /// Runs `beet {command}` on the library under `root` and returns the text
@@ -259,6 +313,55 @@ mod tests {
                 format!("{base} remove -f id:7")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn new_items_are_moved_by_id_in_one_call() {
+        let (dir, settings) = fake_library(&format!(
+            "{LOG}\ncase \"$*\" in *' ls '*) printf '@@sb@@7|||%s/A/B/03.flac\\n@@sb@@9|||%s/A/B/04.flac\\n' \"$PWD\" \"$PWD\";; esac"
+        ))
+        .await;
+        let moved = move_items(&settings, dir.path(), &[7, 9]).await.unwrap();
+        assert_eq!(
+            moved,
+            vec![
+                (7, dir.path().join("A/B/03.flac")),
+                (9, dir.path().join("A/B/04.flac"))
+            ]
+        );
+        let calls = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
+        let base = format!(
+            "-c {} -l {} -d {}",
+            settings.config.display(),
+            super::library_db(dir.path()).display(),
+            dir.path().display()
+        );
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            vec![
+                format!("{base} move id:7 , id:9"),
+                format!("{base} ls -f @@sb@@$id|||$path id:7 , id:9"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn moving_no_items_runs_no_beets() {
+        let (dir, settings) = fake_library(LOG).await;
+        assert_eq!(
+            move_items(&settings, dir.path(), &[]).await,
+            Err("no items to move".to_string())
+        );
+        assert!(!dir.path().join("args.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_moved_item_beets_does_not_list_is_a_failure() {
+        let (dir, settings) = fake_library(&format!(
+            "{LOG}\ncase \"$*\" in *' ls '*) echo \"@@sb@@7|||$PWD/A/B/03.flac\";; esac"
+        ))
+        .await;
+        assert!(move_items(&settings, dir.path(), &[7, 9]).await.is_err());
     }
 
     #[tokio::test]

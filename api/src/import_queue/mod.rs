@@ -19,7 +19,8 @@ use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, 
 use shared::failure::Failure;
 use soulbeet::audio::{count_audio_files, is_audio_path};
 use soulbeet::{
-    DriverChoice, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult, MusicImporter,
+    DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
+    MusicImporter,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -466,7 +467,13 @@ impl Shared {
             false => None,
         };
         let result = importer
-            .import(&sources, target, job.mode, &job.choice)
+            .import(
+                &sources,
+                target,
+                job.mode,
+                &job.choice,
+                DuplicateRun::AsConfigured,
+            )
             .await;
         let new_files = match before {
             Some(before) => {
@@ -754,6 +761,19 @@ mod tests {
         let order: Vec<PathBuf> = stub.seen().into_iter().map(|(s, _)| s[0].clone()).collect();
         assert_eq!(order, sources);
         assert_eq!(stub.max_active(), 1);
+    }
+
+    /// The queue carries out no wanted removal, so it never asks beets to
+    /// report one instead of making it.
+    #[tokio::test]
+    async fn an_import_lets_beets_handle_duplicates_as_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let source = file(tmp.path(), "dl/a.flac");
+        assert!(is_imported(
+            &finish(queue.submit(job(source, &tmp.path().join("lib"))).await).await
+        ));
+        assert_eq!(stub.duplicate_runs(), vec![DuplicateRun::AsConfigured]);
     }
 
     #[tokio::test]

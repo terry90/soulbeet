@@ -84,8 +84,8 @@ mod tests {
     use shared::failure::{FailureCode, RetryAdvice, Stage};
     use shared::library::DuplicateReport;
     use shared::system::HealthIssue;
-    use soulbeet::{DriverChoice, ForgetOutcome, ImportMode, ImportResult};
-    use std::path::Path;
+    use soulbeet::{DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportResult};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -119,7 +119,11 @@ mod tests {
             _: &Path,
             _: ImportMode,
             _: &DriverChoice,
+            _: DuplicateRun,
         ) -> ImportResult {
+            unreachable!()
+        }
+        async fn relocate(&self, _: &Path, _: &[u64]) -> Result<Vec<(u64, PathBuf)>, String> {
             unreachable!()
         }
         fn refused(&self, _: String) -> ImportResult {

@@ -10,11 +10,13 @@ pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 
 use crate::audio::count_audio_files;
 use crate::{
-    DriverChoice, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult, MusicImporter,
+    DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
+    MusicImporter,
 };
 use classify::{parse_run_log, Classifier};
 use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
 use report::Report;
+pub use report::{duplicate_note, DuplicateNote};
 use shared::failure::{UserAction, UserActionCode};
 use shared::system::ImporterHealth;
 use std::ffi::OsString;
@@ -82,6 +84,7 @@ impl BeetsImporter {
         target: &Path,
         mode: ImportMode,
         choice: &DriverChoice,
+        duplicates: DuplicateRun,
     ) -> ImportResult {
         let s = &self.settings;
         let Some(python) = s.python.as_deref() else {
@@ -112,7 +115,7 @@ impl BeetsImporter {
             || self.state().report.as_ref().is_some_and(|r| !r.autotag);
 
         info!(
-            "beets import into {} ({mode:?}, {choice:?}): {:?}",
+            "beets import into {} ({mode:?}, {choice:?}, {duplicates:?}): {:?}",
             target.display(),
             sources
         );
@@ -121,7 +124,7 @@ impl BeetsImporter {
         let beet_args = import_args(s, sources, target, mode, &run_log.0);
         let spec = RunSpec {
             program: python,
-            args: driver_args(&report_file.0, choice, beet_args),
+            args: driver_args(&report_file.0, duplicates, choice, beet_args),
             limits: s.limits,
         };
         let run = run_beet(spec, &mut |stream, line| classifier.feed(stream, line)).await;
@@ -221,8 +224,17 @@ fn import_args(
 }
 
 /// Runs import.py, which runs beets' own CLI with `beet_args`.
-fn driver_args(report: &Path, choice: &DriverChoice, beet_args: Vec<OsString>) -> Vec<OsString> {
+fn driver_args(
+    report: &Path,
+    duplicates: DuplicateRun,
+    choice: &DriverChoice,
+    beet_args: Vec<OsString>,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["-P".into(), "-c".into(), IMPORT_PY.into(), report.into()];
+    args.push(match duplicates {
+        DuplicateRun::AsConfigured => "as-configured".into(),
+        DuplicateRun::ReportRemovals => "report-removals".into(),
+    });
     match choice {
         DriverChoice::Auto => args.push("auto".into()),
         DriverChoice::AsIs => args.push("asis".into()),
@@ -300,8 +312,20 @@ impl MusicImporter for BeetsImporter {
         target: &Path,
         mode: ImportMode,
         choice: &DriverChoice,
+        duplicates: DuplicateRun,
     ) -> ImportResult {
-        with_own_action(self.run_import(sources, target, mode, choice).await)
+        with_own_action(
+            self.run_import(sources, target, mode, choice, duplicates)
+                .await,
+        )
+    }
+
+    async fn relocate(
+        &self,
+        library: &Path,
+        item_ids: &[u64],
+    ) -> Result<Vec<(u64, PathBuf)>, String> {
+        library::move_items(&self.settings, library, item_ids).await
     }
 
     fn refused(&self, issue: String) -> ImportResult {
@@ -601,9 +625,22 @@ mod tests {
                 ],
             ),
         ] {
-            for mode in [ImportMode::Singleton, ImportMode::Album] {
+            for (mode, duplicates, token) in [
+                (
+                    ImportMode::Singleton,
+                    DuplicateRun::AsConfigured,
+                    "as-configured",
+                ),
+                (
+                    ImportMode::Album,
+                    DuplicateRun::ReportRemovals,
+                    "report-removals",
+                ),
+            ] {
                 stage(d, SKIPPED);
-                let result = importer.import(&[&src], &target, mode, &choice).await;
+                let result = importer
+                    .import(&[&src], &target, mode, &choice, duplicates)
+                    .await;
                 assert_eq!(
                     result.outcome,
                     ImportOutcome::Skipped(SkipReason::NoMatch {
@@ -622,8 +659,9 @@ mod tests {
                 );
                 assert!(!report.exists(), "report left behind");
 
-                let after = 4 + words.len();
-                assert_eq!(args[4..after], words[..]);
+                assert_eq!(args[4], token);
+                let after = 5 + words.len();
+                assert_eq!(args[5..after], words[..]);
                 assert_eq!(args[after], "--");
 
                 let beet_args = &args[after + 1..];
@@ -684,6 +722,7 @@ mod tests {
                 &d.join("lib"),
                 ImportMode::Singleton,
                 &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert_eq!(result.to_string(), "No close match (2 candidates)");
@@ -702,6 +741,7 @@ mod tests {
                 &d.join("lib"),
                 ImportMode::Singleton,
                 &DriverChoice::AsIs,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert_eq!(result.choices, None);
@@ -736,6 +776,7 @@ mod tests {
                 &d.join("lib"),
                 ImportMode::Singleton,
                 &pick,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert_eq!(
@@ -768,11 +809,23 @@ mod tests {
             },
         );
         let result = importer
-            .import(&[&src], &lib, ImportMode::Singleton, &DriverChoice::AsIs)
+            .import(
+                &[&src],
+                &lib,
+                ImportMode::Singleton,
+                &DriverChoice::AsIs,
+                DuplicateRun::AsConfigured,
+            )
             .await;
         assert_eq!(result.to_string(), "Imported as-is (untagged)");
         let result = importer
-            .import(&[&src], &lib, ImportMode::Singleton, &DriverChoice::Auto)
+            .import(
+                &[&src],
+                &lib,
+                ImportMode::Singleton,
+                &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
+            )
             .await;
         assert_eq!(result.to_string(), "Imported");
 
@@ -789,7 +842,13 @@ mod tests {
             },
         );
         let result = importer
-            .import(&[&src], &lib, ImportMode::Singleton, &DriverChoice::AsIs)
+            .import(
+                &[&src],
+                &lib,
+                ImportMode::Singleton,
+                &DriverChoice::AsIs,
+                DuplicateRun::AsConfigured,
+            )
             .await;
         assert_eq!(
             result.outcome,
@@ -817,6 +876,7 @@ mod tests {
                     &d.join("lib"),
                     ImportMode::Singleton,
                     &DriverChoice::Auto,
+                    DuplicateRun::AsConfigured,
                 )
                 .await;
             assert_eq!(result.outcome, no_match, "{report:?}");
@@ -863,6 +923,7 @@ mod tests {
                 &d.join("lib"),
                 ImportMode::Album,
                 &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert_eq!(
@@ -889,6 +950,7 @@ mod tests {
                 &target,
                 ImportMode::Album,
                 &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert!(target.is_dir());
@@ -900,6 +962,7 @@ mod tests {
                 &blocked,
                 ImportMode::Album,
                 &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert!(matches!(
@@ -1124,6 +1187,7 @@ mod tests {
                 dir.path(),
                 ImportMode::Album,
                 &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert_eq!(

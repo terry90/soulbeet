@@ -342,6 +342,7 @@ impl Classifier {
             tasks,
             choices: None,
             user_action: None,
+            removals: vec![],
         }
     }
 

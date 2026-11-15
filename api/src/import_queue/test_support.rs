@@ -10,8 +10,8 @@ use shared::download::{
 use shared::library::DuplicateReport;
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::{
-    DriverChoice, ForgetOutcome, ImportMode, ImportOutcome, ImportResult, ImportedItem,
-    MusicImporter, SkipReason, TaskCount,
+    DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
+    ImportedItem, MusicImporter, SkipReason, TaskCount,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,7 @@ pub fn imported() -> ImportResult {
         },
         choices: None,
         user_action: None,
+        removals: vec![],
     }
 }
 
@@ -56,6 +57,7 @@ pub fn no_match(candidates: u32) -> ImportResult {
         },
         choices: None,
         user_action: None,
+        removals: vec![],
     }
 }
 
@@ -110,8 +112,9 @@ pub fn row(item: &str) -> DownloadProgress {
     }
 }
 
-/// Answers imports from a script (Imported once it runs out), and forgets
-/// with one answer (Removed unless scripted).
+/// Answers imports from a script (Imported once it runs out), forgets with
+/// one answer (Removed unless scripted), and relocates by answering that it
+/// moved nothing.
 pub struct StubImporter {
     results: Mutex<VecDeque<ImportResult>>,
     delay: Duration,
@@ -125,8 +128,10 @@ pub struct StubImporter {
     max_active: AtomicUsize,
     seen: Mutex<Vec<(Vec<PathBuf>, PathBuf)>>,
     choices: Mutex<Vec<DriverChoice>>,
+    duplicate_runs: Mutex<Vec<DuplicateRun>>,
     forget_answer: Mutex<ForgetOutcome>,
     forgets: Mutex<Vec<(PathBuf, PathBuf)>>,
+    relocations: Mutex<Vec<(PathBuf, Vec<u64>)>>,
 }
 
 impl StubImporter {
@@ -143,8 +148,10 @@ impl StubImporter {
             max_active: AtomicUsize::new(0),
             seen: Mutex::new(vec![]),
             choices: Mutex::new(vec![]),
+            duplicate_runs: Mutex::new(vec![]),
             forget_answer: Mutex::new(ForgetOutcome::Removed),
             forgets: Mutex::new(vec![]),
+            relocations: Mutex::new(vec![]),
         }
     }
 
@@ -214,6 +221,16 @@ impl StubImporter {
         self.choices.lock().unwrap().clone()
     }
 
+    /// The duplicate handling of every import, in call order.
+    pub fn duplicate_runs(&self) -> Vec<DuplicateRun> {
+        self.duplicate_runs.lock().unwrap().clone()
+    }
+
+    /// Library and item ids of every relocate, in call order.
+    pub fn relocations(&self) -> Vec<(PathBuf, Vec<u64>)> {
+        self.relocations.lock().unwrap().clone()
+    }
+
     fn move_into(sources: &[&Path], target: &Path) {
         for source in sources {
             let files = if source.is_dir() {
@@ -256,9 +273,11 @@ impl MusicImporter for StubImporter {
         target: &Path,
         _: ImportMode,
         choice: &DriverChoice,
+        duplicates: DuplicateRun,
     ) -> ImportResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.choices.lock().unwrap().push(choice.clone());
+        self.duplicate_runs.lock().unwrap().push(duplicates);
         self.seen.lock().unwrap().push((
             sources.iter().map(|s| s.to_path_buf()).collect(),
             target.to_path_buf(),
@@ -283,6 +302,18 @@ impl MusicImporter for StubImporter {
             .unwrap()
             .pop_front()
             .unwrap_or_else(imported)
+    }
+
+    async fn relocate(
+        &self,
+        library: &Path,
+        item_ids: &[u64],
+    ) -> Result<Vec<(u64, PathBuf)>, String> {
+        self.relocations
+            .lock()
+            .unwrap()
+            .push((library.to_path_buf(), item_ids.to_vec()));
+        Ok(vec![])
     }
 
     fn refused(&self, issue: String) -> ImportResult {

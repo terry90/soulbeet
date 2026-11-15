@@ -96,6 +96,26 @@ pub enum DriverChoice {
     Pick { data_source: String, id: String },
 }
 
+/// What a run does when beets' config says `duplicate_action: remove`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateRun {
+    /// beets acts as configured.
+    AsConfigured,
+    /// beets keeps the earlier copy and reports the removal it wanted.
+    ReportRemovals,
+}
+
+/// One beets task's wanted removal: the earlier items beets would have deleted, and the items
+/// the task imported once their files were in place (empty when they never were).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WantedRemoval {
+    /// As `ImportedItem` names a library item: the path relative to the library folder.
+    pub existing: Vec<ImportedItem>,
+    /// Each imported item's id and where beets stored it, relative to the library folder when
+    /// inside it.
+    pub imported: Vec<(u64, PathBuf)>,
+}
+
 /// One file beets imported, as it stored it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportedItem {
@@ -202,6 +222,8 @@ pub struct ImportResult {
     /// person can fix what went wrong. The importer words it, since it names
     /// the importer's own setup.
     pub user_action: Option<UserAction>,
+    /// The removals beets wanted in a `DuplicateRun::ReportRemovals` run, one per task.
+    pub removals: Vec<WantedRemoval>,
 }
 
 impl ImportResult {
@@ -212,6 +234,7 @@ impl ImportResult {
             tasks: TaskCount::default(),
             choices: None,
             user_action: None,
+            removals: vec![],
         }
     }
 
@@ -351,7 +374,16 @@ pub trait MusicImporter: Send + Sync {
         target: &Path,
         mode: ImportMode,
         choice: &DriverChoice,
+        duplicates: DuplicateRun,
     ) -> ImportResult;
+
+    /// Moves the items with `item_ids` of the library of `library` to the paths beets gives
+    /// them, and returns each id with the absolute path its file now has.
+    async fn relocate(
+        &self,
+        library: &Path,
+        item_ids: &[u64],
+    ) -> std::result::Result<Vec<(u64, PathBuf)>, String>;
 
     /// The result of a job not run because of `issue`, the title of one of
     /// this importer's blocking health issues.

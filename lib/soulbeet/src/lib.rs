@@ -14,13 +14,14 @@ pub mod slskd;
 pub(crate) mod test_http;
 pub mod traits;
 
+pub use beets::{duplicate_note, DuplicateNote};
 pub use lastfm::LastFmProvider;
 pub use listenbrainz::ListenBrainzProvider;
 pub use metadata_error::MetadataError;
 pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
 pub use services::{Services, ServicesBuilder};
 pub use traits::{
-    CandidateGenerator, DownloadBackend, DriverChoice, FailKind, ForgetOutcome, ImportMode,
-    ImportOutcome, ImportResult, ImportedItem, MetadataProvider, MusicImporter, ScrobbleProvider,
-    SkipReason, TaskCount, TimeoutKind,
+    CandidateGenerator, DownloadBackend, DriverChoice, DuplicateRun, FailKind, ForgetOutcome,
+    ImportMode, ImportOutcome, ImportResult, ImportedItem, MetadataProvider, MusicImporter,
+    ScrobbleProvider, SkipReason, TaskCount, TimeoutKind, WantedRemoval,
 };
