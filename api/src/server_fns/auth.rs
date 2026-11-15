@@ -192,10 +192,11 @@ enum Credentials {
     },
 }
 
-/// Decides a sign-in. The limiter is checked before Navidrome is asked, every
-/// failed local verification is recorded, and a success clears the account.
-/// The clock is read when each decision is made, so a slow Navidrome call
-/// does not backdate a recorded failure.
+/// Decides a sign-in. The limiter admits the attempt before Navidrome is
+/// asked, a failed local verification is recorded, and a success clears the
+/// account. A database error records nothing. The clock is read when each
+/// decision is made, so a slow Navidrome call does not backdate a recorded
+/// failure.
 #[cfg(feature = "server")]
 async fn authenticate_in(
     db: &sqlx::SqlitePool,
@@ -207,27 +208,26 @@ async fn authenticate_in(
 ) -> Result<Credentials, ServerFnError> {
     use shared::system::NavidromeStatus;
 
-    limiter
-        .check(username, clock())
+    let attempt = limiter
+        .begin(username, clock())
         .map_err(rate_limited_error)?;
-
-    let rejected = || {
-        limiter.record_failure(username, clock());
-        unauthorized_error("Invalid username or password")
-    };
 
     let result = navidrome.await;
     if matches!(result, NavidromeAuthResult::Success) {
-        limiter.record_success(username);
+        attempt.succeeded();
         return Ok(Credentials::Navidrome);
     }
 
     // Navidrome rejected the credentials, is down, or is not set up: fall back
     // to the local password.
-    let user = models::user::User::verify_in(db, username, password)
+    let Some(user) = models::user::User::verify_in(db, username, password)
         .await
-        .map_err(|_| rejected())?;
-    limiter.record_success(username);
+        .map_err(server_error)?
+    else {
+        attempt.failed(clock());
+        return Err(unauthorized_error("Invalid username or password"));
+    };
+    attempt.succeeded();
     // Without Navidrome the status stays Unknown ("not configured") so the UI
     // does not report a server that is down.
     let status = match result {
@@ -569,8 +569,8 @@ mod tests {
             assert_eq!(code(&err), 401);
         }
         assert!(matches!(
-            limiter.check("ann", now),
-            Err(LoginBlock::Account { .. })
+            limiter.begin("ann", now).err(),
+            Some(LoginBlock::Account { .. })
         ));
     }
 
@@ -594,8 +594,8 @@ mod tests {
             assert_eq!(code(&err), 401);
         }
         assert!(matches!(
-            limiter.check("ghost", now),
-            Err(LoginBlock::Account { .. })
+            limiter.begin("ghost", now).err(),
+            Some(LoginBlock::Account { .. })
         ));
     }
 
@@ -606,7 +606,7 @@ mod tests {
         let limiter = LoginLimiter::new();
         let now = Instant::now();
         for _ in 0..=FREE_FAILURES {
-            limiter.record_failure("ann", now);
+            limiter.begin("ann", now).unwrap().failed(now);
         }
         let asked = std::cell::Cell::new(false);
         let err = authenticate_in(&db, &limiter, "ann", "right", || now, async {
@@ -628,7 +628,7 @@ mod tests {
         let limiter = LoginLimiter::new();
         let now = Instant::now();
         for _ in 0..FREE_FAILURES {
-            limiter.record_failure("ann", now);
+            limiter.begin("ann", now).unwrap().failed(now);
         }
         let ok = sign_in(
             &db,
@@ -647,8 +647,8 @@ mod tests {
                 ..
             }
         ));
-        limiter.record_failure("ann", now);
-        assert_eq!(limiter.check("ann", now), Ok(()));
+        limiter.begin("ann", now).unwrap().failed(now);
+        assert!(limiter.begin("ann", now).is_ok());
     }
 
     #[tokio::test]
@@ -657,7 +657,7 @@ mod tests {
         let limiter = LoginLimiter::new();
         let now = Instant::now();
         for _ in 0..FREE_FAILURES {
-            limiter.record_failure("ann", now);
+            limiter.begin("ann", now).unwrap().failed(now);
         }
         let ok = sign_in(
             &db,
@@ -670,8 +670,8 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(ok, Credentials::Navidrome));
-        limiter.record_failure("ann", now);
-        assert_eq!(limiter.check("ann", now), Ok(()));
+        limiter.begin("ann", now).unwrap().failed(now);
+        assert!(limiter.begin("ann", now).is_ok());
     }
 
     #[tokio::test]
@@ -681,7 +681,7 @@ mod tests {
         let start = Instant::now();
         let later = start + std::time::Duration::from_secs(30);
         for _ in 0..FREE_FAILURES {
-            limiter.record_failure("ghost", start);
+            limiter.begin("ghost", start).unwrap().failed(start);
         }
         let calls = std::cell::Cell::new(0);
         let clock = || {
@@ -701,9 +701,32 @@ mod tests {
         assert_eq!(code(&err), 401);
         // The failure sits at `later`, so the wait runs from there.
         assert!(matches!(
-            limiter.check("ghost", later),
-            Err(LoginBlock::Account { .. })
+            limiter.begin("ghost", later).err(),
+            Some(LoginBlock::Account { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_database_error_is_a_server_error_and_records_nothing() {
+        let db = test_db::migrated().await;
+        db.close().await;
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..=FREE_FAILURES {
+            let err = sign_in(
+                &db,
+                &limiter,
+                "ann",
+                "pw",
+                now,
+                NavidromeAuthResult::NotConfigured,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(code(&err), 500);
+        }
+        assert!(limiter.begin("ann", now).is_ok());
     }
 
     fn account(linked: bool, local_password_ok: bool) -> Option<ExistingAccount> {

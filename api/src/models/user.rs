@@ -89,27 +89,19 @@ impl User {
         .map_err(|e| e.to_string())
     }
 
-    pub async fn verify(username: &str, password: &str) -> Result<User, String> {
-        Self::verify_in(&DB, username, password).await
-    }
-
+    /// The user whose name and password these are, or `None` for an unknown
+    /// name or a wrong password. `Err` is a database failure.
     pub(crate) async fn verify_in(
         db: &SqlitePool,
         username: &str,
         password: &str,
-    ) -> Result<User, String> {
+    ) -> Result<Option<User>, String> {
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
             .bind(username)
             .fetch_optional(db)
             .await
-            .map_err(|e| e.to_string())?
-            .ok_or("User not found")?;
-
-        if !user.password_matches(password) {
-            return Err("Invalid password".into());
-        }
-
-        Ok(user)
+            .map_err(|e| e.to_string())?;
+        Ok(user.filter(|u| u.password_matches(password)))
     }
 
     pub fn password_matches(&self, password: &str) -> bool {
