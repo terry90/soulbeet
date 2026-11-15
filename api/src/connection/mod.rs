@@ -16,6 +16,7 @@ use serde_json::json;
 
 use crate::base_url::{explain_request, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
+use crate::oauth::limits::Limits;
 use crate::security::GateReason;
 
 #[cfg(test)]
@@ -26,6 +27,8 @@ pub struct ConnectionState {
     pub(crate) mcp_enabled: bool,
     pub(crate) public_url: Option<Result<BaseUrl, BaseUrlError>>,
     pub(crate) gate: fn() -> Vec<GateReason>,
+    pub(crate) db: sqlx::SqlitePool,
+    pub(crate) limits: Arc<Limits>,
 }
 
 impl ConnectionState {
@@ -35,6 +38,8 @@ impl ConnectionState {
             mcp_enabled: CONFIG.mcp_enabled(),
             public_url: CONFIG.public_url().cloned(),
             gate: crate::security::gate_reasons,
+            db: (*crate::db::DB).clone(),
+            limits: Arc::new(Limits::default()),
         }
     }
 }
@@ -158,12 +163,13 @@ pub(crate) fn refusal_with(
 mod tests {
     use super::test_util::*;
     use super::*;
+    use crate::db::test_db;
 
     #[tokio::test]
     async fn the_endpoints_answer_404_while_mcp_is_off() {
         let state = ConnectionState {
             mcp_enabled: false,
-            ..ConnectionState::for_test()
+            ..ConnectionState::for_test(test_db::migrated().await)
         };
         let (status, _, body) = get_json(
             router(state),
@@ -185,7 +191,7 @@ mod tests {
         }
         let state = ConnectionState {
             gate: both,
-            ..ConnectionState::for_test()
+            ..ConnectionState::for_test(test_db::migrated().await)
         };
         let (status, _, body) = get_json(router(state), "/oauth/token", &[("host", HOST)]).await;
         assert_eq!(
@@ -209,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn a_plain_http_address_off_loopback_is_refused() {
         let (status, _, body) = get_json(
-            router(ConnectionState::for_test()),
+            router(ConnectionState::for_test(test_db::migrated().await)),
             "/.well-known/oauth-protected-resource/mcp",
             &[("host", "192.168.1.5:9765")],
         )
@@ -230,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn an_address_that_cannot_be_read_is_refused() {
         let (status, _, body) = get_json(
-            router(ConnectionState::for_test()),
+            router(ConnectionState::for_test(test_db::migrated().await)),
             "/oauth/token",
             &[("host", HOST), ("x-forwarded-proto", "gopher")],
         )
@@ -248,7 +254,7 @@ mod tests {
     async fn loopback_http_is_served() {
         // localhost:9765 has no route yet: the guard let it through to the 404.
         let (status, _, body) = get_json(
-            router(ConnectionState::for_test()),
+            router(ConnectionState::for_test(test_db::migrated().await)),
             "/oauth/nothing",
             &[("host", "localhost:9765")],
         )
@@ -266,8 +272,12 @@ mod tests {
             ("/.well-known/oauth-nothing", HOST),
             ("/oauth/nothing", "192.168.1.5"),
         ] {
-            let (_, headers, _) =
-                get_json(router(ConnectionState::for_test()), path, &[("host", host)]).await;
+            let (_, headers, _) = get_json(
+                router(ConnectionState::for_test(test_db::migrated().await)),
+                path,
+                &[("host", host)],
+            )
+            .await;
             assert_eq!(headers["cache-control"], "no-store", "{path}");
             assert_eq!(
                 headers["vary"], "Forwarded, X-Forwarded-Host, X-Forwarded-Proto, Host",

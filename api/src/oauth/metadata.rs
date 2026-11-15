@@ -50,9 +50,10 @@ mod tests {
 
     use crate::connection::test_util::*;
     use crate::connection::{router, ConnectionState};
+    use crate::db::test_db;
 
     async fn app() -> Router {
-        router(ConnectionState::for_test())
+        router(ConnectionState::for_test(test_db::migrated().await))
     }
 
     #[tokio::test]

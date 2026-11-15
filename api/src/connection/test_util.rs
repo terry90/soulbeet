@@ -1,27 +1,35 @@
 //! Shared helpers for the connection router's tests.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::Router;
+use sqlx::SqlitePool;
 use tower::ServiceExt;
 
 use super::ConnectionState;
+use crate::oauth::limits::Limits;
 
 impl ConnectionState {
-    /// MCP on, no `PUBLIC_URL`, no gate reasons.
-    pub(crate) fn for_test() -> ConnectionState {
+    /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits.
+    pub(crate) fn for_test(db: SqlitePool) -> ConnectionState {
         ConnectionState {
             mcp_enabled: true,
             public_url: None,
             gate: Vec::new,
+            db,
+            limits: Arc::new(Limits::default()),
         }
     }
 }
 
 /// A named host: with no proxy hint it derives `https://music.example.com`.
 pub(crate) const HOST: &str = "music.example.com";
+
+/// Claude's redirect URI (claude.com `connectors/building/authentication.md:211`).
+pub(crate) const CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
 
 /// Sends `req` to `app` and reads the whole answer, the body within 5 s.
 pub(crate) async fn send(app: Router, req: Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
@@ -47,7 +55,26 @@ pub(crate) async fn get_json(
     for (name, value) in headers {
         req = req.header(*name, *value);
     }
-    let (status, headers, body) = send(app, req.body(Body::empty()).unwrap()).await;
+    send_json(app, req.body(Body::empty()).unwrap()).await
+}
+
+/// A `POST` of `body` as `application/json` to `path` on `HOST`; the answer
+/// parsed as `get_json` parses it.
+pub(crate) async fn post_json(
+    app: Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, HeaderMap, serde_json::Value) {
+    let req = Request::post(path)
+        .header("host", HOST)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    send_json(app, req).await
+}
+
+async fn send_json(app: Router, req: Request<Body>) -> (StatusCode, HeaderMap, serde_json::Value) {
+    let (status, headers, body) = send(app, req).await;
     let json = if body.is_empty() {
         serde_json::Value::Null
     } else {
@@ -59,4 +86,12 @@ pub(crate) async fn get_json(
         })
     };
     (status, headers, json)
+}
+
+/// The rows in `table`, a test's literal table name.
+pub(crate) async fn count(db: &SqlitePool, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+        .fetch_one(db)
+        .await
+        .unwrap()
 }
