@@ -6,7 +6,7 @@ use super::{
     JOB_KEPT_SECS, SEARCH_KEPT_SECS, TERMINAL,
 };
 use crate::auth::UserId;
-use shared::download::{DownloadProgress, DownloadState, DownloadableGroup, JobSlot};
+use shared::download::{DownloadProgress, DownloadState, DownloadableGroup, IndexState, JobSlot};
 use shared::failure::FailureCode;
 use soulbeet::ImportMode;
 use sqlx::{Sqlite, SqliteConnection, SqlitePool};
@@ -79,6 +79,7 @@ struct RowKey {
     state: JobState,
     row: Discriminant<DownloadState>,
     failure: Option<FailureCode>,
+    index: Option<Discriminant<IndexState>>,
 }
 
 impl RowKey {
@@ -87,6 +88,7 @@ impl RowKey {
             state,
             row: std::mem::discriminant(&row.state),
             failure: row.failure.as_ref().map(|f| f.code),
+            index: row.index.as_ref().map(std::mem::discriminant),
         }
     }
 }

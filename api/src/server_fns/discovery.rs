@@ -2252,67 +2252,16 @@ mod tests {
         assert!(failed_ids.contains("t-b/07 - Wake Up.flac"));
     }
 
-    /// A Navidrome whose scan status cannot be read (getLastScanTime's
-    /// `Internal Error`, server/subsonic/library_scanning.go:16-21) and
-    /// that accepts a scan; gives its URL and the endpoints it was asked for.
-    fn navidrome_without_scan_status() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
-        use std::io::{BufRead, BufReader, Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = asked.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let mut reader = BufReader::new(stream.unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let target = line.split_whitespace().nth(1).unwrap_or_default();
-                let endpoint = target.split('?').next().unwrap_or_default().to_string();
-                let mut length = 0;
-                loop {
-                    let mut header = String::new();
-                    reader.read_line(&mut header).unwrap();
-                    if header.trim().is_empty() {
-                        break;
-                    }
-                    if let Some((name, value)) = header.split_once(':') {
-                        if name.eq_ignore_ascii_case("content-length") {
-                            length = value.trim().parse().unwrap();
-                        }
-                    }
-                }
-                reader.read_exact(&mut vec![0; length]).unwrap();
-                let body = match endpoint.as_str() {
-                    "/rest/getScanStatus" => {
-                        r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Internal Error"}}}"#
-                    }
-                    _ => r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#,
-                };
-                recorded.lock().unwrap().push(endpoint);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                reader.get_mut().write_all(response.as_bytes()).unwrap();
-            }
-        });
-        (url, asked)
-    }
-
     #[tokio::test]
     async fn a_scan_status_that_cannot_be_read_still_starts_the_scan() {
-        let (url, asked) = navidrome_without_scan_status();
-        let navi = soulbeet::navidrome::NavidromeClientBuilder::new()
-            .base_url(&url)
-            .username("alice")
-            .password("secret")
-            .build()
-            .unwrap();
-        assert!(scan_imports(&navi, 3).await);
-        assert_eq!(
-            *asked.lock().unwrap(),
-            vec!["/rest/getScanStatus", "/rest/startScan"]
+        // getLastScanTime's `Internal Error` (server/subsonic/library_scanning.go:16-21); the scan
+        // is accepted.
+        let navi = crate::test_navidrome::NavidromeStub::start();
+        navi.answer(
+            "/rest/getScanStatus",
+            &[r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Internal Error"}}}"#],
         );
+        assert!(scan_imports(&navi.client(), 3).await);
+        assert_eq!(navi.asked(), vec!["/rest/getScanStatus", "/rest/startScan"]);
     }
 }

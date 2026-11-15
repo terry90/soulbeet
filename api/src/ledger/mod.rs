@@ -431,7 +431,7 @@ pub fn start_server_ledger() {
 mod tests {
     use super::*;
     use crate::server_fns::download::test_support::{group, item};
-    use shared::download::{DownloadProgress, DownloadState};
+    use shared::download::{DownloadProgress, DownloadState, IndexState};
 
     async fn ledger() -> (Ledger, SqlitePool, String, String) {
         let db = crate::db::test_db::migrated().await;
@@ -754,6 +754,35 @@ mod tests {
         assert_eq!(
             (rows[0].state.clone(), rows[0].transferred),
             (DownloadState::Completed, 100)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_index_change_reaches_the_disk() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![(0, item("peer_a", "One", "01.flac"))],
+        });
+        let imported = row_of("j1", 0, "01.flac", DownloadState::Imported, 100);
+        let waiting = DownloadProgress {
+            index: Some(IndexState::Waiting),
+            ..imported.clone()
+        };
+        for row in [imported, waiting.clone()] {
+            ledger.record(JobEvent::Slots {
+                state: JobState::Indexing,
+                rows: vec![row],
+            });
+        }
+        ledger.settled().await;
+        assert_eq!(
+            store::open_rows(&db, &UserId::new("alice")).await.unwrap(),
+            vec![waiting]
         );
     }
 

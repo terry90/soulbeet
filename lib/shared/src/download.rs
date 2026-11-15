@@ -194,6 +194,18 @@ pub struct DownloadProgress {
     /// The ledger job slot this row is the file of. Never sent to the browser.
     #[serde(skip)]
     pub job: Option<JobSlot>,
+    /// For an imported row, whether Navidrome lists its file; None before its wait and without Navidrome
+    #[serde(default)]
+    pub index: Option<IndexState>,
+}
+
+/// Whether Navidrome lists an imported row's file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexState {
+    Waiting,
+    Listed,
+    Failed(Failure),
 }
 
 /// One file of a ledger job: the job's id and the file's slot in it.
@@ -235,6 +247,7 @@ impl DownloadProgress {
             queued_at_source: false,
             pending_retry: None,
             job: None,
+            index: None,
         }
     }
 
@@ -525,6 +538,7 @@ mod tests {
         assert_eq!(row.skip, None);
         assert!(!row.queued_at_source);
         assert_eq!(row.job, None);
+        assert_eq!(row.index, None);
         let sent = serde_json::to_value(row.with_job(JobSlot {
             job: "j1".into(),
             slot: 0,

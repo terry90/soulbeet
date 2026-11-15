@@ -1,6 +1,6 @@
 //! Reads of the ledger, straight from the pool.
 
-use super::{JobState, TERMINAL};
+use super::{IndexWait, JobState, TERMINAL};
 use crate::auth::UserId;
 use shared::download::{DownloadProgress, DownloadQuery, DownloadableGroup, JobSlot};
 use sqlx::SqlitePool;
@@ -70,6 +70,39 @@ pub async fn open_rows(
         .await?;
     rows.into_iter()
         .map(|(job, slot, row)| Ok(json::<DownloadProgress>(&row)?.with_job(JobSlot { job, slot })))
+        .collect()
+}
+
+/// A slot waiting for Navidrome to list its import, with its owner, its last row (its `job` set)
+/// and the wait.
+pub struct IndexingSlot {
+    pub slot: JobSlot,
+    pub user: UserId,
+    pub row: DownloadProgress,
+    pub wait: IndexWait,
+}
+
+/// Every slot in `indexing`, oldest job first.
+pub async fn indexing_slots(db: &SqlitePool) -> Result<Vec<IndexingSlot>, sqlx::Error> {
+    let rows: Vec<(String, u32, String, String, String)> = sqlx::query_as(
+        "SELECT t.job_id, t.slot, j.user_id, t.last_row, t.index_wait \
+         FROM job_tracks t JOIN jobs j ON j.id = t.job_id \
+         WHERE t.state = ? AND t.last_row IS NOT NULL AND t.index_wait IS NOT NULL \
+         ORDER BY j.created_at, j.rowid, t.slot",
+    )
+    .bind(JobState::Indexing.as_str())
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|(job, slot, user, row, wait)| {
+            let slot = JobSlot { job, slot };
+            Ok(IndexingSlot {
+                row: json::<DownloadProgress>(&row)?.with_job(slot.clone()),
+                slot,
+                user: UserId::new(&user),
+                wait: json(&wait)?,
+            })
+        })
         .collect()
 }
 

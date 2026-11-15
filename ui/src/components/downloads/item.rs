@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use dioxus::prelude::*;
-use shared::download::{DownloadProgress, DownloadState, ImportChoice};
+use shared::download::{DownloadProgress, DownloadState, ImportChoice, IndexState};
 
 use super::picker::{ChoicesLoader, MatchPicker};
 use super::Failure;
@@ -99,6 +99,19 @@ fn note<'a>(
     cancel_refusal: Option<&'a str>,
 ) -> Option<(&'static str, &'a str)> {
     reason(row).or_else(|| cancel_refusal.map(|refusal| ("text-red-400", refusal)))
+}
+
+/// An imported row's line on Navidrome and its text class: whether it lists the file yet, or why
+/// not.
+fn index_line(row: &DownloadProgress) -> Option<(&'static str, &str)> {
+    if row.state != DownloadState::Imported {
+        return None;
+    }
+    Some(match row.index.as_ref()? {
+        IndexState::Waiting => ("text-gray-300", "Waiting for Navidrome"),
+        IndexState::Listed => ("text-gray-300", "In Navidrome"),
+        IndexState::Failed(failure) => ("text-yellow-400", failure.message.as_str()),
+    })
 }
 
 /// Cancels the row's transfer. Resolves to why the server refused, if it did.
@@ -251,6 +264,9 @@ pub fn DownloadItem(
         // The only element holding the reason: e2e matches it by text.
         if let Some((note_class, note)) = note {
           div { class: "text-xs {note_class} mt-1 break-words", "{note}" }
+        }
+        if let Some((index_class, index)) = index_line(&file) {
+          div { class: "text-xs {index_class} font-mono mt-1", "{index}" }
         }
         if let (true, Some(kept)) = (file.retryable, &file.local_path) {
           div { class: "text-xs text-gray-500 font-mono mt-1 break-all", "Kept in {kept}" }
@@ -426,6 +442,32 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn an_imported_row_says_whether_navidrome_lists_it() {
+        let failure = shared::failure::Failure::new(
+            shared::failure::FailureCode::IndexNotFoundAfterScan,
+            shared::failure::Stage::Index,
+            shared::failure::RetryAdvice::NotRetryable,
+            "Navidrome scanned the library after this import and does not list the file",
+        );
+        for (index, text) in [
+            (IndexState::Waiting, "Waiting for Navidrome"),
+            (IndexState::Listed, "In Navidrome"),
+            (
+                IndexState::Failed(failure.clone()),
+                failure.message.as_str(),
+            ),
+        ] {
+            let html = render(DownloadProgress {
+                index: Some(index),
+                ..row(DownloadState::Imported, None)
+            });
+            assert!(html.contains(text), "{html}");
+        }
+        let html = render(row(DownloadState::Imported, None));
+        assert!(!html.contains("Navidrome"), "{html}");
     }
 
     #[test]
