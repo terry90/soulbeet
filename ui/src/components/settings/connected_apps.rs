@@ -1,0 +1,232 @@
+use api::connections::ConnectedApp;
+use api::{get_connected_apps, revoke_connected_app, set_app_deletion};
+use dioxus::prelude::*;
+
+use super::panel::{utc_time, ListRow, LoadError, Loading, Messages, Panel, REMOVE_BUTTON_CLASS};
+use crate::auth::use_auth;
+use crate::{friendly_error, ConfirmModal};
+
+/// The page's origin, `https://music.example.com`. Empty until the first
+/// effect runs, which happens only in the browser, so the server render and
+/// the hydrated page agree.
+pub(super) fn use_browser_origin() -> Signal<String> {
+    let origin = use_signal(String::new);
+    use_effect(move || {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(found) = web_sys::window().and_then(|w| w.location().origin().ok()) {
+            let mut origin = origin;
+            origin.set(found);
+        }
+    });
+    origin
+}
+
+/// Shown to every user: the apps they connected. An admin sees every user's.
+#[component]
+pub fn ConnectedAppsPanel() -> Element {
+    let auth = use_auth();
+    let origin = use_browser_origin();
+    let mut apps = use_resource(move || async move { auth.call(get_connected_apps()).await });
+    let mut error = use_signal(String::new);
+
+    // Every change reloads the list, so it shows what the server holds.
+    let mut finish = move |result: Result<(), ServerFnError>| {
+        match result {
+            Ok(()) => error.set(String::new()),
+            Err(e) => error.set(friendly_error(&e)),
+        }
+        apps.restart();
+    };
+
+    rsx! {
+        Panel { title: "Connected apps",
+            Messages { error: error() }
+            match &*apps.read() {
+                None => rsx! { Loading {} },
+                Some(Err(e)) => rsx! {
+                    LoadError { message: friendly_error(e), on_retry: move |_| apps.restart() }
+                },
+                Some(Ok(list)) => rsx! {
+                    AppList {
+                        apps: list.clone(),
+                        origin: origin(),
+                        on_allow_delete: move |(grant_id, allowed): (String, bool)| {
+                            spawn(async move { finish(auth.call(set_app_deletion(grant_id, allowed)).await) });
+                        },
+                        on_disconnect: move |grant_id: String| {
+                            spawn(async move { finish(auth.call(revoke_connected_app(grant_id)).await) });
+                        },
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// An app the user asked to disconnect, waiting for confirmation.
+#[derive(Clone, PartialEq)]
+struct PendingDisconnect {
+    grant_id: String,
+    app_host: String,
+}
+
+/// One row per app, or how to connect one. `origin` is the page's, empty
+/// until the browser has it.
+#[component]
+fn AppList(
+    apps: Vec<ConnectedApp>,
+    origin: String,
+    on_allow_delete: EventHandler<(String, bool)>,
+    on_disconnect: EventHandler<String>,
+) -> Element {
+    let mut pending = use_signal(|| None::<PendingDisconnect>);
+
+    rsx! {
+        if apps.is_empty() {
+            p { class: "text-sm font-mono text-gray-300",
+                "No app is connected. Add {origin}/mcp as a custom connector in Claude to connect one."
+            }
+        } else {
+            ul { class: "space-y-2",
+                for app in apps {
+                    ListRow { key: "{app.grant_id}",
+                        div { class: "flex justify-between items-start flex-wrap gap-2",
+                            div { class: "text-sm font-mono text-gray-300 space-y-1",
+                                div {
+                                    span { class: "font-bold text-white font-display", "{app.app_host}" }
+                                    if let Some(owner) = &app.owner {
+                                        span { class: "text-gray-500 ml-2", "({owner})" }
+                                    }
+                                }
+                                if let Some(name) = &app.client_name {
+                                    div { class: "text-xs text-gray-400", "It calls itself \"{name}\"." }
+                                }
+                                div { class: "text-xs text-gray-400",
+                                    match app.last_used_at {
+                                        Some(at) => format!("Last used {}", utc_time(at, "%Y-%m-%d")),
+                                        None => "Never used".to_string(),
+                                    }
+                                }
+                                if app.mine {
+                                    label { class: "flex items-center gap-2 text-xs cursor-pointer",
+                                        input {
+                                            r#type: "checkbox",
+                                            checked: app.allow_delete,
+                                            onchange: {
+                                                let grant_id = app.grant_id.clone();
+                                                move |e: FormEvent| on_allow_delete.call((grant_id.clone(), e.checked()))
+                                            },
+                                        }
+                                        "Allow deleting music"
+                                    }
+                                }
+                            }
+                            button {
+                                class: REMOVE_BUTTON_CLASS,
+                                onclick: {
+                                    let asked = PendingDisconnect {
+                                        grant_id: app.grant_id.clone(),
+                                        app_host: app.app_host.clone(),
+                                    };
+                                    move |_| pending.set(Some(asked.clone()))
+                                },
+                                "Disconnect"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(asked) = pending() {
+            ConfirmModal {
+                message: format!(
+                    "Disconnect {}? It will have to be connected again from the app.",
+                    asked.app_host,
+                ),
+                confirm_label: "Disconnect",
+                danger: true,
+                on_confirm: move |_| {
+                    pending.set(None);
+                    on_disconnect.call(asked.grant_id.clone());
+                },
+                on_cancel: move |_| pending.set(None),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(apps: Vec<ConnectedApp>, origin: &str) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |(apps, origin): (Vec<ConnectedApp>, String)| {
+                rsx! {
+                    AppList { apps, origin, on_allow_delete: |_| {}, on_disconnect: |_| {} }
+                }
+            },
+            (apps, origin.to_string()),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn app(
+        mine: bool,
+        owner: Option<&str>,
+        allow_delete: bool,
+        last_used_at: Option<i64>,
+    ) -> ConnectedApp {
+        ConnectedApp {
+            grant_id: "g1".into(),
+            app_host: "claude.ai".into(),
+            client_name: Some("Claude".into()),
+            owner: owner.map(Into::into),
+            last_used_at,
+            allow_delete,
+            mine,
+        }
+    }
+
+    #[test]
+    fn an_app_row_shows_its_host_name_and_switch() {
+        // 1_800_000_000 is 2027-01-15T08:00:00Z
+        let html = render(
+            vec![app(true, None, true, Some(1_800_000_000))],
+            "https://music.example.com",
+        );
+        // dioxus-ssr escapes text with askama_escape (dioxus-ssr 0.7.4 src/renderer.rs:197),
+        // which writes a quote as &#34; (askama_escape 0.13.0 src/html.rs:64,113)
+        for text in [
+            "claude.ai",
+            "It calls itself &#34;Claude&#34;.",
+            "Last used 2027-01-15",
+            "Allow deleting music",
+            "checked",
+            "Disconnect",
+        ] {
+            assert!(html.contains(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn another_users_app_has_no_switch_for_the_admin() {
+        let html = render(
+            vec![app(false, Some("bob"), false, None)],
+            "https://music.example.com",
+        );
+        assert!(
+            html.contains("(bob)") && html.contains("Never used") && html.contains("Disconnect")
+        );
+        assert!(!html.contains("Allow deleting music"));
+    }
+
+    #[test]
+    fn no_apps_says_how_to_connect_one() {
+        let html = render(vec![], "https://music.example.com");
+        assert!(html.contains(
+            "No app is connected. Add https://music.example.com/mcp as a custom connector in Claude to connect one."
+        ));
+    }
+}

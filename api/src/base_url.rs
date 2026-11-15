@@ -81,6 +81,15 @@ impl BaseUrl {
     pub fn same_host(&self, other: &BaseUrl) -> bool {
         self.host == other.host && self.port == other.port
     }
+
+    /// The host, then `:{port}` when the address has a port:
+    /// `music.example.com`, `soulful:9765`.
+    pub fn host_str(&self) -> String {
+        match self.port {
+            Some(port) => format!("{}:{port}", self.host),
+            None => self.host.to_string(),
+        }
+    }
 }
 
 /// The one loopback rule: the domain `localhost`, any IPv4 address in
@@ -95,11 +104,7 @@ pub(crate) fn is_loopback_host(host: &Host<&str>) -> bool {
 
 impl std::fmt::Display for BaseUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}://{}", self.scheme.as_str(), self.host)?;
-        if let Some(port) = self.port {
-            write!(f, ":{port}")?;
-        }
-        Ok(())
+        write!(f, "{}://{}", self.scheme.as_str(), self.host_str())
     }
 }
 

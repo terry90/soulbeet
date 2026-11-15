@@ -7,22 +7,25 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::http::header::{self, CACHE_CONTROL, VARY};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
 use serde_json::json;
 
-use crate::base_url::{explain_request, BaseUrl, BaseUrlError};
+use crate::base_url::{explain_request, BaseExplanation, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
+use crate::connections::LoggedRequest;
 use crate::mcp::status::{LiveStatus, StatusSource};
 use crate::oauth::cimd::{CimdFetcher, ClientDocuments, UnbuiltFetcher};
 use crate::oauth::limits::Limits;
 use crate::security::GateReason;
+use log::{base_and_problem, header_value, RequestLog, LIVE_LOG};
 
 #[cfg(test)]
 mod flow_tests;
+pub(crate) mod log;
 #[cfg(test)]
 pub(crate) mod test_util;
 
@@ -39,6 +42,8 @@ pub struct ConnectionState {
     pub(crate) documents: Arc<dyn ClientDocuments>,
     /// Where `get_status` reads its facts.
     pub(crate) status: Arc<dyn StatusSource>,
+    /// Where the guard records each request.
+    pub(crate) log: Arc<RequestLog>,
 }
 
 impl ConnectionState {
@@ -59,6 +64,7 @@ impl ConnectionState {
                 }
             },
             status: Arc::new(LiveStatus),
+            log: LIVE_LOG.clone(),
         }
     }
 }
@@ -91,13 +97,20 @@ async fn not_found() -> Response {
 
 /// Refuses the request or runs the route with its `RequestBase`, then marks
 /// the answer uncached and dependent on the headers its address was read
-/// from, next to any `Vary` the route set.
+/// from, next to any `Vary` the route set, and records the request and its
+/// answer in the log.
 async fn guard(
     State(state): State<Arc<ConnectionState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let mut response = match admit(&state, request.headers(), request.uri()) {
+    let explained = explain_request(request.headers(), request.uri(), state.public_url.as_ref());
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let [host_header, x_forwarded_host, x_forwarded_proto, forwarded] =
+        ["host", "x-forwarded-host", "x-forwarded-proto", "forwarded"]
+            .map(|name| header_value(request.headers(), name));
+    let mut response = match admit(&state, &explained) {
         Err(refused) => refused,
         Ok(base) => {
             request.extensions_mut().insert(RequestBase(base));
@@ -110,11 +123,30 @@ async fn guard(
         VARY,
         HeaderValue::from_static("Forwarded, X-Forwarded-Host, X-Forwarded-Proto, Host"),
     );
+    let (base, base_problem) = base_and_problem(&explained.result);
+    state.log.record(LoggedRequest {
+        at: crate::oauth::now_unix(),
+        method,
+        path,
+        base,
+        base_problem,
+        host_from: explained.host_from.as_str().into(),
+        scheme_from: explained.scheme_from.as_str().into(),
+        host_header,
+        x_forwarded_host,
+        x_forwarded_proto,
+        forwarded,
+        status: response.status().as_u16(),
+        refusal: response
+            .extensions()
+            .get::<RefusalCode>()
+            .map(|RefusalCode(code)| code.to_string()),
+    });
     response
 }
 
 /// The request's address, or the refusal of the request.
-fn admit(state: &ConnectionState, headers: &HeaderMap, uri: &Uri) -> Result<BaseUrl, Response> {
+fn admit(state: &ConnectionState, explained: &BaseExplanation) -> Result<BaseUrl, Response> {
     if !state.mcp_enabled {
         return Err(refusal(
             StatusCode::NOT_FOUND,
@@ -131,9 +163,8 @@ fn admit(state: &ConnectionState, headers: &HeaderMap, uri: &Uri) -> Result<Base
             json!({ "reasons": reasons }),
         ));
     }
-    let explained = explain_request(headers, uri, state.public_url.as_ref());
-    let base = match explained.result {
-        Ok(base) => base,
+    let base = match &explained.result {
+        Ok(base) => base.clone(),
         Err(e) => {
             return Err(refusal(
                 StatusCode::BAD_REQUEST,
@@ -172,15 +203,24 @@ pub async fn deny_framing(mut response: Response) -> Response {
     response
 }
 
+/// The `error` code of a connection layer refusal, in its response's
+/// extensions for the guard's log.
+#[derive(Clone, Copy)]
+struct RefusalCode(&'static str);
+
 /// The connection layer's refusal: `{"error": code, "message": message}`.
-pub(crate) fn refusal(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+pub(crate) fn refusal(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> Response {
     refusal_with(status, code, message, json!({}))
 }
 
 /// `refusal` with the members of `extra`, a JSON object, added to the body.
 pub(crate) fn refusal_with(
     status: StatusCode,
-    code: &str,
+    code: &'static str,
     message: impl Into<String>,
     extra: serde_json::Value,
 ) -> Response {
@@ -191,7 +231,9 @@ pub(crate) fn refusal_with(
     body.insert("error".into(), code.into());
     body.insert("message".into(), message.into().into());
     body.extend(extra);
-    (status, Json(serde_json::Value::Object(body))).into_response()
+    let mut response = (status, Json(serde_json::Value::Object(body))).into_response();
+    response.extensions_mut().insert(RefusalCode(code));
+    response
 }
 
 #[cfg(test)]
@@ -337,6 +379,109 @@ mod tests {
         assert_eq!(
             own.headers()["content-security-policy"],
             "default-src 'none'"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_log_keeps_where_each_address_came_from() {
+        let state = ConnectionState::for_test(test_db::migrated().await);
+        let log = state.log.clone();
+        let long = "a".repeat(300);
+        get_json(
+            router(state),
+            "/oauth/nothing?code=secret",
+            &[("host", HOST), ("x-forwarded-proto", &long)],
+        )
+        .await;
+        let entry = &log.recent()[0];
+        assert_eq!(
+            (
+                entry.path.as_str(),
+                entry.status,
+                entry.refusal.as_deref(),
+                entry.base.as_deref()
+            ),
+            ("/oauth/nothing", 400, Some("address_unreadable"), None)
+        );
+        assert!(entry
+            .base_problem
+            .as_deref()
+            .unwrap()
+            .ends_with("is not http or https"));
+        assert_eq!(
+            (entry.host_from.as_str(), entry.scheme_from.as_str()),
+            ("host", "x_forwarded_proto")
+        );
+        assert_eq!(entry.x_forwarded_proto.as_ref().map(String::len), Some(200));
+        let state = ConnectionState::for_test(test_db::migrated().await);
+        let log = state.log.clone();
+        get_json(
+            router(state),
+            "/oauth/nothing?code=secret",
+            &[("host", "192.168.1.5:9765")],
+        )
+        .await;
+        let entry = &log.recent()[0];
+        assert_eq!(
+            (
+                entry.path.as_str(),
+                entry.base.as_deref(),
+                entry.status,
+                entry.refusal.as_deref()
+            ),
+            (
+                "/oauth/nothing",
+                Some("http://192.168.1.5:9765"),
+                403,
+                Some("https_required")
+            )
+        );
+        assert_eq!(
+            (entry.host_from.as_str(), entry.scheme_from.as_str()),
+            ("host", "local_host_is_http")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_log_names_a_routes_refusal_and_no_refusal_for_an_answer() {
+        let state = ConnectionState::for_test(test_db::migrated().await);
+        let log = state.log.clone();
+        let app = router(state);
+        get_json(app.clone(), "/oauth/nothing", &[("host", HOST)]).await;
+        get_json(
+            app,
+            "/.well-known/oauth-protected-resource/mcp",
+            &[("host", HOST)],
+        )
+        .await;
+        let recent = log.recent();
+        let seen = |i: usize| {
+            (
+                recent[i].path.as_str(),
+                recent[i].status,
+                recent[i].refusal.as_deref(),
+                recent[i].base.as_deref(),
+                recent[i].host_header.as_deref(),
+            )
+        };
+        assert_eq!(
+            (seen(0), seen(1)),
+            (
+                (
+                    "/.well-known/oauth-protected-resource/mcp",
+                    200,
+                    None,
+                    Some("https://music.example.com"),
+                    Some(HOST)
+                ),
+                (
+                    "/oauth/nothing",
+                    404,
+                    Some("not_found"),
+                    Some("https://music.example.com"),
+                    Some(HOST)
+                )
+            )
         );
     }
 

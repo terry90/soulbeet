@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::Router;
 use sqlx::SqlitePool;
 use tower::ServiceExt;
@@ -18,6 +18,7 @@ use shared::failure::Failure;
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth, SystemHealth};
 use soulbeet::navidrome::ScanStatus;
 
+use super::log::RequestLog;
 use super::{router, ConnectionState};
 use crate::auth::{Role, UserCtx};
 use crate::base_url::BaseUrl;
@@ -50,8 +51,21 @@ impl ConnectionState {
             key: test_key(),
             documents: FixedDocuments::new(vec![]),
             status: Arc::new(FixedStatus(Ok(sample_facts()))),
+            log: Arc::new(RequestLog::default()),
         }
     }
+}
+
+/// The headers `pairs` names, each set once.
+pub(crate) fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (name, value) in pairs {
+        map.insert(
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    map
 }
 
 /// A named host: with no proxy hint it derives `https://music.example.com`.

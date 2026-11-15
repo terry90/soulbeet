@@ -1,14 +1,17 @@
 //! Grants and the tokens they hold: code exchange (RFC 6749 section 4.1.3,
 //! RFC 7636 section 4.6), refresh rotation (section 6), revocation
-//! (RFC 7009) and pruning.
+//! (RFC 7009), the connected apps Settings lists and pruning.
 
 use sqlx::query::Query;
 use sqlx::sqlite::SqliteArguments;
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use url::Url;
 
+use super::clients::{redirect_uris_from_db, ClientKind};
 use super::secrets::{hash, new_secret, s256, successor, valid_verifier};
 use super::OFFLINE_ACCESS;
 use crate::auth::UserCtx;
+use crate::connections::ConnectedApp;
 use crate::models::user::User;
 use crate::secret_key::SecretKey;
 
@@ -337,6 +340,107 @@ pub(crate) async fn access_in(
     }))
 }
 
+#[derive(sqlx::FromRow)]
+struct AppRow {
+    grant_id: String,
+    kind: String,
+    client_id: String,
+    client_name: Option<String>,
+    redirect_uris: String,
+    user_id: String,
+    username: String,
+    last_used_at: Option<i64>,
+    allow_delete: bool,
+}
+
+/// The apps connected as `ctx`'s user, or as any user for an admin, the
+/// latest used first and the never used last.
+pub(crate) async fn apps_in(db: &SqlitePool, ctx: &UserCtx) -> Result<Vec<ConnectedApp>, String> {
+    let rows: Vec<AppRow> = sqlx::query_as(
+        "SELECT g.id AS grant_id, c.kind, c.client_id, c.client_name, c.redirect_uris, \
+                g.user_id, u.username, g.last_used_at, g.allow_delete \
+         FROM oauth_grants g \
+         JOIN oauth_clients c ON c.client_id = g.client_id \
+         JOIN users u ON u.id = g.user_id \
+         WHERE g.user_id = ? OR ? \
+         ORDER BY g.last_used_at IS NULL, g.last_used_at DESC, g.created_at DESC",
+    )
+    .bind(&ctx.user_id)
+    .bind(ctx.role.is_admin())
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    rows.into_iter()
+        .map(|row| {
+            let mine = row.user_id == ctx.user_id;
+            Ok(ConnectedApp {
+                app_host: app_host(
+                    ClientKind::from_db(&row.kind)?,
+                    &row.client_id,
+                    &row.redirect_uris,
+                )?,
+                grant_id: row.grant_id,
+                client_name: row.client_name,
+                owner: (!mine).then_some(row.username),
+                last_used_at: row.last_used_at,
+                allow_delete: row.allow_delete,
+                mine,
+            })
+        })
+        .collect()
+}
+
+/// The host an app is known by (D8): its client id URL's for a client with
+/// a metadata document, its first redirect URI's for a registered client.
+fn app_host(kind: ClientKind, client_id: &str, redirect_uris: &str) -> Result<String, String> {
+    let named_by = match kind {
+        ClientKind::Cimd => client_id.to_string(),
+        ClientKind::Dcr => redirect_uris_from_db(redirect_uris)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("the registered client {client_id} has no redirect URI"))?,
+    };
+    Url::parse(&named_by)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .ok_or_else(|| format!("{named_by} names no host"))
+}
+
+/// Turns deletion through grant `grant_id` on or off. Only the grant's own
+/// user can (D7): false when it is not `ctx`'s.
+pub(crate) async fn set_allow_delete_in(
+    db: &SqlitePool,
+    ctx: &UserCtx,
+    grant_id: &str,
+    allowed: bool,
+) -> Result<bool, String> {
+    sqlx::query("UPDATE oauth_grants SET allow_delete = ? WHERE id = ? AND user_id = ?")
+        .bind(allowed)
+        .bind(grant_id)
+        .bind(&ctx.user_id)
+        .execute(db)
+        .await
+        .map(|done| done.rows_affected() > 0)
+        .map_err(|e| e.to_string())
+}
+
+/// Ends grant `grant_id` with its tokens, for its own user or an admin (D7):
+/// false when it is neither's.
+pub(crate) async fn revoke_grant_in(
+    db: &SqlitePool,
+    ctx: &UserCtx,
+    grant_id: &str,
+) -> Result<bool, String> {
+    sqlx::query("DELETE FROM oauth_grants WHERE id = ? AND (user_id = ? OR ?)")
+        .bind(grant_id)
+        .bind(&ctx.user_id)
+        .bind(ctx.role.is_admin())
+        .execute(db)
+        .await
+        .map(|done| done.rows_affected() > 0)
+        .map_err(|e| e.to_string())
+}
+
 /// Whether `code` was issued to `client_id`, redeemed or not. A plain read
 /// that keeps junk codes from taking the write lock or the client's budget.
 pub(crate) async fn code_of_client_in(
@@ -497,9 +601,11 @@ mod tests {
     use crate::auth::Role;
     use crate::connection::test_util::*;
     use crate::db::test_db;
-    use crate::oauth::clients::find_in;
+    use crate::oauth::clients::{find_in, upsert_cimd_in};
     use crate::oauth::codes::{store_request_in, PendingRequest};
+    use crate::oauth::now_unix;
     use crate::oauth::secrets::hash;
+    use crate::security::SEEDED_ADMIN_ID;
 
     const T: i64 = 1_800_000_000;
     const DAY: i64 = 24 * 3600;
@@ -1107,5 +1213,164 @@ mod tests {
         assert_eq!(prune_in(&db, T + 1).await, Ok(pruned(0, 1, 0)));
         assert_eq!(prune_in(&db, T + 600).await, Ok(pruned(1, 1, 2)));
         assert_eq!(count(&db, "oauth_clients").await, 0);
+    }
+
+    fn ctx(user_id: &str, username: &str, role: Role) -> UserCtx {
+        UserCtx {
+            user_id: user_id.into(),
+            username: username.into(),
+            role,
+        }
+    }
+
+    /// bob (u1) and eve (u2), each connected through dcr_c at T and T + 5; eve's app used at T + 100.
+    async fn two_connected_users() -> SqlitePool {
+        let db = test_db::migrated().await;
+        add_user(&db, "u1", "bob").await;
+        add_user(&db, "u2", "eve").await;
+        let c1 = issue_code(&db, "u1", "soulful", RESOURCE, T).await;
+        redeem_code_in(&db, &good(&c1), T).await.unwrap();
+        let c2 = issue_code(&db, "u2", "soulful", RESOURCE, T + 5).await;
+        redeem_code_in(&db, &good(&c2), T + 5).await.unwrap();
+        sqlx::query("UPDATE oauth_grants SET last_used_at = ? WHERE user_id = 'u2'")
+            .bind(T + 100)
+            .execute(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn grant_of(db: &SqlitePool, user_id: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM oauth_grants WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn each_user_sees_their_apps_and_an_admin_sees_all() {
+        let db = two_connected_users().await;
+        let bob = ctx("u1", "bob", Role::User);
+        assert_eq!(
+            apps_in(&db, &bob).await.unwrap(),
+            vec![ConnectedApp {
+                grant_id: grant_of(&db, "u1").await,
+                app_host: "claude.ai".into(),
+                client_name: Some("Claude".into()),
+                owner: None,
+                last_used_at: None,
+                allow_delete: false,
+                mine: true
+            }]
+        );
+        let admin = ctx(SEEDED_ADMIN_ID, "admin", Role::Admin);
+        let all = apps_in(&db, &admin).await.unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|a| (a.owner.as_deref(), a.mine, a.last_used_at))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("eve"), false, Some(T + 100)),
+                (Some("bob"), false, None)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_document_app_is_named_by_its_client_id_host() {
+        let db = test_db::migrated().await;
+        add_user(&db, "u1", "bob").await;
+        upsert_cimd_in(&db, &claude_code(), T).await.unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_grants (id, user_id, client_id, resource, scope, created_at) \
+             VALUES ('g', 'u1', ?, ?, 'soulful', ?)",
+        )
+        .bind(CLAUDE_CODE_ID)
+        .bind(RESOURCE)
+        .bind(T)
+        .execute(&db)
+        .await
+        .unwrap();
+        let apps = apps_in(&db, &ctx("u1", "bob", Role::User)).await.unwrap();
+        assert_eq!(
+            (apps[0].app_host.as_str(), apps[0].client_name.as_deref()),
+            ("claude.ai", Some("Claude Code"))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_turns_deletion_on() {
+        let db = test_db::migrated().await;
+        add_user(&db, "u1", "bob").await;
+        add_user(&db, "u2", "eve").await;
+        let token = access_token(&db, "u1", RESOURCE).await;
+        let grant = grant_of(&db, "u1").await;
+        let switch = |db: &SqlitePool| {
+            let db = db.clone();
+            let token = token.clone();
+            async move {
+                access_in(&db, &token, now_unix())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .allow_delete
+            }
+        };
+        assert_eq!(
+            set_allow_delete_in(&db, &ctx("u2", "eve", Role::User), &grant, true).await,
+            Ok(false)
+        );
+        assert_eq!(
+            set_allow_delete_in(
+                &db,
+                &ctx(SEEDED_ADMIN_ID, "admin", Role::Admin),
+                &grant,
+                true
+            )
+            .await,
+            Ok(false)
+        );
+        assert!(!switch(&db).await);
+        assert_eq!(
+            set_allow_delete_in(&db, &ctx("u1", "bob", Role::User), &grant, true).await,
+            Ok(true)
+        );
+        assert!(switch(&db).await);
+        assert_eq!(
+            set_allow_delete_in(&db, &ctx("u1", "bob", Role::User), &grant, false).await,
+            Ok(true)
+        );
+        assert!(!switch(&db).await);
+    }
+
+    #[tokio::test]
+    async fn the_owner_or_an_admin_disconnects_an_app() {
+        let db = two_connected_users().await;
+        let bobs = grant_of(&db, "u1").await;
+        assert_eq!(
+            revoke_grant_in(&db, &ctx("u2", "eve", Role::User), &bobs).await,
+            Ok(false)
+        );
+        assert_eq!(count(&db, "oauth_grants").await, 2);
+        assert_eq!(
+            revoke_grant_in(&db, &ctx(SEEDED_ADMIN_ID, "admin", Role::Admin), &bobs).await,
+            Ok(true)
+        );
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_tokens WHERE grant_id = ?")
+            .bind(&bobs)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!((count(&db, "oauth_grants").await, left), (1, 0));
+        assert_eq!(
+            revoke_grant_in(&db, &ctx("u1", "bob", Role::User), &bobs).await,
+            Ok(false)
+        );
+        let evas = grant_of(&db, "u2").await;
+        assert_eq!(
+            revoke_grant_in(&db, &ctx("u2", "eve", Role::User), &evas).await,
+            Ok(true)
+        );
     }
 }

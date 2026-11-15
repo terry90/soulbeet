@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 
 pub mod auth;
+pub mod connections;
 pub mod discovery;
 pub mod download;
 pub mod folder;
@@ -12,6 +13,7 @@ pub mod system;
 pub mod user;
 
 pub use auth::*;
+pub use connections::*;
 pub use discovery::*;
 pub use download::*;
 pub use folder::*;

@@ -1,7 +1,8 @@
 use dioxus::prelude::*;
 use ui::settings::{
-    AccountPanel, AppConfigManager, ConnectionStatusPanel, DeletionChecksPanel, FolderAdminPanel,
-    FolderManager, PreferencesManager, SecurityStatusPanel, UserManager,
+    AccountPanel, AppConfigManager, ConnectedAppsPanel, ConnectionStatusPanel, DeletionChecksPanel,
+    FolderAdminPanel, FolderManager, PreferencesManager, RemoteAccessPanel, SecurityStatusPanel,
+    UserManager,
 };
 
 #[derive(PartialEq, Clone, Copy, Default)]
@@ -86,6 +87,7 @@ pub fn SettingsPage() -> Element {
                     SettingsTab::Users => rsx! {
                         div { class: "space-y-8",
                             AccountPanel {}
+                            ConnectedAppsPanel {}
                             if auth.is_admin() {
                                 UserManager {}
                             }
@@ -96,6 +98,7 @@ pub fn SettingsPage() -> Element {
                             if auth.is_admin() {
                                 AppConfigManager {}
                                 SecurityStatusPanel {}
+                                RemoteAccessPanel {}
                             }
                             ConnectionStatusPanel {}
                         }

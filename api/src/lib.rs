@@ -5,6 +5,7 @@ pub mod build_id;
 pub mod config;
 #[cfg(feature = "server")]
 pub mod connection;
+pub mod connections;
 #[cfg(feature = "server")]
 pub mod core;
 pub mod crypto;

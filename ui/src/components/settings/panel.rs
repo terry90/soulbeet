@@ -7,6 +7,15 @@ pub(super) const LABEL_CLASS: &str =
 /// A small text button that removes something.
 pub(super) const REMOVE_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-red-400 transition-colors underline decoration-dotted cursor-pointer";
 
+/// The unix time `at` in UTC, written with the chrono `format`; the bare
+/// number when chrono cannot represent it.
+pub(super) fn utc_time(at: i64, format: &str) -> String {
+    match chrono::DateTime::from_timestamp(at, 0) {
+        Some(time) => time.format(format).to_string(),
+        None => at.to_string(),
+    }
+}
+
 /// A settings card with its title.
 #[component]
 pub(super) fn Panel(title: String, children: Element) -> Element {
