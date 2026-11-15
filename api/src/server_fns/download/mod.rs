@@ -88,7 +88,7 @@ pub(crate) async fn session_still_valid(
 
 /// What a new download socket sends before the live events: the build frame when the client
 /// asked for it (a bundle older than the frame does not ask: it cannot decode the variant and
-/// would reconnect on every try), then the rows of the user's unfinished jobs when there are any.
+/// would reconnect on every try), then the rows of the user's unfinished files when there are any.
 #[cfg(feature = "server")]
 fn first_frames(build_frame: Option<bool>, rows: Vec<DownloadProgress>) -> Vec<DownloadEvent> {
     let build = (build_frame == Some(true))
