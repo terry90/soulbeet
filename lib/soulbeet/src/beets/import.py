@@ -123,6 +123,7 @@ class Recorder(BeetsPlugin):
                 "recording_mbid": item.mb_trackid or None,
                 "artist": item.artist,
                 "title": item.title,
+                "album": item.album,
             })
 
 

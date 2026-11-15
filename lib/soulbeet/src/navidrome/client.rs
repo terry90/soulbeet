@@ -453,17 +453,38 @@ impl NavidromeClient {
     /// rows `start` to `end` (exclusive): a recording MBID matches the MBID columns, other text
     /// matches every word against title, album and artist names.
     pub async fn find_songs(&self, text: &str, start: u32, end: u32) -> Result<Vec<NativeSong>> {
+        self.native_songs(&[
+            ("_start", start.to_string()),
+            ("_end", end.to_string()),
+            ("_sort", "id".to_string()),
+            ("_order", "ASC".to_string()),
+            ("title", text.to_string()),
+            ("missing", "false".to_string()),
+        ])
+        .await
+    }
+
+    /// Present songs (missing=false), the one Navidrome added last first, rows `start` to `end`
+    /// (exclusive). The `created_at` sort is `media_file.created_at`
+    /// (persistence/mediafile_repository.go:86), set when a file is first stored (`:132`) and kept
+    /// by later scans (persistence/sql_base_repository.go:431).
+    pub async fn newest_songs(&self, start: u32, end: u32) -> Result<Vec<NativeSong>> {
+        self.native_songs(&[
+            ("_start", start.to_string()),
+            ("_end", end.to_string()),
+            ("_sort", "created_at".to_string()),
+            ("_order", "DESC".to_string()),
+            ("missing", "false".to_string()),
+        ])
+        .await
+    }
+
+    /// The native song list for `query`.
+    async fn native_songs(&self, query: &[(&str, String)]) -> Result<Vec<NativeSong>> {
         let url = self.base_url.join("api/song")?;
 
         let resp = self
-            .native_request(self.client.get(url).query(&[
-                ("_start", start.to_string()),
-                ("_end", end.to_string()),
-                ("_sort", "id".to_string()),
-                ("_order", "ASC".to_string()),
-                ("title", text.to_string()),
-                ("missing", "false".to_string()),
-            ]))
+            .native_request(self.client.get(url).query(query))
             .await?;
 
         if !resp.status().is_success() {
@@ -630,6 +651,29 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap()[1].target,
             "/api/song?_start=0&_end=100&_sort=id&_order=ASC&title=Zzqx+Artist+Song+Number+1&missing=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_newest_songs_are_listed_newest_first() {
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: r#"{"token":"jwt"}"#.into(),
+            },
+            Reply {
+                status: 200,
+                body: "[]".into(),
+            },
+        ]);
+        assert!(client(&url)
+            .newest_songs(100, 200)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            seen.lock().unwrap()[1].target,
+            "/api/song?_start=100&_end=200&_sort=created_at&_order=DESC&missing=false"
         );
     }
 

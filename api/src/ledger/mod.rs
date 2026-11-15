@@ -1102,6 +1102,7 @@ mod tests {
                 recording_mbid: None,
                 artist: "Zzqx Artist".into(),
                 title: "One".into(),
+                album: "Qzz Album".into(),
             }],
             since: 0,
             baseline: None,

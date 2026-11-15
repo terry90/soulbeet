@@ -30,6 +30,7 @@ pub fn imported() -> ImportResult {
                 recording_mbid: None,
                 artist: "Zzqx Artist".into(),
                 title: "a".into(),
+                album: "Qzz Album".into(),
             }],
         },
         output_tail: "imported tail".into(),

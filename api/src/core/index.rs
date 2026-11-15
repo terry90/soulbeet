@@ -24,6 +24,8 @@ use tracing::{debug, warn};
 const INDEX_POLL: Duration = Duration::from_secs(5);
 const INDEX_GIVE_UP_SECS: i64 = 10 * 60;
 const LOOKUP_PAGE: u32 = 100;
+/// How many pages of the songs Navidrome added last a file no text finds is looked for in.
+const NEWEST_PAGES: u32 = 3;
 
 pub(crate) enum Step {
     Listed,
@@ -92,33 +94,43 @@ pub(crate) fn is_imported_file(song: &NativeSong, item: &Path, size: u64) -> boo
         && (listed.ends_with(item) || item.ends_with(listed))
 }
 
-/// The words Navidrome's full-text filter finds `item` by: its artist and title, the title being
-/// the file name without its extension when beets has none, as Navidrome names a song without a
-/// title tag (model/metadata/persistent_ids.go:94-99, utils/files.go:16-19). Navidrome's
-/// full_text holds the title it shows (persistence/mediafile_repository.go:58-62).
-fn lookup_text(item: &ImportedItem) -> String {
-    let title = if item.title.trim().is_empty() {
-        let name = item
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        match name.rfind('.') {
-            Some(dot) => name[..dot].to_string(),
-            None => name,
-        }
-    } else {
-        item.title.clone()
-    };
-    format!("{} {title}", item.artist).trim().to_string()
+/// What Navidrome's text sanitizer drops besides white space (utils/str/sanitize_strings.go:14-28):
+/// slashes become spaces, the typographic quotes Clear maps to `'` and `"` (utils/str/str.go:9-12)
+/// and the quotes, brackets, braces, parentheses and commas of ignoredCharsRegex go. Removing
+/// accents (sanitize.Accents) only ever writes letters, and the words are split on white space.
+const NAVIDROME_DROPS: [char; 28] = [
+    '\\', '/', '\'', '"', '[', ']', '(', ')', '{', '}', ',', '\u{2018}', '\u{2019}', '\u{201b}',
+    '\u{2032}', '\u{201c}', '\u{201d}', '\u{ff02}', '\u{3003}', '\u{2ee}', '\u{5f2}', '\u{1cd3}',
+    '\u{2033}', '\u{2036}', '\u{2f6}', '\u{2ba}', '\u{2dd}', '\u{201f}',
+];
+
+/// Whether Navidrome's full-text filter keeps a word of `text`. A text it keeps nothing of is no
+/// filter (persistence/sql_search.go:62-66): Navidrome drops it and lists every song
+/// (persistence/sql_restful.go:26-35). Any other symbol is kept, so the band `!!!` is a word.
+fn navidrome_keeps(text: &str) -> bool {
+    text.chars()
+        .any(|c| !c.is_whitespace() && !NAVIDROME_DROPS.contains(&c))
+}
+
+/// The words Navidrome's full-text filter finds `item` by, as Navidrome's full_text holds the
+/// title, album and artist names it shows (persistence/mediafile_repository.go:59-62), each word a
+/// word prefix there (persistence/sql_search.go:62-76): "{artist} {title}" when Navidrome keeps a
+/// word of it, else the album when it keeps one of that. None when it keeps nothing of either.
+fn lookup_text(item: &ImportedItem) -> Option<String> {
+    [
+        format!("{} {}", item.artist, item.title),
+        item.album.clone(),
+    ]
+    .into_iter()
+    .find(|text| navidrome_keeps(text))
+    .map(|text| text.trim().to_string())
 }
 
 /// Whether every item of `wait` is listed: each looked up by its recording MBID, then by
-/// lookup_text (D7), paging LOOKUP_PAGE at a time until a short page or a match, each candidate
-/// checked with is_imported_file against the size of wait.library.join(item.path) on disk. An
-/// item whose file cannot be read is not listed. A text with no letter or digit is not looked up:
-/// Navidrome drops a filter that sanitizes to nothing and lists every song
-/// (persistence/sql_search.go:62-66, sql_restful.go:31-35).
+/// lookup_text (D7), paging LOOKUP_PAGE at a time until a short page or a match, or, with no text
+/// Navidrome keeps, among the NEWEST_PAGES pages of the songs it added last, where a file just
+/// imported is. Each candidate is checked with is_imported_file against the size of
+/// wait.library.join(item.path) on disk. An item whose file cannot be read is not listed.
 pub(crate) async fn listed(
     navi: &NavidromeClient,
     wait: &IndexWait,
@@ -127,24 +139,42 @@ pub(crate) async fn listed(
         let Ok(file) = tokio::fs::metadata(wait.library.join(&item.path)).await else {
             return Ok(false);
         };
-        let texts = item
-            .recording_mbid
-            .iter()
-            .cloned()
-            .chain([lookup_text(item)])
-            .filter(|text| text.chars().any(char::is_alphanumeric));
-        let mut found = false;
-        for text in texts {
-            if lists(navi, &text, &item.path, file.len()).await? {
-                found = true;
-                break;
-            }
+        let size = file.len();
+        let mut found = match &item.recording_mbid {
+            Some(mbid) => lists(navi, mbid, &item.path, size).await?,
+            None => false,
+        };
+        if !found {
+            found = match lookup_text(item) {
+                Some(text) => lists(navi, &text, &item.path, size).await?,
+                None => among_newest(navi, &item.path, size).await?,
+            };
         }
         if !found {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Whether the file at `item` of `size` bytes is among the NEWEST_PAGES pages of LOOKUP_PAGE songs
+/// Navidrome added last.
+async fn among_newest(
+    navi: &NavidromeClient,
+    item: &Path,
+    size: u64,
+) -> Result<bool, NavidromeError> {
+    for page in 0..NEWEST_PAGES {
+        let start = page * LOOKUP_PAGE;
+        let songs = navi.newest_songs(start, start + LOOKUP_PAGE).await?;
+        if songs.iter().any(|song| is_imported_file(song, item, size)) {
+            return Ok(true);
+        }
+        if songs.len() < LOOKUP_PAGE as usize {
+            return Ok(false);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a song the native `title` filter matches for `text` is the file at `item`.
@@ -647,6 +677,7 @@ mod tests {
                 recording_mbid: None,
                 artist: "Kowloon".into(),
                 title: "Wake Up".into(),
+                album: "Come Over".into(),
             }],
             since,
             baseline: None,
@@ -881,6 +912,7 @@ mod tests {
                 recording_mbid: Some("dfeb96a7-f78a-4b04-93ce-c39e28c9a173".into()),
                 artist: "Zzqx Artist".into(),
                 title: "Song Number 1".into(),
+                album: "Qzz Album".into(),
             }],
             ..waiting(1_000)
         }
@@ -1213,24 +1245,33 @@ mod tests {
         ));
     }
 
-    /// `wait` with its one item imported as-is from an untagged file: no MBID, artist or title.
-    fn untagged(mut wait: IndexWait) -> IndexWait {
+    /// `wait` with its one item tagged `artist`, `title` and `album`, without an MBID.
+    fn tagged(mut wait: IndexWait, artist: &str, title: &str, album: &str) -> IndexWait {
         wait.items[0] = ImportedItem {
             recording_mbid: None,
-            artist: String::new(),
-            title: String::new(),
+            artist: artist.into(),
+            title: title.into(),
+            album: album.into(),
             ..wait.items[0].clone()
         };
         wait
     }
 
+    /// The query of each native song lookup `navi` was asked.
+    fn song_lookups(navi: &NavidromeStub) -> Vec<String> {
+        navi.asked_with_queries()
+            .into_iter()
+            .filter(|target| target.starts_with("/api/song?"))
+            .collect()
+    }
+
     #[tokio::test]
-    async fn an_item_without_tags_is_found_by_its_file_name_and_its_wait_ends_listed() {
+    async fn an_artist_of_symbols_is_looked_up_by_its_name_and_title() {
         let library = tempfile::tempdir().unwrap();
-        let (ledger, db, mut rx, _) = indexing(untagged(imported_in(library.path()))).await;
+        let wait = tagged(imported_in(library.path()), "!!!", "?!", "");
+        let (ledger, db, mut rx, _) = indexing(wait).await;
         let navi = NavidromeStub::start();
         navi.answer("/rest/getScanStatus", &[IDLE]);
-        // Navidrome titles a song without a title tag by its file name.
         navi.answer(
             "/api/song",
             &[&song_json(
@@ -1252,31 +1293,100 @@ mod tests {
             indexes(&mut rx),
             vec![Some(IndexState::Waiting), Some(IndexState::Listed)]
         );
-        let lookups: Vec<String> = navi
-            .asked_with_queries()
-            .into_iter()
-            .filter(|target| target.starts_with("/api/song?"))
-            .collect();
+        let lookups = song_lookups(&navi);
         assert_eq!(lookups.len(), 1);
         assert!(
-            lookups[0].contains("&title=01+Song+Number+1&"),
+            lookups[0].contains("&title=%21%21%21+%3F%21&"),
             "{}",
             lookups[0]
         );
     }
 
+    /// An item none of whose text Navidrome's sanitizer keeps.
+    fn wordless(wait: IndexWait) -> IndexWait {
+        tagged(wait, "\u{201c}\u{201d}", "(/)", "[ , ]")
+    }
+
     #[tokio::test]
-    async fn an_item_whose_name_has_no_letter_or_digit_is_not_looked_up() {
+    async fn an_item_navidrome_keeps_no_word_of_is_found_among_the_newest_songs() {
         let library = tempfile::tempdir().unwrap();
-        let mut wait = untagged(imported_in(library.path()));
-        let path = Path::new("_/_/_.mp3");
-        std::fs::create_dir_all(library.path().join("_/_")).unwrap();
-        std::fs::write(library.path().join(path), b"mp3!").unwrap();
-        wait.items[0].path = path.into();
+        let (ledger, db, mut rx, _) = indexing(wordless(imported_in(library.path()))).await;
         let navi = NavidromeStub::start();
-        navi.answer("/api/song", &[&song_json("_/_/_.mp3", 4)]);
-        assert!(!listed(&navi.client(), &wait).await.unwrap());
-        assert!(!navi.asked().contains(&"/api/song".to_string()));
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        // A full page of songs added since, then the imported one.
+        let others: Vec<String> = (0..LOOKUP_PAGE)
+            .map(|n| {
+                let song = song_json(&format!("Other/{n:03}.mp3"), 4);
+                song[1..song.len() - 1].to_string()
+            })
+            .collect();
+        let newer = format!("[{}]", others.join(","));
+        navi.answer(
+            "/api/song",
+            &[
+                &newer,
+                &song_json("alice/Zzqx Artist/Qzz Album/01 Song Number 1.mp3", 4),
+            ],
+        );
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Ok(navi.client())),
+            &mut IndexRunner::default(),
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Done));
+        assert_eq!(
+            indexes(&mut rx),
+            vec![Some(IndexState::Waiting), Some(IndexState::Listed)]
+        );
+        assert_eq!(
+            song_lookups(&navi),
+            vec![
+                "/api/song?_start=0&_end=100&_sort=created_at&_order=DESC&missing=false",
+                "/api/song?_start=100&_end=200&_sort=created_at&_order=DESC&missing=false",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_navidrome_keeps_no_word_of_and_does_not_list_ends_not_found_after_scan() {
+        let library = tempfile::tempdir().unwrap();
+        // A scan was asked for at 10:01, and Navidrome has completed one since (IDLE).
+        let wait = IndexWait {
+            baseline: Some(ScanBaseline {
+                last_scan: at("2026-11-15T10:00:00Z"),
+                started: at("2026-11-15T09:59:50Z"),
+            }),
+            ..wordless(imported_in(library.path()))
+        };
+        let (ledger, db, mut rx, _) = indexing(wait).await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        navi.answer("/api/song", &[&song_json("Other/001.mp3", 4)]);
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Ok(navi.client())),
+            &mut IndexRunner::default(),
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
+        assert_eq!(
+            indexes(&mut rx),
+            vec![
+                Some(IndexState::Waiting),
+                Some(IndexState::Failed(not_found_after_scan()))
+            ]
+        );
+        assert_eq!(
+            song_lookups(&navi),
+            vec!["/api/song?_start=0&_end=100&_sort=created_at&_order=DESC&missing=false"]
+        );
     }
 
     #[tokio::test]

@@ -1619,6 +1619,7 @@ mod tests {
                     recording_mbid: None,
                     artist: "Kowloon".into(),
                     title: "One".into(),
+                    album: "Come Over".into(),
                 }],
                 since: 0,
                 baseline: None,

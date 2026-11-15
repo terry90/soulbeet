@@ -105,6 +105,9 @@ pub struct ImportedItem {
     pub recording_mbid: Option<String>,
     pub artist: String,
     pub title: String,
+    /// Empty for a waiting import stored before the album was reported.
+    #[serde(default)]
+    pub album: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

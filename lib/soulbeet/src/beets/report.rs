@@ -55,6 +55,7 @@ struct RawItem {
     recording_mbid: Option<String>,
     artist: String,
     title: String,
+    album: String,
 }
 
 /// A file beets reported, relative to `target` when it is inside it.
@@ -223,6 +224,7 @@ impl Report {
                     recording_mbid: i.recording_mbid,
                     artist: i.artist,
                     title: i.title,
+                    album: i.album,
                 })
                 .collect();
             return result;
@@ -619,8 +621,9 @@ mod tests {
     fn an_imported_result_lists_its_items_relative_to_the_library() {
         let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "duplicates": [], "items": [
             {"path": "/music/Zzqx Artist/Song Number 1.mp3", "recording_mbid": "dfeb96a7-f78a-4b04-93ce-c39e28c9a173",
-             "artist": "Zzqx Artist", "title": "Song Number 1"},
-            {"path": "/elsewhere/02.mp3", "recording_mbid": null, "artist": "Zzqx Artist", "title": "Song Number 2"}]}"#;
+             "artist": "Zzqx Artist", "title": "Song Number 1", "album": "Qzz Album"},
+            {"path": "/elsewhere/02.mp3", "recording_mbid": null, "artist": "Zzqx Artist", "title": "Song Number 2",
+             "album": ""}]}"#;
         let imported = result(ImportOutcome::Imported {
             untagged: false,
             warnings: vec![],
@@ -643,12 +646,14 @@ mod tests {
                     recording_mbid: Some("dfeb96a7-f78a-4b04-93ce-c39e28c9a173".into()),
                     artist: "Zzqx Artist".into(),
                     title: "Song Number 1".into(),
+                    album: "Qzz Album".into(),
                 },
                 ImportedItem {
                     path: "/elsewhere/02.mp3".into(),
                     recording_mbid: None,
                     artist: "Zzqx Artist".into(),
                     title: "Song Number 2".into(),
+                    album: String::new(),
                 },
             ]
         );

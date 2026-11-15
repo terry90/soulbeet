@@ -226,12 +226,12 @@ def test_imported_items_are_reported_as_beets_stored_them(beets_env, singleton):
 
     assert run.code == 0, run
     reported = sorted(
-        (i["path"], i["recording_mbid"], i["artist"], i["title"])
+        (i["path"], i["recording_mbid"], i["artist"], i["title"], i["album"])
         for i in run.report["items"]
     )
     stored = sorted(
-        (str(beets_env.music / path), trackid or None, artist, title)
-        for title, artist, _album, trackid, path in beets_env.library()
+        (str(beets_env.music / path), trackid or None, artist, title, album)
+        for title, artist, album, trackid, path in beets_env.library()
     )
     assert reported == stored
     assert len(reported) == 2
@@ -247,6 +247,7 @@ def test_an_as_is_import_reports_its_items_without_a_recording(beets_env):
         "recording_mbid": None,
         "artist": "Zzqx Artist",
         "title": "Song Number 1",
+        "album": "",
     }]
 
 
@@ -273,6 +274,7 @@ def test_pick_applies_a_weak_track_and_tags_it(beets_env):
                 "recording_mbid": "fake-t-w1",
                 "artist": "Some Other Artist",
                 "title": "Totally Different 1",
+                "album": "",
             }
         ],
     }
