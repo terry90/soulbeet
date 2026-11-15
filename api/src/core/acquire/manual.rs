@@ -146,7 +146,7 @@ async fn start_manual(
         items: picked,
         alternates,
     };
-    queue_and_watch(ledger, ctx, backend, fresh, acquisition).await
+    queue_and_watch(ledger, ctx, backend, fresh.into(), acquisition).await
 }
 
 #[cfg(test)]

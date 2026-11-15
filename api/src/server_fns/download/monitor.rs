@@ -410,6 +410,11 @@ impl DownloadMonitor {
         self.track_states[slot].phase == SlotPhase::Watching
     }
 
+    /// Whether no slot is left watching a transfer.
+    fn watches_nothing(&self) -> bool {
+        (0..self.tracked_files.len()).all(|slot| !self.watching(slot))
+    }
+
     /// Whether `dl` is the transfer `slot` watches now. A slot rebound during
     /// a poll no longer owns the entry that poll matched it with.
     fn is_current(&self, slot: usize, dl: &DownloadProgress) -> bool {
@@ -785,6 +790,12 @@ impl DownloadMonitor {
                     continue;
                 }
             };
+            // With no slot to watch, no listing can tell more: a resumed
+            // batch whose files were all on disk, or whose files sent again
+            // were all refused, finishes once nothing more is on its way.
+            if self.watches_nothing() && self.check_completion(&[], &backend).await {
+                break;
+            }
             match backend.get_downloads_for(&self.sources()).await {
                 Ok(mut downloads) => {
                     invalid_responses = 0;
@@ -3729,6 +3740,119 @@ mod tests {
             .map(|rows| rows.iter().map(|r| r.item.clone()).collect())
             .collect();
         assert_eq!(imported, vec![vec!["01.flac".to_string()]], "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_album_left_nothing_to_watch_imports_its_found_files_once_none_are_coming() {
+        let (m, base, mut imports, _recorded) = disk_monitor(
+            &UserId::new("monitor-album-found-only"),
+            &[],
+            &["01.flac", "02.flac"],
+        )
+        .await;
+        let found = vec![
+            found_in(&m, base.path(), "01.flac", 0),
+            found_in(&m, base.path(), "02.flac", 1),
+        ];
+        let mut m = m.with_found(found);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let sending = m.batch.inbox.reserve().expect("open inbox");
+
+        assert!(m.watches_nothing());
+        assert!(
+            !m.check_completion(&[], &backend).await,
+            "finished while a request was still sending into it"
+        );
+        assert!(import_events(&mut imports).is_empty());
+
+        drop(sending);
+        assert!(m.check_completion(&[], &backend).await);
+        let imported: Vec<Vec<String>> = import_events(&mut imports)
+            .iter()
+            .map(|rows| rows.iter().map(|r| r.item.clone()).collect())
+            .collect();
+        assert_eq!(
+            imported,
+            vec![vec!["01.flac".to_string(), "02.flac".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_sent_again_into_a_resumed_album_is_imported_with_its_found_files() {
+        let user = UserId::new("monitor-album-sent-again");
+        let (m, base, mut imports, mut recorded) = disk_monitor(&user, &[], &["01.flac"]).await;
+        let folder = base.path().join(&m.batch.destination);
+        let one = found_in(&m, base.path(), "01.flac", 0);
+        let mut m = m.with_found(vec![one]);
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        // Startup holds the batch open, then sends 02, which slskd never got, into it.
+        let reservation = m.batch.inbox.reserve().expect("open inbox");
+        crate::core::acquire::enqueue_and_watch(
+            &m.ledger.clone(),
+            &crate::core::test_ctx(&user.to_string()),
+            backend.clone(),
+            crate::core::acquire::RequestBatch::Running(m.batch.clone(), reservation),
+            crate::core::acquire::Acquisition {
+                job: "j1".into(),
+                items: vec![(1, item("peer_b", "Two", "q\\02.flac"))],
+                alternates: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stub.destinations(), vec![m.batch.destination.clone()]);
+        // The request's own queued row of 02, on the user's channel.
+        let sent: Vec<Vec<String>> = import_events(&mut imports)
+            .iter()
+            .map(|rows| rows.iter().map(|r| r.item.clone()).collect())
+            .collect();
+        assert_eq!(sent, vec![vec!["q\\02.flac".to_string()]]);
+
+        assert!(m.drain_inbox());
+        let mut empty = 0;
+        let running = vec![listed("peer_b", "q\\02.flac", DownloadState::InProgress)];
+        assert!(
+            !m.process_poll_result(running, &mut empty, 1, &backend)
+                .await
+        );
+        assert!(import_events(&mut imports).is_empty(), "01 went alone");
+
+        std::fs::write(folder.join("02.flac"), b"x").unwrap();
+        let done = vec![listed("peer_b", "q\\02.flac", DownloadState::Completed)];
+        assert!(m.process_poll_result(done, &mut empty, 2, &backend).await);
+
+        let events = import_events(&mut imports);
+        assert_eq!(
+            events
+                .iter()
+                .map(|rows| rows
+                    .iter()
+                    .map(|r| (r.item.clone(), r.job.clone()))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![
+                ("01.flac".to_string(), Some(slot_of_j1(0))),
+                ("q\\02.flac".to_string(), Some(slot_of_j1(1)))
+            ]],
+            "one album job"
+        );
+        let ledger = recorded.events();
+        assert!(ledger.iter().any(|e| matches!(
+            e,
+            JobEvent::Enqueued { job, monitor_batch_id, .. }
+                if job == "j1" && *monitor_batch_id == m.batch.owner.batch_id
+        )));
+        assert!(
+            !ledger.iter().any(|e| matches!(
+                e,
+                JobEvent::Slots { state, rows } if *state == JobState::Failed
+                    || rows.iter().any(|r| r.failure.as_ref().is_some_and(
+                        |f| f.code == FailureCode::FileNotFoundAfterDownload
+                    ))
+            )),
+            "a slot failed: {ledger:?}"
+        );
     }
 
     #[tokio::test]

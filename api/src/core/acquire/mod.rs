@@ -19,12 +19,12 @@ use crate::globals::{get_or_create_user_channel, register_user_task, unregister_
 use crate::ledger::{JobEvent, JobState, Ledger};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{
-    another_folder, claim_request, deliver, failed_reason, nothing_enqueued, stopped_rows,
-    transfer_key, RequestEnqueue, Watcher,
+    another_folder, claim_into, claim_request, deliver, failed_reason, nothing_enqueued,
+    stopped_rows, transfer_key, RequestEnqueue, Watcher,
 };
 use crate::server_fns::download::failover::{align_pool_tracks, item_index, SourcePool};
 use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
-use crate::transfer_registry::{BatchRef, TransferOwner};
+use crate::transfer_registry::{BatchRef, InboxReservation, TransferOwner};
 use dioxus::logger::tracing::info;
 use shared::download::{
     DownloadEvent, DownloadProgress, DownloadableGroup, DownloadableItem, EnqueueStatus, JobSlot,
@@ -75,6 +75,24 @@ pub struct NewBatch {
     pub import_mode: ImportMode,
 }
 
+/// The batch a request's files go into.
+pub enum RequestBatch {
+    /// One of its own, unless the user already downloads some of its files
+    /// into the same folder in the same mode: the rest then join that batch.
+    New(NewBatch),
+    /// A running batch whose inbox the reservation holds open for this
+    /// request: a job resumed at startup sends the files slskd never got
+    /// into the batch that holds the rest of it, so its monitor imports the
+    /// job's album once.
+    Running(BatchRef, InboxReservation),
+}
+
+impl From<NewBatch> for RequestBatch {
+    fn from(fresh: NewBatch) -> Self {
+        Self::New(fresh)
+    }
+}
+
 impl NewBatch {
     fn owned_by(self, ctx: &UserCtx) -> BatchRef {
         BatchRef::new(
@@ -113,8 +131,9 @@ pub(super) async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> 
 
 /// Claims and enqueues the files of `acquisition`'s job for `ctx`, shows
 /// their rows on its user's channel, and hands the enqueued ones to a
-/// monitor: the running batch's when the request joined one of the user's,
-/// else one of `fresh`. Either fails a slot over to its track's alternates.
+/// monitor: the running batch's when the request joined one of the user's
+/// or `batch` names one, else one of the new batch. Either fails a slot over
+/// to its track's alternates.
 ///
 /// Every row it sends carries its slot and is recorded in `ledger`: failed
 /// files Failed, queued ones Downloading. The batch a file goes into and the
@@ -136,14 +155,14 @@ pub(crate) async fn enqueue_and_watch(
     ledger: &Ledger,
     ctx: &UserCtx,
     backend: Arc<dyn DownloadBackend>,
-    fresh: NewBatch,
+    batch: impl Into<RequestBatch>,
     acquisition: Acquisition,
 ) -> Result<Vec<QueuedDownload>, Failure> {
     tokio::spawn(queue_and_watch(
         ledger.clone(),
         ctx.clone(),
         backend,
-        fresh,
+        batch.into(),
         acquisition,
     ))
     .await
@@ -155,7 +174,7 @@ pub(super) async fn queue_and_watch(
     ledger: Ledger,
     ctx: UserCtx,
     backend: Arc<dyn DownloadBackend>,
-    fresh: NewBatch,
+    batch: RequestBatch,
     acquisition: Acquisition,
 ) -> Result<Vec<QueuedDownload>, Failure> {
     let Acquisition {
@@ -164,7 +183,12 @@ pub(super) async fn queue_and_watch(
         alternates,
     } = acquisition;
     let items: Vec<DownloadableItem> = picked.iter().map(|(_, item)| item.clone()).collect();
-    let claimed = claim_request(&backend, items.clone(), fresh.owned_by(&ctx));
+    let claimed = match batch {
+        RequestBatch::New(fresh) => claim_request(&backend, items.clone(), fresh.owned_by(&ctx)),
+        RequestBatch::Running(batch, reservation) => {
+            claim_into(&backend, items.clone(), batch, reservation)
+        }
+    };
     let request = backend.new_request();
     // Stored before the backend hears of a file, so a restart after it took one finds the batch
     // and tells the transfers of this send by its request. Nothing is sent when the ledger

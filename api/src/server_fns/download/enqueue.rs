@@ -315,6 +315,35 @@ pub fn claim_request(
         batch,
         reservation,
     } = TransferRegistry::global().claim_for_request(&keys, &fresh);
+    sort_claim(keys, items, claim, batch, reservation)
+}
+
+/// Claims a request's files for `batch`, a running batch whose inbox
+/// `reservation` holds open, as `claim_request` does but joining that batch
+/// whatever the user's other batches hold. `ClaimedRequest::enqueue` then
+/// enqueues the free ones into its folder, and they are delivered to its
+/// monitor.
+pub fn claim_into(
+    backend: &Arc<dyn DownloadBackend>,
+    items: Vec<DownloadableItem>,
+    batch: BatchRef,
+    reservation: InboxReservation,
+) -> ClaimedRequest {
+    let keys: Vec<TransferKey> = items.iter().map(|i| item_key(backend.id(), i)).collect();
+    let claim = TransferRegistry::global().claim(&keys, &batch);
+    sort_claim(keys, items, claim, batch, Some(reservation))
+}
+
+/// What a request does with each of `items` (by `keys`) after `claim`: the
+/// free files go into `batch`, watched by its own monitor or, through
+/// `reservation`, by the running batch's.
+fn sort_claim(
+    keys: Vec<TransferKey>,
+    items: Vec<DownloadableItem>,
+    claim: Claim,
+    batch: BatchRef,
+    reservation: Option<InboxReservation>,
+) -> ClaimedRequest {
     let item_of = |key: &TransferKey| {
         let at = keys
             .iter()
@@ -334,11 +363,12 @@ pub fn claim_request(
     };
 
     // A batch importing elsewhere neither takes this request's files nor
-    // lets it import the shared ones here.
+    // lets it import the shared ones here. `batch` imports into the folder
+    // the request asked for, whichever batch it is.
     let (here, elsewhere): (Vec<_>, Vec<_>) = claim
         .mine
         .iter()
-        .partition(|(_, running)| running.target == fresh.target);
+        .partition(|(_, running)| running.target == batch.target);
     let results: Vec<QueuedDownload> = here
         .iter()
         .map(|(key, _)| not_enqueued(key, EnqueueStatus::AlreadyRunning))
