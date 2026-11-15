@@ -343,7 +343,8 @@ pub struct DownloadMonitor {
     /// Where every row the monitor sends is recorded with its slot's state.
     ledger: Ledger,
     /// Finished files of an album batch found on disk before it was watched
-    /// (a resumed batch's): imported with the batch's album.
+    /// (a resumed batch's): imported with the batch's album once every slot
+    /// settled, or failed with its slots when it stops early.
     found: Vec<ResolvedSlot>,
 }
 
@@ -395,7 +396,8 @@ impl DownloadMonitor {
 
     /// Hands an album batch `found`, finished files of it already on disk:
     /// they are imported with the files it watches once every one of those
-    /// settled, and never resolved again for another slot.
+    /// settled, fail with them when the monitor stops before that, and are
+    /// never resolved again for another slot.
     pub fn with_found(mut self, found: Vec<ResolvedSlot>) -> Self {
         let mut claimed = self.claimed.lock().unwrap_or_else(|e| e.into_inner());
         claimed.extend(found.iter().filter_map(|f| file_id(&f.path)));
@@ -835,11 +837,6 @@ impl DownloadMonitor {
             }
         }
 
-        // An album batch that stopped before its album was imported still
-        // imports the files it was handed already finished.
-        let found = std::mem::take(&mut self.found);
-        self.import_album(found).await;
-
         // Their keys stay claimed until their imports are done, and the
         // batch's keys are released when the monitor drops.
         self.join_handoffs().await;
@@ -993,8 +990,10 @@ impl DownloadMonitor {
                     MAX_CONSECUTIVE_EMPTY * 2,
                     self.filenames()
                 );
+                // Every slot written off has settled: an album batch imports
+                // what it was handed found.
                 if self.retry_or_fail_absent_batch(backend).await
-                    && self.batch.inbox.close_if_idle()
+                    && self.check_completion(&[], backend).await
                 {
                     return true;
                 }
@@ -1481,6 +1480,11 @@ impl DownloadMonitor {
     /// Mark every watched track as failed and notify the UI. Used when
     /// monitoring must stop early so downloads are never left dangling. With
     /// no backend at hand their keys are released when the monitor drops.
+    ///
+    /// The files the batch was handed found on disk fail with them, as its
+    /// finished slots do: its transfers may still run where Soulful cannot
+    /// see, so no part of its album is imported, and the files stay where
+    /// they are.
     fn fail_unprocessed_tracks(&mut self, failure: Failure) {
         let mut failed: Vec<DownloadProgress> = Vec::new();
         for slot in 0..self.tracked_files.len() {
@@ -1490,10 +1494,18 @@ impl DownloadMonitor {
                 failed.push(self.stamp(slot, row));
             }
         }
+        failed.extend(
+            std::mem::take(&mut self.found)
+                .into_iter()
+                .map(|f| f.row.failed_with(failure.clone())),
+        );
         self.report(JobState::Failed, failed);
     }
 
     /// Check if all downloads are complete. Returns true if monitoring should stop.
+    /// It is the one place a batch is found finished, so the one place an
+    /// album batch imports its album: its watched slots, the ones joining
+    /// requests added, and the files it was handed found.
     ///
     /// A track is settled when it left `Watching` or its transfer completed
     /// successfully. Settled must be judged per track: in album mode
@@ -1803,6 +1815,7 @@ mod tests {
     };
     use shared::failure::{Service, UserActionCode};
     use soulbeet::error::MissingSetting;
+    use std::path::Path;
     use tokio::sync::broadcast;
 
     fn assert_failed(row: &DownloadProgress, code: FailureCode, message: &str) {
@@ -3557,6 +3570,18 @@ mod tests {
         assert!((0..2).all(|slot| phase(&m, slot) == SlotPhase::HandedOff));
     }
 
+    /// `file` of slot `slot` of job j1, found in `m`'s batch folder under
+    /// `base` before `m` watched anything, its record gone from slskd.
+    fn found_in(m: &DownloadMonitor, base: &Path, file: &str, slot: u32) -> ResolvedSlot {
+        ResolvedSlot {
+            row: listed("peer_a", file, DownloadState::Completed)
+                .with_batch(m.batch.owner.batch_id.clone(), m.batch.label.clone())
+                .with_job(slot_of_j1(slot)),
+            path: base.join(&m.batch.destination).join(file),
+            destination: Some(m.batch.destination.clone()),
+        }
+    }
+
     #[tokio::test]
     async fn an_album_file_found_before_watching_is_imported_once_with_the_rest() {
         let (m, base, mut imports, mut recorded) = disk_monitor(
@@ -3567,13 +3592,7 @@ mod tests {
         .await;
         let folder = base.path().join(&m.batch.destination);
         // Resumed with 01 already on disk, its record gone.
-        let one = ResolvedSlot {
-            row: listed("peer_a", "01.flac", DownloadState::Completed)
-                .with_batch(m.batch.owner.batch_id.clone(), m.batch.label.clone())
-                .with_job(slot_of_j1(1)),
-            path: folder.join("01.flac"),
-            destination: Some(m.batch.destination.clone()),
-        };
+        let one = found_in(&m, base.path(), "01.flac", 1);
         let mut m = m.with_found(vec![one]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
 
@@ -3611,6 +3630,105 @@ mod tests {
         assert!(slots_recorded(&mut recorded)
             .iter()
             .all(|(state, _)| *state != JobState::Failed));
+    }
+
+    /// Each recorded `Slots` row: its state, item and failure code.
+    fn recorded_rows(recorded: &mut Recorded) -> Vec<(JobState, String, Option<FailureCode>)> {
+        recorded
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                JobEvent::Slots { state, rows } => Some(
+                    rows.into_iter()
+                        .map(move |r| (state, r.item, r.failure.map(|f| f.code))),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_resumed_album_cut_off_from_slskd_fails_its_found_files_with_the_rest() {
+        let (m, base, mut imports, mut recorded) = disk_monitor(
+            &UserId::new("monitor-album-found-stalled"),
+            &["02.flac"],
+            &["01.flac"],
+        )
+        .await;
+        let one = found_in(&m, base.path(), "01.flac", 1);
+        let mut m = m.with_found(vec![one]);
+        // 02 may still be downloading in a slskd Soulful has not read for 10 minutes.
+        m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
+        let unreachable = || SoulseekError::Api {
+            status: 503,
+            message: "Circuit breaker is open - slskd appears to be unavailable".to_string(),
+        };
+
+        assert!(m.poll_failed(unreachable(), &mut 0));
+
+        let mut rows = recorded_rows(&mut recorded);
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    JobState::Failed,
+                    "01.flac".to_string(),
+                    Some(FailureCode::BackendUnreachable)
+                ),
+                (
+                    JobState::Failed,
+                    "02.flac".to_string(),
+                    Some(FailureCode::BackendUnreachable)
+                ),
+            ]
+        );
+        assert!(
+            m.found.is_empty(),
+            "nothing is left to import after the run"
+        );
+        assert!(import_events(&mut imports).is_empty());
+        assert!(
+            base.path()
+                .join(&m.batch.destination)
+                .join("01.flac")
+                .exists(),
+            "the found file stays for a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_album_whose_transfers_never_show_imports_its_found_files() {
+        let (m, base, mut imports, _recorded) = disk_monitor(
+            &UserId::new("monitor-album-found-absent"),
+            &["02.flac"],
+            &["01.flac"],
+        )
+        .await;
+        let one = found_in(&m, base.path(), "01.flac", 1);
+        let mut m = m.with_found(vec![one]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+
+        let mut empty = 0;
+        for poll in 1..MAX_CONSECUTIVE_EMPTY {
+            assert!(
+                !m.process_poll_result(vec![], &mut empty, poll as u32, &backend)
+                    .await
+            );
+        }
+        // 02 never appeared and has no other source: every slot has settled.
+        assert!(
+            m.process_poll_result(vec![], &mut empty, MAX_CONSECUTIVE_EMPTY as u32, &backend)
+                .await
+        );
+
+        let events = import_events(&mut imports);
+        let imported: Vec<Vec<String>> = events
+            .iter()
+            .map(|rows| rows.iter().map(|r| r.item.clone()).collect())
+            .collect();
+        assert_eq!(imported, vec![vec!["01.flac".to_string()]], "{events:?}");
     }
 
     #[tokio::test]
