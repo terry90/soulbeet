@@ -1075,43 +1075,10 @@ pub async fn generate_discovery_playlist_internal(
     // Trigger a Navidrome scan then wait for it to finish so playlists can be created.
     if total_downloads > 0 {
         if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
-            // The scan runs in a goroutine and startScan answers at once, so
-            // "not scanning" alone can be read before it begins: wait for a
-            // scan that ended after the one recorded here.
-            let before = match navi.get_scan_status().await {
-                Ok(status) => Some(status.last_scan),
-                Err(e) => {
-                    warn!("Failed to read Navidrome scan status: {}", e);
-                    None
-                }
-            };
-            if let Some(before) = before {
-                if let Err(e) = navi.start_scan().await {
-                    warn!("Failed to trigger Navidrome scan: {}", e);
-                } else {
-                    info!(
-                        "Triggered Navidrome library scan after {} discovery imports",
-                        total_downloads
-                    );
-                    // Poll every 3s, at most 2 min
-                    for _ in 0..40u32 {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                        match navi.get_scan_status().await {
-                            Ok(status) if scan_finished(&status, before) => {
-                                if !status.error.is_empty() {
-                                    warn!("Navidrome scan reported an error: {}", status.error);
-                                }
-                                info!("Navidrome scan ended after {} items", status.count);
-                                break;
-                            }
-                            Ok(_) => continue,
-                            Err(_) => break,
-                        }
-                    }
-                    // Create/update smart playlists now that tracks are indexed
-                    if let Err(e) = reconcile_discovery_playlists(user_id).await {
-                        warn!("Playlist reconciliation after generation failed: {}", e);
-                    }
+            if scan_imports(&navi, total_downloads).await {
+                // Create/update smart playlists now that tracks are indexed
+                if let Err(e) = reconcile_discovery_playlists(user_id).await {
+                    warn!("Playlist reconciliation after generation failed: {}", e);
                 }
             }
         }
@@ -1124,6 +1091,51 @@ pub async fn generate_discovery_playlist_internal(
         total_imported: total_downloads,
         profiles: all_profile_stats,
     })
+}
+
+/// Starts a Navidrome scan of `imported` new tracks and waits up to two
+/// minutes for it to end. Returns whether the scan was started.
+///
+/// The scan runs in a goroutine and startScan answers at once, so "not
+/// scanning" alone can be read before it begins: the wait is for a scan that
+/// ended after the one recorded before it. When that cannot be read the scan
+/// is still started, only not waited for.
+#[cfg(feature = "server")]
+async fn scan_imports(navi: &soulbeet::navidrome::NavidromeClient, imported: u32) -> bool {
+    let before = match navi.get_scan_status().await {
+        Ok(status) => Some(status.last_scan),
+        Err(e) => {
+            warn!("Failed to read Navidrome scan status, not waiting for the scan: {e}");
+            None
+        }
+    };
+    if let Err(e) = navi.start_scan().await {
+        warn!("Failed to trigger Navidrome scan: {}", e);
+        return false;
+    }
+    info!(
+        "Triggered Navidrome library scan after {} discovery imports",
+        imported
+    );
+    let Some(before) = before else {
+        return true;
+    };
+    // Poll every 3s, at most 2 min
+    for _ in 0..40u32 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        match navi.get_scan_status().await {
+            Ok(status) if scan_finished(&status, before) => {
+                if !status.error.is_empty() {
+                    warn!("Navidrome scan reported an error: {}", status.error);
+                }
+                info!("Navidrome scan ended after {} items", status.count);
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    true
 }
 
 /// A scan has ended once Navidrome is idle and its last scan is later than
@@ -1520,7 +1532,7 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use super::{scan_finished, settle_poll, QueuedTrack, FAILED_STATE_CONFIRM};
+    use super::{scan_finished, scan_imports, settle_poll, QueuedTrack, FAILED_STATE_CONFIRM};
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
     use crate::server_fns::download::test_support::{
@@ -1935,5 +1947,69 @@ mod tests {
         assert!(queued[0].failing_since.is_none());
         assert_eq!(pending, pending_of(&queued));
         assert!(failed_ids.is_empty());
+    }
+
+    /// A Navidrome whose scan status cannot be read (getLastScanTime's
+    /// `Internal Error`, server/subsonic/library_scanning.go:16-21) and
+    /// that accepts a scan; gives its URL and the endpoints it was asked for.
+    fn navidrome_without_scan_status() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut reader = BufReader::new(stream.unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let target = line.split_whitespace().nth(1).unwrap_or_default();
+                let endpoint = target.split('?').next().unwrap_or_default().to_string();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                let body = match endpoint.as_str() {
+                    "/rest/getScanStatus" => {
+                        r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Internal Error"}}}"#
+                    }
+                    _ => r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#,
+                };
+                recorded.lock().unwrap().push(endpoint);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                reader.get_mut().write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (url, asked)
+    }
+
+    #[tokio::test]
+    async fn a_scan_status_that_cannot_be_read_still_starts_the_scan() {
+        let (url, asked) = navidrome_without_scan_status();
+        let navi = soulbeet::navidrome::NavidromeClientBuilder::new()
+            .base_url(&url)
+            .username("alice")
+            .password("secret")
+            .build()
+            .unwrap();
+        assert!(scan_imports(&navi, 3).await);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["/rest/getScanStatus", "/rest/startScan"]
+        );
     }
 }
