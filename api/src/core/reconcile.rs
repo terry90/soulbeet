@@ -113,16 +113,15 @@ async fn sent(
 /// Every transfer, path and row carries the JobSlot its slot was given.
 #[derive(Default)]
 pub(crate) struct Resumed {
-    /// Transfers the backend still has, or could not be asked about (the monitor's own
-    /// unreadable-list deadline decides those).
+    /// Transfers the backend still has, finished ones included (a monitor hands each off on its
+    /// first poll), or could not be asked about (the monitor's own unreadable-list deadline
+    /// decides those).
     pub watch: Vec<WatchedTransfer>,
-    /// Finished transfers whose file is in the batch folder (or anywhere in the download folder
-    /// for an adopted one), with the path found: those the backend no longer lists, whatever
-    /// their last row said, and in an album batch that has one, every Completed one it still
-    /// lists (D15).
+    /// Finished files of the batch on disk, with the path found: the transfers the backend no
+    /// longer lists, whatever their last row said, whose file is in the batch folder (or
+    /// anywhere in the download folder for an adopted one), and the queued files found in the
+    /// batch folder.
     pub finished: Vec<ResolvedSlot>,
-    /// (source, transfer id) of the finished transfers the backend still lists, removed once found.
-    pub remove: Vec<(String, String)>,
     /// transfer_lost rows for a transfer neither the backend nor the disk has, and
     /// unresolved_row for a finished transfer whose file is not found.
     pub failed: Vec<DownloadProgress>,
@@ -135,13 +134,11 @@ pub(crate) struct Resumed {
     pub on_disk: Vec<JobSlot>,
 }
 
-/// A transfer the backend no longer lists, or a finished one it does, to
-/// look for on disk: its row, the batch folder it was enqueued into (None
-/// for an adopted one), and its transfer when the backend still lists it.
+/// A transfer the backend no longer lists, to look for on disk: its row and
+/// the batch folder it was enqueued into (None for an adopted one).
 struct Lookup {
     row: DownloadProgress,
     destination: Option<String>,
-    listed: Option<WatchedTransfer>,
 }
 
 /// Checks each downloading slot of `batch` against `backend`. A slot's
@@ -165,7 +162,6 @@ pub(crate) async fn resume_downloads(
 ) -> Resumed {
     let mut resumed = Resumed::default();
     let mut unlisted = Vec::new();
-    let mut listed_done = Vec::new();
     for (slot, record) in slots {
         // A slot is downloading only once a row put it there.
         let Some(row) = record.row else {
@@ -194,15 +190,6 @@ pub(crate) async fn resume_downloads(
         };
         let destination = (!adopted).then(|| batch.destination.clone());
         match backend.get_download(&row.source, &row.id).await {
-            Ok(Some(listed)) if listed.state == DownloadState::Completed => {
-                listed_done.push(Lookup {
-                    row: listed
-                        .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
-                        .with_job(slot),
-                    destination,
-                    listed: Some(watched),
-                })
-            }
             Ok(Some(_)) => resumed.watch.push(watched),
             Err(e) => {
                 debug!(
@@ -215,21 +202,15 @@ pub(crate) async fn resume_downloads(
             // A handoff removed the record before the import was queued, or
             // slskd dropped the record of a transfer that finished while
             // Soulful was down: the file says which.
-            Ok(None) => unlisted.push(Lookup {
-                row,
-                destination,
-                listed: None,
-            }),
+            Ok(None) => unlisted.push(Lookup { row, destination }),
         }
     }
 
     let claimed = Mutex::new(HashSet::new());
     let found = look_on_disk(&unlisted, base, &claimed).await;
-    let mut any_found = false;
     for (lookup, path) in unlisted.into_iter().zip(found) {
         match path {
             Ok(path) => {
-                any_found = true;
                 resumed.finished.push(ResolvedSlot {
                     row: lookup.row,
                     path,
@@ -248,7 +229,6 @@ pub(crate) async fn resume_downloads(
         };
         let destination = batch.destination.clone();
         if let Ok(path) = find_on_disk(&row.item, base, Some(&destination), &claimed) {
-            any_found = true;
             resumed.on_disk.push(slot);
             resumed.finished.push(ResolvedSlot {
                 row: row
@@ -257,34 +237,6 @@ pub(crate) async fn resume_downloads(
                 path,
                 destination: Some(destination),
             });
-        }
-    }
-
-    // An album batch's records stay until the whole album is imported, so a
-    // finished one already gone means Soulful stopped inside finish_album
-    // (D15), or slskd cleared the records of files that finished while
-    // Soulful was down: the album is imported from the files there.
-    if batch.import_mode != ImportMode::Album || !any_found {
-        // A monitor hands each off on its first poll.
-        resumed
-            .watch
-            .extend(listed_done.into_iter().filter_map(|l| l.listed));
-        return resumed;
-    }
-    let found = look_on_disk(&listed_done, base, &claimed).await;
-    for (lookup, path) in listed_done.into_iter().zip(found) {
-        match path {
-            Ok(path) => {
-                resumed
-                    .remove
-                    .push((lookup.row.source.clone(), lookup.row.id.clone()));
-                resumed.finished.push(ResolvedSlot {
-                    row: lookup.row,
-                    path,
-                    destination: lookup.destination,
-                });
-            }
-            Err(why) => resumed.failed.push(unresolved_row(lookup.row, base, why)),
         }
     }
     resumed
@@ -309,13 +261,15 @@ async fn look_on_disk(
 pub(crate) trait Resume: Send + Sync {
     /// The backend the downloads of the unfinished jobs ran on.
     async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure>;
-    /// Watches `transfers` for `batch`, failing slots over from `pool`.
+    /// Watches `transfers` for `batch`, failing slots over from `pool`; an
+    /// album batch imports `found`, its files already finished, with them.
     async fn watch(
         &self,
         ctx: &UserCtx,
         batch: BatchRef,
         transfers: Vec<WatchedTransfer>,
         pool: SourcePool,
+        found: Vec<ResolvedSlot>,
     );
     /// Enqueues `acquisition`'s files into `fresh` and watches them.
     async fn enqueue(
@@ -346,11 +300,12 @@ impl Resume for Live {
         batch: BatchRef,
         transfers: Vec<WatchedTransfer>,
         pool: SourcePool,
+        found: Vec<ResolvedSlot>,
     ) {
         let tx = get_or_create_user_channel(&ctx.id()).await;
         let target = batch.target.clone();
         let monitor = DownloadMonitor::new(transfers, target, tx, batch, LEDGER.clone());
-        spawn_monitor(ctx, monitor.with_failover(pool));
+        spawn_monitor(ctx, monitor.with_failover(pool).with_found(found));
     }
 
     async fn enqueue(
@@ -833,9 +788,13 @@ async fn adopt_sent(
     (!queued.slots.is_empty()).then_some(queued)
 }
 
-/// Resumes one monitor batch: fails the transfers slskd lost, imports the
-/// finished ones and the queued files found in its folder, and watches the
-/// rest. A transfer a request made since startup now holds is that
+/// Resumes one monitor batch: fails the transfers slskd lost, and watches the
+/// rest. The files of the batch found on disk (finished transfers slskd no
+/// longer lists, queued files in its folder) are finished slots of it: a
+/// singleton batch imports each now, and an album batch hands them to its
+/// monitor, which imports them with the watched files once every slot
+/// settled, as a live batch does, or imports them now when it watches
+/// nothing. A transfer a request made since startup now holds is that
 /// request's: its slot is dismissed when the request downloads the file into
 /// the same folder for the same user, and fails as that request's claim says
 /// otherwise. Gives back the queued slots whose file it imports.
@@ -858,7 +817,6 @@ async fn resume_batch(
     let Resumed {
         watch,
         finished,
-        remove,
         failed: lost,
         rebound,
         abandon,
@@ -877,30 +835,23 @@ async fn resume_batch(
             warn!("Failed to cancel abandoned transfer {id} in slskd: {e}");
         }
     }
-    for (source, id) in remove {
-        if let Err(e) = backend.cancel_download(&source, &id, true).await {
-            warn!("Failed to remove finished transfer {id} from slskd: {e}");
-        }
-    }
-    let imports = match batch.import_mode {
-        ImportMode::Album => album_jobs(finished, &batch.target, &user, download_base),
-        ImportMode::Singleton => finished
-            .into_iter()
-            .map(|f| {
-                import_job(
+    let found = match batch.import_mode {
+        ImportMode::Album => finished,
+        ImportMode::Singleton => {
+            for f in finished {
+                let import = import_job(
                     f.path,
                     ImportMode::Singleton,
                     vec![f.row],
                     &batch.target,
                     &user,
                     download_base,
-                )
-            })
-            .collect(),
+                );
+                queue.submit(import).await;
+            }
+            Vec::new()
+        }
     };
-    for import in imports {
-        queue.submit(import).await;
-    }
 
     let registry = TransferRegistry::global();
     let mut watched = Vec::new();
@@ -931,6 +882,11 @@ async fn resume_batch(
     }
     fail_rows(ledger, &user, held).await;
     if watched.is_empty() {
+        // Every slot of the album settled: Soulful stopped inside
+        // finish_album (D15), or slskd finished and cleared the rest.
+        for import in album_jobs(found, &batch.target, &user, download_base) {
+            queue.submit(import).await;
+        }
         return on_disk;
     }
     // Every watched transfer is one of the slots given, each with its entry.
@@ -940,7 +896,7 @@ async fn resume_batch(
             .map(|w| pools.remove(&w.job).unwrap_or_default())
             .collect(),
     );
-    resume.watch(&ctx, batch, watched, pool).await;
+    resume.watch(&ctx, batch, watched, pool, found).await;
     on_disk
 }
 
@@ -1065,7 +1021,7 @@ mod tests {
         )
         .await;
 
-        assert!(resumed.watch.is_empty() && resumed.failed.is_empty() && resumed.remove.is_empty());
+        assert!(resumed.watch.is_empty() && resumed.failed.is_empty());
         assert_eq!(
             resumed
                 .finished
@@ -1139,7 +1095,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_album_stopped_while_importing_is_imported_whole() {
+    async fn an_album_stopped_while_importing_watches_its_listed_files_beside_the_gone_ones() {
         let base = tempfile::tempdir().unwrap();
         let b = BatchRef {
             import_mode: ImportMode::Album,
@@ -1189,18 +1145,23 @@ mod tests {
             vec![],
         )
         .await;
-        assert!(resumed.watch.is_empty() && resumed.failed.is_empty());
+        assert!(resumed.failed.is_empty());
+        // The monitor imports both on its first poll, 02 being Completed.
+        assert_eq!(
+            resumed
+                .watch
+                .iter()
+                .map(|w| (w.transfer_id.as_str(), w.job.clone()))
+                .collect::<Vec<_>>(),
+            vec![("t-02", slot(1))]
+        );
         assert_eq!(
             resumed
                 .finished
                 .iter()
-                .map(|f| f.row.job.clone())
+                .map(|f| (f.path.clone(), f.row.job.clone()))
                 .collect::<Vec<_>>(),
-            vec![Some(slot(0)), Some(slot(1))]
-        );
-        assert_eq!(
-            resumed.remove,
-            vec![("peer_a".to_string(), "t-02".to_string())]
+            vec![(folder.join("01.flac"), Some(slot(0)))]
         );
     }
 
@@ -1236,6 +1197,8 @@ mod tests {
     struct Started {
         backend: Arc<dyn DownloadBackend>,
         watched: Mutex<Vec<WatchStart>>,
+        /// The path and slot of each file a watched batch was handed found.
+        found: Mutex<Vec<(PathBuf, Option<JobSlot>)>>,
         enqueued: Mutex<Vec<EnqueueStart>>,
         /// job, search id, stored groups
         searched: Mutex<Vec<(String, String, Option<usize>)>>,
@@ -1246,6 +1209,7 @@ mod tests {
             Started {
                 backend,
                 watched: Mutex::default(),
+                found: Mutex::default(),
                 enqueued: Mutex::default(),
                 searched: Mutex::default(),
             }
@@ -1269,7 +1233,12 @@ mod tests {
             batch: BatchRef,
             transfers: Vec<WatchedTransfer>,
             _: SourcePool,
+            found: Vec<ResolvedSlot>,
         ) {
+            self.found
+                .lock()
+                .unwrap()
+                .extend(found.into_iter().map(|f| (f.path, f.row.job)));
             self.watched.lock().unwrap().push((
                 batch.owner.batch_id,
                 batch.label,
@@ -1682,7 +1651,14 @@ mod tests {
         async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure> {
             Err(unset())
         }
-        async fn watch(&self, _: &UserCtx, _: BatchRef, _: Vec<WatchedTransfer>, _: SourcePool) {
+        async fn watch(
+            &self,
+            _: &UserCtx,
+            _: BatchRef,
+            _: Vec<WatchedTransfer>,
+            _: SourcePool,
+            _: Vec<ResolvedSlot>,
+        ) {
             unreachable!("nothing is watched without a backend")
         }
         async fn enqueue(
@@ -2257,6 +2233,179 @@ mod tests {
             enqueued,
             vec![("j1".to_string(), vec![(1, "q\\02.flac".to_string())])]
         );
+    }
+
+    /// alice's album job `j1` with `slots` picked, its files sent into batch b1 in B1_REQUEST,
+    /// her folder at `library`; gives b1 as its monitor resumes it.
+    async fn album_in_b1(
+        ledger: &Ledger,
+        db: &SqlitePool,
+        library: &Path,
+        slots: Vec<(u32, DownloadableItem)>,
+    ) -> BatchRef {
+        sqlx::query("UPDATE folders SET path = ? WHERE id = 'alice-folder'")
+            .bind(library.to_string_lossy())
+            .execute(db)
+            .await
+            .unwrap();
+        ledger
+            .create(
+                NewJob {
+                    id: "j1".into(),
+                    user: UserId::new("alice"),
+                    folder_id: "alice-folder".into(),
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Album,
+                    state: JobState::Queued,
+                    search_id: None,
+                    picked: slots,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        enqueued_in_b1(ledger, "j1");
+        BatchRef::new(
+            TransferOwner {
+                user_id: UserId::new("alice"),
+                batch_id: "b1".into(),
+            },
+            "Come Over".into(),
+            library.to_path_buf(),
+            ImportMode::Album,
+        )
+    }
+
+    fn slot_of_j1(slot: u32) -> JobSlot {
+        JobSlot {
+            job: "j1".into(),
+            slot,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_album_file_found_on_disk_waits_for_the_transfer_its_batch_still_runs() {
+        let (ledger, db) = ledger().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("music");
+        let b1 = album_in_b1(
+            &ledger,
+            &db,
+            &library,
+            vec![
+                (0, item("peer_a", "One", "q\\01.flac")),
+                (1, item("peer_a", "Two", "q\\02.flac")),
+            ],
+        )
+        .await;
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![
+                transfer("peer_a", "q\\02.flac", "t-02", DownloadState::InProgress)
+                    .with_batch("b1".into(), "Come Over".into())
+                    .with_job(slot_of_j1(1)),
+            ],
+        });
+        ledger.settled().await;
+        // slskd finished 01 and cleared its record while Soulful was down; 02 still downloads.
+        let folder = tmp.path().join(&b1.destination);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("01.flac"), b"flac").unwrap();
+        let stub = StubBackend::new(vec![]);
+        stub.set_listing(vec![in_request(
+            transfer("peer_a", "q\\02.flac", "t-02", DownloadState::InProgress),
+            B1_REQUEST,
+        )]);
+        let started = Started::on(stub.clone());
+        let importer = Arc::new(StubImporter::new());
+        let deps = RecordingDeps::new(importer.clone());
+        let queue = ImportQueue::new(deps.clone());
+
+        reconcile_in(&db, &ledger, &queue, &started, tmp.path()).await;
+        ledger.settled().await;
+
+        assert_eq!(
+            *started.watched.lock().unwrap(),
+            vec![(
+                "b1".into(),
+                "Come Over".into(),
+                vec![("t-02".into(), slot_of_j1(1))]
+            )]
+        );
+        assert_eq!(
+            *started.found.lock().unwrap(),
+            vec![(folder.join("01.flac"), Some(slot_of_j1(0)))],
+            "01 is a finished slot of the batch its monitor imports"
+        );
+        assert!(started.enqueued.lock().unwrap().is_empty());
+        assert!(
+            !deps
+                .ledger_events()
+                .iter()
+                .any(|e| matches!(e, JobEvent::ImportQueued(_))),
+            "an import was queued while 02 still downloads"
+        );
+        assert_eq!(importer.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_album_whose_every_file_is_on_disk_is_imported_once_with_all_of_them() {
+        let (ledger, db) = ledger().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("music");
+        let b1 = album_in_b1(
+            &ledger,
+            &db,
+            &library,
+            vec![
+                (0, item("peer_a", "One", "q\\01.flac")),
+                (1, item("peer_a", "Two", "q\\02.flac")),
+            ],
+        )
+        .await;
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![
+                transfer("peer_a", "q\\01.flac", "t-01", DownloadState::Completed)
+                    .with_batch("b1".into(), "Come Over".into())
+                    .with_job(slot_of_j1(0)),
+            ],
+        });
+        ledger.settled().await;
+        // Both finished while Soulful was down, and slskd cleared their records.
+        let folder = tmp.path().join(&b1.destination);
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["01.flac", "02.flac"] {
+            std::fs::write(folder.join(name), b"flac").unwrap();
+        }
+        let started = Started::on(StubBackend::new(vec![]));
+        let importer = Arc::new(StubImporter::new());
+        let deps = RecordingDeps::new(importer.clone());
+        let queue = ImportQueue::new(deps.clone());
+
+        reconcile_in(&db, &ledger, &queue, &started, tmp.path()).await;
+        ledger.settled().await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while importer.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await
+            }
+        })
+        .await
+        .expect("the album was imported");
+        assert_eq!(importer.seen(), vec![(vec![folder], library)]);
+        let queued: Vec<Vec<JobSlot>> = deps
+            .ledger_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                JobEvent::ImportQueued(import) => {
+                    Some(import.rows.into_iter().map(|(slot, _)| slot).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued, vec![vec![slot_of_j1(0), slot_of_j1(1)]]);
+        assert!(started.nothing());
     }
 
     #[tokio::test]

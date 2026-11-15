@@ -26,7 +26,7 @@ use tokio::time::Instant;
 use super::enqueue::{stopped_rows, transfer_key};
 use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::{album_jobs, import_job, resolve_on_disk, unresolved_row, ResolvedSlot};
-use super::utils::FileId;
+use super::utils::{file_id, FileId};
 use crate::config::CONFIG;
 use crate::core::database_failure;
 use crate::globals::send_user_event;
@@ -342,6 +342,9 @@ pub struct DownloadMonitor {
     completed_seen: HashSet<(String, String)>,
     /// Where every row the monitor sends is recorded with its slot's state.
     ledger: Ledger,
+    /// Finished files of an album batch found on disk before it was watched
+    /// (a resumed batch's): imported with the batch's album.
+    found: Vec<ResolvedSlot>,
 }
 
 impl DownloadMonitor {
@@ -386,7 +389,19 @@ impl DownloadMonitor {
             last_readable_poll: Instant::now(),
             completed_seen: HashSet::new(),
             ledger,
+            found: Vec::new(),
         }
+    }
+
+    /// Hands an album batch `found`, finished files of it already on disk:
+    /// they are imported with the files it watches once every one of those
+    /// settled, and never resolved again for another slot.
+    pub fn with_found(mut self, found: Vec<ResolvedSlot>) -> Self {
+        let mut claimed = self.claimed.lock().unwrap_or_else(|e| e.into_inner());
+        claimed.extend(found.iter().filter_map(|f| file_id(&f.path)));
+        drop(claimed);
+        self.found = found;
+        self
     }
 
     fn watching(&self, slot: usize) -> bool {
@@ -819,6 +834,11 @@ impl DownloadMonitor {
                 self.close_inbox();
             }
         }
+
+        // An album batch that stopped before its album was imported still
+        // imports the files it was handed already finished.
+        let found = std::mem::take(&mut self.found);
+        self.import_album(found).await;
 
         // Their keys stay claimed until their imports are done, and the
         // batch's keys are released when the monitor drops.
@@ -1505,9 +1525,10 @@ impl DownloadMonitor {
         false
     }
 
-    /// Import every finished slot of an album batch together. The slskd
-    /// records are only removed once every file was looked for on disk, and
-    /// the keys only once the imports are done.
+    /// Import every finished slot of an album batch together, with the files
+    /// it was handed found (`with_found`). The slskd records are only removed
+    /// once every file was looked for on disk, and the keys only once the
+    /// imports are done.
     async fn finish_album(
         &mut self,
         matched: &[(usize, DownloadProgress)],
@@ -1526,7 +1547,7 @@ impl DownloadMonitor {
                 )
             })
             .collect();
-        if finished.is_empty() {
+        if finished.is_empty() && self.found.is_empty() {
             info!("Album mode: No successful downloads to process");
             return;
         }
@@ -1583,6 +1604,22 @@ impl DownloadMonitor {
             self.track_states[*slot].phase = SlotPhase::HandedOff;
         }
 
+        let mut album = std::mem::take(&mut self.found);
+        album.append(&mut resolved);
+        self.import_album(album).await;
+        let registry = TransferRegistry::global();
+        for slot in resolved_slots {
+            registry.release(&self.slot_key(slot, backend.id()), &self.batch.owner);
+        }
+    }
+
+    /// Queue the imports of an album batch's finished files (`album_jobs`)
+    /// and wait until they are done.
+    async fn import_album(&self, resolved: Vec<ResolvedSlot>) {
+        if resolved.is_empty() {
+            return;
+        }
+        let files = resolved.len();
         let jobs = album_jobs(
             resolved,
             &self.target_path,
@@ -1592,7 +1629,7 @@ impl DownloadMonitor {
         info!(
             "Album mode: queueing {} import(s) of {} downloads into {:?}",
             jobs.len(),
-            resolved_slots.len(),
+            files,
             self.target_path
         );
         let mut handles = Vec::new();
@@ -1601,10 +1638,6 @@ impl DownloadMonitor {
         }
         for handle in handles {
             handle.wait().await;
-        }
-        let registry = TransferRegistry::global();
-        for slot in resolved_slots {
-            registry.release(&self.slot_key(slot, backend.id()), &self.batch.owner);
         }
     }
 }
@@ -3522,6 +3555,62 @@ mod tests {
             "one album job"
         );
         assert!((0..2).all(|slot| phase(&m, slot) == SlotPhase::HandedOff));
+    }
+
+    #[tokio::test]
+    async fn an_album_file_found_before_watching_is_imported_once_with_the_rest() {
+        let (m, base, mut imports, mut recorded) = disk_monitor(
+            &UserId::new("monitor-album-found"),
+            &["02.flac"],
+            &["01.flac"],
+        )
+        .await;
+        let folder = base.path().join(&m.batch.destination);
+        // Resumed with 01 already on disk, its record gone.
+        let one = ResolvedSlot {
+            row: listed("peer_a", "01.flac", DownloadState::Completed)
+                .with_batch(m.batch.owner.batch_id.clone(), m.batch.label.clone())
+                .with_job(slot_of_j1(1)),
+            path: folder.join("01.flac"),
+            destination: Some(m.batch.destination.clone()),
+        };
+        let mut m = m.with_found(vec![one]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+
+        let mut empty = 0;
+        let running = vec![listed("peer_a", "02.flac", DownloadState::InProgress)];
+        assert!(
+            !m.process_poll_result(running, &mut empty, 1, &backend)
+                .await
+        );
+        assert!(
+            import_events(&mut imports).is_empty(),
+            "imported while 02 still downloads"
+        );
+
+        std::fs::write(folder.join("02.flac"), b"x").unwrap();
+        let done = vec![listed("peer_a", "02.flac", DownloadState::Completed)];
+        assert!(m.process_poll_result(done, &mut empty, 2, &backend).await);
+
+        let events = import_events(&mut imports);
+        assert_eq!(
+            events
+                .iter()
+                .map(|rows| rows.iter().map(|r| r.item.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec!["01.flac".to_string(), "02.flac".to_string()]],
+            "one album job"
+        );
+        assert!(
+            !events.iter().flatten().any(|r| r
+                .failure
+                .as_ref()
+                .is_some_and(|f| f.code == FailureCode::FileNotFoundAfterDownload)),
+            "{events:?}"
+        );
+        assert!(slots_recorded(&mut recorded)
+            .iter()
+            .all(|(state, _)| *state != JobState::Failed));
     }
 
     #[tokio::test]
