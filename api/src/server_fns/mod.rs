@@ -55,6 +55,12 @@ pub fn refusal_error_with<E: std::fmt::Display, D: serde::Serialize>(
     }
 }
 
+/// A typed failure as the browser gets it: a refusal whose message is the
+/// failure's and whose details are the failure.
+pub fn failure_error(failure: shared::failure::Failure) -> ServerFnError {
+    refusal_error_with(&failure.message, &failure)
+}
+
 /// Status of a request refused because of the caller's role.
 pub const FORBIDDEN_CODE: u16 = 403;
 
@@ -115,7 +121,35 @@ pub async fn cleanup_empty_ancestors(
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use super::cleanup_empty_ancestors;
+    use super::{cleanup_empty_ancestors, failure_error, REFUSAL_CODE};
+    use dioxus::prelude::ServerFnError;
+    use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+
+    #[test]
+    fn a_failure_reaches_the_browser_as_a_refusal_carrying_it() {
+        let f = Failure::new(
+            FailureCode::UnknownHandle,
+            Stage::Input,
+            RetryAdvice::NotRetryable,
+            "Folder not found",
+        );
+        let sent: ServerFnError =
+            serde_json::from_value(serde_json::to_value(failure_error(f.clone())).unwrap())
+                .unwrap();
+        let ServerFnError::ServerError {
+            code,
+            message,
+            details,
+        } = sent
+        else {
+            panic!("not a server error")
+        };
+        assert_eq!((code, message.as_str()), (REFUSAL_CODE, "Folder not found"));
+        assert_eq!(
+            serde_json::from_value::<Failure>(details.unwrap()).unwrap(),
+            f
+        );
+    }
 
     #[tokio::test]
     async fn removes_empty_dirs_up_to_but_not_including_the_root() {

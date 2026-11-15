@@ -3,6 +3,8 @@ pub mod auth;
 pub mod base_url;
 pub mod build_id;
 pub mod config;
+#[cfg(feature = "server")]
+pub mod core;
 pub mod crypto;
 pub mod db;
 pub mod folder_policy;

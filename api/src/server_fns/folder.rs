@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use shared::library::DuplicateReport;
 
 #[cfg(feature = "server")]
-use super::{refusal_error, server_error};
+use super::{failure_error, refusal_error, server_error};
 #[cfg(feature = "server")]
 use crate::auth::UserCtx;
 use crate::folder_policy::FolderAdminView;
@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 
 #[get("/api/folders", auth: AuthSession)]
 pub async fn get_user_folders() -> Result<Vec<models::folder::Folder>, ServerFnError> {
-    models::folder::Folder::get_all_by_user(&auth.0.user_id)
+    crate::core::folders::list(&auth.0)
         .await
-        .map_err(server_error)
+        .map_err(failure_error)
 }
 
 #[post("/api/folders", auth: AuthSession)]
@@ -89,28 +89,15 @@ async fn checked_folder_path(
     Ok(candidate)
 }
 
-/// The folder, when `user_id` owns it. Another user's folder is reported as
-/// missing, the same as one that does not exist.
-#[cfg(feature = "server")]
-pub(crate) fn ensure_owner(
-    folder: Option<models::folder::Folder>,
-    user_id: &str,
-) -> Result<models::folder::Folder, ServerFnError> {
-    folder
-        .filter(|f| f.user_id == user_id)
-        .ok_or_else(|| refusal_error("Folder not found"))
-}
-
 #[put("/api/folders/update", auth: AuthSession)]
 pub async fn update_folder(
     folder_id: String,
     name: String,
     path: String,
 ) -> Result<(), ServerFnError> {
-    let folder = models::folder::Folder::get_by_id(&folder_id)
+    let folder = crate::core::folders::owned(&auth.0, &folder_id)
         .await
-        .map_err(server_error)?;
-    let folder = ensure_owner(folder, &auth.0.user_id)?;
+        .map_err(failure_error)?;
     let canonical = checked_folder_path(
         &auth.0,
         &path,
@@ -126,10 +113,9 @@ pub async fn update_folder(
 
 #[delete("/api/folders/delete", auth: AuthSession)]
 pub async fn delete_folder(folder_id: String) -> Result<(), ServerFnError> {
-    let folder = models::folder::Folder::get_by_id(&folder_id)
+    crate::core::folders::owned(&auth.0, &folder_id)
         .await
-        .map_err(server_error)?;
-    ensure_owner(folder, &auth.0.user_id)?;
+        .map_err(failure_error)?;
     models::folder::Folder::delete(&folder_id)
         .await
         .map_err(server_error)
@@ -193,30 +179,4 @@ pub async fn get_folder_duplicates() -> Result<DuplicateReport, ServerFnError> {
 
     let importer = music_importer(None).await.map_err(server_error)?;
     importer.find_duplicates(&paths).await.map_err(server_error)
-}
-
-#[cfg(all(test, feature = "server"))]
-mod tests {
-    use super::*;
-    use crate::models::folder::Folder;
-
-    fn folder(id: &str, user_id: &str) -> Folder {
-        Folder {
-            id: id.to_string(),
-            user_id: user_id.to_string(),
-            name: "Music".to_string(),
-            path: "/music".to_string(),
-            shared: false,
-        }
-    }
-
-    #[test]
-    fn another_users_folder_is_not_found() {
-        let err = ensure_owner(Some(folder("f1", "user-b")), "user-a").unwrap_err();
-        assert!(
-            matches!(err, ServerFnError::ServerError { code: 409, ref message, .. } if message == "Folder not found")
-        );
-        assert!(ensure_owner(None, "user-a").is_err());
-        assert!(ensure_owner(Some(folder("f1", "user-a")), "user-a").is_ok());
-    }
 }
