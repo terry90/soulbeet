@@ -3,9 +3,13 @@
 //! after a restart the ledger's kept imports are restored.
 
 use super::choice::{files_gone, nothing_to_retry, resolve};
+use super::rows::rows_with_state;
 use super::{ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
-use shared::download::{ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind};
+use crate::ledger::{self, JobEvent};
+use shared::download::{
+    DownloadState, ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind,
+};
 use soulbeet::{ImportMode, ImportOutcome, SkipReason};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -38,6 +42,15 @@ impl Kept {
     }
 }
 
+impl ImportJob {
+    /// Whether one of the job's rows is `slot`.
+    fn has_slot(&self, slot: &JobSlot) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| owner.rows.iter().any(|row| row.job.as_ref() == Some(slot)))
+    }
+}
+
 #[derive(Default)]
 struct Store {
     next_seq: u64,
@@ -56,8 +69,9 @@ impl RetryStore {
     }
 
     /// Keeps the job for each of its rows when `keep`, and drops what its
-    /// rows kept before otherwise. Returns the slots of the rows dropped to
-    /// stay within MAX_PER_USER.
+    /// rows kept before otherwise. Returns the slots of the rows this dropped:
+    /// other jobs' rows its rows replaced or removed, and rows dropped to stay
+    /// within MAX_PER_USER.
     pub(super) fn record(&self, job: &Arc<ImportJob>, keep: bool) -> Vec<JobSlot> {
         let Some(owner) = &job.owner else {
             return vec![];
@@ -68,15 +82,20 @@ impl RetryStore {
         store.next_seq += 1;
         let user = store.users.entry(owner.user_id.clone()).or_default();
         for row in &owner.rows {
-            if keep {
+            let before = if keep {
                 let kept = Kept {
                     seq,
                     job: job.clone(),
                 };
-                user.insert(row.item.clone(), kept);
+                user.insert(row.item.clone(), kept)
             } else {
-                user.remove(&row.item);
-            }
+                user.remove(&row.item)
+            };
+            dropped.extend(
+                before
+                    .and_then(|kept| kept.slot(&row.item))
+                    .filter(|slot| !job.has_slot(slot)),
+            );
         }
         while user.len() > MAX_PER_USER {
             let oldest = user
@@ -95,24 +114,32 @@ impl RetryStore {
     }
 
     /// Removes and returns the job of `item` once `accept` takes it, along
-    /// with its other rows' entries, so no row of it can resubmit it a second
-    /// time. A job `accept` refuses stays kept.
+    /// with every entry of its sources, so no row of it can resubmit it a
+    /// second time. A job `accept` refuses stays kept. Also returns the slots
+    /// of other jobs' rows whose entries went with it.
     fn take<T>(
         &self,
         owner: &UserId,
         item: &str,
         accept: impl FnOnce(&ImportJob) -> Result<T, ImportRefusal>,
-    ) -> Result<(Arc<ImportJob>, T), ImportRefusal> {
+    ) -> Result<(Arc<ImportJob>, T, Vec<JobSlot>), ImportRefusal> {
         let mut store = self.store();
         let user = store.users.get_mut(owner).ok_or_else(nothing_to_retry)?;
         let kept = user.get(item).ok_or_else(nothing_to_retry)?;
         let accepted = accept(&kept.job)?;
         let job = kept.job.clone();
-        user.retain(|_, kept| kept.job.sources != job.sources);
+        let mut dropped = vec![];
+        user.retain(|item, kept| {
+            if kept.job.sources != job.sources {
+                return true;
+            }
+            dropped.extend(kept.slot(item).filter(|slot| !job.has_slot(slot)));
+            false
+        });
         if user.is_empty() {
             store.users.remove(owner);
         }
-        Ok((job, accepted))
+        Ok((job, accepted, dropped))
     }
 
     fn peek(&self, owner: &UserId, item: &str) -> Option<Arc<ImportJob>> {
@@ -144,18 +171,35 @@ impl ImportQueue {
         item: &str,
         choice: ImportChoice,
     ) -> Result<(), ImportRefusal> {
-        let (job, choice) = self
-            .shared
-            .retries
-            .take(user, item, |job| resolve(&choice, job))?;
+        let job = {
+            // A finish recording what it kept cannot be split by the take.
+            let _emit = self.shared.emit_lock.lock().await;
+            let (job, choice, dropped) = self
+                .shared
+                .retries
+                .take(user, item, |job| resolve(&choice, job))?;
+            self.shared.dismiss(dropped);
+            ImportJob {
+                choice,
+                ..Arc::unwrap_or_clone(job)
+            }
+        };
         if !job.holds_audio().await {
-            return Err(files_gone());
+            let refusal = files_gone();
+            // The job is no longer kept, so its slots end as a restart would end them.
+            if let Some(owner) = &job.owner {
+                let rows = rows_with_state(&owner.rows, DownloadState::Failed(String::new()))
+                    .into_iter()
+                    .map(|row| row.with_failure(refusal.failure.clone()))
+                    .collect();
+                self.shared.deps.record(JobEvent::Slots {
+                    state: ledger::JobState::Failed,
+                    rows,
+                });
+            }
+            return Err(refusal);
         }
-        self.submit(ImportJob {
-            choice,
-            ..Arc::unwrap_or_clone(job)
-        })
-        .await;
+        self.submit(job).await;
         Ok(())
     }
 
@@ -166,6 +210,7 @@ impl ImportQueue {
         if !job.holds_audio().await {
             return Err(files_gone());
         }
+        let _emit = self.shared.emit_lock.lock().await;
         let dropped = self.shared.retries.record(&Arc::new(job), true);
         self.shared.dismiss(dropped);
         Ok(())
@@ -221,6 +266,7 @@ mod tests {
     };
     use crate::import_queue::tests::{file, finish, job, owned, queue};
     use crate::import_queue::{ImportJob, ImportMode, ImportQueue};
+    use crate::ledger::{JobEvent, JobState as LedgerState};
     use shared::download::{
         DownloadProgress, DownloadState, ImportChoice, JobSlot, MatchChoices, MatchKind,
     };
@@ -535,7 +581,7 @@ mod tests {
     async fn a_retry_whose_files_are_gone_is_refused_without_importing() {
         let tmp = tempfile::tempdir().unwrap();
         let source = file(tmp.path(), "dl/a.flac");
-        let (queue, stub, _) = queue(StubImporter::new());
+        let (queue, stub, deps) = queue(StubImporter::new());
         stub.script(ImportResult::failed(
             FailKind::Beets,
             "beets exited with code 1".into(),
@@ -552,6 +598,20 @@ mod tests {
             queue.retry(&alice(), "a", ImportChoice::Auto).await,
             Err(files_gone())
         );
+        // The job is no longer kept, so its slot fails with the refusal.
+        let events = deps.ledger_events();
+        let Some(JobEvent::Slots {
+            state: LedgerState::Failed,
+            rows,
+        }) = events.last()
+        else {
+            panic!("{events:?}")
+        };
+        let ended: Vec<_> = rows
+            .iter()
+            .map(|row| (row.job.clone(), row.failure.clone()))
+            .collect();
+        assert_eq!(ended, vec![(Some(first("j1")), Some(files_gone().failure))]);
         assert_eq!(
             queue.retry(&alice(), "a", ImportChoice::Auto).await,
             Err(nothing_to_retry())
@@ -583,35 +643,131 @@ mod tests {
         assert_eq!(stub.calls(), 1);
     }
 
+    /// A singleton job of `user` for `item`, its row the ledger's `slot`.
+    fn single(user: &UserId, item: &str, slot: JobSlot) -> Arc<ImportJob> {
+        use crate::import_queue::test_support::row;
+        use crate::import_queue::JobOwner;
+        Arc::new(ImportJob {
+            sources: vec![std::path::PathBuf::from(format!("/dl/{item}.flac"))],
+            target: std::path::PathBuf::from("/music"),
+            mode: ImportMode::Singleton,
+            owner: Some(JobOwner {
+                user_id: user.clone(),
+                rows: vec![row(item).with_job(slot)],
+            }),
+            snapshot_target: false,
+            cleanup_root: None,
+            choice: DriverChoice::Auto,
+            choices: None,
+        })
+    }
+
+    /// `job` with its rows moved to the ledger job `id`.
+    fn under(mut job: ImportJob, id: &str) -> ImportJob {
+        for row in &mut job.owner.as_mut().unwrap().rows {
+            row.job.as_mut().unwrap().job = id.into();
+        }
+        job
+    }
+
+    /// Every slot the queue recorded as dismissed, in order.
+    fn dismissed(deps: &RecordingDeps) -> Vec<JobSlot> {
+        deps.ledger_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                JobEvent::Dismiss(slots) => Some(slots),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn first(id: &str) -> JobSlot {
+        JobSlot {
+            job: id.into(),
+            slot: 0,
+        }
+    }
+
+    #[test]
+    fn a_row_another_job_kept_hands_back_that_jobs_slot() {
+        let store = super::RetryStore::default();
+        let a = |id: &str| single(&alice(), "a", first(id));
+        assert!(store.record(&a("j1"), true).is_empty());
+        // The same job kept again replaces only itself.
+        assert!(store.record(&a("j1"), true).is_empty());
+        assert_eq!(store.record(&a("j2"), true), vec![first("j1")]);
+        assert_eq!(store.record(&a("j3"), false), vec![first("j2")]);
+        assert!(store.record(&a("j3"), false).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_later_job_for_the_same_row_dismisses_the_earlier_kept_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let (queue, stub, deps) = queue(StubImporter::new());
+        let submit = |id: &str, dir: &str| {
+            let source = file(tmp.path(), &format!("{dir}/a.flac"));
+            under(owned(job(source, &lib), &alice(), &["a"]), id)
+        };
+        stub.script(no_match(1));
+        finish(queue.submit(submit("j1", "dl1")).await).await;
+        stub.script(no_match(1));
+        finish(queue.submit(submit("j2", "dl2")).await).await;
+        assert_eq!(dismissed(&deps), vec![first("j1")]);
+
+        // A later job that imports drops the kept one too.
+        finish(queue.submit(submit("j3", "dl3")).await).await;
+        assert_eq!(dismissed(&deps), vec![first("j1"), first("j2")]);
+        assert_eq!(queue.import_choices(&alice(), "a"), Err(nothing_to_retry()));
+    }
+
+    #[tokio::test]
+    async fn a_restored_import_dismisses_the_kept_row_it_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let (queue, _, deps) = queue(StubImporter::new());
+        for (id, dir) in [("j1", "dl1"), ("j2", "dl2")] {
+            let source = file(tmp.path(), &format!("{dir}/a.flac"));
+            let kept = under(owned(job(source, &lib), &alice(), &["a"]), id);
+            let restored = ImportJob::from_stored(kept.stored().unwrap(), alice());
+            assert_eq!(queue.restore(restored).await, Ok(()));
+        }
+        assert_eq!(dismissed(&deps), vec![first("j1")]);
+    }
+
+    #[tokio::test]
+    async fn a_retry_dismisses_other_jobs_rows_of_the_same_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = file(tmp.path(), "dl/a.flac");
+        let lib = tmp.path().join("lib");
+        let (queue, stub, deps) = queue(StubImporter::new());
+        for (id, item) in [("j1", "a"), ("j2", "b")] {
+            stub.script(no_match(1));
+            let kept = under(owned(job(source.clone(), &lib), &alice(), &[item]), id);
+            finish(queue.submit(kept).await).await;
+        }
+        assert!(dismissed(&deps).is_empty());
+
+        assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
+        assert_eq!(dismissed(&deps), vec![first("j2")]);
+        assert_eq!(
+            queue.retry(&alice(), "b", ImportChoice::Auto).await,
+            Err(nothing_to_retry())
+        );
+    }
+
     #[test]
     fn each_user_keeps_only_the_newest_retries() {
         use super::{RetryStore, MAX_PER_USER};
-        use crate::import_queue::test_support::row;
-        use crate::import_queue::{ImportJob, JobOwner};
-        use std::path::PathBuf;
-        use std::sync::Arc;
 
         let store = RetryStore::default();
         let slot = |item: &str| JobSlot {
             job: format!("j-{item}"),
             slot: 0,
         };
-        let record = |user: &UserId, item: &str| {
-            let job = ImportJob {
-                sources: vec![PathBuf::from(format!("/dl/{item}.flac"))],
-                target: PathBuf::from("/music"),
-                mode: ImportMode::Singleton,
-                owner: Some(JobOwner {
-                    user_id: user.clone(),
-                    rows: vec![row(item).with_job(slot(item))],
-                }),
-                snapshot_target: false,
-                cleanup_root: None,
-                choice: DriverChoice::Auto,
-                choices: None,
-            };
-            store.record(&Arc::new(job), true)
-        };
+        let record =
+            |user: &UserId, item: &str| store.record(&single(user, item, slot(item)), true);
         for i in 0..MAX_PER_USER {
             assert!(record(&alice(), &format!("{i}")).is_empty());
         }

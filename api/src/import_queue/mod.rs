@@ -543,10 +543,12 @@ impl Shared {
             choices,
             ..job.clone()
         });
-        // Stored before the rows go out, so their Retry button always finds it.
+        // Stored before the rows go out, so their Retry button always finds
+        // it, and under the lock, so the ledger hears what the store did in
+        // the order the store did it.
         let keep = keeps_retry(&outcome.result.outcome);
-        let dropped = self.retries.record(&job, keep);
         let _emit = self.emit_lock.lock().await;
+        let dropped = self.retries.record(&job, keep);
         if let Some(owner) = &job.owner {
             let rows = rows_for_done(&owner.rows, &job, &outcome);
             if let Some(import) = job.stored() {
