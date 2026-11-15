@@ -219,6 +219,7 @@ pub fn search_result(
         groups,
         has_more: state == SearchState::InProgress,
         state,
+        files_seen: 0,
     }
 }
 

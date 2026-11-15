@@ -9,6 +9,8 @@ pub mod musicbrainz;
 pub mod navidrome;
 pub mod services;
 pub mod slskd;
+#[cfg(test)]
+pub(crate) mod test_http;
 pub mod traits;
 
 pub use lastfm::LastFmProvider;

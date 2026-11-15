@@ -51,9 +51,11 @@ use super::monitor::{DownloadMonitor, WatchedTransfer};
 #[cfg(feature = "server")]
 const AUTO_SELECT_SCORE_THRESHOLD: f64 = 0.7;
 
-/// Maximum time to wait for search results from a single backend.
+/// Maximum time to wait for search results from a single backend. A safety
+/// net above the slskd client's own deadline, which cancels a search at 120
+/// seconds and gives it 15 more to end.
 #[cfg(feature = "server")]
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Poll interval when waiting for search results.
 #[cfg(feature = "server")]
@@ -62,8 +64,9 @@ const SEARCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How one backend's search ended.
 #[cfg(feature = "server")]
 enum SearchStop {
-    /// The backend finished the search.
-    Finished,
+    /// The backend finished the search, its responses holding `files_seen`
+    /// files.
+    Finished { files_seen: u32 },
     /// SEARCH_TIMEOUT passed before the backend finished.
     TimedOut,
     /// Starting or polling the search failed.
@@ -88,11 +91,10 @@ async fn search_backend(
         }
     };
 
-    // Poll until results are ready or timeout. Polls that report
-    // InProgress carry the groups processed so far (the backend
-    // rescores the full response set each time), so keep the
-    // latest non-empty batch: the final Completed poll is empty
-    // when the search ends by timeout instead of result volume.
+    // Poll until results are ready or timeout. A backend may send
+    // groups while the search is in progress, so keep the latest
+    // non-empty batch. slskd sends its groups only in the completing
+    // poll.
     let deadline = tokio::time::Instant::now() + SEARCH_TIMEOUT;
     let mut latest_groups = Vec::<DownloadableGroup>::new();
     loop {
@@ -108,7 +110,10 @@ async fn search_backend(
                     if !result.groups.is_empty() {
                         latest_groups = result.groups;
                     }
-                    return (latest_groups, SearchStop::Finished);
+                    let stop = SearchStop::Finished {
+                        files_seen: result.files_seen,
+                    };
+                    return (latest_groups, stop);
                 }
                 SearchState::InProgress => {
                     if !result.groups.is_empty() {
@@ -125,14 +130,15 @@ async fn search_backend(
     }
 }
 
-/// Why a search of `first` and `rest` found nothing: an empty search when
-/// any backend finished, else a timeout when any timed out, else the first
+/// Why a search of `first` and `rest` found nothing: when any backend
+/// finished, an empty search, or one whose files were all scored out when its
+/// responses held files; else a timeout when any timed out, else the first
 /// backend's own failure.
 #[cfg(feature = "server")]
 fn no_results_failure(first: &SearchStop, rest: &[SearchStop]) -> Failure {
     const MESSAGE: &str = "No results found";
     let rank = |stop: &SearchStop| match stop {
-        SearchStop::Finished => 2,
+        SearchStop::Finished { .. } => 2,
         SearchStop::TimedOut => 1,
         SearchStop::Failed(_) => 0,
     };
@@ -141,7 +147,13 @@ fn no_results_failure(first: &SearchStop, rest: &[SearchStop]) -> Failure {
         .iter()
         .fold(first, |best, s| if rank(s) > rank(best) { s } else { best });
     match stop {
-        SearchStop::Finished => Failure::new(
+        SearchStop::Finished { files_seen: 1.. } => Failure::new(
+            FailureCode::SearchAllFiltered,
+            Stage::SourceSearch,
+            RetryAdvice::OtherQuery,
+            MESSAGE,
+        ),
+        SearchStop::Finished { files_seen: 0 } => Failure::new(
             FailureCode::SearchNoResults,
             Stage::SourceSearch,
             RetryAdvice::OtherQuery,
@@ -583,6 +595,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
 mod tests {
     use super::*;
     use crate::server_fns::download::test_support::{group, item, search_result, StubBackend};
+    use shared::download::SearchResult;
     use shared::failure::UserActionCode;
     use soulbeet::error::MissingSetting;
 
@@ -686,8 +699,8 @@ mod tests {
         );
     }
 
-    /// The last poll of a search that ends by time is empty: the groups an
-    /// earlier poll found are the result.
+    /// A backend may send groups while the search runs: those an earlier
+    /// poll found are the result when the completing poll is empty.
     #[tokio::test(start_paused = true)]
     async fn a_search_keeps_the_groups_found_before_it_completed() {
         let stub = StubBackend::new(vec![]);
@@ -709,7 +722,40 @@ mod tests {
         let (groups, stop) = search_backend("stub", &backend, None, &[]).await;
 
         assert_eq!(groups, found);
-        assert!(matches!(stop, SearchStop::Finished));
+        assert!(matches!(stop, SearchStop::Finished { .. }));
+    }
+
+    #[test]
+    fn a_search_whose_files_were_all_scored_out_is_all_filtered() {
+        let f = no_results_failure(
+            &SearchStop::Finished { files_seen: 7 },
+            &[SearchStop::TimedOut],
+        );
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::SearchAllFiltered,
+                Stage::SourceSearch,
+                RetryAdvice::OtherQuery,
+                "No results found"
+            )
+        );
+        assert_eq!(
+            no_results_failure(&SearchStop::Finished { files_seen: 0 }, &[]).code,
+            FailureCode::SearchNoResults
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_search_reports_the_files_it_saw() {
+        let stub = StubBackend::new(vec![]);
+        stub.script_polls(vec![Ok(SearchResult {
+            files_seen: 7,
+            ..search_result("search", SearchState::Completed, Vec::new())
+        })]);
+        let backend: Arc<dyn DownloadBackend> = stub;
+        let (_, stop) = search_backend("stub", &backend, None, &[]).await;
+        assert!(matches!(stop, SearchStop::Finished { files_seen: 7 }));
     }
 
     #[test]
@@ -730,7 +776,7 @@ mod tests {
         use FailureCode::*;
         use RetryAdvice::*;
         assert_eq!(
-            advice(SearchStop::Finished, vec![]),
+            advice(SearchStop::Finished { files_seen: 0 }, vec![]),
             (SearchNoResults, OtherQuery)
         );
         assert_eq!(
@@ -742,7 +788,7 @@ mod tests {
             (BackendUnreachable, SameSourceLater)
         );
         assert_eq!(
-            advice(dead("down"), vec![SearchStop::Finished]),
+            advice(dead("down"), vec![SearchStop::Finished { files_seen: 0 }]),
             (SearchNoResults, OtherQuery)
         );
         // A timeout says more than a dead backend, an empty search more than both.
@@ -751,7 +797,10 @@ mod tests {
             (SearchTimeout, SameSourceLater)
         );
         assert_eq!(
-            advice(SearchStop::TimedOut, vec![SearchStop::Finished]),
+            advice(
+                SearchStop::TimedOut,
+                vec![SearchStop::Finished { files_seen: 0 }]
+            ),
             (SearchNoResults, OtherQuery)
         );
         let f = no_results_failure(&dead("first"), &[dead("second")]);

@@ -57,6 +57,17 @@ pub enum SoulseekError {
     #[error("Search {search_id} is not known to this client")]
     UnknownSearch { search_id: String },
 
+    /// slskd completed a search and counted responses, but its responses
+    /// stayed empty: it leaves the record that way when its final update
+    /// fails (`SearchService.cs:370-374`).
+    #[error("slskd counted {response_count} responses but returned none")]
+    SearchResponsesLost { response_count: u32 },
+
+    /// A search slskd was told to cancel at the deadline was still running
+    /// after the cancel grace.
+    #[error("Search {search_id} did not end after it was cancelled")]
+    SearchNotEnding { search_id: String },
+
     #[error("Unparseable slskd response: {0}")]
     InvalidResponse(String),
 
@@ -100,6 +111,8 @@ impl SoulseekError {
             SoulseekError::SearchAlreadyRunning { .. } => false,
             SoulseekError::SearchGone { .. } => false,
             SoulseekError::UnknownSearch { .. } => false,
+            SoulseekError::SearchResponsesLost { .. } => false,
+            SoulseekError::SearchNotEnding { .. } => false,
             SoulseekError::NoSearchTarget { .. } => false,
             // 400 and 404 are definitive: a rejected request body or a
             // missing record will not heal on retry.
@@ -139,9 +152,10 @@ impl SoulseekError {
             }
             // slskd or this client no longer has the search: running it
             // again is the remedy.
-            SoulseekError::SearchGone { .. } | SoulseekError::UnknownSearch { .. } => {
-                (SearchLost, SameSourceLater)
-            }
+            SoulseekError::SearchGone { .. }
+            | SoulseekError::UnknownSearch { .. }
+            | SoulseekError::SearchResponsesLost { .. } => (SearchLost, SameSourceLater),
+            SoulseekError::SearchNotEnding { .. } => (SearchTimeout, SameSourceLater),
             SoulseekError::Api { status: 429, .. } if stage == Stage::SourceSearch => {
                 (SearchRateLimited, SameSourceLater)
             }
@@ -409,6 +423,20 @@ mod tests {
                 },
                 Stage::SourceSearch,
                 FailureCode::SearchLost,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                SoulseekError::SearchResponsesLost { response_count: 2 },
+                Stage::SourceSearch,
+                FailureCode::SearchLost,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                SoulseekError::SearchNotEnding {
+                    search_id: "3f2b".into(),
+                },
+                Stage::SourceSearch,
+                FailureCode::SearchTimeout,
                 RetryAdvice::SameSourceLater,
             ),
         ];

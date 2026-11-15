@@ -107,6 +107,9 @@ pub struct SearchResult {
     pub groups: Vec<DownloadableGroup>,
     pub has_more: bool,
     pub state: SearchState,
+    /// Files in the responses the backend read; 0 while in progress.
+    #[serde(default)]
+    pub files_seen: u32,
 }
 
 /// State of a download operation

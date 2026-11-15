@@ -58,7 +58,64 @@ struct SearchContext {
     track_titles: Vec<String>,
     start_time: DateTime<Utc>,
     timeout: Duration,
-    seen_response_count: usize,
+    /// slskd was told to stop the search at the deadline.
+    cancelled: bool,
+}
+
+/// What one poll of a search found: the processed albums and the files in
+/// slskd's responses, both empty while the search is in progress.
+#[derive(Debug)]
+pub struct SearchPoll {
+    pub albums: Vec<AlbumResult>,
+    pub state: SearchState,
+    pub files_seen: u32,
+}
+
+/// The part of slskd's search record a poll reads (`GET searches/{id}`,
+/// `SearchesController.cs:140`; `Search/Types/Search.cs:52,55`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchStatus {
+    is_complete: bool,
+    response_count: u32,
+}
+
+/// What a poll does after reading a search's status.
+enum PollStep {
+    /// The search ended: read its responses.
+    Read,
+    /// The search runs: look again.
+    Wait,
+    /// The deadline passed: tell slskd to stop the search.
+    Cancel,
+    /// The search kept running after it was cancelled.
+    GiveUp,
+}
+
+/// How long a cancelled search may take to end.
+const CANCEL_GRACE: Duration = Duration::seconds(15);
+
+/// slskd marks a search complete before it writes the responses
+/// (`Search/SearchService.cs:284-285`, then `:359-361`), so an empty answer
+/// to a search that counted responses is read again after this delay.
+const RESPONSES_REREAD_DELAY: StdDuration = StdDuration::from_millis(500);
+/// How many times such an answer is read again before the responses count
+/// as lost.
+const RESPONSES_REREADS: u32 = 6;
+
+/// The step for a search `elapsed` into its `deadline`.
+fn poll_step(complete: bool, elapsed: Duration, deadline: Duration, cancelled: bool) -> PollStep {
+    if complete {
+        PollStep::Read
+    } else if elapsed < deadline {
+        PollStep::Wait
+    } else if !cancelled {
+        PollStep::Cancel
+    } else if elapsed < deadline + CANCEL_GRACE {
+        PollStep::Wait
+    } else {
+        PollStep::GiveUp
+    }
 }
 
 #[derive(Debug)]
@@ -347,7 +404,7 @@ impl SoulseekClient {
                 track_titles,
                 start_time: Utc::now(),
                 timeout,
-                seen_response_count: 0,
+                cancelled: false,
             },
         );
 
@@ -355,118 +412,130 @@ impl SoulseekClient {
         Ok(search_id)
     }
 
-    pub async fn poll_search(
-        &self,
-        search_id: String,
-    ) -> Result<(Vec<AlbumResult>, bool, SearchState)> {
+    /// One poll of `search_id`, holding for up to 10 seconds while the search
+    /// runs. slskd 0.26 writes the responses only when the search ends
+    /// (`SearchService.cs:359`; `Search/Extensions.cs:135-149` drops them on
+    /// every earlier update), so a poll returns albums only once it ends.
+    /// A search that ended or failed is deleted from slskd.
+    pub async fn poll_search(&self, search_id: String) -> Result<SearchPoll> {
+        let Some(context) = self.active_searches.lock().await.get(&search_id).cloned() else {
+            return Err(SoulseekError::UnknownSearch { search_id });
+        };
+
+        let polled = self.poll_turns(&search_id, context).await;
+        if matches!(&polled, Ok(poll) if poll.state == SearchState::InProgress) {
+            return polled;
+        }
+        self.active_searches.lock().await.remove(&search_id);
+        let _ = self.delete_search(&search_id).await;
+        match &polled {
+            Ok(poll) => info!(
+                "Search {} completed with {} files from slskd",
+                search_id, poll.files_seen
+            ),
+            Err(e) => warn!("Search {} failed with error, cleaning up: {}", search_id, e),
+        }
+        polled
+    }
+
+    /// Reads the status of `search_id` and acts on it until the search ends,
+    /// fails or the long poll is over.
+    async fn poll_turns(&self, search_id: &str, mut context: SearchContext) -> Result<SearchPoll> {
         let poll_start = Utc::now();
-        // Long-poll duration: hold the request for up to 10 seconds waiting for new data
         let long_poll_timeout = Duration::seconds(10);
+        let endpoint = format!("searches/{search_id}");
 
         loop {
-            let context = {
-                let guard = self.active_searches.lock().await;
-                guard.get(&search_id).cloned()
-            };
-
-            let Some(context) = context else {
-                return Err(SoulseekError::UnknownSearch { search_id });
-            };
-
-            if (Utc::now() - context.start_time) >= context.timeout {
-                info!("Search timeout reached");
-                self.active_searches.lock().await.remove(&search_id);
-                let _ = self.delete_search(&search_id).await;
-                return Ok((vec![], false, SearchState::Completed));
-            }
-
-            let endpoint = format!("searches/{}/responses", search_id);
-            match self
-                .make_request::<Vec<SearchResponse>, ()>(Method::GET, &endpoint, None)
+            let status: SearchStatus = self
+                .make_request(Method::GET, &endpoint, None::<()>)
                 .await
-            {
-                Ok(current_responses) => {
-                    let total_len = current_responses.len();
-
-                    if total_len > context.seen_response_count {
-                        // Update seen count
-                        {
-                            let mut guard = self.active_searches.lock().await;
-                            if let Some(ctx) = guard.get_mut(&search_id) {
-                                ctx.seen_response_count = total_len;
-                            }
-                        }
-
-                        let track_titles_ref: Vec<&str> =
-                            context.track_titles.iter().map(|s| s.as_str()).collect();
-                        let mut albums = processing::process_search_responses(
-                            &current_responses,
-                            &context.artist,
-                            context.album.as_deref(),
-                            &track_titles_ref,
-                        );
-
-                        albums.sort_by(|a, b| {
-                            b.score
-                                .partial_cmp(&a.score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
+                .map_err(poll_refused)?;
+            let elapsed = Utc::now() - context.start_time;
+            match poll_step(
+                status.is_complete,
+                elapsed,
+                context.timeout,
+                context.cancelled,
+            ) {
+                PollStep::Read => {
+                    return self
+                        .read_responses(search_id, &context, status.response_count)
+                        .await
+                }
+                PollStep::Wait => {
+                    if (Utc::now() - poll_start) > long_poll_timeout {
+                        return Ok(SearchPoll {
+                            albums: Vec::new(),
+                            state: SearchState::InProgress,
+                            files_seen: 0,
                         });
-
-                        if albums.len() > MAX_SEARCH_RESULTS {
-                            albums.truncate(MAX_SEARCH_RESULTS);
-                            self.active_searches.lock().await.remove(&search_id);
-                            let _ = self.delete_search(&search_id).await;
-                            return Ok((albums, false, SearchState::Completed));
-                        } else {
-                            return Ok((albums, true, SearchState::InProgress));
-                        }
-                    } else {
-                        // No new data. slskd ends a search a short while after
-                        // responses stop arriving; once it reports completion
-                        // there is nothing more to wait for, so return what we
-                        // have instead of spinning until our own 120s timeout.
-                        if self.is_search_complete(&search_id).await {
-                            self.active_searches.lock().await.remove(&search_id);
-                            let _ = self.delete_search(&search_id).await;
-
-                            let track_titles_ref: Vec<&str> =
-                                context.track_titles.iter().map(|s| s.as_str()).collect();
-                            let mut albums = processing::process_search_responses(
-                                &current_responses,
-                                &context.artist,
-                                context.album.as_deref(),
-                                &track_titles_ref,
-                            );
-                            albums.sort_by(|a, b| {
-                                b.score
-                                    .partial_cmp(&a.score)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            albums.truncate(MAX_SEARCH_RESULTS);
-
-                            info!("Search {} completed on slskd side", search_id);
-                            return Ok((albums, false, SearchState::Completed));
-                        }
-
-                        if (Utc::now() - poll_start) > long_poll_timeout {
-                            // Long poll expired, return "no update" but "in progress"
-                            return Ok((vec![], true, SearchState::InProgress));
-                        }
-
-                        // Wait a bit before retrying slskd
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                        continue;
+                    }
+                    tokio::time::sleep(StdDuration::from_secs(1)).await;
+                }
+                PollStep::Cancel => {
+                    info!("Search {} reached its deadline, cancelling it", search_id);
+                    // slskd answers 200 also for a search that ended
+                    // meanwhile (`SearchesController.cs:209-227`).
+                    self.make_request::<(), ()>(Method::PUT, &endpoint, None)
+                        .await
+                        .map_err(poll_refused)?;
+                    context.cancelled = true;
+                    if let Some(ctx) = self.active_searches.lock().await.get_mut(search_id) {
+                        ctx.cancelled = true;
                     }
                 }
-                Err(e) => {
-                    // Clean up search context on any error to prevent leaks
-                    self.active_searches.lock().await.remove(&search_id);
-                    let _ = self.delete_search(&search_id).await;
-                    warn!("Search {} failed with error, cleaning up: {}", search_id, e);
-                    return Err(poll_refused(e));
+                PollStep::GiveUp => {
+                    return Err(SoulseekError::SearchNotEnding {
+                        search_id: search_id.to_string(),
+                    })
                 }
             }
         }
+    }
+
+    /// The responses of a search slskd completed, counting `response_count`.
+    async fn read_responses(
+        &self,
+        search_id: &str,
+        context: &SearchContext,
+        response_count: u32,
+    ) -> Result<SearchPoll> {
+        let endpoint = format!("searches/{search_id}/responses");
+        let mut rereads = 0;
+        let responses = loop {
+            let responses: Vec<SearchResponse> = self
+                .make_request(Method::GET, &endpoint, None::<()>)
+                .await
+                .map_err(poll_refused)?;
+            if !responses.is_empty() || response_count == 0 {
+                break responses;
+            }
+            if rereads == RESPONSES_REREADS {
+                return Err(SoulseekError::SearchResponsesLost { response_count });
+            }
+            rereads += 1;
+            tokio::time::sleep(RESPONSES_REREAD_DELAY).await;
+        };
+
+        let track_titles: Vec<&str> = context.track_titles.iter().map(|s| s.as_str()).collect();
+        let mut albums = processing::process_search_responses(
+            &responses,
+            &context.artist,
+            context.album.as_deref(),
+            &track_titles,
+        );
+        albums.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        albums.truncate(MAX_SEARCH_RESULTS);
+
+        Ok(SearchPoll {
+            albums,
+            state: SearchState::Completed,
+            files_seen: responses.iter().map(|r| r.files.len() as u32).sum(),
+        })
     }
 
     /// Enqueue `req` into `destination`, a folder under slskd's download
@@ -681,32 +750,6 @@ impl SoulseekClient {
         }
     }
 
-    /// Whether slskd reports the search as finished. A search that slskd no
-    /// longer knows about (404) counts as finished too. Errors are treated as
-    /// "not complete" so polling falls back to its own timeout.
-    async fn is_search_complete(&self, search_id: &str) -> bool {
-        #[derive(Deserialize)]
-        struct SearchStatus {
-            #[serde(rename = "isComplete", default)]
-            is_complete: bool,
-            #[serde(default)]
-            state: String,
-        }
-
-        let endpoint = format!("searches/{search_id}");
-        match self
-            .make_request::<SearchStatus, ()>(Method::GET, &endpoint, None)
-            .await
-        {
-            Ok(status) => status.is_complete || status.state.contains("Completed"),
-            Err(SoulseekError::Api { status: 404, .. }) => true,
-            Err(e) => {
-                debug!("Search state check failed for {}: {}", search_id, e);
-                false
-            }
-        }
-    }
-
     /// Check both slskd connectivity and Soulseek network connection.
     ///
     /// Returns Ok(()) if slskd is reachable and connected to Soulseek.
@@ -796,9 +839,10 @@ fn search_refused(body: String) -> SoulseekError {
     }
 }
 
-/// An error polling `GET searches/{id}/responses`. slskd answers 404, with an
-/// empty body, only when it has no search with that id
-/// (`SearchesController.GetResponsesById`); every other error is kept.
+/// An error polling a search: reading its status or responses, or cancelling
+/// it. slskd answers 404, with an empty body, only when it has no search with
+/// that id (`SearchesController.GetById`, `GetResponsesById`, `Cancel`);
+/// every other error is kept.
 fn poll_refused(e: SoulseekError) -> SoulseekError {
     match e {
         SoulseekError::Api {
@@ -1089,12 +1133,13 @@ impl crate::DownloadBackend for SoulseekClient {
     }
 
     async fn poll_search(&self, search_id: &str) -> Result<shared::download::SearchResult> {
-        let (results, has_more, state) = self.poll_search(search_id.to_string()).await?;
+        let poll = self.poll_search(search_id.to_string()).await?;
         Ok(shared::download::SearchResult {
             search_id: search_id.to_string(),
-            groups: results.into_iter().map(Into::into).collect(),
-            has_more,
-            state: state.into(),
+            groups: poll.albums.into_iter().map(Into::into).collect(),
+            has_more: poll.state == SearchState::InProgress,
+            state: poll.state.into(),
+            files_seen: poll.files_seen,
         })
     }
 
@@ -1183,7 +1228,9 @@ impl<'a> SearchRequest<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_http::{serve, Reply, Seen};
     use shared::download::EnqueueStatus;
+    use std::sync::Mutex as StdMutex;
 
     fn track(artist: &str, title: &str) -> Track {
         Track {
@@ -1647,6 +1694,219 @@ mod tests {
         assert!(matches!(
             polled,
             Err(SoulseekError::UnknownSearch { search_id }) if search_id == "gone"
+        ));
+    }
+
+    const SEARCH_ID: &str = "3f2b9c1e-7d4a-4b8e-9f0a-1c2d3e4f5a6b";
+
+    /// slskd's search record (`Search/Types/Search.cs:44-63`, nulls omitted
+    /// as `Program.cs:981` configures). `Completed, TimedOut` is
+    /// Soulseek.NET's `Completed | TimedOut`, set when the inactivity timer
+    /// fires (`src/SearchInternal.cs:63,145`).
+    fn status(complete: bool, responses: u32) -> Reply {
+        Reply {
+            status: 200,
+            body: serde_json::json!({
+                "fileCount": responses, "id": SEARCH_ID, "isComplete": complete, "lockedFileCount": 0,
+                "responseCount": responses, "responses": [], "searchText": "Marrow Choir O Holy Night",
+                "startedAt": "2026-11-15T10:00:00.0000000Z",
+                "state": if complete { "Completed, TimedOut" } else { "InProgress" }, "token": 17 })
+            .to_string(),
+        }
+    }
+
+    /// One peer's response (`Response.cs:37-46`, `File.cs:37-46`).
+    fn one_response() -> Reply {
+        Reply {
+            status: 200,
+            body: serde_json::json!([{
+                "fileCount": 1, "hasFreeUploadSlot": true, "lockedFileCount": 0, "lockedFiles": [],
+                "queueLength": 0, "token": 17, "uploadSpeed": 1048576, "username": "carol_shares",
+                "files": [{"bitDepth": 16, "code": 1, "extension": "flac", "isLocked": false, "length": 263,
+                           "filename": "@@kqzbm\\Music\\Marrow Choir\\Winter Songs\\03 - O Holy Night.flac",
+                           "sampleRate": 44100, "size": 28734112}]}])
+            .to_string(),
+        }
+    }
+
+    fn empty() -> Reply {
+        Reply {
+            status: 200,
+            body: "[]".into(),
+        }
+    }
+
+    fn ok(body: &str) -> Reply {
+        Reply {
+            status: 200,
+            body: body.into(),
+        }
+    }
+
+    fn no_content() -> Reply {
+        Reply {
+            status: 204,
+            body: String::new(),
+        }
+    }
+
+    /// A client whose search for O Holy Night by Marrow Choir is running.
+    async fn searching(
+        replies: Vec<Reply>,
+        deadline: Duration,
+    ) -> (SoulseekClient, Arc<StdMutex<Vec<Seen>>>) {
+        let mut all = vec![ok(&format!(r#"{{"id":"{SEARCH_ID}"}}"#))];
+        all.extend(replies);
+        let (url, seen) = serve(all);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        client
+            .start_search(None, vec![track("Marrow Choir", "O Holy Night")], deadline)
+            .await
+            .unwrap();
+        (client, seen)
+    }
+
+    /// Review focus 1: slskd saves the record as complete before it writes
+    /// the responses (`Search/SearchService.cs:284-285`, then `:359-361`).
+    #[tokio::test]
+    async fn a_search_slskd_completes_before_writing_its_responses_is_read_again() {
+        let (client, seen) = searching(
+            vec![status(true, 1), empty(), one_response(), no_content()],
+            Duration::seconds(120),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(poll.state, SearchState::Completed);
+        assert_eq!(poll.files_seen, 1);
+        assert_eq!(poll.albums[0].tracks[0].base.username, "carol_shares");
+        let targets: Vec<(String, String)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| (s.method.clone(), s.target.clone()))
+            .collect();
+        let search = format!("/api/v0/searches/{SEARCH_ID}");
+        assert_eq!(
+            targets,
+            vec![
+                ("POST".into(), "/api/v0/searches".into()),
+                ("GET".into(), search.clone()),
+                ("GET".into(), format!("{search}/responses")),
+                ("GET".into(), format!("{search}/responses")),
+                ("DELETE".into(), search)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_without_responses_is_read_once() {
+        let (client, seen) = searching(
+            vec![status(true, 0), empty(), no_content()],
+            Duration::seconds(120),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(
+            (poll.state, poll.files_seen, poll.albums.len()),
+            (SearchState::Completed, 0, 0)
+        );
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    /// slskd leaves a record this way when its final update fails
+    /// (`SearchService.cs:370-374`).
+    #[tokio::test]
+    async fn responses_slskd_counted_but_never_wrote_are_a_lost_search() {
+        let mut replies = vec![status(true, 2)];
+        replies.extend((0..=RESPONSES_REREADS).map(|_| empty()));
+        replies.push(no_content());
+        let (client, _) = searching(replies, Duration::seconds(120)).await;
+        let e = client.poll_search(SEARCH_ID.into()).await.unwrap_err();
+        assert!(
+            matches!(e, SoulseekError::SearchResponsesLost { response_count: 2 }),
+            "{e:?}"
+        );
+        assert_eq!(
+            e.failure(Stage::SourceSearch, "m").code,
+            FailureCode::SearchLost
+        );
+    }
+
+    /// Review focus 4: slskd's inactivity timer restarts at every response,
+    /// so a busy search outlives the deadline.
+    #[tokio::test]
+    async fn a_search_past_its_deadline_is_cancelled_and_its_responses_read() {
+        let (client, seen) = searching(
+            vec![
+                status(false, 1),
+                ok(""),
+                status(true, 1),
+                one_response(),
+                no_content(),
+            ],
+            Duration::zero(),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!((poll.state, poll.files_seen), (SearchState::Completed, 1));
+        let cancel = &seen.lock().unwrap()[2];
+        assert_eq!(
+            (cancel.method.as_str(), cancel.target.as_str()),
+            ("PUT", format!("/api/v0/searches/{SEARCH_ID}").as_str())
+        );
+    }
+
+    /// slskd answers a cancel with an empty 404 only for a search it no longer
+    /// holds (`SearchesController.cs:222-225`; empty because of `Program.cs:973`).
+    #[tokio::test]
+    async fn a_search_slskd_no_longer_holds_at_its_cancel_is_gone() {
+        let (client, seen) = searching(
+            vec![
+                status(false, 1),
+                Reply {
+                    status: 404,
+                    body: String::new(),
+                },
+                Reply {
+                    status: 404,
+                    body: String::new(),
+                },
+            ],
+            Duration::zero(),
+        )
+        .await;
+        let e = client.poll_search(SEARCH_ID.into()).await.unwrap_err();
+        assert!(
+            matches!(e, SoulseekError::SearchGone { ref body } if body.is_empty()),
+            "{e:?}"
+        );
+        let methods: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.method.clone())
+            .collect();
+        assert_eq!(methods, ["POST", "GET", "PUT", "DELETE"]);
+    }
+
+    #[test]
+    fn a_poll_reads_waits_cancels_or_gives_up() {
+        let s = Duration::seconds;
+        let d = s(120);
+        assert!(matches!(poll_step(true, s(500), d, false), PollStep::Read));
+        assert!(matches!(poll_step(false, s(119), d, false), PollStep::Wait));
+        assert!(matches!(
+            poll_step(false, s(120), d, false),
+            PollStep::Cancel
+        ));
+        assert!(matches!(poll_step(false, s(134), d, true), PollStep::Wait));
+        assert!(matches!(
+            poll_step(false, s(135), d, true),
+            PollStep::GiveUp
         ));
     }
 
