@@ -152,7 +152,7 @@ fn WebNavbar() -> Element {
             } => {
                 let mut map = downloads.write();
                 map.remove(&previous_item);
-                map.insert(entry.item.clone(), entry);
+                map.insert(entry.item.clone(), *entry);
             }
             DownloadEvent::AutoDownload(auto_event) => {
                 auto_download_signal.set(Some(auto_event));

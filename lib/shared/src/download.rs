@@ -389,7 +389,7 @@ pub enum DownloadEvent {
     /// panel has to show it that way.
     Replaced {
         previous_item: String,
-        entry: DownloadProgress,
+        entry: Box<DownloadProgress>,
     },
     /// Auto-download lifecycle events (displayed inline on search rows, not in download panel)
     AutoDownload(AutoDownloadEvent),

@@ -495,7 +495,7 @@ impl DownloadMonitor {
         // peer's row instead of gaining a second one for the same track.
         let _ = self.tx.send(DownloadEvent::Replaced {
             previous_item,
-            entry,
+            entry: Box::new(entry),
         });
         true
     }
@@ -900,7 +900,7 @@ impl DownloadMonitor {
         if previous_item != retry.item {
             let _ = self.tx.send(DownloadEvent::Replaced {
                 previous_item,
-                entry: self.stamp(retry.clone()),
+                entry: Box::new(self.stamp(retry.clone())),
             });
         }
         true
