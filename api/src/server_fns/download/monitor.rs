@@ -236,13 +236,10 @@ struct TrackState {
     /// When the track's transfer was first seen in a failed terminal state.
     failing_since: Option<Instant>,
     /// When the track's transfer was first seen waiting in its source's
-    /// queue while that source sent this batch nothing. Cleared on any poll
+    /// queue while that source sent this slskd nothing. Cleared on any poll
     /// that does not show it waiting there, and on any poll that shows its
-    /// source sending this batch another file (`peers_sending`).
+    /// source sending this slskd any file (`peers_sending`).
     queued_at_source_since: Option<Instant>,
-    /// Whether this binding's transfer was already seen Completed, so only
-    /// its first sighting counts as its source sending this batch a file.
-    completed_seen: bool,
     /// When the track's transfer was first seen as a failed attempt slskd
     /// will retry (`read_pending_retry`).
     retry_pending_since: Option<Instant>,
@@ -260,7 +257,6 @@ impl TrackState {
             missing_since: None,
             failing_since: None,
             queued_at_source_since: None,
-            completed_seen: false,
             retry_pending_since: None,
             phase: SlotPhase::Watching,
         }
@@ -336,6 +332,9 @@ pub struct DownloadMonitor {
     /// deadline is evaluated from a readable list, so this one bounds the
     /// case where no list is readable at all.
     last_readable_poll: Instant,
+    /// `(peer, transfer id)` of every transfer seen Completed, so only its
+    /// first sighting counts as its peer sending this slskd a file.
+    completed_seen: HashSet<(String, String)>,
 }
 
 impl DownloadMonitor {
@@ -376,6 +375,7 @@ impl DownloadMonitor {
             abandoned: Vec::new(),
             handoffs: Vec::new(),
             last_readable_poll: Instant::now(),
+            completed_seen: HashSet::new(),
         }
     }
 
@@ -893,6 +893,7 @@ impl DownloadMonitor {
         }
 
         let matched = self.find_matching_downloads(&downloads, backend);
+        let sending = self.peers_sending(&downloads);
 
         let watched = (0..self.tracked_files.len())
             .filter(|slot| self.watching(*slot))
@@ -954,7 +955,7 @@ impl DownloadMonitor {
         }
 
         // Process individual tracks
-        self.process_tracks(&matched, backend).await;
+        self.process_tracks(&matched, &sending, backend).await;
 
         // Fail tracks that never appeared or vanished from slskd's list,
         // so one absent track cannot stall the batch forever
@@ -1130,21 +1131,20 @@ impl DownloadMonitor {
             .with_job(self.tracked_files[slot].job.clone())
     }
 
-    /// The peers sending this batch a file on this poll: a watched slot on
-    /// that peer is transferring, or shows its transfer Completed for the
-    /// first time. A Soulseek.NET peer answers every request with `Queued`
-    /// and sends one file per user at a time (`MaximumConcurrentUploadsPerUser`
-    /// is 1), so the batch's other files from it wait in its queue meanwhile.
-    fn peers_sending(&mut self, matched: &[(usize, DownloadProgress)]) -> HashSet<String> {
+    /// The peers sending this slskd any file on this poll, for this batch or
+    /// any other: a transfer from that peer in `downloads` is in progress, or
+    /// shows Completed for the first time. One slskd account downloads for
+    /// every Soulful user, and a Soulseek.NET peer answers every request with
+    /// `Queued` and sends one file per downloading user at a time
+    /// (`MaximumConcurrentUploadsPerUser` is 1), so every other file from it
+    /// waits in its queue meanwhile.
+    fn peers_sending(&mut self, downloads: &[DownloadProgress]) -> HashSet<String> {
         let mut sending = HashSet::new();
-        for (slot, dl) in matched {
-            if !self.watching(*slot) || !self.is_current(*slot, dl) {
-                continue;
-            }
-            let state = &mut self.track_states[*slot];
-            let completed = is_completed(&dl.state);
-            let first_completion = completed && !state.completed_seen;
-            state.completed_seen |= completed;
+        for dl in downloads {
+            let first_completion = is_completed(&dl.state)
+                && self
+                    .completed_seen
+                    .insert((dl.source.clone(), dl.id.clone()));
             if dl.state == DownloadState::InProgress || first_completion {
                 sending.insert(dl.source.clone());
             }
@@ -1153,13 +1153,14 @@ impl DownloadMonitor {
     }
 
     /// Process each watched track, handling timeouts, completions and
-    /// failures.
+    /// failures. `sending` are the peers sending this slskd a file on this
+    /// poll (`peers_sending`).
     async fn process_tracks(
         &mut self,
         matched: &[(usize, DownloadProgress)],
+        sending: &HashSet<String>,
         backend: &Arc<dyn DownloadBackend>,
     ) {
-        let sending = self.peers_sending(matched);
         for (slot, download) in matched {
             let slot = *slot;
             if self.track_states[slot].first_seen.is_none() {
@@ -1185,8 +1186,8 @@ impl DownloadMonitor {
             }
 
             // A peer can hold its queue for hours; another source may send
-            // the file now. Only the time the peer spends on others counts,
-            // never the time this batch's own files from it take.
+            // the file now. Only the time the peer sends this slskd nothing
+            // counts, never the time any file it sends this slskd takes.
             if download.queued_at_source && !sending.contains(&download.source) {
                 let since = *self.track_states[slot]
                     .queued_at_source_since
@@ -1819,7 +1820,8 @@ mod tests {
         m.read_pending_retries(&mut listing);
         m.apply_cancels(&listing, backend).await;
         let matched = m.find_matching_downloads(&listing, backend);
-        m.process_tracks(&matched, backend).await;
+        let sending = m.peers_sending(&listing);
+        m.process_tracks(&matched, &sending, backend).await;
         m.handle_absent_tracks(&matched, backend).await;
         m.send_status_update(&matched);
     }
@@ -2452,6 +2454,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_slot_waiting_behind_another_batchs_file_from_its_peer_keeps_waiting() {
+        // One slskd account downloads for every batch, and the peer sends it
+        // one file at a time: other.flac is no slot's here, and one.flac
+        // waits behind it all the same.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let past_the_limit = || Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+        let with_other = |state| {
+            [
+                at_source("peer_a", "one.flac"),
+                listed("peer_a", "other.flac", state),
+            ]
+        };
+
+        m.track_states[0].queued_at_source_since = past_the_limit();
+        poll_tracks(&mut m, &with_other(DownloadState::InProgress), &backend).await;
+        assert_eq!(m.track_states[0].queued_at_source_since, None);
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
+
+        // other.flac finished since the last poll.
+        m.track_states[0].queued_at_source_since = past_the_limit();
+        poll_tracks(&mut m, &with_other(DownloadState::Completed), &backend).await;
+        assert_eq!(m.track_states[0].queued_at_source_since, None);
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
+
+        // Since then the peer has sent this slskd nothing.
+        m.track_states[0].queued_at_source_since = past_the_limit();
+        poll_tracks(&mut m, &with_other(DownloadState::Completed), &backend).await;
+        assert_eq!(phase(&m, 0), SlotPhase::TimedOut);
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", &id_of("one.flac"))]
+        );
+        let row = rows_for(&mut rx, "one.flac").pop().unwrap();
+        let stuck = stuck_in_remote_queue();
+        assert_failed(&row, stuck.code, &stuck.message);
+    }
+
+    #[tokio::test]
     async fn a_poll_that_does_not_list_a_slot_stops_its_remote_queue_clock() {
         let mut m = monitor(vec!["peer_a"], vec!["one.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
@@ -2901,7 +2944,8 @@ mod tests {
         m.apply_cancels(&listing, &backend).await;
         assert!(registry.request_cancel(&own, &m.batch.owner.user_id));
         let matched = m.find_matching_downloads(&listing, &backend);
-        m.process_tracks(&matched, &backend).await;
+        let sending = m.peers_sending(&listing);
+        m.process_tracks(&matched, &sending, &backend).await;
         cancelled(&mut rx);
         assert_eq!(phase(&m, 0), SlotPhase::Settled);
         assert!(registry.may_adopt(&own, &batch("Y").owner));
