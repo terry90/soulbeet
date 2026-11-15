@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "server")]
+use crate::auth::RegistrationMode;
+#[cfg(feature = "server")]
 use crate::base_url::{BaseUrl, BaseUrlError};
 
 #[cfg(feature = "server")]
@@ -44,6 +46,29 @@ pub(crate) fn secret_key_weakness(value: Option<&str>) -> Option<SecretKeyWeakne
         Some(DEFAULT_SECRET_KEY) => Some(SecretKeyWeakness::Default),
         Some(v) if v.len() < 32 => Some(SecretKeyWeakness::TooShort),
         Some(_) => None,
+    }
+}
+
+/// Reads `REGISTRATION`. Unset follows whether Navidrome is configured; an
+/// unknown value falls to the closed mode.
+#[cfg(feature = "server")]
+pub(crate) fn parse_registration(
+    value: Option<&str>,
+    navidrome_configured: bool,
+) -> RegistrationMode {
+    match value.map(str::to_lowercase).as_deref() {
+        None if navidrome_configured => RegistrationMode::Navidrome,
+        None => RegistrationMode::Admin,
+        Some("navidrome") => RegistrationMode::Navidrome,
+        Some("admin") => RegistrationMode::Admin,
+        Some("open") => RegistrationMode::Open,
+        Some(other) => {
+            tracing::warn!(
+                "Invalid REGISTRATION value '{}' (expected navidrome, admin or open), using admin",
+                other
+            );
+            RegistrationMode::Admin
+        }
     }
 }
 
@@ -93,6 +118,10 @@ pub struct AppConfig {
     beets_python: Option<PathBuf>,
     /// `PUBLIC_URL`, parsed once; `None` when unset or empty
     public_url: Option<Result<BaseUrl, BaseUrlError>>,
+    /// `NAVIDROME_URL`; `None` when unset or empty
+    navidrome_url: Option<String>,
+    /// Who can create accounts (`REGISTRATION`)
+    registration: RegistrationMode,
     /// HTTP server port (default: 9765)
     pub port: u16,
     /// HTTP server bind address (default: "0.0.0.0")
@@ -118,6 +147,18 @@ impl AppConfig {
             .map(PathBuf::from)
             .or_else(|| soulbeet::beets::python_from_shebang(&beet_bin));
 
+        let navidrome_url = std::env::var("NAVIDROME_URL")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let registration = parse_registration(
+            std::env::var("REGISTRATION")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty()),
+            navidrome_url.is_some(),
+        );
+
         Self {
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite:soulbeet.db".to_string()),
@@ -137,6 +178,8 @@ impl AppConfig {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
                 .map(|v| BaseUrl::parse(&v)),
+            navidrome_url,
+            registration,
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
@@ -185,6 +228,16 @@ impl AppConfig {
         self.public_url.as_ref()
     }
 
+    /// The Navidrome server, when `NAVIDROME_URL` is set.
+    pub fn navidrome_url(&self) -> Option<&str> {
+        self.navidrome_url.as_deref()
+    }
+
+    /// Who can create accounts.
+    pub fn registration(&self) -> RegistrationMode {
+        self.registration
+    }
+
     /// Check if album mode is enabled.
     pub fn is_album_mode(&self) -> bool {
         self.beets_album_mode
@@ -215,5 +268,19 @@ mod tests {
             Some(SecretKeyWeakness::TooShort)
         );
         assert_eq!(secret_key_weakness(Some(&"a".repeat(32))), None);
+    }
+
+    #[test]
+    fn registration_defaults_follow_navidrome() {
+        assert_eq!(parse_registration(None, true), RegistrationMode::Navidrome);
+        assert_eq!(parse_registration(None, false), RegistrationMode::Admin);
+        assert_eq!(
+            parse_registration(Some("OPEN"), true),
+            RegistrationMode::Open
+        );
+        assert_eq!(
+            parse_registration(Some("bogus"), false),
+            RegistrationMode::Admin
+        );
     }
 }

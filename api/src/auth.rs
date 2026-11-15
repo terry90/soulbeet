@@ -60,6 +60,18 @@ impl UserCtx {
     }
 }
 
+/// Who can create accounts (`REGISTRATION`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrationMode {
+    /// Accounts appear when a Navidrome user signs in.
+    Navidrome,
+    /// Only an admin creates accounts.
+    Admin,
+    /// Anyone can register.
+    Open,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthResponse {
     pub username: String,
@@ -68,6 +80,9 @@ pub struct AuthResponse {
     pub navidrome_status: NavidromeStatus,
     #[serde(default)]
     pub role: Role,
+    /// False while `NAVIDROME_URL` is set: usernames follow Navidrome.
+    #[serde(default)]
+    pub rename_allowed: bool,
 }
 
 #[cfg(feature = "server")]

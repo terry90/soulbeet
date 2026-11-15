@@ -1,5 +1,6 @@
 //! Conditions that keep the MCP endpoint closed until the instance is safe to expose.
 
+use crate::auth::RegistrationMode;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "server")]
@@ -19,6 +20,13 @@ pub enum GateCode {
 pub struct GateReason {
     pub code: GateCode,
     pub message: String,
+}
+
+/// What Settings shows about the instance's exposure.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SecurityStatus {
+    pub mcp_blocked_by: Vec<GateReason>,
+    pub registration: RegistrationMode,
 }
 
 #[cfg(feature = "server")]

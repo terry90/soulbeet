@@ -3,8 +3,9 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use crate::{
-    auth,
+    auth::{self, RegistrationMode},
     base_url::{request_base, DerivedBase},
+    config::CONFIG,
     login_limiter::{LoginLimiter, LOGIN_LIMITER},
     models,
     server_fns::{rate_limited_error, refusal_error, server_error, unauthorized_error},
@@ -48,20 +49,37 @@ pub(crate) fn secure_for(derived: &DerivedBase, origin: Option<&str>) -> bool {
     derived.base.is_https() && !browser_on_http
 }
 
+/// How this request's session cookie is set. Read from the headers before
+/// anything is written, so a request whose address cannot be told changes
+/// nothing.
+#[cfg(feature = "server")]
+pub(crate) struct SessionCookie {
+    secure: bool,
+}
+
+#[cfg(feature = "server")]
+impl SessionCookie {
+    pub(crate) fn for_request(headers: &HeaderMap) -> Result<SessionCookie, ServerFnError> {
+        let derived = request_base(headers)
+            .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
+        let origin = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok());
+        Ok(SessionCookie {
+            secure: secure_for(&derived, origin),
+        })
+    }
+}
+
 /// Sets the session cookie for the user's current credentials version.
 #[cfg(feature = "server")]
 pub(crate) fn issue_session_cookie(
     cookies: &Cookies,
-    headers: &HeaderMap,
+    session: &SessionCookie,
     user: &models::user::User,
 ) -> Result<(), ServerFnError> {
-    let derived = request_base(headers)
-        .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
-    let origin = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok());
     let token = auth::create_token(&user.id, user.credentials_version).map_err(server_error)?;
-    cookies.add(build_auth_cookie(token, secure_for(&derived, origin)));
+    cookies.add(build_auth_cookie(token, session.secure));
     Ok(())
 }
 
@@ -70,19 +88,36 @@ pub(crate) fn issue_session_cookie(
 #[cfg(feature = "server")]
 pub(crate) async fn start_session(
     cookies: &Cookies,
-    headers: &HeaderMap,
+    session: &SessionCookie,
     user_id: &str,
 ) -> Result<models::user::User, ServerFnError> {
     let user = models::user::User::find_by_id(user_id)
         .await
         .map_err(server_error)?
         .ok_or_else(|| server_error("User not found"))?;
-    issue_session_cookie(cookies, headers, &user)?;
+    issue_session_cookie(cookies, session, &user)?;
     Ok(user)
+}
+
+/// Why strangers cannot register in this mode; `None` only for `Open`.
+#[cfg(feature = "server")]
+pub(crate) fn registration_refusal(mode: RegistrationMode) -> Option<&'static str> {
+    match mode {
+        RegistrationMode::Open => None,
+        RegistrationMode::Admin => {
+            Some("Registration is closed. An admin creates accounts in Settings > Users.")
+        }
+        RegistrationMode::Navidrome => {
+            Some("Accounts are created by signing in with your Navidrome account.")
+        }
+    }
 }
 
 #[post("/api/auth/register")]
 pub async fn register(username: String, password: String) -> Result<(), ServerFnError> {
+    if let Some(msg) = registration_refusal(CONFIG.registration()) {
+        return Err(refusal_error(msg));
+    }
     models::user::User::create(&username, &password)
         .await
         .map_err(server_error)
@@ -111,13 +146,12 @@ enum NavidromeAuthResult {
 async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResult {
     use soulbeet::NavidromeClientBuilder;
 
-    let url = match std::env::var("NAVIDROME_URL") {
-        Ok(u) if !u.is_empty() => u,
-        _ => return NavidromeAuthResult::NotConfigured,
+    let Some(url) = CONFIG.navidrome_url() else {
+        return NavidromeAuthResult::NotConfigured;
     };
 
     let client = match NavidromeClientBuilder::new()
-        .base_url(&url)
+        .base_url(url)
         .username(username)
         .password(password)
         .build()
@@ -173,7 +207,9 @@ async fn authenticate_in(
 ) -> Result<Credentials, ServerFnError> {
     use shared::system::NavidromeStatus;
 
-    limiter.check(username, clock()).map_err(rate_limited_error)?;
+    limiter
+        .check(username, clock())
+        .map_err(rate_limited_error)?;
 
     let rejected = || {
         limiter.record_failure(username, clock());
@@ -204,6 +240,128 @@ async fn authenticate_in(
     Ok(Credentials::Local { user, status })
 }
 
+/// The Soulful row that has the name Navidrome just verified.
+#[cfg(feature = "server")]
+pub(crate) struct ExistingAccount {
+    /// The row holds a Navidrome token.
+    pub linked: bool,
+    /// The submitted password also verifies against the row's own hash.
+    pub local_password_ok: bool,
+}
+
+/// What a Navidrome-verified login does to the Soulful account of that name.
+#[cfg(feature = "server")]
+#[derive(Debug, PartialEq)]
+pub(crate) enum LoginPlan {
+    Create,
+    Link,
+    Refresh {
+        password_changed: bool,
+    },
+    /// The row is not linked and its password differs: it may not be the
+    /// Navidrome user's, so it is not taken over.
+    RefuseUnlinked,
+    RefuseNoAccount,
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn navidrome_login_plan(
+    existing: Option<ExistingAccount>,
+    mode: RegistrationMode,
+) -> LoginPlan {
+    match existing {
+        None => match mode {
+            RegistrationMode::Navidrome | RegistrationMode::Open => LoginPlan::Create,
+            RegistrationMode::Admin => LoginPlan::RefuseNoAccount,
+        },
+        Some(ExistingAccount {
+            linked: true,
+            local_password_ok,
+        }) => LoginPlan::Refresh {
+            password_changed: !local_password_ok,
+        },
+        Some(ExistingAccount {
+            linked: false,
+            local_password_ok: true,
+        }) => LoginPlan::Link,
+        Some(ExistingAccount {
+            linked: false,
+            local_password_ok: false,
+        }) => LoginPlan::RefuseUnlinked,
+    }
+}
+
+#[cfg(feature = "server")]
+#[derive(Debug)] // User has no PartialEq; tests match on the variant
+pub(crate) enum LoginOutcome {
+    SignedIn(models::user::User),
+    Refused(String),
+}
+
+/// The Success branch's database work: plans from `existing`, writes, and
+/// returns the row read back after the writes. No cookie, no cache eviction.
+#[cfg(feature = "server")]
+pub(crate) async fn apply_navidrome_login(
+    db: &sqlx::SqlitePool,
+    existing: Option<models::user::User>,
+    username: &str,
+    password: &str,
+    encrypted_password: &str,
+    mode: RegistrationMode,
+) -> Result<LoginOutcome, String> {
+    use crate::security;
+    use models::user::User;
+    use shared::system::NavidromeStatus;
+
+    let connected = NavidromeStatus::Connected.as_str();
+    let account = existing.as_ref().map(|u| ExistingAccount {
+        linked: u.navidrome_token.is_some(),
+        local_password_ok: u.password_matches(password),
+    });
+    let id = match (navidrome_login_plan(account, mode), existing) {
+        (LoginPlan::RefuseUnlinked, _) => {
+            return Ok(LoginOutcome::Refused(format!(
+                "A Soulful account named '{username}' exists but is not linked to Navidrome. \
+                 Sign in with its Soulful password, change that password to your Navidrome \
+                 password in Settings > Users, then sign in again. An admin can also set it \
+                 for you."
+            )));
+        }
+        (LoginPlan::RefuseNoAccount, _) => {
+            return Ok(LoginOutcome::Refused(format!(
+                "There is no Soulful account named '{username}'. An admin creates accounts in \
+                 Settings > Users."
+            )));
+        }
+        (LoginPlan::Create, None) => {
+            let user = User::create_in(db, username, password).await?;
+            User::update_navidrome_token_in(db, &user.id, Some(encrypted_password), connected)
+                .await?;
+            user.id
+        }
+        (LoginPlan::Link, Some(user)) => {
+            User::link_navidrome_in(db, &user.id, encrypted_password, connected).await?;
+            user.id
+        }
+        (LoginPlan::Refresh { password_changed }, Some(user)) => {
+            User::update_navidrome_token_in(db, &user.id, Some(encrypted_password), connected)
+                .await?;
+            if password_changed {
+                User::update_password_in(db, &user.id, password).await?;
+                security::note_password_set(&user.id, password);
+            }
+            user.id
+        }
+        (LoginPlan::Create, Some(_)) | (LoginPlan::Link | LoginPlan::Refresh { .. }, None) => {
+            unreachable!("the plan follows whether a row exists")
+        }
+    };
+    User::find_by_id_in(db, &id)
+        .await?
+        .map(LoginOutcome::SignedIn)
+        .ok_or_else(|| "User not found".to_string())
+}
+
 #[post("/api/auth/login", cookies: Cookies, headers: HeaderMap)]
 pub async fn login(username: String, password: String) -> Result<AuthResponse, ServerFnError> {
     use crate::crypto;
@@ -212,6 +370,9 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
     use models::user::User;
     use shared::system::NavidromeStatus;
     use std::time::Instant;
+
+    let session = SessionCookie::for_request(&headers)?;
+    let rename_allowed = CONFIG.navidrome_url().is_none();
 
     let credentials = authenticate_in(
         &DB,
@@ -225,31 +386,24 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
 
     match credentials {
         Credentials::Navidrome => {
-            // Look up or create user
-            let user = match User::get_by_username(&username)
-                .await
-                .map_err(server_error)?
-            {
-                Some(u) => u,
-                None => User::create(&username, &password)
-                    .await
-                    .map_err(server_error)?,
-            };
-
-            // Encrypt the Navidrome password and store it
             let encrypted = crypto::encrypt(&password).map_err(server_error)?;
-            User::update_navidrome_token(
-                &user.id,
-                Some(&encrypted),
-                NavidromeStatus::Connected.as_str(),
-            )
-            .await
-            .map_err(server_error)?;
-
-            // Keep local password hash current
-            User::update_password(&user.id, &password)
+            let existing = User::get_by_username(&username)
                 .await
                 .map_err(server_error)?;
+            let user = match apply_navidrome_login(
+                &DB,
+                existing,
+                &username,
+                &password,
+                &encrypted,
+                CONFIG.registration(),
+            )
+            .await
+            .map_err(server_error)?
+            {
+                LoginOutcome::SignedIn(user) => user,
+                LoginOutcome::Refused(msg) => return Err(refusal_error(msg)),
+            };
 
             // Reset the dismissed banner so it can reappear if credentials break again
             let _ = models::user_settings::UserSettings::reset_navidrome_banner(&user.id).await;
@@ -257,13 +411,14 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             // Evict any cached client so it picks up the new token
             evict_navidrome_client(&user.id).await;
 
-            let user = start_session(&cookies, &headers, &user.id).await?;
+            issue_session_cookie(&cookies, &session, &user)?;
 
             Ok(AuthResponse {
                 username: user.username,
                 user_id: user.id,
                 navidrome_status: NavidromeStatus::Connected,
                 role: user.role,
+                rename_allowed,
             })
         }
         Credentials::Local { user, status } => {
@@ -281,13 +436,14 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
                 evict_navidrome_client(&user.id).await;
             }
 
-            let user = start_session(&cookies, &headers, &user.id).await?;
+            let user = start_session(&cookies, &session, &user.id).await?;
 
             Ok(AuthResponse {
                 username: user.username,
                 user_id: user.id,
                 navidrome_status: status,
                 role: user.role,
+                rename_allowed,
             })
         }
     }
@@ -295,7 +451,8 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
 
 #[post("/api/auth/refresh", auth: AuthSession, cookies: Cookies, headers: HeaderMap)]
 pub async fn refresh_token() -> Result<(), ServerFnError> {
-    start_session(&cookies, &headers, &auth.0.user_id)
+    let session = SessionCookie::for_request(&headers)?;
+    start_session(&cookies, &session, &auth.0.user_id)
         .await
         .map(|_| ())
 }
@@ -326,6 +483,7 @@ pub async fn get_current_user() -> Result<Option<AuthResponse>, ServerFnError> {
         user_id: user.user_id,
         navidrome_status: status,
         role: user.role,
+        rename_allowed: CONFIG.navidrome_url().is_none(),
     }))
 }
 
@@ -546,5 +704,205 @@ mod tests {
             limiter.check("ghost", later),
             Err(LoginBlock::Account { .. })
         ));
+    }
+
+    fn account(linked: bool, local_password_ok: bool) -> Option<ExistingAccount> {
+        Some(ExistingAccount {
+            linked,
+            local_password_ok,
+        })
+    }
+
+    #[test]
+    fn a_prehijacked_name_is_refused() {
+        // attacker registered "bob" with their own password; Bob's Navidrome password does not verify locally
+        let plan = navidrome_login_plan(account(false, false), RegistrationMode::Open);
+        assert_eq!(plan, LoginPlan::RefuseUnlinked);
+    }
+
+    #[test]
+    fn an_unlinked_row_with_the_same_password_is_linked() {
+        assert_eq!(
+            navidrome_login_plan(account(false, true), RegistrationMode::Navidrome),
+            LoginPlan::Link
+        );
+    }
+
+    #[test]
+    fn a_linked_row_is_refreshed_and_notes_a_password_change() {
+        assert_eq!(
+            navidrome_login_plan(account(true, false), RegistrationMode::Admin),
+            LoginPlan::Refresh {
+                password_changed: true
+            }
+        );
+        assert_eq!(
+            navidrome_login_plan(account(true, true), RegistrationMode::Admin),
+            LoginPlan::Refresh {
+                password_changed: false
+            }
+        );
+    }
+
+    #[test]
+    fn new_names_follow_the_registration_mode() {
+        assert_eq!(
+            navidrome_login_plan(None, RegistrationMode::Navidrome),
+            LoginPlan::Create
+        );
+        assert_eq!(
+            navidrome_login_plan(None, RegistrationMode::Open),
+            LoginPlan::Create
+        );
+        assert_eq!(
+            navidrome_login_plan(None, RegistrationMode::Admin),
+            LoginPlan::RefuseNoAccount
+        );
+    }
+
+    #[test]
+    fn only_open_mode_allows_register() {
+        assert!(registration_refusal(RegistrationMode::Open).is_none());
+        assert!(registration_refusal(RegistrationMode::Admin).is_some());
+        assert!(registration_refusal(RegistrationMode::Navidrome).is_some());
+    }
+
+    async fn row(db: &sqlx::SqlitePool, name: &str) -> Option<User> {
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
+            .bind(name)
+            .fetch_optional(db)
+            .await
+            .unwrap()
+    }
+
+    /// Bob's row, linked to Navidrome (version 1) with local password `password`.
+    async fn linked_bob(db: &sqlx::SqlitePool, password: &str) -> User {
+        let bob = User::create_in(db, "bob", password).await.unwrap();
+        User::link_navidrome_in(db, &bob.id, "enc-old", "connected")
+            .await
+            .unwrap();
+        row(db, "bob").await.unwrap()
+    }
+
+    fn signed_in(outcome: LoginOutcome) -> User {
+        match outcome {
+            LoginOutcome::SignedIn(user) => user,
+            other => panic!("expected a sign-in, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prehijacked_row_is_refused_and_left_alone() {
+        let db = test_db::migrated().await;
+        let bob = User::create_in(&db, "bob", "attacker-pw").await.unwrap();
+        let outcome = apply_navidrome_login(
+            &db,
+            Some(bob),
+            "bob",
+            "navidrome-pw",
+            "enc",
+            RegistrationMode::Open,
+        )
+        .await
+        .unwrap();
+        match outcome {
+            LoginOutcome::Refused(msg) => assert!(
+                msg.starts_with("A Soulful account named 'bob' exists but is not linked"),
+                "{msg}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let bob = row(&db, "bob").await.unwrap();
+        assert_eq!(bob.navidrome_token, None);
+        assert_eq!(bob.credentials_version, 0);
+        assert!(bob.password_matches("attacker-pw"));
+    }
+
+    #[tokio::test]
+    async fn an_unlinked_row_with_the_same_password_is_linked_with_one_bump() {
+        let db = test_db::migrated().await;
+        let bob = User::create_in(&db, "bob", "pw").await.unwrap();
+        let u = signed_in(
+            apply_navidrome_login(
+                &db,
+                Some(bob),
+                "bob",
+                "pw",
+                "enc",
+                RegistrationMode::Navidrome,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(u.navidrome_token.as_deref(), Some("enc"));
+        assert_eq!(u.credentials_version, 1);
+    }
+
+    #[tokio::test]
+    async fn a_linked_row_with_a_new_password_gets_one_bump_and_a_new_hash() {
+        let db = test_db::migrated().await;
+        let bob = linked_bob(&db, "old").await;
+        let u = signed_in(
+            apply_navidrome_login(
+                &db,
+                Some(bob),
+                "bob",
+                "new",
+                "enc",
+                RegistrationMode::Navidrome,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(u.credentials_version, 2);
+        assert_eq!(u.navidrome_token.as_deref(), Some("enc"));
+        assert!(u.password_matches("new"));
+        assert!(!u.password_matches("old"));
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_password_does_not_bump() {
+        let db = test_db::migrated().await;
+        let bob = linked_bob(&db, "pw").await;
+        let u = signed_in(
+            apply_navidrome_login(
+                &db,
+                Some(bob),
+                "bob",
+                "pw",
+                "enc",
+                RegistrationMode::Navidrome,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(u.credentials_version, 1);
+        assert_eq!(u.navidrome_token.as_deref(), Some("enc"));
+    }
+
+    #[tokio::test]
+    async fn a_new_name_in_admin_mode_creates_nothing() {
+        let db = test_db::migrated().await;
+        let outcome =
+            apply_navidrome_login(&db, None, "carol", "pw", "enc", RegistrationMode::Admin)
+                .await
+                .unwrap();
+        assert!(matches!(outcome, LoginOutcome::Refused(_)), "{outcome:?}");
+        assert!(row(&db, "carol").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_new_name_in_navidrome_mode_is_created_linked() {
+        let db = test_db::migrated().await;
+        let u = signed_in(
+            apply_navidrome_login(&db, None, "carol", "pw", "enc", RegistrationMode::Navidrome)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(u.username, "carol");
+        assert_eq!(u.navidrome_token.as_deref(), Some("enc"));
+        assert_eq!(u.navidrome_status, "connected");
+        assert_eq!(u.role, crate::auth::Role::User);
+        assert!(u.password_matches("pw"));
     }
 }

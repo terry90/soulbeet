@@ -1,4 +1,4 @@
-use api::{delete_user, get_users, register, update_user_password, update_username};
+use api::{create_user, delete_user, get_users, update_user_password, update_username};
 use dioxus::prelude::*;
 
 use crate::auth::use_auth;
@@ -45,7 +45,7 @@ pub fn UserManager() -> Element {
             return;
         }
 
-        match auth.call(register(new_username(), new_password())).await {
+        match auth.call(create_user(new_username(), new_password())).await {
             Ok(_) => {
                 success_msg.set(format!("User '{}' created successfully", new_username()));
                 new_username.set("".to_string());

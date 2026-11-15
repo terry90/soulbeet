@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use api::login;
 use dioxus::prelude::*;
-use ui::Login;
+use ui::{login_failure_message, Login};
 
 use crate::auth::use_auth;
 use crate::Route;
@@ -23,7 +23,7 @@ pub fn LoginPage() -> Element {
                     navigator.push(Route::SearchPage {});
                     Ok(())
                 }
-                _ => Err("Invalid username or password".to_string()),
+                Err(e) => Err(login_failure_message(&e)),
             }
         })
     });

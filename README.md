@@ -126,13 +126,14 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `DOWNLOAD_PATH` | Path where slskd saves downloads | `/downloads` |
 | `SECRET_KEY` | Signs sessions and encrypts stored Navidrome passwords. Use at least 32 random bytes (`openssl rand -hex 32`). Changing it makes stored Navidrome passwords unreadable until each user signs in again | |
 | `NAVIDROME_URL` | Your Navidrome server URL. Optional: without it you log in with local accounts, and discovery playlists, rating sync and auto-delete are unavailable | |
+| `REGISTRATION` | Who can create accounts: `navidrome` (accounts appear when a Navidrome user signs in), `admin` (only an admin creates accounts), `open` (anyone can register) | `navidrome` with `NAVIDROME_URL`, else `admin` |
 | `BEETS_CONFIG` | Path to your beets config file. Replaces the shipped `/app/beets_config.yaml` (beets defaults still apply underneath) | `beets_config.yaml` |
 | `BEETS_PYTHON` | Python interpreter that runs beets imports and the config check. By default it is read from the `#!` line of `beet` (`/usr/bin/python3` in the image) | |
 | `PUBLIC_URL` | Optional. The public address (`https://host[:port]`, no path). When set, Soulful uses it instead of reading the address from request headers | |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
-**Note**: Local passwords always work. If Navidrome rejects your credentials or can't be reached, Soulbeet checks the password stored in its own database, which is updated to your Navidrome password on every successful Navidrome login.
+**Note**: Local passwords always work. If Navidrome rejects your credentials or can't be reached, Soulbeet checks the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. A Navidrome login only takes over an existing Soulful account that is already linked to Navidrome or whose Soulful password is the same.
 
 **Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. Scrobble credentials (Last.fm API key, ListenBrainz token) are configured per-user in Settings > Library.
 

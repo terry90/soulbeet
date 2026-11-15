@@ -231,11 +231,12 @@ pub async fn navidrome_client_for_user(user_id: &str) -> Result<Arc<NavidromeCli
         }
     };
 
-    let url = std::env::var("NAVIDROME_URL")
-        .map_err(|_| "NAVIDROME_URL environment variable not set".to_string())?;
+    let url = crate::config::CONFIG
+        .navidrome_url()
+        .ok_or("NAVIDROME_URL environment variable not set")?;
 
     let client = NavidromeClientBuilder::new()
-        .base_url(&url)
+        .base_url(url)
         .username(&user.username)
         .password(&password)
         .build()
