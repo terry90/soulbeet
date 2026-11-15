@@ -2,11 +2,6 @@
 //! retried without the client naming any path. Kept in memory per user and
 //! lost on restart.
 
-#![allow(
-    clippy::result_large_err,
-    reason = "import refusals carry a Failure by value, as core functions do"
-)]
-
 use super::choice::{files_gone, nothing_to_retry, resolve};
 use super::{ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;

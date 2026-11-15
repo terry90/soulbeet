@@ -18,10 +18,6 @@ pub fn folder_not_found() -> Failure {
 
 /// The folder, when `ctx` owns it. Another user's folder is reported as
 /// missing, the same as one that does not exist, so an id leaks nothing.
-#[allow(
-    clippy::result_large_err,
-    reason = "core functions fail with a Failure by value, as the async ones do"
-)]
 pub(crate) fn ensure_owner(folder: Option<Folder>, ctx: &UserCtx) -> Result<Folder, Failure> {
     folder
         .filter(|f| f.user_id == ctx.user_id)

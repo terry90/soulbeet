@@ -1,11 +1,6 @@
 //! Turns what the user chose for a skipped import into what the importer
 //! runs, refusing anything the kept job does not allow.
 
-#![allow(
-    clippy::result_large_err,
-    reason = "import refusals carry a Failure by value, as core functions do"
-)]
-
 use super::ImportJob;
 use shared::download::{ImportChoice, ImportRefusal, KeptImport};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
