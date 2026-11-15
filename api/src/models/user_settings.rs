@@ -65,11 +65,18 @@ pub struct UpdateUserSettings {
 #[cfg(feature = "server")]
 impl UserSettings {
     pub async fn get(user_id: &str) -> Result<UserSettings, String> {
+        Self::get_in(&DB, user_id).await
+    }
+
+    pub(crate) async fn get_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+    ) -> Result<UserSettings, String> {
         // Try to get existing settings, or return defaults
         let settings =
             sqlx::query_as::<_, UserSettings>("SELECT * FROM user_settings WHERE user_id = ?")
                 .bind(user_id)
-                .fetch_optional(&*DB)
+                .fetch_optional(db)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -97,8 +104,18 @@ impl UserSettings {
     }
 
     pub async fn upsert(user_id: &str, update: UpdateUserSettings) -> Result<UserSettings, String> {
+        Self::upsert_in(&DB, user_id, update).await
+    }
+
+    /// Stores the fields of `update` that are set. Switching auto-delete off drops the tracks
+    /// its last run kept, in the same transaction, so Settings does not show them as current.
+    pub(crate) async fn upsert_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        update: UpdateUserSettings,
+    ) -> Result<UserSettings, String> {
         // Build dynamic update - only update fields that are Some
-        let current = Self::get(user_id).await?;
+        let current = Self::get_in(db, user_id).await?;
 
         let provider = update
             .default_metadata_provider
@@ -139,6 +156,7 @@ impl UserSettings {
             .default_download_folder_id
             .or(current.default_download_folder_id);
 
+        let mut tx = db.begin().await.map_err(|e| e.to_string())?;
         sqlx::query(
             r#"
             INSERT INTO user_settings (user_id, default_metadata_provider, last_search_type, auto_delete_enabled, lastfm_api_key, lastfm_username, discovery_promote_threshold, navidrome_banner_dismissed, listenbrainz_username, listenbrainz_token, discovery_enabled, discovery_folder_id, discovery_track_count, discovery_lifetime_days, discovery_profiles, discovery_playlist_name, default_download_folder_id)
@@ -179,11 +197,15 @@ impl UserSettings {
         .bind(&disc_profiles)
         .bind(&disc_name)
         .bind(&default_folder)
-        .execute(&*DB)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+        if current.auto_delete_enabled && !auto_delete {
+            super::deletion_block::DeletionBlockRow::clear_in(&mut tx, user_id).await?;
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
 
-        Self::get(user_id).await
+        Self::get_in(db, user_id).await
     }
 
     /// Update the stored Navidrome playlist ID for a specific discovery profile.

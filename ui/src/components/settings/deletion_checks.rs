@@ -46,7 +46,7 @@ fn KeptList(kept: Vec<BlockedDeletion>) -> Element {
         SectionTitle { title: "Kept by auto-delete" }
         if kept.is_empty() {
             p { class: "text-sm font-mono text-gray-300 mb-4",
-                "Auto-delete kept no track at its last run."
+                "Auto-delete is not keeping any track."
             }
         } else {
             ul { class: "list-disc pl-5 space-y-1 text-sm font-mono text-yellow-400 mb-4",
@@ -115,7 +115,7 @@ mod tests {
             ),
             "{html}"
         );
-        assert!(render_kept(vec![]).contains("Auto-delete kept no track at its last run."));
+        assert!(render_kept(vec![]).contains("Auto-delete is not keeping any track."));
     }
 
     #[test]

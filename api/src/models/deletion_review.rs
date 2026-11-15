@@ -114,6 +114,20 @@ impl DeletionReviewRow {
     }
 
     /// "artist:title" lowercased, of the user's tracks deleted as disliked.
+    /// The song id and path of each of the user's recorded deletions.
+    pub(crate) async fn deleted_files_in(
+        db: &SqlitePool,
+        user_id: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        sqlx::query_as(
+            "SELECT song_id, path FROM deletion_reviews WHERE user_id = ? AND path IS NOT NULL",
+        )
+        .bind(user_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())
+    }
+
     pub async fn disliked_keys(user_id: &str) -> Result<Vec<String>, String> {
         Self::disliked_keys_in(&DB, user_id).await
     }

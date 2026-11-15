@@ -21,7 +21,7 @@ use crate::core::{database_failure, logged};
 #[cfg(feature = "server")]
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
 #[cfg(feature = "server")]
-use crate::models::deletion_block::DeletionBlockRow;
+use crate::models::deletion_block::{DeletionBlockRow, KeptTrack};
 #[cfg(feature = "server")]
 use crate::models::deletion_review::DeletionReviewRow;
 #[cfg(feature = "server")]
@@ -208,15 +208,6 @@ pub(crate) async fn remove_disliked_pending_in(
     removed
 }
 
-/// A 1-star song auto-delete kept, and the refusal that kept it.
-#[cfg(feature = "server")]
-pub(crate) struct KeptTrack {
-    pub song_id: String,
-    pub title: String,
-    pub artist: String,
-    pub failure: Failure,
-}
-
 /// What one auto-delete run did.
 #[cfg(feature = "server")]
 pub(crate) struct AutoDeleteRun {
@@ -230,8 +221,9 @@ pub(crate) struct AutoDeleteRun {
 /// Deletes through the guard every song of `songs` that `actor` rated 1 and pending_track_for
 /// does not match in `pending`: a library file is carried out, a pending discovery track the
 /// guard finds is removed as a staged track. Only a song the fresh record still shows at 1
-/// star is removed; one rated otherwise since `songs` was listed is skipped. A failure of any
-/// step is kept with its song.
+/// star is removed; one rated otherwise since `songs` was listed is skipped, also when the
+/// guard refuses it. A song whose file an earlier deletion of `actor` removed, which Navidrome
+/// lists until it notices, is skipped. Any other failure is kept with its song.
 #[cfg(feature = "server")]
 pub(crate) async fn auto_delete_songs(
     guard: &Guard<'_>,
@@ -245,11 +237,23 @@ pub(crate) async fn auto_delete_songs(
         removed: 0,
         kept: Vec::new(),
     };
+    let deleted = match DeletionReviewRow::deleted_files_in(guard.db, &actor.to_string()).await {
+        Ok(deleted) => deleted,
+        Err(e) => {
+            warn!("Auto-delete could not read which files it deleted before: {e}");
+            vec![]
+        }
+    };
     for song in songs {
         if song.user_rating != Some(1) || pending_track_for(song, pending).is_some() {
             continue;
         }
         let artist = song.artist.as_deref().unwrap_or_default();
+        let skipped = |why: &str| info!("Auto-delete skipped {artist} - {}: {why}", song.title);
+        if deleted_before(&deleted, &song.id).await {
+            skipped("deleted earlier, and Navidrome has not noticed yet");
+            continue;
+        }
         let outcome = match guard.check_song(actor, &song.id).await {
             Ok(Verdict::Library(checked)) if checked.song.rating == 1 => {
                 let forget = ForgetVia::Queue(queue.clone());
@@ -265,6 +269,10 @@ pub(crate) async fn auto_delete_songs(
                     // Its only warning, an unrecorded deletion, is logged where it happens.
                     .map(|_| run.deleted += 1)
             }
+            Ok(Verdict::Library(_)) => {
+                skipped("no longer rated 1");
+                Ok(())
+            }
             Ok(Verdict::Discovery { track, rating: 1 }) => {
                 match Folder::get_by_id_in(guard.db, &track.folder_id).await {
                     Ok(Some(folder)) => {
@@ -276,14 +284,17 @@ pub(crate) async fn auto_delete_songs(
                     Err(e) => Err(database_failure(Stage::Delete, e)),
                 }
             }
-            Ok(_) => {
-                info!(
-                    "Auto-delete skipped {artist} - {}: no longer rated 1",
-                    song.title
-                );
+            Ok(Verdict::Discovery { .. }) => {
+                skipped("no longer rated 1");
                 Ok(())
             }
-            Err(f) => Err(f),
+            Err(f) => match still_rated_one(guard, actor, &song.id).await {
+                true => Err(f),
+                false => {
+                    skipped("no longer rated 1");
+                    Ok(())
+                }
+            },
         };
         if let Err(failure) = outcome {
             run.kept.push(KeptTrack {
@@ -295,6 +306,31 @@ pub(crate) async fn auto_delete_songs(
         }
     }
     run
+}
+
+/// Whether a deletion in `deleted` (song id, path) removed song `song_id`'s file: its path
+/// is no longer there.
+#[cfg(feature = "server")]
+async fn deleted_before(deleted: &[(String, String)], song_id: &str) -> bool {
+    for (_, path) in deleted.iter().filter(|(id, _)| id == song_id) {
+        if tokio::fs::symlink_metadata(path)
+            .await
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `actor`'s record of `song_id` still shows a rating of 1; true when it cannot be
+/// read, so the refusal stands.
+#[cfg(feature = "server")]
+async fn still_rated_one(guard: &Guard<'_>, actor: &UserId, song_id: &str) -> bool {
+    match guard.listeners.native_song(actor, song_id).await {
+        Ok(Some(song)) => song.rating == 1,
+        Ok(None) | Err(_) => true,
+    }
 }
 
 #[get("/api/navidrome/deletion-history", auth: AuthSession)]
@@ -717,6 +753,10 @@ mod tests {
             !lib.root.join("music/alice/A/x.flac").exists()
                 && lib.root.join("music/alice/A/y.flac").exists()
         );
+        sqlx::query("INSERT INTO user_settings (user_id, auto_delete_enabled) VALUES ('alice', 1)")
+            .execute(&lib.db)
+            .await
+            .unwrap();
         DeletionBlockRow::replace_in(&lib.db, "alice", &run.kept)
             .await
             .unwrap();
@@ -755,6 +795,56 @@ mod tests {
         .await;
         assert_eq!((run.deleted, run.removed, run.kept.len()), (0, 0, 0));
         assert!(lib.root.join("music/alice/A/x.flac").exists());
+    }
+
+    #[tokio::test]
+    async fn a_song_rated_again_since_the_listing_is_not_kept_when_the_guard_refuses_it() {
+        let lib = Library::new().await;
+        lib.fake.stars("bob", "s1");
+        lib.fake.rates("alice", "s1", 4);
+        let queue = ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())));
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &[subsonic("s1", "O Holy Night", Some(1))],
+            &[],
+            &queue,
+        )
+        .await;
+        assert_eq!((run.deleted, run.removed, run.kept.len()), (0, 0, 0));
+        // Still at 1 star, the same refusal keeps it.
+        lib.fake.rates("alice", "s1", 1);
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &[subsonic("s1", "O Holy Night", Some(1))],
+            &[],
+            &queue,
+        )
+        .await;
+        assert_eq!(
+            run.kept.iter().map(|k| k.failure.code).collect::<Vec<_>>(),
+            vec![FailureCode::DeleteBlockedByOtherUser]
+        );
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+    }
+
+    #[tokio::test]
+    async fn a_song_deleted_earlier_that_navidrome_still_lists_is_neither_checked_nor_kept() {
+        let lib = Library::new().await;
+        let queue = ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())));
+        let songs = [subsonic("s1", "O Holy Night", Some(1))];
+        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        assert_eq!((run.deleted, run.kept.len()), (1, 0));
+        // The next sync lists it again: Navidrome has not scanned since.
+        let reads = lib.fake.reads_by("alice");
+        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        assert_eq!((run.deleted, run.removed, run.kept.len()), (0, 0, 0));
+        assert_eq!(lib.fake.reads_by("alice"), reads);
+        // A file at that path again (re-imported) is checked as usual.
+        lib.write("alice/A/x.flac", b"audio");
+        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        assert_eq!(run.deleted, 1);
     }
 
     #[tokio::test]
