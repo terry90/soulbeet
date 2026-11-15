@@ -5,11 +5,15 @@ use shared::navidrome::{DeletionReview, LibraryStats, SyncResult};
 use dioxus::logger::tracing::{info, warn};
 
 #[cfg(feature = "server")]
+use crate::folder_policy::canonical_folder_path;
+#[cfg(feature = "server")]
 use crate::models::deletion_review::DeletionReviewRow;
 #[cfg(feature = "server")]
 use crate::models::discovery_history::DiscoveryHistoryRow;
 #[cfg(feature = "server")]
 use crate::models::discovery_playlist::DiscoveryTrackRow;
+#[cfg(feature = "server")]
+use crate::models::folder::Folder;
 #[cfg(feature = "server")]
 use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
@@ -18,6 +22,8 @@ use crate::services::navidrome_client_for_user;
 use crate::AuthSession;
 #[cfg(feature = "server")]
 use shared::navidrome::DiscoveryStatus;
+#[cfg(feature = "server")]
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "server")]
 use super::server_error;
@@ -43,9 +49,8 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
     let promote_threshold = user_settings.discovery_promote_threshold;
     let auto_delete = user_settings.auto_delete_enabled;
 
-    let folders = crate::models::folder::Folder::get_all_by_user(user_id)
-        .await
-        .unwrap_or_default();
+    let folders = local_folders(&Folder::get_all_by_user(user_id).await.unwrap_or_default());
+    let navidrome_music_path = std::env::var("NAVIDROME_MUSIC_PATH").ok();
 
     let mut real_path_failures = 0u32;
     let mut deleted_tracks = 0u32;
@@ -62,19 +67,25 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
 
     for song in &songs {
         // Auto-delete 1-star tracks (when enabled)
-        if auto_delete {
-            if let Some(rating) = song.user_rating {
-                if rating == 1 {
-                    let shared_veto = song.average_rating.map(|avg| avg > 1.0).unwrap_or(false);
-                    if shared_veto {
-                        info!(
-                            "Auto-delete skipped (shared veto, avg={:.1}): {} - {}",
-                            song.average_rating.unwrap_or(0.0),
-                            song.artist.as_deref().unwrap_or("?"),
-                            song.title
-                        );
-                        skipped_veto += 1;
-                    } else if let Some(ref path_str) = song.path {
+        if auto_delete && song.user_rating == Some(1) {
+            let artist = song.artist.as_deref().unwrap_or("?");
+            match shared_veto(song.average_rating) {
+                Veto::OtherRaters(avg) => {
+                    info!(
+                        "Auto-delete skipped (shared veto, avg={:.1}): {} - {}",
+                        avg, artist, song.title
+                    );
+                    skipped_veto += 1;
+                }
+                Veto::AverageUnknown => {
+                    info!(
+                        "Auto-delete skipped (average rating unknown): {} - {}",
+                        artist, song.title
+                    );
+                    skipped_veto += 1;
+                }
+                Veto::Allowed => {
+                    if let Some(ref path_str) = song.path {
                         // A pending discovery track is deleted by the
                         // discovery branch below instead, which also marks
                         // its row Removed and records the outcome. Skip only
@@ -91,38 +102,43 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                                         .map(|f| f.to_ascii_lowercase())
                         });
                         if !is_discovery {
-                            // Navidrome stores relative paths from its library
-                            // root. Resolve to a local absolute path by trying
-                            // each user folder.
-                            if let Some(local_path) = resolve_navidrome_path(path_str, &folders) {
-                                let path = std::path::Path::new(&local_path);
-                                if let Err(e) = tokio::fs::remove_file(path).await {
-                                    warn!("Auto-delete failed for {}: {}", path.display(), e);
-                                } else {
-                                    let library_root = folders
-                                        .iter()
-                                        .map(|f| std::path::Path::new(&f.path))
-                                        .find(|root| path.starts_with(root));
-                                    if let (Some(parent), Some(root)) =
-                                        (path.parent(), library_root)
-                                    {
-                                        let _ = super::cleanup_empty_ancestors(parent, root).await;
+                            match resolve_navidrome_path(
+                                path_str,
+                                &folders,
+                                navidrome_music_path.as_deref(),
+                            ) {
+                                LocalPath::Found { path, folder } => {
+                                    if let Err(e) = tokio::fs::remove_file(&path).await {
+                                        warn!("Auto-delete failed for {}: {}", path.display(), e);
+                                    } else {
+                                        info!("Auto-deleted {}", path.display());
+                                        if let Some(parent) = path.parent() {
+                                            let _ = super::cleanup_empty_ancestors(parent, &folder)
+                                                .await;
+                                        }
+                                        DeletionReviewRow::upsert(
+                                            &song.id,
+                                            &song.title,
+                                            song.artist.as_deref().unwrap_or("Unknown"),
+                                            song.album.as_deref().unwrap_or("Unknown"),
+                                            Some(&path.to_string_lossy()),
+                                            song.user_rating,
+                                            user_id,
+                                        )
+                                        .await?;
+                                        deleted_tracks += 1;
                                     }
-                                    DeletionReviewRow::upsert(
-                                        &song.id,
-                                        &song.title,
-                                        song.artist.as_deref().unwrap_or("Unknown"),
-                                        song.album.as_deref().unwrap_or("Unknown"),
-                                        Some(&local_path),
-                                        Some(rating),
-                                        user_id,
-                                    )
-                                    .await?;
-                                    deleted_tracks += 1;
                                 }
-                            } else {
-                                real_path_failures += 1;
-                                skipped_not_found += 1;
+                                LocalPath::Ambiguous(_) => {
+                                    info!(
+                                        "Auto-delete skipped (several local files match): {}",
+                                        path_str
+                                    );
+                                }
+                                LocalPath::NotFound => {
+                                    real_path_failures += 1;
+                                    skipped_not_found += 1;
+                                }
                             }
                         }
                     }
@@ -231,61 +247,100 @@ pub async fn check_report_real_path(user_id: &str) -> Result<Option<bool>, Strin
     Ok(soulbeet.map(|p| p.report_real_path))
 }
 
-/// Resolve a Navidrome relative path to a local absolute path.
-///
-/// Navidrome stores paths relative to its library root (e.g.
-/// "Artist/Album/track.flac"). We try prepending each user folder
-/// path and return the first one that exists on disk.
-///
-/// When direct resolution fails and NAVIDROME_MUSIC_PATH is set,
-/// falls back to prefix substitution for Docker deployments where
-/// Navidrome sees different mount points than Soulful.
+/// Where a track Navidrome reports lives on this machine.
 #[cfg(feature = "server")]
-fn resolve_navidrome_path(
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LocalPath {
+    /// A regular file strictly inside `folder`, the deepest of the user's
+    /// folders that holds it.
+    Found {
+        path: PathBuf,
+        folder: PathBuf,
+    },
+    NotFound,
+    /// Several distinct files match, so none of them is chosen.
+    Ambiguous(Vec<PathBuf>),
+}
+
+/// The user's folders through `canonical_folder_path`, leaving out the ones
+/// that cannot be resolved.
+#[cfg(feature = "server")]
+fn local_folders(folders: &[Folder]) -> Vec<PathBuf> {
+    folders
+        .iter()
+        .filter_map(|f| canonical_folder_path(Path::new(&f.path)).ok())
+        .collect()
+}
+
+/// Finds the local file behind a path Navidrome reports, only ever inside
+/// one of `folders` (canonical, from `local_folders`).
+///
+/// An absolute path is tried as given, a relative one (Navidrome's library
+/// root) under each folder. When Navidrome mounts the music elsewhere,
+/// `navidrome_music_path` is its root: the part of the path below it is
+/// tried under each folder and each of the folder's ancestors.
+#[cfg(feature = "server")]
+pub(crate) fn resolve_navidrome_path(
     navidrome_path: &str,
-    folders: &[crate::models::folder::Folder],
-) -> Option<String> {
-    let rel = std::path::Path::new(navidrome_path);
-
-    // 1. Path exists as-is (same machine, same mounts)
-    if rel.is_absolute() && rel.exists() {
-        return Some(navidrome_path.to_string());
+    folders: &[PathBuf],
+    navidrome_music_path: Option<&str>,
+) -> LocalPath {
+    let reported = Path::new(navidrome_path);
+    let mut candidates = Vec::new();
+    if reported.is_absolute() {
+        candidates.push(reported.to_path_buf());
+    } else {
+        candidates.extend(folders.iter().map(|f| f.join(reported)));
     }
-
-    // 2. Relative path -- prepend each folder root
-    if !rel.is_absolute() {
+    if let Some(rest) = navidrome_music_path.and_then(|root| reported.strip_prefix(root).ok()) {
         for folder in folders {
-            let candidate = std::path::PathBuf::from(&folder.path).join(rel);
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
-            }
+            candidates.extend(folder.ancestors().map(|dir| dir.join(rest)));
         }
     }
 
-    // 3. Docker prefix swap: Navidrome sees /media/music, Soulful sees /music.
-    //    Replace the Navidrome prefix with the local root (parent of folder paths).
-    let navi_prefix = std::env::var("NAVIDROME_MUSIC_PATH").ok()?;
-    let navi_prefix = navi_prefix.trim_end_matches('/');
-
-    if !navidrome_path.starts_with(navi_prefix) {
-        return None;
-    }
-    let rest = &navidrome_path[navi_prefix.len()..];
-    if !rest.is_empty() && !rest.starts_with('/') {
-        return None;
-    }
-
-    let local_root = folders
-        .first()
-        .and_then(|f| std::path::Path::new(&f.path).parent())
-        .map(|p| p.to_string_lossy().to_string())?;
-
-    let resolved = format!("{}{}", local_root, rest);
-    if std::path::Path::new(&resolved).exists() {
-        return Some(resolved);
+    let mut found = std::collections::BTreeMap::new();
+    for candidate in candidates {
+        let Ok(path) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if !std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let deepest = folders
+            .iter()
+            .filter(|f| path.starts_with(f) && path != **f)
+            .max_by_key(|f| f.components().count());
+        if let Some(folder) = deepest {
+            found.insert(path, folder.clone());
+        }
     }
 
-    None
+    if found.len() > 1 {
+        return LocalPath::Ambiguous(found.into_keys().collect());
+    }
+    match found.pop_first() {
+        Some((path, folder)) => LocalPath::Found { path, folder },
+        None => LocalPath::NotFound,
+    }
+}
+
+/// Whether other listeners' ratings block an auto-delete.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Veto {
+    Allowed,
+    OtherRaters(f64),
+    /// Navidrome leaves the average out when average ratings are off.
+    AverageUnknown,
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn shared_veto(average_rating: Option<f64>) -> Veto {
+    match average_rating {
+        None => Veto::AverageUnknown,
+        Some(avg) if avg > 1.0 => Veto::OtherRaters(avg),
+        Some(_) => Veto::Allowed,
+    }
 }
 
 #[get("/api/navidrome/library-stats", auth: AuthSession)]
@@ -397,7 +452,6 @@ pub(crate) async fn promote_discovery_track_internal(
 #[cfg(feature = "server")]
 async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), PromoteError> {
     use crate::models::discovery_history::DiscoveryHistoryRow;
-    use crate::models::folder::Folder;
 
     // CAS guard: only one caller can promote a given track
     if !DiscoveryTrackRow::try_set_promoting(track_id).await? {
@@ -465,7 +519,7 @@ async fn remove_discovery_track_internal(track_id: &str) -> Result<(), String> {
         tokio::fs::remove_file(path)
             .await
             .map_err(|e| format!("Failed to delete file: {}", e))?;
-        let folder = crate::models::folder::Folder::get_by_id(&track.folder_id).await;
+        let folder = Folder::get_by_id(&track.folder_id).await;
         if let (Some(parent), Ok(Some(folder))) = (path.parent(), folder) {
             let profile_root = folder.discovery_profile_path(&track.profile);
             let _ =
@@ -477,4 +531,172 @@ async fn remove_discovery_track_internal(track_id: &str) -> Result<(), String> {
 
     info!("Removed discovery track: {}", track.title);
     Ok(())
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// `tmp/music/alice/A/x.flac`, `tmp/music/bob/B/y.flac`, `tmp/outside/z.flac`.
+    fn library() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(dir.path()).unwrap();
+        for file in [
+            "music/alice/A/x.flac",
+            "music/bob/B/y.flac",
+            "outside/z.flac",
+        ] {
+            let path = tmp.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"audio").unwrap();
+        }
+        (dir, tmp)
+    }
+
+    fn folder(path: &Path) -> Folder {
+        Folder {
+            id: "f1".to_string(),
+            user_id: "alice".to_string(),
+            name: "Music".to_string(),
+            path: path.to_str().unwrap().to_string(),
+            shared: false,
+        }
+    }
+
+    #[test]
+    fn absolute_path_inside_a_folder_is_found() {
+        let (_dir, tmp) = library();
+        let alice = tmp.join("music/alice");
+        let track = alice.join("A/x.flac");
+        assert_eq!(
+            resolve_navidrome_path(track.to_str().unwrap(), std::slice::from_ref(&alice), None),
+            LocalPath::Found {
+                path: track,
+                folder: alice
+            }
+        );
+    }
+
+    #[test]
+    fn absolute_path_outside_every_folder_is_not_found() {
+        let (_dir, tmp) = library();
+        let outside = tmp.join("outside/z.flac");
+        assert_eq!(
+            resolve_navidrome_path(outside.to_str().unwrap(), &[tmp.join("music/alice")], None),
+            LocalPath::NotFound
+        );
+    }
+
+    #[test]
+    fn parent_components_cannot_escape_a_folder() {
+        let (_dir, tmp) = library();
+        assert_eq!(
+            resolve_navidrome_path("../bob/B/y.flac", &[tmp.join("music/alice")], None),
+            LocalPath::NotFound
+        );
+    }
+
+    #[test]
+    fn a_symlink_inside_a_folder_pointing_outside_is_not_found() {
+        let (_dir, tmp) = library();
+        let link = tmp.join("music/alice/link.flac");
+        symlink(tmp.join("outside/z.flac"), &link).unwrap();
+        assert_eq!(
+            resolve_navidrome_path(link.to_str().unwrap(), &[tmp.join("music/alice")], None),
+            LocalPath::NotFound
+        );
+        assert_eq!(
+            resolve_navidrome_path("link.flac", &[tmp.join("music/alice")], None),
+            LocalPath::NotFound
+        );
+    }
+
+    #[test]
+    fn folder_reached_through_a_symlink_still_matches() {
+        let (_dir, tmp) = library();
+        symlink(tmp.join("music"), tmp.join("lib")).unwrap();
+        let folders = local_folders(&[folder(&tmp.join("lib/alice"))]);
+        let track = tmp.join("music/alice/A/x.flac");
+        assert_eq!(
+            resolve_navidrome_path(track.to_str().unwrap(), &folders, None),
+            LocalPath::Found {
+                path: track,
+                folder: tmp.join("music/alice")
+            }
+        );
+    }
+
+    #[test]
+    fn navidrome_music_path_maps_onto_the_folder_that_holds_the_file() {
+        let (_dir, tmp) = library();
+        let alice = tmp.join("music/alice");
+        assert_eq!(
+            resolve_navidrome_path(
+                "/navi/alice/A/x.flac",
+                std::slice::from_ref(&alice),
+                Some("/navi")
+            ),
+            LocalPath::Found {
+                path: alice.join("A/x.flac"),
+                folder: alice
+            }
+        );
+    }
+
+    #[test]
+    fn navidrome_music_path_never_reaches_a_sibling_folder() {
+        let (_dir, tmp) = library();
+        assert_eq!(
+            resolve_navidrome_path(
+                "/navi/bob/B/y.flac",
+                &[tmp.join("music/alice")],
+                Some("/navi")
+            ),
+            LocalPath::NotFound
+        );
+    }
+
+    #[test]
+    fn a_directory_is_never_a_track() {
+        let (_dir, tmp) = library();
+        let album = tmp.join("music/alice/A");
+        assert_eq!(
+            resolve_navidrome_path(album.to_str().unwrap(), &[tmp.join("music/alice")], None),
+            LocalPath::NotFound
+        );
+    }
+
+    #[test]
+    fn several_matching_files_are_ambiguous() {
+        let (_dir, tmp) = library();
+        let (alice, bob) = (tmp.join("music/alice"), tmp.join("music/bob"));
+        std::fs::create_dir_all(bob.join("A")).unwrap();
+        std::fs::write(bob.join("A/x.flac"), b"audio").unwrap();
+        assert_eq!(
+            resolve_navidrome_path("A/x.flac", &[alice.clone(), bob.clone()], None),
+            LocalPath::Ambiguous(vec![alice.join("A/x.flac"), bob.join("A/x.flac")])
+        );
+    }
+
+    #[test]
+    fn the_deepest_folder_holding_the_file_is_the_cleanup_root() {
+        let (_dir, tmp) = library();
+        let (music, alice) = (tmp.join("music"), tmp.join("music/alice"));
+        let track = alice.join("A/x.flac");
+        assert_eq!(
+            resolve_navidrome_path(track.to_str().unwrap(), &[music, alice.clone()], None),
+            LocalPath::Found {
+                path: track,
+                folder: alice
+            }
+        );
+    }
+
+    #[test]
+    fn the_veto_fails_closed() {
+        assert_eq!(shared_veto(None), Veto::AverageUnknown);
+        assert_eq!(shared_veto(Some(2.5)), Veto::OtherRaters(2.5));
+        assert_eq!(shared_veto(Some(1.0)), Veto::Allowed);
+    }
 }
