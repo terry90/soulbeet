@@ -46,19 +46,21 @@ pub(crate) async fn owned_in(
     ensure_owner(folder, ctx)
 }
 
-/// Stores a new name and path for `folder`, one `owned` gave and whose path
-/// the folder rules allowed.
-pub async fn update(folder: &Folder, name: &str, path: &str) -> Result<(), Failure> {
-    update_in(&DB, folder, name, path).await
+/// Stores a new name and path for `ctx`'s folder `folder_id`, a path the
+/// folder rules allowed.
+pub async fn update(ctx: &UserCtx, folder_id: &str, name: &str, path: &str) -> Result<(), Failure> {
+    update_in(&DB, ctx, folder_id, name, path).await
 }
 
 async fn update_in(
     db: &SqlitePool,
-    folder: &Folder,
+    ctx: &UserCtx,
+    folder_id: &str,
     name: &str,
     path: &str,
 ) -> Result<(), Failure> {
-    Folder::update_in(db, &folder.id, name, path)
+    owned_in(db, ctx, folder_id).await?;
+    Folder::update_in(db, folder_id, name, path)
         .await
         .map_err(|e| database_failure(Stage::Input, e))
 }
@@ -158,15 +160,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_owner_updates_a_folder() {
+        let db = crate::db::test_db::migrated().await;
+        let alice_folder = crate::core::folder_of(&db, "alice").await;
+        let alice = test_ctx("alice");
+        assert_eq!(
+            update_in(&db, &test_ctx("bob"), &alice_folder, "Bob's", "/music/bob").await,
+            Err(folder_not_found())
+        );
+        let stored = owned_in(&db, &alice, &alice_folder).await.unwrap();
+        assert_eq!(stored.name, "f");
+        assert_eq!(
+            update_in(&db, &alice, &alice_folder, "Music", "/music/alice").await,
+            Ok(())
+        );
+        let stored = owned_in(&db, &alice, &alice_folder).await.unwrap();
+        assert_eq!(stored.name, "Music");
+    }
+
+    #[tokio::test]
     async fn a_folder_write_the_database_refuses_is_a_database_failure() {
         let db = crate::db::test_db::migrated().await;
         let id = crate::core::folder_of(&db, "alice").await;
         let alice = test_ctx("alice");
-        let folder = owned_in(&db, &alice, &id).await.unwrap();
         db.close().await;
         let closed = sqlx::Error::PoolClosed.to_string();
 
-        let renamed = update_in(&db, &folder, "Music", "/music/alice")
+        let renamed = update_in(&db, &alice, &id, "Music", "/music/alice")
             .await
             .unwrap_err();
         assert_eq!(renamed, database_failure(Stage::Input, &closed));

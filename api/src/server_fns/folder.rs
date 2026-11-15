@@ -106,7 +106,7 @@ pub async fn update_folder(
         },
     )
     .await?;
-    crate::core::folders::update(&folder, &name, path_str(&canonical))
+    crate::core::folders::update(&auth.0, &folder_id, &name, path_str(&canonical))
         .await
         .map_err(failure_error)
 }
