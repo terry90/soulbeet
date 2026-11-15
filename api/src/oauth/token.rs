@@ -56,11 +56,7 @@ async fn exchange(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Issued, Response> {
-    let params = read_form(headers, body, TOKEN_PARAMS).map_err(|refused| match refused {
-        // RFC 8707 section 2 allows several resources; Soulful issues tokens for one.
-        FormRefusal::Twice("resource") => wrong_resource(base),
-        refused => refused.into_response(),
-    })?;
+    let params = read_form(headers, body, TOKEN_PARAMS).map_err(IntoResponse::into_response)?;
     let grant_type = required(&params, "grant_type")?;
     let client_id = required(&params, "client_id")?;
     let resource = mcp_url(base);
@@ -411,7 +407,6 @@ mod tests {
                 json!({"error": "invalid_request", "error_description": "code is given more than once"})
             )
         );
-        // RFC 8707 section 2 allows several resources; Soulful accepts one.
         let mut two_resources = code_form(&code);
         two_resources.push(("resource", RESOURCE.into()));
         let (status, _, doc) = token(app.clone(), AT_HOST, &two_resources).await;
@@ -419,7 +414,7 @@ mod tests {
             (status, doc),
             (
                 StatusCode::BAD_REQUEST,
-                json!({"error": "invalid_target", "error_description": "resource must be https://music.example.com/mcp"})
+                json!({"error": "invalid_request", "error_description": "resource is given more than once"})
             )
         );
         let body = url::form_urlencoded::Serializer::new(String::new())
