@@ -2,6 +2,7 @@
 
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
+use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
@@ -64,6 +65,27 @@ impl From<Errno> for UnlinkError {
 /// component with AT_SYMLINK_NOFOLLOW, and unlinks it only when its identity is `expected`.
 /// A symlinked component (ELOOP, ENOTDIR), a missing one (ENOENT) or another identity is Changed.
 pub(super) fn unlink_if_same(path: &Path, expected: FileId) -> Result<(), UnlinkError> {
+    let (dir, name, found) = located(path)?;
+    if found != expected {
+        return Err(UnlinkError::Changed);
+    }
+    rustix::fs::unlinkat(&dir, name, AtFlags::empty())?;
+    Ok(())
+}
+
+/// Whether the file that was checked is still at `path`, read as unlink_if_same reads it:
+/// false when the path leads nowhere, through a link, or to a file of another identity.
+pub(super) fn still_there(path: &Path, expected: FileId) -> Result<bool, UnlinkError> {
+    match located(path) {
+        Ok((_, _, found)) => Ok(found == expected),
+        Err(UnlinkError::Changed) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The directory of the canonical `path`, opened from "/" without following a link, the name
+/// of `path` in it, and the identity of what that name holds.
+fn located(path: &Path) -> Result<(OwnedFd, &OsStr, FileId), UnlinkError> {
     let canonical = path.is_absolute()
         && path
             .components()
@@ -81,9 +103,5 @@ pub(super) fn unlink_if_same(path: &Path, expected: FileId) -> Result<(), Unlink
         dir = rustix::fs::openat(&dir, child, flags, Mode::empty())?;
     }
     let stat = rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
-    if FileId::of_stat(&stat) != expected {
-        return Err(UnlinkError::Changed);
-    }
-    rustix::fs::unlinkat(&dir, name, AtFlags::empty())?;
-    Ok(())
+    Ok((dir, name, FileId::of_stat(&stat)))
 }

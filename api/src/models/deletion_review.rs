@@ -4,8 +4,6 @@ use crate::db::DB;
 use shared::navidrome::{DeletionReason, DeletionReview};
 #[cfg(feature = "server")]
 use sqlx::SqlitePool;
-#[cfg(feature = "server")]
-use uuid::Uuid;
 
 /// A row of the deletion audit.
 #[derive(Clone, Debug)]
@@ -24,13 +22,17 @@ pub struct DeletionReviewRow {
 
 /// One deletion, as the guard records it.
 #[cfg(feature = "server")]
-pub struct DeletionRecord<'a> {
-    pub user_id: &'a str,
-    pub song_id: &'a str,
-    pub title: &'a str,
-    pub artist: &'a str,
-    pub album: &'a str,
-    pub path: &'a str,
+#[derive(Clone, Debug)]
+pub struct DeletionRecord {
+    /// The row's id, chosen before the removal so a removal that lost track of itself can
+    /// record it once.
+    pub id: String,
+    pub user_id: String,
+    pub song_id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub path: String,
     /// The caller's own rating, None when unrated.
     pub rating: Option<u8>,
     /// What started the removal: "ui" or "auto".
@@ -61,22 +63,23 @@ impl TryFrom<DeletionReviewRow> for DeletionReview {
 
 #[cfg(feature = "server")]
 impl DeletionReviewRow {
-    /// Records `record` on `conn`, inside the caller's transaction.
+    /// Records `record` on `conn` (inside the caller's transaction, when it has one), unless a
+    /// row with its id is there already.
     pub(crate) async fn insert_in(
         conn: &mut sqlx::SqliteConnection,
-        record: &DeletionRecord<'_>,
+        record: &DeletionRecord,
     ) -> Result<(), String> {
         sqlx::query(
             "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, path, rating, origin, reason)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
         )
-        .bind(Uuid::new_v4().to_string())
-        .bind(record.user_id)
-        .bind(record.song_id)
-        .bind(record.title)
-        .bind(record.artist)
-        .bind(record.album)
-        .bind(record.path)
+        .bind(&record.id)
+        .bind(&record.user_id)
+        .bind(&record.song_id)
+        .bind(&record.title)
+        .bind(&record.artist)
+        .bind(&record.album)
+        .bind(&record.path)
         .bind(record.rating.map(i32::from))
         .bind(record.origin)
         .bind(record.reason.as_str())
@@ -170,12 +173,13 @@ mod tests {
             DeletionReviewRow::insert_in(
                 &mut conn,
                 &DeletionRecord {
-                    user_id: "alice",
-                    song_id: "s",
-                    title,
-                    artist: "Marrow Choir",
-                    album: "Winter Songs",
-                    path: "/music/x.flac",
+                    id: title.to_string(),
+                    user_id: "alice".into(),
+                    song_id: "s".into(),
+                    title: title.into(),
+                    artist: "Marrow Choir".into(),
+                    album: "Winter Songs".into(),
+                    path: "/music/x.flac".into(),
                     rating: Some(1),
                     origin: "auto",
                     reason,

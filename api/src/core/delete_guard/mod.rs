@@ -234,11 +234,12 @@ impl Guard<'_> {
     /// caller's rating, origin, reason) in a transaction; unlink_if_same(checked.path, checked.id);
     /// commit; one info line "Deleted {path} ({reason}, {origin})"; then the forget and pruning
     /// the empty parents up to checked.folder. Ok holds the deletion's warnings: a commit that
-    /// failed, and with `ForgetVia::Worker` a forget that did not remove one item (with
-    /// `ForgetVia::Queue` that one is logged). Nothing may use `self.db` while the transaction
-    /// is open, so the row is built before it begins. The unlink, the commit, the info line and
-    /// the spawn of a queued forget run in one spawned task, which a dropped caller does not
-    /// cancel.
+    /// failed (logged where it happens), and with `ForgetVia::Worker` a forget that did not
+    /// remove one item (with `ForgetVia::Queue` that one is logged). Nothing may use `self.db`
+    /// while the transaction is open, so the row is built before it begins. The unlink, the
+    /// commit, its warning, the info line and the spawn of a queued forget run in one spawned
+    /// task, which a dropped caller does not cancel. A removal that stops without saying whether
+    /// it unlinked is settled by lost_removal.
     pub async fn carry_out(
         &self,
         actor: &UserId,
@@ -253,19 +254,7 @@ impl Guard<'_> {
             folder,
             id,
         } = checked;
-        let user_id = actor.to_string();
-        let path_text = path.to_string_lossy();
-        let record = DeletionRecord {
-            user_id: &user_id,
-            song_id: &song.id,
-            title: &song.title,
-            artist: &song.artist,
-            album: &song.album,
-            path: &path_text,
-            rating: (song.rating > 0).then_some(song.rating),
-            origin: origin.as_str(),
-            reason,
-        };
+        let record = record_of(actor, song, &path, reason, origin);
         let mut tx = self
             .db
             .begin()
@@ -278,47 +267,54 @@ impl Guard<'_> {
             ForgetVia::Queue(queue) => (Some(queue), None),
             ForgetVia::Worker { importer, library } => (None, Some((importer, library))),
         };
-        let (target, removed, root) = (path.clone(), path.clone(), folder.clone());
+        let (db, target, root, kept) = (
+            self.db.clone(),
+            path.clone(),
+            folder.clone(),
+            record.clone(),
+        );
         // One task unlinks, commits and, for a queued forget, spawns it, so a dropped caller can
         // neither delete the file and roll its row back nor leave the file in beets' library.
         // A refusal drops the transaction, which rolls the row back.
         let removal = tokio::spawn(async move {
-            let committed = match tokio::task::spawn_blocking(move || {
-                unlink::unlink_if_same(&target, id)
-            })
-            .await
+            let unlinking = target.clone();
+            match tokio::task::spawn_blocking(move || unlink::unlink_if_same(&unlinking, id)).await
             {
-                Ok(Ok(())) => tx.commit().await.err(),
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(UnlinkError::Io(std::io::Error::other(e))),
-            };
+                Ok(Ok(())) => {}
+                Ok(Err(UnlinkError::Changed)) => return Err(changed_since_check()),
+                Ok(Err(UnlinkError::Io(e))) => return Err(delete_failed(&target, &e)),
+                Err(e) => {
+                    drop(tx);
+                    return Err(lost_removal(&db, &kept, &target, id, &e.to_string()).await);
+                }
+            }
+            let unrecorded = tx.commit().await.err().map(|e| {
+                let warning = not_recorded(&target, &e.to_string());
+                warn!("{warning}");
+                warning
+            });
             info!(
                 "Deleted {} ({}, {})",
-                removed.display(),
+                target.display(),
                 reason.as_str(),
                 origin.as_str()
             );
             if let Some(queue) = queued {
                 tokio::spawn(async move {
-                    let outcome = queue.forget(&root, &removed).await;
-                    if let Some(note) = forget_note(&outcome, &removed, &root) {
+                    let outcome = queue.forget(&root, &target).await;
+                    if let Some(note) = forget_note(&outcome, &target, &root) {
                         warn!("{note}");
                     }
-                    prune(&removed, &root).await;
+                    prune(&target, &root).await;
                 });
             }
-            Ok(committed)
+            Ok(unrecorded)
         });
         let mut warnings = Vec::new();
         match removal.await {
-            Ok(Ok(None)) => {}
-            Ok(Ok(Some(e))) => warnings.push(format!(
-                "The deletion of {} was not recorded: {e}",
-                path.display()
-            )),
-            Ok(Err(UnlinkError::Changed)) => return Err(changed_since_check()),
-            Ok(Err(UnlinkError::Io(e))) => return Err(delete_failed(&path, &e)),
-            Err(e) => return Err(delete_failed(&path, &std::io::Error::other(e))),
+            Ok(Ok(unrecorded)) => warnings.extend(unrecorded),
+            Ok(Err(f)) => return Err(f),
+            Err(e) => return Err(lost_removal(self.db, &record, &path, id, &e.to_string()).await),
         }
         if let Some((importer, library)) = in_worker {
             let outcome = importer.forget(library, &path).await;
@@ -383,12 +379,90 @@ impl Guard<'_> {
     }
 }
 
-/// Removes the directories the removal of `path` left empty, up to (not including) `folder`.
-/// A directory that cannot be removed is left, as an empty one is harmless.
-async fn prune(path: &Path, folder: &Path) {
-    if let Some(parent) = path.parent() {
-        let _ = crate::server_fns::cleanup_empty_ancestors(parent, folder).await;
+/// The audit row of `actor`'s removal of `song`'s file `path`, with a new id.
+fn record_of(
+    actor: &UserId,
+    song: NativeSong,
+    path: &Path,
+    reason: DeletionReason,
+    origin: Origin,
+) -> DeletionRecord {
+    DeletionRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        user_id: actor.to_string(),
+        rating: (song.rating > 0).then_some(song.rating),
+        song_id: song.id,
+        title: song.title,
+        artist: song.artist,
+        album: song.album,
+        path: path.to_string_lossy().into_owned(),
+        origin: origin.as_str(),
+        reason,
     }
+}
+
+/// The warning for a deletion whose audit row could not be stored.
+fn not_recorded(path: &Path, error: &str) -> String {
+    format!(
+        "The deletion of {} was not recorded: {error}",
+        path.display()
+    )
+}
+
+/// Settles a removal of the checked file `path` (identity `id`) that stopped (`error`) without
+/// saying whether its unlink ran, and makes the audit match the file: when the checked file is
+/// still there nothing was removed, no row stays, and the removal failed; when it is gone the
+/// row is recorded once (`record` keeps its id) and the failure says the file may have been
+/// deleted; when that cannot be read nothing is recorded and the failure says the same.
+async fn lost_removal(
+    db: &SqlitePool,
+    record: &DeletionRecord,
+    path: &Path,
+    id: unlink::FileId,
+    error: &str,
+) -> Failure {
+    match unlink::still_there(path, id) {
+        Ok(true) => return delete_failed(path, &std::io::Error::other(error)),
+        Ok(false) => {
+            let recorded = match db.acquire().await {
+                Ok(mut conn) => DeletionReviewRow::insert_in(&mut conn, record).await,
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = recorded {
+                warn!("{}", not_recorded(path, &e));
+            }
+        }
+        Err(_) => {}
+    }
+    warn!(
+        "The removal of {} stopped before it reported: {error}",
+        path.display()
+    );
+    removal_unconfirmed(path, error)
+}
+
+/// Removes the directories the removal of `path` left empty, up to (not including) `folder`.
+/// A directory that cannot be removed is left, as an empty one is harmless, and logged.
+async fn prune(path: &Path, folder: &Path) {
+    if let Err(e) = pruned(path, folder).await {
+        warn!("{e}");
+    }
+}
+
+/// prune, with why a directory could not be removed.
+async fn pruned(path: &Path, folder: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    crate::server_fns::cleanup_empty_ancestors(parent, folder)
+        .await
+        .map_err(|e| {
+            format!(
+                "Could not remove the empty folders above {} up to {}: {e}",
+                path.display(),
+                folder.display()
+            )
+        })
 }
 
 /// The warning for a forget that did not remove exactly one item, None for Removed.
@@ -483,6 +557,19 @@ pub(crate) fn changed_since_check() -> Failure {
         Stage::Delete,
         RetryAdvice::SameSourceLater,
         "The file changed after it was checked",
+    )
+}
+
+/// A removal of `path` stopped (`error`) and the file is not where it was checked.
+fn removal_unconfirmed(path: &Path, error: &str) -> Failure {
+    Failure::new(
+        FailureCode::DeleteFailed,
+        Stage::Delete,
+        RetryAdvice::SameSourceLater,
+        format!(
+            "{} may have been deleted: the removal stopped before it reported ({error})",
+            path.display()
+        ),
     )
 }
 
@@ -1649,6 +1736,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_removal_that_lost_track_of_itself_leaves_the_audit_as_the_file_is() {
+        let lib = Library::new().await;
+        let Checked { song, path, id, .. } = checked(&lib).await;
+        let record = record_of(
+            &lib.alice(),
+            song,
+            &path,
+            DeletionReason::Disliked,
+            Origin::Auto,
+        );
+        let rows = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deletion_reviews")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap()
+        };
+        let f = lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await;
+        assert_eq!(
+            (f.code, f.message),
+            (
+                FailureCode::DeleteFailed,
+                format!("Could not delete {}: task 7 panicked", path.display())
+            )
+        );
+        assert_eq!(rows().await, 0);
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
+        // The task and its caller may both settle it: the row is recorded once.
+        for _ in 0..2 {
+            let f = lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await;
+            assert_eq!(
+                (f.code, f.message),
+                (
+                    FailureCode::DeleteFailed,
+                    format!(
+                        "{} may have been deleted: the removal stopped before it reported (task 7 panicked)",
+                        path.display()
+                    )
+                )
+            );
+        }
+        assert_eq!(rows().await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_folder_that_cannot_be_removed_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("alice");
+        std::fs::create_dir_all(folder.join("A")).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let pruning = pruned(&folder.join("A/x.flac"), &folder).await;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            pruning,
+            Err(format!(
+                "Could not remove the empty folders above {} up to {}: {}",
+                folder.join("A/x.flac").display(),
+                folder.display(),
+                std::io::Error::from_raw_os_error(13) // EACCES
+            ))
+        );
+        assert!(folder.join("A").is_dir());
+    }
+
     #[test]
     fn a_forget_that_did_not_remove_one_item_is_a_warning() {
         let (p, l) = (
@@ -1705,6 +1858,31 @@ mod tests {
                 Stage::Delete,
                 SameSourceLater,
                 "A download or import that is not finished wants this track",
+            ),
+            (
+                changed_since_check(),
+                DeleteChangedSincePreview,
+                Stage::Delete,
+                SameSourceLater,
+                "The file changed after it was checked",
+            ),
+            (
+                // EACCES
+                delete_failed(
+                    Path::new("/music/alice/A/x.flac"),
+                    &std::io::Error::from_raw_os_error(13),
+                ),
+                DeleteFailed,
+                Stage::Delete,
+                SameSourceLater,
+                "Could not delete /music/alice/A/x.flac: Permission denied (os error 13)",
+            ),
+            (
+                removal_unconfirmed(Path::new("/music/alice/A/x.flac"), "task 7 panicked"),
+                DeleteFailed,
+                Stage::Delete,
+                SameSourceLater,
+                "/music/alice/A/x.flac may have been deleted: the removal stopped before it reported (task 7 panicked)",
             ),
         ] {
             assert_eq!(

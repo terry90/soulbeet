@@ -262,12 +262,8 @@ pub(crate) async fn auto_delete_songs(
                         forget,
                     )
                     .await
-                    .map(|warnings| {
-                        for warning in warnings {
-                            warn!("{warning}");
-                        }
-                        run.deleted += 1;
-                    })
+                    // Its only warning, an unrecorded deletion, is logged where it happens.
+                    .map(|_| run.deleted += 1)
             }
             Ok(Verdict::Discovery { track, rating: 1 }) => {
                 match Folder::get_by_id_in(guard.db, &track.folder_id).await {
