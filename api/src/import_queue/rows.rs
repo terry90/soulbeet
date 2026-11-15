@@ -56,6 +56,7 @@ fn import_failure(result: &ImportResult) -> Option<Failure> {
                 FailureCode::ImportTargetUnwritable,
                 RetryAdvice::NotRetryable,
             ),
+            FailKind::DiskFull => (FailureCode::ImportDiskFull, RetryAdvice::NeedsUser),
             FailKind::AsIsMissingTags => (
                 FailureCode::ImportAsIsMissingTags,
                 RetryAdvice::NeedsDecision,
@@ -67,8 +68,15 @@ fn import_failure(result: &ImportResult) -> Option<Failure> {
     };
     let message = result.to_string();
     let mut failure = Failure::new(code, Stage::Import, retry, message.clone());
-    if code == FailureCode::ImporterBroken {
-        failure = failure.with_user_action(UserAction::fix_importer(&message));
+    match code {
+        FailureCode::ImporterBroken => {
+            failure = failure.with_user_action(UserAction::fix_importer(&message));
+        }
+        // Once there is space, the same files import.
+        FailureCode::ImportDiskFull => {
+            failure = failure.with_user_action(UserAction::free_disk_space(&message));
+        }
+        _ => {}
     }
     if !result.output_tail.is_empty() {
         failure = failure.with_cause(Service::Beets, None, result.output_tail.clone());
@@ -405,6 +413,16 @@ mod tests {
             ),
             (
                 ImportOutcome::Failed {
+                    kind: FailKind::DiskFull,
+                    message:
+                        "Error: No space left on device while copying /dl/a.flac to /music/A/a.flac"
+                            .into(),
+                },
+                FailureCode::ImportDiskFull,
+                RetryAdvice::NeedsUser,
+            ),
+            (
+                ImportOutcome::Failed {
                     kind: FailKind::AsIsMissingTags,
                     message: "Import as-is needs tags".into(),
                 },
@@ -440,6 +458,15 @@ mod tests {
         assert_eq!(
             refused.user_action.unwrap().code,
             UserActionCode::FixImporter
+        );
+        let full = import_failure(&run(ImportOutcome::Failed {
+            kind: FailKind::DiskFull,
+            message: "Error: No space left on device while creating /music/A".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            full.user_action.unwrap().code,
+            UserActionCode::FreeDiskSpace
         );
     }
 

@@ -116,6 +116,8 @@ pub enum FailKind {
     /// The importer could not be set up or started.
     Setup,
     TargetUnwritable,
+    /// The disk beets writes to is full.
+    DiskFull,
     AsIsMissingTags,
     ChoiceInvalid,
 }

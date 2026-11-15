@@ -9,6 +9,7 @@ use crate::{
 };
 use regex::Regex;
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 static RE_ITEMS_HEADER: LazyLock<Regex> =
@@ -43,26 +44,57 @@ const CHAINED: [&str; 2] = [
     "During handling of the above exception, another exception occurred:",
 ];
 
-/// What a fatal line of beets 2.11 (`ui.main`) says failed.
+/// What a fatal line of beets 2.11 (`ui.main`) says failed, `target` being
+/// the library folder.
 ///
+/// - `Error: {reason} while {verb} {path}` is a `FilesystemError`, whose
+///   reason is the OS error's text. `No space left on device` (ENOSPC) and
+///   `Disk quota exceeded` (EDQUOT) are a full disk, whatever the verb.
 /// - `configuration error:` is a config file confuse could not use, and
 ///   `can't be both quiet and timid` is the user's `import.timid` against
 ///   Soulful's `import -q`: the beets setup.
 /// - `database access error:` is one of beets' two `DBAccessError` texts,
 ///   both a library database it cannot open or write. That database sits in
 ///   the library folder (`library::library_db`).
-/// - `Error: {reason} while creating {path}` is `util.mkdirall`, which beets
-///   only calls for folders in the library (`Item.move`, playlists).
+/// - `Error: {reason} while creating {path}` is `util.mkdirall`. Inside the
+///   library folder that folder is unwritable. Outside it, the folder is a
+///   plugin's (`smartplaylist`, `importfeeds` and `convert` write their own
+///   folders), set in the beets config.
 ///
 /// A move or copy failure names both ends, and a lowercase `error:` is any
 /// `UserError`, so those stay beets failures.
-fn fatal_kind(line: &str) -> FailKind {
-    if line.starts_with("configuration error: ") || line == "error: can't be both quiet and timid" {
-        FailKind::Setup
-    } else if line.starts_with("database access error: ")
-        || (line.starts_with("Error: ") && line.contains(" while creating "))
+fn fatal_kind(line: &str, target: &Path) -> FailKind {
+    let filesystem = line.strip_prefix("Error: ");
+    if filesystem.is_some_and(|reason| DISK_FULL.iter().any(|full| reason.starts_with(full))) {
+        FailKind::DiskFull
+    } else if line.starts_with("configuration error: ")
+        || line == "error: can't be both quiet and timid"
     {
+        FailKind::Setup
+    } else if line.starts_with("database access error: ") {
         FailKind::TargetUnwritable
+    } else {
+        match filesystem.and_then(|r| r.split_once(" while creating ")) {
+            Some((_, path)) if Path::new(path).starts_with(target) => FailKind::TargetUnwritable,
+            Some(_) => FailKind::Setup,
+            None => FailKind::Beets,
+        }
+    }
+}
+
+/// The OS texts of a full disk, as Python's `strerror` gives them on Linux.
+const DISK_FULL: [&str; 2] = ["No space left on device ", "Disk quota exceeded "];
+
+/// What the last exception line of a beets traceback says failed: a full
+/// disk for Python's `OSError` of ENOSPC or EDQUOT (`OSError: [Errno 28] No
+/// space left on device: '{path}'`) and SQLite's `database or disk is full`,
+/// else beets itself.
+fn exception_kind(line: &str) -> FailKind {
+    if line.contains("[Errno 28] No space left on device")
+        || line.contains("[Errno 122] Disk quota exceeded")
+        || line.ends_with("database or disk is full")
+    {
+        FailKind::DiskFull
     } else {
         FailKind::Beets
     }
@@ -118,6 +150,8 @@ enum Traceback {
 
 pub(crate) struct Classifier {
     mode: ImportMode,
+    /// The library folder beets imports into.
+    target: PathBuf,
     submitted: usize,
     autotag_off: bool,
     tasks: TaskCount,
@@ -143,9 +177,15 @@ pub(crate) struct Classifier {
 }
 
 impl Classifier {
-    pub(crate) fn new(mode: ImportMode, submitted: usize, autotag_off: bool) -> Self {
+    pub(crate) fn new(
+        mode: ImportMode,
+        target: &Path,
+        submitted: usize,
+        autotag_off: bool,
+    ) -> Self {
         Classifier {
             mode,
+            target: target.to_path_buf(),
             submitted,
             autotag_off,
             tasks: TaskCount::default(),
@@ -280,20 +320,22 @@ impl Classifier {
                 limit: TimeoutKind::Total(limits.total),
                 last_line: self.last_line,
             },
-            RunEnd::Exited(status) if !status.success() => match self.fatal {
-                Some(line) => ImportOutcome::Failed {
-                    kind: fatal_kind(&line),
+            RunEnd::Exited(status) if !status.success() => match (self.fatal, self.exception) {
+                (Some(line), _) => ImportOutcome::Failed {
+                    kind: fatal_kind(&line, &self.target),
                     message: line,
                 },
-                None => ImportOutcome::Failed {
+                (None, Some(line)) => ImportOutcome::Failed {
+                    kind: exception_kind(&line),
+                    message: line,
+                },
+                (None, None) => ImportOutcome::Failed {
                     kind: FailKind::Beets,
-                    message: self.exception.unwrap_or_else(|| {
-                        match (status.code(), status.signal()) {
-                            (Some(code), _) => format!("beets exited with code {code}"),
-                            (None, Some(signal)) => format!("beets was killed by signal {signal}"),
-                            (None, None) => format!("beets exited with {status}"),
-                        }
-                    }),
+                    message: match (status.code(), status.signal()) {
+                        (Some(code), _) => format!("beets exited with code {code}"),
+                        (None, Some(signal)) => format!("beets was killed by signal {signal}"),
+                        (None, None) => format!("beets exited with {status}"),
+                    },
                 },
             },
             RunEnd::Exited(_) => self.exited_cleanly(run_log),
@@ -421,7 +463,7 @@ mod tests {
         let submitted = meta["submitted"].as_u64().unwrap() as usize;
         let exit = meta["exit"].as_i64().unwrap() as i32;
 
-        let mut classifier = Classifier::new(mode, submitted, autotag_off);
+        let mut classifier = Classifier::new(mode, Path::new("/music"), submitted, autotag_off);
         let mut streams = [(Stream::Stdout, f.stdout), (Stream::Stderr, f.stderr)];
         if stderr_first {
             streams.reverse();
@@ -707,7 +749,7 @@ mod tests {
             "database access error: unable to open database file. Check that the parent directory exists and is writable.",
             "database access error: attempt to write a readonly database. Check file permissions: the database file or its directory may not be writable.",
         ] {
-            let mut c = Classifier::new(ImportMode::Album, 1, false);
+            let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false);
             c.feed(Stream::Stderr, line);
             c.feed(Stream::Stderr, "the library file might have a permissions problem");
             let result = c.finish(&exited(1), &RunLimits::default(), &[], String::new());
@@ -721,12 +763,89 @@ mod tests {
         }
     }
 
+    fn failed_with(line: &str) -> ImportOutcome {
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false);
+        c.feed(Stream::Stderr, line);
+        c.finish(&exited(1), &RunLimits::default(), &[], String::new())
+            .outcome
+    }
+
+    /// A folder a plugin writes outside the library is the beets setup's,
+    /// not the library folder.
+    #[test]
+    fn a_folder_beets_cannot_create_outside_the_library_is_the_setup() {
+        for (line, kind) in [
+            (
+                "Error: Permission denied while creating /playlists/Smart",
+                FailKind::Setup,
+            ),
+            (
+                "Error: Permission denied while creating /musicals/A",
+                FailKind::Setup,
+            ),
+            (
+                "Error: Read-only file system while creating /music/A/B",
+                FailKind::TargetUnwritable,
+            ),
+        ] {
+            assert_eq!(
+                failed_with(line),
+                ImportOutcome::Failed {
+                    kind,
+                    message: line.to_string()
+                },
+                "{line}"
+            );
+        }
+    }
+
+    /// ENOSPC and EDQUOT as `FilesystemError`, an unhandled `OSError` and
+    /// SQLite: the disk is full, wherever beets was writing.
+    #[test]
+    fn a_full_disk_is_its_own_failure() {
+        for line in [
+            "Error: No space left on device while creating /music/A/B",
+            "Error: No space left on device while creating /playlists",
+            "Error: No space left on device while copying /src/01.flac to /music/A/B/01.flac",
+            "Error: Disk quota exceeded while moving /src/01.flac to /music/A/B/01.flac",
+        ] {
+            assert_eq!(
+                failed_with(line),
+                ImportOutcome::Failed {
+                    kind: FailKind::DiskFull,
+                    message: line.to_string()
+                },
+                "{line}"
+            );
+        }
+        for exception in [
+            "OSError: [Errno 28] No space left on device: '/music/A/B/01.flac'",
+            "sqlite3.OperationalError: database or disk is full",
+        ] {
+            let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false);
+            c.feed(Stream::Stderr, TRACEBACK);
+            c.feed(
+                Stream::Stderr,
+                "  File \"beets/importer.py\", line 1, in run",
+            );
+            c.feed(Stream::Stderr, exception);
+            let result = c.finish(&exited(1), &RunLimits::default(), &[], String::new());
+            assert_eq!(
+                result.outcome,
+                ImportOutcome::Failed {
+                    kind: FailKind::DiskFull,
+                    message: exception.to_string()
+                }
+            );
+        }
+    }
+
     /// A move or copy names both ends, so its failure does not say which
     /// side could not be written.
     #[test]
     fn a_failed_move_stays_a_beets_failure() {
         let line = "Error: Permission denied while moving /src/01.flac to /music/A/B/01.flac";
-        let mut c = Classifier::new(ImportMode::Album, 1, false);
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false);
         c.feed(Stream::Stderr, line);
         let result = c.finish(&exited(1), &RunLimits::default(), &[], String::new());
         assert_eq!(
@@ -781,7 +900,7 @@ mod tests {
     #[test]
     fn idle_and_total_map_to_timed_out() {
         let limits = RunLimits::default();
-        let mut c = Classifier::new(ImportMode::Album, 2, false);
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 2, false);
         c.feed(Stream::Stderr, "x");
         let idle = c.finish(&RunEnd::Idle, &limits, &[], String::new());
         assert_eq!(
@@ -793,7 +912,7 @@ mod tests {
         );
         assert_eq!(idle.to_string(), "No output from beets for 3 min (last: x)");
 
-        let silent = Classifier::new(ImportMode::Album, 2, false).finish(
+        let silent = Classifier::new(ImportMode::Album, Path::new("/music"), 2, false).finish(
             &RunEnd::Idle,
             &limits,
             &[],
@@ -801,7 +920,7 @@ mod tests {
         );
         assert_eq!(silent.to_string(), "No output from beets for 3 min");
 
-        let total = Classifier::new(ImportMode::Album, 2, false).finish(
+        let total = Classifier::new(ImportMode::Album, Path::new("/music"), 2, false).finish(
             &RunEnd::Total,
             &limits,
             &[],
@@ -820,7 +939,7 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "No such file or directory (os error 2)",
         ));
-        let result = Classifier::new(ImportMode::Album, 1, false).finish(
+        let result = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false).finish(
             &end,
             &RunLimits::default(),
             &[],
@@ -841,7 +960,7 @@ mod tests {
 
     #[test]
     fn unknown_nonzero_exit_without_lines() {
-        let result = Classifier::new(ImportMode::Album, 1, false).finish(
+        let result = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false).finish(
             &exited(2),
             &RunLimits::default(),
             &[],
@@ -858,7 +977,7 @@ mod tests {
 
     #[test]
     fn a_plugin_load_traceback_alone_is_not_the_failure_message() {
-        let mut c = Classifier::new(ImportMode::Album, 1, false);
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false);
         for line in fixture!("bad_plugin").stderr.lines() {
             c.feed(Stream::Stderr, line);
         }
@@ -868,7 +987,7 @@ mod tests {
 
     #[test]
     fn a_fatal_line_wins_over_a_later_traceback() {
-        let mut c = Classifier::new(ImportMode::Album, 1, false);
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false);
         for line in [
             "error: no such file or directory: /src/a",
             "Traceback (most recent call last):",
@@ -886,7 +1005,7 @@ mod tests {
 
     #[test]
     fn markers_are_matched_after_ansi_stripping() {
-        let mut c = Classifier::new(ImportMode::Album, 2, false);
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 2, false);
         c.feed(
             Stream::Stdout,
             "\x1b[1;34m/src\x1b[39;49;00m \x1b[1;34m(2 items)\x1b[39;49;00m",
@@ -901,7 +1020,7 @@ mod tests {
     fn skipping_on_stderr_is_not_a_no_match() {
         // ask + quiet logs "Skipping." on stderr for a duplicate; only the
         // stdout line means a weak match.
-        let mut c = Classifier::new(ImportMode::Album, 2, false);
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 2, false);
         c.feed(Stream::Stderr, "Sending event: import_task_created");
         c.feed(Stream::Stderr, "Skipping.");
         c.feed(Stream::Stderr, "Sending event: album_imported");
@@ -911,7 +1030,7 @@ mod tests {
 
     #[test]
     fn tag_write_errors_are_warnings() {
-        let mut c = Classifier::new(ImportMode::Album, 2, false);
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 2, false);
         c.feed(Stream::Stdout, "/src (2 items)");
         c.feed(Stream::Stderr, "Sending event: import_task_created");
         c.feed(
@@ -932,7 +1051,7 @@ mod tests {
 
     #[test]
     fn tasks_that_end_without_an_import_or_a_reason_are_a_failure() {
-        let mut c = Classifier::new(ImportMode::Album, 2, false);
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 2, false);
         c.feed(Stream::Stderr, "Sending event: import_task_created");
         let result = c.finish(&exited(0), &RunLimits::default(), &[], String::new());
         assert_eq!(
@@ -943,7 +1062,7 @@ mod tests {
             }
         );
 
-        let none = Classifier::new(ImportMode::Album, 0, false).finish(
+        let none = Classifier::new(ImportMode::Album, Path::new("/music"), 0, false).finish(
             &exited(0),
             &RunLimits::default(),
             &[],
@@ -979,7 +1098,7 @@ mod tests {
 
     #[test]
     fn a_signal_is_named_in_the_failure() {
-        let result = Classifier::new(ImportMode::Album, 1, false).finish(
+        let result = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false).finish(
             &RunEnd::Exited(ExitStatus::from_raw(9)),
             &RunLimits::default(),
             &[],

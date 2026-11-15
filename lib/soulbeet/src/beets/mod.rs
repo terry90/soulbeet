@@ -211,7 +211,7 @@ impl MusicImporter for BeetsImporter {
             sources
         );
         let started = Instant::now();
-        let mut classifier = Classifier::new(mode, submitted, autotag_off);
+        let mut classifier = Classifier::new(mode, target, submitted, autotag_off);
         let beet_args = import_args(s, sources, target, mode, &run_log.0);
         let spec = RunSpec {
             program: python,
