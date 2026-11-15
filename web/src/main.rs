@@ -52,6 +52,7 @@ fn main() {
                 dioxus::logger::tracing::error!("{e}");
                 std::process::exit(1);
             }
+            api::ledger::start_server_ledger();
             // Start background cleanup task for user channels
             api::globals::start_channel_cleanup_task();
             // Check the beets config in the background; never awaited here.

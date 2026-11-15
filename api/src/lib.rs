@@ -14,6 +14,8 @@ pub mod import_queue;
 #[cfg(feature = "server")]
 pub mod importer_health;
 #[cfg(feature = "server")]
+pub mod ledger;
+#[cfg(feature = "server")]
 pub mod login_limiter;
 pub mod models;
 #[cfg(feature = "server")]
