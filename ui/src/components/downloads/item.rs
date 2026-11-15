@@ -266,7 +266,7 @@ pub fn DownloadItem(
           div { class: "text-xs {note_class} mt-1 break-words", "{note}" }
         }
         if let Some((index_class, index)) = index_line(&file) {
-          div { class: "text-xs {index_class} font-mono mt-1", "{index}" }
+          div { class: "text-xs {index_class} font-mono mt-1 break-words", "{index}" }
         }
         if let (true, Some(kept)) = (file.retryable, &file.local_path) {
           div { class: "text-xs text-gray-500 font-mono mt-1 break-all", "Kept in {kept}" }
