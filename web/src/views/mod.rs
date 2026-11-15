@@ -4,6 +4,7 @@ mod search;
 mod settings;
 
 pub use dashboard::DashboardPage;
+pub(crate) use login::leave_login;
 pub use login::LoginPage;
 pub use search::SearchPage;
 pub use settings::SettingsPage;

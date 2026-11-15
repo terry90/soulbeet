@@ -251,32 +251,32 @@ mod tests {
         let long = format!("https://claude.ai/{}", "a".repeat(2000));
         for (body, error, description) in [
             (
-                json!({"redirect_uris": [CALLBACK], "token_endpoint_auth_method": "client_secret_basic"}),
+                json!({"redirect_uris": [CLAUDE_CALLBACK], "token_endpoint_auth_method": "client_secret_basic"}),
                 "invalid_client_metadata",
                 "Soulful registers public clients only: token_endpoint_auth_method must be none",
             ),
             (
-                json!({"redirect_uris": [CALLBACK], "grant_types": ["client_credentials"]}),
+                json!({"redirect_uris": [CLAUDE_CALLBACK], "grant_types": ["client_credentials"]}),
                 "invalid_client_metadata",
                 "Soulful supports the grant types authorization_code and refresh_token only",
             ),
             (
-                json!({"redirect_uris": [CALLBACK], "response_types": ["token"]}),
+                json!({"redirect_uris": [CLAUDE_CALLBACK], "response_types": ["token"]}),
                 "invalid_client_metadata",
                 "Soulful supports the response type code only",
             ),
             (
-                json!({"redirect_uris": [CALLBACK], "client_name": "c".repeat(201)}),
+                json!({"redirect_uris": [CLAUDE_CALLBACK], "client_name": "c".repeat(201)}),
                 "invalid_client_metadata",
                 "client_name must be at most 200 characters",
             ),
             (
-                json!({"redirect_uris": [CALLBACK], "client_name": 7}),
+                json!({"redirect_uris": [CLAUDE_CALLBACK], "client_name": 7}),
                 "invalid_client_metadata",
                 "client_name must be a string",
             ),
             (
-                json!({"redirect_uris": [CALLBACK], "logo_uri": "x".repeat(64 * 1024)}),
+                json!({"redirect_uris": [CLAUDE_CALLBACK], "logo_uri": "x".repeat(64 * 1024)}),
                 "invalid_client_metadata",
                 "The registration must be a JSON object",
             ),
@@ -306,7 +306,7 @@ mod tests {
                 "Register 1 to 10 redirect URIs of at most 2,000 characters",
             ),
             (
-                json!({"redirect_uris": [CALLBACK, 7]}),
+                json!({"redirect_uris": [CLAUDE_CALLBACK, 7]}),
                 "invalid_redirect_uri",
                 "Register 1 to 10 redirect URIs of at most 2,000 characters",
             ),
@@ -328,7 +328,9 @@ mod tests {
         let req = Request::post("/oauth/register")
             .header("host", HOST)
             .header("content-type", "text/plain")
-            .body(Body::from(json!({"redirect_uris": [CALLBACK]}).to_string()))
+            .body(Body::from(
+                json!({"redirect_uris": [CLAUDE_CALLBACK]}).to_string(),
+            ))
             .unwrap();
         let (status, _, body) = send(router(ConnectionState::for_test(db.clone())), req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -352,7 +354,7 @@ mod tests {
             ..ConnectionState::for_test(test_db::migrated().await)
         };
         let app = router(state);
-        let body = json!({"redirect_uris": [CALLBACK]});
+        let body = json!({"redirect_uris": [CLAUDE_CALLBACK]});
         let (first, _, _) = post_json(app.clone(), "/oauth/register", body.clone()).await;
         let (second, headers, doc) = post_json(app, "/oauth/register", body).await;
         assert_eq!(
@@ -392,7 +394,7 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let body = json!({"redirect_uris": [CALLBACK]});
+        let body = json!({"redirect_uris": [CLAUDE_CALLBACK]});
         let (status, _, doc) = post_json(
             router(ConnectionState::for_test(db.clone())),
             "/oauth/register",

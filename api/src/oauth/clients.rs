@@ -33,6 +33,113 @@ pub(crate) fn redirect_uri_allowed(uri: &str) -> Result<(), &'static str> {
     }
 }
 
+/// Exact match, or both loopback http URIs equal but for the port (RFC 8252 section 7.3; Claude Code's
+/// http://localhost/callback, claude.com connectors/building/authentication.md:220).
+pub(crate) fn redirect_matches(registered: &str, requested: &str) -> bool {
+    if registered == requested {
+        return true;
+    }
+    match (
+        loopback_without_port(registered),
+        loopback_without_port(requested),
+    ) {
+        (Some(registered), Some(requested)) => registered == requested,
+        _ => false,
+    }
+}
+
+/// `uri` as written with its port taken out, when it is an `http://` URI on
+/// a loopback host; the rest of the string is compared as sent.
+fn loopback_without_port(uri: &str) -> Option<String> {
+    let url = Url::parse(uri).ok()?;
+    if url.scheme() != "http" || !url.host().is_some_and(|host| is_loopback_host(&host)) {
+        return None;
+    }
+    let rest = uri.strip_prefix("http://")?;
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    // The last ':' outside an IPv6 literal's brackets starts the port.
+    let host = match authority.rfind(':') {
+        Some(at)
+            if !authority[at..].contains(']')
+                && authority[at + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            &authority[..at]
+        }
+        _ => authority,
+    };
+    Some(format!("{host}{tail}"))
+}
+
+/// Whether `uri` returns to this computer: its host is loopback.
+pub(crate) fn is_loopback_uri(uri: &str) -> bool {
+    Url::parse(uri)
+        .ok()
+        .is_some_and(|url| url.host().is_some_and(|host| is_loopback_host(&host)))
+}
+
+/// How a client is known: registered through `POST /oauth/register`, or by
+/// its Client ID Metadata Document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientKind {
+    Dcr,
+    Cimd,
+}
+
+impl ClientKind {
+    /// The `kind` column's value.
+    pub(crate) fn as_db(self) -> &'static str {
+        match self {
+            ClientKind::Dcr => "dcr",
+            ClientKind::Cimd => "cimd",
+        }
+    }
+
+    pub(crate) fn from_db(kind: &str) -> Result<ClientKind, String> {
+        match kind {
+            "dcr" => Ok(ClientKind::Dcr),
+            "cimd" => Ok(ClientKind::Cimd),
+            other => Err(format!("unknown client kind {other:?}")),
+        }
+    }
+}
+
+/// A client an authorize request may name.
+pub(crate) struct KnownClient {
+    pub client_id: String,
+    pub kind: ClientKind,
+    pub client_name: Option<String>,
+    pub redirect_uris: Vec<String>,
+}
+
+/// The stored client `client_id`, or None.
+pub(crate) async fn find_in(
+    db: &SqlitePool,
+    client_id: &str,
+) -> Result<Option<KnownClient>, String> {
+    let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT client_id, kind, client_name, redirect_uris FROM oauth_clients \
+         WHERE client_id = ?",
+    )
+    .bind(client_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    row.map(|(client_id, kind, client_name, redirect_uris)| {
+        Ok(KnownClient {
+            client_id,
+            kind: ClientKind::from_db(&kind)?,
+            client_name,
+            redirect_uris: redirect_uris_from_db(&redirect_uris)?,
+        })
+    })
+    .transpose()
+}
+
+/// A stored JSON array of redirect URIs.
+pub(crate) fn redirect_uris_from_db(json: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str(json).map_err(|e| format!("stored redirect URIs are unreadable: {e}"))
+}
+
 /// A client as `POST /oauth/register` validated it.
 pub(crate) struct NewClient {
     pub client_name: Option<String>,
@@ -97,7 +204,7 @@ pub(crate) async fn insert_dcr_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::test_util::CALLBACK;
+    use crate::connection::test_util::CLAUDE_CALLBACK;
     use crate::db::test_db;
 
     #[test]
@@ -144,6 +251,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn loopback_redirects_match_on_any_port_and_nothing_else_does() {
+        assert!(redirect_matches(
+            "http://localhost/callback",
+            "http://localhost:3118/callback"
+        ));
+        assert!(redirect_matches(
+            "http://127.0.0.1/callback",
+            "http://127.0.0.1:50000/callback"
+        ));
+        assert!(redirect_matches(
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://claude.ai/api/mcp/auth_callback"
+        ));
+        assert!(!redirect_matches(
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://claude.ai:8443/api/mcp/auth_callback"
+        ));
+        assert!(!redirect_matches(
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://claude.ai/api/mcp/auth_callback?x=1"
+        ));
+        assert!(!redirect_matches(
+            "http://localhost/callback",
+            "http://localhost:3118/other"
+        ));
+        assert!(!redirect_matches(
+            "http://localhost/callback",
+            "http://127.0.0.1:3118/callback"
+        ));
+    }
+
+    #[test]
+    fn only_the_port_of_a_loopback_redirect_may_differ() {
+        assert!(redirect_matches("http://[::1]/cb", "http://[::1]:8080/cb"));
+        assert!(redirect_matches(
+            "http://localhost:1/cb",
+            "http://localhost/cb"
+        ));
+        for requested in [
+            "http://evil.example@localhost:3118/callback",
+            "http://LOCALHOST:3118/callback",
+            "http://localhost:3118/callback/",
+            "http://localhost:99999/callback",
+            "https://localhost:3118/callback",
+        ] {
+            assert!(
+                !redirect_matches("http://localhost/callback", requested),
+                "{requested}"
+            );
+        }
+    }
+
     async fn grant(db: &SqlitePool, client_id: &str) {
         // Not INSERT OR IGNORE: the username trigger aborts before OR IGNORE applies.
         sqlx::query(
@@ -176,7 +336,7 @@ mod tests {
         let db = test_db::migrated().await;
         let client = NewClient {
             client_name: None,
-            redirect_uris: vec![CALLBACK.into()],
+            redirect_uris: vec![CLAUDE_CALLBACK.into()],
         };
         for (id, at) in [("dcr_a", 1), ("dcr_b", 2), ("dcr_c", 3)] {
             insert_dcr_in(&db, id, &client, at, 3).await.unwrap();
@@ -203,7 +363,7 @@ mod tests {
         let db = test_db::migrated().await;
         let client = NewClient {
             client_name: None,
-            redirect_uris: vec![CALLBACK.into()],
+            redirect_uris: vec![CLAUDE_CALLBACK.into()],
         };
         // A CIMD client unused since time 0, the oldest row and without a grant.
         sqlx::query(

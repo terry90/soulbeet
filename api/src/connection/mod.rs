@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::header::{CACHE_CONTROL, VARY};
+use axum::http::header::{self, CACHE_CONTROL, VARY};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -29,6 +29,8 @@ pub struct ConnectionState {
     pub(crate) gate: fn() -> Vec<GateReason>,
     pub(crate) db: sqlx::SqlitePool,
     pub(crate) limits: Arc<Limits>,
+    /// The key session cookies are signed with.
+    pub(crate) key: &'static crate::secret_key::SecretKey,
 }
 
 impl ConnectionState {
@@ -40,6 +42,7 @@ impl ConnectionState {
             gate: crate::security::gate_reasons,
             db: (*crate::db::DB).clone(),
             limits: Arc::new(Limits::default()),
+            key: crate::secret_key::current(),
         }
     }
 }
@@ -135,6 +138,17 @@ fn admit(state: &ConnectionState, headers: &HeaderMap, uri: &Uri) -> Result<Base
         ));
     }
     Ok(base)
+}
+
+/// Keeps a page from being framed by another site: sets
+/// `Content-Security-Policy: frame-ancestors 'none'` on a response that has
+/// no policy of its own.
+pub async fn deny_framing(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static("frame-ancestors 'none'"));
+    response
 }
 
 /// The connection layer's refusal: `{"error": code, "message": message}`.
@@ -263,6 +277,27 @@ mod tests {
         assert_eq!(
             body,
             json!({"error": "not_found", "message": "Nothing is served here"})
+        );
+    }
+
+    #[tokio::test]
+    async fn framing_is_denied_unless_the_page_sets_its_own() {
+        let plain = deny_framing(StatusCode::OK.into_response()).await;
+        assert_eq!(
+            plain.headers()["content-security-policy"],
+            "frame-ancestors 'none'"
+        );
+        let own = deny_framing(
+            (
+                [(header::CONTENT_SECURITY_POLICY, "default-src 'none'")],
+                "",
+            )
+                .into_response(),
+        )
+        .await;
+        assert_eq!(
+            own.headers()["content-security-policy"],
+            "default-src 'none'"
         );
     }
 

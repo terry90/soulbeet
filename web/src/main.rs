@@ -15,7 +15,10 @@ use ui::{
     AutoDownloadSignal, Downloads, HealthProvider, Layout, Navbar, SearchPrefill, SearchReset,
     SettingsProvider,
 };
-use views::{DashboardPage, LoginPage, SearchPage, SettingsPage, SettingsTab, SettingsTabRequest};
+use views::{
+    leave_login, DashboardPage, LoginPage, SearchPage, SettingsPage, SettingsTab,
+    SettingsTabRequest,
+};
 
 mod auth;
 mod views;
@@ -68,7 +71,12 @@ fn main() {
                 dioxus::logger::tracing::warn!("MCP stays off: {}", reason.message);
             }
 
+            // Only the app's pages get the framing header: the consent
+            // page sets its own policy.
             Ok(dioxus::server::router(App)
+                .layer(axum::middleware::map_response(
+                    api::connection::deny_framing,
+                ))
                 .merge(api::connection::router(
                     api::connection::ConnectionState::live(),
                 ))
@@ -115,9 +123,9 @@ fn AuthGuard() -> Element {
             nav.replace(Route::LoginPage {});
         }
 
-        // If logged in and on /login -> go to home
+        // If logged in and on /login -> back to where sign-in was asked for
         if is_logged_in && matches!(current, Route::LoginPage {}) {
-            nav.replace(Route::SearchPage {});
+            leave_login(nav);
         }
     });
 
