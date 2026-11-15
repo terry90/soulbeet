@@ -43,6 +43,31 @@ const CHAINED: [&str; 2] = [
     "During handling of the above exception, another exception occurred:",
 ];
 
+/// What a fatal line of beets 2.11 (`ui.main`) says failed.
+///
+/// - `configuration error:` is a config file confuse could not use, and
+///   `can't be both quiet and timid` is the user's `import.timid` against
+///   Soulful's `import -q`: the beets setup.
+/// - `database access error:` is one of beets' two `DBAccessError` texts,
+///   both a library database it cannot open or write. That database sits in
+///   the library folder (`library::library_db`).
+/// - `Error: {reason} while creating {path}` is `util.mkdirall`, which beets
+///   only calls for folders in the library (`Item.move`, playlists).
+///
+/// A move or copy failure names both ends, and a lowercase `error:` is any
+/// `UserError`, so those stay beets failures.
+fn fatal_kind(line: &str) -> FailKind {
+    if line.starts_with("configuration error: ") || line == "error: can't be both quiet and timid" {
+        FailKind::Setup
+    } else if line.starts_with("database access error: ")
+        || (line.starts_with("Error: ") && line.contains(" while creating "))
+    {
+        FailKind::TargetUnwritable
+    } else {
+        FailKind::Beets
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunLogAction {
     Skip,
@@ -255,19 +280,22 @@ impl Classifier {
                 limit: TimeoutKind::Total(limits.total),
                 last_line: self.last_line,
             },
-            RunEnd::Exited(status) if !status.success() => {
-                let message = self.fatal.or(self.exception).unwrap_or_else(|| {
-                    match (status.code(), status.signal()) {
-                        (Some(code), _) => format!("beets exited with code {code}"),
-                        (None, Some(signal)) => format!("beets was killed by signal {signal}"),
-                        (None, None) => format!("beets exited with {status}"),
-                    }
-                });
-                ImportOutcome::Failed {
+            RunEnd::Exited(status) if !status.success() => match self.fatal {
+                Some(line) => ImportOutcome::Failed {
+                    kind: fatal_kind(&line),
+                    message: line,
+                },
+                None => ImportOutcome::Failed {
                     kind: FailKind::Beets,
-                    message,
-                }
-            }
+                    message: self.exception.unwrap_or_else(|| {
+                        match (status.code(), status.signal()) {
+                            (Some(code), _) => format!("beets exited with code {code}"),
+                            (None, Some(signal)) => format!("beets was killed by signal {signal}"),
+                            (None, None) => format!("beets exited with {status}"),
+                        }
+                    }),
+                },
+            },
             RunEnd::Exited(_) => self.exited_cleanly(run_log),
         };
         ImportResult {
@@ -639,30 +667,74 @@ mod tests {
         );
     }
 
+    /// The fatal line is the message, and says what a person has to fix: the
+    /// beets setup, or the library folder beets could not write to.
     #[test]
     fn fatal_lines_become_the_failed_message() {
-        for f in [
-            fixture!("missing_path"),
-            fixture!("timid"),
-            fixture!("missing_config"),
+        for (f, kind) in [
+            (fixture!("missing_path"), FailKind::Beets),
+            // Soulful runs `import -q`; the user's config sets `timid`.
+            (fixture!("timid"), FailKind::Setup),
+            (fixture!("missing_config"), FailKind::Setup),
         ] {
             let line = fatal_line(&f);
             let result = classify(f, false);
             assert_eq!(
                 result.outcome,
                 ImportOutcome::Failed {
-                    kind: FailKind::Beets,
+                    kind,
                     message: line.to_string()
                 }
             );
             assert_eq!(result.to_string(), line);
         }
 
-        let readonly = classify(fixture!("readonly_target"), false);
-        assert!(
-            matches!(&readonly.outcome, ImportOutcome::Failed { kind: FailKind::Beets, message } if message.starts_with("Error:")),
-            "{:?}",
-            readonly.outcome
+        assert_eq!(
+            classify(fixture!("readonly_target"), false).outcome,
+            ImportOutcome::Failed {
+                kind: FailKind::TargetUnwritable,
+                message: "Error: Permission denied while creating /music/Zzqx Artist/Qzz Album"
+                    .to_string()
+            }
+        );
+    }
+
+    /// beets' two `DBAccessError` texts (`dbcore/db.py`, beets 2.11). The
+    /// library database sits in the library folder.
+    #[test]
+    fn a_library_database_beets_cannot_write_is_an_unwritable_target() {
+        for line in [
+            "database access error: unable to open database file. Check that the parent directory exists and is writable.",
+            "database access error: attempt to write a readonly database. Check file permissions: the database file or its directory may not be writable.",
+        ] {
+            let mut c = Classifier::new(ImportMode::Album, 1, false);
+            c.feed(Stream::Stderr, line);
+            c.feed(Stream::Stderr, "the library file might have a permissions problem");
+            let result = c.finish(&exited(1), &RunLimits::default(), &[], String::new());
+            assert_eq!(
+                result.outcome,
+                ImportOutcome::Failed {
+                    kind: FailKind::TargetUnwritable,
+                    message: line.to_string()
+                }
+            );
+        }
+    }
+
+    /// A move or copy names both ends, so its failure does not say which
+    /// side could not be written.
+    #[test]
+    fn a_failed_move_stays_a_beets_failure() {
+        let line = "Error: Permission denied while moving /src/01.flac to /music/A/B/01.flac";
+        let mut c = Classifier::new(ImportMode::Album, 1, false);
+        c.feed(Stream::Stderr, line);
+        let result = c.finish(&exited(1), &RunLimits::default(), &[], String::new());
+        assert_eq!(
+            result.outcome,
+            ImportOutcome::Failed {
+                kind: FailKind::Beets,
+                message: line.to_string()
+            }
         );
     }
 
