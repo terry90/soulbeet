@@ -778,16 +778,44 @@ mod tests {
         // One guard lists Navidrome's users once: asked of alice, then listed by bob.
         library_verdict(guard.check_song(&lib.alice(), "s1").await);
         assert_eq!(lib.fake.user_lists(), 2);
+    }
 
-        // A linked account that cannot see the song was not read: it may have rated it before.
+    #[tokio::test]
+    async fn a_linked_listener_who_cannot_see_the_track_keeps_it_without_being_asked_to_sign_in() {
+        // Bob signed in to Soulful, but his Navidrome account cannot see the song (per-user
+        // libraries): a rating he gave it before stays in the average unread.
+        let cannot_see = (
+            FailureCode::DeleteVetoUnknown,
+            RetryAdvice::NeedsUser,
+            "A linked listener's Navidrome account cannot see this track, so Soulful cannot rule out a rating they gave it earlier, and the copy is kept"
+                .to_string(),
+            Some(UserAction::new(
+                UserActionCode::ConfigureNavidrome,
+                "Give every Navidrome account linked to Soulful access to this track's library, so Soulful can read their ratings of it",
+                "Navidrome's user settings",
+            )),
+        );
         let lib = Library::new().await;
         lib.fake.rates("alice", "s1", 4);
         lib.fake.admin("bob");
         lib.fake.unsee("bob", "s1");
-        assert_eq!(
-            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
-            (FailureCode::DeleteVetoUnknown, UNKNOWN.into())
-        );
+        let f = lib
+            .guard()
+            .check_song(&lib.alice(), "s1")
+            .await
+            .unwrap_err();
+        assert_eq!((f.code, f.retry, f.message, f.user_action), cannot_see);
+
+        // With a Navidrome user who never signed in as well, signing in cannot make the check
+        // pass, so the account that cannot see the track is what the refusal names.
+        lib.fake.users_are(&["alice", "bob", "carol-nd"]);
+        let f = lib
+            .guard()
+            .check_song(&lib.alice(), "s1")
+            .await
+            .unwrap_err();
+        assert_eq!((f.code, f.retry, f.message, f.user_action), cannot_see);
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
     }
 
     #[tokio::test]

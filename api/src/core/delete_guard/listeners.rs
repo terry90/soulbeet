@@ -149,6 +149,9 @@ pub(super) struct Read {
     /// The Soulful names of the linked accounts whose rating of the song this check reads: the
     /// actor's (rule 4 reads it) and each other listener who sees the song.
     names: Vec<String>,
+    /// The Soulful names of the other linked accounts that cannot see the song, so their rating
+    /// of it is not read.
+    unseen: Vec<String>,
 }
 
 /// Why one other listener keeps the file.
@@ -196,6 +199,7 @@ impl Guard<'_> {
                 .filter(|u| u.id == actor)
                 .map(|u| u.username.clone())
                 .collect(),
+            unseen: Vec::new(),
         };
         let mut refusal = None;
         for user in users.iter().filter(|u| u.id != actor) {
@@ -214,7 +218,7 @@ impl Guard<'_> {
                 );
             }
             match marks {
-                Ok(None) => {}
+                Ok(None) => read.unseen.push(user.username.clone()),
                 Ok(Some(rating)) => {
                     read.names.push(user.username.clone());
                     if rating > 0 {
@@ -360,26 +364,29 @@ impl Guard<'_> {
             return Err(blocked_by_other_user());
         }
         if raters.iter().any(|r| *r > 1) {
-            self.every_rater_read(&others.names).await?;
+            self.every_rater_read(others).await?;
         }
         Ok(after)
     }
 
-    /// Whether every Navidrome user is a linked account whose rating this check read (`read`,
-    /// Soulful names): the first linked account Navidrome lets list its users (an admin's)
-    /// lists them, and each name must be one of `read`, compared without regard to ASCII case
-    /// as both Soulful (`COLLATE NOCASE`) and Navidrome's login
-    /// (persistence/user_repository.go:203) compare names. The listing is read once per guard.
-    /// Else unknown_listener.
-    async fn every_rater_read(&self, read: &[String]) -> Result<(), Failure> {
+    /// Whether every Navidrome user is a linked account whose rating this check read (`read`):
+    /// the first linked account Navidrome lets list its users (an admin's) lists them, and each
+    /// name must be one of `read.names`, compared without regard to ASCII case as both Soulful
+    /// (`COLLATE NOCASE`) and Navidrome's login (persistence/user_repository.go:203) compare
+    /// names. The listing is read once per guard. Else unknown_listener: CannotSee when a name
+    /// not read is a linked account that cannot see the song (signing in again cannot change
+    /// that, so it is named before any user who never signed in), NotSignedIn otherwise.
+    async fn every_rater_read(&self, read: &Read) -> Result<(), Failure> {
         let listed = self
             .navidrome_users
             .get_or_init(|| self.list_navidrome_users())
             .await
             .clone()?;
+        let among =
+            |names: &[String], name: &str| names.iter().any(|n| n.eq_ignore_ascii_case(name));
         let unread: Vec<&str> = listed
             .iter()
-            .filter(|name| !read.iter().any(|r| r.eq_ignore_ascii_case(name)))
+            .filter(|name| !among(&read.names, name))
             .map(String::as_str)
             .collect();
         if unread.is_empty() {
@@ -389,7 +396,13 @@ impl Guard<'_> {
             "Navidrome users whose ratings Soulful did not read keep a file: {}",
             unread.join(", ")
         );
-        Err(unknown_listener(UnknownListener::NotSignedIn))
+        Err(unknown_listener(
+            if unread.iter().any(|name| among(&read.unseen, name)) {
+                UnknownListener::CannotSee
+            } else {
+                UnknownListener::NotSignedIn
+            },
+        ))
     }
 
     /// Navidrome's users, as the first linked account that may list them lists them. None of
@@ -423,8 +436,11 @@ enum UnknownListener {
     NoAdmin,
     /// Listing them failed with this error.
     Unreadable(NavidromeLookupError),
-    /// Navidrome lists a user whose rating Soulful did not read.
+    /// Navidrome lists a user who has no linked Soulful account.
     NotSignedIn,
+    /// A linked account Navidrome lists cannot see the song (per-user libraries), so a rating
+    /// it gave the song earlier stays in the average unread.
+    CannotSee,
 }
 
 /// Rule 4 cannot rule out a rater Soulful cannot read; the next step says how it can.
@@ -449,6 +465,17 @@ fn unknown_listener(why: UnknownListener) -> Failure {
             UserActionCode::RelinkNavidrome,
             "Have every Navidrome user sign in to Soulful once, so Soulful can read their ratings",
             "Soulful sign-in",
+        )),
+        UnknownListener::CannotSee => Failure::new(
+            FailureCode::DeleteVetoUnknown,
+            Stage::Delete,
+            RetryAdvice::NeedsUser,
+            "A linked listener's Navidrome account cannot see this track, so Soulful cannot rule out a rating they gave it earlier, and the copy is kept",
+        )
+        .with_user_action(UserAction::new(
+            UserActionCode::ConfigureNavidrome,
+            "Give every Navidrome account linked to Soulful access to this track's library, so Soulful can read their ratings of it",
+            "Navidrome's user settings",
         )),
         // The lookup error's own cause (Navidrome's answer), none for a stored password.
         UnknownListener::Unreadable(e) => Failure {
