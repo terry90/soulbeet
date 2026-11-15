@@ -1,6 +1,6 @@
 use super::processing;
 use crate::{
-    error::{Result, SoulseekError},
+    error::{MissingSetting, Result, SoulseekError},
     http::{resolve_docker_url, CircuitBreaker},
     slskd::models::{
         BatchEnqueueOptions, BatchEnqueueRequest, BatchEnqueueResponse, DownloadRequestFile,
@@ -110,8 +110,21 @@ impl SoulseekClientBuilder {
         self
     }
 
+    /// A builder for the slskd at `url` with `api_key`, as Soulful stores
+    /// them: a setting that is missing or empty is `NotConfigured`.
+    pub fn from_settings(url: Option<String>, api_key: Option<String>) -> Result<Self> {
+        let url = url.ok_or(SoulseekError::NotConfigured(MissingSetting::Url))?;
+        let api_key = api_key.ok_or(SoulseekError::NotConfigured(MissingSetting::ApiKey))?;
+        if url.is_empty() || api_key.is_empty() {
+            return Err(SoulseekError::NotConfigured(MissingSetting::Empty));
+        }
+        Ok(Self::new().base_url(&url).api_key(&api_key))
+    }
+
     pub fn build(self) -> Result<SoulseekClient> {
-        let base_url_str = self.base_url.ok_or(SoulseekError::NotConfigured)?;
+        let base_url_str = self
+            .base_url
+            .ok_or(SoulseekError::NotConfigured(MissingSetting::Url))?;
         let base_url = Url::parse(base_url_str.trim_end_matches('/'))?;
 
         // Build HTTP client with proper timeouts
@@ -334,7 +347,14 @@ impl SoulseekClient {
         }
         let search_id_resp: SearchId = self
             .make_request(Method::POST, "searches", Some(&request_body))
-            .await?;
+            .await
+            .map_err(|e| match e {
+                SoulseekError::Api {
+                    status: 400,
+                    message,
+                } => search_refused(message),
+                e => e,
+            })?;
         let search_id = search_id_resp.id;
 
         self.active_searches.lock().await.insert(
@@ -370,9 +390,8 @@ impl SoulseekClient {
                 guard.get(&search_id).cloned()
             };
 
-            let context = match context {
-                Some(ctx) => ctx,
-                None => return Ok((vec![], false, SearchState::NotFound)),
+            let Some(context) = context else {
+                return Err(SoulseekError::UnknownSearch { search_id });
             };
 
             if (Utc::now() - context.start_time) >= context.timeout {
@@ -460,11 +479,8 @@ impl SoulseekClient {
                         continue;
                     }
                 }
-                Err(SoulseekError::Api { status: 404, .. }) => {
-                    self.active_searches.lock().await.remove(&search_id);
-                    info!("Search 404");
-                    return Ok((vec![], false, SearchState::NotFound));
-                }
+                // A 404 is a search slskd no longer has, which is no answer
+                // to the query either.
                 Err(e) => {
                     // Clean up search context on any error to prevent leaks
                     self.active_searches.lock().await.remove(&search_id);
@@ -551,6 +567,8 @@ impl SoulseekClient {
                 warn!("User '{}' is offline, not retrying", batch.username);
                 return Err(SoulseekError::UserOffline {
                     username: batch.username.clone(),
+                    status: status.as_u16(),
+                    body: resp_text,
                 });
             }
 
@@ -789,6 +807,20 @@ const ALREADY_IN_PROGRESS: &str = "Skipped: Already in progress";
 
 /// `value` as one path segment. URL parsing resolves `.` and `..` as dot
 /// segments even when percent-encoded, so those cannot be sent at all.
+/// slskd's 400 to `POST searches`, read from its body: Soulseek.NET's
+/// `DuplicateTokenException` says `An active search with token {token} is
+/// already in progress`, and every other 400 refuses the request itself, an
+/// `ArgumentException` about the query or a field that failed validation
+/// (`SearchesController.cs`).
+fn search_refused(body: String) -> SoulseekError {
+    if body.starts_with("An active search with token ") && body.ends_with(" is already in progress")
+    {
+        SoulseekError::SearchAlreadyRunning { body }
+    } else {
+        SoulseekError::SearchQueryRejected { body }
+    }
+}
+
 fn path_segment(value: &str) -> Result<String> {
     if matches!(value, "" | "." | "..") {
         return Err(SoulseekError::UnaddressablePeer {
@@ -1428,6 +1460,8 @@ mod tests {
             async {
                 Err(SoulseekError::UserOffline {
                     username: "peer".into(),
+                    status: 404,
+                    body: "User peer appears to be offline".into(),
                 })
             }
         })
@@ -1438,6 +1472,68 @@ mod tests {
             FailureCode::PeerOffline,
             "User 'peer' is offline"
         ));
+        let EnqueueStatus::Failed(f) = &results[0].status else {
+            panic!("not a failure");
+        };
+        let cause = f.cause.as_ref().unwrap();
+        assert_eq!(
+            (cause.status, cause.raw.as_str()),
+            (Some(404), "User peer appears to be offline")
+        );
+    }
+
+    /// slskd's 400 bodies to `POST searches` (`SearchesController.cs`,
+    /// Soulseek.NET 10.0.2 `SearchAsync`).
+    #[test]
+    fn a_refused_search_is_told_apart_by_slskds_answer() {
+        for body in [
+            "Search query must contain at least one non-exclusion term (Parameter 'query')",
+            "Search query must contain at least one non-exclusion term with length greater than 1 (Parameter 'query')",
+            "Search text must not be a null or empty string, or one consisting only of whitespace (Parameter 'query')",
+            "The field SearchText can not be null, empty, or consist of only whitespace",
+        ] {
+            assert!(
+                matches!(search_refused(body.into()), SoulseekError::SearchQueryRejected { body: b } if b == body),
+                "{body}"
+            );
+        }
+        let duplicate = "An active search with token 1234 is already in progress";
+        assert!(matches!(
+            search_refused(duplicate.into()),
+            SoulseekError::SearchAlreadyRunning { body } if body == duplicate
+        ));
+    }
+
+    /// A search this client is not running is an error, never an empty
+    /// result: nothing answered the query.
+    #[tokio::test]
+    async fn polling_a_search_this_client_does_not_run_is_an_error() {
+        let client = SoulseekClientBuilder::new()
+            .base_url("http://127.0.0.1:9")
+            .build()
+            .unwrap();
+        let polled = client.poll_search("gone".to_string()).await;
+        assert!(matches!(
+            polled,
+            Err(SoulseekError::UnknownSearch { search_id }) if search_id == "gone"
+        ));
+    }
+
+    #[test]
+    fn settings_slskd_cannot_run_without_are_not_configured() {
+        let set = || Some("x".to_string());
+        for (url, key, missing) in [
+            (None, set(), MissingSetting::Url),
+            (set(), None, MissingSetting::ApiKey),
+            (Some(String::new()), set(), MissingSetting::Empty),
+            (set(), Some(String::new()), MissingSetting::Empty),
+        ] {
+            assert!(matches!(
+                SoulseekClientBuilder::from_settings(url, key),
+                Err(SoulseekError::NotConfigured(m)) if m == missing
+            ));
+        }
+        assert!(SoulseekClientBuilder::from_settings(set(), set()).is_ok());
     }
 
     #[tokio::test]

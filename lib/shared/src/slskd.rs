@@ -479,7 +479,6 @@ impl AlbumResult {
 pub enum SearchState {
     InProgress,
     Completed,
-    NotFound,
     TimedOut,
 }
 
@@ -499,7 +498,6 @@ impl From<SearchState> for crate::download::SearchState {
         match state {
             SearchState::InProgress => crate::download::SearchState::InProgress,
             SearchState::Completed => crate::download::SearchState::Completed,
-            SearchState::NotFound => crate::download::SearchState::NotFound,
             SearchState::TimedOut => crate::download::SearchState::TimedOut,
         }
     }
@@ -595,9 +593,12 @@ impl From<FileEntry> for crate::download::DownloadProgress {
 /// What Soulseek.NET says, in lowercase, when slskd is not logged in to the
 /// Soulseek server: `The server connection must be connected and logged in
 /// to {download files|fetch user endpoint|...} (currently: {state})`. slskd
-/// has no typed signal for it, so the text is all there is. When `TryFail`
-/// stores the text of a single attempt, the cut at the first colon leaves
-/// only `{state})`, which says nothing.
+/// has no typed signal for it, so the text is all there is. On a download
+/// slskd stores it through `TryFail`, which cuts at the first colon, from
+/// the `AggregateException` its retries end with: `One or more errors
+/// occurred. ({text}) ({text}) ...`. With the default 3 attempts the cut
+/// leaves `Disconnected)) ({text}) ({text})`, which still names it. With
+/// `Retry.Attempts = 1` only `Disconnected))` is left, which says nothing.
 pub const NOT_LOGGED_IN: &str = "must be connected and logged in";
 
 /// The row state for a transfer and, for a failed or cancelled one, its
@@ -693,15 +694,24 @@ fn classify_transfer(
 /// Code and retry advice for a peer's refusal, from its lowercased text.
 ///
 /// Soulseek.NET stores the peer's reason as `Transfer rejected: {reason}`
-/// or bare, and slskd may cut everything up to the first colon. Only the
-/// exact `Too many files` and `Too many megabytes` mean "retry later"
-/// between clients; the `today` and `this week` forms are quotas that last
-/// that long.
+/// when the peer refuses the transfer request, and bare when it sends
+/// `UploadDenied` later. Three reasons mean "retry later": the exact
+/// `Too many files` and `Too many megabytes` that clients send each other
+/// for a full queue (old Nicotine+ sends `User limit of {n} files|megabytes
+/// exceeded` instead), and slskd's `Overwhelmed with requests; try again
+/// later.`. The `today` and `this week` forms are quotas that last that long.
 fn rejection(text: &str) -> (FailureCode, RetryAdvice) {
     let reason = text.strip_prefix("transfer rejected: ").unwrap_or(text);
     let reason = reason.strip_suffix('.').unwrap_or(reason);
+    let old_queue_limit = reason
+        .strip_prefix("user limit of ")
+        .is_some_and(|r| r.ends_with(" files exceeded") || r.ends_with(" megabytes exceeded"));
     match reason {
         "too many files" | "too many megabytes" | "overwhelmed with requests; try again later" => (
+            FailureCode::TransferRejectedPeerBusy,
+            RetryAdvice::SameSourceLater,
+        ),
+        _ if old_queue_limit => (
             FailureCode::TransferRejectedPeerBusy,
             RetryAdvice::SameSourceLater,
         ),
@@ -842,6 +852,17 @@ mod tests {
                 "Too many failed transfers this week",
                 TransferRejectedFailureLimit,
                 OtherSource,
+            ),
+            // Old Nicotine+ forms of `Too many files` and `Too many megabytes`.
+            (
+                "User limit of 50 files exceeded",
+                TransferRejectedPeerBusy,
+                SameSourceLater,
+            ),
+            (
+                "User limit of 1000 megabytes exceeded",
+                TransferRejectedPeerBusy,
+                SameSourceLater,
             ),
             ("Banned", TransferRejectedOther, OtherSource),
             ("Banned (no leechers)", TransferRejectedOther, OtherSource),

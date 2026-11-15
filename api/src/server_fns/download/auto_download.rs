@@ -60,7 +60,7 @@ const SEARCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How one backend's search ended.
 #[cfg(feature = "server")]
 enum SearchStop {
-    /// The backend finished the search, or no longer knows it.
+    /// The backend finished the search.
     Finished,
     /// SEARCH_TIMEOUT passed before the backend finished.
     TimedOut,
@@ -108,7 +108,6 @@ async fn search_backend(
                     }
                     return (latest_groups, SearchStop::Finished);
                 }
-                SearchState::NotFound => return (latest_groups, SearchStop::Finished),
                 SearchState::InProgress => {
                     if !result.groups.is_empty() {
                         latest_groups = result.groups;
@@ -713,6 +712,52 @@ mod tests {
         let f = no_results_failure(&[SearchStop::Failed(dead)]);
         assert_eq!(f.message, "No results found");
         assert_eq!(f.cause.unwrap().raw, "Connection failed");
+    }
+
+    /// slskd lost the search: a 404 on its responses is a failed search to
+    /// run again, not an empty one.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_slskd_no_longer_has_is_not_an_empty_search() {
+        let stub = StubBackend::new(vec![]);
+        stub.script_polls(vec![Err(SoulseekError::Api {
+            status: 404,
+            message: String::new(),
+        })]);
+
+        let (_, f) = searched(stub).await;
+
+        assert_eq!(
+            advice(&f),
+            (
+                FailureCode::BackendUnreachable,
+                Stage::SourceSearch,
+                RetryAdvice::SameSourceLater,
+                "No results found"
+            )
+        );
+        assert_eq!(f.cause.and_then(|c| c.status), Some(404));
+    }
+
+    /// slskd refused the query itself: another query, not a wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_query_slskd_refuses_asks_for_another_query() {
+        let stub = StubBackend::new(vec![]);
+        let body = "Search query must contain at least one non-exclusion term (Parameter 'query')";
+        stub.fail_search_start(SoulseekError::SearchQueryRejected { body: body.into() });
+
+        let (_, f) = searched(stub).await;
+
+        assert_eq!(
+            advice(&f),
+            (
+                FailureCode::SearchQueryRejected,
+                Stage::SourceSearch,
+                RetryAdvice::OtherQuery,
+                "No results found"
+            )
+        );
+        let cause = f.cause.unwrap();
+        assert_eq!((cause.status, cause.raw.as_str()), (Some(400), body));
     }
 
     #[test]

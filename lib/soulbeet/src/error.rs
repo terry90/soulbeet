@@ -1,11 +1,13 @@
-use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage, UserAction};
+use shared::failure::{
+    Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
+};
 use shared::slskd::NOT_LOGGED_IN;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SoulseekError {
-    #[error("Client is not configured. Base URL is missing.")]
-    NotConfigured,
+    #[error("{0}")]
+    NotConfigured(MissingSetting),
 
     #[error("Request error: {0}")]
     Request(#[from] reqwest::Error),
@@ -22,8 +24,32 @@ pub enum SoulseekError {
     )]
     SlskdTooOld { body: String },
 
+    /// slskd answered `status` with `body`, `User {username} appears to be
+    /// offline`, for a peer that is offline or that it blacklists.
     #[error("User '{username}' is offline")]
-    UserOffline { username: String },
+    UserOffline {
+        username: String,
+        status: u16,
+        body: String,
+    },
+
+    /// slskd refused a search's request with 400: an `ArgumentException`
+    /// about the query, such as `Search query must contain at least one
+    /// non-exclusion term (Parameter 'query')`, or a request field it could
+    /// not validate.
+    #[error("API error: 400 - {body}")]
+    SearchQueryRejected { body: String },
+
+    /// slskd answered a search's request with 400 `An active search with
+    /// token {token} is already in progress` (Soulseek.NET's
+    /// `DuplicateTokenException`).
+    #[error("API error: 400 - {body}")]
+    SearchAlreadyRunning { body: String },
+
+    /// A poll for a search this client is not running: it never started it,
+    /// the search already ended, or the client was rebuilt since.
+    #[error("Search {search_id} is not known to this client")]
+    UnknownSearch { search_id: String },
 
     #[error("Unparseable slskd response: {0}")]
     InvalidResponse(String),
@@ -32,15 +58,37 @@ pub enum SoulseekError {
     UnaddressablePeer { username: String },
 }
 
+/// A setting the slskd client cannot run without, as Soulful stores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSetting {
+    Url,
+    ApiKey,
+    /// The URL or the API key is saved empty.
+    Empty,
+}
+
+impl std::fmt::Display for MissingSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MissingSetting::Url => "slskd URL not configured",
+            MissingSetting::ApiKey => "slskd API key not configured",
+            MissingSetting::Empty => "slskd not configured",
+        })
+    }
+}
+
 impl SoulseekError {
     /// Whether this error is worth retrying. Returns false for definitive
     /// failures like user offline where retrying would be wasteful.
     pub fn is_retryable(&self) -> bool {
         match self {
             SoulseekError::UserOffline { .. } => false,
-            SoulseekError::NotConfigured => false,
+            SoulseekError::NotConfigured(_) => false,
             SoulseekError::UnaddressablePeer { .. } => false,
             SoulseekError::SlskdTooOld { .. } => false,
+            SoulseekError::SearchQueryRejected { .. } => false,
+            SoulseekError::SearchAlreadyRunning { .. } => false,
+            SoulseekError::UnknownSearch { .. } => false,
             // 400 and 404 are definitive: a rejected request body or a
             // missing record will not heal on retry.
             SoulseekError::Api {
@@ -52,7 +100,7 @@ impl SoulseekError {
     }
 
     /// This error as the failure of `stage`, shown as `message`. The cause
-    /// is slskd's status and body for an `Api` error, else the Display.
+    /// is slskd's status and body when slskd answered, else the Display.
     pub fn failure(&self, stage: Stage, message: impl Into<String>) -> Failure {
         use FailureCode::*;
         use RetryAdvice::*;
@@ -64,10 +112,19 @@ impl SoulseekError {
         let (code, retry) = match self {
             SoulseekError::UserOffline { .. } => (PeerOffline, OtherSource),
             SoulseekError::SlskdTooOld { .. } => (FailureCode::SlskdTooOld, NeedsUser),
-            SoulseekError::NotConfigured
+            // A URL that does not parse is the configured one: every
+            // endpoint is joined onto it.
+            SoulseekError::NotConfigured(_)
+            | SoulseekError::UrlParse(_)
             | SoulseekError::Api {
                 status: 401 | 403, ..
             } => (BackendNotConfigured, NeedsUser),
+            SoulseekError::SearchQueryRejected { .. } => {
+                (FailureCode::SearchQueryRejected, OtherQuery)
+            }
+            SoulseekError::SearchAlreadyRunning { .. } => {
+                (FailureCode::SearchAlreadyRunning, SameSourceLater)
+            }
             SoulseekError::Api { status: 429, .. } if stage == Stage::SourceSearch => {
                 (SearchRateLimited, SameSourceLater)
             }
@@ -78,12 +135,9 @@ impl SoulseekError {
             | SoulseekError::Request(_) => (BackendUnreachable, SameSourceLater),
             SoulseekError::UnaddressablePeer { .. } => (EnqueueFailed, OtherSource),
             // A request slskd refused as malformed: the same files fail
-            // again. At search it is the query that slskd cannot use.
+            // again.
             SoulseekError::Api { status: 400, .. } if stage == Stage::Enqueue => {
                 (EnqueueFailed, NotRetryable)
-            }
-            SoulseekError::Api { status: 400, .. } if stage == Stage::SourceSearch => {
-                (BackendUnreachable, OtherQuery)
             }
             // slskd is not logged in to Soulseek: every peer fails the same
             // way until it logs back in.
@@ -95,23 +149,58 @@ impl SoulseekError {
             SoulseekError::Api { status: 500, .. } if stage == Stage::Enqueue => {
                 (EnqueueFailed, OtherSource)
             }
-            SoulseekError::Api { .. }
-            | SoulseekError::InvalidResponse(_)
-            | SoulseekError::UrlParse(_) => (by_stage, SameSourceLater),
+            // An answer Soulful cannot parse will not parse later either.
+            SoulseekError::InvalidResponse(_) => (by_stage, NotRetryable),
+            SoulseekError::Api { .. } | SoulseekError::UnknownSearch { .. } => {
+                (by_stage, SameSourceLater)
+            }
         };
         let (status, raw) = match self {
-            SoulseekError::Api { status, message } => (Some(i32::from(*status)), message.clone()),
+            SoulseekError::Api { status, message } => (Some(*status), message.clone()),
             SoulseekError::SlskdTooOld { body } => (Some(404), body.clone()),
+            SoulseekError::UserOffline { status, body, .. } => (Some(*status), body.clone()),
+            SoulseekError::SearchQueryRejected { body }
+            | SoulseekError::SearchAlreadyRunning { body } => (Some(400), body.clone()),
             other => (None, other.to_string()),
         };
-        let failure =
-            Failure::new(code, stage, retry, message).with_cause(Service::Slskd, status, raw);
-        match code {
-            BackendNotConfigured => failure.with_user_action(UserAction::configure_backend()),
-            FailureCode::SlskdTooOld => failure.with_user_action(UserAction::upgrade_backend()),
+        let failure = Failure::new(code, stage, retry, message).with_cause(
+            Service::Slskd,
+            status.map(i32::from),
+            raw,
+        );
+        match self {
+            SoulseekError::InvalidResponse(_) => {
+                failure.with_user_action(update_soulful_or_slskd())
+            }
+            _ if code == BackendNotConfigured => failure.with_user_action(configure_slskd()),
+            SoulseekError::SlskdTooOld { .. } => failure.with_user_action(upgrade_slskd()),
             _ => failure,
         }
     }
+}
+
+fn configure_slskd() -> UserAction {
+    UserAction::new(
+        UserActionCode::ConfigureBackend,
+        "Set the slskd URL and API key",
+        "Settings > Config",
+    )
+}
+
+fn upgrade_slskd() -> UserAction {
+    UserAction::new(
+        UserActionCode::UpgradeBackend,
+        "Upgrade slskd to 0.26 or newer",
+        "slskd",
+    )
+}
+
+fn update_soulful_or_slskd() -> UserAction {
+    UserAction::new(
+        UserActionCode::UpdateSoulfulOrBackend,
+        "Update Soulful or slskd so that Soulful can read slskd's answers again",
+        "Soulful and slskd",
+    )
 }
 
 pub type Result<T> = std::result::Result<T, SoulseekError>;
@@ -119,7 +208,6 @@ pub type Result<T> = std::result::Result<T, SoulseekError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::failure::UserActionCode;
 
     #[test]
     fn soulseek_errors_map_to_failure_codes() {
@@ -129,9 +217,7 @@ mod tests {
         };
         let cases = [
             (
-                SoulseekError::UserOffline {
-                    username: "p".into(),
-                },
+                offline(),
                 Stage::Enqueue,
                 FailureCode::PeerOffline,
                 RetryAdvice::OtherSource,
@@ -170,13 +256,13 @@ mod tests {
                 SoulseekError::InvalidResponse("x".into()),
                 Stage::Transfer,
                 FailureCode::TransferListUnreadable,
-                RetryAdvice::SameSourceLater,
+                RetryAdvice::NotRetryable,
             ),
             (
                 SoulseekError::InvalidResponse("x".into()),
                 Stage::Enqueue,
                 FailureCode::EnqueueFailed,
-                RetryAdvice::SameSourceLater,
+                RetryAdvice::NotRetryable,
             ),
         ];
         for (e, stage, code, retry) in cases {
@@ -231,13 +317,20 @@ mod tests {
                 RetryAdvice::SameSourceLater,
             ),
             (
-                api(
-                    400,
-                    "Search query must contain at least one non-exclusion term (Parameter 'query')",
-                ),
+                SoulseekError::SearchQueryRejected {
+                    body: "Search query must contain at least one non-exclusion term (Parameter 'query')".into(),
+                },
                 Stage::SourceSearch,
-                FailureCode::BackendUnreachable,
+                FailureCode::SearchQueryRejected,
                 RetryAdvice::OtherQuery,
+            ),
+            (
+                SoulseekError::SearchAlreadyRunning {
+                    body: "An active search with token 17 is already in progress".into(),
+                },
+                Stage::SourceSearch,
+                FailureCode::SearchAlreadyRunning,
+                RetryAdvice::SameSourceLater,
             ),
             (
                 api(
@@ -255,7 +348,7 @@ mod tests {
                 RetryAdvice::NeedsUser,
             ),
             (
-                SoulseekError::NotConfigured,
+                SoulseekError::NotConfigured(MissingSetting::Url),
                 Stage::SourceSearch,
                 FailureCode::BackendNotConfigured,
                 RetryAdvice::NeedsUser,
@@ -272,6 +365,18 @@ mod tests {
                 SoulseekError::InvalidResponse("x".into()),
                 Stage::SourceSearch,
                 FailureCode::BackendUnreachable,
+                RetryAdvice::NotRetryable,
+            ),
+            (
+                SoulseekError::UrlParse(url::ParseError::RelativeUrlWithoutBase),
+                Stage::Transfer,
+                FailureCode::BackendNotConfigured,
+                RetryAdvice::NeedsUser,
+            ),
+            (
+                api(404, ""),
+                Stage::SourceSearch,
+                FailureCode::BackendUnreachable,
                 RetryAdvice::SameSourceLater,
             ),
         ];
@@ -280,21 +385,99 @@ mod tests {
             assert_eq!((f.code, f.retry), (code, retry), "{e:?} at {stage:?}");
             let raw = match &e {
                 SoulseekError::Api { message, .. } => message.clone(),
+                SoulseekError::SearchQueryRejected { body }
+                | SoulseekError::SearchAlreadyRunning { body } => body.clone(),
                 other => other.to_string(),
             };
             assert_eq!(f.cause.unwrap().raw, raw, "{e:?}");
         }
-        let unconfigured = SoulseekError::NotConfigured.failure(Stage::Enqueue, "m");
+        let unconfigured =
+            SoulseekError::NotConfigured(MissingSetting::ApiKey).failure(Stage::Enqueue, "m");
         assert_eq!(
             unconfigured.user_action.unwrap().code,
             UserActionCode::ConfigureBackend
         );
-        let offline = SoulseekError::UserOffline {
-            username: "p".into(),
+        let rejected = SoulseekError::SearchQueryRejected { body: "b".into() }
+            .failure(Stage::SourceSearch, "m");
+        assert_eq!(rejected.cause.unwrap().status, Some(400));
+    }
+
+    fn offline() -> SoulseekError {
+        SoulseekError::UserOffline {
+            username: "bob".into(),
+            status: 404,
+            body: "User bob appears to be offline".into(),
         }
-        .failure(Stage::Enqueue, "m");
-        assert_eq!(offline.cause.unwrap().status, None);
-        assert_eq!(offline.user_action, None);
+    }
+
+    /// slskd's own answer is the cause, not Soulful's text.
+    #[test]
+    fn an_offline_peer_keeps_slskds_answer_as_its_cause() {
+        let f = offline().failure(Stage::Enqueue, offline().to_string());
+        assert_eq!(f.message, "User 'bob' is offline");
+        let cause = f.cause.unwrap();
+        assert_eq!(
+            (cause.status, cause.raw.as_str()),
+            (Some(404), "User bob appears to be offline")
+        );
+        assert_eq!(f.user_action, None);
+    }
+
+    /// A downloads list or answer that no longer parses waits for a new
+    /// Soulful or slskd, not for time.
+    #[test]
+    fn an_unparseable_answer_asks_for_matching_versions() {
+        let drift = SoulseekError::InvalidResponse("JSON parse error: missing field `id`".into());
+        let f = drift.failure(Stage::Transfer, "Could not read slskd downloads list");
+        assert_eq!(
+            (f.code, f.retry),
+            (
+                FailureCode::TransferListUnreadable,
+                RetryAdvice::NotRetryable
+            )
+        );
+        assert_eq!(f.cause.unwrap().raw, drift.to_string());
+        assert_eq!(f.user_action, Some(update_soulful_or_slskd()));
+    }
+
+    #[test]
+    fn slskd_user_actions_carry_their_texts() {
+        let action = |code, what: &str, where_: &str| UserAction::new(code, what, where_);
+        assert_eq!(
+            configure_slskd(),
+            action(
+                UserActionCode::ConfigureBackend,
+                "Set the slskd URL and API key",
+                "Settings > Config"
+            )
+        );
+        assert_eq!(
+            upgrade_slskd(),
+            action(
+                UserActionCode::UpgradeBackend,
+                "Upgrade slskd to 0.26 or newer",
+                "slskd"
+            )
+        );
+        assert_eq!(
+            update_soulful_or_slskd(),
+            action(
+                UserActionCode::UpdateSoulfulOrBackend,
+                "Update Soulful or slskd so that Soulful can read slskd's answers again",
+                "Soulful and slskd"
+            )
+        );
+    }
+
+    #[test]
+    fn missing_settings_read_as_before() {
+        for (missing, text) in [
+            (MissingSetting::Url, "slskd URL not configured"),
+            (MissingSetting::ApiKey, "slskd API key not configured"),
+            (MissingSetting::Empty, "slskd not configured"),
+        ] {
+            assert_eq!(SoulseekError::NotConfigured(missing).to_string(), text);
+        }
     }
 
     #[test]

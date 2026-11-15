@@ -97,7 +97,6 @@ impl DownloadableGroup {
 pub enum SearchState {
     InProgress,
     Completed,
-    NotFound,
     TimedOut,
 }
 

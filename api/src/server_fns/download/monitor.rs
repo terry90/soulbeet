@@ -1953,6 +1953,16 @@ mod tests {
             FailureCode::TransferListUnreadable,
             "Could not read slskd downloads list: Unparseable slskd response: JSON parse error: missing field `id`",
         );
+        let f = entries[0].failure.as_ref().unwrap();
+        assert_eq!(f.retry, RetryAdvice::NotRetryable);
+        assert_eq!(
+            f.user_action.as_ref().map(|a| a.code),
+            Some(UserActionCode::UpdateSoulfulOrBackend)
+        );
+        assert_eq!(
+            f.cause.as_ref().map(|c| c.raw.as_str()),
+            Some("Unparseable slskd response: JSON parse error: missing field `id`")
+        );
     }
 
     #[tokio::test]
@@ -2165,7 +2175,7 @@ mod tests {
             (
                 stalled(&e),
                 FailureCode::TransferListUnreadable,
-                SameSourceLater,
+                NotRetryable,
                 "slskd's transfer list was unreadable for 10 minutes",
             ),
             (
@@ -2177,7 +2187,7 @@ mod tests {
             (
                 list_unreadable(&e),
                 FailureCode::TransferListUnreadable,
-                SameSourceLater,
+                NotRetryable,
                 unreadable.as_str(),
             ),
             (
