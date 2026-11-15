@@ -140,13 +140,15 @@ impl NavidromeClient {
 
         debug!("Navidrome GET {}", endpoint);
 
+        // The URL's query carries the Subsonic token and salt, a working
+        // credential, so no error built here may include it.
         let response = match self.client.get(url).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 self.circuit_breaker.record_failure().await;
                 return Err(SoulseekError::Api {
                     status: if e.is_timeout() { 408 } else { 503 },
-                    message: format!("Navidrome request failed: {}", e),
+                    message: format!("Navidrome request failed: {}", e.without_url()),
                 });
             }
         };
@@ -164,7 +166,7 @@ impl NavidromeClient {
         let envelope: SubsonicEnvelope<T> =
             response.json().await.map_err(|e| SoulseekError::Api {
                 status: 500,
-                message: format!("Failed to parse Navidrome response: {}", e),
+                message: format!("Failed to parse Navidrome response: {}", e.without_url()),
             })?;
 
         if envelope.response.status != "ok" {
@@ -592,5 +594,33 @@ impl NavidromeClient {
             status: 0,
             message: format!("Failed to parse players response: {}", e),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_request_does_not_reveal_the_subsonic_token() {
+        // A port nothing listens on: the connection is refused.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = NavidromeClientBuilder::new()
+            .base_url(&format!("http://127.0.0.1:{port}"))
+            .username("alice")
+            .password("secret-password")
+            .build()
+            .unwrap();
+
+        let message = client.ping().await.unwrap_err().to_string();
+
+        assert!(message.contains("Navidrome request failed"), "{message}");
+        for leak in ["u=alice", "t=", "s=", "rest/ping"] {
+            assert!(!message.contains(leak), "{leak} in {message}");
+        }
     }
 }
