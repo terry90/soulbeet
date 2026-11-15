@@ -657,6 +657,7 @@ mod tests {
             cleanup_root: None,
             choice: DriverChoice::Auto,
             choices: None,
+            duplicates: crate::import_queue::Duplicates::AsConfigured,
         })
     }
 

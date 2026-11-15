@@ -81,7 +81,8 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
         if let Some(PendingAction::Promote(track)) =
             pending_action(song, &pending, promote_threshold)
         {
-            if let Err(e) = promote_discovery_track_internal(&track.id, user_id).await {
+            if let Err(e) = promote_discovery_track_internal(&track.id, user_id, Origin::Auto).await
+            {
                 warn!("Failed to promote track {}: {}", track.title, e.message);
             } else {
                 promoted_tracks += 1;
@@ -399,9 +400,10 @@ pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
 pub(crate) async fn promote_discovery_track_internal(
     track_id: &str,
     user_id: &str,
+    origin: Origin,
 ) -> Result<(), Failure> {
     let (track_id, user_id) = (track_id.to_string(), user_id.to_string());
-    tokio::spawn(async move { promote_detached(&track_id, &user_id).await })
+    tokio::spawn(async move { promote_detached(&track_id, &user_id, origin).await })
         .await
         .unwrap_or_else(|e| Err(promote_stopped(&e)))
 }
@@ -519,7 +521,7 @@ async fn claim_for_promote_in(
 }
 
 #[cfg(feature = "server")]
-async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), Failure> {
+async fn promote_detached(track_id: &str, user_id: &str, origin: Origin) -> Result<(), Failure> {
     use crate::models::discovery_history::DiscoveryHistoryRow;
 
     let (track, folder) = claim_for_promote_in(&crate::db::DB, track_id, user_id).await?;
@@ -533,7 +535,9 @@ async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), Failure> 
     }
 
     let target = std::path::PathBuf::from(&folder.path);
-    if let Err(failure) = crate::import_queue::import_to_library(&src, &target).await {
+    if let Err(failure) =
+        crate::import_queue::import_to_library(&src, &target, &UserId::new(user_id), origin).await
+    {
         // Import failed -- revert to Pending
         let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
         return Err(failure);

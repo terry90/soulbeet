@@ -3,6 +3,7 @@
 //! instead of reading "Importing".
 
 mod choice;
+mod replace;
 mod retry;
 mod rows;
 #[cfg(test)]
@@ -12,6 +13,7 @@ pub use retry::{forget_retries, import_choices_for, retry_import_for};
 pub(crate) use rows::import_failure;
 
 use crate::auth::UserId;
+use crate::core::delete_guard::{Guard, Origin};
 use crate::ledger::{self, ImportDone, IndexWait, JobEvent, StoredImport};
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -57,6 +59,17 @@ pub struct ImportJob {
     pub choice: DriverChoice,
     /// What the last automatic run of these files left to pick from.
     pub choices: Option<Arc<MatchChoices>>,
+    /// What becomes of the library's earlier copy beets finds.
+    pub duplicates: Duplicates,
+}
+
+/// How an import treats the library's earlier copy of what it imports.
+#[derive(Debug, Clone)]
+pub enum Duplicates {
+    /// beets acts as configured (discovery staging, section 13).
+    AsConfigured,
+    /// beets reports the removals it wants; the guard decides them for `actor`.
+    Guarded { actor: UserId, origin: Origin },
 }
 
 impl ImportJob {
@@ -79,9 +92,14 @@ impl ImportJob {
         })
     }
 
-    /// The job `stored` describes, reporting to `user` through its rows (jobs set).
+    /// The job `stored` describes, reporting to `user` through its rows (jobs set). Every
+    /// stored import is a download or a retry, so its earlier copies are guarded for `user`.
     pub fn from_stored(stored: StoredImport, user: UserId) -> ImportJob {
         ImportJob {
+            duplicates: Duplicates::Guarded {
+                actor: user.clone(),
+                origin: Origin::Ui,
+            },
             sources: stored.sources,
             target: stored.target,
             mode: match stored.album {
@@ -167,6 +185,8 @@ pub trait QueueDeps: Send + Sync {
     async fn emit(&self, user: &UserId, event: DownloadEvent);
     /// Records `event` in the job ledger.
     fn record(&self, event: JobEvent);
+    /// The guard that decides the removals beets wants.
+    fn guard(&self) -> Guard<'_>;
 }
 
 struct Waiting {
@@ -466,15 +486,36 @@ impl Shared {
             true => Some(audio_files_under(target).await),
             false => None,
         };
-        let result = importer
-            .import(
-                &sources,
-                target,
-                job.mode,
-                &job.choice,
-                DuplicateRun::AsConfigured,
-            )
+        let duplicates = match job.duplicates {
+            Duplicates::AsConfigured => DuplicateRun::AsConfigured,
+            Duplicates::Guarded { .. } => DuplicateRun::ReportRemovals,
+        };
+        let mut result = importer
+            .import(&sources, target, job.mode, &job.choice, duplicates)
             .await;
+        if let Duplicates::Guarded { actor, origin } = &job.duplicates {
+            if !result.removals.is_empty() {
+                // The import's own jobs want what it replaces.
+                let mut exempt: Vec<String> = job
+                    .owner
+                    .iter()
+                    .flat_map(|owner| &owner.rows)
+                    .filter_map(|row| Some(row.job.as_ref()?.job.clone()))
+                    .collect();
+                exempt.sort();
+                exempt.dedup();
+                result = replace::settle_removals(
+                    &self.deps.guard(),
+                    importer.as_ref(),
+                    actor,
+                    *origin,
+                    &exempt,
+                    target,
+                    result,
+                )
+                .await;
+            }
+        }
         let new_files = match before {
             Some(before) => {
                 let mut new: Vec<PathBuf> = audio_files_under(target)
@@ -633,9 +674,15 @@ pub async fn canonical_target(target: &Path) -> std::io::Result<PathBuf> {
     tokio::fs::canonicalize(target).await
 }
 
-/// Imports one file into a library folder and waits for it (promote). Ok when
-/// the file imported, else the outcome's failure.
-pub async fn import_to_library(src: &Path, target: &Path) -> Result<(), Failure> {
+/// Imports one file into a library folder for `actor` and waits for it (promote),
+/// replacing an earlier copy through the guard with `origin`. Ok when the file
+/// imported, its warnings logged since no row shows them, else the outcome's failure.
+pub async fn import_to_library(
+    src: &Path,
+    target: &Path,
+    actor: &UserId,
+    origin: Origin,
+) -> Result<(), Failure> {
     let outcome = IMPORT_QUEUE
         .submit(ImportJob {
             sources: vec![src.to_path_buf()],
@@ -646,11 +693,27 @@ pub async fn import_to_library(src: &Path, target: &Path) -> Result<(), Failure>
             cleanup_root: None,
             choice: DriverChoice::Auto,
             choices: None,
+            duplicates: Duplicates::Guarded {
+                actor: actor.clone(),
+                origin,
+            },
         })
         .await
         .wait()
         .await;
-    import_failure(&outcome.result).map_or(Ok(()), Err)
+    if let Some(failure) = import_failure(&outcome.result) {
+        return Err(failure);
+    }
+    if let ImportOutcome::Imported { warnings, .. } = &outcome.result.outcome {
+        for note in warnings {
+            warn!(
+                "Promote of {} into {}: {note}",
+                src.display(),
+                target.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 struct LiveDeps;
@@ -668,6 +731,10 @@ impl QueueDeps for LiveDeps {
     fn record(&self, event: JobEvent) {
         ledger::LEDGER.record(event);
     }
+
+    fn guard(&self) -> Guard<'_> {
+        Guard::live()
+    }
 }
 
 pub static IMPORT_QUEUE: LazyLock<ImportQueue> =
@@ -680,6 +747,7 @@ mod tests {
         alice, broken, imported, no_match, row, RecordingDeps, StubImporter,
     };
     use super::*;
+    use crate::core::delete_guard::test_support::{wanted, Library};
     use shared::download::{DownloadState, ImportChoice, JobSlot};
     use soulbeet::{ForgetOutcome, ImportOutcome, SkipReason};
     use std::time::Duration;
@@ -710,6 +778,7 @@ mod tests {
             cleanup_root: None,
             choice: DriverChoice::Auto,
             choices: None,
+            duplicates: Duplicates::AsConfigured,
         }
     }
 
@@ -763,17 +832,96 @@ mod tests {
         assert_eq!(stub.max_active(), 1);
     }
 
-    /// The queue carries out no wanted removal, so it never asks beets to
-    /// report one instead of making it.
     #[tokio::test]
-    async fn an_import_lets_beets_handle_duplicates_as_configured() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (queue, stub, _) = queue(StubImporter::new());
-        let source = file(tmp.path(), "dl/a.flac");
-        assert!(is_imported(
-            &finish(queue.submit(job(source, &tmp.path().join("lib"))).await).await
+    async fn library_imports_report_removals_and_staging_imports_keep_beets_handling() {
+        let stub = Arc::new(StubImporter::new());
+        let lib = Library::new().await;
+        let queue = ImportQueue::new(RecordingDeps::with_guard(
+            stub.clone(),
+            lib.db.clone(),
+            lib.fake.clone(),
         ));
-        assert_eq!(stub.duplicate_runs(), vec![DuplicateRun::AsConfigured]);
+        let dir = tempfile::tempdir().unwrap();
+        let src = file(dir.path(), "in/01.flac");
+        for duplicates in [
+            Duplicates::Guarded {
+                actor: lib.alice(),
+                origin: Origin::Ui,
+            },
+            Duplicates::AsConfigured,
+        ] {
+            finish(
+                queue
+                    .submit(ImportJob {
+                        duplicates,
+                        ..job(src.clone(), &dir.path().join("lib"))
+                    })
+                    .await,
+            )
+            .await;
+        }
+        assert_eq!(
+            stub.duplicate_runs(),
+            vec![DuplicateRun::ReportRemovals, DuplicateRun::AsConfigured]
+        );
+    }
+
+    /// The import's own job wants the track it replaces, and does not keep it.
+    #[tokio::test]
+    async fn a_library_import_settles_its_removals_for_the_jobs_it_works_for() {
+        let stub = Arc::new(StubImporter::new());
+        let lib = Library::new().await;
+        lib.job(
+            "j1",
+            "alice-music",
+            "importing",
+            wanted("Marrow Choir", "O Holy Night", None),
+        )
+        .await;
+        let queue = ImportQueue::new(RecordingDeps::with_guard(
+            stub.clone(),
+            lib.db.clone(),
+            lib.fake.clone(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let target = lib.root.join("music/alice");
+        stub.script(ImportResult {
+            removals: vec![soulbeet::WantedRemoval {
+                existing: vec![soulbeet::ImportedItem {
+                    path: "A/x.flac".into(),
+                    recording_mbid: None,
+                    artist: "Marrow Choir".into(),
+                    title: "O Holy Night".into(),
+                    album: "Winter Songs".into(),
+                }],
+                imported: vec![(7, "Zzqx Artist/a.flac".into())],
+            }],
+            ..imported()
+        });
+        let guarded = ImportJob {
+            duplicates: Duplicates::Guarded {
+                actor: lib.alice(),
+                origin: Origin::Ui,
+            },
+            ..owned(
+                job(file(dir.path(), "in/01.flac"), &target),
+                &lib.alice(),
+                &["a"],
+            )
+        };
+        let outcome = finish(queue.submit(guarded).await).await;
+        let ImportOutcome::Imported { warnings, .. } = outcome.result.outcome else {
+            panic!("{:?}", outcome.result)
+        };
+        assert_eq!(
+            warnings,
+            vec!["replaced the library's earlier copy A/x.flac".to_string()]
+        );
+        assert!(!target.join("A/x.flac").exists());
+        assert_eq!(
+            stub.relocations(),
+            vec![(std::fs::canonicalize(&target).unwrap(), vec![7])]
+        );
     }
 
     #[tokio::test]
@@ -1178,6 +1326,11 @@ mod tests {
             id: "c2b1f1c4-6c7f-4a77-8a44-4c3e0b8a9b11".into(),
         };
         let rebuilt = ImportJob::from_stored(original.stored().unwrap(), alice());
+        assert!(
+            matches!(&rebuilt.duplicates, Duplicates::Guarded { actor, origin: Origin::Ui } if *actor == alice()),
+            "{:?}",
+            rebuilt.duplicates
+        );
         assert_eq!(
             (
                 &rebuilt.sources,

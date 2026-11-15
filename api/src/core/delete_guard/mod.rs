@@ -9,7 +9,7 @@ use crate::models::discovery_playlist::DiscoveryTrackRow;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::navidrome::{DeletionReason, DiscoveryTrack};
 use soulbeet::navidrome::models::NativeSong;
-use soulbeet::{ForgetOutcome, MusicImporter};
+use soulbeet::{ForgetOutcome, ImportedItem, MusicImporter};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -136,6 +136,50 @@ impl Guard<'_> {
         self.check_resolved(actor, song, path, &[])
             .await
             .map(Verdict::Library)
+    }
+
+    /// Checks the library item beets reported at `library.join(&item.path)`: its song is the
+    /// song of `actor`'s search for the item's tags whose file (local_file_in) is the canonical
+    /// file; candidates whose file cannot be told are other files. Then check_resolved with
+    /// `exempt_jobs`. A pending discovery track never holds a library item, so this is Checked.
+    pub async fn check_file(
+        &self,
+        actor: &UserId,
+        item: &ImportedItem,
+        library: &Path,
+        exempt_jobs: &[String],
+    ) -> Result<Checked, Failure> {
+        let reported = library.join(&item.path);
+        let path = tokio::fs::canonicalize(&reported).await.map_err(|e| {
+            path_unresolved(format!("No file at {}", reported.display())).with_cause(
+                Service::Filesystem,
+                None,
+                e.to_string(),
+            )
+        })?;
+        let candidates = self
+            .listeners
+            .songs_for_item(actor, item)
+            .await
+            .map_err(|e| e.failure(Stage::Delete, e.to_string()))?
+            .ok_or_else(|| {
+                path_unresolved(format!(
+                    "Navidrome cannot be searched for the tags of {}",
+                    path.display()
+                ))
+            })?;
+        for song in candidates {
+            if paths::local_file_in(self.db, &song, self.music_path)
+                .await
+                .is_ok_and(|file| file == path)
+            {
+                return self.check_resolved(actor, song, path, exempt_jobs).await;
+            }
+        }
+        Err(path_unresolved(format!(
+            "Navidrome has no song for {}",
+            path.display()
+        )))
     }
 
     /// Rules 1, 2, 5, the one-song check, 3 and 4, in that order, for `path`, the canonical
@@ -1512,5 +1556,60 @@ mod tests {
             );
             assert_eq!(f.user_action, None);
         }
+    }
+
+    #[tokio::test]
+    async fn a_reported_file_is_checked_as_the_song_whose_file_it_is() {
+        let lib = Library::new().await;
+        // Found first by the same search, and another file.
+        lib.song("s0", "alice/B/w.flac", b"audio");
+        let library = lib.root.join("music/alice");
+        let item = |rel: &str| ImportedItem {
+            path: rel.into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+        };
+        let checked = lib
+            .guard()
+            .check_file(&lib.alice(), &item("A/x.flac"), &library, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            (checked.song.id.as_str(), checked.path),
+            ("s1", canonical(&lib, "music/alice/A/x.flac"))
+        );
+
+        let refused = |r: Result<Checked, Failure>| match r {
+            Err(f) => (f.code, f.message),
+            Ok(c) => panic!("allowed {c:?}"),
+        };
+        assert_eq!(
+            refused(
+                lib.guard()
+                    .check_file(&lib.alice(), &item("A/gone.flac"), &library, &[])
+                    .await
+            ),
+            (
+                FailureCode::DeletePathUnresolved,
+                format!("No file at {}", library.join("A/gone.flac").display())
+            )
+        );
+        std::fs::write(library.join("A/z.flac"), b"audio").unwrap();
+        assert_eq!(
+            refused(
+                lib.guard()
+                    .check_file(&lib.alice(), &item("A/z.flac"), &library, &[])
+                    .await
+            ),
+            (
+                FailureCode::DeletePathUnresolved,
+                format!(
+                    "Navidrome has no song for {}",
+                    canonical(&lib, "music/alice/A/z.flac").display()
+                )
+            )
+        );
     }
 }

@@ -36,7 +36,7 @@ async fn update_progress(
 #[cfg(feature = "server")]
 use crate::auth::UserId;
 #[cfg(feature = "server")]
-use crate::import_queue::{ImportJob, IMPORT_QUEUE};
+use crate::import_queue::{Duplicates, ImportJob, IMPORT_QUEUE};
 #[cfg(feature = "server")]
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 #[cfg(feature = "server")]
@@ -191,9 +191,13 @@ pub struct TrackActionRequest {
 
 #[post("/api/discovery/promote", auth: AuthSession)]
 pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    super::navidrome::promote_discovery_track_internal(&req.track_id, &auth.0.user_id)
-        .await
-        .map_err(failure_error)
+    super::navidrome::promote_discovery_track_internal(
+        &req.track_id,
+        &auth.0.user_id,
+        crate::core::delete_guard::Origin::Ui,
+    )
+    .await
+    .map_err(failure_error)
 }
 
 #[post("/api/discovery/remove", auth: AuthSession)]
@@ -1054,6 +1058,8 @@ pub async fn generate_discovery_playlist_internal(
                         cleanup_root: Some(download_base.clone()),
                         choice: soulbeet::DriverChoice::Auto,
                         choices: None,
+                        // Discovery's staging keeps its own rules (section 13).
+                        duplicates: Duplicates::AsConfigured,
                     })
                     .await
                     .wait()

@@ -8,7 +8,8 @@ use std::sync::Mutex;
 
 use super::utils::{file_id, resolve_download_path, resolve_in_destination, FileId, Unresolved};
 use crate::auth::UserId;
-use crate::import_queue::{ImportJob, JobOwner};
+use crate::core::delete_guard::Origin;
+use crate::import_queue::{Duplicates, ImportJob, JobOwner};
 
 /// Maximum number of retries when waiting for a downloaded file to appear on disk.
 /// With exponential backoff (500ms, 1s, 2s, 4s, 8s), this covers ~15.5s total.
@@ -139,6 +140,10 @@ pub fn import_job(
         cleanup_root: Some(base.to_path_buf()),
         choice: DriverChoice::Auto,
         choices: None,
+        duplicates: Duplicates::Guarded {
+            actor: user.clone(),
+            origin: Origin::Ui,
+        },
     }
 }
 

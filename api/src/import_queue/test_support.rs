@@ -2,6 +2,8 @@
 
 use super::QueueDeps;
 use crate::auth::UserId;
+use crate::core::delete_guard::test_support::FakeNavidrome;
+use crate::core::delete_guard::Guard;
 use crate::ledger::JobEvent;
 use async_trait::async_trait;
 use shared::download::{
@@ -13,6 +15,7 @@ use soulbeet::{
     DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
     ImportedItem, MusicImporter, SkipReason, TaskCount,
 };
+use sqlx::SqlitePool;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -113,8 +116,8 @@ pub fn row(item: &str) -> DownloadProgress {
 }
 
 /// Answers imports from a script (Imported once it runs out), forgets with
-/// one answer (Removed unless scripted), and relocates by answering that it
-/// moved nothing.
+/// one answer (Removed unless scripted), and relocates with one answer (that
+/// it moved nothing unless scripted).
 pub struct StubImporter {
     results: Mutex<VecDeque<ImportResult>>,
     delay: Duration,
@@ -132,6 +135,7 @@ pub struct StubImporter {
     forget_answer: Mutex<ForgetOutcome>,
     forgets: Mutex<Vec<(PathBuf, PathBuf)>>,
     relocations: Mutex<Vec<(PathBuf, Vec<u64>)>>,
+    relocate_answer: Mutex<Result<Vec<(u64, PathBuf)>, String>>,
 }
 
 impl StubImporter {
@@ -152,6 +156,7 @@ impl StubImporter {
             forget_answer: Mutex::new(ForgetOutcome::Removed),
             forgets: Mutex::new(vec![]),
             relocations: Mutex::new(vec![]),
+            relocate_answer: Mutex::new(Ok(vec![])),
         }
     }
 
@@ -188,6 +193,10 @@ impl StubImporter {
 
     pub fn script_forget(&self, outcome: ForgetOutcome) {
         *self.forget_answer.lock().unwrap() = outcome;
+    }
+
+    pub fn script_relocate(&self, answer: Result<Vec<(u64, PathBuf)>, String>) {
+        *self.relocate_answer.lock().unwrap() = answer;
     }
 
     pub fn panic_next(&self) {
@@ -313,7 +322,7 @@ impl MusicImporter for StubImporter {
             .lock()
             .unwrap()
             .push((library.to_path_buf(), item_ids.to_vec()));
-        Ok(vec![])
+        self.relocate_answer.lock().unwrap().clone()
     }
 
     fn refused(&self, issue: String) -> ImportResult {
@@ -345,17 +354,37 @@ impl MusicImporter for StubImporter {
     }
 }
 
-/// Hands out one importer, records every event per user id and every ledger event.
+/// Hands out one importer and, when given one, a delete guard; records every event per user id
+/// and every ledger event.
 pub struct RecordingDeps {
     importer: Arc<StubImporter>,
+    guard: Option<(SqlitePool, Arc<FakeNavidrome>)>,
     events: Mutex<Vec<(UserId, DownloadEvent)>>,
     ledger: Mutex<Vec<JobEvent>>,
 }
 
 impl RecordingDeps {
+    /// Deps whose queue never settles a removal: `guard` panics.
     pub fn new(importer: Arc<StubImporter>) -> Arc<Self> {
+        Self::build(importer, None)
+    }
+
+    /// Deps whose guard checks against `db` and `fake`, with no music path set.
+    pub fn with_guard(
+        importer: Arc<StubImporter>,
+        db: SqlitePool,
+        fake: Arc<FakeNavidrome>,
+    ) -> Arc<Self> {
+        Self::build(importer, Some((db, fake)))
+    }
+
+    fn build(
+        importer: Arc<StubImporter>,
+        guard: Option<(SqlitePool, Arc<FakeNavidrome>)>,
+    ) -> Arc<Self> {
         Arc::new(RecordingDeps {
             importer,
+            guard,
             events: Mutex::new(vec![]),
             ledger: Mutex::new(vec![]),
         })
@@ -400,6 +429,18 @@ impl QueueDeps for RecordingDeps {
 
     fn record(&self, event: JobEvent) {
         self.ledger.lock().unwrap().push(event);
+    }
+
+    fn guard(&self) -> Guard<'_> {
+        let (db, fake) = self
+            .guard
+            .as_ref()
+            .expect("this test gives the import queue no delete guard");
+        Guard {
+            db,
+            listeners: fake.as_ref(),
+            music_path: None,
+        }
     }
 }
 
