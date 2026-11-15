@@ -10,6 +10,7 @@ use shared::download::{DownloadEvent, DownloadProgress, IndexState, JobSlot};
 use shared::failure::{
     Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
 };
+use soulbeet::navidrome::error::NOT_AUTHORIZED;
 use soulbeet::navidrome::models::NativeSong;
 use soulbeet::navidrome::{NavidromeClient, ScanStatus};
 use soulbeet::NavidromeError;
@@ -205,8 +206,9 @@ impl Import {
 /// A slot the runner holds no wait for gets its row sent and recorded (Slots { Indexing }) with
 /// index Waiting. listed() runs when Navidrome is idle and its lastScan differs from `checked`
 /// (which it then becomes). StartScan calls start_scan; a refusal (Subsonic 50, `StartScan`'s
-/// ErrorAuthorizationFail, server/subsonic/library_scanning.go:40-42) leaves the wait to the watcher
-/// or a schedule. Listed: rows with index Listed, Slots { Done }. Fail(f): rows with index
+/// ErrorAuthorizationFail, server/subsonic/library_scanning.go:43-44) leaves the wait to the watcher
+/// or a schedule. Another start_scan error keeps the wait without the new baseline, so the next
+/// idle round asks again, and fails it as a status error does once given up. Listed: rows with index Listed, Slots { Done }. Fail(f): rows with index
 /// Failed(f), Slots { Failed }. A changed wait: Indexing. Rows go out with send_user_event.
 pub(crate) async fn index_round(
     db: &SqlitePool,
@@ -269,7 +271,8 @@ pub(crate) async fn index_round(
             }
             Err(failure) => {
                 for import in imports {
-                    give_up_after(ledger, runner, &user, import, &failure, now).await;
+                    let held = import.wait.clone();
+                    give_up_after(ledger, runner, &user, import, held, &failure, now).await;
                 }
             }
         }
@@ -337,7 +340,8 @@ async fn advance(
             }
             Err(e) => {
                 let failure = e.failure(Stage::Index, e.to_string());
-                return give_up_after(ledger, runner, user, import, &failure, now).await;
+                let held = import.wait.clone();
+                return give_up_after(ledger, runner, user, import, held, &failure, now).await;
             }
         }
     }
@@ -364,30 +368,44 @@ async fn advance(
             )
             .await
         }
-        Step::StartScan(wait) => {
-            // A non-admin account is refused (Subsonic 50, server/subsonic/library_scanning.go:40-42):
+        Step::StartScan(started) => match navi.start_scan().await {
+            // A non-admin account is refused (Subsonic 50, server/subsonic/library_scanning.go:43-44):
             // Navidrome's watcher or its schedule may still scan.
-            if let Err(e) = navi.start_scan().await {
-                debug!("Navidrome did not start a scan for {user}: {e}");
+            Ok(()) => keep(ledger, runner, import, started),
+            Err(NavidromeError::Subsonic {
+                code: NOT_AUTHORIZED,
+                ..
+            }) => {
+                debug!("Navidrome does not let {user} start a scan");
+                keep(ledger, runner, import, started);
             }
-            keep(ledger, runner, import, wait);
-        }
+            // Any other error says nothing of the account: without the baseline the next idle
+            // round asks again.
+            Err(e) => {
+                warn!("Could not ask Navidrome to scan for {user}: {e}");
+                let failure = e.failure(Stage::Index, e.to_string());
+                give_up_after(ledger, runner, user, import, wait, &failure, now).await;
+            }
+        },
         Step::Wait(wait) => keep(ledger, runner, import, wait),
     }
 }
 
-/// Fails the import with `failure` once the wait gave up; until then it waits.
+/// Fails the import with `failure` once the wait gave up; until then it keeps `wait`.
 async fn give_up_after(
     ledger: &Ledger,
     runner: &mut IndexRunner,
     user: &UserId,
     import: Import,
+    wait: IndexWait,
     failure: &Failure,
     now: i64,
 ) {
     if now - import.wait.since >= INDEX_GIVE_UP_SECS {
         let index = Some(IndexState::Failed(failure.clone()));
         end(ledger, runner, user, import, JobState::Failed, index).await;
+    } else {
+        keep(ledger, runner, import, wait);
     }
 }
 
@@ -862,6 +880,101 @@ mod tests {
             Some("2026-11-15T10:01:56Z".parse().unwrap())
         );
         assert_eq!(indexes(&mut rx), vec![Some(IndexState::Waiting)]);
+    }
+
+    fn scans_asked(navi: &NavidromeStub) -> usize {
+        navi.asked()
+            .iter()
+            .filter(|path| *path == "/rest/startScan")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn an_account_refused_a_scan_is_not_asked_again() {
+        let library = tempfile::tempdir().unwrap();
+        let (ledger, db, _rx, _) = indexing(imported_in(library.path())).await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        navi.answer("/api/song", &["[]"]);
+        // StartScan's ErrorAuthorizationFail (server/subsonic/library_scanning.go:43-44, responses/errors.go:20).
+        navi.answer(
+            "/rest/startScan",
+            &[r#"{"subsonic-response":{"status":"failed","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"error":{"code":50,"message":"User is not authorized for the given operation"}}}"#],
+        );
+        let mut runner = IndexRunner::default();
+        for now in [1_005, 1_010] {
+            index_round(
+                &db,
+                &ledger,
+                &Navidrome(Ok(navi.client())),
+                &mut runner,
+                now,
+            )
+            .await;
+            ledger.settled().await;
+        }
+        assert_eq!(scans_asked(&navi), 1);
+        let [slot] = &store::indexing_slots(&db).await.unwrap()[..] else {
+            panic!()
+        };
+        assert!(slot.wait.baseline.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_scan_request_that_fails_otherwise_is_asked_again_until_the_wait_gives_up() {
+        let library = tempfile::tempdir().unwrap();
+        let (ledger, db, mut rx, _) = indexing(imported_in(library.path())).await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        navi.answer("/api/song", &["[]"]);
+        // StartScan's ErrorGeneric (server/subsonic/library_scanning.go:40).
+        navi.answer(
+            "/rest/startScan",
+            &[r#"{"subsonic-response":{"status":"failed","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"error":{"code":0,"message":"Internal error"}}}"#],
+        );
+        let mut runner = IndexRunner::default();
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Ok(navi.client())),
+            &mut runner,
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        let [slot] = &store::indexing_slots(&db).await.unwrap()[..] else {
+            panic!()
+        };
+        assert_eq!(
+            (slot.wait.baseline, slot.wait.checked),
+            (None, Some(at("2026-11-15T10:02:00Z")))
+        );
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Ok(navi.client())),
+            &mut runner,
+            1_010,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(scans_asked(&navi), 2);
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Indexing));
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Ok(navi.client())),
+            &mut runner,
+            1_000 + INDEX_GIVE_UP_SECS,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
+        let failed = indexes(&mut rx).into_iter().last().flatten();
+        assert!(
+            matches!(failed, Some(IndexState::Failed(ref f)) if f.stage == Stage::Index && f.message.contains("Internal error")),
+            "{failed:?}"
+        );
     }
 
     #[tokio::test]

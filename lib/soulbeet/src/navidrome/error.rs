@@ -7,6 +7,11 @@ use thiserror::Error;
 /// body (`responses.ErrorAuthenticationFail`).
 pub const WRONG_CREDENTIALS: u32 = 40;
 
+/// Subsonic error code Navidrome sends when the account may not do what was
+/// asked (`responses.ErrorAuthorizationFail`), as `startScan` answers a
+/// non-admin account (server/subsonic/library_scanning.go:43-44).
+pub const NOT_AUTHORIZED: u32 = 50;
+
 /// What went wrong talking to Navidrome. None of these carries the request
 /// URL: its query holds the Subsonic token and salt, a working credential.
 #[derive(Error, Debug)]
