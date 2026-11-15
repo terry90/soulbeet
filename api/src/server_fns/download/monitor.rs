@@ -111,12 +111,13 @@ fn per_track_timeout() -> Failure {
     )
 }
 
-/// slskd's transfer list stayed unreadable for `BACKEND_STALL_TIMEOUT`.
-fn stalled() -> Failure {
-    transfer_failure(
-        FailureCode::TransferListUnreadable,
-        RetryAdvice::SameSourceLater,
-        &format!(
+/// slskd's transfer list stayed unreadable for `BACKEND_STALL_TIMEOUT`, the
+/// last read failing with `e`. Its code, advice and cause are `e`'s: a
+/// refused API key needs a person, an unreachable slskd needs time.
+fn stalled(e: &SoulseekError) -> Failure {
+    e.failure(
+        Stage::Transfer,
+        format!(
             "slskd's transfer list was unreadable for {} minutes",
             BACKEND_STALL_TIMEOUT.as_secs() / 60
         ),
@@ -399,17 +400,38 @@ impl DownloadMonitor {
         }
     }
 
-    /// Give up when slskd's transfer list has been unreadable for too long.
+    /// Count a failed read of slskd's transfer list. Returns whether the
+    /// batch was failed, so the monitor must stop.
     ///
-    /// Transport errors are deliberately not fused by count, because a slskd
-    /// restart resolves on its own, but they must be fused by time: while no
-    /// list can be read, no per-track deadline is ever evaluated and the
-    /// monitor polls for the life of the process (#78).
-    fn fail_if_backend_stalled(&mut self) -> bool {
+    /// An unparseable list is fused by count (`MAX_INVALID_RESPONSES`).
+    /// Every error is also fused by time: transport errors are deliberately
+    /// not fused by count, because a slskd restart resolves on its own, but
+    /// while no list can be read no per-track deadline is ever evaluated and
+    /// the monitor would poll for the life of the process (#78). The batch
+    /// fails with the error that ended it.
+    fn poll_failed(&mut self, e: SoulseekError, invalid_responses: &mut u32) -> bool {
+        if let SoulseekError::InvalidResponse(_) = e {
+            // Schema drift: slskd answered but its downloads list no
+            // longer parses. That will not fix itself, so fail the
+            // batch with the real error instead of polling forever
+            // (pre-fix this surfaced as the misleading "Download
+            // never appeared in slskd", issue #73).
+            *invalid_responses += 1;
+            warn!(
+                "Unparseable slskd downloads list ({}/{}): {}",
+                invalid_responses, MAX_INVALID_RESPONSES, e
+            );
+            if *invalid_responses >= MAX_INVALID_RESPONSES {
+                self.fail_unprocessed_tracks(list_unreadable(&e));
+                return true;
+            }
+        } else {
+            warn!("Error fetching download status from slskd: {}", e);
+        }
         if self.last_readable_poll.elapsed() <= BACKEND_STALL_TIMEOUT {
             return false;
         }
-        let failure = stalled();
+        let failure = stalled(&e);
         warn!(
             "{} - giving up on batch {:?}",
             failure.message,
@@ -553,10 +575,6 @@ impl DownloadMonitor {
                 break;
             }
 
-            if self.fail_if_backend_stalled() {
-                break;
-            }
-
             poll_count += 1;
 
             let backend = match download_backend(None).await {
@@ -605,25 +623,10 @@ impl DownloadMonitor {
                         break;
                     }
                 }
-                Err(e @ SoulseekError::InvalidResponse(_)) => {
-                    // Schema drift: slskd answered but its downloads list no
-                    // longer parses. That will not fix itself, so fail the
-                    // batch with the real error instead of polling forever
-                    // (pre-fix this surfaced as the misleading "Download
-                    // never appeared in slskd", issue #73).
-                    invalid_responses += 1;
-                    warn!(
-                        "Unparseable slskd downloads list ({}/{}): {}",
-                        invalid_responses, MAX_INVALID_RESPONSES, e
-                    );
-                    if invalid_responses >= MAX_INVALID_RESPONSES {
-                        self.fail_unprocessed_tracks(list_unreadable(&e));
+                Err(e) => {
+                    if self.poll_failed(e, &mut invalid_responses) {
                         break;
                     }
-                }
-                Err(e) => {
-                    // Transport errors: don't break, slskd might recover
-                    warn!("Error fetching download status from slskd: {}", e);
                 }
             }
 
@@ -1857,11 +1860,22 @@ mod tests {
         // instance (#78).
         let (tx, mut rx) = broadcast::channel(16);
         let mut m = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["a.flac", "b.flac"]);
+        let mut invalid = 0;
+        let circuit_open = || SoulseekError::Api {
+            status: 503,
+            message: "Circuit breaker is open - slskd appears to be unavailable".to_string(),
+        };
 
-        assert!(!m.fail_if_backend_stalled(), "gave up while slskd was fine");
+        assert!(
+            !m.poll_failed(circuit_open(), &mut invalid),
+            "gave up while slskd was fine"
+        );
 
         m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
-        assert!(m.fail_if_backend_stalled(), "polled a dead backend forever");
+        assert!(
+            m.poll_failed(circuit_open(), &mut invalid),
+            "polled a dead backend forever"
+        );
 
         assert!(
             (0..2).all(|slot| phase(&m, slot) == SlotPhase::Settled),
@@ -1874,10 +1888,71 @@ mod tests {
         for e in &entries {
             assert_failed(
                 e,
-                FailureCode::TransferListUnreadable,
+                FailureCode::BackendUnreachable,
                 "slskd's transfer list was unreadable for 10 minutes",
             );
+            let f = e.failure.as_ref().unwrap();
+            assert_eq!(f.retry, RetryAdvice::SameSourceLater);
+            let cause = f.cause.as_ref().expect("the poll error as cause");
+            assert_eq!(cause.status, Some(503));
+            assert_eq!(
+                cause.raw,
+                "Circuit breaker is open - slskd appears to be unavailable"
+            );
         }
+    }
+
+    /// The API key changed while the batch ran: every poll is refused, and
+    /// waiting will not help, a person has to fix the key.
+    #[tokio::test]
+    async fn a_refused_api_key_ends_the_monitor_asking_for_the_settings() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
+        m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
+
+        let refused = SoulseekError::Api {
+            status: 401,
+            message: String::new(),
+        };
+        assert!(m.poll_failed(refused, &mut 0));
+
+        let Ok(DownloadEvent::Progress(entries)) = rx.try_recv() else {
+            panic!("the UI was never told the batch died");
+        };
+        assert_failed(
+            &entries[0],
+            FailureCode::BackendNotConfigured,
+            "slskd's transfer list was unreadable for 10 minutes",
+        );
+        let f = entries[0].failure.as_ref().unwrap();
+        assert_eq!(f.retry, RetryAdvice::NeedsUser);
+        assert_eq!(
+            f.user_action.as_ref().map(|a| a.code),
+            Some(UserActionCode::ConfigureBackend)
+        );
+        assert_eq!(f.cause.as_ref().and_then(|c| c.status), Some(401));
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_listing_fails_the_batch_after_its_fuse() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
+        let drift =
+            || SoulseekError::InvalidResponse("JSON parse error: missing field `id`".into());
+        let mut invalid = 0;
+        for _ in 1..MAX_INVALID_RESPONSES {
+            assert!(!m.poll_failed(drift(), &mut invalid));
+        }
+        assert!(m.poll_failed(drift(), &mut invalid));
+
+        let Ok(DownloadEvent::Progress(entries)) = rx.try_recv() else {
+            panic!("the UI was never told the batch died");
+        };
+        assert_failed(
+            &entries[0],
+            FailureCode::TransferListUnreadable,
+            "Could not read slskd downloads list: Unparseable slskd response: JSON parse error: missing field `id`",
+        );
     }
 
     #[tokio::test]
@@ -2088,7 +2163,7 @@ mod tests {
                 "Per-track timeout",
             ),
             (
-                stalled(),
+                stalled(&e),
                 FailureCode::TransferListUnreadable,
                 SameSourceLater,
                 "slskd's transfer list was unreadable for 10 minutes",
