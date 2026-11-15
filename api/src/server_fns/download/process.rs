@@ -31,20 +31,7 @@ pub async fn resolve_on_disk(
     destination: Option<&str>,
     claimed: &Mutex<HashSet<FileId>>,
 ) -> Result<PathBuf, Unresolved> {
-    let attempt = || {
-        let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
-        let path = match destination {
-            Some(destination) => resolve_in_destination(filename, base, destination, &claimed)?,
-            None => resolve_download_path(filename, base)
-                .map(PathBuf::from)
-                .ok_or(Unresolved::NotOnDisk)?,
-        };
-        let id = file_id(&path).ok_or(Unresolved::NotOnDisk)?;
-        match claimed.insert(id) {
-            true => Ok(path),
-            false => Err(Unresolved::Claimed),
-        }
-    };
+    let attempt = || find_on_disk(filename, base, destination, claimed);
     let mut why = match attempt() {
         Ok(path) => return Ok(path),
         Err(why) => why,
@@ -73,6 +60,27 @@ pub async fn resolve_on_disk(
     }
 
     Err(why)
+}
+
+/// One look of `resolve_on_disk`, without waiting for the file to appear.
+pub fn find_on_disk(
+    filename: &str,
+    base: &Path,
+    destination: Option<&str>,
+    claimed: &Mutex<HashSet<FileId>>,
+) -> Result<PathBuf, Unresolved> {
+    let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
+    let path = match destination {
+        Some(destination) => resolve_in_destination(filename, base, destination, &claimed)?,
+        None => resolve_download_path(filename, base)
+            .map(PathBuf::from)
+            .ok_or(Unresolved::NotOnDisk)?,
+    };
+    let id = file_id(&path).ok_or(Unresolved::NotOnDisk)?;
+    match claimed.insert(id) {
+        true => Ok(path),
+        false => Err(Unresolved::Claimed),
+    }
 }
 
 /// Row text for a finished download whose file was not found on disk.

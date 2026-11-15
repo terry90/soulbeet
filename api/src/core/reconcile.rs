@@ -21,7 +21,7 @@ use crate::server_fns::download::enqueue::{held_failure, transfer_key};
 use crate::server_fns::download::failover::{alternates_for, SourcePool};
 use crate::server_fns::download::monitor::{is_terminal_state, DownloadMonitor, WatchedTransfer};
 use crate::server_fns::download::process::{
-    album_jobs, import_job, resolve_on_disk, unresolved_row, ResolvedSlot,
+    album_jobs, find_on_disk, import_job, resolve_on_disk, unresolved_row, ResolvedSlot,
 };
 use crate::server_fns::download::utils::{FileId, Unresolved};
 use crate::services::download_backend;
@@ -136,6 +136,8 @@ pub(crate) struct Resumed {
     pub rebound: Vec<DownloadProgress>,
     /// (source, transfer id) of the transfers those slots left, to stop.
     pub abandon: Vec<(String, String)>,
+    /// The queued slots whose file is in the batch folder, among `finished`: not to enqueue again.
+    pub on_disk: Vec<JobSlot>,
 }
 
 /// A transfer the backend no longer lists, or a finished one it does, to
@@ -153,12 +155,19 @@ struct Lookup {
 /// records its next source before it enqueues it. Its last attempt says
 /// whether it was adopted. `base` is the download folder; `since` is when
 /// the batch's job was made.
+///
+/// `queued` are queued slots of the batch's job whose file the backend does
+/// not hold: one slskd finished and cleared while Soulful was down is in the
+/// batch folder already. They are looked for there once, without the waits
+/// of resolve_on_disk, which give a file the backend just reported finished
+/// time to show through a mount: Soulful was down, so nothing just finished.
 pub(crate) async fn resume_downloads(
     backend: &Arc<dyn DownloadBackend>,
     base: &Path,
     batch: &BatchRef,
     since: i64,
     slots: Vec<(JobSlot, SlotRecord)>,
+    queued: Vec<(JobSlot, SlotRecord)>,
 ) -> Resumed {
     let mut resumed = Resumed::default();
     let mut unlisted = Vec::new();
@@ -239,9 +248,28 @@ pub(crate) async fn resume_downloads(
             Err(_) => resumed.failed.push(lookup.row.failed_with(transfer_lost())),
         }
     }
+    for (slot, record) in queued {
+        let Some(row) = shown_row(&slot, &record) else {
+            continue;
+        };
+        let destination = batch.destination.clone();
+        if let Ok(path) = find_on_disk(&row.item, base, Some(&destination), &claimed) {
+            any_found = true;
+            resumed.on_disk.push(slot);
+            resumed.finished.push(ResolvedSlot {
+                row: row
+                    .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
+                    .with_backend(backend.id()),
+                path,
+                destination: Some(destination),
+            });
+        }
+    }
 
     // An album batch's records stay until the whole album is imported, so a
-    // finished one already gone means Soulful stopped inside finish_album (D15).
+    // finished one already gone means Soulful stopped inside finish_album
+    // (D15), or slskd cleared the records of files that finished while
+    // Soulful was down: the album is imported from the files there.
     if batch.import_mode != ImportMode::Album || !any_found {
         // A monitor hands each off on its first poll.
         resumed
@@ -413,6 +441,8 @@ struct Downloads {
     /// When the earliest job of the batch was made.
     since: i64,
     slots: Vec<(JobSlot, SlotRecord)>,
+    /// Queued slots the backend does not hold, to look for in the batch folder.
+    queued: Vec<(JobSlot, SlotRecord)>,
     pools: HashMap<JobSlot, (Vec<DownloadableItem>, usize)>,
 }
 
@@ -452,6 +482,7 @@ fn batch_of<'a>(
             downloads.push(Downloads {
                 ctx: job.ctx.clone(),
                 since: job.created_at,
+                queued: Vec::new(),
                 batch: BatchRef::new(
                     TransferOwner {
                         user_id: user,
@@ -584,6 +615,10 @@ pub(crate) async fn resume_unfinished(
             &format!("its stored state cannot be read: {e}"),
         );
     }
+    let partly_unreadable: HashSet<String> = unreadable_slots
+        .iter()
+        .map(|(slot, _)| slot.job.clone())
+        .collect();
     if !unreadable_slots.is_empty() {
         for (slot, e) in &unreadable_slots {
             warn!("Ending {slot:?}, whose stored state cannot be read: {e}");
@@ -616,11 +651,12 @@ pub(crate) async fn resume_unfinished(
             continue;
         }
         if job.state == JobState::Queued && job.slots.is_empty() {
-            end_interrupted(
-                ledger,
-                &job.id,
-                "it stopped before it had files to download",
-            );
+            let why = if partly_unreadable.contains(&job.id) {
+                "the stored state of its files cannot be read"
+            } else {
+                "it stopped before it had files to download"
+            };
+            end_interrupted(ledger, &job.id, why);
             continue;
         }
 
@@ -739,24 +775,33 @@ pub(crate) async fn resume_unfinished(
         }
     }
     // One batch whose files are slow to find on disk holds up no other.
-    futures::future::join_all(
+    let imported: HashSet<JobSlot> = futures::future::join_all(
         downloads
             .into_iter()
             .map(|batch| resume_batch(ledger, queue, resume, &backend, download_base, batch)),
     )
-    .await;
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    for job in &mut again {
+        job.slots.retain(|(slot, _)| !imported.contains(slot));
+    }
     futures::future::join_all(
         again
             .into_iter()
+            .filter(|job| !job.slots.is_empty())
             .map(|job| enqueue_again(resume, &backend, job)),
     )
     .await;
 }
 
 /// Moves the queued slots of `job` whose file the backend already holds into
-/// the job's monitor batch, recording each as downloading. The batch is
-/// recorded before the backend hears of a file, so a job without one sent
-/// nothing. Gives back the slots to enqueue again, None when none is left.
+/// the job's monitor batch, recording each as downloading, and hands that
+/// batch the others to look for in its folder. The batch is stored before
+/// the backend hears of a file, so a job without one sent nothing. Gives
+/// back the slots to enqueue again unless their file is found, None when
+/// none is left.
 async fn adopt_sent(
     ledger: &Ledger,
     backend: &Arc<dyn DownloadBackend>,
@@ -775,6 +820,9 @@ async fn adopt_sent(
             _ => None,
         };
         let Some(transfer) = held else {
+            batch_of(downloads, &queued.job, &batch_id, &label)
+                .queued
+                .push((slot.clone(), record.clone()));
             rest.push((slot, record));
             continue;
         };
@@ -798,10 +846,11 @@ async fn adopt_sent(
 }
 
 /// Resumes one monitor batch: fails the transfers slskd lost, imports the
-/// finished ones and watches the rest. A transfer a request made since
-/// startup now holds is that request's: its slot is dismissed when the
-/// request downloads the file into the same folder for the same user, and
-/// fails as that request's claim says otherwise.
+/// finished ones and the queued files found in its folder, and watches the
+/// rest. A transfer a request made since startup now holds is that
+/// request's: its slot is dismissed when the request downloads the file into
+/// the same folder for the same user, and fails as that request's claim says
+/// otherwise. Gives back the queued slots whose file it imports.
 async fn resume_batch(
     ledger: &Ledger,
     queue: &ImportQueue,
@@ -809,12 +858,13 @@ async fn resume_batch(
     backend: &Arc<dyn DownloadBackend>,
     download_base: &Path,
     downloads: Downloads,
-) {
+) -> Vec<JobSlot> {
     let Downloads {
         ctx,
         batch,
         since,
         slots,
+        queued,
         mut pools,
     } = downloads;
     let user = ctx.id();
@@ -825,7 +875,8 @@ async fn resume_batch(
         failed: lost,
         rebound,
         abandon,
-    } = resume_downloads(backend, download_base, &batch, since, slots).await;
+        on_disk,
+    } = resume_downloads(backend, download_base, &batch, since, slots, queued).await;
     fail_rows(ledger, &user, lost).await;
     if !rebound.is_empty() {
         ledger.record(JobEvent::Slots {
@@ -893,7 +944,7 @@ async fn resume_batch(
     }
     fail_rows(ledger, &user, held).await;
     if watched.is_empty() {
-        return;
+        return on_disk;
     }
     // Every watched transfer is one of the slots given, each with its entry.
     let pool = SourcePool::resumed(
@@ -903,6 +954,7 @@ async fn resume_batch(
             .collect(),
     );
     resume.watch(&ctx, batch, watched, pool).await;
+    on_disk
 }
 
 /// Enqueues a job's queued slots again by their first sources, into a new
@@ -1022,6 +1074,7 @@ mod tests {
                     vec![Some(item("peer_a", "Wake Up", "07.flac"))],
                 ),
             )],
+            vec![],
         )
         .await;
 
@@ -1077,6 +1130,7 @@ mod tests {
                     ),
                 ),
             ],
+            vec![],
         )
         .await;
         assert_eq!(
@@ -1147,6 +1201,7 @@ mod tests {
                     ),
                 ),
             ],
+            vec![],
         )
         .await;
         assert!(resumed.watch.is_empty() && resumed.failed.is_empty());
@@ -2083,6 +2138,154 @@ mod tests {
         );
     }
 
+    /// Keeps the message of every event logged while it is this thread's subscriber.
+    struct Logged(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Logged {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message<'a>(&'a mut String);
+            impl tracing::field::Visit for Message<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        *self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = String::new();
+            event.record(&mut Message(&mut message));
+            self.0.lock().unwrap().push(message);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn a_queued_job_whose_files_cannot_be_read_ends_saying_so() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        // A current-thread runtime: everything the test runs logs here.
+        let _logging = tracing::subscriber::set_default(Logged(lines.clone()));
+        let (ledger, db) = ledger().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let started = Started::on(StubBackend::new(vec![]));
+        job_of(
+            &ledger,
+            &db,
+            "j1",
+            JobState::Queued,
+            None,
+            vec![(0, item("peer_a", "One", "01.flac"))],
+        )
+        .await;
+        ledger.settled().await;
+        sqlx::query("UPDATE job_tracks SET last_row = '{' WHERE job_id = 'j1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        // A callsite another test registered while this subscriber was being set may have
+        // cached that nothing listens: ask every callsite again.
+        tracing::callsite::rebuild_interest_cache();
+
+        reconcile_in(&db, &ledger, &queue(), &started, tmp.path()).await;
+        ledger.settled().await;
+
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
+        let ended: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("Ending job j1"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            ended,
+            vec![
+                "Ending job j1, which cannot resume: the stored state of its files cannot be read"
+            ]
+        );
+        assert!(started.nothing());
+    }
+
+    #[tokio::test]
+    async fn a_queued_file_slskd_finished_and_cleared_is_imported_and_not_enqueued_again() {
+        let (ledger, db) = ledger().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let b1 = BatchRef::new(
+            TransferOwner {
+                user_id: UserId::new("alice"),
+                batch_id: "b1".into(),
+            },
+            "Come Over".into(),
+            tmp.path().join("music"),
+            ImportMode::Singleton,
+        );
+        // slskd took both files of b1 and finished 01 while Soulful was down, and its record
+        // was cleared; it holds nothing now.
+        let folder = tmp.path().join(&b1.destination);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("01.flac"), b"flac").unwrap();
+        let started = Started::on(StubBackend::new(vec![]));
+        let importer = Arc::new(StubImporter::new());
+        let queue = ImportQueue::new(RecordingDeps::new(importer.clone()));
+        let library = tmp.path().join("music");
+        sqlx::query("UPDATE folders SET path = ? WHERE id = 'alice-folder'")
+            .bind(library.to_string_lossy())
+            .execute(&db)
+            .await
+            .unwrap();
+        job_of(
+            &ledger,
+            &db,
+            "j1",
+            JobState::Queued,
+            None,
+            vec![
+                (0, item("peer_a", "One", "q\\01.flac")),
+                (1, item("peer_a", "Two", "q\\02.flac")),
+            ],
+        )
+        .await;
+        enqueued_in_b1(&ledger, "j1");
+        ledger.settled().await;
+
+        reconcile_in(&db, &ledger, &queue, &started, tmp.path()).await;
+        ledger.settled().await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while importer.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await
+            }
+        })
+        .await
+        .expect("the finished file was imported");
+        assert_eq!(
+            importer.seen().into_iter().collect::<Vec<_>>(),
+            vec![(vec![folder.join("01.flac")], library)]
+        );
+        let enqueued: Vec<(String, Vec<(u32, String)>)> = started
+            .enqueued
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(job, items, ..)| (job.clone(), items.clone()))
+            .collect();
+        assert_eq!(
+            enqueued,
+            vec![("j1".to_string(), vec![(1, "q\\02.flac".to_string())])]
+        );
+    }
+
     #[tokio::test]
     async fn a_downloading_slot_resumes_in_the_batch_its_row_names() {
         let (ledger, db) = ledger().await;
@@ -2259,6 +2462,7 @@ mod tests {
                     ],
                 ),
             )],
+            vec![],
         )
         .await;
         assert_eq!(
@@ -2309,6 +2513,7 @@ mod tests {
                     vec![Some(item("peer_a", "One", "a\\01.flac"))],
                 ),
             )],
+            vec![],
         )
         .await;
         assert!(resumed.watch.is_empty() && resumed.failed.is_empty());
