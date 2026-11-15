@@ -5,7 +5,7 @@ use shared::navidrome::{DeletionReview, LibraryStats, SyncResult};
 use dioxus::logger::tracing::{info, warn};
 
 #[cfg(feature = "server")]
-use crate::folder_policy::canonical_folder_path;
+use crate::folder_policy::{canonical_folder_path, deepest_folder_is_own, PolicyRows};
 #[cfg(feature = "server")]
 use crate::models::deletion_review::DeletionReviewRow;
 #[cfg(feature = "server")]
@@ -50,6 +50,13 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
     let auto_delete = user_settings.auto_delete_enabled;
 
     let folders = local_folders(&Folder::get_all_by_user(user_id).await.unwrap_or_default());
+    // Every user's folders, so a file in someone else's folder that overlaps
+    // one of the user's is left to its owner.
+    let everyones_folders = if auto_delete {
+        PolicyRows::load().await?.inputs().0
+    } else {
+        Vec::new()
+    };
     let navidrome_music_path = std::env::var("NAVIDROME_MUSIC_PATH").ok();
 
     let mut real_path_failures = 0u32;
@@ -107,6 +114,18 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                                 &folders,
                                 navidrome_music_path.as_deref(),
                             ) {
+                                LocalPath::Found { path, .. }
+                                    if !deepest_folder_is_own(
+                                        &path,
+                                        &everyones_folders,
+                                        user_id,
+                                    ) =>
+                                {
+                                    info!(
+                                        "Auto-delete skipped (in another user's folder): {}",
+                                        path.display()
+                                    );
+                                }
                                 LocalPath::Found { path, folder } => {
                                     if let Err(e) = tokio::fs::remove_file(&path).await {
                                         warn!("Auto-delete failed for {}: {}", path.display(), e);

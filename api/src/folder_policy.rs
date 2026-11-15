@@ -147,7 +147,6 @@ pub fn overlap(a: &Path, b: &Path) -> Option<Overlap> {
 #[cfg(feature = "server")]
 #[derive(Clone, Debug)]
 pub struct PolicyFolder {
-    pub id: String,
     pub user_id: String,
     pub owner_is_admin: bool,
     pub path: Result<PathBuf, String>,
@@ -253,6 +252,28 @@ pub fn check_folder_update(
     check_folder_path(candidate, actor, folders, roots)
 }
 
+/// Whether `actor` owns the deepest stored folder, of any user, that holds
+/// the canonical file `path`. A file that sits in someone else's folder,
+/// nested in or shared over the actor's, is theirs to remove, not the
+/// actor's; when folders of several owners tie, it belongs to none alone.
+#[cfg(feature = "server")]
+pub fn deepest_folder_is_own(path: &Path, folders: &[PolicyFolder], actor: &str) -> bool {
+    let holding: Vec<(&PolicyFolder, usize)> = folders
+        .iter()
+        .filter_map(|f| {
+            let folder = f.path.as_ref().ok()?;
+            (path != folder && path.starts_with(folder)).then(|| (f, folder.components().count()))
+        })
+        .collect();
+    let Some(deepest) = holding.iter().map(|(_, depth)| *depth).max() else {
+        return false;
+    };
+    holding
+        .iter()
+        .filter(|(_, depth)| *depth == deepest)
+        .all(|(f, _)| f.user_id == actor)
+}
+
 /// Every stored folder that breaks the rules today, for admins to sort out.
 /// Folders are named by their index in `folders`.
 #[cfg(feature = "server")]
@@ -312,7 +333,6 @@ pub(crate) fn policy_inputs(
         .map(|f| PolicyFolder {
             owner_is_admin: f.owner_role.is_admin(),
             path: canonical_folder_path(Path::new(&f.folder.path)).map_err(|e| e.to_string()),
-            id: f.folder.id.clone(),
             user_id: f.folder.user_id.clone(),
             shared: f.folder.shared,
         })
@@ -405,9 +425,8 @@ mod tests {
     use crate::auth::Role;
     use std::os::unix::fs::symlink;
 
-    fn pf(id: &str, user: &str, admin: bool, path: &Path, shared: bool) -> PolicyFolder {
+    fn pf(user: &str, admin: bool, path: &Path, shared: bool) -> PolicyFolder {
         PolicyFolder {
-            id: id.to_string(),
             user_id: user.to_string(),
             owner_is_admin: admin,
             path: Ok(path.to_path_buf()),
@@ -501,7 +520,7 @@ mod tests {
     #[test]
     fn equal_containing_and_inside_paths_of_another_user_are_refused() {
         let (_dir, tmp) = tmp();
-        let folders = [pf("bob", "b", false, &tmp.join("music/bob"), false)];
+        let folders = [pf("b", false, &tmp.join("music/bob"), false)];
         let roots = [tmp.clone()];
         let me = actor("a", Role::User);
         let check = |p: &str| check_folder_path(&tmp.join(p), &me, &folders, &roots);
@@ -524,7 +543,7 @@ mod tests {
     #[test]
     fn a_shared_folder_may_be_overlapped() {
         let (_dir, tmp) = tmp();
-        let folders = [pf("bob", "b", false, &tmp.join("music/bob"), true)];
+        let folders = [pf("b", false, &tmp.join("music/bob"), true)];
         let roots = [tmp.clone()];
         let me = actor("a", Role::User);
 
@@ -539,7 +558,7 @@ mod tests {
     #[test]
     fn own_folders_may_overlap() {
         let (_dir, tmp) = tmp();
-        let folders = [pf("mine", "a", false, &tmp.join("music"), false)];
+        let folders = [pf("a", false, &tmp.join("music"), false)];
         let roots = [tmp.clone()];
 
         assert_eq!(
@@ -632,7 +651,7 @@ mod tests {
         let (_dir, tmp) = tmp();
         std::fs::create_dir_all(tmp.join("music/bob")).unwrap();
         symlink(tmp.join("music/bob"), tmp.join("mine")).unwrap();
-        let folders = [pf("bob", "b", false, &tmp.join("music/bob"), false)];
+        let folders = [pf("b", false, &tmp.join("music/bob"), false)];
         let roots = [tmp.clone()];
         let candidate = canonical_folder_path(&tmp.join("mine")).unwrap();
 
@@ -643,11 +662,44 @@ mod tests {
     }
 
     #[test]
+    fn a_file_in_another_users_nested_folder_is_not_the_actors() {
+        // Alice shared /music; Bob has /music/bob inside it.
+        let (_dir, tmp) = tmp();
+        let folders = [
+            pf("alice", false, &tmp.join("music"), true),
+            pf("bob", false, &tmp.join("music/bob"), false),
+        ];
+        let bobs_file = tmp.join("music/bob/B/y.flac");
+        let alices_file = tmp.join("music/alice/A/x.flac");
+        assert!(!deepest_folder_is_own(&bobs_file, &folders, "alice"));
+        assert!(deepest_folder_is_own(&bobs_file, &folders, "bob"));
+        assert!(deepest_folder_is_own(&alices_file, &folders, "alice"));
+        assert!(!deepest_folder_is_own(&alices_file, &folders, "bob"));
+        assert!(!deepest_folder_is_own(
+            &tmp.join("elsewhere/z.flac"),
+            &folders,
+            "alice"
+        ));
+    }
+
+    #[test]
+    fn a_file_in_a_folder_two_users_share_is_neither_ones_alone() {
+        let (_dir, tmp) = tmp();
+        let folders = [
+            pf("alice", false, &tmp.join("music"), true),
+            pf("bob", false, &tmp.join("music"), false),
+        ];
+        let file = tmp.join("music/x.flac");
+        assert!(!deepest_folder_is_own(&file, &folders, "alice"));
+        assert!(!deepest_folder_is_own(&file, &folders, "bob"));
+    }
+
+    #[test]
     fn an_unresolvable_folder_blocks_the_check() {
         let (_dir, tmp) = tmp();
         let folders = [PolicyFolder {
             path: Err("permission denied".to_string()),
-            ..pf("bob", "b", false, &tmp, false)
+            ..pf("b", false, &tmp, false)
         }];
         let roots = [tmp.clone()];
 
@@ -667,7 +719,7 @@ mod tests {
         let (_dir, tmp) = tmp();
         let folders = [PolicyFolder {
             path: Err("permission denied".to_string()),
-            ..pf("bob", "b", false, &tmp, true)
+            ..pf("b", false, &tmp, true)
         }];
         let roots = [tmp.clone()];
 
@@ -687,8 +739,8 @@ mod tests {
         // Upgraded install: the admin's /music and Bob's /music/bob, no root.
         let (_dir, tmp) = tmp();
         let folders = [
-            pf("admin", "z", true, &tmp.join("music"), false),
-            pf("bob", "b", false, &tmp.join("music/bob"), false),
+            pf("z", true, &tmp.join("music"), false),
+            pf("b", false, &tmp.join("music/bob"), false),
         ];
         let bob = actor("b", Role::User);
         let stored = format!("{}/music/bob/", tmp.display());
@@ -717,8 +769,8 @@ mod tests {
     fn conflicts_list_existing_overlaps_and_rootless_folders() {
         let (_dir, tmp) = tmp();
         let roots = [tmp.join("music")];
-        let a = pf("fa", "a", true, &tmp.join("music"), false);
-        let b = pf("fb", "b", false, &tmp.join("music/b"), false);
+        let a = pf("a", true, &tmp.join("music"), false);
+        let b = pf("b", false, &tmp.join("music/b"), false);
 
         assert_eq!(
             folder_conflicts(&[a.clone(), b.clone()], &roots),
@@ -737,8 +789,8 @@ mod tests {
         let shared_a = PolicyFolder { shared: true, ..a };
         assert_eq!(folder_conflicts(&[shared_a, b], &roots), vec![]);
 
-        let c = pf("fc", "c", false, &tmp.join("other"), false);
-        let at_root = pf("fd", "d", false, &tmp.join("music"), false);
+        let c = pf("c", false, &tmp.join("other"), false);
+        let at_root = pf("d", false, &tmp.join("music"), false);
         assert_eq!(
             folder_conflicts(&[c, at_root], &roots),
             vec![
@@ -758,11 +810,11 @@ mod tests {
     fn conflicts_report_equal_and_unresolvable_folders() {
         let (_dir, tmp) = tmp();
         let roots = [tmp.clone()];
-        let a = pf("fa", "a", false, &tmp.join("music"), false);
-        let b = pf("fb", "b", false, &tmp.join("music"), false);
+        let a = pf("a", false, &tmp.join("music"), false);
+        let b = pf("b", false, &tmp.join("music"), false);
         let broken = PolicyFolder {
             path: Err("permission denied".to_string()),
-            ..pf("fx", "x", false, &tmp, false)
+            ..pf("x", false, &tmp, false)
         };
 
         assert_eq!(
