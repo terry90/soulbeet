@@ -71,10 +71,11 @@ const MAX_INVALID_RESPONSES: u32 = 15;
 const BACKEND_STALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long a failed transfer state must persist before it is treated as
-/// final. slskd 0.26 auto-retries failed downloads (3 attempts by default):
-/// the failed state is persisted only briefly before the retry re-queues
-/// the transfer as "Queued, Locally". Acting on a single sighting would
-/// abandon a transfer slskd is about to retry.
+/// final. The backend already reads a failed attempt it knows will be
+/// retried as queued; this window covers a failed sighting the backend
+/// replaces anyway, such as a slskd retry beyond the limit the client read
+/// before slskd's limit was raised. Acting on a single sighting would
+/// abandon that transfer.
 ///
 /// Shared with discovery's poll loop, which waits on the same transfers and
 /// so must judge them by the same rule.

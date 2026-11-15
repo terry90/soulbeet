@@ -1200,18 +1200,20 @@ impl crate::DownloadBackend for SoulseekClient {
     ) -> Result<Vec<shared::download::DownloadProgress>> {
         let limit = self.retry_limit().await?;
         let entries = self.get_downloads_for_users(sources).await?;
+        let now = chrono::Utc::now();
         Ok(entries
             .into_iter()
-            .map(|e| e.into_progress(limit))
+            .map(|e| e.into_progress(limit, now))
             .collect())
     }
 
     async fn get_downloads(&self) -> Result<Vec<shared::download::DownloadProgress>> {
         let limit = self.retry_limit().await?;
         let entries = self.get_all_downloads().await?;
+        let now = chrono::Utc::now();
         Ok(entries
             .into_iter()
-            .map(|e| e.into_progress(limit))
+            .map(|e| e.into_progress(limit, now))
             .collect())
     }
 

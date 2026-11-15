@@ -141,12 +141,14 @@ const BEHAVIOR_PLANS: Record<EnqueueableBehavior, TransferStep[]> = {
       attempts: 3,
     },
   ],
-  // slskd 0.26 auto-retry: a failed attempt is briefly persisted as
-  // "Completed, Errored" before onRetry re-queues the transfer. The failed
-  // dwell (2s) must stay under the monitor's FAILED_STATE_CONFIRM window
-  // (4s) so a correct monitor rides the flap out and imports the file; a
-  // monitor acting on a single failed sighting abandons the transfer and
-  // the import assertion in the spec fails.
+  // A failed sighting slskd replaces with a retry that soulbeet cannot read
+  // as one: an attempt fails at the retry limit the options route reports
+  // (3), and slskd retries anyway because its limit was raised after
+  // soulbeet read it. The failed dwell (2s) must stay under the
+  // monitor's FAILED_STATE_CONFIRM window (4s) so a correct monitor rides
+  // it out and imports the file; a monitor acting on a single failed
+  // sighting abandons the transfer and the import assertion in the spec
+  // fails.
   retryflap: [
     { afterMs: 0, state: 'Queued, Locally', percent: 0 },
     { afterMs: 100, state: 'Requested', percent: 0, attempts: 1 },
@@ -157,8 +159,9 @@ const BEHAVIOR_PLANS: Record<EnqueueableBehavior, TransferStep[]> = {
       state: 'Completed, Errored',
       percent: 40,
       exception: 'Connection reset by peer',
+      attempts: 3,
     },
-    { afterMs: 7300, state: 'Queued, Locally', percent: 40, attempts: 2 },
+    { afterMs: 7300, state: 'Queued, Locally', percent: 40, attempts: 4 },
     { afterMs: 9000, state: 'InProgress', percent: 80 },
     { afterMs: 10500, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
   ],
