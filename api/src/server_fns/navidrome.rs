@@ -598,31 +598,52 @@ pub(crate) async fn owned_discovery_track(
     user_id: &str,
     stage: Stage,
 ) -> Result<(DiscoveryTrack, Folder), Failure> {
-    let track = DiscoveryTrackRow::get_by_id(track_id)
+    owned_discovery_track_in(&crate::db::DB, track_id, user_id, stage).await
+}
+
+#[cfg(feature = "server")]
+async fn owned_discovery_track_in(
+    db: &sqlx::SqlitePool,
+    track_id: &str,
+    user_id: &str,
+    stage: Stage,
+) -> Result<(DiscoveryTrack, Folder), Failure> {
+    let track = DiscoveryTrackRow::get_by_id_in(db, track_id)
         .await
         .map_err(|e| database_failure(stage, e))?
         .ok_or_else(discovery_track_not_found)?;
-    let folder = Folder::get_by_id(&track.folder_id)
+    let folder = Folder::get_by_id_in(db, &track.folder_id)
         .await
         .map_err(|e| database_failure(stage, e))?;
     let folder = track_folder_of(folder, user_id)?;
     Ok((track, folder))
 }
 
+/// `owned_discovery_track` for a promote, which then marks the track
+/// Promoting: `promote_not_pending` when it is not Pending. The owner is
+/// checked first, so another user's track is never left promoting.
 #[cfg(feature = "server")]
-async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), Failure> {
-    use crate::models::discovery_history::DiscoveryHistoryRow;
-
-    // Check the owner before claiming, so another user's track is never left promoting.
-    let (track, folder) = owned_discovery_track(track_id, user_id, Stage::Import).await?;
-
+async fn claim_for_promote_in(
+    db: &sqlx::SqlitePool,
+    track_id: &str,
+    user_id: &str,
+) -> Result<(DiscoveryTrack, Folder), Failure> {
+    let owned = owned_discovery_track_in(db, track_id, user_id, Stage::Import).await?;
     // CAS guard: only one caller can promote a given track
-    if !DiscoveryTrackRow::try_set_promoting(track_id)
+    if !DiscoveryTrackRow::try_set_promoting_in(db, track_id)
         .await
         .map_err(|e| database_failure(Stage::Import, e))?
     {
         return Err(promote_not_pending());
     }
+    Ok(owned)
+}
+
+#[cfg(feature = "server")]
+async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), Failure> {
+    use crate::models::discovery_history::DiscoveryHistoryRow;
+
+    let (track, folder) = claim_for_promote_in(&crate::db::DB, track_id, user_id).await?;
 
     let src = std::path::PathBuf::from(&track.path);
     if !src.exists() {
@@ -710,6 +731,36 @@ mod tests {
             std::fs::write(&path, b"audio").unwrap();
         }
         (dir, tmp)
+    }
+
+    #[tokio::test]
+    async fn another_users_track_is_refused_before_it_is_claimed() {
+        let db = crate::db::test_db::migrated().await;
+        let folder = crate::core::folder_of(&db, "alice").await;
+        sqlx::query(
+            "INSERT INTO discovery_tracks (id, title, artist, album, path, folder_id)
+             VALUES ('t1', 'Wake Up', 'Kowloon', 'Come Over', '/music/alice/x.flac', ?)",
+        )
+        .bind(&folder)
+        .execute(&db)
+        .await
+        .unwrap();
+        let claim = |user: &'static str| {
+            let db = db.clone();
+            async move {
+                claim_for_promote_in(&db, "t1", user)
+                    .await
+                    .map(|(track, folder)| (track.id, folder.user_id))
+            }
+        };
+
+        assert_eq!(claim("bob").await, Err(not_your_track()));
+        // Still Pending, so its owner can promote it.
+        assert_eq!(
+            claim("alice").await,
+            Ok(("t1".to_string(), "alice".to_string()))
+        );
+        assert_eq!(claim("alice").await, Err(promote_not_pending()));
     }
 
     #[test]

@@ -120,10 +120,17 @@ impl DiscoveryTrackRow {
     }
 
     pub async fn get_by_id(id: &str) -> Result<Option<DiscoveryTrack>, String> {
+        Self::get_by_id_in(&DB, id).await
+    }
+
+    pub(crate) async fn get_by_id_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+    ) -> Result<Option<DiscoveryTrack>, String> {
         let row =
             sqlx::query_as::<_, DiscoveryTrackRow>("SELECT * FROM discovery_tracks WHERE id = ?")
                 .bind(id)
-                .fetch_optional(&*DB)
+                .fetch_optional(db)
                 .await
                 .map_err(|e| e.to_string())?;
         Ok(row.map(Into::into))
@@ -171,12 +178,15 @@ impl DiscoveryTrackRow {
     /// Atomically set status to Promoting if currently Pending.
     /// Returns Ok(true) if the CAS succeeded (this caller owns the promote),
     /// Ok(false) if another caller already changed the status.
-    pub async fn try_set_promoting(id: &str) -> Result<bool, String> {
+    pub(crate) async fn try_set_promoting_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+    ) -> Result<bool, String> {
         let result = sqlx::query(
             "UPDATE discovery_tracks SET status = 'Promoting' WHERE id = ? AND status = 'Pending'",
         )
         .bind(id)
-        .execute(&*DB)
+        .execute(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(result.rows_affected() == 1)
