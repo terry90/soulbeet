@@ -1856,7 +1856,7 @@ mod tests {
         assert_eq!((f.code, f.message), no_file);
         assert_eq!(lib.fake.ratings_set(), vec![]);
         let checked = library_verdict(lib.guard().check_song(&lib.alice(), "s2").await);
-        assert_eq!(checked.path, canonical(&lib, "music/alice/A/y.flac"));
+        assert_eq!(checked.path, canonical(lib, "music/alice/A/y.flac"));
         assert!(
             lib.root.join("mirror/alice/A/x.flac").exists()
                 && lib.root.join("mirror/alice/A/y.flac").exists()
