@@ -88,6 +88,14 @@ impl UserAction {
         }
     }
 
+    pub fn fix_importer(message: &str) -> Self {
+        Self {
+            code: UserActionCode::FixImporter,
+            what: format!("Fix the beets setup: {message}"),
+            where_: "Settings > Config".to_string(),
+        }
+    }
+
     pub fn upgrade_backend() -> Self {
         Self {
             code: UserActionCode::UpgradeBackend,
@@ -373,6 +381,17 @@ mod tests {
                 "slskd"
             )
         );
+    }
+
+    #[test]
+    fn fix_importer_carries_the_message() {
+        let a = UserAction::fix_importer("No metadata source plugin loaded");
+        assert_eq!(a.code, UserActionCode::FixImporter);
+        assert_eq!(
+            a.what,
+            "Fix the beets setup: No metadata source plugin loaded"
+        );
+        assert_eq!(a.where_, "Settings > Config");
     }
 
     #[test]

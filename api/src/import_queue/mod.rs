@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, MatchChoices};
 use soulbeet::audio::{count_audio_files, is_audio_path};
-use soulbeet::{DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter};
+use soulbeet::{DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, MusicImporter};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -99,7 +99,9 @@ impl ImportHandle {
             },
             Err(_) => None,
         };
-        done.unwrap_or_else(|| JobOutcome::of(ImportResult::failed(WORKER_STOPPED.into())))
+        done.unwrap_or_else(|| {
+            JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
+        })
     }
 }
 
@@ -156,8 +158,10 @@ impl ImportQueue {
         let key = match canonical_target(&job.target).await {
             Ok(key) => key,
             Err(e) => {
-                let result =
-                    ImportResult::failed(format!("Could not create {}: {e}", job.target.display()));
+                let result = ImportResult::failed(
+                    FailKind::TargetUnwritable,
+                    format!("Could not create {}: {e}", job.target.display()),
+                );
                 let (state, rx) = watch::channel(JobState::Running);
                 self.shared
                     .finish(&job, JobOutcome::of(result), &state)
@@ -247,7 +251,7 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
             .await
             .unwrap_or_else(|_| {
                 warn!("Import into {} panicked", key.display());
-                JobOutcome::of(ImportResult::failed(WORKER_STOPPED.into()))
+                JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
             });
         shared.finish(&job, outcome, &state).await;
     }
@@ -298,7 +302,7 @@ impl Shared {
         }
         let importer = match self.deps.importer().await {
             Ok(importer) => importer,
-            Err(e) => return JobOutcome::of(ImportResult::failed(e)),
+            Err(e) => return JobOutcome::of(ImportResult::failed(FailKind::Setup, e)),
         };
         if let Some(issue) = crate::importer_health::refusal(importer.as_ref()).await {
             return JobOutcome::of(ImportResult::refused(issue));
@@ -620,7 +624,7 @@ mod tests {
         let first = finish(queue.submit(job(source.clone(), &lib)).await).await;
         assert_eq!(
             first.result,
-            ImportResult::failed("import worker stopped".into())
+            ImportResult::failed(FailKind::Beets, "import worker stopped".into())
         );
 
         let second = finish(queue.submit(job(source, &lib)).await).await;
@@ -723,7 +727,10 @@ mod tests {
     async fn a_failed_import_reports_to_the_owners_id() {
         let tmp = tempfile::tempdir().unwrap();
         let (queue, stub, deps) = queue(StubImporter::new());
-        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        stub.script(ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ));
         let alice = alice();
         let failing = owned(
             job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
@@ -745,7 +752,7 @@ mod tests {
 
         assert_eq!(
             outcome.result,
-            ImportResult::failed("import worker stopped".into())
+            ImportResult::failed(FailKind::Beets, "import worker stopped".into())
         );
         assert!(outcome.new_files.is_empty());
     }

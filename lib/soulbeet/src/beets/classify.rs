@@ -4,7 +4,9 @@
 //! and the `--log` run log are used, never adjacency across streams.
 
 use crate::beets::runner::{strip_ansi, RunEnd, RunLimits, Stream};
-use crate::{ImportMode, ImportOutcome, ImportResult, SkipReason, TaskCount, TimeoutKind};
+use crate::{
+    FailKind, ImportMode, ImportOutcome, ImportResult, SkipReason, TaskCount, TimeoutKind,
+};
 use regex::Regex;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::LazyLock;
@@ -242,6 +244,7 @@ impl Classifier {
         let tasks = self.tasks;
         let outcome = match end {
             RunEnd::SpawnFailed(e) => ImportOutcome::Failed {
+                kind: FailKind::Setup,
                 message: format!("Could not start beets: {e}"),
             },
             RunEnd::Idle => ImportOutcome::TimedOut {
@@ -260,7 +263,10 @@ impl Classifier {
                         (None, None) => format!("beets exited with {status}"),
                     }
                 });
-                ImportOutcome::Failed { message }
+                ImportOutcome::Failed {
+                    kind: FailKind::Beets,
+                    message,
+                }
             }
             RunEnd::Exited(_) => self.exited_cleanly(run_log),
         };
@@ -298,6 +304,7 @@ impl Classifier {
             }
             // Tasks ran, none was applied, and beets gave no reason.
             return ImportOutcome::Failed {
+                kind: FailKind::Beets,
                 message: "beets finished without importing anything".to_string(),
             };
         }
@@ -644,6 +651,7 @@ mod tests {
             assert_eq!(
                 result.outcome,
                 ImportOutcome::Failed {
+                    kind: FailKind::Beets,
                     message: line.to_string()
                 }
             );
@@ -652,7 +660,7 @@ mod tests {
 
         let readonly = classify(fixture!("readonly_target"), false);
         assert!(
-            matches!(&readonly.outcome, ImportOutcome::Failed { message } if message.starts_with("Error:")),
+            matches!(&readonly.outcome, ImportOutcome::Failed { kind: FailKind::Beets, message } if message.starts_with("Error:")),
             "{:?}",
             readonly.outcome
         );
@@ -665,6 +673,7 @@ mod tests {
         assert_eq!(
             classify(f, false).outcome,
             ImportOutcome::Failed {
+                kind: FailKind::Beets,
                 message: "TypeError: simulated crash in import stage".to_string()
             }
         );
@@ -762,6 +771,7 @@ mod tests {
         assert_eq!(
             result.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::Beets,
                 message: "beets exited with code 2".to_string()
             }
         );
@@ -849,6 +859,7 @@ mod tests {
         assert_eq!(
             result.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::Beets,
                 message: "beets finished without importing anything".to_string()
             }
         );
@@ -916,7 +927,10 @@ mod tests {
             ImportResult::refused("beets cannot start".into()).to_string(),
             "beets cannot start"
         );
-        assert_eq!(ImportResult::failed("boom".into()).to_string(), "boom");
+        assert_eq!(
+            ImportResult::failed(FailKind::Beets, "boom".into()).to_string(),
+            "boom"
+        );
         assert_eq!(ImportResult::nothing_to_import().outcome, NOTHING);
     }
 }

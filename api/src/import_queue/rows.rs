@@ -2,8 +2,9 @@
 
 use super::retry::keeps_retry;
 use super::{ImportJob, JobOutcome};
-use shared::download::{DownloadProgress, DownloadState};
-use soulbeet::{ImportMode, ImportOutcome};
+use shared::download::{DownloadProgress, DownloadState, SkipKind};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage, UserAction};
+use soulbeet::{FailKind, ImportMode, ImportOutcome, ImportResult, SkipReason, TimeoutKind};
 
 pub fn row_state(outcome: &ImportOutcome) -> DownloadState {
     match outcome {
@@ -16,16 +17,77 @@ pub fn row_state(outcome: &ImportOutcome) -> DownloadState {
     }
 }
 
+/// The typed failure for an import outcome that is not a success. Its message
+/// is the result's text, so a row shows what it always showed.
+fn import_failure(result: &ImportResult) -> Option<Failure> {
+    let (code, retry) = match &result.outcome {
+        ImportOutcome::Imported { .. } => return None,
+        ImportOutcome::Skipped(SkipReason::AlreadyInLibrary) => (
+            FailureCode::ImportAlreadyInLibrary,
+            RetryAdvice::NotRetryable,
+        ),
+        ImportOutcome::Skipped(SkipReason::NoMatch { .. }) => {
+            (FailureCode::ImportNoMatch, RetryAdvice::NeedsDecision)
+        }
+        ImportOutcome::Skipped(SkipReason::NothingToImport) => (
+            FailureCode::ImportNothingToImport,
+            RetryAdvice::NotRetryable,
+        ),
+        ImportOutcome::LookupFailed { .. } => (
+            FailureCode::ImportLookupFailed,
+            RetryAdvice::SameSourceLater,
+        ),
+        ImportOutcome::TimedOut {
+            limit: TimeoutKind::Idle(_),
+            ..
+        } => (FailureCode::ImportIdleTimeout, RetryAdvice::SameSourceLater),
+        ImportOutcome::TimedOut {
+            limit: TimeoutKind::Total(_),
+            ..
+        } => (
+            FailureCode::ImportTotalTimeout,
+            RetryAdvice::SameSourceLater,
+        ),
+        ImportOutcome::Refused { .. } => (FailureCode::ImporterBroken, RetryAdvice::NeedsUser),
+        ImportOutcome::Failed { kind, .. } => match kind {
+            FailKind::Beets => (FailureCode::ImportBeetsFailed, RetryAdvice::SameSourceLater),
+            FailKind::Setup => (FailureCode::ImporterBroken, RetryAdvice::NeedsUser),
+            FailKind::TargetUnwritable => (
+                FailureCode::ImportTargetUnwritable,
+                RetryAdvice::NotRetryable,
+            ),
+            FailKind::AsIsMissingTags => (
+                FailureCode::ImportAsIsMissingTags,
+                RetryAdvice::NeedsDecision,
+            ),
+            FailKind::ChoiceInvalid => {
+                (FailureCode::ImportChoiceInvalid, RetryAdvice::NeedsDecision)
+            }
+        },
+    };
+    let message = result.to_string();
+    let mut failure = Failure::new(code, Stage::Import, retry, message.clone());
+    if code == FailureCode::ImporterBroken {
+        failure = failure.with_user_action(UserAction::fix_importer(&message));
+    }
+    if !result.output_tail.is_empty() {
+        failure = failure.with_cause(Service::Beets, None, result.output_tail.clone());
+    }
+    Some(failure)
+}
+
 pub fn rows_with_state(rows: &[DownloadProgress], state: DownloadState) -> Vec<DownloadProgress> {
     rows.iter()
         .map(|row| DownloadProgress {
             state: state.clone(),
+            failure: None,
+            skip: None,
             ..row.clone()
         })
         .collect()
 }
 
-/// The rows of a finished job: the outcome text as the error, the folder the
+/// The rows of a finished job: the outcome's failure and text, the folder the
 /// files were kept in when a retry is kept for them, whether that retry can
 /// pick a match, and the output tail on the first row only.
 pub fn rows_for_done(
@@ -52,17 +114,28 @@ pub fn rows_for_done(
     let can_choose_import = retryable && job.choices.is_some();
     let local_path = retryable.then(|| kept_in(job)).flatten();
     let output = (!result.output_tail.is_empty()).then(|| result.output_tail.clone());
+    let skip = match &result.outcome {
+        ImportOutcome::Skipped(reason) => Some(SkipKind::from(reason)),
+        _ => None,
+    };
+    let failure = import_failure(result);
     rows.iter()
         .enumerate()
         .map(|(i, row)| {
-            DownloadProgress {
+            let built = DownloadProgress {
                 state: state.clone(),
                 error: error.clone(),
+                failure: None,
+                skip,
                 retryable,
                 can_choose_import,
                 ..row.clone()
             }
-            .with_import_details(local_path.clone(), output.clone().filter(|_| i == 0))
+            .with_import_details(local_path.clone(), output.clone().filter(|_| i == 0));
+            match &failure {
+                Some(failure) => built.with_failure(failure.clone()),
+                None => built,
+            }
         })
         .collect()
 }
@@ -82,7 +155,8 @@ mod tests {
     use super::*;
     use crate::import_queue::test_support::{candidate, imported, no_match, row, track_choices};
     use crate::import_queue::{ImportJob, JobOutcome};
-    use soulbeet::{DriverChoice, ImportMode, ImportResult, SkipReason, TaskCount, TimeoutKind};
+    use shared::failure::UserActionCode;
+    use soulbeet::{DriverChoice, TaskCount};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -120,6 +194,7 @@ mod tests {
                 message: "timed out".into(),
             },
             ImportOutcome::Failed {
+                kind: FailKind::Beets,
                 message: "beets exited with code 1".into(),
             },
             ImportOutcome::TimedOut {
@@ -177,9 +252,14 @@ mod tests {
         );
         for r in &album {
             assert_eq!(r.state, DownloadState::ImportSkipped);
+            let text = "No close match (3 candidates) (0 of 2 imported)";
+            assert_eq!(r.error.as_deref(), Some(text));
+            assert_eq!(r.failure.as_ref().unwrap().message, text);
             assert_eq!(
-                r.error.as_deref(),
-                Some("No close match (3 candidates) (0 of 2 imported)")
+                r.skip,
+                Some(SkipKind::NoMatch {
+                    candidates: Some(3)
+                })
             );
             assert_eq!(r.local_path.as_deref(), Some("/dl/X [12345678]"));
             assert!(r.retryable);
@@ -189,6 +269,7 @@ mod tests {
 
         let failed = ImportResult {
             outcome: ImportOutcome::Failed {
+                kind: FailKind::Beets,
                 message: "beets exited with code 1".into(),
             },
             ..skipped
@@ -204,6 +285,11 @@ mod tests {
         );
         assert_eq!(single[0].local_path.as_deref(), Some("/dl/X [12345678]"));
         assert!(single[0].retryable);
+        assert_eq!(
+            single[0].failure.as_ref().unwrap().code,
+            FailureCode::ImportBeetsFailed
+        );
+        assert_eq!(single[0].skip, None);
 
         let ok = rows_for_done(
             &rows,
@@ -213,6 +299,7 @@ mod tests {
         for r in &ok {
             assert_eq!(r.state, DownloadState::Imported);
             assert_eq!(r.error, None);
+            assert_eq!((&r.failure, r.skip), (&None, None));
             assert_eq!(r.local_path, None);
             assert!(!r.retryable);
         }
@@ -235,6 +322,154 @@ mod tests {
             ok[0].error.as_deref(),
             Some("Imported as-is (untagged); 1 file(s) were not imported")
         );
+        assert_eq!(ok[0].failure, None);
+    }
+
+    #[test]
+    fn import_failure_codes_every_outcome() {
+        let run = |outcome| ImportResult {
+            outcome,
+            output_tail: "tail".into(),
+            tasks: TaskCount {
+                imported: 0,
+                total: 1,
+            },
+            choices: None,
+        };
+        let cases = [
+            (
+                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary),
+                FailureCode::ImportAlreadyInLibrary,
+                RetryAdvice::NotRetryable,
+            ),
+            (
+                ImportOutcome::Skipped(SkipReason::NoMatch {
+                    candidates: Some(2),
+                }),
+                FailureCode::ImportNoMatch,
+                RetryAdvice::NeedsDecision,
+            ),
+            (
+                ImportOutcome::Skipped(SkipReason::NothingToImport),
+                FailureCode::ImportNothingToImport,
+                RetryAdvice::NotRetryable,
+            ),
+            (
+                ImportOutcome::LookupFailed {
+                    source: "MusicBrainz".into(),
+                    message: "timed out".into(),
+                },
+                FailureCode::ImportLookupFailed,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                ImportOutcome::TimedOut {
+                    limit: TimeoutKind::Idle(Duration::from_secs(180)),
+                    last_line: None,
+                },
+                FailureCode::ImportIdleTimeout,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                ImportOutcome::TimedOut {
+                    limit: TimeoutKind::Total(Duration::from_secs(1800)),
+                    last_line: None,
+                },
+                FailureCode::ImportTotalTimeout,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                ImportOutcome::Refused {
+                    issue: "No metadata source plugin loaded".into(),
+                },
+                FailureCode::ImporterBroken,
+                RetryAdvice::NeedsUser,
+            ),
+            (
+                ImportOutcome::Failed {
+                    kind: FailKind::Beets,
+                    message: "beets exited with code 1".into(),
+                },
+                FailureCode::ImportBeetsFailed,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                ImportOutcome::Failed {
+                    kind: FailKind::Setup,
+                    message: "Could not start beets: x".into(),
+                },
+                FailureCode::ImporterBroken,
+                RetryAdvice::NeedsUser,
+            ),
+            (
+                ImportOutcome::Failed {
+                    kind: FailKind::TargetUnwritable,
+                    message: "Could not create /m: x".into(),
+                },
+                FailureCode::ImportTargetUnwritable,
+                RetryAdvice::NotRetryable,
+            ),
+            (
+                ImportOutcome::Failed {
+                    kind: FailKind::AsIsMissingTags,
+                    message: "Import as-is needs tags".into(),
+                },
+                FailureCode::ImportAsIsMissingTags,
+                RetryAdvice::NeedsDecision,
+            ),
+            (
+                ImportOutcome::Failed {
+                    kind: FailKind::ChoiceInvalid,
+                    message: "FakeSrc has no recording w1".into(),
+                },
+                FailureCode::ImportChoiceInvalid,
+                RetryAdvice::NeedsDecision,
+            ),
+        ];
+        for (outcome, code, retry) in cases {
+            let result = run(outcome);
+            let f = import_failure(&result).expect("a failure");
+            assert_eq!(
+                (f.code, f.retry, f.stage),
+                (code, retry, Stage::Import),
+                "{:?}",
+                result.outcome
+            );
+            assert_eq!(f.message, result.to_string());
+            assert_eq!(f.cause.unwrap().raw, "tail");
+        }
+        assert_eq!(import_failure(&imported()), None);
+        let refused = import_failure(&run(ImportOutcome::Refused {
+            issue: "No metadata source plugin loaded".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            refused.user_action.unwrap().code,
+            UserActionCode::FixImporter
+        );
+    }
+
+    #[test]
+    fn an_imported_result_clears_an_earlier_failure_and_skip() {
+        let earlier = import_failure(&ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ))
+        .unwrap();
+        let stale = DownloadProgress {
+            skip: Some(SkipKind::AlreadyInLibrary),
+            ..row("a").with_failure(earlier)
+        };
+        let rows = rows_for_done(
+            &[stale],
+            &job("/dl/a.flac", ImportMode::Singleton),
+            &done(imported()),
+        );
+        assert_eq!(rows[0].state, DownloadState::Imported);
+        assert_eq!(
+            (&rows[0].failure, rows[0].skip, &rows[0].error),
+            (&None, None, &None)
+        );
     }
 
     #[test]
@@ -249,7 +484,10 @@ mod tests {
         assert!(choosable(&with_choices, no_match(1)));
         assert!(choosable(
             &with_choices,
-            ImportResult::failed("FakeSrc has no recording w1".into())
+            ImportResult::failed(
+                FailKind::ChoiceInvalid,
+                "FakeSrc has no recording w1".into()
+            )
         ));
         assert!(!choosable(&with_choices, imported()));
         assert!(!choosable(
@@ -283,5 +521,17 @@ mod tests {
                 ..waiting
             }]
         );
+
+        let earlier = import_failure(&ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ))
+        .unwrap();
+        let stale = DownloadProgress {
+            skip: Some(SkipKind::AlreadyInLibrary),
+            ..row("a").with_failure(earlier)
+        };
+        let rows = rows_with_state(&[stale], DownloadState::Importing);
+        assert_eq!((&rows[0].failure, rows[0].skip), (&None, None));
     }
 }

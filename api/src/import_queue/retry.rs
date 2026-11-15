@@ -197,7 +197,7 @@ mod tests {
     use shared::download::{
         DownloadProgress, DownloadState, ImportChoice, KeptImport, MatchChoices,
     };
-    use soulbeet::{DriverChoice, ImportResult};
+    use soulbeet::{DriverChoice, FailKind, ImportResult};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -345,7 +345,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (queue, stub, deps, _) = skipped(tmp.path()).await;
 
-        stub.script(ImportResult::failed("FakeSrc has no recording w1".into()));
+        stub.script(ImportResult::failed(
+            FailKind::ChoiceInvalid,
+            "FakeSrc has no recording w1".into(),
+        ));
         let pick = ImportChoice::Candidate {
             data_source: "FakeSrc".into(),
             id: "w1".into(),
@@ -355,12 +358,18 @@ mod tests {
         assert!(failed_pick.retryable && failed_pick.can_choose_import);
         assert_eq!(queue.import_choices(&alice(), "a"), Ok(found()));
 
-        stub.script(ImportResult::failed("Import as-is needs tags".into()));
+        stub.script(ImportResult::failed(
+            FailKind::AsIsMissingTags,
+            "Import as-is needs tags".into(),
+        ));
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::AsIs).await, Ok(()));
         assert!(done_row(&deps, "a", 3).await.can_choose_import);
 
         // An automatic run that ends some other way leaves nothing to pick.
-        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        stub.script(ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ));
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
         let failed_auto = done_row(&deps, "a", 4).await;
         assert!(failed_auto.retryable && !failed_auto.can_choose_import);
@@ -429,7 +438,10 @@ mod tests {
             Err(Refusal::nothing_to_retry())
         );
 
-        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        stub.script(ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ));
         let failing = owned(
             job(file(tmp.path(), "dl/b.flac"), &tmp.path().join("lib")),
             &alice(),
@@ -449,7 +461,10 @@ mod tests {
         let album = tmp.path().join("dl/X");
         file(&album, "1.flac");
         let (queue, stub, deps) = queue(StubImporter::new());
-        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        stub.script(ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ));
 
         let mut failing = owned(job(album.clone(), &lib), &alice(), &["a", "b"]);
         failing.mode = ImportMode::Album;
@@ -466,7 +481,10 @@ mod tests {
         );
 
         // An import that succeeds later drops the stored job too.
-        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        stub.script(ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ));
         finish(queue.submit(failing.clone()).await).await;
         finish(queue.submit(failing).await).await;
         assert_eq!(
@@ -502,7 +520,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let source = file(tmp.path(), "dl/a.flac");
         let (queue, stub, _) = queue(StubImporter::new());
-        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        stub.script(ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ));
         let failing = owned(
             job(source.clone(), &tmp.path().join("lib")),
             &alice(),
@@ -528,7 +549,10 @@ mod tests {
         let lib = tmp.path().join("lib");
         let source = file(tmp.path(), "dl/a.flac");
         let (queue, stub, _) = queue(StubImporter::new());
-        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        stub.script(ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ));
         let failing = owned(job(source.clone(), &lib), &alice(), &["a"]);
         finish(queue.submit(failing.clone()).await).await;
         std::fs::remove_file(&source).unwrap();
@@ -552,7 +576,7 @@ mod tests {
         use std::sync::Arc;
 
         let store = RetryStore::default();
-        let failed = ImportResult::failed("beets exited with code 1".into());
+        let failed = ImportResult::failed(FailKind::Beets, "beets exited with code 1".into());
         let record = |user: &UserId, item: &str| {
             let job = ImportJob {
                 sources: vec![PathBuf::from(format!("/dl/{item}.flac"))],
@@ -589,7 +613,10 @@ mod tests {
     async fn a_kept_import_is_found_by_the_owners_id_only() {
         let tmp = tempfile::tempdir().unwrap();
         let (queue, stub, _) = queue(StubImporter::new());
-        stub.script(ImportResult::failed("beets exited with code 1".into()));
+        stub.script(ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ));
         let alice = alice();
         let failing = owned(
             job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
@@ -616,7 +643,10 @@ mod tests {
         let lib = tmp.path().join("lib");
         let (queue, stub, _) = queue(StubImporter::new());
         for item in ["a", "b"] {
-            stub.script(ImportResult::failed("beets exited with code 1".into()));
+            stub.script(ImportResult::failed(
+                FailKind::Beets,
+                "beets exited with code 1".into(),
+            ));
             let failing = owned(
                 job(file(tmp.path(), &format!("dl/{item}.flac")), &lib),
                 &alice(),

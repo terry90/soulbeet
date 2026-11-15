@@ -1,7 +1,7 @@
 //! The report import.py writes after every run: the candidates beets weighed
 //! for each task, and what kept a pick or an as-is import from running.
 
-use crate::{DriverChoice, ImportMode, ImportOutcome, ImportResult, SkipReason};
+use crate::{DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, SkipReason};
 use serde::Deserialize;
 use shared::download::{MatchCandidate, MatchChoices, MatchKind, TrackFit};
 
@@ -138,7 +138,10 @@ impl Report {
         choice: &DriverChoice,
     ) -> ImportResult {
         if let Some(message) = self.refused {
-            result.outcome = ImportOutcome::Failed { message };
+            result.outcome = ImportOutcome::Failed {
+                kind: FailKind::AsIsMissingTags,
+                message,
+            };
             return result;
         }
         // A pick that found nothing and a weak automatic match both end in a
@@ -161,6 +164,7 @@ impl Report {
                     ImportMode::Album => "release",
                 };
                 result.outcome = ImportOutcome::Failed {
+                    kind: FailKind::ChoiceInvalid,
                     message: format!("{data_source} has no {entity} {id}"),
                 };
             }
@@ -356,6 +360,7 @@ mod tests {
         assert_eq!(
             single.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::ChoiceInvalid,
                 message: format!("MusicBrainz has no recording {id}"),
             }
         );
@@ -391,6 +396,7 @@ mod tests {
         assert_eq!(
             applied.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::AsIsMissingTags,
                 message: why.into()
             }
         );

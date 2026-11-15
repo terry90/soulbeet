@@ -9,7 +9,7 @@ pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
 pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 
 use crate::audio::count_audio_files;
-use crate::{DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter};
+use crate::{DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, MusicImporter};
 use classify::{parse_run_log, Classifier};
 use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
 use report::Report;
@@ -180,21 +180,25 @@ impl MusicImporter for BeetsImporter {
         let s = &self.settings;
         let Some(python) = s.python.as_deref() else {
             return ImportResult::failed(
+                FailKind::Setup,
                 "Cannot determine the Python that runs beet. Set BEETS_PYTHON.".into(),
             );
         };
         // beets prompts instead of creating a missing library db directory.
         if let Err(e) = tokio::fs::create_dir_all(target).await {
-            return ImportResult::failed(format!(
-                "Could not create library folder {}: {e}",
-                target.display()
-            ));
+            return ImportResult::failed(
+                FailKind::TargetUnwritable,
+                format!("Could not create library folder {}: {e}", target.display()),
+            );
         }
         let submitted = count_audio_files(sources).await;
         let (run_log, report_file) = match (TempFile::create("log"), TempFile::create("json")) {
             (Ok(log), Ok(report)) => (log, report),
             (Err(e), _) | (_, Err(e)) => {
-                return ImportResult::failed(format!("Could not create the beets run files: {e}"))
+                return ImportResult::failed(
+                    FailKind::Setup,
+                    format!("Could not create the beets run files: {e}"),
+                )
             }
         };
         // -A leaves no marker in beets' output.
@@ -674,6 +678,7 @@ mod tests {
         assert_eq!(
             result.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::ChoiceInvalid,
                 message: format!("MusicBrainz has no recording {id}")
             }
         );
@@ -722,6 +727,7 @@ mod tests {
         assert_eq!(
             result.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::AsIsMissingTags,
                 message: why.into()
             }
         );
@@ -795,6 +801,7 @@ mod tests {
         assert_eq!(
             result.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::Setup,
                 message: "Cannot determine the Python that runs beet. Set BEETS_PYTHON.".into()
             }
         );
@@ -828,6 +835,13 @@ mod tests {
                 &DriverChoice::Auto,
             )
             .await;
+        assert!(matches!(
+            result.outcome,
+            ImportOutcome::Failed {
+                kind: FailKind::TargetUnwritable,
+                ..
+            }
+        ));
         let text = result.to_string();
         assert!(
             text.starts_with(&format!(

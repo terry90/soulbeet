@@ -1549,6 +1549,7 @@ mod tests {
             ),
             (
                 ImportOutcome::Failed {
+                    kind: soulbeet::FailKind::Beets,
                     message: "beets exited with code 1".into(),
                 },
                 DiscoveryImport::Failed,

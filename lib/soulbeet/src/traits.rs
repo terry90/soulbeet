@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use shared::{
-    download::{DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult},
+    download::{
+        DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult, SkipKind,
+    },
     library::DuplicateReport,
     metadata::{Album, AlbumWithTracks, SearchResult as MetadataSearchResult, Track},
     recommendation::{
@@ -93,6 +95,7 @@ pub enum ImportOutcome {
         message: String,
     },
     Failed {
+        kind: FailKind,
         message: String,
     },
     TimedOut {
@@ -105,6 +108,18 @@ pub enum ImportOutcome {
     },
 }
 
+/// What a `Failed` import outcome went wrong with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailKind {
+    /// beets ran and failed, or the import worker stopped.
+    Beets,
+    /// The importer could not be set up or started.
+    Setup,
+    TargetUnwritable,
+    AsIsMissingTags,
+    ChoiceInvalid,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
     AlreadyInLibrary,
@@ -114,6 +129,18 @@ pub enum SkipReason {
         candidates: Option<u32>,
     },
     NothingToImport,
+}
+
+impl From<&SkipReason> for SkipKind {
+    fn from(reason: &SkipReason) -> Self {
+        match reason {
+            SkipReason::AlreadyInLibrary => SkipKind::AlreadyInLibrary,
+            SkipReason::NoMatch { candidates } => SkipKind::NoMatch {
+                candidates: *candidates,
+            },
+            SkipReason::NothingToImport => SkipKind::NothingToImport,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,8 +180,8 @@ impl ImportResult {
         Self::without_run(ImportOutcome::Refused { issue })
     }
 
-    pub fn failed(message: String) -> Self {
-        Self::without_run(ImportOutcome::Failed { message })
+    pub fn failed(kind: FailKind, message: String) -> Self {
+        Self::without_run(ImportOutcome::Failed { kind, message })
     }
 
     pub fn nothing_to_import() -> Self {
@@ -210,7 +237,7 @@ impl fmt::Display for ImportOutcome {
             ImportOutcome::LookupFailed { source, message } => {
                 write!(f, "Lookup failed in {source}: {message}")
             }
-            ImportOutcome::Failed { message } => f.write_str(message),
+            ImportOutcome::Failed { message, .. } => f.write_str(message),
             ImportOutcome::TimedOut {
                 limit: TimeoutKind::Idle(d),
                 last_line: Some(line),
