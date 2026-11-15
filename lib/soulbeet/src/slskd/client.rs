@@ -479,14 +479,12 @@ impl SoulseekClient {
                         continue;
                     }
                 }
-                // A 404 is a search slskd no longer has, which is no answer
-                // to the query either.
                 Err(e) => {
                     // Clean up search context on any error to prevent leaks
                     self.active_searches.lock().await.remove(&search_id);
                     let _ = self.delete_search(&search_id).await;
                     warn!("Search {} failed with error, cleaning up: {}", search_id, e);
-                    return Err(e);
+                    return Err(poll_refused(e));
                 }
             }
         }
@@ -805,8 +803,6 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remo
 /// of (`DownloadService.EnqueueAsync`).
 const ALREADY_IN_PROGRESS: &str = "Skipped: Already in progress";
 
-/// `value` as one path segment. URL parsing resolves `.` and `..` as dot
-/// segments even when percent-encoded, so those cannot be sent at all.
 /// slskd's 400 to `POST searches`, read from its body: Soulseek.NET's
 /// `DuplicateTokenException` says `An active search with token {token} is
 /// already in progress`, and every other 400 refuses the request itself, an
@@ -821,6 +817,21 @@ fn search_refused(body: String) -> SoulseekError {
     }
 }
 
+/// An error polling `GET searches/{id}/responses`. slskd answers 404, with an
+/// empty body, only when it has no search with that id
+/// (`SearchesController.GetResponsesById`); every other error is kept.
+fn poll_refused(e: SoulseekError) -> SoulseekError {
+    match e {
+        SoulseekError::Api {
+            status: 404,
+            message,
+        } => SoulseekError::SearchGone { body: message },
+        e => e,
+    }
+}
+
+/// `value` as one path segment. URL parsing resolves `.` and `..` as dot
+/// segments even when percent-encoded, so those cannot be sent at all.
 fn path_segment(value: &str) -> Result<String> {
     if matches!(value, "" | "." | "..") {
         return Err(SoulseekError::UnaddressablePeer {
@@ -1501,6 +1512,25 @@ mod tests {
         assert!(matches!(
             search_refused(duplicate.into()),
             SoulseekError::SearchAlreadyRunning { body } if body == duplicate
+        ));
+    }
+
+    /// slskd's 404 to a poll is a search it no longer has; other answers
+    /// stay as they were.
+    #[test]
+    fn a_poll_slskd_answers_404_is_a_search_it_no_longer_has() {
+        let gone = poll_refused(SoulseekError::Api {
+            status: 404,
+            message: String::new(),
+        });
+        assert!(matches!(gone, SoulseekError::SearchGone { body } if body.is_empty()));
+        let unavailable = poll_refused(SoulseekError::Api {
+            status: 503,
+            message: "Circuit breaker is open - slskd appears to be unavailable".into(),
+        });
+        assert!(matches!(
+            unavailable,
+            SoulseekError::Api { status: 503, message } if message.starts_with("Circuit breaker is open")
         ));
     }
 

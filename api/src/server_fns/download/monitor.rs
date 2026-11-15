@@ -2223,7 +2223,7 @@ mod tests {
         assert_eq!(
             (f.code, f.stage, f.retry, f.message.as_str()),
             (
-                FailureCode::BackendUnreachable,
+                FailureCode::SettingsUnreadable,
                 Stage::Transfer,
                 RetryAdvice::SameSourceLater,
                 "Download backend unavailable"

@@ -680,7 +680,7 @@ mod tests {
             refused,
             vec![
                 ("peer_b", FailureCode::PeerOffline),
-                ("peer_c", FailureCode::EnqueueFailed)
+                ("peer_c", FailureCode::BackendResponseUnreadable)
             ]
         );
     }

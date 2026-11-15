@@ -760,14 +760,13 @@ mod tests {
         assert_eq!(f.cause.unwrap().raw, "first");
     }
 
-    /// slskd lost the search: a 404 on its responses is a failed search to
-    /// run again, not an empty one.
+    /// slskd lost the search: its 404 on the responses is a failed search
+    /// to run again, not an empty one.
     #[tokio::test(start_paused = true)]
     async fn a_search_slskd_no_longer_has_is_not_an_empty_search() {
         let stub = StubBackend::new(vec![]);
-        stub.script_polls(vec![Err(SoulseekError::Api {
-            status: 404,
-            message: String::new(),
+        stub.script_polls(vec![Err(SoulseekError::SearchGone {
+            body: String::new(),
         })]);
 
         let (_, f) = searched(stub).await;
@@ -775,7 +774,7 @@ mod tests {
         assert_eq!(
             advice(&f),
             (
-                FailureCode::BackendUnreachable,
+                FailureCode::SearchLost,
                 Stage::SourceSearch,
                 RetryAdvice::SameSourceLater,
                 "No results found"

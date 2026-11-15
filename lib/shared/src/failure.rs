@@ -249,6 +249,11 @@ failure_codes! {
     NavidromeCircuitOpen => "navidrome_circuit_open",
     BackendNotConfigured => "backend_not_configured",
     BackendUnreachable => "backend_unreachable",
+    /// Soulful could not read its own settings database to find the backend.
+    SettingsUnreadable => "settings_unreadable",
+    /// The backend answered with something Soulful cannot parse. The
+    /// downloads list has its own code, `transfer_list_unreadable`.
+    BackendResponseUnreadable => "backend_response_unreadable",
     SearchRateLimited => "search_rate_limited",
     SearchNoResults => "search_no_results",
     /// Every response scored below the floor. Produced once the slskd client
@@ -260,6 +265,9 @@ failure_codes! {
     SearchQueryRejected => "search_query_rejected",
     /// The backend already runs a search under the token this one asked for.
     SearchAlreadyRunning => "search_already_running",
+    /// The backend no longer has a search Soulful was polling, or this client
+    /// no longer runs it: running the same search again is the remedy.
+    SearchLost => "search_lost",
     PeerOffline => "peer_offline",
     AlreadyRunning => "already_running",
     AlreadyInFlightOtherUser => "already_in_flight_other_user",
@@ -317,11 +325,12 @@ failure_codes! {
 mod tests {
     use super::*;
 
-    /// Design section 7 and 13 codes, by stage, with `search_query_rejected`,
-    /// `search_already_running` and `import_disk_full`, and without
-    /// `peer_rejected_enqueue`, which nothing produces. The one normative list
-    /// of FailureCode names.
-    const NAMES: [&str; 73] = [
+    /// Design section 7 and 13 codes, by stage, with `settings_unreadable`,
+    /// `backend_response_unreadable`, `search_query_rejected`,
+    /// `search_already_running`, `search_lost` and `import_disk_full`, and
+    /// without `peer_rejected_enqueue`, which nothing produces. The one
+    /// normative list of FailureCode names.
+    const NAMES: [&str; 76] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -339,12 +348,15 @@ mod tests {
         "navidrome_circuit_open",
         "backend_not_configured",
         "backend_unreachable",
+        "settings_unreadable",
+        "backend_response_unreadable",
         "search_rate_limited",
         "search_no_results",
         "search_all_filtered",
         "search_timeout",
         "search_query_rejected",
         "search_already_running",
+        "search_lost",
         "peer_offline",
         "already_running",
         "already_in_flight_other_user",

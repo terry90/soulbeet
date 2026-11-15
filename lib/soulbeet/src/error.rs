@@ -46,6 +46,12 @@ pub enum SoulseekError {
     #[error("API error: 400 - {body}")]
     SearchAlreadyRunning { body: String },
 
+    /// slskd answered 404 to a poll: it has no search with that id any more
+    /// (`SearchesController.GetResponsesById`), for example because it was
+    /// deleted from slskd.
+    #[error("API error: 404 - {body}")]
+    SearchGone { body: String },
+
     /// A poll for a search this client is not running: it never started it,
     /// the search already ended, or the client was rebuilt since.
     #[error("Search {search_id} is not known to this client")]
@@ -88,6 +94,7 @@ impl SoulseekError {
             SoulseekError::SlskdTooOld { .. } => false,
             SoulseekError::SearchQueryRejected { .. } => false,
             SoulseekError::SearchAlreadyRunning { .. } => false,
+            SoulseekError::SearchGone { .. } => false,
             SoulseekError::UnknownSearch { .. } => false,
             // 400 and 404 are definitive: a rejected request body or a
             // missing record will not heal on retry.
@@ -125,6 +132,11 @@ impl SoulseekError {
             SoulseekError::SearchAlreadyRunning { .. } => {
                 (FailureCode::SearchAlreadyRunning, SameSourceLater)
             }
+            // slskd or this client no longer has the search: running it
+            // again is the remedy.
+            SoulseekError::SearchGone { .. } | SoulseekError::UnknownSearch { .. } => {
+                (SearchLost, SameSourceLater)
+            }
             SoulseekError::Api { status: 429, .. } if stage == Stage::SourceSearch => {
                 (SearchRateLimited, SameSourceLater)
             }
@@ -150,14 +162,18 @@ impl SoulseekError {
                 (EnqueueFailed, OtherSource)
             }
             // An answer Soulful cannot parse will not parse later either.
-            SoulseekError::InvalidResponse(_) => (by_stage, NotRetryable),
-            SoulseekError::Api { .. } | SoulseekError::UnknownSearch { .. } => {
-                (by_stage, SameSourceLater)
+            // At transfer it is the downloads list, which has its own code.
+            SoulseekError::InvalidResponse(_) if stage == Stage::Transfer => {
+                (TransferListUnreadable, NotRetryable)
             }
+            SoulseekError::InvalidResponse(_) => (BackendResponseUnreadable, NotRetryable),
+            SoulseekError::Api { .. } => (by_stage, SameSourceLater),
         };
         let (status, raw) = match self {
             SoulseekError::Api { status, message } => (Some(*status), message.clone()),
-            SoulseekError::SlskdTooOld { body } => (Some(404), body.clone()),
+            SoulseekError::SlskdTooOld { body } | SoulseekError::SearchGone { body } => {
+                (Some(404), body.clone())
+            }
             SoulseekError::UserOffline { status, body, .. } => (Some(*status), body.clone()),
             SoulseekError::SearchQueryRejected { body }
             | SoulseekError::SearchAlreadyRunning { body } => (Some(400), body.clone()),
@@ -261,7 +277,7 @@ mod tests {
             (
                 SoulseekError::InvalidResponse("x".into()),
                 Stage::Enqueue,
-                FailureCode::EnqueueFailed,
+                FailureCode::BackendResponseUnreadable,
                 RetryAdvice::NotRetryable,
             ),
         ];
@@ -364,7 +380,7 @@ mod tests {
             (
                 SoulseekError::InvalidResponse("x".into()),
                 Stage::SourceSearch,
-                FailureCode::BackendUnreachable,
+                FailureCode::BackendResponseUnreadable,
                 RetryAdvice::NotRetryable,
             ),
             (
@@ -374,9 +390,19 @@ mod tests {
                 RetryAdvice::NeedsUser,
             ),
             (
-                api(404, ""),
+                SoulseekError::SearchGone {
+                    body: String::new(),
+                },
                 Stage::SourceSearch,
-                FailureCode::BackendUnreachable,
+                FailureCode::SearchLost,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                SoulseekError::UnknownSearch {
+                    search_id: "3f2b".into(),
+                },
+                Stage::SourceSearch,
+                FailureCode::SearchLost,
                 RetryAdvice::SameSourceLater,
             ),
         ];
@@ -386,7 +412,8 @@ mod tests {
             let raw = match &e {
                 SoulseekError::Api { message, .. } => message.clone(),
                 SoulseekError::SearchQueryRejected { body }
-                | SoulseekError::SearchAlreadyRunning { body } => body.clone(),
+                | SoulseekError::SearchAlreadyRunning { body }
+                | SoulseekError::SearchGone { body } => body.clone(),
                 other => other.to_string(),
             };
             assert_eq!(f.cause.unwrap().raw, raw, "{e:?}");
@@ -400,6 +427,14 @@ mod tests {
         let rejected = SoulseekError::SearchQueryRejected { body: "b".into() }
             .failure(Stage::SourceSearch, "m");
         assert_eq!(rejected.cause.unwrap().status, Some(400));
+        let gone = SoulseekError::SearchGone {
+            body: String::new(),
+        };
+        assert_eq!(gone.to_string(), "API error: 404 - ");
+        assert_eq!(
+            gone.failure(Stage::SourceSearch, "m").cause.unwrap().status,
+            Some(404)
+        );
     }
 
     fn offline() -> SoulseekError {

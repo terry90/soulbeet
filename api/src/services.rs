@@ -117,17 +117,16 @@ impl BackendLookupError {
         match self {
             BackendLookupError::Backend(e) => e.failure(stage, message),
             BackendLookupError::Settings(e) => Failure::new(
-                FailureCode::BackendUnreachable,
+                FailureCode::SettingsUnreadable,
                 stage,
                 RetryAdvice::SameSourceLater,
                 message,
             )
             .with_cause(Service::Database, None, e.clone()),
-            // The caller named a backend that does not exist, so nothing at
-            // `stage` ran.
+            // The caller named a backend that does not exist.
             BackendLookupError::Unknown(_) => Failure::new(
                 FailureCode::InvalidInput,
-                Stage::Input,
+                stage,
                 RetryAdvice::NotRetryable,
                 message,
             ),
@@ -462,6 +461,40 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dismissed, 1);
+    }
+
+    /// Each lookup error fails at the caller's stage: an unreadable settings
+    /// database keeps sqlx's text, an unknown id is the caller's input.
+    #[test]
+    fn a_lookup_error_fails_at_the_callers_stage() {
+        let locked = BackendLookupError::Settings(
+            "error returned from database: (code: 5) database is locked".into(),
+        );
+        let unknown = BackendLookupError::Unknown("nicotine".into());
+        for stage in [Stage::SourceSearch, Stage::Enqueue, Stage::Transfer] {
+            let f = locked.failure(stage, "m");
+            assert_eq!(
+                (f.code, f.stage, f.retry),
+                (
+                    FailureCode::SettingsUnreadable,
+                    stage,
+                    RetryAdvice::SameSourceLater
+                )
+            );
+            let cause = f.cause.unwrap();
+            assert_eq!(
+                (cause.service, cause.raw.as_str()),
+                (
+                    Service::Database,
+                    "error returned from database: (code: 5) database is locked"
+                )
+            );
+            let f = unknown.failure(stage, "Unknown download backend: nicotine");
+            assert_eq!(
+                (f.code, f.stage, f.retry),
+                (FailureCode::InvalidInput, stage, RetryAdvice::NotRetryable)
+            );
+        }
     }
 
     #[tokio::test]
