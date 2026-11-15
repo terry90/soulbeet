@@ -436,11 +436,7 @@ impl QueueDeps for RecordingDeps {
             .guard
             .as_ref()
             .expect("this test gives the import queue no delete guard");
-        Guard {
-            db,
-            listeners: fake.as_ref(),
-            music_path: None,
-        }
+        Guard::new(db, fake.as_ref(), None)
     }
 }
 

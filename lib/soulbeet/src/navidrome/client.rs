@@ -572,6 +572,33 @@ impl NavidromeClient {
         }
     }
 
+    /// The name of every Navidrome user (`GET /api/user`, server/nativeapi/native_api.go:70), as
+    /// an admin may list them; Ok(None) when this user is not an admin, as Navidrome refuses
+    /// anyone else with rest.ErrPermissionDenied (persistence/user_repository.go:234-256), which
+    /// deluan/rest answers with 403. No `_end` is sent, so the list is not cut short
+    /// (persistence/sql_base_repository.go:136 limits only a positive Max).
+    pub async fn user_names(&self) -> Result<Option<Vec<String>>> {
+        #[derive(serde::Deserialize)]
+        struct NavidromeUser {
+            #[serde(rename = "userName")]
+            user_name: String,
+        }
+        let url = self.base_url.join("api/user")?;
+        let resp = self.native_request(self.client.get(url)).await?;
+        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(NavidromeError::Http {
+                action: "List users",
+                status: resp.status().as_u16(),
+                body: None,
+            });
+        }
+        let users: Vec<NavidromeUser> = resp.json().await.map_err(parse)?;
+        Ok(Some(users.into_iter().map(|u| u.user_name).collect()))
+    }
+
     /// The native song list for `query`; a non-success status is an Http error of `action`.
     async fn native_songs(
         &self,
@@ -1068,6 +1095,43 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap()[1].target,
             "/api/song?_start=0&_end=1&id=3sG8kPq0WmZ1xYbN4vTcDe"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admin_lists_every_user_and_anyone_else_is_refused() {
+        // model/user.go:8-12, as persistence/user_repository.go ReadAll answers an admin.
+        let users = r#"[{"id":"8uY3tR6eW9qA2sD5fG8hJ1","userName":"alice","name":"Alice","email":"","isAdmin":true,"lastLoginAt":null,"lastAccessAt":null,"createdAt":"2026-10-01T09:00:00Z","updatedAt":"2026-10-01T09:00:00Z","scrobbleFilter":""},{"id":"2wE5rT8yU1iO4pA7sD0fG3","userName":"Erin","name":"Erin","email":"","isAdmin":false,"lastLoginAt":null,"lastAccessAt":null,"createdAt":"2026-10-02T09:00:00Z","updatedAt":"2026-10-02T09:00:00Z","scrobbleFilter":""}]"#;
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: LOGIN.into(),
+            },
+            Reply {
+                status: 200,
+                body: users.into(),
+            },
+            // The body is not read.
+            Reply {
+                status: 403,
+                body: "".into(),
+            },
+            Reply {
+                status: 500,
+                body: "".into(),
+            },
+        ]);
+        let c = client(&url);
+        assert_eq!(
+            c.user_names().await.unwrap(),
+            Some(vec!["alice".to_string(), "Erin".to_string()])
+        );
+        assert_eq!(seen.lock().unwrap()[1].target, "/api/user");
+        assert_eq!(c.user_names().await.unwrap(), None);
+        let err = c.user_names().await.unwrap_err();
+        assert!(
+            matches!(err, NavidromeError::Http { status: 500, .. }),
+            "{err:?}"
         );
     }
 

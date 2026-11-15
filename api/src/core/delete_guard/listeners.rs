@@ -7,13 +7,13 @@ use crate::core::database_failure;
 use crate::models::navidrome_read_failure::NavidromeReadFailureRow;
 use crate::models::user::User;
 use crate::services::{navidrome_client_for_user, NavidromeLookupError};
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use soulbeet::navidrome::models::{keeps_song_averages, NativeSong, SubsonicAlbum, SubsonicSong};
 use soulbeet::navidrome::NavidromeClient;
 use soulbeet::ImportedItem;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Navidrome as each Soulful user sees it.
 #[async_trait::async_trait]
@@ -51,6 +51,12 @@ pub trait Listeners: Send + Sync {
     ) -> Result<Option<Vec<NativeSong>>, NavidromeLookupError>;
     /// Navidrome's version as `user`'s ping reports it; None when it reports none.
     async fn server_version(&self, user: &UserId) -> Result<Option<String>, NavidromeLookupError>;
+    /// The name of every Navidrome user, listed as `user`; None when `user` is not a Navidrome
+    /// admin and may not list them.
+    async fn navidrome_users(
+        &self,
+        user: &UserId,
+    ) -> Result<Option<Vec<String>>, NavidromeLookupError>;
 }
 
 /// Each user's client from navidrome_client_for_user.
@@ -124,6 +130,25 @@ impl Listeners for LiveListeners {
             .await
             .map_err(NavidromeLookupError::Client)
     }
+
+    async fn navidrome_users(
+        &self,
+        user: &UserId,
+    ) -> Result<Option<Vec<String>>, NavidromeLookupError> {
+        let navi = client(user).await?;
+        navi.user_names()
+            .await
+            .map_err(NavidromeLookupError::Client)
+    }
+}
+
+/// What rule 3 read: the ratings rule 4 compares Navidrome's average with, and whose.
+pub(super) struct Read {
+    /// The other listeners' ratings of the song above 0.
+    ratings: Vec<u8>,
+    /// The Soulful names of the linked accounts whose rating of the song this check reads: the
+    /// actor's (rule 4 reads it) and each other listener who sees the song.
+    names: Vec<String>,
 }
 
 /// Why one other listener keeps the file.
@@ -159,11 +184,20 @@ impl Guard<'_> {
         actor: &UserId,
         song: &NativeSong,
         path: &Path,
-    ) -> Result<Vec<u8>, Failure> {
+    ) -> Result<Read, Failure> {
         let users = User::linked_to_navidrome_in(self.db)
             .await
             .map_err(|e| database_failure(Stage::Delete, e))?;
-        let (actor, mut ratings, mut refusal) = (actor.to_string(), Vec::new(), None);
+        let actor = actor.to_string();
+        let mut read = Read {
+            ratings: Vec::new(),
+            names: users
+                .iter()
+                .filter(|u| u.id == actor)
+                .map(|u| u.username.clone())
+                .collect(),
+        };
+        let mut refusal = None;
         for user in users.iter().filter(|u| u.id != actor) {
             let listener = UserId::new(&user.id);
             let marks = self.marks_of(&listener, song, path).await;
@@ -180,8 +214,13 @@ impl Guard<'_> {
                 );
             }
             match marks {
-                Ok(0) => {}
-                Ok(rating) => ratings.push(rating),
+                Ok(None) => {}
+                Ok(Some(rating)) => {
+                    read.names.push(user.username.clone());
+                    if rating > 0 {
+                        read.ratings.push(rating);
+                    }
+                }
                 Err(keeps) => {
                     refusal.get_or_insert(match keeps {
                         Keeps::Unreadable(_) => veto_unknown(),
@@ -192,20 +231,21 @@ impl Guard<'_> {
         }
         match refusal {
             Some(f) => Err(f),
-            None => Ok(ratings),
+            None => Ok(read),
         }
     }
 
-    /// `listener`'s rating of `song` (0 when unrated or unseen), or why they keep it.
+    /// `listener`'s rating of `song` (0 when unrated), None when they cannot see it, or why they
+    /// keep it.
     async fn marks_of(
         &self,
         listener: &UserId,
         song: &NativeSong,
         path: &Path,
-    ) -> Result<u8, Keeps> {
+    ) -> Result<Option<u8>, Keeps> {
         let unreadable = |e: NavidromeLookupError| Keeps::Unreadable(e.to_string());
         let blocked = || Keeps::Refused(blocked_by_other_user());
-        let mut rating = 0;
+        let mut rating = None;
         if let Some(seen) = self
             .listeners
             .song(listener, &song.id)
@@ -218,8 +258,9 @@ impl Guard<'_> {
                         .into(),
                 ));
             };
-            rating = seen.user_rating.unwrap_or(0);
-            if rating > 1 || seen.starred.is_some() {
+            let seen_rating = seen.user_rating.unwrap_or(0);
+            rating = Some(seen_rating);
+            if seen_rating > 1 || seen.starred.is_some() {
                 return Err(blocked());
             }
             let Some(album) = self
@@ -265,17 +306,21 @@ impl Guard<'_> {
 
     /// Rule 4: reads `actor`'s record of `song` again (N1), re-sends N1's rating so Navidrome
     /// recomputes the average, reads it again (N2), and compares N2's average with the mean of
-    /// N1's rating (when above 0) and `others`: a difference beyond Navidrome's rounding is
-    /// blocked_by_other_user. Navidrome before 0.60.0 or an unknown version keeps no average to
-    /// compare, so every file is veto_unknown; a version the actor's own Navidrome does not
-    /// answer is that read's own failure, with its error as the cause. An absent average means
-    /// nobody rated the song (`omitempty`), which cannot be so while the actor rated it: that is
-    /// veto_unknown too. N2 comes back for the caller to act on.
+    /// N1's rating (when above 0) and the other listeners' ratings in `others`: a difference
+    /// beyond Navidrome's rounding is blocked_by_other_user. Navidrome before 0.60.0 or an
+    /// unknown version keeps no average to compare, so every file is veto_unknown; a version
+    /// the actor's own Navidrome does not answer is that read's own failure, with its error as
+    /// the cause. An absent average means nobody rated the song (`omitempty`), which cannot be
+    /// so while the actor rated it: that is veto_unknown too. When the ratings read are all 1
+    /// (or none), an average that equals their mean has no other rating above 1 in it. When one
+    /// is above 1, a Navidrome user Soulful cannot read who gave ratings that keep the mean
+    /// hides in it, so the file passes only when no such user exists (every_rater_read). N2
+    /// comes back for the caller to act on.
     pub(super) async fn no_unknown_rater(
         &self,
         actor: &UserId,
         song: &NativeSong,
-        others: &[u8],
+        others: &Read,
     ) -> Result<NativeSong, Failure> {
         let own = |e: NavidromeLookupError| e.failure(Stage::Delete, e.to_string());
         let version = self.listeners.server_version(actor).await.map_err(|e| {
@@ -309,12 +354,107 @@ impl Guard<'_> {
             None => 0.0,
         };
         let raters: Vec<u8> = std::iter::once(before.rating)
-            .chain(others.iter().copied())
+            .chain(others.ratings.iter().copied())
             .collect();
         if !average_matches(average, positive_mean(&raters)) {
             return Err(blocked_by_other_user());
         }
+        if raters.iter().any(|r| *r > 1) {
+            self.every_rater_read(&others.names).await?;
+        }
         Ok(after)
+    }
+
+    /// Whether every Navidrome user is a linked account whose rating this check read (`read`,
+    /// Soulful names): the first linked account Navidrome lets list its users (an admin's)
+    /// lists them, and each name must be one of `read`, compared without regard to ASCII case
+    /// as both Soulful (`COLLATE NOCASE`) and Navidrome's login
+    /// (persistence/user_repository.go:203) compare names. The listing is read once per guard.
+    /// Else unknown_listener.
+    async fn every_rater_read(&self, read: &[String]) -> Result<(), Failure> {
+        let listed = self
+            .navidrome_users
+            .get_or_init(|| self.list_navidrome_users())
+            .await
+            .clone()?;
+        let unread: Vec<&str> = listed
+            .iter()
+            .filter(|name| !read.iter().any(|r| r.eq_ignore_ascii_case(name)))
+            .map(String::as_str)
+            .collect();
+        if unread.is_empty() {
+            return Ok(());
+        }
+        info!(
+            "Navidrome users whose ratings Soulful did not read keep a file: {}",
+            unread.join(", ")
+        );
+        Err(unknown_listener(UnknownListener::NotSignedIn))
+    }
+
+    /// Navidrome's users, as the first linked account that may list them lists them. None of
+    /// them may (none is a Navidrome admin): unknown_listener NoAdmin; a read that failed
+    /// before any list was read: unknown_listener Unreadable with its error.
+    async fn list_navidrome_users(&self) -> Result<Vec<String>, Failure> {
+        let users = User::linked_to_navidrome_in(self.db)
+            .await
+            .map_err(|e| database_failure(Stage::Delete, e))?;
+        let mut failed = None;
+        for user in &users {
+            match self.listeners.navidrome_users(&UserId::new(&user.id)).await {
+                Ok(Some(names)) => return Ok(names),
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Could not list Navidrome's users as {}: {e}", user.username);
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        Err(unknown_listener(match failed {
+            Some(e) => UnknownListener::Unreadable(e),
+            None => UnknownListener::NoAdmin,
+        }))
+    }
+}
+
+/// Why Soulful cannot show that no Navidrome user it cannot read rated a track.
+enum UnknownListener {
+    /// No linked account is a Navidrome admin, so Navidrome's users cannot be listed.
+    NoAdmin,
+    /// Listing them failed with this error.
+    Unreadable(NavidromeLookupError),
+    /// Navidrome lists a user whose rating Soulful did not read.
+    NotSignedIn,
+}
+
+/// Rule 4 cannot rule out a rater Soulful cannot read; the next step says how it can.
+fn unknown_listener(why: UnknownListener) -> Failure {
+    let failure = |retry| {
+        Failure::new(
+            FailureCode::DeleteVetoUnknown,
+            Stage::Delete,
+            retry,
+            "Another Navidrome listener Soulful cannot read may have rated this track",
+        )
+    };
+    match why {
+        UnknownListener::NoAdmin => failure(RetryAdvice::NeedsUser)
+            .with_user_action(UserAction::new(
+            UserActionCode::RelinkNavidrome,
+            "Sign in to Soulful once as a Navidrome admin, so Soulful can list Navidrome's users",
+            "Soulful sign-in",
+        )),
+        UnknownListener::NotSignedIn => failure(RetryAdvice::NeedsUser)
+            .with_user_action(UserAction::new(
+            UserActionCode::RelinkNavidrome,
+            "Have every Navidrome user sign in to Soulful once, so Soulful can read their ratings",
+            "Soulful sign-in",
+        )),
+        // The lookup error's own cause (Navidrome's answer), none for a stored password.
+        UnknownListener::Unreadable(e) => Failure {
+            cause: e.failure(Stage::Delete, String::new()).cause,
+            ..failure(RetryAdvice::SameSourceLater)
+        },
     }
 }
 

@@ -46,6 +46,14 @@ struct State {
     version: Option<PingAnswer>,
     reads: HashMap<String, usize>,
     ratings_set: Vec<(String, String, u8)>,
+    /// Navidrome's users, by name.
+    navidrome_users: Vec<String>,
+    /// Who may list them.
+    admins: HashSet<String>,
+    /// Listing them fails with this error.
+    users_unlistable: Option<fn() -> NavidromeLookupError>,
+    /// How many times they were listed, or listing was asked for.
+    user_lists: usize,
 }
 
 impl State {
@@ -217,6 +225,26 @@ impl FakeNavidrome {
         self.with(|s| s.version = Some(Err(error)));
     }
 
+    /// Navidrome's users are `names`.
+    pub fn users_are(&self, names: &[&str]) {
+        self.with(|s| s.navidrome_users = names.iter().map(|n| n.to_string()).collect());
+    }
+
+    /// `user` is a Navidrome admin, who may list Navidrome's users.
+    pub fn admin(&self, user: &str) {
+        self.with(|s| s.admins.insert(user.into()));
+    }
+
+    /// Listing Navidrome's users fails with this error, for an admin too.
+    pub fn users_unlistable(&self, error: fn() -> NavidromeLookupError) {
+        self.with(|s| s.users_unlistable = Some(error));
+    }
+
+    /// How many times Navidrome's users were asked for.
+    pub fn user_lists(&self) -> usize {
+        self.with(|s| s.user_lists)
+    }
+
     pub fn reads_by(&self, user: &str) -> usize {
         self.with(|s| s.reads.get(user).copied().unwrap_or(0))
     }
@@ -344,9 +372,24 @@ impl Listeners for FakeNavidrome {
             }
         })
     }
+
+    async fn navidrome_users(
+        &self,
+        user: &UserId,
+    ) -> Result<Option<Vec<String>>, NavidromeLookupError> {
+        self.with(|s| {
+            s.user_lists += 1;
+            let user = s.read(user)?;
+            if let Some(error) = s.users_unlistable {
+                return Err(error());
+            }
+            Ok(s.admins.contains(&user).then(|| s.navidrome_users.clone()))
+        })
+    }
 }
 
 /// A temp library: users alice and bob linked to Navidrome (navidrome_token 'cipher'), carol not;
+/// Navidrome's users are alice and bob, and neither is an admin;
 /// folders alice-music at `{root}/music/alice`, bob-music at `{root}/music/bob`, stored as the
 /// tempdir gave the paths; `{root}/music/alice/A/x.flac` (5 bytes) is song "s1" (album "al1";
 /// artist and album artist "Marrow Choir", album "Winter Songs", title "O Holy Night", no
@@ -411,15 +454,12 @@ impl Library {
         lib.fake.sees("alice", "s1");
         lib.fake.sees("bob", "s1");
         lib.fake.rates("alice", "s1", 1);
+        lib.fake.users_are(&["alice", "bob"]);
         lib
     }
 
     pub fn guard(&self) -> Guard<'_> {
-        Guard {
-            db: &self.db,
-            listeners: self.fake.as_ref(),
-            music_path: None,
-        }
+        Guard::new(&self.db, self.fake.as_ref(), None)
     }
 
     pub fn alice(&self) -> UserId {

@@ -26,21 +26,40 @@ mod unlink;
 pub use listeners::{Listeners, LiveListeners};
 
 /// The guard over Soulful's database, Navidrome as each user sees it, and the local path of
-/// Navidrome's default library when it is set (D8).
+/// Navidrome's default library when it is set (D8). One guard serves one run (a rating sync, or
+/// the removals of one import): Navidrome's user list, once rule 4 needs it, is read once per
+/// guard.
 pub struct Guard<'a> {
     pub db: &'a SqlitePool,
     pub listeners: &'a dyn Listeners,
     pub music_path: Option<&'a Path>,
+    /// Navidrome's users as the first linked admin lists them, or why they cannot be listed.
+    navidrome_users: tokio::sync::OnceCell<Result<Vec<String>, Failure>>,
+}
+
+impl<'a> Guard<'a> {
+    pub fn new(
+        db: &'a SqlitePool,
+        listeners: &'a dyn Listeners,
+        music_path: Option<&'a Path>,
+    ) -> Guard<'a> {
+        Guard {
+            db,
+            listeners,
+            music_path,
+            navidrome_users: tokio::sync::OnceCell::new(),
+        }
+    }
 }
 
 impl Guard<'static> {
     /// The guard on Soulful's database, each user's stored credentials and CONFIG's music path.
     pub fn live() -> Guard<'static> {
-        Guard {
-            db: &crate::db::DB,
-            listeners: &LiveListeners,
-            music_path: crate::config::CONFIG.navidrome_music_path(),
-        }
+        Guard::new(
+            &crate::db::DB,
+            &LiveListeners,
+            crate::config::CONFIG.navidrome_music_path(),
+        )
     }
 }
 
@@ -592,7 +611,7 @@ mod tests {
     use crate::models::navidrome_read_failure::NavidromeReadFailureRow;
     use crate::services::NavidromeLookupError;
     use shared::download::DownloadQuery;
-    use shared::failure::Cause;
+    use shared::failure::{Cause, UserAction, UserActionCode};
     use shared::metadata::Album;
     use soulbeet::NavidromeError;
     use std::sync::Arc;
@@ -640,6 +659,117 @@ mod tests {
         assert_eq!(
             lib.fake.ratings_set(),
             vec![("alice".to_string(), "s1".to_string(), 1)]
+        );
+        // Ratings of 1 and an average of 1.00 hide no rating above 1: no user list is read.
+        assert_eq!(lib.fake.user_lists(), 0);
+    }
+
+    const UNKNOWN: &str =
+        "Another Navidrome listener Soulful cannot read may have rated this track";
+
+    #[tokio::test]
+    async fn an_average_a_rater_soulful_cannot_read_may_hide_in_needs_every_navidrome_user_read() {
+        // Alice rated 4, and Carol, a Navidrome user with no Soulful account, rated 4 too: the
+        // average is 4.00, the mean of what Soulful reads.
+        let lib = Library::new().await;
+        lib.fake.rates("alice", "s1", 4);
+        lib.fake.hidden_rater("s1", 4);
+        let f = lib
+            .guard()
+            .check_song(&lib.alice(), "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.retry, f.message.as_str()),
+            (
+                FailureCode::DeleteVetoUnknown,
+                RetryAdvice::NeedsUser,
+                UNKNOWN
+            )
+        );
+        assert_eq!(
+            f.user_action,
+            Some(UserAction::new(
+                UserActionCode::RelinkNavidrome,
+                "Sign in to Soulful once as a Navidrome admin, so Soulful can list Navidrome's users",
+                "Soulful sign-in",
+            ))
+        );
+        // Asked of alice and bob, neither an admin.
+        assert_eq!(lib.fake.user_lists(), 2);
+
+        // Bob is an admin, and Navidrome lists Carol, whom Soulful has no account for.
+        lib.fake.admin("bob");
+        lib.fake.users_are(&["alice", "bob", "carol-nd"]);
+        let f = lib
+            .guard()
+            .check_song(&lib.alice(), "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.message.as_str(), f.user_action.map(|a| a.what)),
+            (
+                FailureCode::DeleteVetoUnknown,
+                UNKNOWN,
+                Some(
+                    "Have every Navidrome user sign in to Soulful once, so Soulful can read their ratings"
+                        .to_string()
+                )
+            )
+        );
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+    }
+
+    #[tokio::test]
+    async fn an_equal_average_passes_when_every_navidrome_user_is_a_linked_account_read_in_the_check(
+    ) {
+        let lib = Library::new().await;
+        lib.fake.rates("alice", "s1", 4);
+        lib.fake.admin("bob");
+        // Navidrome compares names without regard to case, as Soulful does.
+        lib.fake.users_are(&["Alice", "bob"]);
+        let guard = lib.guard();
+        let checked = library_verdict(guard.check_song(&lib.alice(), "s1").await);
+        assert_eq!(checked.song.average_rating, Some(4.0));
+        // One guard lists Navidrome's users once: asked of alice, then listed by bob.
+        library_verdict(guard.check_song(&lib.alice(), "s1").await);
+        assert_eq!(lib.fake.user_lists(), 2);
+
+        // A linked account that cannot see the song was not read: it may have rated it before.
+        let lib = Library::new().await;
+        lib.fake.rates("alice", "s1", 4);
+        lib.fake.admin("bob");
+        lib.fake.unsee("bob", "s1");
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
+            (FailureCode::DeleteVetoUnknown, UNKNOWN.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_list_that_cannot_be_read_keeps_the_file() {
+        let lib = Library::new().await;
+        lib.fake.rates("alice", "s1", 4);
+        lib.fake.admin("bob");
+        lib.fake
+            .users_unlistable(|| NavidromeLookupError::Client(NavidromeError::CircuitOpen));
+        let f = lib
+            .guard()
+            .check_song(&lib.alice(), "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.retry, f.message.as_str(), f.user_action),
+            (
+                FailureCode::DeleteVetoUnknown,
+                RetryAdvice::SameSourceLater,
+                UNKNOWN,
+                None
+            )
+        );
+        assert_eq!(
+            f.cause.map(|c| c.raw),
+            Some(NavidromeError::CircuitOpen.to_string())
         );
     }
 
@@ -1484,6 +1614,8 @@ mod tests {
             .unwrap();
         let (path, id) = paths::local_file_in(&lib.db, &stale, None).await.unwrap();
         lib.fake.rates("alice", "s1", 5);
+        // A rating above 1 needs Navidrome's user list to rule out a rater Soulful cannot read.
+        lib.fake.admin("bob");
         let checked = lib
             .guard()
             .check_resolved(&lib.alice(), stale, path, id, &[])
