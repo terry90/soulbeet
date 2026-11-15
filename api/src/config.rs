@@ -72,6 +72,20 @@ pub(crate) fn parse_registration(
     }
 }
 
+/// Why `PUBLIC_URL` stops every sign-in, when it is set and cannot be used.
+#[cfg(feature = "server")]
+pub(crate) fn public_url_problem(
+    public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+) -> Option<String> {
+    match public_url {
+        Some(Err(e)) => Some(format!(
+            "PUBLIC_URL is not usable: {e}. It must look like https://host or \
+             https://host:port. Nobody can sign in until it is fixed or removed."
+        )),
+        None | Some(Ok(_)) => None,
+    }
+}
+
 /// Parse a boolean from an environment variable.
 ///
 /// Accepts: "true", "1", "yes" (case-insensitive) as true.
@@ -159,6 +173,15 @@ impl AppConfig {
             navidrome_url.is_some(),
         );
 
+        let public_url = std::env::var("PUBLIC_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(|v| BaseUrl::parse(&v));
+        if let Some(problem) = public_url_problem(public_url.as_ref()) {
+            tracing::error!("{problem}");
+        }
+
         Self {
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite:soulbeet.db".to_string()),
@@ -173,11 +196,7 @@ impl AppConfig {
             beets_album_mode: parse_bool_env("BEETS_ALBUM_MODE", false),
             beet_bin,
             beets_python,
-            public_url: std::env::var("PUBLIC_URL")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .map(|v| BaseUrl::parse(&v)),
+            public_url,
             navidrome_url,
             registration,
             port: std::env::var("PORT")
@@ -228,6 +247,11 @@ impl AppConfig {
         self.public_url.as_ref()
     }
 
+    /// Why `PUBLIC_URL` stops every sign-in, if it does.
+    pub fn public_url_problem(&self) -> Option<String> {
+        public_url_problem(self.public_url.as_ref())
+    }
+
     /// The Navidrome server, when `NAVIDROME_URL` is set.
     pub fn navidrome_url(&self) -> Option<&str> {
         self.navidrome_url.as_deref()
@@ -268,6 +292,21 @@ mod tests {
             Some(SecretKeyWeakness::TooShort)
         );
         assert_eq!(secret_key_weakness(Some(&"a".repeat(32))), None);
+    }
+
+    #[test]
+    fn an_unusable_public_url_is_reported() {
+        let missing_scheme = BaseUrl::parse("music.example.com");
+        let problem = public_url_problem(Some(&missing_scheme)).unwrap();
+        assert!(
+            problem
+                .starts_with("PUBLIC_URL is not usable: 'music.example.com' is not a valid host."),
+            "{problem}"
+        );
+        assert!(problem.ends_with("Nobody can sign in until it is fixed or removed."));
+        assert_eq!(public_url_problem(None), None);
+        let good = BaseUrl::parse("https://music.example.com");
+        assert_eq!(public_url_problem(Some(&good)), None);
     }
 
     #[test]

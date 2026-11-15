@@ -1,6 +1,5 @@
 //! Conditions that keep the MCP endpoint closed until the instance is safe to expose.
 
-use crate::auth::RegistrationMode;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "server")]
@@ -26,7 +25,8 @@ pub struct GateReason {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SecurityStatus {
     pub mcp_blocked_by: Vec<GateReason>,
-    pub registration: RegistrationMode,
+    /// Why every sign-in is refused, when the configuration makes it so.
+    pub sign_in_problem: Option<String>,
 }
 
 #[cfg(feature = "server")]

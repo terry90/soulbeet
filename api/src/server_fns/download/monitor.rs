@@ -25,7 +25,6 @@ use super::enqueue::{stopped_rows, transfer_key};
 use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::{album_jobs, import_job, resolve_on_disk, unresolved_row, ResolvedSlot};
 use super::utils::FileId;
-use crate::auth::UserId;
 use crate::config::CONFIG;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
@@ -978,7 +977,6 @@ impl DownloadMonitor {
             key: self.slot_key(slot, backend.id()),
             owner: self.batch.owner.clone(),
             target: self.target_path.clone(),
-            user_id: self.batch.owner.user_id.clone(),
             download_base: self.download_base.clone(),
             claimed: Arc::clone(&self.claimed),
         };
@@ -1248,7 +1246,6 @@ struct Handoff {
     key: TransferKey,
     owner: TransferOwner,
     target: PathBuf,
-    user_id: UserId,
     download_base: PathBuf,
     claimed: Arc<Mutex<HashSet<FileId>>>,
 }
@@ -1267,7 +1264,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
     .await
     else {
         send_user_event(
-            &h.user_id,
+            &h.owner.user_id,
             DownloadEvent::Progress(vec![unresolved_row(h.row)]),
         )
         .await;
@@ -1288,7 +1285,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
         ImportMode::Singleton,
         vec![h.row],
         &h.target,
-        &h.user_id,
+        &h.owner.user_id,
         &h.download_base,
     );
     IMPORT_QUEUE.submit(job).await.wait().await;
@@ -1375,6 +1372,7 @@ pub fn filenames_match(a: &str, b: &str) -> bool {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::auth::UserId;
     use crate::server_fns::download::test_support::{
         batch, item, key, transfer, Cancel, ScriptedOutcome, StubBackend,
     };

@@ -52,6 +52,27 @@ impl fmt::Display for UserChangeError {
     }
 }
 
+/// Longest username an account can have. Sign-ins with a longer name are
+/// refused before anything is remembered about them.
+#[cfg(feature = "server")]
+pub const MAX_USERNAME_BYTES: usize = 256;
+
+#[cfg(feature = "server")]
+pub fn username_fits(username: &str) -> bool {
+    username.len() <= MAX_USERNAME_BYTES
+}
+
+/// The Soulful rows a name Navidrome verified can belong to. Navidrome
+/// compares names without letter case, so `Bob` signs in as `bob`.
+#[cfg(feature = "server")]
+#[derive(Debug)] // User has no PartialEq; tests match on the variant
+pub enum NavidromeNameMatch {
+    None,
+    One(User),
+    /// No row has the exact name and several match it without case.
+    Several,
+}
+
 #[cfg(feature = "server")]
 fn hash_password(password: &str) -> Result<String, String> {
     let salt = SaltString::generate(&mut OsRng);
@@ -233,6 +254,28 @@ impl User {
             .fetch_optional(&*DB)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// The row with exactly this name, else the only row whose name matches
+    /// it without letter case, the way Navidrome compares names.
+    pub(crate) async fn match_navidrome_name_in(
+        db: &SqlitePool,
+        username: &str,
+    ) -> Result<NavidromeNameMatch, String> {
+        let mut rows =
+            sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ? COLLATE NOCASE")
+                .bind(username)
+                .fetch_all(db)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some(i) = rows.iter().position(|u| u.username == username) {
+            return Ok(NavidromeNameMatch::One(rows.swap_remove(i)));
+        }
+        Ok(match rows.len() {
+            0 => NavidromeNameMatch::None,
+            1 => NavidromeNameMatch::One(rows.remove(0)),
+            _ => NavidromeNameMatch::Several,
+        })
     }
 
     pub(crate) async fn link_navidrome_in(

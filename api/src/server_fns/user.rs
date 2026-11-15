@@ -15,6 +15,19 @@ use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use tower_cookies::Cookies;
 
+/// Refuses a name no one could sign in with.
+#[cfg(feature = "server")]
+pub(crate) fn check_username_length(username: &str) -> Result<(), ServerFnError> {
+    use models::user::{username_fits, MAX_USERNAME_BYTES};
+    if username_fits(username) {
+        Ok(())
+    } else {
+        Err(refusal_error(format!(
+            "A username can be at most {MAX_USERNAME_BYTES} bytes"
+        )))
+    }
+}
+
 #[get("/api/users", _: AdminSession)]
 pub async fn get_users() -> Result<Vec<models::user::User>, ServerFnError> {
     models::user::User::get_all().await.map_err(server_error)
@@ -32,6 +45,7 @@ pub async fn create_user(
     if username.is_empty() || password.is_empty() {
         return Err(refusal_error("Username and password are required"));
     }
+    check_username_length(&username)?;
     if User::get_by_username(&username)
         .await
         .map_err(server_error)?
@@ -54,6 +68,7 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
     if new_username.trim().is_empty() {
         return Err(server_error("Username cannot be empty"));
     }
+    check_username_length(new_username.trim())?;
     models::user::User::update_username(&auth.0.user_id, new_username.trim())
         .await
         .map_err(server_error)

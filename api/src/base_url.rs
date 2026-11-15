@@ -78,29 +78,6 @@ impl std::fmt::Display for BaseUrl {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostSource {
-    Forwarded,
-    XForwardedHost,
-    Host,
-    PublicUrl,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SchemeSource {
-    Forwarded,
-    XForwardedProto,
-    HostKind,
-    PublicUrl,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct DerivedBase {
-    pub base: BaseUrl,
-    pub host_from: HostSource,
-    pub scheme_from: SchemeSource,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BaseUrlError {
     MissingHost,
@@ -158,52 +135,43 @@ fn host_url(scheme: Scheme, host: &str) -> Result<Url, BaseUrlError> {
 }
 
 /// Work out the address a request was made to. `pin` (from `PUBLIC_URL`) replaces the headers.
-pub fn derive_base(
-    headers: &HeaderMap,
-    pin: Option<&BaseUrl>,
-) -> Result<DerivedBase, BaseUrlError> {
+pub fn derive_base(headers: &HeaderMap, pin: Option<&BaseUrl>) -> Result<BaseUrl, BaseUrlError> {
     if let Some(pin) = pin {
-        return Ok(DerivedBase {
-            base: pin.clone(),
-            host_from: HostSource::PublicUrl,
-            scheme_from: SchemeSource::PublicUrl,
-        });
+        return Ok(pin.clone());
     }
 
-    let (host, host_from) = if let Some(h) = forwarded_param(headers, "host") {
-        (h, HostSource::Forwarded)
+    let host = if let Some(h) = forwarded_param(headers, "host") {
+        h
     } else if let Some(h) = first_element(headers, "x-forwarded-host") {
-        (h.to_string(), HostSource::XForwardedHost)
+        h.to_string()
     } else if let Some(h) = first_element(headers, header::HOST.as_str()) {
-        (h.to_string(), HostSource::Host)
+        h.to_string()
     } else {
         return Err(BaseUrlError::MissingHost);
     };
 
-    let (scheme, scheme_from) = if let Some(p) = forwarded_param(headers, "proto") {
-        (Scheme::parse(&p)?, SchemeSource::Forwarded)
+    let scheme = if let Some(p) = forwarded_param(headers, "proto") {
+        Scheme::parse(&p)?
     } else if let Some(p) = first_element(headers, "x-forwarded-proto") {
-        (Scheme::parse(p)?, SchemeSource::XForwardedProto)
+        Scheme::parse(p)?
     } else {
         let probe = BaseUrl::from_url(&host_url(Scheme::Http, &host)?, &host)?;
         let local = match probe.host {
             Host::Domain(d) => d == "localhost",
             Host::Ipv4(_) | Host::Ipv6(_) => true,
         };
-        let scheme = if local { Scheme::Http } else { Scheme::Https };
-        (scheme, SchemeSource::HostKind)
+        if local {
+            Scheme::Http
+        } else {
+            Scheme::Https
+        }
     };
 
-    let base = BaseUrl::from_url(&host_url(scheme, &host)?, &host)?;
-    Ok(DerivedBase {
-        base,
-        host_from,
-        scheme_from,
-    })
+    BaseUrl::from_url(&host_url(scheme, &host)?, &host)
 }
 
 /// `derive_base` with the configured `PUBLIC_URL`.
-pub fn request_base(headers: &HeaderMap) -> Result<DerivedBase, BaseUrlError> {
+pub fn request_base(headers: &HeaderMap) -> Result<BaseUrl, BaseUrlError> {
     match crate::config::CONFIG.public_url() {
         None => derive_base(headers, None),
         Some(Ok(pin)) => derive_base(headers, Some(pin)),
@@ -228,16 +196,14 @@ mod tests {
     }
 
     fn base(pairs: &[(&str, &str)]) -> String {
-        derive_base(&headers(pairs), None).unwrap().base.to_string()
+        derive_base(&headers(pairs), None).unwrap().to_string()
     }
 
     #[test]
     fn named_host_without_proxy_hint_is_https() {
-        let d = derive_base(&headers(&[("host", "music.example.com")]), None).unwrap();
-        assert_eq!(d.base.to_string(), "https://music.example.com");
         assert_eq!(
-            (d.host_from, d.scheme_from),
-            (HostSource::Host, SchemeSource::HostKind)
+            base(&[("host", "music.example.com")]),
+            "https://music.example.com"
         );
     }
 
@@ -265,20 +231,17 @@ mod tests {
 
     #[test]
     fn forwarded_wins_over_x_forwarded() {
-        let d = derive_base(
-            &headers(&[
+        assert_eq!(
+            base(&[
                 (
                     "forwarded",
                     "for=1.2.3.4;host=\"a.example:8443\";proto=https",
                 ),
                 ("x-forwarded-host", "b.example"),
+                ("x-forwarded-proto", "http"),
             ]),
-            None,
-        )
-        .unwrap();
-        assert_eq!(d.base.to_string(), "https://a.example:8443");
-        assert_eq!(d.host_from, HostSource::Forwarded);
-        assert_eq!(d.scheme_from, SchemeSource::Forwarded);
+            "https://a.example:8443"
+        );
     }
 
     #[test]
@@ -344,11 +307,7 @@ mod tests {
     fn public_url_pin_replaces_derivation() {
         let pin = BaseUrl::parse("https://pinned.example").unwrap();
         let d = derive_base(&headers(&[("host", "other.example")]), Some(&pin)).unwrap();
-        assert_eq!(d.base.to_string(), "https://pinned.example");
-        assert_eq!(
-            (d.host_from, d.scheme_from),
-            (HostSource::PublicUrl, SchemeSource::PublicUrl)
-        );
+        assert_eq!(d.to_string(), "https://pinned.example");
     }
 
     #[test]

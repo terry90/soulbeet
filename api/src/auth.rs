@@ -40,10 +40,6 @@ impl UserId {
     pub fn new(users_id: &str) -> UserId {
         UserId(users_id.to_string())
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 #[cfg(feature = "server")]
