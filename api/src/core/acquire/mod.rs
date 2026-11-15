@@ -14,7 +14,7 @@ pub use cancel::cancel;
 pub use manual::download;
 
 use crate::auth::UserCtx;
-use crate::core::target_unwritable;
+use crate::core::{database_failure, target_unwritable};
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
 use crate::ledger::{JobEvent, JobState, Ledger};
 use crate::models::folder::Folder;
@@ -117,14 +117,16 @@ pub(super) async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> 
 /// else one of `fresh`. Either fails a slot over to its track's alternates.
 ///
 /// Every row it sends carries its slot and is recorded in `ledger`: failed
-/// files Failed, queued ones Downloading. The batch a file goes into is
-/// stored before the backend hears of it, so a restart knows where a file
-/// slskd took may be. A file one of the user's batches
+/// files Failed, queued ones Downloading. The batch a file goes into and the
+/// backend request it is sent in are stored before the backend hears of it,
+/// so a restart knows where a file slskd took may be; when the ledger cannot
+/// store them nothing is sent and the request fails with the database's
+/// failure. A file one of the user's batches
 /// already downloads into this folder dismisses its slot, as that batch
 /// pursues it. A slot the request got no answer for is recorded Failed but
 /// not sent, the request's own answer showing why: the same user downloads
-/// it into another folder, the backend call failed, or the backend answered
-/// nothing for it.
+/// it into another folder, the ledger could not store its batch, the backend
+/// call failed, or the backend answered nothing for it.
 ///
 /// Runs as its own task. Registry keys are claimed from its start, and the
 /// client may disconnect at any await and drop the caller: dropping the
@@ -164,21 +166,26 @@ pub(super) async fn queue_and_watch(
     let items: Vec<DownloadableItem> = picked.iter().map(|(_, item)| item.clone()).collect();
     let claimed = claim_request(&backend, items.clone(), fresh.owned_by(&ctx));
     let request = backend.new_request();
-    if claimed.sends() {
-        let batch = claimed.batch();
-        // Stored before the backend hears of a file, so a restart after it took one finds the
-        // batch and tells the transfers of this send by its request. A write the ledger refused
-        // is logged there, and the request goes on.
-        let _ = ledger
+    // Stored before the backend hears of a file, so a restart after it took one finds the batch
+    // and tells the transfers of this send by its request. Nothing is sent when the ledger
+    // cannot store it.
+    let unstored = match claimed.sends() {
+        true => ledger
             .record_stored(JobEvent::Enqueued {
                 job: job.clone(),
-                monitor_batch_id: batch.owner.batch_id.clone(),
-                batch_label: batch.label.clone(),
+                monitor_batch_id: claimed.batch().owner.batch_id.clone(),
+                batch_label: claimed.batch().label.clone(),
                 request: request.clone(),
             })
-            .await;
-    }
-    let enq = claimed.enqueue(&backend, &request).await;
+            .await
+            .err()
+            .map(|e| database_failure(Stage::Enqueue, e)),
+        false => None,
+    };
+    let enq = match unstored {
+        None => claimed.enqueue(&backend, &request).await,
+        Some(_) => claimed.withdraw(&backend),
+    };
     let refusal = enq.refusal();
     let RequestEnqueue {
         batch,
@@ -229,6 +236,8 @@ pub(super) async fn queue_and_watch(
             let failure = if elsewhere.contains(&transfer_key(backend.id(), &item.source, &item.id))
             {
                 another_folder(RetryAdvice::OtherSource)
+            } else if let Some(failure) = &unstored {
+                failure.clone()
             } else if let Some(e) = &error {
                 queue_failed(e)
             } else {
@@ -328,6 +337,9 @@ pub(super) async fn queue_and_watch(
         }
     }
 
+    if let Some(failure) = unstored {
+        return Err(failure);
+    }
     if let Some(e) = error {
         return Err(queue_failed(&e));
     }
@@ -913,6 +925,65 @@ mod tests {
             })
             .collect();
         assert_eq!(after, vec![Some(JobState::Downloading), None]);
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_batch_the_ledger_cannot_store_sends_nothing_and_fails() {
+        let db = crate::db::test_db::migrated().await;
+        let folder_id = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let picked = numbered(vec![item("peer_a", "One", "01.flac")]);
+        ledger
+            .create(
+                NewJob {
+                    id: "j1".into(),
+                    user: UserId::new("alice"),
+                    folder_id,
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Queued,
+                    search_id: None,
+                    picked: picked.clone(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_batches BEFORE UPDATE OF monitor_batch_id ON jobs \
+             BEGIN SELECT RAISE(ABORT, 'this test refuses the write'); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+
+        let f = enqueue_and_watch(
+            &ledger,
+            &own_ctx(),
+            backend.clone(),
+            new_batch("Come Over"),
+            Acquisition {
+                job: "j1".into(),
+                items: picked,
+                alternates: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            (f.code, f.stage, f.message.as_str()),
+            (
+                FailureCode::SettingsUnreadable,
+                Stage::Enqueue,
+                "Soulful's database is unavailable"
+            )
+        );
+        assert!(stub.destinations().is_empty(), "a file was sent unstored");
+        assert!(TransferRegistry::global()
+            .may_adopt(&key(&backend, "peer_a", "01.flac"), &batch("Y").owner));
     }
 
     #[tokio::test]

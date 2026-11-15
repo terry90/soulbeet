@@ -28,6 +28,7 @@ use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::{album_jobs, import_job, resolve_on_disk, unresolved_row, ResolvedSlot};
 use super::utils::FileId;
 use crate::config::CONFIG;
+use crate::core::database_failure;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
 use crate::ledger::{JobEvent, JobState, Ledger};
@@ -603,15 +604,23 @@ impl DownloadMonitor {
         backend: &Arc<dyn DownloadBackend>,
         reason: &str,
     ) -> bool {
-        // Each source is recorded before it is sent, so a restart knows
-        // which peer may hold the slot's transfer.
+        // Each source is stored before it is sent, so a restart knows which
+        // peer may hold the slot's transfer and in which request. A source
+        // the ledger cannot store is not sent.
         let (ledger, job) = (self.ledger.clone(), self.tracked_files[slot].job.clone());
         let record = |item: &DownloadableItem, request: &str| {
-            ledger.record(JobEvent::Attempt {
+            let ledger = ledger.clone();
+            let attempt = JobEvent::Attempt {
                 slot: job.clone(),
                 candidate: Some(item.clone()),
                 request: Some(request.to_string()),
-            })
+            };
+            async move {
+                ledger
+                    .record_stored(attempt)
+                    .await
+                    .map_err(|e| database_failure(Stage::Enqueue, e))
+            }
         };
         let next = self
             .pool
@@ -2023,6 +2032,110 @@ mod tests {
                 stub.requests().first().cloned()
             )]
         );
+    }
+
+    /// A ledger writing to a test database holding job j1 with slot 0, and that database.
+    async fn stored_j1() -> (Ledger, sqlx::SqlitePool) {
+        let db = crate::db::test_db::migrated().await;
+        let folder_id = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        ledger
+            .create(
+                crate::ledger::NewJob {
+                    id: "j1".into(),
+                    user: UserId::new("alice"),
+                    folder_id,
+                    wanted: shared::download::DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Queued,
+                    search_id: None,
+                    picked: vec![(0, item("peer_a", "Wake Up", "dirA/aaa.flac"))],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        (ledger, db)
+    }
+
+    #[tokio::test]
+    async fn a_failover_source_reaches_the_backend_only_once_it_is_stored() {
+        let (mut m, _rx, _recorded) = failover_monitor();
+        let (ledger, db) = stored_j1().await;
+        m.ledger = ledger;
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let (reached, release) = stub.hold_downloads();
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+        // A slow writer: the pool's one connection is taken until the test lets it go.
+        let busy = db.acquire().await.unwrap();
+        let poll = tokio::spawn(async move {
+            poll_tracks(
+                &mut m,
+                &[failed_transfer("peer_a", "dirA/aaa.flac")],
+                &backend,
+            )
+            .await;
+        });
+
+        let early = tokio::time::timeout(Duration::from_millis(300), reached.notified());
+        assert!(
+            early.await.is_err(),
+            "the backend heard of the source before it was stored"
+        );
+        drop(busy);
+        reached.notified().await;
+        let stored: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT candidate, request FROM job_attempts WHERE job_id = 'j1' AND slot = 0 AND n = 2",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let candidate: Option<DownloadableItem> =
+            stored.0.map(|c| serde_json::from_str(&c).unwrap());
+        assert_eq!(
+            (candidate, stored.1),
+            (
+                Some(item("peer_b", "Wake Up", "dirB/bbb.flac")),
+                stub.requests().first().cloned()
+            )
+        );
+        release.notify_one();
+        poll.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failover_source_the_ledger_cannot_store_is_not_sent() {
+        let (mut m, _rx, _recorded) = failover_monitor();
+        let (ledger, db) = stored_j1().await;
+        sqlx::query(
+            "CREATE TRIGGER refuse_attempts BEFORE INSERT ON job_attempts \
+             BEGIN SELECT RAISE(ABORT, 'this test refuses the write'); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        m.ledger = ledger;
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[failed_transfer("peer_a", "dirA/aaa.flac")],
+            &backend,
+        )
+        .await;
+
+        assert!(stub.destinations().is_empty(), "a source was sent unstored");
+        assert_eq!(phase(&m, 0), SlotPhase::Settled);
+        assert_eq!(m.tracked_files[0].source, "peer_a");
+        for (peer, file) in [("peer_b", "dirB/bbb.flac"), ("peer_c", "dirC/ccc.flac")] {
+            assert!(
+                TransferRegistry::global().may_adopt(&key(&backend, peer, file), &batch("Y").owner),
+                "{file} is not held"
+            );
+        }
     }
 
     #[tokio::test]

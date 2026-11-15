@@ -11,6 +11,7 @@ use shared::download::{DownloadableGroup, DownloadableItem, EnqueueStatus, Queue
 use shared::failure::{Failure, Stage};
 use soulbeet::DownloadBackend;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 use tracing::info;
 
@@ -142,29 +143,44 @@ impl SourcePool {
         backend: &Arc<dyn DownloadBackend>,
         batch: &BatchRef,
     ) -> NextSource {
-        self.enqueue_next_noting(slot, backend, batch, |_, _| {})
+        self.enqueue_next_noting(slot, backend, batch, |_, _| std::future::ready(Ok(())))
             .await
     }
 
-    /// `enqueue_next`, calling `sending` with each alternate and the backend
-    /// request it goes in just before it is sent to the backend.
-    pub async fn enqueue_next_noting(
+    /// `enqueue_next`, awaiting `sending` with each alternate and the backend
+    /// request it goes in before it is sent to the backend. When `sending`
+    /// fails, that alternate is refused with its failure and not sent, and
+    /// no other is tried.
+    pub async fn enqueue_next_noting<F, Noted>(
         &mut self,
         slot: usize,
         backend: &Arc<dyn DownloadBackend>,
         batch: &BatchRef,
-        mut sending: impl FnMut(&DownloadableItem, &str),
-    ) -> NextSource {
+        mut sending: F,
+    ) -> NextSource
+    where
+        F: FnMut(&DownloadableItem, &str) -> Noted,
+        Noted: Future<Output = Result<(), Failure>>,
+    {
         let mut refused = Vec::new();
         while let Some(item) = self.take_next(slot) {
             let (source, id) = (item.source.clone(), item.id.clone());
             let key = transfer_key(backend.id(), &source, &id);
-            let claim = TransferRegistry::global().claim(&[key], batch);
+            let registry = TransferRegistry::global();
+            let claim = registry.claim(std::slice::from_ref(&key), batch);
             let failure = if claim.claimed.is_empty() {
                 held_failure(&claim, batch)
             } else {
                 let request = backend.new_request();
-                sending(&item, &request);
+                if let Err(failure) = sending(&item, &request).await {
+                    registry.release(&key, &batch.owner);
+                    refused.push(RefusedAlternate {
+                        source,
+                        item: id,
+                        failure,
+                    });
+                    break;
+                }
                 match enqueue_claimed(backend, vec![item.clone()], batch, &request).await {
                     Ok(queued) => {
                         if let Some(ok) =

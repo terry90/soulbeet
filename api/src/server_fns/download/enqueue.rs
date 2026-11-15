@@ -250,6 +250,22 @@ impl ClaimedRequest {
         !self.to_enqueue.is_empty()
     }
 
+    /// Sends nothing: releases the keys of the files it would have sent, which
+    /// get no entry in `results`.
+    pub fn withdraw(self, backend: &Arc<dyn DownloadBackend>) -> RequestEnqueue {
+        let registry = TransferRegistry::global();
+        for item in &self.to_enqueue {
+            registry.release(&item_key(backend.id(), item), &self.batch.owner);
+        }
+        RequestEnqueue {
+            batch: self.batch,
+            results: self.results,
+            watcher: self.watcher,
+            error: None,
+            elsewhere: self.elsewhere,
+        }
+    }
+
     /// Enqueues the claimed files in the backend request `request`.
     pub async fn enqueue(
         self,
