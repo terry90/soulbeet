@@ -400,14 +400,23 @@ enum Outcome {
     Cancelled,
 }
 
+/// Whether a discovery transfer in `state` delivered its file.
+#[cfg(feature = "server")]
+fn succeeded(state: &shared::download::DownloadState) -> bool {
+    use shared::download::DownloadState as DS;
+    matches!(state, DS::Completed | DS::Imported | DS::ImportSkipped)
+}
+
 /// Settle one poll of slskd's transfer list against the tracks still pending.
 ///
 /// `pending` and `failed` hold transfer ids. Finished transfers leave
 /// `pending`; a failed one retries from the track's next-best peer, moving
 /// the track's key and transfer id to it, and only lands in `failed` once
 /// the track is out of peers. A cancellation is a decision rather than a
-/// peer problem, so it fails without a retry. A track that settles without
-/// a file gives up its key.
+/// peer problem, so it fails without a retry: one slskd shows, and one its
+/// user asked for through the transfer registry, which is cancelled here
+/// unless it already finished. A track that settles without a file gives up
+/// its key.
 ///
 /// A failure counts only once it has persisted for `FAILED_STATE_CONFIRM`,
 /// the same window `DownloadMonitor` applies. slskd 0.26 retries failed
@@ -423,12 +432,33 @@ async fn settle_poll(
     failed: &mut std::collections::HashSet<String>,
     backend: &Arc<dyn soulbeet::DownloadBackend>,
 ) {
+    let registry = TransferRegistry::global();
     let mut newly_done: Vec<(usize, String, Outcome)> = Vec::new();
     for (idx, qt) in queued.iter_mut().enumerate() {
         if !pending.contains(&qt.transfer_id) {
             continue;
         }
-        let Some(dl) = transfer_by_id(downloads, &qt.key.peer, &qt.transfer_id) else {
+        let listed = transfer_by_id(downloads, &qt.key.peer, &qt.transfer_id);
+        if registry.is_cancelled(&qt.key, &qt.batch.owner)
+            && !listed.is_some_and(|dl| succeeded(&dl.state))
+        {
+            info!(
+                "Discovery: '{}' - {} cancelled on request",
+                qt.artist, qt.track
+            );
+            if let Err(e) = backend
+                .cancel_download(&qt.key.peer, &qt.transfer_id, false)
+                .await
+            {
+                warn!(
+                    "Failed to cancel transfer {} in slskd: {}",
+                    qt.transfer_id, e
+                );
+            }
+            newly_done.push((idx, qt.transfer_id.clone(), Outcome::Cancelled));
+            continue;
+        }
+        let Some(dl) = listed else {
             continue;
         };
         let dl = read_pending_retry(dl, &mut qt.retry_pending_since);
@@ -436,9 +466,7 @@ async fn settle_poll(
             qt.failing_since = None;
         }
         match &dl.state {
-            shared::download::DownloadState::Completed
-            | shared::download::DownloadState::Imported
-            | shared::download::DownloadState::ImportSkipped => {
+            state if succeeded(state) => {
                 newly_done.push((idx, qt.transfer_id.clone(), Outcome::Succeeded));
             }
             shared::download::DownloadState::Failed(_) => {
@@ -456,7 +484,6 @@ async fn settle_poll(
         }
     }
 
-    let registry = TransferRegistry::global();
     for (idx, id, outcome) in newly_done {
         pending.remove(&id);
         let qt = &mut queued[idx];
@@ -487,13 +514,13 @@ async fn settle_poll(
                         );
                         // The new peer serves this track under its own remote
                         // path and transfer id, so the whole identity moves at
-                        // once, and the fresh transfer starts with no failure
-                        // recorded.
+                        // once, a cancel asked for meanwhile with it, and the
+                        // fresh transfer starts with no failure recorded.
                         let dead = std::mem::replace(
                             &mut qt.key,
                             transfer_key(backend.id(), &next.source, &next.item),
                         );
-                        registry.release(&dead, &qt.batch.owner);
+                        registry.hand_over(&dead, &qt.key, &qt.batch.owner);
                         qt.transfer_id = next.id.clone();
                         qt.failing_since = None;
                         qt.retry_pending_since = None;
@@ -1617,14 +1644,14 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 mod tests {
     use super::{
         claim_run, discovery_disabled, discovery_folder_not_found, discovery_folder_required,
-        generation_running, scan_finished, scan_imports, settle_poll, QueuedTrack,
-        FAILED_STATE_CONFIRM,
+        generation_running, run_database_failure, scan_finished, scan_imports, settle_poll,
+        QueuedTrack, FAILED_STATE_CONFIRM,
     };
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
     use crate::server_fns::download::monitor::RETRY_PENDING_FOR;
     use crate::server_fns::download::test_support::{
-        batch, item, transfer, ScriptedOutcome, StubBackend,
+        batch, item, transfer, Cancel, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::download::{DownloadProgress, DownloadState, DownloadableItem};
@@ -1680,6 +1707,23 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn a_run_database_failure_keeps_the_database_text_at_its_stage() {
+        use shared::failure::{Cause, Service};
+        let raw = "error returned from database: (code: 5) database is locked";
+        let f = run_database_failure(Stage::SourceSearch, raw.to_string());
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::SettingsUnreadable,
+                Stage::SourceSearch,
+                RetryAdvice::SameSourceLater,
+                raw
+            )
+        );
+        assert_eq!(f.cause, Some(Cause::new(Service::Database, None, raw)));
     }
 
     #[test]
@@ -2136,6 +2180,115 @@ mod tests {
         settle_poll(&mut queued, &[row], &mut pending, &mut failed_ids, &backend).await;
 
         assert_eq!(queued[0].pool.attempts_used(0), 2);
+    }
+
+    #[tokio::test]
+    async fn a_track_its_user_cancels_is_cancelled_and_not_retried() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let mut queued = vec![queued_track(
+            vec![
+                item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+                item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+            ],
+            &backend,
+        )];
+        let registry = TransferRegistry::global();
+        let own = queued[0].key.clone();
+        assert!(registry.request_cancel(&own, &queued[0].batch.owner.user_id));
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+
+        settle_poll(
+            &mut queued,
+            &[live("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed_ids,
+            &backend,
+        )
+        .await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-a/07 - Wake Up.flac")]
+        );
+        assert!(pending.is_empty());
+        assert!(failed_ids.contains("t-a/07 - Wake Up.flac"));
+        assert_eq!(queued[0].pool.attempts_used(0), 1, "no other peer");
+        assert!(registry.may_adopt(&own, &batch("Y").owner));
+    }
+
+    #[tokio::test]
+    async fn a_track_cancelled_after_its_transfer_finished_is_still_imported() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let mut queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        assert!(TransferRegistry::global()
+            .request_cancel(&queued[0].key, &queued[0].batch.owner.user_id));
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+
+        settle_poll(
+            &mut queued,
+            &[completed("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed_ids,
+            &backend,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(failed_ids.is_empty(), "it settled as done");
+        assert!(stub.cancelled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_asked_for_during_a_tracks_failover_follows_it() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let mut queued = vec![queued_track(
+            vec![
+                item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+                item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+            ],
+            &backend,
+        )];
+        let registry = TransferRegistry::global();
+        let first = queued[0].key.clone();
+        let user = queued[0].batch.owner.user_id.clone();
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+        already_confirmed_failing(&mut queued[0]);
+        let (reached, release) = stub.hold_downloads();
+        let cancel = async {
+            reached.notified().await; // the failover's enqueue is in flight
+            assert!(registry.request_cancel(&first, &user));
+            release.notify_one();
+        };
+
+        let dead = [failed("peer_a", "a/07 - Wake Up.flac")];
+        tokio::join!(
+            settle_poll(&mut queued, &dead, &mut pending, &mut failed_ids, &backend,),
+            cancel
+        );
+        assert_eq!(queued[0].key.peer, "peer_b");
+        settle_poll(
+            &mut queued,
+            &[live("peer_b", "b/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed_ids,
+            &backend,
+        )
+        .await;
+
+        assert!(stub
+            .cancelled()
+            .contains(&Cancel::only("peer_b", "t-b/07 - Wake Up.flac")));
+        assert!(pending.is_empty());
+        assert!(failed_ids.contains("t-b/07 - Wake Up.flac"));
     }
 
     /// A Navidrome whose scan status cannot be read (getLastScanTime's
