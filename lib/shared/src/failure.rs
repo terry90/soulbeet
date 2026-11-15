@@ -205,169 +205,112 @@ pub enum UserActionCode {
     AddFolder,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureCode {
-    InvalidInput,
-    UnknownHandle,
-    ExpiredHandle,
-    NotOwner,
-    PermissionNotGranted,
-    FolderRequired,
-    RateLimited,
-    MetadataUnavailable,
-    MetadataNotFound,
-    MetadataRateLimited,
-    ProviderNotConfigured,
-    NavidromeUnreachable,
-    NavidromeAuthFailed,
-    NavidromeNotLinked,
-    NavidromeCircuitOpen,
-    BackendNotConfigured,
-    BackendUnreachable,
-    SearchRateLimited,
-    SearchNoResults,
-    /// Every response scored below the floor. Produced once the slskd client
-    /// reports the files it dropped (build step 3, design 8.1 and 10.2).
-    SearchAllFiltered,
-    SearchTimeout,
-    /// The backend refused the search request as unusable, for example a
-    /// query of exclusion terms only.
-    SearchQueryRejected,
-    /// The backend already runs a search under the token this one asked for.
-    SearchAlreadyRunning,
-    PeerOffline,
-    AlreadyRunning,
-    AlreadyInFlightOtherUser,
-    AlreadyInFlightOtherFolder,
-    EnqueueFailed,
-    SlskdTooOld,
-    TransferConnectionFailed,
-    TransferSizeMismatch,
-    TransferRejectedNotShared,
-    TransferRejectedPeerBusy,
-    TransferRejectedFailureLimit,
-    TransferRejectedOther,
-    TransferTimedOut,
-    TransferAborted,
-    TransferCancelled,
-    TransferNeverAppeared,
-    TransferDisappeared,
-    TransferStuckInRemoteQueue,
-    TransferListUnreadable,
-    FileNotFoundAfterDownload,
-    ImportNoMatch,
-    ImportAlreadyInLibrary,
-    ImportNothingToImport,
-    ImportLookupFailed,
-    ImportBeetsFailed,
-    ImportTargetUnwritable,
-    /// The disk beets writes to is full.
-    ImportDiskFull,
-    ImportIdleTimeout,
-    ImportTotalTimeout,
-    ImporterBroken,
-    ImportAsIsMissingTags,
-    ImportChoiceInvalid,
-    ImportFilesGone,
-    ImportPartial,
-    IndexNotFoundAfterScan,
-    IndexNoScanPossible,
-    ScanFailed,
-    PlaylistNotFound,
-    PlaylistNotOwner,
-    PlaylistNameTaken,
-    PlaylistTracksNotWritten,
-    DeletePathUnresolved,
-    DeleteOutsideLibrary,
-    DeleteNotATrack,
-    DeleteBlockedByOtherUser,
-    DeleteVetoUnknown,
-    DeleteInUse,
-    DeleteChangedSincePreview,
-    DeleteDailyLimit,
-    ServerRestarted,
+/// Defines `FailureCode` from one list of variants and wire names: `as_str`
+/// gives each name, and the tests check every variant against serde through
+/// `ALL`, so a new variant cannot be left out of either.
+macro_rules! failure_codes {
+    ($($(#[$doc:meta])* $variant:ident => $name:literal,)*) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum FailureCode {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl FailureCode {
+            /// Every variant, in declaration order.
+            #[cfg(test)]
+            const ALL: &'static [FailureCode] = &[$(FailureCode::$variant,)*];
+
+            /// The wire name, as serde writes it.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(FailureCode::$variant => $name,)*
+                }
+            }
+        }
+    };
 }
 
-impl FailureCode {
-    /// The wire name, as serde writes it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FailureCode::InvalidInput => "invalid_input",
-            FailureCode::UnknownHandle => "unknown_handle",
-            FailureCode::ExpiredHandle => "expired_handle",
-            FailureCode::NotOwner => "not_owner",
-            FailureCode::PermissionNotGranted => "permission_not_granted",
-            FailureCode::FolderRequired => "folder_required",
-            FailureCode::RateLimited => "rate_limited",
-            FailureCode::MetadataUnavailable => "metadata_unavailable",
-            FailureCode::MetadataNotFound => "metadata_not_found",
-            FailureCode::MetadataRateLimited => "metadata_rate_limited",
-            FailureCode::ProviderNotConfigured => "provider_not_configured",
-            FailureCode::NavidromeUnreachable => "navidrome_unreachable",
-            FailureCode::NavidromeAuthFailed => "navidrome_auth_failed",
-            FailureCode::NavidromeNotLinked => "navidrome_not_linked",
-            FailureCode::NavidromeCircuitOpen => "navidrome_circuit_open",
-            FailureCode::BackendNotConfigured => "backend_not_configured",
-            FailureCode::BackendUnreachable => "backend_unreachable",
-            FailureCode::SearchRateLimited => "search_rate_limited",
-            FailureCode::SearchNoResults => "search_no_results",
-            FailureCode::SearchAllFiltered => "search_all_filtered",
-            FailureCode::SearchTimeout => "search_timeout",
-            FailureCode::SearchQueryRejected => "search_query_rejected",
-            FailureCode::SearchAlreadyRunning => "search_already_running",
-            FailureCode::PeerOffline => "peer_offline",
-            FailureCode::AlreadyRunning => "already_running",
-            FailureCode::AlreadyInFlightOtherUser => "already_in_flight_other_user",
-            FailureCode::AlreadyInFlightOtherFolder => "already_in_flight_other_folder",
-            FailureCode::EnqueueFailed => "enqueue_failed",
-            FailureCode::SlskdTooOld => "slskd_too_old",
-            FailureCode::TransferConnectionFailed => "transfer_connection_failed",
-            FailureCode::TransferSizeMismatch => "transfer_size_mismatch",
-            FailureCode::TransferRejectedNotShared => "transfer_rejected_not_shared",
-            FailureCode::TransferRejectedPeerBusy => "transfer_rejected_peer_busy",
-            FailureCode::TransferRejectedFailureLimit => "transfer_rejected_failure_limit",
-            FailureCode::TransferRejectedOther => "transfer_rejected_other",
-            FailureCode::TransferTimedOut => "transfer_timed_out",
-            FailureCode::TransferAborted => "transfer_aborted",
-            FailureCode::TransferCancelled => "transfer_cancelled",
-            FailureCode::TransferNeverAppeared => "transfer_never_appeared",
-            FailureCode::TransferDisappeared => "transfer_disappeared",
-            FailureCode::TransferStuckInRemoteQueue => "transfer_stuck_in_remote_queue",
-            FailureCode::TransferListUnreadable => "transfer_list_unreadable",
-            FailureCode::FileNotFoundAfterDownload => "file_not_found_after_download",
-            FailureCode::ImportNoMatch => "import_no_match",
-            FailureCode::ImportAlreadyInLibrary => "import_already_in_library",
-            FailureCode::ImportNothingToImport => "import_nothing_to_import",
-            FailureCode::ImportLookupFailed => "import_lookup_failed",
-            FailureCode::ImportBeetsFailed => "import_beets_failed",
-            FailureCode::ImportTargetUnwritable => "import_target_unwritable",
-            FailureCode::ImportDiskFull => "import_disk_full",
-            FailureCode::ImportIdleTimeout => "import_idle_timeout",
-            FailureCode::ImportTotalTimeout => "import_total_timeout",
-            FailureCode::ImporterBroken => "importer_broken",
-            FailureCode::ImportAsIsMissingTags => "import_as_is_missing_tags",
-            FailureCode::ImportChoiceInvalid => "import_choice_invalid",
-            FailureCode::ImportFilesGone => "import_files_gone",
-            FailureCode::ImportPartial => "import_partial",
-            FailureCode::IndexNotFoundAfterScan => "index_not_found_after_scan",
-            FailureCode::IndexNoScanPossible => "index_no_scan_possible",
-            FailureCode::ScanFailed => "scan_failed",
-            FailureCode::PlaylistNotFound => "playlist_not_found",
-            FailureCode::PlaylistNotOwner => "playlist_not_owner",
-            FailureCode::PlaylistNameTaken => "playlist_name_taken",
-            FailureCode::PlaylistTracksNotWritten => "playlist_tracks_not_written",
-            FailureCode::DeletePathUnresolved => "delete_path_unresolved",
-            FailureCode::DeleteOutsideLibrary => "delete_outside_library",
-            FailureCode::DeleteNotATrack => "delete_not_a_track",
-            FailureCode::DeleteBlockedByOtherUser => "delete_blocked_by_other_user",
-            FailureCode::DeleteVetoUnknown => "delete_veto_unknown",
-            FailureCode::DeleteInUse => "delete_in_use",
-            FailureCode::DeleteChangedSincePreview => "delete_changed_since_preview",
-            FailureCode::DeleteDailyLimit => "delete_daily_limit",
-            FailureCode::ServerRestarted => "server_restarted",
-        }
-    }
+failure_codes! {
+    InvalidInput => "invalid_input",
+    UnknownHandle => "unknown_handle",
+    ExpiredHandle => "expired_handle",
+    NotOwner => "not_owner",
+    PermissionNotGranted => "permission_not_granted",
+    FolderRequired => "folder_required",
+    RateLimited => "rate_limited",
+    MetadataUnavailable => "metadata_unavailable",
+    MetadataNotFound => "metadata_not_found",
+    MetadataRateLimited => "metadata_rate_limited",
+    ProviderNotConfigured => "provider_not_configured",
+    NavidromeUnreachable => "navidrome_unreachable",
+    NavidromeAuthFailed => "navidrome_auth_failed",
+    NavidromeNotLinked => "navidrome_not_linked",
+    NavidromeCircuitOpen => "navidrome_circuit_open",
+    BackendNotConfigured => "backend_not_configured",
+    BackendUnreachable => "backend_unreachable",
+    SearchRateLimited => "search_rate_limited",
+    SearchNoResults => "search_no_results",
+    /// Every response scored below the floor. Produced once the slskd client
+    /// reports the files it dropped (build step 3, design 8.1 and 10.2).
+    SearchAllFiltered => "search_all_filtered",
+    SearchTimeout => "search_timeout",
+    /// The backend refused the search request as unusable, for example a
+    /// query of exclusion terms only.
+    SearchQueryRejected => "search_query_rejected",
+    /// The backend already runs a search under the token this one asked for.
+    SearchAlreadyRunning => "search_already_running",
+    PeerOffline => "peer_offline",
+    AlreadyRunning => "already_running",
+    AlreadyInFlightOtherUser => "already_in_flight_other_user",
+    AlreadyInFlightOtherFolder => "already_in_flight_other_folder",
+    EnqueueFailed => "enqueue_failed",
+    SlskdTooOld => "slskd_too_old",
+    TransferConnectionFailed => "transfer_connection_failed",
+    TransferSizeMismatch => "transfer_size_mismatch",
+    TransferRejectedNotShared => "transfer_rejected_not_shared",
+    TransferRejectedPeerBusy => "transfer_rejected_peer_busy",
+    TransferRejectedFailureLimit => "transfer_rejected_failure_limit",
+    TransferRejectedOther => "transfer_rejected_other",
+    TransferTimedOut => "transfer_timed_out",
+    TransferAborted => "transfer_aborted",
+    TransferCancelled => "transfer_cancelled",
+    TransferNeverAppeared => "transfer_never_appeared",
+    TransferDisappeared => "transfer_disappeared",
+    TransferStuckInRemoteQueue => "transfer_stuck_in_remote_queue",
+    TransferListUnreadable => "transfer_list_unreadable",
+    FileNotFoundAfterDownload => "file_not_found_after_download",
+    ImportNoMatch => "import_no_match",
+    ImportAlreadyInLibrary => "import_already_in_library",
+    ImportNothingToImport => "import_nothing_to_import",
+    ImportLookupFailed => "import_lookup_failed",
+    ImportBeetsFailed => "import_beets_failed",
+    ImportTargetUnwritable => "import_target_unwritable",
+    /// The disk beets writes to is full.
+    ImportDiskFull => "import_disk_full",
+    ImportIdleTimeout => "import_idle_timeout",
+    ImportTotalTimeout => "import_total_timeout",
+    ImporterBroken => "importer_broken",
+    ImportAsIsMissingTags => "import_as_is_missing_tags",
+    ImportChoiceInvalid => "import_choice_invalid",
+    ImportFilesGone => "import_files_gone",
+    ImportPartial => "import_partial",
+    IndexNotFoundAfterScan => "index_not_found_after_scan",
+    IndexNoScanPossible => "index_no_scan_possible",
+    ScanFailed => "scan_failed",
+    PlaylistNotFound => "playlist_not_found",
+    PlaylistNotOwner => "playlist_not_owner",
+    PlaylistNameTaken => "playlist_name_taken",
+    PlaylistTracksNotWritten => "playlist_tracks_not_written",
+    DeletePathUnresolved => "delete_path_unresolved",
+    DeleteOutsideLibrary => "delete_outside_library",
+    DeleteNotATrack => "delete_not_a_track",
+    DeleteBlockedByOtherUser => "delete_blocked_by_other_user",
+    DeleteVetoUnknown => "delete_veto_unknown",
+    DeleteInUse => "delete_in_use",
+    DeleteChangedSincePreview => "delete_changed_since_preview",
+    DeleteDailyLimit => "delete_daily_limit",
+    ServerRestarted => "server_restarted",
 }
 
 #[cfg(test)]
@@ -456,14 +399,25 @@ mod tests {
 
     #[test]
     fn every_failure_code_has_its_section_7_name() {
-        let mut codes = std::collections::HashSet::new();
+        for code in FailureCode::ALL {
+            assert_eq!(
+                serde_json::to_value(code).unwrap(),
+                serde_json::json!(code.as_str()),
+                "{code:?}"
+            );
+        }
+        let wire: std::collections::BTreeSet<&str> =
+            FailureCode::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            wire.len(),
+            FailureCode::ALL.len(),
+            "two variants share a name"
+        );
+        assert_eq!(wire, NAMES.into_iter().collect());
         for name in NAMES {
             let code: FailureCode = serde_json::from_value(serde_json::json!(name)).expect(name);
-            assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!(name));
             assert_eq!(code.as_str(), name);
-            codes.insert(code);
         }
-        assert_eq!(codes.len(), NAMES.len(), "two names map to one variant");
     }
 
     #[test]
