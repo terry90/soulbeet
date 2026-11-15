@@ -12,8 +12,6 @@ use shared::download::DownloadEvent;
 #[cfg(feature = "server")]
 use tokio::sync::{broadcast, RwLock};
 #[cfg(feature = "server")]
-use tokio_util::sync::CancellationToken;
-#[cfg(feature = "server")]
 use tracing::{info, warn};
 
 /// Interval for cleaning up stale user channels (5 minutes).
@@ -24,11 +22,10 @@ const CHANNEL_CLEANUP_INTERVAL_SECS: u64 = 300;
 #[cfg(feature = "server")]
 const CHANNEL_STALE_THRESHOLD_SECS: u64 = 600;
 
-/// Channel info including the sender and cancellation token for cleanup
+/// A user's download event channel and the count of tasks using it, for cleanup
 #[cfg(feature = "server")]
 pub struct UserChannel {
     pub sender: broadcast::Sender<DownloadEvent>,
-    pub cancellation_token: CancellationToken,
     pub active_tasks: std::sync::atomic::AtomicUsize,
     /// Timestamp of last activity (task registration or message send)
     last_activity: std::sync::atomic::AtomicU64,
@@ -40,7 +37,6 @@ impl UserChannel {
         let (sender, _) = broadcast::channel(100);
         Self {
             sender,
-            cancellation_token: CancellationToken::new(),
             active_tasks: std::sync::atomic::AtomicUsize::new(0),
             last_activity: std::sync::atomic::AtomicU64::new(Self::current_timestamp()),
         }
@@ -90,11 +86,6 @@ impl UserChannel {
     pub fn task_count(&self) -> usize {
         self.active_tasks.load(std::sync::atomic::Ordering::Relaxed)
     }
-
-    /// Cancel all active tasks
-    pub fn cancel_all(&self) {
-        self.cancellation_token.cancel();
-    }
 }
 
 #[cfg(feature = "server")]
@@ -113,14 +104,12 @@ pub static DISCOVERY_PROGRESS: LazyLock<
     RwLock<HashMap<String, shared::navidrome::DiscoveryProgress>>,
 > = LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Get or create a user channel, returning the sender and cancellation token
+/// Get or create a user channel, returning its sender
 #[cfg(feature = "server")]
-pub async fn get_or_create_user_channel(
-    user: &UserId,
-) -> (broadcast::Sender<DownloadEvent>, CancellationToken) {
+pub async fn get_or_create_user_channel(user: &UserId) -> broadcast::Sender<DownloadEvent> {
     let mut map = USER_CHANNELS.write().await;
     let channel = map.entry(user.clone()).or_insert_with(UserChannel::new);
-    (channel.sender.clone(), channel.cancellation_token.clone())
+    channel.sender.clone()
 }
 
 /// Sends to the user's channel as it is now: `cleanup_stale_channels` may
@@ -136,13 +125,12 @@ pub async fn send_user_event(user: &UserId, event: DownloadEvent) -> bool {
     channel.sender.send(event).is_ok()
 }
 
-/// Register a new task for a user and return the cancellation token
+/// Register a new task for a user
 #[cfg(feature = "server")]
-pub async fn register_user_task(user: &UserId) -> CancellationToken {
+pub async fn register_user_task(user: &UserId) {
     let mut map = USER_CHANNELS.write().await;
     let channel = map.entry(user.clone()).or_insert_with(UserChannel::new);
     channel.add_task();
-    channel.cancellation_token.clone()
 }
 
 /// Unregister a task for a user and clean up if no tasks remain

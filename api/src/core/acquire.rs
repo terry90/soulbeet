@@ -1,5 +1,5 @@
 //! Getting files: batches, enqueueing a request's files and watching them,
-//! the manual download and the auto-download pipeline.
+//! the manual download, the auto-download pipeline and cancelling a download.
 
 use crate::auth::UserCtx;
 use crate::config::CONFIG;
@@ -9,12 +9,12 @@ use crate::globals::{get_or_create_user_channel, register_user_task, unregister_
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{
     another_folder, deliver, enqueue_request, failed_reason, not_enqueued_failure, stopped_rows,
-    RequestEnqueue, Watcher,
+    transfer_key, RequestEnqueue, Watcher,
 };
 use crate::server_fns::download::failover::{align_pool_tracks, SourcePool};
 use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
 use crate::services::download_backend;
-use crate::transfer_registry::{BatchRef, TransferOwner};
+use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
 use dioxus::logger::tracing::info;
 use shared::download::{
     AutoDownloadEvent, DownloadEvent, DownloadProgress, DownloadQuery, DownloadableGroup,
@@ -135,7 +135,7 @@ async fn queue_and_watch(
     } = enq;
 
     let user = ctx.id();
-    let (tx, _) = get_or_create_user_channel(&user).await;
+    let tx = get_or_create_user_channel(&user).await;
     let row = |p: DownloadProgress| {
         let mut p = p.with_batch(batch.owner.batch_id.clone(), batch.label.clone());
         p.backend = Some(backend.id().to_string());
@@ -212,16 +212,10 @@ async fn queue_and_watch(
             // Pool slots must line up with the monitor's slots, which follow
             // `enqueued`, not `items`.
             let pool = SourcePool::from_tracks(&align_pool_tracks(&enqueued, &items), &alternates);
-            let task_cancellation = register_user_task(&user).await;
+            register_user_task(&user).await;
             tokio::spawn(async move {
-                let mut monitor = DownloadMonitor::new(
-                    transfers,
-                    batch.target.clone(),
-                    tx,
-                    task_cancellation,
-                    batch,
-                )
-                .with_failover(pool);
+                let mut monitor = DownloadMonitor::new(transfers, batch.target.clone(), tx, batch)
+                    .with_failover(pool);
                 monitor.run().await;
                 unregister_user_task(&user).await;
             });
@@ -312,7 +306,7 @@ pub async fn auto_download(
     }
     let key = lastfm_key(ctx).await?;
 
-    let (tx, _) = get_or_create_user_channel(&ctx.id()).await;
+    let tx = get_or_create_user_channel(&ctx.id()).await;
     let send = move |event| {
         let _ = tx.send(DownloadEvent::AutoDownload(event));
     };
@@ -468,13 +462,68 @@ pub async fn auto_download(
     Ok(batch_id_for_response)
 }
 
+/// No transfer of the user's has that id on that peer.
+fn download_not_found() -> Failure {
+    Failure::new(
+        FailureCode::UnknownHandle,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "Download not found",
+    )
+}
+
+/// The registry key of the transfer the backend lists with exactly this peer
+/// and id, built from the backend's own filename. `None` when it lists no
+/// such transfer.
+fn cancel_key(
+    listed: &[DownloadProgress],
+    backend: &'static str,
+    source: &str,
+    id: &str,
+) -> Option<TransferKey> {
+    listed
+        .iter()
+        .find(|row| row.source == source && row.id == id)
+        .map(|row| transfer_key(backend, &row.source, &row.item))
+}
+
+/// Cancels the transfer the named backend, or the default one, lists under
+/// `transfer_id` from `source`, when one of `ctx`'s batches holds it. Its
+/// monitor stops it and shows it Cancelled on its next poll.
+pub async fn cancel(
+    ctx: &UserCtx,
+    backend: Option<&str>,
+    source: &str,
+    transfer_id: &str,
+) -> Result<(), Failure> {
+    let backend = download_backend(backend)
+        .await
+        .map_err(|e| backend_unavailable(Stage::Transfer, &e))?;
+
+    // The key comes from the transfer the backend lists under that id, never
+    // from text the client sends, so a user cannot pair their own file with
+    // another user's transfer id on the same peer.
+    let listed = backend
+        .get_downloads_for(&[source.to_string()])
+        .await
+        .map_err(|e| e.failure(Stage::Transfer, e.to_string()))?;
+    let user = ctx.id();
+    let marked = cancel_key(&listed, backend.id(), source, transfer_id)
+        .is_some_and(|key| TransferRegistry::global().request_cancel(&key, &user));
+    if !marked {
+        return Err(download_not_found());
+    }
+    info!("User {user} cancelled download {transfer_id} from {source}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::test_ctx;
-    use crate::server_fns::download::enqueue::other_user;
+    use crate::server_fns::download::enqueue::{other_user, transfer_key};
     use crate::server_fns::download::test_support::{
-        batch, group, item, key, same_user_into, ScriptedOutcome, StubBackend,
+        batch, group, item, key, same_user_into, transfer, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::failure::{Cause, Service};
@@ -703,7 +752,6 @@ mod tests {
         let fresh = batch("Come Over");
         let mut rx = crate::globals::get_or_create_user_channel(&fresh.owner.user_id)
             .await
-            .0
             .subscribe();
         let results = enqueue_and_watch(
             &ctx_of(&fresh),
@@ -725,6 +773,43 @@ mod tests {
         assert_eq!(
             rows[0].failure.as_ref().map(|f| f.code),
             Some(FailureCode::PeerOffline)
+        );
+    }
+
+    fn listed() -> Vec<DownloadProgress> {
+        vec![transfer(
+            "peer_a",
+            "Music\\A\\01.flac",
+            "t-1",
+            shared::download::DownloadState::Queued,
+        )]
+    }
+
+    #[test]
+    fn cancel_uses_the_listed_filename_not_the_clients_text() {
+        assert_eq!(
+            cancel_key(&listed(), "slskd", "peer_a", "t-1"),
+            Some(transfer_key("slskd", "peer_a", "Music\\A\\01.flac"))
+        );
+    }
+
+    #[test]
+    fn cancel_needs_a_listed_transfer_with_that_id_and_peer() {
+        assert_eq!(cancel_key(&listed(), "slskd", "peer_a", "t-2"), None);
+        assert_eq!(cancel_key(&listed(), "slskd", "peer_b", "t-1"), None);
+    }
+
+    #[test]
+    fn a_transfer_nobody_of_the_user_holds_is_not_found() {
+        let f = download_not_found();
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::UnknownHandle,
+                Stage::Input,
+                RetryAdvice::NotRetryable,
+                "Download not found"
+            )
         );
     }
 

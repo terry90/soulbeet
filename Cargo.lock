@@ -140,7 +140,6 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
- "tokio-util",
  "tower-cookies",
  "tracing",
  "url",

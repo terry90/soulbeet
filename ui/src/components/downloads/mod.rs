@@ -77,7 +77,6 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
             let req = CancelDownloadRequest {
                 id: file.id.clone(),
                 source: file.source.clone(),
-                item: file.item.clone(),
                 backend: file.backend.clone(),
             };
             Box::pin(async move {

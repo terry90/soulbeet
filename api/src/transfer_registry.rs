@@ -89,9 +89,34 @@ pub struct RequestClaim {
     pub reservation: Option<InboxReservation>,
 }
 
+/// The claims and cancel marks, behind one lock so a check of both is one
+/// step.
+#[derive(Default)]
+struct Held {
+    owners: HashMap<TransferKey, BatchRef>,
+    /// Held keys their user asked to cancel. A mark lives only as long as
+    /// its key's claim.
+    cancelled: HashSet<TransferKey>,
+}
+
+impl Held {
+    /// Whether `owner` holds `key`.
+    fn held_by(&self, key: &TransferKey, owner: &TransferOwner) -> bool {
+        self.owners
+            .get(key)
+            .is_some_and(|held| held.owner == *owner)
+    }
+
+    /// Drops `key`'s claim and mark. Returns whether it was marked.
+    fn remove(&mut self, key: &TransferKey) -> bool {
+        self.owners.remove(key);
+        self.cancelled.remove(key)
+    }
+}
+
 #[derive(Default)]
 pub struct TransferRegistry {
-    owners: Mutex<HashMap<TransferKey, BatchRef>>,
+    held: Mutex<Held>,
 }
 
 static REGISTRY: LazyLock<TransferRegistry> = LazyLock::new(TransferRegistry::default);
@@ -101,8 +126,8 @@ impl TransferRegistry {
         &REGISTRY
     }
 
-    fn owners(&self) -> MutexGuard<'_, HashMap<TransferKey, BatchRef>> {
-        self.owners.lock().unwrap_or_else(|e| e.into_inner())
+    fn held(&self) -> MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Sorts `keys` by who holds them, from `user`'s point of view, and
@@ -129,10 +154,10 @@ impl TransferRegistry {
 
     /// Claims every free key for `batch` in one step.
     pub fn claim(&self, keys: &[TransferKey], batch: &BatchRef) -> Claim {
-        let mut owners = self.owners();
-        let claim = Self::classify(&owners, keys, &batch.owner.user_id);
+        let mut held = self.held();
+        let claim = Self::classify(&held.owners, keys, &batch.owner.user_id);
         for key in &claim.claimed {
-            owners.insert(key.clone(), batch.clone());
+            held.owners.insert(key.clone(), batch.clone());
         }
         claim
     }
@@ -144,8 +169,8 @@ impl TransferRegistry {
     /// go to `fresh`. No other request ever sees them owned by a batch that
     /// gets no monitor.
     pub fn claim_for_request(&self, keys: &[TransferKey], fresh: &BatchRef) -> RequestClaim {
-        let mut owners = self.owners();
-        let claim = Self::classify(&owners, keys, &fresh.owner.user_id);
+        let mut held = self.held();
+        let claim = Self::classify(&held.owners, keys, &fresh.owner.user_id);
         let joined = match claim.claimed.is_empty() {
             true => None,
             false => claim
@@ -161,7 +186,7 @@ impl TransferRegistry {
             None => (fresh.clone(), None),
         };
         for key in &claim.claimed {
-            owners.insert(key.clone(), batch.clone());
+            held.owners.insert(key.clone(), batch.clone());
         }
         RequestClaim {
             claim,
@@ -170,51 +195,86 @@ impl TransferRegistry {
         }
     }
 
-    /// Releases `key` if `owner` still holds it. A key released and claimed
-    /// again by someone else meanwhile stays theirs.
+    /// Releases `key`, and its cancel mark, if `owner` still holds it. A key
+    /// released and claimed again by someone else meanwhile stays theirs.
     pub fn release(&self, key: &TransferKey, owner: &TransferOwner) {
-        let mut owners = self.owners();
-        if owners.get(key).is_some_and(|held| held.owner == *owner) {
-            owners.remove(key);
+        let mut held = self.held();
+        if held.held_by(key, owner) {
+            held.remove(key);
         }
     }
 
-    /// Releases every key the batch still holds.
+    /// Releases every key the batch still holds, with their cancel marks.
     pub fn release_batch(&self, owner: &TransferOwner) {
-        self.owners().retain(|_, batch| batch.owner != *owner);
+        let Held { owners, cancelled } = &mut *self.held();
+        owners.retain(|_, batch| batch.owner != *owner);
+        cancelled.retain(|key| owners.contains_key(key));
     }
 
-    /// Moves `batch`'s claim from `old` to `new`. Refused, with nothing
-    /// changed, when another batch holds `new`, even the same user's: that
-    /// batch has its own monitor. `old` is only released when `batch` holds
-    /// it.
+    /// Moves `batch`'s claim, and its cancel mark, from `old` to `new`.
+    /// Refused, with nothing changed, when another batch holds `new`, even
+    /// the same user's: that batch has its own monitor. `old` is only
+    /// released when `batch` holds it.
     pub fn rebind(&self, old: &TransferKey, new: TransferKey, batch: &BatchRef) -> bool {
-        let mut owners = self.owners();
-        let own = |held: &BatchRef| held.owner == batch.owner;
-        if owners.get(&new).is_some_and(|held| !own(held)) {
+        let mut held = self.held();
+        if held
+            .owners
+            .get(&new)
+            .is_some_and(|other| other.owner != batch.owner)
+        {
             return false;
         }
-        if owners.get(old).is_some_and(own) {
-            owners.remove(old);
+        let cancelled = held.held_by(old, &batch.owner) && held.remove(old);
+        if cancelled {
+            held.cancelled.insert(new.clone());
         }
-        owners.insert(new, batch.clone());
+        held.owners.insert(new, batch.clone());
         true
+    }
+
+    /// Releases `old` if `owner` holds it and, when `old` was cancelled,
+    /// marks `new` (held by `owner`) cancelled. Changes nothing when they
+    /// are the same key: releasing it would free the claim the new transfer
+    /// holds.
+    pub fn hand_over(&self, old: &TransferKey, new: &TransferKey, owner: &TransferOwner) {
+        if old == new {
+            return;
+        }
+        let mut held = self.held();
+        let cancelled = held.held_by(old, owner) && held.remove(old);
+        if cancelled && held.held_by(new, owner) {
+            held.cancelled.insert(new.clone());
+        }
+    }
+
+    /// Marks `key` cancelled when one of `user`'s batches holds it. False
+    /// otherwise, with nothing changed.
+    pub fn request_cancel(&self, key: &TransferKey, user: &UserId) -> bool {
+        let mut held = self.held();
+        let mine = held
+            .owners
+            .get(key)
+            .is_some_and(|batch| &batch.owner.user_id == user);
+        if mine {
+            held.cancelled.insert(key.clone());
+        }
+        mine
+    }
+
+    /// Whether `owner` holds `key` and it was marked cancelled.
+    pub fn is_cancelled(&self, key: &TransferKey, owner: &TransferOwner) -> bool {
+        let held = self.held();
+        held.held_by(key, owner) && held.cancelled.contains(key)
     }
 
     /// Whether a batch may start watching a transfer it did not enqueue:
     /// only one nobody owns or one it owns already. Another batch's transfer,
     /// even the same user's, has its own monitor.
     pub fn may_adopt(&self, key: &TransferKey, owner: &TransferOwner) -> bool {
-        self.owners()
+        self.held()
+            .owners
             .get(key)
             .is_none_or(|held| held.owner == *owner)
-    }
-
-    /// Whether one of `user`'s batches holds `key`.
-    pub fn owned_by(&self, key: &TransferKey, user: &UserId) -> bool {
-        self.owners()
-            .get(key)
-            .is_some_and(|held| &held.owner.user_id == user)
     }
 }
 
@@ -611,23 +671,61 @@ mod tests {
     }
 
     #[test]
-    fn only_the_owning_user_holds_a_transfer() {
+    fn only_the_owning_user_can_cancel_a_transfer() {
         let reg = TransferRegistry::default();
-        let (a, b) = (UserId::new("user-a"), UserId::new("user-b"));
-        reg.claim(
-            &[key("1.flac")],
-            &batch("user-a", "b1", ImportMode::Singleton),
+        let mine = batch("user-a", "b1", ImportMode::Singleton);
+        reg.claim(&[key("1.flac")], &mine);
+        assert!(!reg.request_cancel(&key("1.flac"), &UserId::new("user-b")));
+        assert!(!reg.is_cancelled(&key("1.flac"), &mine.owner));
+        assert!(
+            !reg.request_cancel(&key("2.flac"), &UserId::new("user-a")),
+            "not held"
         );
-
-        assert!(reg.owned_by(&key("1.flac"), &a));
-        assert!(!reg.owned_by(&key("1.flac"), &b));
-
-        reg.release_batch(&batch("user-a", "b1", ImportMode::Singleton).owner);
-        assert!(!reg.owned_by(&key("1.flac"), &a));
+        assert!(reg.request_cancel(&key("1.flac"), &UserId::new("user-a")));
+        assert!(reg.is_cancelled(&key("1.flac"), &mine.owner));
     }
 
     #[test]
-    fn a_transfer_rebound_by_failover_is_owned_under_its_new_peer() {
+    fn a_cancel_moves_with_its_slot_and_ends_with_the_key() {
+        let reg = TransferRegistry::default();
+        let mine = batch("user-a", "b1", ImportMode::Singleton);
+        reg.claim(&[key("1.flac")], &mine);
+        reg.request_cancel(&key("1.flac"), &UserId::new("user-a"));
+        reg.claim(&[key("2.flac")], &mine);
+        reg.hand_over(&key("1.flac"), &key("2.flac"), &mine.owner);
+        assert!(reg.is_cancelled(&key("2.flac"), &mine.owner));
+        assert!(reg.may_adopt(
+            &key("1.flac"),
+            &batch("user-b", "b2", ImportMode::Singleton).owner
+        ));
+        let moved = TransferKey {
+            peer: "peer_b".into(),
+            ..key("2.flac")
+        };
+        assert!(reg.rebind(&key("2.flac"), moved.clone(), &mine));
+        assert!(reg.is_cancelled(&moved, &mine.owner));
+        reg.release(&moved, &mine.owner);
+        reg.claim(std::slice::from_ref(&moved), &mine);
+        assert!(
+            !reg.is_cancelled(&moved, &mine.owner),
+            "a released key starts clean"
+        );
+    }
+
+    #[test]
+    fn handing_a_key_over_to_itself_keeps_its_claim_and_mark() {
+        let reg = TransferRegistry::default();
+        let mine = batch("user-a", "b1", ImportMode::Singleton);
+        reg.claim(&[key("1.flac")], &mine);
+        reg.request_cancel(&key("1.flac"), &UserId::new("user-a"));
+
+        reg.hand_over(&key("1.flac"), &key("1.flac"), &mine.owner);
+
+        assert!(reg.is_cancelled(&key("1.flac"), &mine.owner));
+    }
+
+    #[test]
+    fn a_transfer_rebound_by_failover_is_cancelled_under_its_new_peer() {
         let reg = TransferRegistry::default();
         let mine = batch("user-a", "b1", ImportMode::Singleton);
         reg.claim(&[key("1.flac")], &mine);
@@ -637,8 +735,8 @@ mod tests {
         };
 
         assert!(reg.rebind(&key("1.flac"), moved.clone(), &mine));
-        assert!(reg.owned_by(&moved, &UserId::new("user-a")));
-        assert!(!reg.owned_by(&key("1.flac"), &UserId::new("user-a")));
+        assert!(reg.request_cancel(&moved, &UserId::new("user-a")));
+        assert!(!reg.request_cancel(&key("1.flac"), &UserId::new("user-a")));
     }
 
     #[test]

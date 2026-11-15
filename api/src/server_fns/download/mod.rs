@@ -1,8 +1,6 @@
 use dioxus::fullstack::{WebSocketOptions, Websocket};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "server")]
-use shared::download::DownloadProgress;
 use shared::download::{
     DownloadEvent, DownloadableItem, ImportChoice, MatchChoices, QueuedDownload,
 };
@@ -15,9 +13,7 @@ use tokio::sync::broadcast;
 #[cfg(feature = "server")]
 use crate::{
     base_url::{BaseUrl, BaseUrlError},
-    server_fns::{
-        failure_error, forbidden_error, import_refusal_error, refusal_error, server_error,
-    },
+    server_fns::{failure_error, forbidden_error, import_refusal_error, refusal_error},
     AuthSession,
 };
 #[cfg(feature = "server")]
@@ -26,9 +22,7 @@ use axum::http::{HeaderMap, Uri};
 use tower_cookies::Cookies;
 
 #[cfg(feature = "server")]
-use crate::globals::{cleanup_stale_channels, get_or_create_user_channel, USER_CHANNELS};
-#[cfg(feature = "server")]
-use crate::services::download_backend;
+use crate::globals::{cleanup_stale_channels, USER_CHANNELS};
 
 // Local modules
 pub mod auto_download;
@@ -51,11 +45,7 @@ pub mod utils;
 pub(crate) mod test_support;
 
 #[cfg(feature = "server")]
-use self::enqueue::transfer_key;
-#[cfg(feature = "server")]
 use crate::auth::UserId;
-#[cfg(feature = "server")]
-use crate::transfer_registry::{TransferKey, TransferRegistry};
 
 /// How often an open download socket checks that its session still counts.
 #[cfg(feature = "server")]
@@ -209,81 +199,14 @@ pub async fn download_updates_ws(
 pub struct CancelDownloadRequest {
     pub id: String,
     pub source: String,
-    pub item: String,
     pub backend: Option<String>,
-}
-
-/// The registry key of the transfer the backend lists with exactly this peer
-/// and id, built from the backend's own filename. `None` when it lists no
-/// such transfer.
-#[cfg(feature = "server")]
-pub(crate) fn cancel_key(
-    listed: &[DownloadProgress],
-    backend: &'static str,
-    source: &str,
-    id: &str,
-) -> Option<TransferKey> {
-    listed
-        .iter()
-        .find(|row| row.source == source && row.id == id)
-        .map(|row| transfer_key(backend, &row.source, &row.item))
 }
 
 #[post("/api/downloads/cancel", auth: AuthSession)]
 pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnError> {
-    let user = auth.0.id();
-
-    let backend = download_backend(req.backend.as_deref())
+    crate::core::acquire::cancel(&auth.0, req.backend.as_deref(), &req.source, &req.id)
         .await
-        .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
-
-    // The client's `item` is never trusted: the key comes from the transfer
-    // the backend lists under that id, so a user cannot pair their own file
-    // with another user's transfer id on the same peer.
-    let listed = backend
-        .get_downloads_for(std::slice::from_ref(&req.source))
-        .await
-        .map_err(server_error)?;
-    let owned = cancel_key(&listed, backend.id(), &req.source, &req.id)
-        .is_some_and(|key| TransferRegistry::global().owned_by(&key, &user));
-    if !owned {
-        return Err(refusal_error("Download not found"));
-    }
-
-    backend
-        .cancel_download(&req.source, &req.id, false)
-        .await
-        .map_err(server_error)?;
-
-    info!(
-        "User {} cancelled download {} from {}",
-        user, req.id, req.source
-    );
-
-    // Send cancelled state to UI via broadcast channel
-    let (tx, _) = get_or_create_user_channel(&user).await;
-    let cancelled = DownloadProgress {
-        id: req.id,
-        source: req.source,
-        item: req.item,
-        size: 0,
-        transferred: 0,
-        state: shared::download::DownloadState::Cancelled,
-        percent: 0.0,
-        speed: 0.0,
-        error: None,
-        backend: req.backend,
-        batch_id: None,
-        batch_label: None,
-        local_path: None,
-        import_output: None,
-        retryable: false,
-        failure: None,
-        skip: None,
-    };
-    let _ = tx.send(DownloadEvent::Progress(vec![cancelled]));
-
-    Ok(())
+        .map_err(failure_error)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,29 +259,6 @@ mod tests {
         assert!(!sends_build_frame(Some(false)));
         // An older bundle does not send the parameter.
         assert!(!sends_build_frame(None));
-    }
-
-    fn listed() -> Vec<DownloadProgress> {
-        vec![test_support::transfer(
-            "peer_a",
-            "Music\\A\\01.flac",
-            "t-1",
-            shared::download::DownloadState::Queued,
-        )]
-    }
-
-    #[test]
-    fn cancel_uses_the_listed_filename_not_the_clients_text() {
-        assert_eq!(
-            cancel_key(&listed(), "slskd", "peer_a", "t-1"),
-            Some(transfer_key("slskd", "peer_a", "Music\\A\\01.flac"))
-        );
-    }
-
-    #[test]
-    fn cancel_needs_a_listed_transfer_with_that_id_and_peer() {
-        assert_eq!(cancel_key(&listed(), "slskd", "peer_a", "t-2"), None);
-        assert_eq!(cancel_key(&listed(), "slskd", "peer_b", "t-1"), None);
     }
 
     #[test]

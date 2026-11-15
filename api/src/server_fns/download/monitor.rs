@@ -20,7 +20,6 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
 
 use super::enqueue::{stopped_rows, transfer_key};
 use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
@@ -109,6 +108,15 @@ fn per_track_timeout() -> Failure {
         FailureCode::TransferTimedOut,
         RetryAdvice::OtherSource,
         "Per-track timeout",
+    )
+}
+
+/// A transfer its user cancelled.
+fn cancelled_on_request() -> Failure {
+    transfer_failure(
+        FailureCode::TransferCancelled,
+        RetryAdvice::NotRetryable,
+        "Cancelled on request",
     )
 }
 
@@ -227,9 +235,6 @@ pub struct DownloadMonitor {
     track_states: Vec<TrackState>,
     /// Alternate sources per slot, parallel to `tracked_files` by index.
     pool: SourcePool,
-    /// Whether album mode is enabled.
-    /// Cancellation token for graceful shutdown.
-    cancellation_token: CancellationToken,
     /// The batch this monitor watches: its rows, its folder under the
     /// download directory, and the inbox joining requests deliver to.
     batch: BatchRef,
@@ -257,7 +262,6 @@ impl DownloadMonitor {
         transfers: Vec<WatchedTransfer>,
         target_path: PathBuf,
         tx: broadcast::Sender<DownloadEvent>,
-        cancellation_token: CancellationToken,
         batch: BatchRef,
     ) -> Self {
         let tracked_files: Vec<TrackedFile> = transfers
@@ -281,7 +285,6 @@ impl DownloadMonitor {
             tx,
             track_states,
             pool,
-            cancellation_token,
             batch,
             download_base: CONFIG.download_path().clone(),
             claimed: Arc::new(Mutex::new(HashSet::new())),
@@ -448,17 +451,15 @@ impl DownloadMonitor {
     /// Re-enqueue this slot from its next-best peer. Returns true when the
     /// slot was rebound, in which case the caller must not mark it failed.
     ///
-    /// Never fires for cancellations: a user cancelling a download, or the
-    /// monitor's own cleanup, must not spawn a fresh transfer.
+    /// A slot its user cancelled is settled by `apply_cancels` before any
+    /// failover runs. A cancel that arrives while the next peer is being
+    /// enqueued moves to the new transfer with the slot.
     async fn try_failover(
         &mut self,
         slot: usize,
         backend: &Arc<dyn DownloadBackend>,
         reason: &str,
     ) -> bool {
-        if self.cancellation_token.is_cancelled() {
-            return false;
-        }
         let next = self.pool.enqueue_next(slot, backend, &self.batch).await;
         for refused in &next.refused {
             warn!(
@@ -487,9 +488,8 @@ impl DownloadMonitor {
 
         self.abandon(slot, backend).await;
         let old_key = self.slot_key(slot, backend.id());
-        if old_key != transfer_key(backend.id(), &queued.source, &queued.item) {
-            TransferRegistry::global().release(&old_key, &self.batch.owner);
-        }
+        let new_key = transfer_key(backend.id(), &queued.source, &queued.item);
+        TransferRegistry::global().hand_over(&old_key, &new_key, &self.batch.owner);
 
         // The new peer serves this track under a completely different remote
         // path and transfer id, so the slot must track both outright or the
@@ -560,14 +560,6 @@ impl DownloadMonitor {
             if self.drain_inbox() {
                 // The new transfers get the whole window to show up.
                 consecutive_empty = 0;
-            }
-
-            if self.cancellation_token.is_cancelled() {
-                info!(
-                    "Download monitoring cancelled for batch {:?}",
-                    self.filenames()
-                );
-                break;
             }
 
             poll_count += 1;
@@ -698,6 +690,50 @@ impl DownloadMonitor {
         }
     }
 
+    /// Stop every watched slot whose transfer its user cancelled, and show
+    /// it Cancelled. A slot whose own transfer already completed is left
+    /// alone, so its file is still imported.
+    async fn apply_cancels(
+        &mut self,
+        downloads: &[DownloadProgress],
+        backend: &Arc<dyn DownloadBackend>,
+    ) {
+        let registry = TransferRegistry::global();
+        let mut cancelled = Vec::new();
+        for slot in 0..self.tracked_files.len() {
+            if !self.watching(slot)
+                || !registry.is_cancelled(&self.slot_key(slot, backend.id()), &self.batch.owner)
+            {
+                continue;
+            }
+            let tracked = &self.tracked_files[slot];
+            if transfer_by_id(downloads, &tracked.source, &tracked.transfer_id)
+                .is_some_and(|dl| is_completed(&dl.state))
+            {
+                continue;
+            }
+            info!(
+                "Cancelling {} from {} on request",
+                tracked.filename, tracked.source
+            );
+            let row = DownloadProgress::queued(
+                tracked.transfer_id.clone(),
+                tracked.source.clone(),
+                tracked.filename.clone(),
+                0,
+            )
+            .with_state(DownloadState::Cancelled)
+            .with_failure(cancelled_on_request())
+            .with_backend(backend.id());
+            self.abandon(slot, backend).await;
+            self.settle(slot, SlotPhase::Settled, backend.id());
+            cancelled.push(self.stamp(row));
+        }
+        if !cancelled.is_empty() {
+            let _ = self.tx.send(DownloadEvent::Progress(cancelled));
+        }
+    }
+
     /// Process a poll result from slskd.
     /// Returns true if monitoring should stop.
     async fn process_poll_result(
@@ -707,6 +743,8 @@ impl DownloadMonitor {
         poll_count: u32,
         backend: &Arc<dyn DownloadBackend>,
     ) -> bool {
+        self.apply_cancels(&downloads, backend).await;
+
         // Debug logging for first few polls
         if poll_count <= 3 {
             debug!("Looking for filenames: {:?}", self.filenames());
@@ -1532,7 +1570,6 @@ mod tests {
                 .collect(),
             PathBuf::from("/music"),
             tx,
-            CancellationToken::new(),
             batch("X"),
         )
     }
@@ -1544,6 +1581,7 @@ mod tests {
         listing: &[DownloadProgress],
         backend: &Arc<dyn DownloadBackend>,
     ) {
+        m.apply_cancels(listing, backend).await;
         let matched = m.find_matching_downloads(listing, backend);
         m.process_tracks(&matched, backend).await;
         m.handle_absent_tracks(&matched, backend).await;
@@ -2198,6 +2236,12 @@ mod tests {
                 SameSourceLater,
                 MONITOR_STOPPED,
             ),
+            (
+                cancelled_on_request(),
+                FailureCode::TransferCancelled,
+                NotRetryable,
+                "Cancelled on request",
+            ),
         ] {
             assert_eq!(
                 (f.code, f.stage, f.retry, f.message.as_str()),
@@ -2288,6 +2332,106 @@ mod tests {
         assert_eq!(phase(&m, 0), SlotPhase::Settled);
     }
 
+    #[tokio::test]
+    async fn a_cancelled_slot_is_stopped_once_and_never_failed_over() {
+        let (mut m, mut rx) = failover_monitor();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let own = key(&backend, "peer_a", "dirA/aaa.flac");
+        TransferRegistry::global().claim(std::slice::from_ref(&own), &m.batch);
+        assert!(TransferRegistry::global().request_cancel(&own, &m.batch.owner.user_id));
+
+        poll_tracks(
+            &mut m,
+            &[listed("peer_a", "dirA/aaa.flac", DownloadState::InProgress)],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", &id_of("dirA/aaa.flac"))]
+        );
+        assert!(stub.destinations().is_empty(), "no other source was asked");
+        assert_eq!(phase(&m, 0), SlotPhase::Settled);
+        let rows = rows_for(&mut rx, "dirA/aaa.flac");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, DownloadState::Cancelled);
+        assert_eq!(
+            rows[0]
+                .failure
+                .as_ref()
+                .map(|f| (f.code, f.message.as_str())),
+            Some((FailureCode::TransferCancelled, "Cancelled on request"))
+        );
+        assert!(TransferRegistry::global().may_adopt(&own, &batch("Y").owner));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_arrives_during_failover_follows_the_slot() {
+        let (mut m, mut rx) = failover_monitor();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let registry = TransferRegistry::global();
+        let first = key(&backend, "peer_a", "dirA/aaa.flac");
+        registry.claim(std::slice::from_ref(&first), &m.batch);
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+        let user = m.batch.owner.user_id.clone();
+        let (reached, release) = stub.hold_downloads();
+        let cancel = async {
+            reached.notified().await; // the failover's enqueue is in flight
+            assert!(registry.request_cancel(&first, &user));
+            release.notify_one();
+        };
+
+        let failed = [failed_transfer("peer_a", "dirA/aaa.flac")];
+        tokio::join!(poll_tracks(&mut m, &failed, &backend), cancel);
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+        poll_tracks(
+            &mut m,
+            &[listed("peer_b", "dirB/bbb.flac", DownloadState::InProgress)],
+            &backend,
+        )
+        .await;
+
+        assert!(stub
+            .cancelled()
+            .contains(&Cancel::only("peer_b", &id_of("dirB/bbb.flac"))));
+        assert_eq!(m.pool.attempts_used(0), 2, "no third source");
+        assert_eq!(phase(&m, 0), SlotPhase::Settled);
+        assert_eq!(
+            rows_for(&mut rx, "dirB/bbb.flac")
+                .last()
+                .map(|r| r.state.clone()),
+            Some(DownloadState::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_transfer_is_imported_even_when_cancelled() {
+        let user = UserId::new("monitor-cancel-finished");
+        let (mut m, _base, _rx) = disk_monitor(&user, &["one.flac"], &["one.flac"]).await;
+        m.batch.import_mode = ImportMode::Singleton;
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let own = key(&backend, "peer_a", "one.flac");
+        TransferRegistry::global().claim(std::slice::from_ref(&own), &m.batch);
+        assert!(TransferRegistry::global().request_cancel(&own, &user));
+
+        poll_tracks(
+            &mut m,
+            &[listed("peer_a", "one.flac", DownloadState::Completed)],
+            &backend,
+        )
+        .await;
+        m.join_handoffs().await;
+
+        assert_eq!(phase(&m, 0), SlotPhase::HandedOff);
+        assert!(!stub
+            .cancelled()
+            .contains(&Cancel::only("peer_a", &id_of("one.flac"))));
+    }
+
     /// A monitor of `user` watching `watched` from peer_a, whose finished
     /// files are found in a temporary download folder holding `on_disk`, and
     /// whose import target cannot be created, so a handed-off row comes
@@ -2314,7 +2458,7 @@ mod tests {
         for file in on_disk {
             std::fs::write(folder.join(file), b"x").unwrap();
         }
-        let (user_tx, _) = crate::globals::get_or_create_user_channel(user).await;
+        let user_tx = crate::globals::get_or_create_user_channel(user).await;
         m.batch.owner.user_id = user.clone();
         (m, base, user_tx.subscribe())
     }
