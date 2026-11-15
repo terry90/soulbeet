@@ -128,12 +128,13 @@ fn lookup_text(item: &ImportedItem) -> Option<String> {
 }
 
 /// Whether every item of `wait` is listed: each looked up by its recording MBID, then by
-/// lookup_text (D7), paging LOOKUP_PAGE at a time until a short page or a match, or, with no text
-/// Navidrome keeps, among the NEWEST_PAGES pages of the songs it added last, where a file just
-/// imported is. Each candidate is checked with is_imported_file against the size of
-/// wait.library.join(item.path) on disk. An item whose file cannot be read is not listed. The
-/// songs of the page that matched teach where their libraries are on this machine
-/// (paths::learn_in).
+/// lookup_text (D7), paging LOOKUP_PAGE at a time until a short page, or, with no text Navidrome
+/// keeps, among the NEWEST_PAGES pages of the songs it added last, where a file just imported
+/// is. Each candidate is checked with is_imported_file against the size of
+/// wait.library.join(item.path) on disk. An item whose file cannot be read is not listed. Every
+/// song of every page the lookup read that it took for the file teaches where the libraries are
+/// on this machine (paths::learn_in), so a library with two such songs, on one page or on two,
+/// teaches nothing.
 pub(crate) async fn listed(
     db: &SqlitePool,
     navi: &NavidromeClient,
@@ -168,46 +169,56 @@ pub(crate) async fn listed(
     Ok(true)
 }
 
-/// The songs of the first of the NEWEST_PAGES pages of LOOKUP_PAGE songs Navidrome added last
-/// that holds one that is the file at `item` of `size` bytes: each such song of that page.
+/// Every song of the NEWEST_PAGES pages of LOOKUP_PAGE songs Navidrome added last (up to a short
+/// page) that is the file at `item` of `size` bytes, each once (by id).
 async fn among_newest(
     navi: &NavidromeClient,
     item: &Path,
     size: u64,
 ) -> Result<Vec<NativeSong>, NavidromeError> {
+    let mut found = Found::default();
     for page in 0..NEWEST_PAGES {
         let start = page * LOOKUP_PAGE;
         let songs = navi.newest_songs(start, start + LOOKUP_PAGE).await?;
         let short = songs.len() < LOOKUP_PAGE as usize;
-        let found = imported_files(songs, item, size);
-        if !found.is_empty() || short {
-            return Ok(found);
+        found.add(songs, item, size);
+        if short {
+            break;
         }
     }
-    Ok(vec![])
+    Ok(found.songs)
 }
 
-/// The songs of the first page the native `title` filter matches for `text` that holds one
-/// that is the file at `item`: each such song of that page.
+/// Every song of every page the native `title` filter matches for `text` that is the file at
+/// `item` of `size` bytes, each once (by id).
 async fn lists(
     navi: &NavidromeClient,
     text: &str,
     item: &Path,
     size: u64,
 ) -> Result<Vec<NativeSong>, NavidromeError> {
-    Ok(page_through(navi, text, |page| {
-        let found = imported_files(page, item, size);
-        (!found.is_empty()).then_some(found)
-    })
-    .await?
-    .unwrap_or_default())
+    let mut found = Found::default();
+    page_through(navi, text, |page| found.add(page, item, size)).await?;
+    Ok(found.songs)
 }
 
-/// The songs of `page` that is_imported_file takes for the file at `item` of `size` bytes.
-fn imported_files(page: Vec<NativeSong>, item: &Path, size: u64) -> Vec<NativeSong> {
-    page.into_iter()
-        .filter(|song| is_imported_file(song, item, size))
-        .collect()
+/// The songs a lookup took for an imported file so far, and their ids.
+#[derive(Default)]
+struct Found {
+    songs: Vec<NativeSong>,
+    ids: HashSet<String>,
+}
+
+impl Found {
+    /// Adds each song of `page` that is_imported_file takes for the file at `item` of `size`
+    /// bytes and that is not added yet.
+    fn add(&mut self, page: Vec<NativeSong>, item: &Path, size: u64) {
+        for song in page {
+            if is_imported_file(&song, item, size) && self.ids.insert(song.id.clone()) {
+                self.songs.push(song);
+            }
+        }
+    }
 }
 
 /// Every present song the user of `navi` sees that may be `item`: each page of the native
@@ -232,7 +243,6 @@ pub(crate) async fn candidates(
     for text in &texts {
         page_through(navi, text, |page| {
             songs.extend(page.into_iter().filter(|song| seen.insert(song.id.clone())));
-            None::<()>
         })
         .await?;
     }
@@ -240,21 +250,19 @@ pub(crate) async fn candidates(
 }
 
 /// Hands `take` each page of LOOKUP_PAGE songs the native `title` filter matches for `text`,
-/// in order, until it gives Some or a page is short.
-async fn page_through<T>(
+/// in order, up to a short page.
+async fn page_through(
     navi: &NavidromeClient,
     text: &str,
-    mut take: impl FnMut(Vec<NativeSong>) -> Option<T>,
-) -> Result<Option<T>, NavidromeError> {
+    mut take: impl FnMut(Vec<NativeSong>),
+) -> Result<(), NavidromeError> {
     let mut start = 0;
     loop {
         let page = navi.find_songs(text, start, start + LOOKUP_PAGE).await?;
         let short = page.len() < LOOKUP_PAGE as usize;
-        if let Some(found) = take(page) {
-            return Ok(Some(found));
-        }
+        take(page);
         if short {
-            return Ok(None);
+            return Ok(());
         }
         start += LOOKUP_PAGE;
     }
@@ -1026,6 +1034,35 @@ mod tests {
             )],
         );
         assert!(listed(&db, &navi.client(), &wait).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn two_songs_of_one_library_on_two_pages_that_may_each_be_the_file_teach_nothing() {
+        let library = tempfile::tempdir().unwrap();
+        let wait = imported_in(library.path());
+        let db = crate::db::test_db::migrated().await;
+        let navi = NavidromeStub::start();
+        let row = |id: usize, path: &str| {
+            let song = song_json(path, 4).replace(
+                "f2c4d1a8b0e94c37a6d5e8b1c2a3f405",
+                &format!("f2c4d1a8b0e94c37a6d5e8b1c2a3{id:04}"),
+            );
+            song[1..song.len() - 1].to_string()
+        };
+        // The recording's MBID matches a full page holding another user's copy of the same size at
+        // the item's own path, then a short page holding the imported file's own song.
+        let mut first: Vec<String> = (0..LOOKUP_PAGE as usize - 1)
+            .map(|n| row(n, &format!("Other/{n:03}.mp3")))
+            .collect();
+        first.push(row(99, "Zzqx Artist/Qzz Album/01 Song Number 1.mp3"));
+        let second = row(100, "alice/Zzqx Artist/Qzz Album/01 Song Number 1.mp3");
+        navi.answer(
+            "/api/song",
+            &[&format!("[{}]", first.join(",")), &format!("[{second}]")],
+        );
+        assert!(listed(&db, &navi.client(), &wait).await.unwrap());
+        assert_eq!(song_lookups(&navi).len(), 2);
+        assert_eq!(NavidromeLibraryRow::get_in(&db, 1).await.unwrap(), None);
     }
 
     #[tokio::test]
