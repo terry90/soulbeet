@@ -21,6 +21,8 @@ pub mod ledger;
 pub mod login_limiter;
 pub mod models;
 #[cfg(feature = "server")]
+pub mod oauth;
+#[cfg(feature = "server")]
 pub mod secret_key;
 pub mod security;
 pub mod services;

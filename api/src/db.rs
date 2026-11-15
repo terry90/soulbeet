@@ -216,6 +216,178 @@ mod tests {
         );
     }
 
+    /// One client, one grant and one token for `user`.
+    async fn grant_for(db: &SqlitePool, user: &str) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO oauth_clients (client_id, kind, redirect_uris, created_at) \
+             VALUES ('dcr_c', 'dcr', '[\"https://claude.ai/api/mcp/auth_callback\"]', 0)",
+        )
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_grants (id, user_id, client_id, resource, scope, created_at) \
+             VALUES (?, ?, 'dcr_c', 'https://music.example.com/mcp', 'soulful', 0)",
+        )
+        .bind(format!("g-{user}"))
+        .bind(user)
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_tokens (token_hash, grant_id, kind, expires_at) \
+             VALUES (?, ?, 'access', 9999999999)",
+        )
+        .bind(format!("h-{user}"))
+        .bind(format!("g-{user}"))
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// (grants, tokens) of `user`.
+    async fn grants_of(db: &SqlitePool, user: &str) -> (i64, i64) {
+        let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_grants WHERE user_id = ?")
+            .bind(user)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let tokens: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oauth_tokens WHERE grant_id = ?")
+                .bind(format!("g-{user}"))
+                .fetch_one(db)
+                .await
+                .unwrap();
+        (grants, tokens)
+    }
+
+    /// One unredeemed code and one consent request waiting for `user`; the
+    /// client of `grant_for` must exist.
+    async fn pending_for(db: &SqlitePool, user: &str) {
+        sqlx::query(
+            "INSERT INTO oauth_codes (code_hash, user_id, client_id, redirect_uri, \
+             code_challenge, scope, resource, expires_at) \
+             VALUES (?, ?, 'dcr_c', 'https://claude.ai/api/mcp/auth_callback', 'x', 'soulful', \
+             'https://music.example.com/mcp', 9999999999)",
+        )
+        .bind(format!("c-{user}"))
+        .bind(user)
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_requests (id_hash, user_id, client_id, client_kind, \
+             client_redirect_uris, redirect_uri, code_challenge, scope, resource, expires_at) \
+             VALUES (?, ?, 'dcr_c', 'dcr', '[\"https://claude.ai/api/mcp/auth_callback\"]', \
+             'https://claude.ai/api/mcp/auth_callback', 'x', 'soulful', \
+             'https://music.example.com/mcp', 9999999999)",
+        )
+        .bind(format!("r-{user}"))
+        .bind(user)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// (codes, consent requests) of `user`.
+    async fn pending_of(db: &SqlitePool, user: &str) -> (i64, i64) {
+        let codes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_codes WHERE user_id = ?")
+            .bind(user)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let requests: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oauth_requests WHERE user_id = ?")
+                .bind(user)
+                .fetch_one(db)
+                .await
+                .unwrap();
+        (codes, requests)
+    }
+
+    #[tokio::test]
+    async fn a_credential_change_ends_the_users_connected_apps() {
+        let db = test_db::migrated().await;
+        insert_user(&db, "u1", "bob").await;
+        insert_user(&db, "u2", "eve").await;
+        for user in ["u1", "u2"] {
+            grant_for(&db, user).await;
+            pending_for(&db, user).await;
+        }
+        sqlx::query(
+            "UPDATE users SET credentials_version = credentials_version + 1 WHERE id = 'u1'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(grants_of(&db, "u1").await, (0, 0));
+        assert_eq!(pending_of(&db, "u1").await, (0, 0));
+        assert_eq!(grants_of(&db, "u2").await, (1, 1));
+        assert_eq!(pending_of(&db, "u2").await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn an_update_that_keeps_the_version_keeps_the_apps() {
+        // The Navidrome login adds (navidrome_token IS NULL): 0 for a linked
+        // row (User::link_navidrome_in).
+        let db = test_db::migrated().await;
+        insert_user(&db, "u1", "bob").await;
+        grant_for(&db, "u1").await;
+        sqlx::query(
+            "UPDATE users SET credentials_version = credentials_version + 0, \
+             navidrome_status = 'connected' WHERE id = 'u1'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(grants_of(&db, "u1").await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_deletes_their_apps() {
+        let db = test_db::migrated().await;
+        insert_user(&db, "u1", "bob").await;
+        insert_user(&db, "u2", "eve").await;
+        grant_for(&db, "u1").await;
+        grant_for(&db, "u2").await;
+        sqlx::query("DELETE FROM users WHERE id = 'u1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            (grants_of(&db, "u1").await, grants_of(&db, "u2").await),
+            ((0, 0), (1, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_client_deletes_its_grants_and_codes() {
+        let db = test_db::migrated().await;
+        insert_user(&db, "u1", "bob").await;
+        grant_for(&db, "u1").await;
+        sqlx::query(
+            "INSERT INTO oauth_codes (code_hash, user_id, client_id, redirect_uri, \
+             code_challenge, scope, resource, expires_at) \
+             VALUES ('c', 'u1', 'dcr_c', 'https://claude.ai/api/mcp/auth_callback', 'x', \
+             'soulful', 'https://music.example.com/mcp', 0)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM oauth_clients WHERE client_id = 'dcr_c'")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(grants_of(&db, "u1").await, (0, 0));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM oauth_codes")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn role_accepts_only_admin_and_user() {
         let db = test_db::migrated().await;

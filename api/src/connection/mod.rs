@@ -39,12 +39,17 @@ impl ConnectionState {
     }
 }
 
+/// The address of the request, put into the request extensions by the guard.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestBase(pub BaseUrl);
+
 /// The connection routes, each answer passed through the guard. The
 /// catch-alls are routes, not a fallback: the Dioxus router this merges into
 /// has its own fallback, and axum refuses to merge two.
 pub fn router(state: ConnectionState) -> Router {
     let state = Arc::new(state);
     Router::new()
+        .merge(crate::oauth::routes())
         .route("/.well-known/{*rest}", any(not_found))
         .route("/oauth/{*rest}", any(not_found))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -55,16 +60,20 @@ async fn not_found() -> Response {
     refusal(StatusCode::NOT_FOUND, "not_found", "Nothing is served here")
 }
 
-/// Refuses the request or runs the route, then marks the answer uncached and
-/// dependent on the headers its address was read from.
+/// Refuses the request or runs the route with its `RequestBase`, then marks
+/// the answer uncached and dependent on the headers its address was read
+/// from.
 async fn guard(
     State(state): State<Arc<ConnectionState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let mut response = match refusal_for(&state, request.headers(), request.uri()) {
-        Some(refused) => refused,
-        None => next.run(request).await,
+    let mut response = match admit(&state, request.headers(), request.uri()) {
+        Err(refused) => refused,
+        Ok(base) => {
+            request.extensions_mut().insert(RequestBase(base));
+            next.run(request).await
+        }
     };
     let headers = response.headers_mut();
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -75,9 +84,10 @@ async fn guard(
     response
 }
 
-fn refusal_for(state: &ConnectionState, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
+/// The request's address, or the refusal of the request.
+fn admit(state: &ConnectionState, headers: &HeaderMap, uri: &Uri) -> Result<BaseUrl, Response> {
     if !state.mcp_enabled {
-        return Some(refusal(
+        return Err(refusal(
             StatusCode::NOT_FOUND,
             "mcp_disabled",
             "Claude (MCP) access is turned off: MCP=off is set",
@@ -85,7 +95,7 @@ fn refusal_for(state: &ConnectionState, headers: &HeaderMap, uri: &Uri) -> Optio
     }
     let reasons = (state.gate)();
     if !reasons.is_empty() {
-        return Some(refusal_with(
+        return Err(refusal_with(
             StatusCode::SERVICE_UNAVAILABLE,
             "mcp_unavailable",
             "Claude (MCP) access stays off until the security checks in Settings pass",
@@ -96,7 +106,7 @@ fn refusal_for(state: &ConnectionState, headers: &HeaderMap, uri: &Uri) -> Optio
     let base = match explained.result {
         Ok(base) => base,
         Err(e) => {
-            return Some(refusal(
+            return Err(refusal(
                 StatusCode::BAD_REQUEST,
                 "address_unreadable",
                 format!("Cannot tell this request's address: {e}"),
@@ -104,7 +114,7 @@ fn refusal_for(state: &ConnectionState, headers: &HeaderMap, uri: &Uri) -> Optio
         }
     };
     if !base.is_https() && !base.is_loopback() {
-        return Some(refusal_with(
+        return Err(refusal_with(
             StatusCode::FORBIDDEN,
             "https_required",
             format!(
@@ -119,7 +129,7 @@ fn refusal_for(state: &ConnectionState, headers: &HeaderMap, uri: &Uri) -> Optio
             }),
         ));
     }
-    None
+    Ok(base)
 }
 
 /// The connection layer's refusal: `{"error": code, "message": message}`.
