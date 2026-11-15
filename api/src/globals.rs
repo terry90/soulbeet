@@ -452,7 +452,10 @@ async fn run_automation() {
                 );
             }
             Ok(_) => {}
-            Err(e) => info!("Automation: refill failed for {}: {}", user.username, e),
+            Err(e) => info!(
+                "Automation: refill failed for {}: {}",
+                user.username, e.message
+            ),
         }
     }
 }

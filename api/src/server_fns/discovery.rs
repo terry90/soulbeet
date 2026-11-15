@@ -64,7 +64,86 @@ use crate::AuthSession;
 #[cfg(feature = "server")]
 use super::{failure_error, server_error};
 #[cfg(feature = "server")]
-use shared::failure::Stage;
+use crate::core::{database_failure, target_unwritable};
+#[cfg(feature = "server")]
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
+#[cfg(feature = "server")]
+use shared::navidrome::DiscoveryProgress;
+
+#[cfg(feature = "server")]
+fn generation_running() -> Failure {
+    Failure::new(
+        FailureCode::AlreadyRunning,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "Discovery generation already in progress",
+    )
+}
+
+#[cfg(feature = "server")]
+fn discovery_disabled() -> Failure {
+    Failure::new(
+        FailureCode::InvalidInput,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "Discovery is not enabled",
+    )
+}
+
+#[cfg(feature = "server")]
+fn choose_discovery_folder() -> UserAction {
+    UserAction::new(
+        UserActionCode::AddFolder,
+        "Choose a discovery folder",
+        "Settings > Library > Discovery",
+    )
+}
+
+/// The user's settings name no discovery folder.
+#[cfg(feature = "server")]
+fn discovery_folder_required() -> Failure {
+    Failure::new(
+        FailureCode::FolderRequired,
+        Stage::Input,
+        RetryAdvice::NeedsUser,
+        "No download folder configured for discovery",
+    )
+    .with_user_action(choose_discovery_folder())
+}
+
+/// The discovery folder the user's settings name no longer exists.
+#[cfg(feature = "server")]
+fn discovery_folder_not_found() -> Failure {
+    Failure::new(
+        FailureCode::FolderRequired,
+        Stage::Input,
+        RetryAdvice::NeedsUser,
+        "Discovery folder not found",
+    )
+    .with_user_action(choose_discovery_folder())
+}
+
+/// A database error of a generation run, shown as the database's own text.
+#[cfg(feature = "server")]
+fn run_database_failure(stage: Stage, e: String) -> Failure {
+    database_failure(stage, &e).with_message(e)
+}
+
+/// Records `progress` as `user_id`'s run unless one is still running, in
+/// which case nothing changes. The caller holds the `DISCOVERY_PROGRESS`
+/// write lock, so two starts cannot both pass.
+#[cfg(feature = "server")]
+fn claim_run(
+    runs: &mut HashMap<String, DiscoveryProgress>,
+    user_id: &str,
+    progress: DiscoveryProgress,
+) -> Result<(), Failure> {
+    if runs.get(user_id).is_some_and(|p| !p.is_terminal()) {
+        return Err(generation_running());
+    }
+    runs.insert(user_id.to_string(), progress);
+    Ok(())
+}
 
 /// Get the current user's discovery configuration
 #[get("/api/discovery/config", auth: AuthSession)]
@@ -163,31 +242,23 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
 
 #[post("/api/discovery/start-generation", auth: AuthSession)]
 pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
-    use shared::navidrome::{DiscoveryProgress, GenerationStatus, ProfilePhase, ProfileProgress};
+    use shared::navidrome::{GenerationStatus, ProfilePhase, ProfileProgress};
 
     let user_id = auth.0.user_id.clone();
 
-    // Check if already running
-    {
-        let progress = crate::globals::DISCOVERY_PROGRESS.read().await;
-        if let Some(p) = progress.get(&user_id) {
-            if !p.is_terminal() {
-                return Err(server_error("Discovery generation already in progress"));
-            }
-        }
-    }
-
     // Read settings to get profile list for initial progress state
-    let settings = UserSettings::get(&user_id).await.map_err(server_error)?;
+    let settings = UserSettings::get(&user_id)
+        .await
+        .map_err(|e| failure_error(database_failure(Stage::Input, e)))?;
     if !settings.discovery_enabled {
-        return Err(server_error("Discovery is not enabled"));
+        return Err(failure_error(discovery_disabled()));
     }
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
     let track_counts = settings.parse_track_counts();
     let folder_id = settings
         .discovery_folder_id
         .as_ref()
-        .ok_or_else(|| server_error("No download folder configured for discovery"))?;
+        .ok_or_else(|| failure_error(discovery_folder_required()))?;
 
     // Determine which profiles need tracks (skip those already at target)
     let mut profile_entries = Vec::new();
@@ -212,18 +283,21 @@ pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
         });
     }
 
-    // Write initial progress BEFORE spawn (prevents race with first poll)
+    // Claim the run and write its initial progress BEFORE spawn (prevents
+    // race with first poll)
     {
         let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
-        map.insert(
-            user_id.clone(),
+        claim_run(
+            &mut map,
+            &user_id,
             DiscoveryProgress {
                 status: GenerationStatus::Running,
                 profiles: profile_entries,
                 started_at: Some(chrono::Utc::now().to_rfc3339()),
                 ..Default::default()
             },
-        );
+        )
+        .map_err(failure_error)?;
     }
 
     // Spawn background task
@@ -249,7 +323,7 @@ pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
                 if let Some(p) = map.get_mut(&uid) {
                     p.status = GenerationStatus::Error;
                     p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    p.error = Some(e.to_string());
+                    p.failure = Some(e);
                 }
             }
         }
@@ -438,7 +512,7 @@ async fn settle_poll(
 #[cfg(feature = "server")]
 pub async fn generate_discovery_playlist_internal(
     user_id: &str,
-) -> Result<shared::navidrome::GenerationResult, String> {
+) -> Result<shared::navidrome::GenerationResult, Failure> {
     use crate::models::deletion_review::DeletionReviewRow;
     use crate::models::discovery_candidate::DiscoveryCandidateRow;
     use crate::models::discovery_history::DiscoveryHistoryRow;
@@ -454,44 +528,54 @@ pub async fn generate_discovery_playlist_internal(
             .clone()
     };
     let Ok(_guard) = user_lock.try_lock() else {
-        return Err("Discovery generation already in progress".to_string());
+        return Err(generation_running());
     };
 
-    let settings = UserSettings::get(user_id).await?;
+    let settings = UserSettings::get(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
     if !settings.discovery_enabled {
-        return Err("Discovery is not enabled".to_string());
+        return Err(discovery_disabled());
     }
     let folder_id = settings
         .discovery_folder_id
         .as_ref()
-        .ok_or("No download folder configured for discovery")?;
+        .ok_or_else(discovery_folder_required)?;
     let folder = Folder::get_by_id(folder_id)
-        .await?
-        .ok_or("Discovery folder not found")?;
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?
+        .ok_or_else(discovery_folder_not_found)?;
 
     // Shown as the run's error, so the user sees why nothing was imported.
     if let Some(failure) = crate::importer_health::blocking_failure().await {
-        return Err(failure.message);
+        return Err(failure);
     }
 
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
     let track_counts = settings.parse_track_counts();
 
-    let backend = download_backend(None).await.map_err(|e| e.to_string())?;
+    let backend = download_backend(None)
+        .await
+        .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))?;
 
     // Create per-profile subdirectories under Discovery/
     for profile in &selected_profiles {
         let profile_dir = folder.discovery_profile_path(&profile.to_string());
-        tokio::fs::create_dir_all(&profile_dir)
-            .await
-            .map_err(|e| format!("Failed to create Discovery/{} dir: {}", profile, e))?;
+        tokio::fs::create_dir_all(&profile_dir).await.map_err(|e| {
+            target_unwritable(
+                &e,
+                format!("Failed to create Discovery/{} dir: {}", profile, e),
+            )
+        })?;
     }
 
     // Build the "already seen" set for deduplication
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Past discovery suggestions
-    let history_keys = DiscoveryHistoryRow::get_suggested_keys(user_id).await?;
+    let history_keys = DiscoveryHistoryRow::get_suggested_keys(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
     info!(
         "Loaded {} tracks from discovery history",
         history_keys.len()
@@ -499,7 +583,9 @@ pub async fn generate_discovery_playlist_internal(
     seen.extend(history_keys);
 
     // Past deletions (user doesn't want these back)
-    let deletions = DeletionReviewRow::get_history(user_id, 1000).await?;
+    let deletions = DeletionReviewRow::get_history(user_id, 1000)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
     let deletion_count = deletions.len();
     for d in &deletions {
         seen.insert(format!(
@@ -513,7 +599,7 @@ pub async fn generate_discovery_playlist_internal(
     let mut total_downloads = 0u32;
     let mut all_profile_stats: Vec<ProfileGenerationStats> = Vec::new();
     // Set when the importer broke during the run and stopped it.
-    let mut importer_issue: Option<String> = None;
+    let mut importer_issue: Option<Failure> = None;
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
@@ -574,7 +660,9 @@ pub async fn generate_discovery_playlist_internal(
             // Over-fetch candidates (3x) to survive search/download/import attrition
             let fetch_count = (remaining as f64 * 3.0).ceil() as u32;
             let mut candidates =
-                DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count).await?;
+                DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count)
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Input, e))?;
 
             if candidates.is_empty() {
                 if _attempt == 0 {
@@ -596,7 +684,8 @@ pub async fn generate_discovery_playlist_internal(
                     }
                     candidates =
                         DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count)
-                            .await?;
+                            .await
+                            .map_err(|e| run_database_failure(Stage::Input, e))?;
                 }
                 if candidates.is_empty() {
                     info!("{}: no more candidates available", profile_name);
@@ -606,7 +695,7 @@ pub async fn generate_discovery_playlist_internal(
 
             if let Some(failure) = crate::importer_health::blocking_failure().await {
                 warn!("Discovery for {user_id} skipped: {}", failure.message);
-                importer_issue = Some(failure.message);
+                importer_issue = Some(failure);
                 break;
             }
 
@@ -667,7 +756,8 @@ pub async fn generate_discovery_playlist_internal(
                             &candidate.artist,
                             &candidate.track,
                         )
-                        .await?;
+                        .await
+                        .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
                         continue;
                     }
                 };
@@ -716,7 +806,8 @@ pub async fn generate_discovery_playlist_internal(
                         &candidate.artist,
                         &candidate.track,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
                     continue;
                 }
                 stats.search_hits += 1;
@@ -800,7 +891,8 @@ pub async fn generate_discovery_playlist_internal(
                             &candidate.artist,
                             &candidate.track,
                         )
-                        .await?;
+                        .await
+                        .map_err(|e| run_database_failure(Stage::Enqueue, e))?;
                         downloaded = true;
                         break;
                     }
@@ -824,7 +916,8 @@ pub async fn generate_discovery_playlist_internal(
                         &candidate.artist,
                         &candidate.track,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Enqueue, e))?;
                 }
             }
 
@@ -990,7 +1083,8 @@ pub async fn generate_discovery_playlist_internal(
                         // would download it again. Only genuine failures
                         // stay eligible for rediscovery.
                         DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_name)
-                            .await?;
+                            .await
+                            .map_err(|e| run_database_failure(Stage::Import, e))?;
                         continue;
                     }
                     DiscoveryImport::Failed => {
@@ -1023,12 +1117,15 @@ pub async fn generate_discovery_playlist_internal(
                         folder_id,
                         &profile_name,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Import, e))?;
                 }
                 // Recorded here, not at enqueue: discovery history is the
                 // permanent exclusion set, and a track killed by a bad peer
                 // must stay available to suggest again.
-                DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_name).await?;
+                DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_name)
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Import, e))?;
                 stats.imports_succeeded += 1;
                 profile_downloads += 1;
             }
@@ -1054,7 +1151,9 @@ pub async fn generate_discovery_playlist_internal(
         all_profile_stats.push(stats);
     }
 
-    UserSettings::update_discovery_last_generated(user_id).await?;
+    UserSettings::update_discovery_last_generated(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Import, e))?;
 
     // Trigger a Navidrome scan then wait for it to finish so playlists can be created.
     if total_downloads > 0 {
@@ -1516,7 +1615,11 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use super::{scan_finished, scan_imports, settle_poll, QueuedTrack, FAILED_STATE_CONFIRM};
+    use super::{
+        claim_run, discovery_disabled, discovery_folder_not_found, discovery_folder_required,
+        generation_running, scan_finished, scan_imports, settle_poll, QueuedTrack,
+        FAILED_STATE_CONFIRM,
+    };
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
     use crate::server_fns::download::monitor::RETRY_PENDING_FOR;
@@ -1525,10 +1628,76 @@ mod tests {
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::download::{DownloadProgress, DownloadState, DownloadableItem};
-    use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+    use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserActionCode};
+    use shared::navidrome::{DiscoveryProgress, GenerationStatus};
     use soulbeet::DownloadBackend;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+
+    #[test]
+    fn discovery_refusals_keep_their_text() {
+        use FailureCode::*;
+        use RetryAdvice::*;
+        for (f, code, retry, message) in [
+            (
+                generation_running(),
+                AlreadyRunning,
+                NotRetryable,
+                "Discovery generation already in progress",
+            ),
+            (
+                discovery_disabled(),
+                InvalidInput,
+                NotRetryable,
+                "Discovery is not enabled",
+            ),
+            (
+                discovery_folder_required(),
+                FolderRequired,
+                NeedsUser,
+                "No download folder configured for discovery",
+            ),
+            (
+                discovery_folder_not_found(),
+                FolderRequired,
+                NeedsUser,
+                "Discovery folder not found",
+            ),
+        ] {
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message.as_str()),
+                (code, Stage::Input, retry, message)
+            );
+        }
+        for f in [discovery_folder_required(), discovery_folder_not_found()] {
+            let action = f.user_action.unwrap();
+            assert_eq!(
+                (action.code, action.what.as_str(), action.where_.as_str()),
+                (
+                    UserActionCode::AddFolder,
+                    "Choose a discovery folder",
+                    "Settings > Library > Discovery"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_start_is_refused_while_the_first_runs() {
+        let running = || DiscoveryProgress {
+            status: GenerationStatus::Running,
+            ..Default::default()
+        };
+        let mut runs = HashMap::new();
+        assert_eq!(claim_run(&mut runs, "user-a", running()), Ok(()));
+        assert_eq!(
+            claim_run(&mut runs, "user-a", running()),
+            Err(generation_running())
+        );
+        assert_eq!(claim_run(&mut runs, "user-b", running()), Ok(()));
+        runs.get_mut("user-a").unwrap().status = GenerationStatus::Complete;
+        assert_eq!(claim_run(&mut runs, "user-a", running()), Ok(()));
+    }
 
     #[test]
     fn a_scan_is_finished_once_a_later_one_ended() {

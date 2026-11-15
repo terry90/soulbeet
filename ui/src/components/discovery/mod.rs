@@ -241,7 +241,11 @@ fn ProgressPanel(progress: DiscoveryProgress) -> Element {
             }
         }
         GenerationStatus::Error => {
-            let msg = progress.error.as_deref().unwrap_or("Unknown error");
+            let msg = progress
+                .failure
+                .as_ref()
+                .map(|f| f.message.as_str())
+                .unwrap_or("Unknown error");
             rsx! {
                 div { class: "mt-4 bg-beet-dark/50 border border-white/10 rounded-lg p-4",
                     p { class: "text-xs font-mono text-red-400", "{msg}" }

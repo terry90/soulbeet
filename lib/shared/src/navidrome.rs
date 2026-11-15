@@ -184,7 +184,9 @@ pub struct DiscoveryProgress {
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub result: Option<GenerationResult>,
-    pub error: Option<String>,
+    /// Why the run failed or could not go on, when its status is `Error`.
+    #[serde(default)]
+    pub failure: Option<crate::failure::Failure>,
 }
 
 impl DiscoveryProgress {
@@ -193,5 +195,19 @@ impl DiscoveryProgress {
             self.status,
             GenerationStatus::Complete | GenerationStatus::Error
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_from_an_older_server_reads_without_a_failure() {
+        let p: DiscoveryProgress = serde_json::from_value(serde_json::json!({
+            "status": "Error", "profiles": [], "started_at": null, "completed_at": null,
+            "result": null, "error": "Discovery is not enabled" }))
+        .unwrap();
+        assert_eq!(p.failure, None);
     }
 }
