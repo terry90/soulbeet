@@ -60,35 +60,25 @@ impl SourcePool {
     /// and that slot simply gets no alternates.
     ///
     /// `rest` must already be in descending score order, which is how
-    /// `auto_download` sorts it. Matching is by normalized title, never by
-    /// filename: the same track has a completely different remote path on
-    /// each peer.
+    /// `auto_download` sorts it.
     pub fn from_tracks(tracks: &[Option<DownloadableItem>], rest: &[DownloadableGroup]) -> Self {
-        let slots = tracks
-            .iter()
-            .map(|track| {
-                let alternates = match track {
-                    Some(track) => {
-                        let wanted = shared::recommendation::normalize_for_matching(&track.title);
-                        rest.iter()
-                            .flat_map(|group| group.items.iter())
-                            .filter(|candidate| {
-                                shared::recommendation::normalize_for_matching(&candidate.title)
-                                    == wanted
-                            })
-                            .cloned()
-                            .collect()
-                    }
-                    None => VecDeque::new(),
-                };
-                Slot {
-                    alternates,
-                    used: 1,
-                }
-            })
-            .collect();
+        let mut pool = Self { slots: Vec::new() };
+        for track in tracks {
+            let alternates = match track {
+                Some(track) => alternates_for(track, rest),
+                None => Vec::new(),
+            };
+            pool.push_slot(alternates);
+        }
+        pool
+    }
 
-        Self { slots }
+    /// Adds a slot after the last; its transfer counts as its first source.
+    pub fn push_slot(&mut self, alternates: Vec<DownloadableItem>) {
+        self.slots.push(Slot {
+            alternates: alternates.into(),
+            used: 1,
+        });
     }
 
     /// Single track, N ranked sources. `items[0]` is the source already
@@ -168,6 +158,23 @@ impl SourcePool {
             refused,
         }
     }
+}
+
+/// The items of `rest` offering `track` (same normalized title), best group
+/// first. Matching is by title, never by filename: the same track has a
+/// completely different remote path on each peer.
+pub fn alternates_for(
+    track: &DownloadableItem,
+    rest: &[DownloadableGroup],
+) -> Vec<DownloadableItem> {
+    let wanted = shared::recommendation::normalize_for_matching(&track.title);
+    rest.iter()
+        .flat_map(|group| group.items.iter())
+        .filter(|candidate| {
+            shared::recommendation::normalize_for_matching(&candidate.title) == wanted
+        })
+        .cloned()
+        .collect()
 }
 
 /// Line the accepted downloads up with the tracks they came from, in the
@@ -453,6 +460,28 @@ mod tests {
         let mut pool = SourcePool::single(vec![item("peer_a", "Wake Up", "a.flac")]);
         assert!(pool.take_next(0).is_none());
         assert!(pool.take_next(9).is_none());
+    }
+
+    #[test]
+    fn a_pushed_slot_offers_its_own_alternates() {
+        let mut pool = SourcePool::from_tracks(
+            &[Some(item("peer_a", "One", "a/01.flac"))],
+            &[group(
+                "peer_b",
+                vec![item("peer_b", "One", "b/01.flac")],
+                0.9,
+            )],
+        );
+        pool.push_slot(vec![item("peer_c", "Two", "c/02.flac")]);
+        assert_eq!(pool.attempts_used(1), 1);
+        assert_eq!(
+            pool.take_next(1).map(|i| i.id),
+            Some("c/02.flac".to_string())
+        );
+        assert_eq!(
+            pool.take_next(0).map(|i| i.id),
+            Some("b/01.flac".to_string())
+        );
     }
 
     #[tokio::test]

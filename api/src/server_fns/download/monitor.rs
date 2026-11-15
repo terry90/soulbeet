@@ -225,8 +225,8 @@ pub struct DownloadMonitor {
     tx: broadcast::Sender<DownloadEvent>,
     /// Per-track state, parallel to `tracked_files` by index.
     track_states: Vec<TrackState>,
-    /// Alternate sources per slot; `None` disables failover.
-    pool: Option<SourcePool>,
+    /// Alternate sources per slot, parallel to `tracked_files` by index.
+    pool: SourcePool,
     /// Whether album mode is enabled.
     album_mode: bool,
     /// Cancellation token for graceful shutdown.
@@ -274,13 +274,14 @@ impl DownloadMonitor {
         let track_states = (0..tracked_files.len())
             .map(|_| TrackState::bound_now())
             .collect();
+        let pool = SourcePool::from_tracks(&vec![None; tracked_files.len()], &[]);
 
         Self {
             tracked_files,
             target_path,
             tx,
             track_states,
-            pool: None,
+            pool,
             album_mode: CONFIG.is_album_mode(),
             cancellation_token,
             batch,
@@ -357,6 +358,7 @@ impl DownloadMonitor {
                 destination: Some(self.batch.destination.clone()),
             });
             self.track_states.push(TrackState::bound_now());
+            self.pool.push_slot(slot.alternates);
         }
         any
     }
@@ -439,8 +441,9 @@ impl DownloadMonitor {
     }
 
     /// Attach alternate sources so failed transfers retry from another peer.
+    /// `pool` has a slot per transfer the monitor was created with.
     pub fn with_failover(mut self, pool: SourcePool) -> Self {
-        self.pool = Some(pool);
+        self.pool = pool;
         self
     }
 
@@ -458,10 +461,7 @@ impl DownloadMonitor {
         if self.cancellation_token.is_cancelled() {
             return false;
         }
-        let Some(pool) = self.pool.as_mut() else {
-            return false;
-        };
-        let next = pool.enqueue_next(slot, backend, &self.batch).await;
+        let next = self.pool.enqueue_next(slot, backend, &self.batch).await;
         for refused in &next.refused {
             warn!(
                 "Failover source {} refused {} for {}: {}: {}",
@@ -476,7 +476,7 @@ impl DownloadMonitor {
             return false;
         };
 
-        let attempt = pool.attempts_used(slot);
+        let attempt = self.pool.attempts_used(slot);
         info!(
             "{} for {} from {}, retrying from {} ({}/{})",
             reason,
@@ -1595,7 +1595,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 2);
+        assert_eq!(m.pool.attempts_used(0), 2);
         assert_eq!(m.tracked_files[0].source, "peer_b");
         assert_eq!(m.tracked_files[0].transfer_id, "t-dirB/bbb.flac");
         assert_eq!(phase(&m, 0), SlotPhase::Watching);
@@ -2044,12 +2044,12 @@ mod tests {
 
         // Nothing for this track anywhere in slskd's list.
         m.handle_absent_tracks(&[], &backend).await;
-        assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 2);
+        assert_eq!(m.pool.attempts_used(0), 2);
         assert_eq!(m.tracked_files[0].source, "peer_b");
 
         // The rebind reset the window, so the next sweep leaves it alone.
         m.handle_absent_tracks(&[], &backend).await;
-        assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 2);
+        assert_eq!(m.pool.attempts_used(0), 2);
         assert_eq!(m.tracked_files[0].source, "peer_b");
     }
 
@@ -2282,7 +2282,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(m.pool.as_ref().unwrap().attempts_used(0), 1);
+        assert_eq!(m.pool.attempts_used(0), 1);
         assert_eq!(m.tracked_files[0].source, "peer_a");
         assert_eq!(phase(&m, 0), SlotPhase::Settled);
     }
@@ -2629,6 +2629,7 @@ mod tests {
                 source: "peer_b".to_string(),
                 filename: "02.flac".to_string(),
                 transfer_id: id_of("02.flac"),
+                alternates: vec![],
             }])
             .expect("delivered");
 
@@ -2650,6 +2651,47 @@ mod tests {
             m.batch.inbox.reserve().is_none(),
             "the finished batch is closed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_slot_a_joining_request_added_fails_over_to_its_own_alternates() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.batch
+            .inbox
+            .reserve()
+            .expect("open inbox")
+            .deliver(vec![AddedSlot {
+                source: "peer_a".into(),
+                filename: "dirA/two.flac".into(),
+                transfer_id: id_of("dirA/two.flac"),
+                alternates: vec![item("peer_b", "Two", "dirB/two.flac")],
+            }])
+            .expect("delivered");
+        assert!(m.drain_inbox());
+        m.track_states[1].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[
+                listed("peer_a", "dirA/aaa.flac", DownloadState::InProgress),
+                failed_transfer("peer_a", "dirA/two.flac"),
+            ],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(
+            (
+                m.tracked_files[1].source.as_str(),
+                m.tracked_files[1].transfer_id.as_str()
+            ),
+            ("peer_b", "t-dirB/two.flac")
+        );
+        assert_eq!((m.pool.attempts_used(0), m.pool.attempts_used(1)), (1, 2));
+        assert_eq!(m.tracked_files[0].source, "peer_a");
     }
 
     #[tokio::test]
@@ -2693,6 +2735,7 @@ mod tests {
                 source: "peer_b".to_string(),
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02".to_string(),
+                alternates: vec![],
             }])
             .expect("delivered");
 
@@ -2723,6 +2766,7 @@ mod tests {
                 source: "peer_b".to_string(),
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02".to_string(),
+                alternates: vec![],
             }])
             .expect("delivered");
 

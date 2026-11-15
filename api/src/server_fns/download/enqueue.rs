@@ -3,12 +3,15 @@
 //! Every enqueue site claims its keys before it asks the backend for
 //! anything, and releases each key whose file was not enqueued.
 
-use shared::download::{DownloadProgress, DownloadableItem, EnqueueStatus, QueuedDownload};
+use shared::download::{
+    DownloadProgress, DownloadableGroup, DownloadableItem, EnqueueStatus, QueuedDownload,
+};
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::DownloadBackend;
 use std::sync::Arc;
 
+use super::failover::{align_pool_tracks, alternates_for};
 use crate::transfer_registry::{
     AddedSlot, BatchRef, Claim, InboxReservation, RequestClaim, TransferKey, TransferRegistry,
 };
@@ -276,22 +279,28 @@ pub async fn enqueue_request(
     }
 }
 
-/// Hands a joining request's enqueued transfers to `batch`'s monitor.
+/// Hands a joining request's enqueued transfers to `batch`'s monitor, each
+/// with the alternates `rest` holds for the item it came from among `items`,
+/// none for one it cannot be lined up with.
 /// Returns the ones nobody will watch because that monitor stopped first,
 /// with their keys released and their transfers cancelled, since they would
 /// download into the batch's folder with nobody to import them.
 pub async fn deliver(
     reservation: InboxReservation,
     enqueued: &[QueuedDownload],
+    items: &[DownloadableItem],
+    rest: &[DownloadableGroup],
     backend: &Arc<dyn DownloadBackend>,
     batch: &BatchRef,
 ) -> Vec<AddedSlot> {
     let slots = enqueued
         .iter()
-        .map(|q| AddedSlot {
+        .zip(align_pool_tracks(enqueued, items))
+        .map(|(q, track)| AddedSlot {
             source: q.source.clone(),
             filename: q.item.clone(),
             transfer_id: q.id.clone(),
+            alternates: track.map_or_else(Vec::new, |track| alternates_for(&track, rest)),
         })
         .collect();
     let lost = match reservation.deliver(slots) {
@@ -337,7 +346,8 @@ pub fn stopped_rows(lost: &[AddedSlot], batch: &BatchRef) -> Vec<DownloadProgres
 mod tests {
     use super::*;
     use crate::server_fns::download::test_support::{
-        batch, item, key, same_user_into, Cancel, ScriptedOutcome, StubBackend, STUB_IN_FLIGHT,
+        batch, group, item, key, same_user_into, Cancel, ScriptedOutcome, StubBackend,
+        STUB_IN_FLIGHT,
     };
     use shared::failure::{FailureCode, RetryAdvice, Service, Stage};
     use std::path::PathBuf;
@@ -475,7 +485,16 @@ mod tests {
             item("peer_a", "Two", "02.flac"),
         ];
 
-        let enq = enqueue_request(&backend, items, fresh.clone()).await;
+        let rest = vec![group(
+            "peer_b",
+            vec![
+                item("peer_b", "Two", "b/02.flac"),
+                item("peer_b", "Three", "b/03.flac"),
+            ],
+            0.8,
+        )];
+
+        let enq = enqueue_request(&backend, items.clone(), fresh.clone()).await;
 
         assert_eq!(
             statuses(&enq.results),
@@ -499,15 +518,18 @@ mod tests {
             .into_iter()
             .filter(|q| q.status == EnqueueStatus::Enqueued)
             .collect();
-        assert!(deliver(reservation, &enqueued, &backend, &running)
-            .await
-            .is_empty());
+        assert!(
+            deliver(reservation, &enqueued, &items, &rest, &backend, &running)
+                .await
+                .is_empty()
+        );
         assert_eq!(
             running.inbox.take(),
             vec![AddedSlot {
                 source: "peer_a".to_string(),
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02.flac".to_string(),
+                alternates: vec![item("peer_b", "Two", "b/02.flac")],
             }]
         );
     }
@@ -726,7 +748,15 @@ mod tests {
         let enqueued = enqueue_claimed_for(&backend, &running).await;
         running.inbox.close();
 
-        let lost = deliver(reservation, &enqueued, &backend, &running).await;
+        let lost = deliver(
+            reservation,
+            &enqueued,
+            &[item("peer_a", "One", "01.flac")],
+            &[],
+            &backend,
+            &running,
+        )
+        .await;
 
         assert_eq!(lost.len(), 1);
         assert!(TransferRegistry::global()

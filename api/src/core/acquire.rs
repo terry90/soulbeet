@@ -89,7 +89,8 @@ async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> {
 
 /// Claims and enqueues a request's files, shows their rows, and hands the
 /// enqueued ones to a monitor: the running batch's when the request joined
-/// one, else a new one that fails a slot over to its track's `alternates`.
+/// one, else a new one. Either fails a slot over to its track's
+/// `alternates`.
 ///
 /// Runs as its own task. Registry keys are claimed from its start, and the
 /// client may disconnect at any await and drop the caller: dropping the
@@ -184,7 +185,15 @@ async fn queue_and_watch(
                 enqueued.len(),
                 batch.owner.batch_id
             );
-            let lost = deliver(reservation, &enqueued, &backend, &batch).await;
+            let lost = deliver(
+                reservation,
+                &enqueued,
+                &items,
+                &alternates,
+                &backend,
+                &batch,
+            )
+            .await;
             if !lost.is_empty() {
                 let _ = tx.send(DownloadEvent::Progress(stopped_rows(&lost, &batch)));
             }
@@ -463,7 +472,7 @@ mod tests {
     use crate::core::test_ctx;
     use crate::server_fns::download::enqueue::other_user;
     use crate::server_fns::download::test_support::{
-        batch, item, key, same_user_into, ScriptedOutcome, StubBackend,
+        batch, group, item, key, same_user_into, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::failure::{Cause, Service};
@@ -604,6 +613,40 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].filename, "2.flac");
         assert_eq!(delivered[0].transfer_id, "t-2.flac");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_joins_a_running_batch_hands_over_its_alternates() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = batch("Come Over");
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
+        let fresh = same_user_into(&running, running.target.clone());
+        let rest = vec![group(
+            "peer_b",
+            vec![item("peer_b", "Two", "b/02.flac")],
+            0.8,
+        )];
+
+        enqueue_and_watch(
+            &ctx_of(&running),
+            backend,
+            vec![
+                item("peer_a", "One", "01.flac"),
+                item("peer_a", "Two", "02.flac"),
+            ],
+            fresh,
+            rest,
+        )
+        .await
+        .unwrap();
+
+        let slots = running.inbox.take();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(
+            (slots[0].filename.as_str(), slots[0].alternates.clone()),
+            ("02.flac", vec![item("peer_b", "Two", "b/02.flac")])
+        );
     }
 
     #[tokio::test]

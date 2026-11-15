@@ -11,7 +11,7 @@
 //! The monitor only finishes once no reservation is outstanding.
 
 use crate::auth::UserId;
-use shared::download::batch_folder;
+use shared::download::{batch_folder, DownloadableItem};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -209,11 +209,14 @@ impl TransferRegistry {
 }
 
 /// A transfer a joining request enqueued into a running batch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AddedSlot {
     pub source: String,
     pub filename: String,
     pub transfer_id: String,
+    /// Other sources for the same track, best first; empty when the request
+    /// had none.
+    pub alternates: Vec<DownloadableItem>,
 }
 
 #[derive(Debug)]
@@ -336,6 +339,7 @@ mod tests {
             source: "peer_a".to_string(),
             filename: filename.to_string(),
             transfer_id: format!("t-{filename}"),
+            alternates: vec![],
         }
     }
 
