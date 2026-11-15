@@ -92,6 +92,8 @@ interface TransferRecord {
   /** number of plan steps already applied */
   applied: number;
   delivered: boolean;
+  /** how far the one-file-per-peer wait pushed this plan back */
+  shiftMs: number;
 }
 
 export interface BatchEnqueueBody {
@@ -211,17 +213,32 @@ function dotnetTicks(): string {
   return String(sinceEpoch + 621_355_968_000_000_000n);
 }
 
-/** Guid.Parse for the hyphenated and the bare 32-digit forms. */
-function parseGuid(text: string): string | null {
-  const match = /^([0-9a-f]{8})-?([0-9a-f]{4})-?([0-9a-f]{4})-?([0-9a-f]{4})-?([0-9a-f]{12})$/i.exec(
-    text,
-  );
+/**
+ * Guid.TryParse: trims, takes 32 hex digits or the 8-4-4-4-12 form, either
+ * one bare or inside braces or parentheses. Returns the lowercase hyphenated
+ * form, null when .NET would not parse it.
+ */
+export function parseGuid(text: string): string | null {
+  const trimmed = text.trim();
+  const wrapped = /^\{(.*)\}$/s.exec(trimmed) ?? /^\((.*)\)$/s.exec(trimmed);
+  const inner = wrapped ? (wrapped[1] as string) : trimmed;
+  const match =
+    /^([0-9a-f]{8})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{12})$/i.exec(inner) ??
+    /^([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$/i.exec(inner);
   return match ? match.slice(1).join('-').toLowerCase() : null;
 }
 
 export class SlskdState {
   private searches = new Map<string, SearchRecord>();
   private transfers: TransferRecord[] = [];
+  /**
+   * Peer username to the id of the transfer sending that peer's file now. A
+   * Soulseek.NET uploader sends one file at a time per downloading user
+   * (MaximumConcurrentUploadsPerUser = 1, Soulseek.NET 10.0.2
+   * src/Options/SoulseekClientOptions.cs:322; SoulseekClient.cs:4346). The
+   * stub is one slskd, so one downloader: the slot is keyed by the peer.
+   */
+  private slotHolder = new Map<string, string>();
   private behaviors = new Map<string, PeerBehavior>();
   private fileSizes = new Map<string, number>();
   private nextToken = 1000;
@@ -258,6 +275,7 @@ export class SlskdState {
   reset(): void {
     this.searches.clear();
     this.transfers = [];
+    this.slotHolder.clear();
     this.resetBehaviors();
     this.rejectedOnce.clear();
     this.batchIds.clear();
@@ -539,6 +557,7 @@ export class SlskdState {
         plan: plan.map((step) => ({ ...step })),
         applied: 1,
         delivered: false,
+        shiftMs: 0,
       };
       this.transfers.push(transfer);
       // The new record supersedes the finished ones for the same file.
@@ -572,17 +591,51 @@ export class SlskdState {
   /** Advance every transfer along its behavior plan; called on a short timer. */
   tick(): void {
     const now = Date.now();
-    for (const transfer of this.transfers) {
-      const elapsed = now - transfer.requestedAtMs;
-      while (transfer.applied < transfer.plan.length) {
-        const step = transfer.plan[transfer.applied] as TransferStep;
-        if (elapsed < step.afterMs) {
-          break;
+    // Oldest request first; Array.sort is stable, so insertion order breaks ties.
+    const ordered = [...this.transfers].sort((a, b) => a.requestedAtMs - b.requestedAtMs);
+    let slotFreed = true;
+    // A slot released by one transfer goes to the next waiting one in the same tick.
+    while (slotFreed) {
+      slotFreed = false;
+      for (const transfer of ordered) {
+        if (transfer.state === 'Completed, Cancelled') {
+          continue;
         }
-        transfer.applied++;
-        this.applyStep(transfer, step);
+        while (transfer.applied < transfer.plan.length) {
+          const step = transfer.plan[transfer.applied] as TransferStep;
+          if (now - transfer.requestedAtMs - transfer.shiftMs < step.afterMs) {
+            break;
+          }
+          if (step.state === 'Initializing' || step.state === 'InProgress') {
+            const holder = this.slotHolder.get(transfer.username);
+            if (holder !== undefined && holder !== transfer.id) {
+              break;
+            }
+            if (holder === undefined) {
+              this.slotHolder.set(transfer.username, transfer.id);
+              transfer.shiftMs = now - transfer.requestedAtMs - step.afterMs;
+            }
+          }
+          transfer.applied++;
+          this.applyStep(transfer, step);
+          if (this.releaseSlot(transfer)) {
+            slotFreed = true;
+          }
+        }
       }
     }
+  }
+
+  /** Free the peer's slot when this transfer holds it and has completed. */
+  private releaseSlot(transfer: TransferRecord): boolean {
+    if (
+      transfer.state.startsWith('Completed') &&
+      this.slotHolder.get(transfer.username) === transfer.id
+    ) {
+      this.slotHolder.delete(transfer.username);
+      return true;
+    }
+    return false;
   }
 
   private applyStep(transfer: TransferRecord, step: TransferStep): void {
@@ -638,19 +691,26 @@ export class SlskdState {
     console.log(`[slskd] delivered ${target}`);
   }
 
-  cancel(username: string, id: string, remove: boolean): boolean {
-    const transfer = this.transfers.find((t) => t.username === username && t.id === id);
+  /**
+   * slskd 0.26 CancelDownloadAsync (TransfersController.cs:91-121): both
+   * lookups go by id alone and an unknown id is a no-op. `remove` only
+   * flags a record that was already Completed (DownloadService.cs:960-1031).
+   */
+  cancel(id: string, remove: boolean): void {
+    const transfer = this.transfers.find((t) => t.id === id);
     if (!transfer) {
-      return false;
+      return;
     }
-    if (!transfer.state.startsWith('Completed')) {
+    const wasCompleted = transfer.state.startsWith('Completed');
+    if (!wasCompleted) {
       transfer.state = 'Completed, Cancelled';
       transfer.endedAtMs = Date.now();
+      transfer.exception = 'The operation was canceled.';
+      this.releaseSlot(transfer);
     }
-    if (remove) {
+    if (remove && wasCompleted) {
       transfer.removed = true;
     }
-    return true;
   }
 
   transferJson(transfer: TransferRecord): Record<string, unknown> {

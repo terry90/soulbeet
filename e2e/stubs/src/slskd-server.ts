@@ -4,7 +4,7 @@
 import type { Server } from 'node:http';
 import type { PeerBehavior } from '../../fixtures/dataset.js';
 import { createStubServer, sendEmpty, sendJson, sendText } from './router.js';
-import type { BatchEnqueueBody, SlskdState } from './slskd-state.js';
+import { parseGuid, type BatchEnqueueBody, type SlskdState } from './slskd-state.js';
 
 const VALID_BEHAVIORS: PeerBehavior[] = [
   'happy',
@@ -157,8 +157,13 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
         pattern: '/api/v0/transfers/downloads/:username/:id',
         handler: ({ res, params, url }) => {
           const remove = url.searchParams.get('remove') === 'true';
-          const ok = state.cancel(params.username as string, params.id as string, remove);
-          sendEmpty(res, ok ? 204 : 404);
+          const id = parseGuid(params.id as string);
+          if (id === null) {
+            sendEmpty(res, 400);
+            return;
+          }
+          state.cancel(id, remove);
+          sendEmpty(res, 204);
         },
       },
 
