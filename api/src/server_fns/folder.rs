@@ -6,11 +6,12 @@ use shared::library::DuplicateReport;
 use super::{refusal_error, server_error};
 #[cfg(feature = "server")]
 use crate::auth::UserCtx;
+use crate::folder_policy::FolderAdminView;
 #[cfg(feature = "server")]
 use crate::folder_policy::{
-    canonical_folder_path, check_folder_path, folder_conflicts, load_policy_inputs, FolderRefusal,
+    canonical_folder_path, check_folder_path, folder_conflicts, load_policy_inputs,
+    FolderAdminEntry, FolderRefusal,
 };
-use crate::folder_policy::{FolderAdminEntry, FolderAdminView};
 #[cfg(feature = "server")]
 use crate::models::{folder_root::FolderRoot, user::User};
 #[cfg(feature = "server")]
