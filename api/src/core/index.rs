@@ -199,15 +199,55 @@ async fn lists(
     item: &Path,
     size: u64,
 ) -> Result<Option<NativeSong>, NavidromeError> {
+    page_through(navi, text, |page| {
+        page.into_iter()
+            .find(|song| is_imported_file(song, item, size))
+    })
+    .await
+}
+
+/// Every present song the user of `navi` sees that may be `item`: each page of the native
+/// `title` filter for its recording MBID, then for lookup_text, each song once. None when
+/// Navidrome's filter keeps nothing of either, since no search can then show every song that
+/// may be the item.
+pub(crate) async fn candidates(
+    navi: &NavidromeClient,
+    item: &ImportedItem,
+) -> Result<Option<Vec<NativeSong>>, NavidromeError> {
+    let texts: Vec<String> = item
+        .recording_mbid
+        .iter()
+        .filter(|mbid| navidrome_keeps(mbid))
+        .cloned()
+        .chain(lookup_text(item))
+        .collect();
+    if texts.is_empty() {
+        return Ok(None);
+    }
+    let (mut songs, mut seen) = (Vec::new(), HashSet::new());
+    for text in &texts {
+        page_through(navi, text, |page| {
+            songs.extend(page.into_iter().filter(|song| seen.insert(song.id.clone())));
+            None::<()>
+        })
+        .await?;
+    }
+    Ok(Some(songs))
+}
+
+/// Hands `take` each page of LOOKUP_PAGE songs the native `title` filter matches for `text`,
+/// in order, until it gives Some or a page is short.
+async fn page_through<T>(
+    navi: &NavidromeClient,
+    text: &str,
+    mut take: impl FnMut(Vec<NativeSong>) -> Option<T>,
+) -> Result<Option<T>, NavidromeError> {
     let mut start = 0;
     loop {
         let page = navi.find_songs(text, start, start + LOOKUP_PAGE).await?;
         let short = page.len() < LOOKUP_PAGE as usize;
-        if let Some(song) = page
-            .into_iter()
-            .find(|song| is_imported_file(song, item, size))
-        {
-            return Ok(Some(song));
+        if let Some(found) = take(page) {
+            return Ok(Some(found));
         }
         if short {
             return Ok(None);
@@ -982,6 +1022,63 @@ mod tests {
             )],
         );
         assert!(listed(&db, &navi.client(), &wait).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_item_is_looked_up_by_recording_then_by_artist_and_title() {
+        let navi = NavidromeStub::start();
+        let record = |id: &str, path: &str| {
+            format!(
+                r#"{{"id":"{id}","libraryId":1,"libraryPath":"/music","path":"{path}","title":"O Holy Night",
+                "album":"Winter Songs","artist":"Marrow Choir","albumArtist":"Marrow Choir","size":5,"suffix":"flac","missing":false}}"#
+            )
+        };
+        let first = record(
+            "3sG8kPq0WmZ1xYbN4vTcDe",
+            "Marrow Choir/Winter Songs/03.flac",
+        );
+        let second = record("7hJ2mNq4RtX9vBc1LkWsAe", "Marrow Choir/Best Of/11.flac");
+        navi.answer(
+            "/api/song",
+            &[&format!("[{first}]"), &format!("[{first},{second}]")],
+        );
+        let item = ImportedItem {
+            path: "Marrow Choir/Winter Songs/03.flac".into(),
+            recording_mbid: Some("0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c".into()),
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+        };
+        let found = candidates(&navi.client(), &item).await.unwrap().unwrap();
+        assert_eq!(
+            found.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["3sG8kPq0WmZ1xYbN4vTcDe", "7hJ2mNq4RtX9vBc1LkWsAe"]
+        );
+        let asked: Vec<String> = navi
+            .asked_with_queries()
+            .into_iter()
+            .filter(|target| target.starts_with("/api/song?"))
+            .collect();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        for (target, title) in asked.iter().zip([
+            "title=0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c",
+            "title=Marrow+Choir+O+Holy+Night",
+        ]) {
+            assert!(
+                target.split(['?', '&']).any(|p| p == title)
+                    && target.split(['?', '&']).any(|p| p == "missing=false"),
+                "{target}"
+            );
+        }
+        // Nothing Navidrome's filter keeps: no search can show that no other song has the file.
+        let bare = ImportedItem {
+            recording_mbid: None,
+            artist: "(".into(),
+            title: ")".into(),
+            album: "[]".into(),
+            ..item
+        };
+        assert!(candidates(&navi.client(), &bare).await.unwrap().is_none());
     }
 
     const IDLE: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"scanStatus":{"scanning":false,"count":1342,"folderCount":120,"lastScan":"2026-11-15T10:02:00Z","scanType":"quick","elapsedTime":4000000000}}}"#;

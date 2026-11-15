@@ -341,6 +341,14 @@ impl User {
             .await
             .map_err(|e| e.to_string())
     }
+
+    /// Every user with a Navidrome password stored, whatever its last status.
+    pub(crate) async fn linked_to_navidrome_in(db: &SqlitePool) -> Result<Vec<User>, String> {
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE navidrome_token IS NOT NULL")
+            .fetch_all(db)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Startup check: accounts whose names differ only in letter case cannot

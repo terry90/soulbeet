@@ -198,6 +198,13 @@ impl NavidromeClient {
         Ok(())
     }
 
+    /// Navidrome's version as ping reports it (`serverVersion`, e.g. "0.60.3 (34c6f12a)"); None
+    /// when the answer has none.
+    pub async fn server_version(&self) -> Result<Option<String>> {
+        let body: VersionBody = self.get("ping", &[]).await?;
+        Ok(body.server_version)
+    }
+
     pub async fn start_scan(&self) -> Result<()> {
         let _: PingBody = self.post_form("startScan", &[]).await?;
         Ok(())
@@ -681,6 +688,28 @@ mod tests {
             e.to_string(),
             "Unreadable Navidrome response: error decoding response body"
         );
+    }
+
+    #[tokio::test]
+    async fn the_server_version_is_read_from_ping() {
+        // server/subsonic/helpers.go:32 sets serverVersion on every answer.
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.60.3 (34c6f12a)","openSubsonic":true}}"#.into(),
+            },
+            Reply {
+                status: 200,
+                body: r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#.into(),
+            },
+        ]);
+        let navi = client(&url);
+        assert_eq!(
+            navi.server_version().await.unwrap().as_deref(),
+            Some("0.60.3 (34c6f12a)")
+        );
+        assert_eq!(navi.server_version().await.unwrap(), None);
+        assert!(seen.lock().unwrap()[0].target.starts_with("/rest/ping?"));
     }
 
     #[tokio::test]

@@ -147,6 +147,7 @@ pub fn overlap(a: &Path, b: &Path) -> Option<Overlap> {
 #[cfg(feature = "server")]
 #[derive(Clone, Debug)]
 pub struct PolicyFolder {
+    pub id: String,
     pub user_id: String,
     pub owner_is_admin: bool,
     pub path: Result<PathBuf, String>,
@@ -375,6 +376,7 @@ pub(crate) fn policy_inputs(
     let folders = folders
         .iter()
         .map(|f| PolicyFolder {
+            id: f.folder.id.clone(),
             owner_is_admin: f.owner_role.is_admin(),
             path: canonical_folder_path(Path::new(&f.folder.path)).map_err(|e| e.to_string()),
             stored_path: PathBuf::from(&f.folder.path),
@@ -472,6 +474,7 @@ mod tests {
 
     fn pf(user: &str, admin: bool, path: &Path, shared: bool) -> PolicyFolder {
         PolicyFolder {
+            id: format!("{user}:{}", path.display()),
             user_id: user.to_string(),
             owner_is_admin: admin,
             path: Ok(path.to_path_buf()),

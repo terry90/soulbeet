@@ -124,6 +124,17 @@ pub struct ProfileGenerationStats {
     pub imports_file_missing: u32,
 }
 
+/// A Soulful account whose Navidrome ratings the delete guard could not read, so deletions
+/// are refused until a read succeeds. Shown to admins only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnreadableListener {
+    pub username: String,
+    /// What the last failed read gave.
+    pub error: String,
+    /// When reads of this account started failing (SQLite `datetime('now')`, UTC).
+    pub since: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncResult {
     pub deleted_tracks: u32,

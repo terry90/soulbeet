@@ -976,6 +976,7 @@ mod tests {
 
     fn owned(user: &str, path: &Path, shared: bool) -> PolicyFolder {
         PolicyFolder {
+            id: format!("{user}:{}", path.display()),
             user_id: user.to_string(),
             owner_is_admin: false,
             path: Ok(path.to_path_buf()),

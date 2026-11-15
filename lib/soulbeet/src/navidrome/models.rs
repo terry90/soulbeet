@@ -39,6 +39,35 @@ pub struct SubsonicError {
 #[derive(Debug, Deserialize)]
 pub struct PingBody {}
 
+/// Navidrome's own version, sent on every answer (server/subsonic/helpers.go:32,
+/// responses/responses.go:14); absent from a server that is not Navidrome.
+#[derive(Debug, Deserialize)]
+pub struct VersionBody {
+    #[serde(rename = "serverVersion")]
+    pub server_version: Option<String>,
+}
+
+/// Whether the Navidrome reporting `server_version` keeps every song's average rating, which
+/// release 0.60.0 added (model/annotation.go:12 `AverageRating`; 0.59.0 has none). The version
+/// reads "{release} ({sha})" (consts/version.go:20-26), and a local build's release is the last
+/// tag with "-SNAPSHOT" appended (Makefile:12), so a snapshot is at least that release. "dev",
+/// a branch name, a release candidate or anything else that is not three numbers is not known
+/// to keep them.
+pub fn keeps_song_averages(server_version: &str) -> bool {
+    let release = server_version.split(' ').next().unwrap_or_default();
+    let release = release.strip_suffix("-SNAPSHOT").unwrap_or(release);
+    let numbers: Option<Vec<u32>> = release
+        .split('.')
+        .map(|n| {
+            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            n.parse().ok()
+        })
+        .collect();
+    matches!(numbers.as_deref(), Some(&[major, minor, _]) if (major, minor) >= (0, 60))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ScanStatusBody {
     #[serde(rename = "scanStatus")]
@@ -250,6 +279,27 @@ mod tests {
             r#"{"scanning":true,"count":12,"folderCount":3,"lastScan":"2026-11-15T10:02:00Z","scanType":"quick","elapsedTime":9000000000}"#,
         );
         assert_eq!(running.last_start(), None);
+    }
+
+    #[test]
+    fn song_averages_are_kept_from_release_0_60_0_on() {
+        for (version, keeps) in [
+            ("0.60.3 (34c6f12a)", true),
+            ("0.60.0 (1b2c3d4e)", true),
+            ("1.0.0 (1b2c3d4e)", true),
+            ("0.64.2", true),
+            ("0.60.0-SNAPSHOT (1b2c3d4e)", true),
+            ("0.59.0 (fa46aefa)", false),
+            ("0.59.0-SNAPSHOT (fa46aefa)", false),
+            ("0.60.0-rc1 (1b2c3d4e)", false),
+            ("dev", false),
+            ("master (9ed35cb)", false),
+            ("0.60 (1b2c3d4e)", false),
+            ("0.60.x (1b2c3d4e)", false),
+            ("", false),
+        ] {
+            assert_eq!(keeps_song_averages(version), keeps, "{version}");
+        }
     }
 
     #[test]

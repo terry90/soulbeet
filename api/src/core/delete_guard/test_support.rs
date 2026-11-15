@@ -1,0 +1,568 @@
+//! Navidrome as the guard sees it, and a temp library to check files in.
+
+use super::{Guard, Listeners};
+use crate::auth::UserId;
+use crate::models::discovery_playlist::DiscoveryTrackRow;
+use crate::services::NavidromeLookupError;
+use shared::download::DownloadQuery;
+use shared::metadata::Track;
+use shared::navidrome::DiscoveryTrack;
+use soulbeet::navidrome::models::{NativeSong, SubsonicAlbum, SubsonicSong};
+use soulbeet::ImportedItem;
+use sqlx::SqlitePool;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+type Pair = (String, String);
+
+/// What ping answers: the version it reports, or the error it fails with.
+type PingAnswer = Result<Option<String>, fn() -> NavidromeLookupError>;
+
+/// The server version the fake reports unless told otherwise: the maintainer's.
+const VERSION: &str = "0.60.3 (34c6f12a)";
+
+#[derive(Default)]
+struct State {
+    /// Each song's record (rating and average unset) and album id.
+    records: BTreeMap<String, (NativeSong, String)>,
+    /// (user, song id)
+    sees: HashSet<Pair>,
+    ratings: HashMap<Pair, u8>,
+    stars: HashSet<Pair>,
+    /// (user, album id)
+    album_ratings: HashMap<Pair, u8>,
+    album_stars: HashSet<Pair>,
+    hidden: HashMap<String, Vec<u8>>,
+    /// The average stored per song, as the last setRating left it.
+    averages: HashMap<String, f64>,
+    unreadable: HashMap<String, fn() -> NavidromeLookupError>,
+    minimal: HashSet<String>,
+    legacy: HashSet<String>,
+    lost_albums: HashSet<String>,
+    unsearchable: HashSet<String>,
+    without_averages: bool,
+    /// None: VERSION.
+    version: Option<PingAnswer>,
+    reads: HashMap<String, usize>,
+    ratings_set: Vec<(String, String, u8)>,
+}
+
+impl State {
+    /// Navidrome's average: every positive rating of the song, seen or not
+    /// (persistence/sql_annotations.go:150-158), rounded to 2 decimals.
+    fn recompute(&mut self, song: &str) {
+        let ratings: Vec<f64> = self
+            .ratings
+            .iter()
+            .filter(|((_, id), r)| id == song && **r > 0)
+            .map(|(_, r)| f64::from(*r))
+            .chain(
+                self.hidden
+                    .get(song)
+                    .into_iter()
+                    .flatten()
+                    .map(|r| f64::from(*r)),
+            )
+            .collect();
+        let mean = match ratings.len() {
+            0 => 0.0,
+            n => ratings.iter().sum::<f64>() / n as f64,
+        };
+        self.averages
+            .insert(song.to_string(), (mean * 100.0).round() / 100.0);
+    }
+
+    /// Counts a read as `user` and fails it when `user` is unreadable.
+    fn read(&mut self, user: &UserId) -> Result<String, NavidromeLookupError> {
+        let user = user.to_string();
+        *self.reads.entry(user.clone()).or_default() += 1;
+        match self.unreadable.get(&user) {
+            Some(error) => Err(error()),
+            None => Ok(user),
+        }
+    }
+
+    fn native(&self, user: &str, id: &str) -> Option<NativeSong> {
+        let (record, _) = self.records.get(id)?;
+        self.sees
+            .contains(&(user.to_string(), id.to_string()))
+            .then(|| NativeSong {
+                rating: self.rating(user, id),
+                // omitempty: an average of 0 is not sent.
+                average_rating: self
+                    .averages
+                    .get(id)
+                    .copied()
+                    .filter(|a| *a > 0.0 && !self.without_averages),
+                ..record.clone()
+            })
+    }
+
+    fn rating(&self, user: &str, id: &str) -> u8 {
+        self.ratings
+            .get(&(user.to_string(), id.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// Navidrome as the guard sees it: each user's view of the songs, their ratings and stars,
+/// an average stored per song that only set_rating recomputes (sql_annotations.go:141-158).
+#[derive(Default)]
+pub(crate) struct FakeNavidrome {
+    state: Mutex<State>,
+}
+
+impl FakeNavidrome {
+    fn with<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
+        f(&mut self.state.lock().unwrap())
+    }
+
+    /// The record's fields other than rating and average.
+    pub fn file(&self, song: NativeSong, album_id: &str) {
+        self.with(|s| {
+            let id = song.id.clone();
+            s.records.insert(id.clone(), (song, album_id.to_string()));
+            s.recompute(&id);
+        })
+    }
+
+    pub fn sees(&self, user: &str, song_id: &str) {
+        self.with(|s| s.sees.insert((user.into(), song_id.into())));
+    }
+
+    /// `user`'s reads answer None for `song_id`, as getSong answers code 70.
+    pub fn unsee(&self, user: &str, song_id: &str) {
+        self.with(|s| s.sees.remove(&(user.into(), song_id.into())));
+    }
+
+    pub fn rates(&self, user: &str, song_id: &str, rating: u8) {
+        self.with(|s| {
+            s.ratings.insert((user.into(), song_id.into()), rating);
+            s.recompute(song_id);
+        })
+    }
+
+    pub fn stars(&self, user: &str, song_id: &str) {
+        self.with(|s| s.stars.insert((user.into(), song_id.into())));
+    }
+
+    pub fn rates_album(&self, user: &str, album_id: &str, rating: u8) {
+        self.with(|s| {
+            s.album_ratings
+                .insert((user.into(), album_id.into()), rating)
+        });
+    }
+
+    pub fn stars_album(&self, user: &str, album_id: &str) {
+        self.with(|s| s.album_stars.insert((user.into(), album_id.into())));
+    }
+
+    /// A rater Soulful has no account for; counts in the average only.
+    pub fn hidden_rater(&self, song_id: &str, rating: u8) {
+        self.with(|s| {
+            s.hidden.entry(song_id.into()).or_default().push(rating);
+            s.recompute(song_id);
+        })
+    }
+
+    /// The stored average, as left by an earlier setRating (stale until the next one).
+    pub fn stale_average(&self, song_id: &str, average: f64) {
+        self.with(|s| s.averages.insert(song_id.into(), average));
+    }
+
+    /// Every read as `user` fails with this error.
+    pub fn unreadable(&self, user: &str, error: fn() -> NavidromeLookupError) {
+        self.with(|s| s.unreadable.insert(user.into(), error));
+    }
+
+    /// Undoes `unreadable`.
+    pub fn readable(&self, user: &str) {
+        self.with(|s| s.unreadable.remove(user));
+    }
+
+    /// Answers `user` as a minimal client: songs without albumId.
+    pub fn minimal_client(&self, user: &str) {
+        self.with(|s| s.minimal.insert(user.into()));
+    }
+
+    /// Answers `user` as a legacy client: albums without userRating.
+    pub fn legacy_client(&self, user: &str) {
+        self.with(|s| s.legacy.insert(user.into()));
+    }
+
+    /// getAlbum answers code 70 for `album_id`, for everyone.
+    pub fn lose_album(&self, album_id: &str) {
+        self.with(|s| s.lost_albums.insert(album_id.into()));
+    }
+
+    /// No search finds `song_id`.
+    pub fn unsearchable(&self, song_id: &str) {
+        self.with(|s| s.unsearchable.insert(song_id.into()));
+    }
+
+    /// Navidrome never sends an average.
+    pub fn without_averages(&self) {
+        self.with(|s| s.without_averages = true);
+    }
+
+    /// ping reports `version` (None: no serverVersion).
+    pub fn reports_version(&self, version: Option<&str>) {
+        self.with(|s| s.version = Some(Ok(version.map(String::from))));
+    }
+
+    /// ping fails with this error.
+    pub fn version_unreadable(&self, error: fn() -> NavidromeLookupError) {
+        self.with(|s| s.version = Some(Err(error)));
+    }
+
+    pub fn reads_by(&self, user: &str) -> usize {
+        self.with(|s| s.reads.get(user).copied().unwrap_or(0))
+    }
+
+    /// Every setRating, as (user, song id, rating).
+    pub fn ratings_set(&self) -> Vec<(String, String, u8)> {
+        self.with(|s| s.ratings_set.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl Listeners for FakeNavidrome {
+    async fn native_song(
+        &self,
+        user: &UserId,
+        id: &str,
+    ) -> Result<Option<NativeSong>, NavidromeLookupError> {
+        self.with(|s| {
+            let user = s.read(user)?;
+            Ok(s.native(&user, id))
+        })
+    }
+
+    async fn song(
+        &self,
+        user: &UserId,
+        id: &str,
+    ) -> Result<Option<SubsonicSong>, NavidromeLookupError> {
+        self.with(|s| {
+            let user = s.read(user)?;
+            let Some(song) = s.native(&user, id) else {
+                return Ok(None);
+            };
+            let album_id = s.records[id].1.clone();
+            let pair = (user.clone(), id.to_string());
+            Ok(Some(SubsonicSong {
+                id: song.id,
+                title: song.title,
+                artist: Some(song.artist),
+                album: Some(song.album),
+                album_id: (!s.minimal.contains(&user)).then_some(album_id),
+                genre: None,
+                duration: None,
+                path: None,
+                user_rating: (song.rating > 0).then_some(song.rating),
+                average_rating: song.average_rating,
+                play_count: None,
+                starred: s
+                    .stars
+                    .contains(&pair)
+                    .then(|| "2026-11-14T20:11:05Z".to_string()),
+            }))
+        })
+    }
+
+    async fn album(
+        &self,
+        user: &UserId,
+        id: &str,
+    ) -> Result<Option<SubsonicAlbum>, NavidromeLookupError> {
+        self.with(|s| {
+            let user = s.read(user)?;
+            let known = s.records.values().any(|(_, album)| album == id);
+            if !known || s.lost_albums.contains(id) {
+                return Ok(None);
+            }
+            let pair = (user.clone(), id.to_string());
+            Ok(Some(SubsonicAlbum {
+                id: id.to_string(),
+                name: Some("Winter Songs".into()),
+                title: None,
+                artist: Some("Marrow Choir".into()),
+                song_count: None,
+                duration: None,
+                genre: None,
+                user_rating: (!s.legacy.contains(&user))
+                    .then(|| s.album_ratings.get(&pair).copied().unwrap_or(0)),
+                average_rating: None,
+                starred: s
+                    .album_stars
+                    .contains(&pair)
+                    .then(|| "2026-11-14T20:11:05Z".to_string()),
+            }))
+        })
+    }
+
+    async fn set_rating(
+        &self,
+        user: &UserId,
+        id: &str,
+        rating: u8,
+    ) -> Result<(), NavidromeLookupError> {
+        self.with(|s| {
+            let user = s.read(user)?;
+            s.ratings_set.push((user.clone(), id.to_string(), rating));
+            s.ratings.insert((user, id.to_string()), rating);
+            s.recompute(id);
+            Ok(())
+        })
+    }
+
+    /// Every record `user` sees that a search can find: a text search can return other files.
+    async fn songs_for_item(
+        &self,
+        user: &UserId,
+        _: &ImportedItem,
+    ) -> Result<Option<Vec<NativeSong>>, NavidromeLookupError> {
+        self.with(|s| {
+            let user = s.read(user)?;
+            Ok(Some(
+                s.records
+                    .keys()
+                    .filter(|id| !s.unsearchable.contains(*id))
+                    .filter_map(|id| s.native(&user, id))
+                    .collect(),
+            ))
+        })
+    }
+
+    async fn server_version(&self, user: &UserId) -> Result<Option<String>, NavidromeLookupError> {
+        self.with(|s| {
+            s.read(user)?;
+            match &s.version {
+                None => Ok(Some(VERSION.to_string())),
+                Some(Ok(version)) => Ok(version.clone()),
+                Some(Err(error)) => Err(error()),
+            }
+        })
+    }
+}
+
+/// A temp library: users alice and bob linked to Navidrome (navidrome_token 'cipher'), carol not;
+/// folders alice-music at `{root}/music/alice`, bob-music at `{root}/music/bob`, stored as the
+/// tempdir gave the paths; `{root}/music/alice/A/x.flac` (5 bytes) is song "s1" (album "al1";
+/// artist and album artist "Marrow Choir", album "Winter Songs", title "O Holy Night", no
+/// recording MBID) in library 1 at `{root}/music`, seen by alice and bob, rated 1 by alice.
+pub(crate) struct Library {
+    /// Holds the temp directory until the library is dropped.
+    _dir: tempfile::TempDir,
+    pub root: PathBuf,
+    pub db: SqlitePool,
+    pub fake: Arc<FakeNavidrome>,
+}
+
+impl Library {
+    pub async fn new() -> Library {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let db = crate::db::test_db::migrated().await;
+        for (user, token) in [
+            ("alice", Some("cipher")),
+            ("bob", Some("cipher")),
+            ("carol", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (id, username, password_hash, navidrome_token) VALUES (?, ?, 'x', ?)",
+            )
+            .bind(user)
+            .bind(user)
+            .bind(token)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let lib = Library {
+            _dir: dir,
+            root,
+            db,
+            fake: Arc::new(FakeNavidrome::default()),
+        };
+        lib.folder("alice", "alice-music", "music/alice", false)
+            .await;
+        lib.folder("bob", "bob-music", "music/bob", false).await;
+        std::fs::create_dir_all(lib.root.join("music/bob")).unwrap();
+        lib.fake.file(
+            NativeSong {
+                id: "s1".into(),
+                path: "alice/A/x.flac".into(),
+                title: "O Holy Night".into(),
+                size: 5,
+                library_id: 1,
+                library_path: lib.root.join("music").to_string_lossy().into_owned(),
+                missing: false,
+                artist: "Marrow Choir".into(),
+                album: "Winter Songs".into(),
+                album_artist: "Marrow Choir".into(),
+                rating: 0,
+                average_rating: None,
+                mbz_recording_id: None,
+            },
+            "al1",
+        );
+        lib.write("alice/A/x.flac", b"audio");
+        lib.fake.sees("alice", "s1");
+        lib.fake.sees("bob", "s1");
+        lib.fake.rates("alice", "s1", 1);
+        lib
+    }
+
+    pub fn guard(&self) -> Guard<'_> {
+        Guard {
+            db: &self.db,
+            listeners: self.fake.as_ref(),
+            music_path: None,
+        }
+    }
+
+    pub fn alice(&self) -> UserId {
+        UserId::new("alice")
+    }
+
+    fn write(&self, rel: &str, bytes: &[u8]) {
+        let path = self.root.join("music").join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Adds song `id` (album "al1") at `{root}/music/{rel}` with `bytes`, seen by alice and bob, unrated.
+    pub fn song(&self, id: &str, rel: &str, bytes: &[u8]) {
+        self.write(rel, bytes);
+        self.fake.file(
+            NativeSong {
+                id: id.into(),
+                path: rel.into(),
+                size: bytes.len() as u64,
+                ..self.record("s1")
+            },
+            "al1",
+        );
+        self.fake.sees("alice", id);
+        self.fake.sees("bob", id);
+    }
+
+    /// The native record `song` gave the fake, to build a variant of it.
+    pub fn record(&self, id: &str) -> NativeSong {
+        self.fake.with(|s| s.records[id].0.clone())
+    }
+
+    /// Inserts folder `id` of `user` at `{root}/{rel}`.
+    pub async fn folder(&self, user: &str, id: &str, rel: &str, shared: bool) {
+        sqlx::query("INSERT INTO folders (id, user_id, name, path, shared) VALUES (?, ?, ?, ?, ?)")
+            .bind(id)
+            .bind(user)
+            .bind(id)
+            .bind(format!("{}/{rel}", self.root.display()))
+            .bind(shared)
+            .execute(&self.db)
+            .await
+            .unwrap();
+    }
+
+    /// Inserts a step 5 `jobs` row of alice (import_mode 'singleton') with `wanted` as its JSON;
+    /// `set_job_state` changes its state.
+    pub async fn job(&self, id: &str, folder_id: &str, state: &str, wanted: DownloadQuery) {
+        sqlx::query(
+            "INSERT INTO jobs (id, user_id, folder_id, created_at, updated_at, wanted, import_mode, state) \
+             VALUES (?, 'alice', ?, 1763200000, 1763200000, ?, 'singleton', ?)",
+        )
+        .bind(id)
+        .bind(folder_id)
+        .bind(serde_json::to_string(&wanted).unwrap())
+        .bind(state)
+        .execute(&self.db)
+        .await
+        .unwrap();
+    }
+
+    pub async fn set_job_state(&self, id: &str, state: &str) {
+        sqlx::query("UPDATE jobs SET state = ? WHERE id = ?")
+            .bind(state)
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .unwrap();
+    }
+
+    /// Inserts a Pending discovery track titled `id` by "Marrow Choir", and the discovery_history
+    /// row of the folder's owner that generation records with it; returns the track as
+    /// DiscoveryTrackRow::get_by_id would.
+    pub async fn pending_track(
+        &self,
+        id: &str,
+        folder_id: &str,
+        profile: &str,
+        path: &Path,
+        song_id: Option<&str>,
+    ) -> DiscoveryTrack {
+        sqlx::query(
+            "INSERT INTO discovery_tracks (id, song_id, title, artist, album, path, folder_id, profile) \
+             VALUES (?, ?, ?, 'Marrow Choir', 'Winter Songs', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(song_id)
+        .bind(id)
+        .bind(path.to_str().unwrap())
+        .bind(folder_id)
+        .bind(profile)
+        .execute(&self.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO discovery_history (id, user_id, artist, track, profile) \
+             SELECT ?, user_id, 'Marrow Choir', ?, ? FROM folders WHERE id = ?",
+        )
+        .bind(format!("history-{id}"))
+        .bind(id)
+        .bind(profile)
+        .bind(folder_id)
+        .execute(&self.db)
+        .await
+        .unwrap();
+        DiscoveryTrackRow::get_by_id_in(&self.db, id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    pub async fn track_status(&self, id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM discovery_tracks WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .unwrap()
+    }
+
+    /// The outcome of the history row `pending_track` wrote for track `id`.
+    pub async fn history_outcome(&self, id: &str) -> String {
+        sqlx::query_scalar("SELECT outcome FROM discovery_history WHERE id = ?")
+            .bind(format!("history-{id}"))
+            .fetch_one(&self.db)
+            .await
+            .unwrap()
+    }
+}
+
+/// A job's `wanted` for one track (Track.id "lastfm-track-1", no album fields).
+pub(crate) fn wanted(artist: &str, title: &str, mbid: Option<&str>) -> DownloadQuery {
+    DownloadQuery::new(vec![Track {
+        id: "lastfm-track-1".into(),
+        title: title.into(),
+        artist: artist.into(),
+        album_id: None,
+        album_title: None,
+        release_date: None,
+        duration: None,
+        mbid: mbid.map(String::from),
+        release_mbid: None,
+    }])
+}

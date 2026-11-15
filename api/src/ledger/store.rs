@@ -84,6 +84,24 @@ pub async fn open_rows(
         .collect())
 }
 
+/// The id, state and `wanted` JSON of every job in one of `folder_ids` whose state is not
+/// terminal, a state this version does not know included.
+pub async fn open_wanted_in(
+    db: &SqlitePool,
+    folder_ids: &[&str],
+) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    let marks = vec!["?"; folder_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT id, state, wanted FROM jobs WHERE folder_id IN ({marks}) \
+         AND state NOT IN {TERMINAL_SQL} ORDER BY created_at, rowid"
+    );
+    let mut query = sqlx::query_as(&sql);
+    for id in folder_ids {
+        query = query.bind(*id);
+    }
+    query.fetch_all(db).await
+}
+
 /// A slot waiting for Navidrome to list its import, with its owner, its last row (its `job` set)
 /// and the wait.
 pub struct IndexingSlot {

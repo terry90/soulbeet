@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 pub(crate) const DEFAULT_LIBRARY_ID: i64 = 1;
 
 /// `path` when it names something inside a library: relative, with a name and no `..`.
-fn inside(path: &str) -> Option<&Path> {
+pub(super) fn inside(path: &str) -> Option<&Path> {
     let path = Path::new(path);
     let mut named = false;
     for component in path.components() {
@@ -42,22 +42,7 @@ pub(crate) async fn local_file_in(
             "Navidrome lists the file of this song as missing",
         ));
     }
-    let Some(relative) = inside(&song.path) else {
-        return Err(path_unresolved(format!(
-            "Navidrome's path for this song is not inside its library: {}",
-            song.path
-        )));
-    };
-    let root = match music_path {
-        Some(root) if song.library_id == DEFAULT_LIBRARY_ID => root.to_path_buf(),
-        _ => match NavidromeLibraryRow::get_in(db, song.library_id)
-            .await
-            .map_err(|e| database_failure(Stage::Delete, e))?
-        {
-            Some(row) if row.navidrome_path == song.library_path => PathBuf::from(row.local_path),
-            _ => PathBuf::from(&song.library_path),
-        },
-    };
+    let (root, relative) = located_in(db, song, music_path).await?;
     let local = root.join(relative);
     let no_file = |e: std::io::Error| {
         path_unresolved(format!("No file at {}", local.display())).with_cause(
@@ -86,6 +71,42 @@ pub(crate) async fn local_file_in(
         )));
     }
     Ok(canonical)
+}
+
+/// The path on this machine `song.path` names, as local_file_in finds its library's root,
+/// not resolved and not checked.
+pub(super) async fn local_path_in(
+    db: &SqlitePool,
+    song: &NativeSong,
+    music_path: Option<&Path>,
+) -> Result<PathBuf, Failure> {
+    let (root, relative) = located_in(db, song, music_path).await?;
+    Ok(root.join(relative))
+}
+
+/// `song`'s library root on this machine and its path below it (local_file_in).
+async fn located_in<'s>(
+    db: &SqlitePool,
+    song: &'s NativeSong,
+    music_path: Option<&Path>,
+) -> Result<(PathBuf, &'s Path), Failure> {
+    let Some(relative) = inside(&song.path) else {
+        return Err(path_unresolved(format!(
+            "Navidrome's path for this song is not inside its library: {}",
+            song.path
+        )));
+    };
+    let root = match music_path {
+        Some(root) if song.library_id == DEFAULT_LIBRARY_ID => root.to_path_buf(),
+        _ => match NavidromeLibraryRow::get_in(db, song.library_id)
+            .await
+            .map_err(|e| database_failure(Stage::Delete, e))?
+        {
+            Some(row) if row.navidrome_path == song.library_path => PathBuf::from(row.local_path),
+            _ => PathBuf::from(&song.library_path),
+        },
+    };
+    Ok((root, relative))
 }
 
 /// Learns where `song`'s library lives from `local`, the absolute path beets gave a file Soulful
