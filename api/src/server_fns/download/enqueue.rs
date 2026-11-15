@@ -142,18 +142,20 @@ pub fn held_failure(claim: &Claim, batch: &BatchRef) -> Failure {
     }
 }
 
-/// Enqueues files `batch` has claimed into its folder. Every key whose file
-/// was not enqueued is released. An answer for a file not asked for is left
+/// Enqueues files `batch` has claimed into its folder, in the backend request
+/// `request` (`DownloadBackend::new_request`). Every key whose file was not
+/// enqueued is released. An answer for a file not asked for is left
 /// out, and a transfer it enqueued is cancelled: no batch owns it, so it
 /// would download with nobody to import it.
 pub async fn enqueue_claimed(
     backend: &Arc<dyn DownloadBackend>,
     items: Vec<DownloadableItem>,
     batch: &BatchRef,
+    request: &str,
 ) -> SoulResult<Vec<QueuedDownload>> {
     let registry = TransferRegistry::global();
     let keys: Vec<TransferKey> = items.iter().map(|i| item_key(backend.id(), i)).collect();
-    let answered = match backend.download(items, &batch.destination).await {
+    let answered = match backend.download(items, &batch.destination, request).await {
         Ok(queued) => queued,
         Err(e) => {
             for key in &keys {
@@ -248,8 +250,12 @@ impl ClaimedRequest {
         !self.to_enqueue.is_empty()
     }
 
-    /// Enqueues the claimed files.
-    pub async fn enqueue(self, backend: &Arc<dyn DownloadBackend>) -> RequestEnqueue {
+    /// Enqueues the claimed files in the backend request `request`.
+    pub async fn enqueue(
+        self,
+        backend: &Arc<dyn DownloadBackend>,
+        request: &str,
+    ) -> RequestEnqueue {
         let ClaimedRequest {
             batch,
             to_enqueue,
@@ -259,7 +265,7 @@ impl ClaimedRequest {
         } = self;
         let mut error = None;
         if !to_enqueue.is_empty() {
-            match enqueue_claimed(backend, to_enqueue, &batch).await {
+            match enqueue_claimed(backend, to_enqueue, &batch, request).await {
                 Ok(queued) => results.extend(queued),
                 Err(e) => error = Some(e),
             }
@@ -437,7 +443,9 @@ mod tests {
         items: Vec<DownloadableItem>,
         fresh: BatchRef,
     ) -> RequestEnqueue {
-        claim_request(backend, items, fresh).enqueue(backend).await
+        claim_request(backend, items, fresh)
+            .enqueue(backend, &backend.new_request())
+            .await
     }
 
     /// An `EnqueueStatus` with a failure reduced to its code.
@@ -960,8 +968,13 @@ mod tests {
     ) -> Vec<QueuedDownload> {
         let claim = TransferRegistry::global().claim(&[key(backend, "peer_a", "01.flac")], running);
         assert_eq!(claim.claimed.len(), 1);
-        enqueue_claimed(backend, vec![item("peer_a", "One", "01.flac")], running)
-            .await
-            .expect("enqueued")
+        enqueue_claimed(
+            backend,
+            vec![item("peer_a", "One", "01.flac")],
+            running,
+            &backend.new_request(),
+        )
+        .await
+        .expect("enqueued")
     }
 }

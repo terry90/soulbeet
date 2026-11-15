@@ -547,11 +547,13 @@ impl SoulseekClient {
     }
 
     /// Enqueue `req` into `destination`, a folder under slskd's download
-    /// directory that every file of the call shares.
+    /// directory that every file of the call shares, in slskd batches of the
+    /// request `request` (`shared::slskd::request_batch_id`).
     pub async fn download(
         &self,
         req: Vec<TrackResult>,
         destination: &str,
+        request: &str,
     ) -> Result<Vec<DownloadResponse>> {
         info!(
             "Attempting to download: {} files into {:?}",
@@ -573,7 +575,7 @@ impl SoulseekClient {
             .collect();
 
         let mut results = Vec::new();
-        for batch in plan_batches(wanted, destination, config.batch_size) {
+        for batch in plan_batches(wanted, destination, config.batch_size, request) {
             if batch.index > 0 {
                 debug!("Waiting {}ms before next batch", config.batch_delay_ms);
                 tokio::time::sleep(tokio::time::Duration::from_millis(config.batch_delay_ms)).await;
@@ -974,11 +976,13 @@ impl PendingBatch {
 
 /// Split one call into slskd batches: one user per batch, at most
 /// `batch_size` files each, all into `destination`. Users keep the order of
-/// their first file, and a file asked for twice is sent once.
+/// their first file, and a file asked for twice is sent once. The batches are
+/// numbered in order as batches of `request`.
 fn plan_batches(
     wanted: Vec<(String, DownloadRequestFile)>,
     destination: &str,
     batch_size: usize,
+    request: &str,
 ) -> Vec<PendingBatch> {
     let mut per_user: Vec<(String, Vec<DownloadRequestFile>)> = Vec::new();
     for (username, file) in wanted {
@@ -1001,14 +1005,16 @@ fn plan_batches(
             files
                 .chunks(batch_size.max(1))
                 .enumerate()
-                .map(|(index, chunk)| PendingBatch {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    username: username.clone(),
-                    destination: destination.to_string(),
-                    files: chunk.to_vec(),
-                    index,
-                })
+                .map(|(index, chunk)| (username.clone(), index, chunk.to_vec()))
                 .collect::<Vec<_>>()
+        })
+        .zip(0..)
+        .map(|((username, index, files), n)| PendingBatch {
+            id: shared::slskd::request_batch_id(request, n),
+            username,
+            destination: destination.to_string(),
+            files,
+            index,
         })
         .collect()
 }
@@ -1201,17 +1207,22 @@ impl crate::DownloadBackend for SoulseekClient {
         })
     }
 
+    fn new_request(&self) -> String {
+        shared::slskd::request_batch_id(&uuid::Uuid::new_v4().to_string(), 0)
+    }
+
     async fn download(
         &self,
         items: Vec<shared::download::DownloadableItem>,
         destination: &str,
+        request: &str,
     ) -> Result<Vec<shared::download::QueuedDownload>> {
         let tracks: Vec<TrackResult> = items
             .into_iter()
             .filter_map(|item| item.to_slskd_track())
             .collect();
 
-        let responses = self.download(tracks, destination).await?;
+        let responses = self.download(tracks, destination, request).await?;
         Ok(responses.into_iter().map(Into::into).collect())
     }
 
@@ -1617,6 +1628,41 @@ mod tests {
         assert!(transfer_endpoint("peer", "..", false).is_err());
     }
 
+    /// A request as `new_request` draws one.
+    const REQUEST: &str = "5b1d3c2a-9e4f-4a7b-8c6d-0f1e00000000";
+
+    #[test]
+    fn every_slskd_batch_of_a_request_has_its_own_id_naming_the_request() {
+        let batches = plan_batches(
+            vec![
+                wanted("peer", r"music\A\01.flac"),
+                wanted("other", r"music\A\02.flac"),
+                wanted("peer", r"music\A\03.flac"),
+            ],
+            "A [1]",
+            1,
+            REQUEST,
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| (b.username.as_str(), b.index, b.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("peer", 0, "5b1d3c2a-9e4f-4a7b-8c6d-0f1e00000000"),
+                ("peer", 1, "5b1d3c2a-9e4f-4a7b-8c6d-0f1e00000001"),
+                ("other", 0, "5b1d3c2a-9e4f-4a7b-8c6d-0f1e00000002"),
+            ]
+        );
+        let drawn = crate::DownloadBackend::new_request(
+            &SoulseekClientBuilder::from_settings(Some("http://slskd".into()), Some("k".into()))
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        assert!(drawn.ends_with("00000000") && drawn.len() == 36, "{drawn}");
+    }
+
     fn wanted(username: &str, filename: &str) -> (String, DownloadRequestFile) {
         (
             username.to_string(),
@@ -1636,6 +1682,7 @@ mod tests {
             ],
             "Album A [12345678]",
             3,
+            REQUEST,
         );
 
         assert_eq!(
@@ -1651,7 +1698,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_retried_batch_reuses_its_client_id() {
-        let batches = plan_batches(vec![wanted("peer", r"music\A\01.flac")], "A [1]", 3);
+        let batches = plan_batches(
+            vec![wanted("peer", r"music\A\01.flac")],
+            "A [1]",
+            3,
+            REQUEST,
+        );
         let config = DownloadConfig {
             batch_size: 3,
             batch_delay_ms: 0,
@@ -1684,7 +1736,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_offline_peer_fails_its_batch_at_once_with_peer_offline() {
-        let batches = plan_batches(vec![wanted("peer", r"music\A\01.flac")], "A [1]", 3);
+        let batches = plan_batches(
+            vec![wanted("peer", r"music\A\01.flac")],
+            "A [1]",
+            3,
+            REQUEST,
+        );
         let config = DownloadConfig {
             batch_size: 3,
             batch_delay_ms: 0,
@@ -2114,7 +2171,12 @@ mod tests {
 
     #[tokio::test]
     async fn spent_retries_keep_the_last_error_and_its_code() {
-        let batches = plan_batches(vec![wanted("peer", r"music\A\01.flac")], "A [1]", 3);
+        let batches = plan_batches(
+            vec![wanted("peer", r"music\A\01.flac")],
+            "A [1]",
+            3,
+            REQUEST,
+        );
         let config = DownloadConfig {
             batch_size: 3,
             batch_delay_ms: 0,
@@ -2172,6 +2234,7 @@ mod tests {
             ],
             "A [1]",
             3,
+            REQUEST,
         );
         let ours = batches[0].id.to_uppercase();
         // 01 was enqueued by the attempt whose answer was lost. 02 failed in

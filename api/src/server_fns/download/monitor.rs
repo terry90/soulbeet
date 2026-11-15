@@ -606,10 +606,11 @@ impl DownloadMonitor {
         // Each source is recorded before it is sent, so a restart knows
         // which peer may hold the slot's transfer.
         let (ledger, job) = (self.ledger.clone(), self.tracked_files[slot].job.clone());
-        let record = |item: &DownloadableItem| {
+        let record = |item: &DownloadableItem, request: &str| {
             ledger.record(JobEvent::Attempt {
                 slot: job.clone(),
                 candidate: Some(item.clone()),
+                request: Some(request.to_string()),
             })
         };
         let next = self
@@ -673,6 +674,7 @@ impl DownloadMonitor {
         self.ledger.record(JobEvent::Attempt {
             slot: self.tracked_files[slot].job.clone(),
             candidate: None,
+            request: None,
         });
     }
 
@@ -1988,9 +1990,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_slot_that_fails_over_records_its_next_source() {
+    async fn a_slot_that_fails_over_records_its_next_source_and_the_request_it_is_sent_in() {
         let (mut m, _rx, mut recorded) = failover_monitor();
-        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
 
         poll_tracks(
@@ -2000,17 +2003,25 @@ mod tests {
         )
         .await;
 
-        let attempts: Vec<(JobSlot, Option<String>)> = recorded
+        let attempts: Vec<(JobSlot, Option<String>, Option<String>)> = recorded
             .events()
             .into_iter()
             .filter_map(|e| match e {
-                JobEvent::Attempt { slot, candidate } => Some((slot, candidate.map(|c| c.id))),
+                JobEvent::Attempt {
+                    slot,
+                    candidate,
+                    request,
+                } => Some((slot, candidate.map(|c| c.id), request)),
                 _ => None,
             })
             .collect();
         assert_eq!(
             attempts,
-            vec![(slot_of_j1(0), Some("dirB/bbb.flac".into()))]
+            vec![(
+                slot_of_j1(0),
+                Some("dirB/bbb.flac".into()),
+                stub.requests().first().cloned()
+            )]
         );
     }
 
@@ -2126,7 +2137,8 @@ mod tests {
             vec![
                 JobEvent::Attempt {
                     slot: slot_of_j1(0),
-                    candidate: None
+                    candidate: None,
+                    request: None,
                 },
                 JobEvent::Slots {
                     state: JobState::Downloading,

@@ -140,6 +140,9 @@ pub struct SlotRecord {
     pub import: Option<StoredImport>,
     /// In order; None for an adopted transfer.
     pub attempts: Vec<Option<DownloadableItem>>,
+    /// The backend request a failover sent its newest attempt in; None when that attempt is its
+    /// first source, which went in the job's request, or a transfer it adopted.
+    pub sent_in: Option<String>,
 }
 
 /// A job not in a terminal state, with the user and folder it runs for (a job whose user or folder
@@ -155,8 +158,8 @@ pub struct UnfinishedJob {
     pub search_id: Option<String>,
     pub monitor_batch_id: Option<String>,
     pub batch_label: Option<String>,
-    /// When the job was made, in Unix seconds on Soulful's clock.
-    pub created_at: i64,
+    /// The backend request of the job's latest enqueue.
+    pub request: Option<String>,
     pub slots: Vec<SlotRecord>,
 }
 
@@ -177,7 +180,7 @@ struct UnfinishedRow {
     search_id: Option<String>,
     monitor_batch_id: Option<String>,
     batch_label: Option<String>,
-    created_at: i64,
+    request: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -215,7 +218,7 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
         "SELECT j.id, j.user_id, u.username, u.role, j.folder_id, f.user_id AS folder_owner, \
                 f.name AS folder_name, f.path AS folder_path, f.shared AS folder_shared, \
                 j.wanted, j.import_mode, j.state, j.search_id, j.monitor_batch_id, j.batch_label, \
-                j.created_at \
+                j.request \
          FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
          WHERE j.state NOT IN {TERMINAL_SQL} ORDER BY j.created_at, j.rowid"
     ))
@@ -228,21 +231,28 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
     ))
     .fetch_all(db)
     .await?;
-    let attempts: Vec<(String, u32, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT a.job_id, a.slot, a.candidate FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
+    let attempts: Vec<(String, u32, Option<String>, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT a.job_id, a.slot, a.candidate, a.request \
+         FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
          WHERE j.state NOT IN {TERMINAL_SQL} ORDER BY a.job_id, a.slot, a.n"
     ))
     .fetch_all(db)
     .await?;
 
     let mut unfinished = Unfinished::default();
-    let mut tried: HashMap<JobSlot, Result<Vec<Option<DownloadableItem>>, sqlx::Error>> =
-        HashMap::new();
-    for (job, slot, candidate) in attempts {
+    // Each slot's attempts, and the request of the newest.
+    type Tried = (Vec<Option<DownloadableItem>>, Option<String>);
+    let mut tried: HashMap<JobSlot, Result<Tried, sqlx::Error>> = HashMap::new();
+    for (job, slot, candidate, request) in attempts {
         let candidate = candidate.as_deref().map(json).transpose();
-        let entry = tried.entry(JobSlot { job, slot }).or_insert(Ok(Vec::new()));
+        let entry = tried
+            .entry(JobSlot { job, slot })
+            .or_insert(Ok(Default::default()));
         match (entry, candidate) {
-            (Ok(attempts), Ok(candidate)) => attempts.push(candidate),
+            (Ok((attempts, newest)), Ok(candidate)) => {
+                attempts.push(candidate);
+                *newest = request;
+            }
             (entry @ Ok(_), Err(e)) => *entry = Err(e),
             (Err(_), _) => {}
         }
@@ -254,12 +264,14 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
             slot: row.slot,
         };
         let record = (|| {
+            let (attempts, sent_in) = tried.remove(&slot).unwrap_or(Ok(Default::default()))?;
             Ok::<_, sqlx::Error>(SlotRecord {
                 slot: row.slot,
                 state: state_named(&row.state)?,
                 row: row.last_row.as_deref().map(json).transpose()?,
                 import: row.import_job.as_deref().map(json).transpose()?,
-                attempts: tried.remove(&slot).unwrap_or(Ok(Vec::new()))?,
+                attempts,
+                sent_in,
             })
         })();
         match record {
@@ -289,7 +301,7 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
                 search_id: row.search_id,
                 monitor_batch_id: row.monitor_batch_id,
                 batch_label: row.batch_label,
-                created_at: row.created_at,
+                request: row.request,
                 slots: by_job.remove(&row.id).unwrap_or_default(),
                 id: row.id.clone(),
             })
@@ -356,9 +368,22 @@ mod tests {
             job: "j1".into(),
             slot,
         };
+        ledger.record(JobEvent::Enqueued {
+            job: "j1".into(),
+            monitor_batch_id: "b1".into(),
+            batch_label: "Come Over".into(),
+            request: "r1".into(),
+        });
         ledger.record(JobEvent::Attempt {
             slot: slot(0),
             candidate: None,
+            request: None,
+        });
+        let two_elsewhere = item("peer_b", "Two", "b/02.flac");
+        ledger.record(JobEvent::Attempt {
+            slot: slot(1),
+            candidate: Some(two_elsewhere.clone()),
+            request: Some("r2".into()),
         });
         let import = StoredImport {
             sources: vec!["/downloads/b/02.flac".into()],
@@ -388,18 +413,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("j1", "alice", folder.as_str(), JobState::Queued)]
         );
+        assert_eq!(jobs[0].request.as_deref(), Some("r1"));
         let slots = &jobs[0].slots;
         assert_eq!(
             slots
                 .iter()
-                .map(|s| (s.slot, s.state, s.attempts.clone()))
+                .map(|s| (s.slot, s.state, s.attempts.clone(), s.sent_in.clone()))
                 .collect::<Vec<_>>(),
             vec![
-                (0, JobState::Queued, vec![Some(one), None]),
+                (0, JobState::Queued, vec![Some(one), None], None),
                 (
                     1,
                     JobState::Importing,
-                    vec![Some(item("peer_a", "Two", "02.flac"))]
+                    vec![Some(item("peer_a", "Two", "02.flac")), Some(two_elsewhere)],
+                    Some("r2".into())
                 ),
             ]
         );

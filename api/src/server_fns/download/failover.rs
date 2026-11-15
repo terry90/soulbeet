@@ -142,17 +142,18 @@ impl SourcePool {
         backend: &Arc<dyn DownloadBackend>,
         batch: &BatchRef,
     ) -> NextSource {
-        self.enqueue_next_noting(slot, backend, batch, |_| {}).await
+        self.enqueue_next_noting(slot, backend, batch, |_, _| {})
+            .await
     }
 
-    /// `enqueue_next`, calling `sending` with each alternate just before it
-    /// is sent to the backend.
+    /// `enqueue_next`, calling `sending` with each alternate and the backend
+    /// request it goes in just before it is sent to the backend.
     pub async fn enqueue_next_noting(
         &mut self,
         slot: usize,
         backend: &Arc<dyn DownloadBackend>,
         batch: &BatchRef,
-        mut sending: impl FnMut(&DownloadableItem),
+        mut sending: impl FnMut(&DownloadableItem, &str),
     ) -> NextSource {
         let mut refused = Vec::new();
         while let Some(item) = self.take_next(slot) {
@@ -162,8 +163,9 @@ impl SourcePool {
             let failure = if claim.claimed.is_empty() {
                 held_failure(&claim, batch)
             } else {
-                sending(&item);
-                match enqueue_claimed(backend, vec![item.clone()], batch).await {
+                let request = backend.new_request();
+                sending(&item, &request);
+                match enqueue_claimed(backend, vec![item.clone()], batch, &request).await {
                     Ok(queued) => {
                         if let Some(ok) =
                             queued.iter().find(|d| d.status == EnqueueStatus::Enqueued)

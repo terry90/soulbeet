@@ -869,8 +869,12 @@ pub async fn generate_discovery_playlist_internal(
                         stats.downloads_failed += 1;
                         continue;
                     }
+                    // Discovery keeps no ledger, so nothing reads its request back.
+                    let request = backend.new_request();
                     let download_results =
-                        match enqueue_claimed(&backend, vec![item.clone()], &track_batch).await {
+                        match enqueue_claimed(&backend, vec![item.clone()], &track_batch, &request)
+                            .await
+                        {
                             Ok(r) => r,
                             Err(e) => {
                                 if attempt_idx + 1 < ranked_items.len() {

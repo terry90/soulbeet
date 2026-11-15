@@ -156,21 +156,25 @@ pub enum JobEvent {
         job: String,
         items: Vec<(u32, DownloadableItem)>,
     },
-    /// The monitor batch the job's files go into, recorded before the backend hears of them.
+    /// The monitor batch the job's files go into and the backend request they are sent in,
+    /// recorded before the backend hears of them.
     Enqueued {
         job: String,
         monitor_batch_id: String,
         batch_label: String,
+        request: String,
     },
     /// Rows of slots now in `state`, each carrying its slot. Rows without a job are ignored.
     Slots {
         state: JobState,
         rows: Vec<DownloadProgress>,
     },
-    /// The slot's next source, recorded before it is sent; None for a transfer it adopted.
+    /// The slot's next source and the backend request it is sent in, recorded before it is sent;
+    /// both None for a transfer it adopted.
     Attempt {
         slot: JobSlot,
         candidate: Option<DownloadableItem>,
+        request: Option<String>,
     },
     ImportQueued(Box<StoredImport>),
     /// `next` is Indexing (with `index`), Done (an import with no items, D14), NeedsDecision

@@ -550,19 +550,26 @@ impl From<AlbumResult> for crate::download::DownloadableGroup {
     }
 }
 
-/// Unix seconds of a slskd timestamp, None when it cannot be read. slskd sets them from
-/// `DateTime.UtcNow` (Transfers/Downloads/DownloadService.cs:486) and lists transfers from its
-/// database (`List`, `:890-903`), which gives `RequestedAt` back with no kind, as only `StartedAt`
-/// and `EndedAt` are converted to UTC (Transfers/TransfersDbContext.cs:76-86): the text then has
-/// no offset and is UTC all the same.
-fn unix_seconds(text: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(text)
-        .map(|at| at.timestamp())
-        .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
-                .map(|at| at.and_utc().timestamp())
-        })
-        .ok()
+/// Where the last 8 hex digits of a GUID start, in its hyphenated form.
+const BATCH_NUMBER_AT: usize = 28;
+
+/// The id of the `n`th slskd batch of the request `request`. One `download` call (a request) sends
+/// its files in several slskd batches, each needing a GUID of its own (`TransfersController.cs:
+/// 336-350`, 409 for one already used), and slskd lists every transfer with the batch it came in
+/// (`Transfers/Types/Transfer.cs:49`, set at `Transfers/Downloads/DownloadService.cs:481` and kept
+/// through slskd's retries, which reuse the record). A request is a GUID whose last 8 hex digits are
+/// zero, its batch `n` the same GUID with `n` there, so `request_of_batch` reads the request back
+/// from any of its batches. `request` is the request's batch 0 (`request_batch_id(guid, 0)`).
+pub fn request_batch_id(request: &str, n: u32) -> String {
+    let prefix = request.get(..BATCH_NUMBER_AT).unwrap_or(request);
+    format!("{prefix}{n:08x}")
+}
+
+/// The request whose batch `batch_id` is (`request_batch_id`); None for a text that is no GUID.
+/// A batch another client made reads as a request no `download` call had.
+fn request_of_batch(batch_id: &str) -> Option<String> {
+    (batch_id.len() == 36 && batch_id.is_ascii())
+        .then(|| request_batch_id(&batch_id.to_ascii_lowercase(), 0))
 }
 
 impl FileEntry {
@@ -625,7 +632,7 @@ impl FileEntry {
             queued_at_source,
             pending_retry: None,
             job: None,
-            requested_at: unix_seconds(&self.requested_at),
+            request: self.batch_id.as_deref().and_then(request_of_batch),
             index: None,
         };
         match failure {
@@ -894,28 +901,32 @@ mod tests {
     }
 
     #[test]
-    fn a_row_says_when_slskd_took_the_request_with_or_without_an_offset() {
-        let at = |requested: &str| {
+    fn a_row_names_the_request_whose_batch_its_transfer_came_in() {
+        let request = request_batch_id("890f943c-02e1-4d45-af76-d55e3d855684", 0);
+        assert_eq!(request, "890f943c-02e1-4d45-af76-d55e00000000");
+        let row = |batch: Option<String>| {
             let mut entry: FileEntry = serde_json::from_value(json!({
-                "id": "890f943c-02e1-4d45-af76-d55e3d855684",
+                "id": "0d6a2c1e-7a5b-4f4e-9a51-3c0f6d1b2e7a",
                 "username": "peer",
                 "direction": "Download",
                 "filename": "shared\\Artist\\Album\\01. Track.flac",
                 "size": 1024,
                 "state": "Queued, Remotely",
-                "requestedAt": "2026-07-19T05:11:22Z",
+                "requestedAt": "2026-07-19T05:11:22",
                 "bytesTransferred": 0,
                 "percentComplete": 0.0
             }))
             .unwrap();
-            entry.requested_at = requested.to_string();
-            entry.into_progress(3).requested_at
+            entry.batch_id = batch;
+            entry.into_progress(3).request
         };
-        // 2026-07-19T05:11:22Z
-        assert_eq!(at("2026-07-19T05:11:22Z"), Some(1_784_437_882));
-        assert_eq!(at("2026-07-19T05:11:22.1234567"), Some(1_784_437_882));
-        assert_eq!(at("2026-07-19T07:11:22+02:00"), Some(1_784_437_882));
-        assert_eq!(at("yesterday"), None);
+        for n in [0, 1, 0xffff_ffff] {
+            let batch = request_batch_id(&request, n);
+            assert_eq!(batch.len(), 36);
+            assert_eq!(row(Some(batch.to_ascii_uppercase())), Some(request.clone()));
+        }
+        assert_eq!(row(None), None);
+        assert_eq!(row(Some("not a guid".into())), None);
     }
 
     #[test]

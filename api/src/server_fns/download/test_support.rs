@@ -110,7 +110,7 @@ pub enum ScriptedOutcome {
 /// Answers each enqueue from a scripted list, then rejects everything after
 /// the script runs out. Starts every search unless told to fail it, and
 /// answers its polls from a scripted list, then as still running with
-/// nothing found. Records every destination and cancellation, and lists
+/// nothing found. Records every destination, request and cancellation, and lists
 /// whatever transfers the test sets. Each stub has its own backend id, so
 /// the registry keys of concurrent tests never collide.
 pub struct StubBackend {
@@ -120,6 +120,7 @@ pub struct StubBackend {
     polls: Mutex<VecDeque<SoulResult<SearchResult>>>,
     cancelled: Mutex<Vec<Cancel>>,
     destinations: Mutex<Vec<String>>,
+    requests: Mutex<Vec<String>>,
     listing: Mutex<Vec<DownloadProgress>>,
     hold: Mutex<Option<Hold>>,
 }
@@ -142,6 +143,7 @@ impl StubBackend {
             polls: Mutex::new(VecDeque::new()),
             cancelled: Mutex::new(Vec::new()),
             destinations: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
             listing: Mutex::new(Vec::new()),
             hold: Mutex::new(None),
         })
@@ -155,6 +157,11 @@ impl StubBackend {
     /// The destination of every `download` call, in order.
     pub fn destinations(&self) -> Vec<String> {
         self.destinations.lock().unwrap().clone()
+    }
+
+    /// The request of every `download` call, in order, from when it arrives.
+    pub fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
     }
 
     /// Makes each `download` call wait: the first notifier fires when a call
@@ -257,11 +264,16 @@ impl DownloadBackend for StubBackend {
             ))
         })
     }
+    fn new_request(&self) -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
     async fn download(
         &self,
         items: Vec<DownloadableItem>,
         destination: &str,
+        request: &str,
     ) -> SoulResult<Vec<QueuedDownload>> {
+        self.requests.lock().unwrap().push(request.to_string());
         let hold = self.hold.lock().unwrap().clone();
         if let Some(hold) = hold {
             hold.reached.notify_one();

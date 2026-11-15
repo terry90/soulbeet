@@ -49,12 +49,18 @@ pub trait DownloadBackend: Send + Sync {
 
     async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String>;
     async fn poll_search(&self, search_id: &str) -> Result<SearchResult>;
+    /// A fresh id for one `download` call, drawn before the call so the caller can store it
+    /// first. Opaque to the caller.
+    fn new_request(&self) -> String;
     /// Enqueue `items` into `destination`, a folder under the backend's
-    /// download directory shared by every item of the call.
+    /// download directory shared by every item of the call. `request` is
+    /// one `new_request` gave, for this call only: every transfer the call
+    /// makes is listed with it as `DownloadProgress::request`.
     async fn download(
         &self,
         items: Vec<DownloadableItem>,
         destination: &str,
+        request: &str,
     ) -> Result<Vec<QueuedDownload>>;
     /// Transfers held for the given peers. Scoped rather than global: the
     /// backend's full list grows with its whole history, and every caller

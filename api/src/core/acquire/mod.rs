@@ -163,19 +163,22 @@ pub(super) async fn queue_and_watch(
     } = acquisition;
     let items: Vec<DownloadableItem> = picked.iter().map(|(_, item)| item.clone()).collect();
     let claimed = claim_request(&backend, items.clone(), fresh.owned_by(&ctx));
+    let request = backend.new_request();
     if claimed.sends() {
         let batch = claimed.batch();
         // Stored before the backend hears of a file, so a restart after it took one finds the
-        // batch. A write the ledger refused is logged there, and the request goes on.
+        // batch and tells the transfers of this send by its request. A write the ledger refused
+        // is logged there, and the request goes on.
         let _ = ledger
             .record_stored(JobEvent::Enqueued {
                 job: job.clone(),
                 monitor_batch_id: batch.owner.batch_id.clone(),
                 batch_label: batch.label.clone(),
+                request: request.clone(),
             })
             .await;
     }
-    let enq = claimed.enqueue(&backend).await;
+    let enq = claimed.enqueue(&backend, &request).await;
     let refusal = enq.refusal();
     let RequestEnqueue {
         batch,
@@ -827,7 +830,8 @@ mod tests {
         assert!(events.contains(&JobEvent::Enqueued {
             job: "j2".into(),
             monitor_batch_id: running.owner.batch_id.clone(),
-            batch_label: "Come Over".into()
+            batch_label: "Come Over".into(),
+            request: stub.requests()[0].clone(),
         }));
         assert_eq!(
             running
@@ -893,6 +897,7 @@ mod tests {
             job: "j1".into(),
             monitor_batch_id: running.owner.batch_id.clone(),
             batch_label: running.label.clone(),
+            request: stub.requests()[0].clone(),
         };
         assert_eq!(recorded.events(), vec![enqueued]);
         release.notify_one();

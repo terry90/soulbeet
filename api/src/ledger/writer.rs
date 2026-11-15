@@ -226,11 +226,15 @@ impl Writer {
                 job,
                 monitor_batch_id,
                 batch_label,
+                request,
             } => {
-                sqlx::query("UPDATE jobs SET monitor_batch_id = ?, batch_label = ? WHERE id = ?")
-                    .bind(monitor_batch_id)
-                    .bind(batch_label)
-                    .bind(job)
+                sqlx::query(
+                    "UPDATE jobs SET monitor_batch_id = ?, batch_label = ?, request = ? WHERE id = ?",
+                )
+                .bind(monitor_batch_id)
+                .bind(batch_label)
+                .bind(request)
+                .bind(job)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -243,15 +247,20 @@ impl Writer {
                     }
                 }
             }
-            JobEvent::Attempt { slot, candidate } => {
+            JobEvent::Attempt {
+                slot,
+                candidate,
+                request,
+            } => {
                 // Selected from the slot, so a deleted job's attempt adds nothing.
                 sqlx::query(
-                    "INSERT INTO job_attempts (job_id, slot, n, candidate) \
+                    "INSERT INTO job_attempts (job_id, slot, n, candidate, request) \
                      SELECT job_id, slot, (SELECT COALESCE(MAX(n), 0) + 1 FROM job_attempts \
-                                           WHERE job_id = t.job_id AND slot = t.slot), ? \
+                                           WHERE job_id = t.job_id AND slot = t.slot), ?, ? \
                      FROM job_tracks t WHERE job_id = ? AND slot = ?",
                 )
                 .bind(candidate.map(|c| serde_json::to_string(&c)).transpose()?)
+                .bind(request)
                 .bind(&slot.job)
                 .bind(slot.slot)
                 .execute(&mut *tx)
