@@ -858,6 +858,15 @@ mod tests {
             path: path.into(),
             title: "Song Number 1".into(),
             size,
+            library_id: 1,
+            library_path: "/music".into(),
+            missing: false,
+            artist: "Zzqx Artist".into(),
+            album: "Qzz Album".into(),
+            album_artist: "Zzqx Artist".into(),
+            rating: 0,
+            average_rating: None,
+            mbz_recording_id: None,
         };
         let item = Path::new("Zzqx Artist/Qzz Album/01 Song Number 1.mp3");
         assert!(is_imported_file(
@@ -896,7 +905,7 @@ mod tests {
     fn song_json(path: &str, size: u64) -> String {
         format!(
             r#"[{{"id":"f2c4d1a8b0e94c37a6d5e8b1c2a3f405","libraryId":1,"libraryPath":"/music","path":"{path}",
-        "title":"Song Number 1","album":"Qzz Album","artist":"Zzqx Artist","size":{size},"suffix":"mp3","missing":false}}]"#
+        "title":"Song Number 1","album":"Qzz Album","artist":"Zzqx Artist","albumArtist":"Zzqx Artist","size":{size},"suffix":"mp3","missing":false}}]"#
         )
     }
 
@@ -1235,6 +1244,15 @@ mod tests {
             path: path.into(),
             title: "Song Number 1".into(),
             size: 4,
+            library_id: 1,
+            library_path: "/music".into(),
+            missing: false,
+            artist: "Zzqx Artist".into(),
+            album: "Qzz Album".into(),
+            album_artist: "Zzqx Artist".into(),
+            rating: 0,
+            average_rating: None,
+            mbz_recording_id: None,
         };
         let item = Path::new("Zzqx Artist/Qzz Album/01 Song Number 1.mp3");
         assert!(!is_imported_file(&song(""), item, 4));

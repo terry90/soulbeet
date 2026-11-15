@@ -12,6 +12,10 @@ const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const API_VERSION: &str = "1.16.1";
 const CLIENT_NAME: &str = "Soulbeet";
+/// Subsonic error code for an id Navidrome has no record of, or one in a library this
+/// user cannot access (Navidrome 0.64.2 server/subsonic/responses/errors.go:11,
+/// browsing.go:197,253, the library filter persistence/sql_base_repository.go:246).
+const DATA_NOT_FOUND: u32 = 70;
 
 pub struct NavidromeClient {
     base_url: Url,
@@ -202,6 +206,49 @@ impl NavidromeClient {
     pub async fn get_scan_status(&self) -> Result<ScanStatus> {
         let body: ScanStatusBody = self.get("getScanStatus", &[]).await?;
         Ok(body.scan_status)
+    }
+
+    /// getSong, as this user sees the song; Ok(None) on DATA_NOT_FOUND.
+    pub async fn get_song(&self, id: &str) -> Result<Option<SubsonicSong>> {
+        let Some(body) = found(self.get::<SongBody>("getSong", &[("id", id)]).await)? else {
+            return Ok(None);
+        };
+        let song = body
+            .song
+            .ok_or_else(|| NavidromeError::Parse("getSong answered without a song".into()))?;
+        if song.id != id {
+            return Err(NavidromeError::Parse(format!(
+                "Navidrome answered another song for {id}"
+            )));
+        }
+        Ok(Some(song))
+    }
+
+    /// getAlbum without its songs, as this user sees the album; Ok(None) on DATA_NOT_FOUND.
+    pub async fn get_album(&self, id: &str) -> Result<Option<SubsonicAlbum>> {
+        let Some(body) = found(self.get::<AlbumBody>("getAlbum", &[("id", id)]).await)? else {
+            return Ok(None);
+        };
+        let album = body
+            .album
+            .ok_or_else(|| NavidromeError::Parse("getAlbum answered without an album".into()))?;
+        if album.id != id {
+            return Err(NavidromeError::Parse(format!(
+                "Navidrome answered another album for {id}"
+            )));
+        }
+        Ok(Some(album))
+    }
+
+    /// setRating as a form post. Navidrome then recomputes the song's average
+    /// (persistence/sql_annotations.go:141-158). An unknown id is Subsonic error 70
+    /// "data not found" (server/subsonic/api.go:304-305).
+    pub async fn set_rating(&self, id: &str, rating: u8) -> Result<()> {
+        let rating = rating.to_string();
+        let _: PingBody = self
+            .post_form("setRating", &[("id", id), ("rating", &rating)])
+            .await?;
+        Ok(())
     }
 
     pub async fn get_all_albums(&self) -> Result<Vec<SubsonicAlbum>> {
@@ -453,14 +500,17 @@ impl NavidromeClient {
     /// rows `start` to `end` (exclusive): a recording MBID matches the MBID columns, other text
     /// matches every word against title, album and artist names.
     pub async fn find_songs(&self, text: &str, start: u32, end: u32) -> Result<Vec<NativeSong>> {
-        self.native_songs(&[
-            ("_start", start.to_string()),
-            ("_end", end.to_string()),
-            ("_sort", "id".to_string()),
-            ("_order", "ASC".to_string()),
-            ("title", text.to_string()),
-            ("missing", "false".to_string()),
-        ])
+        self.native_songs(
+            "Find songs",
+            &[
+                ("_start", start.to_string()),
+                ("_end", end.to_string()),
+                ("_sort", "id".to_string()),
+                ("_order", "ASC".to_string()),
+                ("title", text.to_string()),
+                ("missing", "false".to_string()),
+            ],
+        )
         .await
     }
 
@@ -469,18 +519,58 @@ impl NavidromeClient {
     /// (persistence/mediafile_repository.go:86), set when a file is first stored (`:132`) and kept
     /// by later scans (persistence/sql_base_repository.go:431).
     pub async fn newest_songs(&self, start: u32, end: u32) -> Result<Vec<NativeSong>> {
-        self.native_songs(&[
-            ("_start", start.to_string()),
-            ("_end", end.to_string()),
-            ("_sort", "created_at".to_string()),
-            ("_order", "DESC".to_string()),
-            ("missing", "false".to_string()),
-        ])
+        self.native_songs(
+            "Find songs",
+            &[
+                ("_start", start.to_string()),
+                ("_end", end.to_string()),
+                ("_sort", "created_at".to_string()),
+                ("_order", "DESC".to_string()),
+                ("missing", "false".to_string()),
+            ],
+        )
         .await
     }
 
-    /// The native song list for `query`.
-    async fn native_songs(&self, query: &[(&str, String)]) -> Result<Vec<NativeSong>> {
+    /// The native record of song `id` (an `id` filter, persistence/mediafile_repository.go:120),
+    /// as this user sees it; a missing file comes back with `missing: true`.
+    /// Ok(None) for an empty list, and for an empty id with no request, since Navidrome drops a
+    /// filter whose value is empty (persistence/sql_restful.go:25-28) and would answer the first
+    /// song of the library. Any record but the one asked for is refused.
+    pub async fn get_native_song(&self, id: &str) -> Result<Option<NativeSong>> {
+        if id.is_empty() {
+            return Ok(None);
+        }
+        let mut songs = self
+            .native_songs(
+                "Get song",
+                &[
+                    ("_start", "0".to_string()),
+                    ("_end", "1".to_string()),
+                    ("id", id.to_string()),
+                ],
+            )
+            .await?;
+        if songs.len() > 1 {
+            return Err(NavidromeError::Parse(format!(
+                "Navidrome answered more than one song for {id}"
+            )));
+        }
+        match songs.pop() {
+            None => Ok(None),
+            Some(song) if song.id == id => Ok(Some(song)),
+            Some(_) => Err(NavidromeError::Parse(format!(
+                "Navidrome answered another song for {id}"
+            ))),
+        }
+    }
+
+    /// The native song list for `query`; a non-success status is an Http error of `action`.
+    async fn native_songs(
+        &self,
+        action: &'static str,
+        query: &[(&str, String)],
+    ) -> Result<Vec<NativeSong>> {
         let url = self.base_url.join("api/song")?;
 
         let resp = self
@@ -489,7 +579,7 @@ impl NavidromeClient {
 
         if !resp.status().is_success() {
             return Err(NavidromeError::Http {
-                action: "Find songs",
+                action,
                 status: resp.status().as_u16(),
                 body: None,
             });
@@ -514,6 +604,18 @@ impl NavidromeClient {
         }
 
         resp.json().await.map_err(parse)
+    }
+}
+
+/// A read's answer, None when Navidrome has no record the user can see (DATA_NOT_FOUND).
+fn found<T>(answer: Result<T>) -> Result<Option<T>> {
+    match answer {
+        Ok(body) => Ok(Some(body)),
+        Err(NavidromeError::Subsonic {
+            code: DATA_NOT_FOUND,
+            ..
+        }) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -626,7 +728,7 @@ mod tests {
     async fn songs_are_found_by_text_among_present_files() {
         let songs = r#"[{"id":"f2c4d1a8b0e94c37a6d5e8b1c2a3f405","libraryId":1,"libraryPath":"/music",
         "path":"Zzqx Artist/Qzz Album/01 Song Number 1.mp3","title":"Song Number 1","album":"Qzz Album",
-        "artist":"Zzqx Artist","size":32032,"suffix":"mp3","missing":false}]"#;
+        "artist":"Zzqx Artist","albumArtist":"Zzqx Artist","size":32032,"suffix":"mp3","missing":false}]"#;
         let (url, seen) = serve(vec![
             Reply {
                 status: 200,
@@ -742,6 +844,277 @@ mod tests {
         let err = client(&url).ping().await.unwrap_err();
         assert!(matches!(err, NavidromeError::Parse(_)), "{err:?}");
         assert!(!err.is_wrong_credentials());
+    }
+
+    const SONG: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"song":{"id":"3sG8kPq0WmZ1xYbN4vTcDe","parent":"7hQ2nLr5VxZ0cYbM8wTkAf","isDir":false,"title":"O Holy Night","album":"Winter Songs","artist":"Marrow Choir","track":3,"size":28734112,"contentType":"audio/flac","suffix":"flac","starred":"2026-11-02T18:04:51.112Z","duration":263,"bitRate":912,"path":"Marrow Choir/Winter Songs/01-03 - O Holy Night.flac","discNumber":1,"albumId":"7hQ2nLr5VxZ0cYbM8wTkAf","artistId":"2kD9pWq4ZxC1vBnM6yTjLs","type":"music","userRating":4,"averageRating":3.5,"bpm":0,"comment":"","sortName":"","mediaType":"song","musicBrainzId":"0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c","isrc":[],"genres":[],"replayGain":{},"channelCount":2,"samplingRate":44100}}}"#;
+    const ALBUM: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"album":{"id":"7hQ2nLr5VxZ0cYbM8wTkAf","name":"Winter Songs","artist":"Marrow Choir","artistId":"2kD9pWq4ZxC1vBnM6yTjLs","songCount":12,"duration":2841,"starred":"2026-11-03T09:12:40.004Z","year":2019,"userRating":0,"genres":[],"musicBrainzId":"","isCompilation":false,"sortName":"","discTitles":[],"song":[]}}}"#;
+    /// What a legacy client gets: no OpenSubsonic part, so no userRating (helpers.go:427-431).
+    const LEGACY_ALBUM: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"album":{"id":"7hQ2nLr5VxZ0cYbM8wTkAf","name":"Winter Songs","artist":"Marrow Choir","songCount":12,"duration":2841,"year":2019,"song":[]}}}"#;
+    const NATIVE_SONG: &str = r#"[{"id":"3sG8kPq0WmZ1xYbN4vTcDe","libraryId":1,"libraryPath":"/music","libraryName":"Music Library","folderId":"5tR1yUi8OpA3sDf6GhJ9kL","path":"Marrow Choir/Winter Songs/03 - O Holy Night.flac","title":"O Holy Night","album":"Winter Songs","artist":"Marrow Choir","albumArtist":"Marrow Choir","albumId":"7hQ2nLr5VxZ0cYbM8wTkAf","size":28734112,"suffix":"flac","duration":263.4,"bitRate":912,"mbzRecordingID":"0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c","missing":false,"rating":1,"playCount":3}]"#;
+    const LOGIN: &str = r#"{"id":"8uY3tR6eW9qA2sD5fG8hJ1","name":"Alice","username":"alice","isAdmin":false,"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.c2ln"}"#;
+
+    fn failed(code: u32, message: &str) -> String {
+        format!(
+            r#"{{"subsonic-response":{{"status":"failed","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"error":{{"code":{code},"message":"{message}"}}}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_song_is_read_with_its_rating_star_and_album() {
+        let (url, seen) = serve(vec![Reply {
+            status: 200,
+            body: SONG.into(),
+        }]);
+        let song = client(&url)
+            .get_song("3sG8kPq0WmZ1xYbN4vTcDe")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                song.user_rating,
+                song.starred.as_deref(),
+                song.album_id.as_deref()
+            ),
+            (
+                Some(4),
+                Some("2026-11-02T18:04:51.112Z"),
+                Some("7hQ2nLr5VxZ0cYbM8wTkAf")
+            )
+        );
+        let sent = seen.lock().unwrap()[0].clone();
+        assert!(sent.target.starts_with("/rest/getSong?"), "{}", sent.target);
+        assert!(
+            sent.target.contains("id=3sG8kPq0WmZ1xYbN4vTcDe"),
+            "{}",
+            sent.target
+        );
+    }
+
+    #[tokio::test]
+    async fn a_song_or_album_navidrome_cannot_find_is_none() {
+        // browsing.go:251 and :197
+        let (url, _) = serve(vec![
+            Reply {
+                status: 200,
+                body: failed(70, "Song not found"),
+            },
+            Reply {
+                status: 200,
+                body: failed(70, "Album not found"),
+            },
+        ]);
+        let c = client(&url);
+        assert!(c.get_song("gone").await.unwrap().is_none());
+        assert!(c.get_album("gone").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn another_refusal_of_a_read_is_an_error() {
+        // mapToSubsonicError, server/subsonic/api.go:290-291
+        let (url, _) = serve(vec![
+            Reply {
+                status: 200,
+                body: failed(0, "Internal Server Error: database is locked"),
+            },
+            Reply {
+                status: 200,
+                body: SCAN_STATUS.into(),
+            },
+            Reply {
+                status: 200,
+                body: SCAN_STATUS.into(),
+            },
+        ]);
+        let c = client(&url);
+        let err = c.get_song("3sG8kPq0WmZ1xYbN4vTcDe").await.unwrap_err();
+        assert!(
+            matches!(err, NavidromeError::Subsonic { code: 0, .. }),
+            "{err:?}"
+        );
+        let err = c.get_song("3sG8kPq0WmZ1xYbN4vTcDe").await.unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Parse(m) if m == "getSong answered without a song"),
+            "{err:?}"
+        );
+        let err = c.get_album("7hQ2nLr5VxZ0cYbM8wTkAf").await.unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Parse(m) if m == "getAlbum answered without an album"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_album_is_read_with_its_rating_and_star_or_without_a_rating_when_not_sent() {
+        let (url, _) = serve(vec![
+            Reply {
+                status: 200,
+                body: ALBUM.into(),
+            },
+            Reply {
+                status: 200,
+                body: LEGACY_ALBUM.into(),
+            },
+        ]);
+        let c = client(&url);
+        let album = c
+            .get_album("7hQ2nLr5VxZ0cYbM8wTkAf")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (album.user_rating, album.starred.as_deref()),
+            (Some(0), Some("2026-11-03T09:12:40.004Z"))
+        );
+        let legacy = c
+            .get_album("7hQ2nLr5VxZ0cYbM8wTkAf")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((legacy.user_rating, legacy.starred), (None, None));
+    }
+
+    #[tokio::test]
+    async fn a_native_song_is_read_by_id_with_its_library_path_size_and_ratings() {
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: LOGIN.into(),
+            },
+            Reply {
+                status: 200,
+                body: NATIVE_SONG.into(),
+            },
+            Reply {
+                status: 200,
+                body: "[]".into(),
+            },
+            // What Navidrome answers when the id filter is dropped: the first song of the library.
+            Reply {
+                status: 200,
+                body: NATIVE_SONG.replace("3sG8kPq0WmZ1xYbN4vTcDe", "0bF4hJ7kL2zX9cV5nM1qWe"),
+            },
+        ]);
+        let c = client(&url);
+        let song = c
+            .get_native_song("3sG8kPq0WmZ1xYbN4vTcDe")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                song.library_id,
+                song.library_path.as_str(),
+                song.path.as_str(),
+                song.size,
+                song.missing
+            ),
+            (
+                1,
+                "/music",
+                "Marrow Choir/Winter Songs/03 - O Holy Night.flac",
+                28734112,
+                false
+            )
+        );
+        assert_eq!(
+            (song.rating, song.average_rating, song.album_artist.as_str()),
+            (1, None, "Marrow Choir")
+        );
+        assert_eq!(
+            song.mbz_recording_id.as_deref(),
+            Some("0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c")
+        );
+        assert!(c.get_native_song("gone").await.unwrap().is_none());
+        assert!(c.get_native_song("").await.unwrap().is_none());
+        assert_eq!(seen.lock().unwrap().len(), 3, "an empty id sends nothing");
+        let err = c
+            .get_native_song("3sG8kPq0WmZ1xYbN4vTcDe")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Parse(m) if m == "Navidrome answered another song for 3sG8kPq0WmZ1xYbN4vTcDe"),
+            "{err:?}"
+        );
+        assert_eq!(
+            seen.lock().unwrap()[1].target,
+            "/api/song?_start=0&_end=1&id=3sG8kPq0WmZ1xYbN4vTcDe"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_about_another_item_is_refused() {
+        let record = &NATIVE_SONG[1..NATIVE_SONG.len() - 1];
+        let (url, _) = serve(vec![
+            Reply {
+                status: 200,
+                body: SONG.into(),
+            },
+            Reply {
+                status: 200,
+                body: ALBUM.into(),
+            },
+            Reply {
+                status: 200,
+                body: LOGIN.into(),
+            },
+            Reply {
+                status: 200,
+                body: format!("[{record},{record}]"),
+            },
+        ]);
+        let c = client(&url);
+        let err = c.get_song("0bF4hJ7kL2zX9cV5nM1qWe").await.unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Parse(m) if m == "Navidrome answered another song for 0bF4hJ7kL2zX9cV5nM1qWe"),
+            "{err:?}"
+        );
+        let err = c.get_album("1aB2cD3eF4gH5iJ6kL7mNo").await.unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Parse(m) if m == "Navidrome answered another album for 1aB2cD3eF4gH5iJ6kL7mNo"),
+            "{err:?}"
+        );
+        let err = c
+            .get_native_song("3sG8kPq0WmZ1xYbN4vTcDe")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Parse(m) if m == "Navidrome answered more than one song for 3sG8kPq0WmZ1xYbN4vTcDe"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rating_is_set_with_a_form_post_and_an_unknown_id_is_refused() {
+        // setRating answers an empty ok response (server/subsonic/media_annotation.go:36).
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: SCAN_STATUS.into(),
+            },
+            Reply {
+                status: 200,
+                body: failed(70, "data not found"),
+            },
+        ]);
+        let c = client(&url);
+        c.set_rating("3sG8kPq0WmZ1xYbN4vTcDe", 1).await.unwrap();
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            (sent.method.as_str(), sent.target.as_str()),
+            ("POST", "/rest/setRating")
+        );
+        for part in ["id=3sG8kPq0WmZ1xYbN4vTcDe", "rating=1"] {
+            assert!(
+                sent.body.split('&').any(|p| p == part),
+                "{part} in {}",
+                sent.body
+            );
+        }
+        assert!(matches!(
+            c.set_rating("gone", 1).await,
+            Err(NavidromeError::Subsonic { code: 70, .. })
+        ));
     }
 
     #[tokio::test]

@@ -104,6 +104,18 @@ pub struct SearchResult3 {
     pub song: Vec<SubsonicSong>,
 }
 
+/// getSong's body. Option so that an ok answer without its song is reported as such.
+#[derive(Debug, Deserialize)]
+pub struct SongBody {
+    pub song: Option<SubsonicSong>,
+}
+
+/// getAlbum's body. Option so that an ok answer without its album is reported as such.
+#[derive(Debug, Deserialize)]
+pub struct AlbumBody {
+    pub album: Option<SubsonicAlbum>,
+}
+
 // Core data types
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,6 +141,9 @@ pub struct SubsonicSong {
     pub average_rating: Option<f64>,
     #[serde(default)]
     pub play_count: Option<u32>,
+    /// When this user starred the song; absent when not starred.
+    #[serde(default)]
+    pub starred: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +166,9 @@ pub struct SubsonicAlbum {
     pub user_rating: Option<u8>,
     #[serde(default)]
     pub average_rating: Option<f64>,
+    /// When this user starred the album; absent when not starred.
+    #[serde(default)]
+    pub starred: Option<String>,
 }
 
 impl SubsonicAlbum {
@@ -172,7 +190,8 @@ pub struct PlayerInfo {
     pub report_real_path: bool,
 }
 
-/// A song from Navidrome's native API (GET /api/song).
+/// A song from Navidrome's native API (GET /api/song), as the logged-in user sees it
+/// (model/mediafile.go, model/annotation.go).
 /// The `path` field is the raw `media_file.path` from the database,
 /// relative to the library root (not transformed by ReportRealPath).
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +202,23 @@ pub struct NativeSong {
     pub title: String,
     /// bytes (model/mediafile.go `Size`)
     pub size: u64,
+    pub library_id: i64,
+    /// The library's root as Navidrome sees it.
+    pub library_path: String,
+    /// The file is no longer found in the library's folder.
+    pub missing: bool,
+    pub artist: String,
+    pub album: String,
+    pub album_artist: String,
+    /// This user's rating, 0 when unrated (`omitempty`).
+    #[serde(default)]
+    pub rating: u8,
+    /// The mean of every user's rating above 0. `omitempty`, so absent when nobody rated the
+    /// song, and on Navidrome before 0.60.0, which has no average.
+    #[serde(default)]
+    pub average_rating: Option<f64>,
+    #[serde(default, rename = "mbzRecordingID")]
+    pub mbz_recording_id: Option<String>,
 }
 
 #[cfg(test)]
