@@ -83,7 +83,7 @@ pub enum JobState {
         position: u32,
     },
     Running,
-    Done(JobOutcome),
+    Done(Box<JobOutcome>),
 }
 
 pub struct ImportHandle {
@@ -94,7 +94,7 @@ impl ImportHandle {
     pub async fn wait(mut self) -> JobOutcome {
         let done = match self.rx.wait_for(|s| matches!(s, JobState::Done(_))).await {
             Ok(state) => match &*state {
-                JobState::Done(outcome) => Some(outcome.clone()),
+                JobState::Done(outcome) => Some(JobOutcome::clone(outcome)),
                 _ => None,
             },
             Err(_) => None,
@@ -382,7 +382,7 @@ impl Shared {
                 .emit(&owner.user_id, DownloadEvent::Progress(rows))
                 .await;
         }
-        state.send_replace(JobState::Done(outcome));
+        state.send_replace(JobState::Done(Box::new(outcome)));
     }
 }
 
