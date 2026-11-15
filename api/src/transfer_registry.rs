@@ -12,6 +12,7 @@
 
 use crate::auth::UserId;
 use shared::download::{batch_folder, DownloadableItem};
+use soulbeet::ImportMode;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -33,12 +34,18 @@ pub struct BatchRef {
     pub destination: String,
     pub target: PathBuf,
     pub inbox: Arc<BatchInbox>,
+    pub import_mode: ImportMode,
 }
 
 impl BatchRef {
     /// A new batch downloading into `batch_folder(label, batch_id)` and
-    /// importing into `target`.
-    pub fn new(owner: TransferOwner, label: String, target: PathBuf) -> Self {
+    /// importing into `target` in `import_mode`.
+    pub fn new(
+        owner: TransferOwner,
+        label: String,
+        target: PathBuf,
+        import_mode: ImportMode,
+    ) -> Self {
         let destination = batch_folder(&label, &owner.batch_id);
         Self {
             owner,
@@ -46,6 +53,7 @@ impl BatchRef {
             destination,
             target,
             inbox: BatchInbox::new(),
+            import_mode,
         }
     }
 }
@@ -131,7 +139,7 @@ impl TransferRegistry {
 
     /// Claims a request's free keys in one step, for the batch that will
     /// download them. When the user is already downloading some of the files
-    /// into `fresh`'s library folder and that batch still takes files, its
+    /// into `fresh`'s library folder in its import mode and that batch still takes files, its
     /// inbox is reserved and the free keys go straight to it. Otherwise they
     /// go to `fresh`. No other request ever sees them owned by a batch that
     /// gets no monitor.
@@ -143,7 +151,9 @@ impl TransferRegistry {
             false => claim
                 .mine
                 .iter()
-                .filter(|(_, running)| running.target == fresh.target)
+                .filter(|(_, running)| {
+                    running.target == fresh.target && running.import_mode == fresh.import_mode
+                })
                 .find_map(|(_, running)| Some((running.clone(), running.inbox.reserve()?))),
         };
         let (batch, reservation) = match joined {
@@ -315,7 +325,7 @@ impl Drop for InboxReservation {
 mod tests {
     use super::*;
 
-    fn batch(user_id: &str, batch_id: &str) -> BatchRef {
+    fn batch(user_id: &str, batch_id: &str, import_mode: ImportMode) -> BatchRef {
         BatchRef::new(
             TransferOwner {
                 user_id: UserId::new(user_id),
@@ -323,6 +333,7 @@ mod tests {
             },
             "Come Over".to_string(),
             PathBuf::from("/music"),
+            import_mode,
         )
     }
 
@@ -346,10 +357,13 @@ mod tests {
     #[test]
     fn a_key_claimed_by_another_user_is_reported_as_other_user() {
         let registry = TransferRegistry::default();
-        let alice = batch("alice", "a1");
+        let alice = batch("alice", "a1", ImportMode::Singleton);
         registry.claim(&[key("01.flac")], &alice);
 
-        let claim = registry.claim(&[key("01.flac"), key("02.flac")], &batch("bob", "b1"));
+        let claim = registry.claim(
+            &[key("01.flac"), key("02.flac")],
+            &batch("bob", "b1", ImportMode::Singleton),
+        );
 
         assert_eq!(claim.other_user, vec![key("01.flac")]);
         assert_eq!(claim.claimed, vec![key("02.flac")]);
@@ -359,10 +373,13 @@ mod tests {
     #[test]
     fn a_key_claimed_by_the_same_user_is_reported_as_mine_with_its_batch() {
         let registry = TransferRegistry::default();
-        let running = batch("alice", "a1");
+        let running = batch("alice", "a1", ImportMode::Singleton);
         registry.claim(&[key("01.flac")], &running);
 
-        let claim = registry.claim(&[key("01.flac"), key("02.flac")], &batch("alice", "a2"));
+        let claim = registry.claim(
+            &[key("01.flac"), key("02.flac")],
+            &batch("alice", "a2", ImportMode::Singleton),
+        );
 
         assert_eq!(claim.mine.len(), 1);
         assert_eq!(claim.mine[0].0, key("01.flac"));
@@ -375,7 +392,10 @@ mod tests {
     #[test]
     fn a_key_repeated_in_one_request_is_reported_once() {
         let registry = TransferRegistry::default();
-        registry.claim(&[key("02.flac")], &batch("alice", "a1"));
+        registry.claim(
+            &[key("02.flac")],
+            &batch("alice", "a1", ImportMode::Singleton),
+        );
 
         let claim = registry.claim(
             &[
@@ -384,7 +404,7 @@ mod tests {
                 key("02.flac"),
                 key("02.flac"),
             ],
-            &batch("alice", "a2"),
+            &batch("alice", "a2", ImportMode::Singleton),
         );
 
         assert_eq!(claim.claimed, vec![key("01.flac")]);
@@ -395,22 +415,25 @@ mod tests {
     #[test]
     fn release_lets_the_key_be_claimed_again() {
         let registry = TransferRegistry::default();
-        let alice = batch("alice", "a1");
+        let alice = batch("alice", "a1", ImportMode::Singleton);
         registry.claim(&[key("01.flac")], &alice);
 
         registry.release(&key("01.flac"), &alice.owner);
 
-        let claim = registry.claim(&[key("01.flac")], &batch("bob", "b1"));
+        let claim = registry.claim(
+            &[key("01.flac")],
+            &batch("bob", "b1", ImportMode::Singleton),
+        );
         assert_eq!(claim.claimed, vec![key("01.flac")]);
     }
 
     #[test]
     fn a_late_release_leaves_a_key_someone_else_claimed_since() {
         let registry = TransferRegistry::default();
-        let alice = batch("alice", "a1");
+        let alice = batch("alice", "a1", ImportMode::Singleton);
         registry.claim(&[key("01.flac")], &alice);
         registry.release(&key("01.flac"), &alice.owner);
-        let bob = batch("bob", "b1");
+        let bob = batch("bob", "b1", ImportMode::Singleton);
         registry.claim(&[key("01.flac")], &bob);
 
         registry.release(&key("01.flac"), &alice.owner);
@@ -422,15 +445,18 @@ mod tests {
     #[test]
     fn releasing_a_batch_frees_only_its_own_keys() {
         let registry = TransferRegistry::default();
-        let first = batch("alice", "a1");
+        let first = batch("alice", "a1", ImportMode::Singleton);
         registry.claim(&[key("01.flac"), key("02.flac")], &first);
-        registry.claim(&[key("03.flac")], &batch("alice", "a2"));
+        registry.claim(
+            &[key("03.flac")],
+            &batch("alice", "a2", ImportMode::Singleton),
+        );
 
         registry.release_batch(&first.owner);
 
         let claim = registry.claim(
             &[key("01.flac"), key("02.flac"), key("03.flac")],
-            &batch("bob", "b1"),
+            &batch("bob", "b1", ImportMode::Singleton),
         );
         assert_eq!(claim.claimed, vec![key("01.flac"), key("02.flac")]);
         assert_eq!(claim.other_user, vec![key("03.flac")]);
@@ -439,9 +465,12 @@ mod tests {
     #[test]
     fn rebind_refuses_another_users_key() {
         let registry = TransferRegistry::default();
-        let alice = batch("alice", "a1");
+        let alice = batch("alice", "a1", ImportMode::Singleton);
         registry.claim(&[key("01.flac")], &alice);
-        registry.claim(&[key("02.flac")], &batch("bob", "b1"));
+        registry.claim(
+            &[key("02.flac")],
+            &batch("bob", "b1", ImportMode::Singleton),
+        );
 
         assert!(!registry.rebind(&key("01.flac"), key("02.flac"), &alice));
         // Nothing moved: alice still holds her key, bob his.
@@ -450,15 +479,18 @@ mod tests {
 
         assert!(registry.rebind(&key("01.flac"), key("03.flac"), &alice));
         assert!(registry.may_adopt(&key("03.flac"), &alice.owner));
-        let claim = registry.claim(&[key("01.flac")], &batch("bob", "b2"));
+        let claim = registry.claim(
+            &[key("01.flac")],
+            &batch("bob", "b2", ImportMode::Singleton),
+        );
         assert_eq!(claim.claimed, vec![key("01.flac")], "the old key was freed");
     }
 
     #[test]
     fn rebind_refuses_a_key_of_another_batch_of_the_same_user() {
         let registry = TransferRegistry::default();
-        let mine = batch("alice", "a1");
-        let other = batch("alice", "a2");
+        let mine = batch("alice", "a1", ImportMode::Singleton);
+        let other = batch("alice", "a2", ImportMode::Singleton);
         registry.claim(&[key("01.flac")], &mine);
         registry.claim(&[key("02.flac")], &other);
 
@@ -478,9 +510,9 @@ mod tests {
     #[test]
     fn a_request_joining_a_running_batch_claims_its_free_keys_for_that_batch() {
         let registry = TransferRegistry::default();
-        let running = batch("alice", "r");
+        let running = batch("alice", "r", ImportMode::Singleton);
         registry.claim(&keys(1..=5), &running);
-        let fresh = batch("alice", "a");
+        let fresh = batch("alice", "a", ImportMode::Singleton);
 
         let joined = registry.claim_for_request(&keys(1..=10), &fresh);
 
@@ -500,10 +532,10 @@ mod tests {
         // files and more, comes right after A's claim and before A enqueues:
         // it must find R, not A's own batch, which never gets a monitor.
         let registry = TransferRegistry::default();
-        let running = batch("alice", "r");
+        let running = batch("alice", "r", ImportMode::Singleton);
         registry.claim(&keys(1..=5), &running);
-        let fresh_a = batch("alice", "a");
-        let fresh_b = batch("alice", "b");
+        let fresh_a = batch("alice", "a", ImportMode::Singleton);
+        let fresh_b = batch("alice", "b", ImportMode::Singleton);
 
         let a = registry.claim_for_request(&keys(1..=10), &fresh_a);
         let b = registry.claim_for_request(&keys(6..=12), &fresh_b);
@@ -524,10 +556,10 @@ mod tests {
     #[test]
     fn a_request_whose_running_batch_finished_claims_for_itself() {
         let registry = TransferRegistry::default();
-        let running = batch("alice", "r");
+        let running = batch("alice", "r", ImportMode::Singleton);
         registry.claim(&keys(1..=1), &running);
         assert!(running.inbox.close_if_idle());
-        let fresh = batch("alice", "a");
+        let fresh = batch("alice", "a", ImportMode::Singleton);
 
         let own = registry.claim_for_request(&keys(1..=2), &fresh);
 
@@ -539,10 +571,11 @@ mod tests {
     #[test]
     fn a_request_with_nothing_free_reserves_nothing() {
         let registry = TransferRegistry::default();
-        let running = batch("alice", "r");
+        let running = batch("alice", "r", ImportMode::Singleton);
         registry.claim(&keys(1..=2), &running);
 
-        let none_free = registry.claim_for_request(&keys(1..=2), &batch("alice", "a"));
+        let none_free =
+            registry.claim_for_request(&keys(1..=2), &batch("alice", "a", ImportMode::Singleton));
 
         assert!(none_free.reservation.is_none());
         assert!(running.inbox.close_if_idle(), "no reservation left behind");
@@ -551,10 +584,16 @@ mod tests {
     #[test]
     fn may_adopt_only_unowned_or_own() {
         let registry = TransferRegistry::default();
-        let mine = batch("alice", "a1");
+        let mine = batch("alice", "a1", ImportMode::Singleton);
         registry.claim(&[key("01.flac")], &mine);
-        registry.claim(&[key("02.flac")], &batch("alice", "a2"));
-        registry.claim(&[key("03.flac")], &batch("bob", "b1"));
+        registry.claim(
+            &[key("02.flac")],
+            &batch("alice", "a2", ImportMode::Singleton),
+        );
+        registry.claim(
+            &[key("03.flac")],
+            &batch("bob", "b1", ImportMode::Singleton),
+        );
 
         assert!(registry.may_adopt(&key("00.flac"), &mine.owner), "unowned");
         assert!(
@@ -575,19 +614,22 @@ mod tests {
     fn only_the_owning_user_holds_a_transfer() {
         let reg = TransferRegistry::default();
         let (a, b) = (UserId::new("user-a"), UserId::new("user-b"));
-        reg.claim(&[key("1.flac")], &batch("user-a", "b1"));
+        reg.claim(
+            &[key("1.flac")],
+            &batch("user-a", "b1", ImportMode::Singleton),
+        );
 
         assert!(reg.owned_by(&key("1.flac"), &a));
         assert!(!reg.owned_by(&key("1.flac"), &b));
 
-        reg.release_batch(&batch("user-a", "b1").owner);
+        reg.release_batch(&batch("user-a", "b1", ImportMode::Singleton).owner);
         assert!(!reg.owned_by(&key("1.flac"), &a));
     }
 
     #[test]
     fn a_transfer_rebound_by_failover_is_owned_under_its_new_peer() {
         let reg = TransferRegistry::default();
-        let mine = batch("user-a", "b1");
+        let mine = batch("user-a", "b1", ImportMode::Singleton);
         reg.claim(&[key("1.flac")], &mine);
         let moved = TransferKey {
             peer: "peer_b".into(),
@@ -601,7 +643,7 @@ mod tests {
 
     #[test]
     fn a_batch_downloads_into_its_own_folder() {
-        let b = batch("alice", "12345678-aaaa");
+        let b = batch("alice", "12345678-aaaa", ImportMode::Singleton);
         assert_eq!(b.destination, "Come Over [12345678]");
         assert_eq!(b.label, "Come Over");
     }
@@ -674,5 +716,24 @@ mod tests {
             Err(vec![slot("02.flac")])
         );
         assert!(inbox.reserve().is_none());
+    }
+
+    #[test]
+    fn a_request_does_not_join_a_batch_importing_in_another_mode() {
+        let registry = TransferRegistry::default();
+        let running = batch("alice", "r", ImportMode::Album);
+        registry.claim(&keys(1..=5), &running);
+        let fresh = batch("alice", "a", ImportMode::Singleton);
+
+        let own = registry.claim_for_request(&keys(1..=10), &fresh);
+
+        assert_eq!(own.batch.owner, fresh.owner);
+        assert!(own.reservation.is_none());
+        assert_eq!(own.claim.claimed, keys(6..=10));
+        assert_eq!(own.claim.mine.len(), 5);
+        assert!(
+            running.inbox.close_if_idle(),
+            "the album batch was not joined"
+        );
     }
 }

@@ -349,7 +349,9 @@ mod tests {
         batch, group, item, key, same_user_into, Cancel, ScriptedOutcome, StubBackend,
         STUB_IN_FLIGHT,
     };
+    use crate::transfer_registry::TransferOwner;
     use shared::failure::{FailureCode, RetryAdvice, Service, Stage};
+    use soulbeet::ImportMode;
     use std::path::PathBuf;
 
     /// Another batch of `running`'s user, importing into the same folder.
@@ -471,6 +473,45 @@ mod tests {
             )
         );
         assert_eq!(nothing.cause, None);
+    }
+
+    #[tokio::test]
+    async fn a_repeat_request_in_another_import_mode_starts_its_own_batch() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let mut running = batch("Come Over");
+        running.import_mode = ImportMode::Album;
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
+        let fresh = BatchRef::new(
+            TransferOwner {
+                user_id: running.owner.user_id.clone(),
+                batch_id: uuid::Uuid::new_v4().to_string(),
+            },
+            "Come Over".into(),
+            running.target.clone(),
+            ImportMode::Singleton,
+        );
+
+        let enq = enqueue_request(
+            &backend,
+            vec![
+                item("peer_a", "One", "01.flac"),
+                item("peer_a", "Two", "02.flac"),
+            ],
+            fresh.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            statuses(&enq.results),
+            vec![
+                ("01.flac".to_string(), Answer::AlreadyRunning),
+                ("02.flac".to_string(), Answer::Enqueued),
+            ]
+        );
+        assert!(matches!(enq.watcher, Watcher::Own));
+        assert_eq!(enq.batch.owner, fresh.owner);
+        assert_eq!(stub.destinations(), vec![fresh.destination.clone()]);
     }
 
     #[tokio::test]

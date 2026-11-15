@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "server")]
 use crate::auth::RegistrationMode;
-#[cfg(feature = "server")]
 use crate::base_url::{BaseUrl, BaseUrlError};
+#[cfg(feature = "server")]
+use soulbeet::ImportMode;
 
 /// Reads `REGISTRATION`. Unset follows whether Navidrome is configured; an
 /// unknown value falls to the closed mode.
@@ -201,9 +202,12 @@ impl AppConfig {
         self.registration
     }
 
-    /// Check if album mode is enabled.
-    pub fn is_album_mode(&self) -> bool {
-        self.beets_album_mode
+    /// The mode every batch of this run imports in.
+    pub fn import_mode(&self) -> ImportMode {
+        match self.beets_album_mode {
+            true => ImportMode::Album,
+            false => ImportMode::Singleton,
+        }
     }
 }
 

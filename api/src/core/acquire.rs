@@ -2,6 +2,7 @@
 //! the manual download and the auto-download pipeline.
 
 use crate::auth::UserCtx;
+use crate::config::CONFIG;
 use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
 use crate::core::{backend_unavailable, sources, target_unwritable};
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
@@ -75,6 +76,7 @@ fn fresh_batch(ctx: &UserCtx, batch_id: String, label: String, target: PathBuf) 
         },
         label,
         target,
+        CONFIG.import_mode(),
     )
 }
 

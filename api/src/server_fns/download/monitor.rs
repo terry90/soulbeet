@@ -228,7 +228,6 @@ pub struct DownloadMonitor {
     /// Alternate sources per slot, parallel to `tracked_files` by index.
     pool: SourcePool,
     /// Whether album mode is enabled.
-    album_mode: bool,
     /// Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
     /// The batch this monitor watches: its rows, its folder under the
@@ -282,7 +281,6 @@ impl DownloadMonitor {
             tx,
             track_states,
             pool,
-            album_mode: CONFIG.is_album_mode(),
             cancellation_token,
             batch,
             download_base: CONFIG.download_path().clone(),
@@ -995,7 +993,7 @@ impl DownloadMonitor {
             }
 
             // Singleton mode: process completed tracks immediately
-            if !self.album_mode && is_completed(&download.state) {
+            if self.batch.import_mode != ImportMode::Album && is_completed(&download.state) {
                 info!(
                     "Track completed, processing immediately (singleton mode): {}",
                     download.item
@@ -1195,7 +1193,7 @@ impl DownloadMonitor {
         // A joining request may still be enqueueing into this batch, or its
         // slots wait to be drained: finishing now would leave them unwatched.
         if all_settled && self.batch.inbox.close_if_idle() {
-            if self.album_mode {
+            if self.batch.import_mode == ImportMode::Album {
                 self.finish_album(matched, backend).await;
             }
             info!("All downloads finished");
@@ -1997,7 +1995,10 @@ mod tests {
         for album_mode in [false, true] {
             let (tx, mut rx) = broadcast::channel(64);
             let mut m = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
-            m.album_mode = album_mode;
+            m.batch.import_mode = match album_mode {
+                true => ImportMode::Album,
+                false => ImportMode::Singleton,
+            };
             let stub = StubBackend::new(vec![]);
             let backend: Arc<dyn DownloadBackend> = stub.clone();
             let held = key(&backend, "peer_a", "one.flac");
@@ -2305,7 +2306,7 @@ mod tests {
         std::fs::write(base.path().join("not-a-dir"), b"x").unwrap();
         let (tx, _rx) = broadcast::channel(64);
         let mut m = monitor_on(tx, vec!["peer_a"; watched.len()], watched.to_vec());
-        m.album_mode = true;
+        m.batch.import_mode = ImportMode::Album;
         m.download_base = base.path().to_path_buf();
         m.target_path = base.path().join("not-a-dir").join("library");
         let folder = base.path().join(&m.batch.destination);
@@ -2350,7 +2351,7 @@ mod tests {
         )
         .await;
         m.tx = tx;
-        m.album_mode = false;
+        m.batch.import_mode = ImportMode::Singleton;
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let listing = || {
             vec![
@@ -2386,7 +2387,7 @@ mod tests {
             &[],
         )
         .await;
-        m.album_mode = false;
+        m.batch.import_mode = ImportMode::Singleton;
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let held = key(&backend, "peer_a", "one.flac");
@@ -2586,7 +2587,10 @@ mod tests {
         for album_mode in [false, true] {
             let user = UserId::new(&format!("monitor-batch-rows-{album_mode}"));
             let (mut m, _base, mut imports) = disk_monitor(&user, &["01.flac"], &["01.flac"]).await;
-            m.album_mode = album_mode;
+            m.batch.import_mode = match album_mode {
+                true => ImportMode::Album,
+                false => ImportMode::Singleton,
+            };
             let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
 
             let mut empty = 0;

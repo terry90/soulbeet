@@ -13,7 +13,7 @@ use shared::download::{
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::metadata::{Album, Track};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
-use soulbeet::DownloadBackend;
+use soulbeet::{DownloadBackend, ImportMode};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,6 +63,7 @@ pub fn batch(label: &str) -> BatchRef {
         },
         label.to_string(),
         PathBuf::from("/music"),
+        ImportMode::Singleton,
     )
 }
 
@@ -75,6 +76,7 @@ pub fn same_user_into(running: &BatchRef, target: PathBuf) -> BatchRef {
         },
         "Come Over".to_string(),
         target,
+        running.import_mode,
     )
 }
 
