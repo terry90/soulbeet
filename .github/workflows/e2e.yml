@@ -47,8 +47,10 @@ jobs:
           tags: soulbeet:e2e
           build-args: |
             TIER=light
-          # Reuse the layer cache from the image publishing workflow; the
-          # light/amd64 build there is byte-identical to this one.
+          # Reuse the layer cache from the image publishing workflow. Its
+          # light/amd64 build matches this one up to the app build, which
+          # it runs with a BUILD_ID build arg this one does not pass, so the
+          # app build and the layers after it are built here.
           cache-from: |
             type=gha,scope=Build and Push Docker Image-linux/amd64-light
             type=gha,scope=Build and Push Docker Image-linux/amd64-rust

@@ -123,8 +123,9 @@ impl NavidromeClient {
     }
 
     /// A Subsonic write as a form body. Navidrome copies the form into the
-    /// query before every handler (server/subsonic/middlewares.go
-    /// `fromFormToQuery`, applied to all routes at server/subsonic/api.go).
+    /// query before every handler (server/subsonic/middlewares.go:32
+    /// `postFormToQueryParams`, applied to all routes at
+    /// server/subsonic/api.go:80).
     async fn post_form<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
