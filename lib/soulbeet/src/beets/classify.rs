@@ -754,6 +754,13 @@ mod tests {
             &[],
             String::new(),
         );
+        assert!(matches!(
+            result.outcome,
+            ImportOutcome::Failed {
+                kind: FailKind::Setup,
+                ..
+            }
+        ));
         assert_eq!(
             result.to_string(),
             "Could not start beets: No such file or directory (os error 2)"

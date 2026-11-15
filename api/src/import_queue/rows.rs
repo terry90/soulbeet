@@ -98,16 +98,13 @@ pub fn rows_for_done(
     let result = &done.result;
     // The result's text, unlike the outcome's, carries the task count.
     let text = result.to_string();
-    let (state, error) = match row_state(&result.outcome) {
-        DownloadState::Imported => {
-            let notable = matches!(
-                &result.outcome,
-                ImportOutcome::Imported { untagged, warnings } if *untagged || !warnings.is_empty()
-            );
-            (DownloadState::Imported, notable.then_some(text))
+    let state = row_state(&result.outcome);
+    // The note on an imported row is not a failure; with_failure writes the rest.
+    let error = match &result.outcome {
+        ImportOutcome::Imported { untagged, warnings } if *untagged || !warnings.is_empty() => {
+            Some(text)
         }
-        DownloadState::Failed(_) => (DownloadState::Failed(text.clone()), Some(text)),
-        state => (state, Some(text)),
+        _ => None,
     };
     // Same rule as the retry store, so a row offers Retry only when one is kept.
     let retryable = keeps_retry(&result.outcome);
