@@ -2,12 +2,14 @@
 //! they act for, failing with a typed `Failure`. The web UI's server
 //! functions and the MCP server call the same code.
 
+use crate::services::BackendLookupError;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 
 pub mod folders;
 pub mod health;
 pub mod metadata;
 pub mod settings;
+pub mod sources;
 
 /// Soulful's own database failed.
 pub(crate) fn database_failure(stage: Stage, e: impl std::fmt::Display) -> Failure {
@@ -18,6 +20,11 @@ pub(crate) fn database_failure(stage: Stage, e: impl std::fmt::Display) -> Failu
         "Soulful's database is unavailable",
     )
     .with_cause(Service::Database, None, e.to_string())
+}
+
+/// `e`'s own failure at `stage`, shown as "Download backend not available: {e}".
+pub(crate) fn backend_unavailable(stage: Stage, e: &BackendLookupError) -> Failure {
+    e.failure(stage, format!("Download backend not available: {e}"))
 }
 
 #[cfg(test)]
@@ -52,7 +59,8 @@ pub(crate) async fn folder_of(db: &sqlx::SqlitePool, user: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::failure::Cause;
+    use shared::failure::{Cause, UserActionCode};
+    use soulbeet::error::{MissingSetting, SoulseekError};
 
     #[test]
     fn a_database_failure_keeps_the_database_text_as_its_cause() {
@@ -68,5 +76,30 @@ mod tests {
             )
         );
         assert_eq!(f.cause, Some(Cause::new(Service::Database, None, raw)));
+    }
+
+    #[test]
+    fn an_unavailable_backend_keeps_its_text_at_either_stage() {
+        let unset = BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url));
+        for stage in [Stage::SourceSearch, Stage::Enqueue] {
+            let f = backend_unavailable(stage, &unset);
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message.as_str()),
+                (
+                    FailureCode::BackendNotConfigured,
+                    stage,
+                    RetryAdvice::NeedsUser,
+                    "Download backend not available: slskd URL not configured"
+                )
+            );
+            assert_eq!(
+                f.user_action.map(|a| a.code),
+                Some(UserActionCode::ConfigureBackend)
+            );
+            assert_eq!(
+                f.cause.map(|c| c.raw),
+                Some("slskd URL not configured".to_string())
+            );
+        }
     }
 }
