@@ -46,10 +46,11 @@ pub(super) async fn local_file_in(
     file_under_root(db, song, music_path).await?
 }
 
-/// local_file_in, and when no file is found under the song's root (none is learned, or the
-/// learned one does not hold it) and that root is not `music_path`'s, learns the root from the
-/// files the folders of `owner` that resolve may hold for the song (learn_from_folders) and
-/// looks again. With no proof the first answer stands.
+/// local_file_in, and when no file is found under the song's root and its library has no root
+/// on this machine (rootless), learns the root from the files the folders of `owner` that
+/// resolve may hold for the song (learn_from_folders) and looks again. With no proof the first
+/// answer stands. A root that is here keeps the first answer: the file is gone, not the
+/// library.
 pub(super) async fn local_file_learning(
     db: &SqlitePool,
     song: &NativeSong,
@@ -60,7 +61,10 @@ pub(super) async fn local_file_learning(
         Ok(found) => return Ok(found),
         Err(no_file) => no_file,
     };
-    if music_path.is_some() && song.library_id == DEFAULT_LIBRARY_ID {
+    if !rootless(db, song, music_path)
+        .await
+        .map_err(|e| database_failure(Stage::Delete, e))?
+    {
         return Err(no_file);
     }
     let (folders, _) = PolicyRows::load_in(db)
@@ -227,6 +231,60 @@ fn relative_path(song: &NativeSong) -> Result<&Path, Failure> {
     })
 }
 
+/// What is at a path on this machine, as a library root.
+enum Dir {
+    Here,
+    /// Nothing, or something that is not a directory.
+    Absent,
+    /// It cannot be told: why.
+    Unreadable(std::io::Error),
+}
+
+/// What is at `path`, following links.
+async fn dir_at(path: &Path) -> Dir {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => Dir::Here,
+        Ok(_) => Dir::Absent,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Dir::Absent
+        }
+        Err(e) => Dir::Unreadable(e),
+    }
+}
+
+/// Whether `song`'s library has no root on this machine, the one case a deletion check may
+/// learn one in: it is not the default library under `music_path`, the root stored for the
+/// library at Navidrome's current path of it, if any, is no longer a directory here, and that
+/// Navidrome path is not a directory here. A root that is here, or that cannot be read, stays
+/// the library's root when a file under it is missing; a row stored for another Navidrome path
+/// is not a root of the library as Navidrome reports it (root_in does not read it).
+async fn rootless(
+    db: &SqlitePool,
+    song: &NativeSong,
+    music_path: Option<&Path>,
+) -> Result<bool, String> {
+    if music_path.is_some() && song.library_id == DEFAULT_LIBRARY_ID {
+        return Ok(false);
+    }
+    let stored = NavidromeLibraryRow::get_in(db, song.library_id)
+        .await?
+        .filter(|row| row.navidrome_path == song.library_path);
+    if let Some(row) = stored {
+        if !matches!(dir_at(Path::new(&row.local_path)).await, Dir::Absent) {
+            return Ok(false);
+        }
+    }
+    Ok(matches!(
+        dir_at(Path::new(&song.library_path)).await,
+        Dir::Absent
+    ))
+}
+
 /// `song`'s library root on this machine, as local_file_in finds it.
 async fn root_in(
     db: &SqlitePool,
@@ -249,43 +307,88 @@ async fn root_in(
 /// Soulful imported, and `listed`, every song the index lookup took for that file. A library
 /// with more than one of them teaches nothing: all but one are other files of the same size
 /// whose paths end like this one's, and the root each implies differs. The ids of the
-/// libraries learned (learn_one).
+/// libraries learned (learn_one). This is an import's learning (Learner::Import).
 pub(crate) async fn learn_in(
     db: &SqlitePool,
     listed: &[NativeSong],
     local: &Path,
 ) -> Result<Vec<i64>, String> {
+    let mut learned = Vec::new();
+    for song in alone_in_library(listed) {
+        if learn_one(db, song, local, Learner::Import).await? {
+            learned.push(song.library_id);
+        }
+    }
+    Ok(learned)
+}
+
+/// learn_in for a deletion check, from `local`, a file Soulful knows for the songs `listed`
+/// (`music_path` is `NAVIDROME_MUSIC_PATH`): only a library that has no root on this machine
+/// (rootless) learns one.
+pub(super) async fn learn_in_check(
+    db: &SqlitePool,
+    listed: &[NativeSong],
+    local: &Path,
+    music_path: Option<&Path>,
+) -> Result<Vec<i64>, String> {
+    let mut learned = Vec::new();
+    for song in alone_in_library(listed) {
+        if rootless(db, song, music_path).await?
+            && learn_one(db, song, local, Learner::Check).await?
+        {
+            learned.push(song.library_id);
+        }
+    }
+    Ok(learned)
+}
+
+/// The songs of `listed` that are the only one of their library, by library id.
+fn alone_in_library(listed: &[NativeSong]) -> Vec<&NativeSong> {
     let mut by_library: HashMap<i64, Vec<&NativeSong>> = HashMap::new();
     for song in listed {
         by_library.entry(song.library_id).or_default().push(song);
     }
-    let mut learned = Vec::new();
-    for (library, songs) in by_library {
-        if let [song] = songs.as_slice() {
-            if learn_one(db, song, local).await? {
-                learned.push(library);
-            }
-        }
-    }
-    learned.sort_unstable();
-    Ok(learned)
+    let mut alone: Vec<&NativeSong> = by_library
+        .into_values()
+        .filter_map(|songs| match songs.as_slice() {
+            [song] => Some(*song),
+            _ => None,
+        })
+        .collect();
+    alone.sort_unstable_by_key(|song| song.library_id);
+    alone
+}
+
+/// Who learns a library root, which decides what a stored root that is here gives way to.
+#[derive(Clone, Copy)]
+enum Learner {
+    /// An import's index wait: a proof that contradicts a stored root forgets both.
+    Import,
+    /// A deletion check, for a rootless library only: a stored root that is here is never
+    /// replaced or forgotten.
+    Check,
 }
 
 /// Learns `song`'s library root from `local` (proven_root), storing it (store_root). Ok(true)
 /// when a root is stored or already known.
-async fn learn_one(db: &SqlitePool, song: &NativeSong, local: &Path) -> Result<bool, String> {
+async fn learn_one(
+    db: &SqlitePool,
+    song: &NativeSong,
+    local: &Path,
+    at: Learner,
+) -> Result<bool, String> {
     match proven_root(song, local).await? {
-        Some(proven) => store_root(db, song, &proven).await,
+        Some(proven) => store_root(db, song, &proven, at).await,
         None => Ok(false),
     }
 }
 
-/// Learns `song`'s library root from the files `folders` (canonical folders of one user) may
-/// hold for it: each folder joined with `song.path`, and with what follows each leading part
-/// of `song.path` the folder's path ends with (a folder inside Navidrome's library). Those
-/// that are there are taken through proven_root, and only when exactly one root is proven
-/// is it stored (store_root): two files that each prove a root may each be the song's.
-/// Ok(true) when a root is stored or already known.
+/// Learns `song`'s library root, at a deletion check, from the files `folders` (canonical
+/// folders of one user) may hold for it: each folder joined with `song.path`, and with what
+/// follows each leading part of `song.path` the folder's path ends with (a folder inside
+/// Navidrome's library). Those that are there are taken through proven_root, and only when
+/// exactly one root is proven is it stored (store_root): two files that each prove a root may
+/// each be the song's. Ok(true) when a root is stored or already known.
 async fn learn_from_folders(
     db: &SqlitePool,
     song: &NativeSong,
@@ -327,7 +430,7 @@ async fn learn_from_folders(
         }
     }
     match proven.as_slice() {
-        [one] => store_root(db, song, one).await,
+        [one] => store_root(db, song, one, Learner::Check).await,
         _ => Ok(false),
     }
 }
@@ -380,32 +483,48 @@ async fn proven_root(song: &NativeSong, local: &Path) -> Result<Option<Proven>, 
 }
 
 /// Stores `proven` as the root of `song`'s library. A root already stored for the same
-/// Navidrome path is replaced only when it no longer resolves here; one that resolves to
-/// another directory means one of the two was learned from another file, so both are forgotten
-/// and the conflict is logged. Ok(true) when the root is stored or already known.
-async fn store_root(db: &SqlitePool, song: &NativeSong, proven: &Proven) -> Result<bool, String> {
+/// Navidrome path is replaced only when it is no longer a directory here, and kept, with
+/// nothing stored, when it cannot be read (Err). One that is here and resolves to another
+/// directory is forgotten only by an import's proof: one of the two was learned from another
+/// file, so both are forgotten and the conflict is logged; a check keeps it. Ok(true) when the
+/// root is stored or already known.
+async fn store_root(
+    db: &SqlitePool,
+    song: &NativeSong,
+    proven: &Proven,
+    at: Learner,
+) -> Result<bool, String> {
     let Some(local_path) = proven.root.to_str() else {
         return Err(format!("{} is not valid UTF-8", proven.root.display()));
     };
     let stored = NavidromeLibraryRow::get_in(db, song.library_id).await?;
     if let Some(row) = stored.filter(|row| row.navidrome_path == song.library_path) {
-        match tokio::fs::canonicalize(&row.local_path).await {
-            Ok(known) if known == proven.canonical_root => return Ok(true),
-            Ok(_) => {
-                NavidromeLibraryRow::delete_in(db, song.library_id).await?;
-                warn!(
-                    "Navidrome library {} ({}) was learned at {} on this machine, and {} puts it \
-                     at {}: one of the two came from another file, so Soulful forgets both \
-                     until an import shows it again",
-                    song.library_id,
-                    song.library_path,
-                    row.local_path,
-                    proven.local.display(),
-                    local_path
-                );
+        let unreadable = |e: std::io::Error| format!("{}: {e}", row.local_path);
+        match dir_at(Path::new(&row.local_path)).await {
+            Dir::Absent => {}
+            Dir::Unreadable(e) => return Err(unreadable(e)),
+            Dir::Here => {
+                let known = tokio::fs::canonicalize(&row.local_path)
+                    .await
+                    .map_err(unreadable)?;
+                if known == proven.canonical_root {
+                    return Ok(true);
+                }
+                if let Learner::Import = at {
+                    NavidromeLibraryRow::delete_in(db, song.library_id).await?;
+                    warn!(
+                        "Navidrome library {} ({}) was learned at {} on this machine, and {} puts \
+                         it at {}: one of the two came from another file, so Soulful forgets both \
+                         until an import shows it again",
+                        song.library_id,
+                        song.library_path,
+                        row.local_path,
+                        proven.local.display(),
+                        local_path
+                    );
+                }
                 return Ok(false);
             }
-            Err(_) => {}
         }
     }
     NavidromeLibraryRow::upsert_in(
@@ -795,6 +914,41 @@ mod tests {
                 .unwrap()
                 .map(|row| row.local_path),
             Some(dir.path().join("data/music").to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_learned_root_that_cannot_be_read_is_kept_and_nothing_is_stored() {
+        use std::os::unix::fs::PermissionsExt;
+        let (db, dir) = (test_db::migrated().await, tempfile::tempdir().unwrap());
+        let alices = shared_parent(dir.path());
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(locked.join("mount")).unwrap();
+        let stored = NavidromeLibraryRow {
+            library_id: 1,
+            navidrome_path: "/music".into(),
+            local_path: locked.join("mount").to_string_lossy().into_owned(),
+        };
+        NavidromeLibraryRow::upsert_in(&db, &stored).await.unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let learned = learn_in(
+            &db,
+            &[native(Path::new("/music"), "alice/Artist/Album/03.flac", 5)],
+            &alices,
+        )
+        .await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            learned,
+            Err(format!(
+                "{}: {}",
+                stored.local_path,
+                std::io::Error::from_raw_os_error(13) // EACCES
+            ))
+        );
+        assert_eq!(
+            NavidromeLibraryRow::get_in(&db, 1).await.unwrap(),
+            Some(stored)
         );
     }
 

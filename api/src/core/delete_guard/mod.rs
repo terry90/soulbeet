@@ -161,8 +161,9 @@ impl Guard<'_> {
     /// first song of `actor`'s search for the item's tags whose path on this machine names the
     /// canonical file (paths::names_file), and that song's own refusal from local_file_in
     /// stands. When no song names it, the songs is_imported_file takes for the item teach where
-    /// their libraries are from the item's file, as an import's index lookup does
-    /// (paths::learn_in), and when one is learned the songs are asked again. When still none
+    /// their libraries are from the item's file, as an import's index lookup does, when their
+    /// library has no root on this machine (paths::learn_in_check), and when one is learned the
+    /// songs are asked again. When still none
     /// names it, the refusal of a song is_imported_file takes for the item but whose file cannot
     /// be found here says why, else Navidrome has no song for it. Then check_resolved with
     /// `exempt_jobs`. A pending discovery track never holds a library item, so this is Checked.
@@ -201,7 +202,7 @@ impl Guard<'_> {
             .collect();
         let mut named = self.song_naming(&candidates, &path).await?;
         if named.is_none() && !taken.is_empty() {
-            match paths::learn_in(self.db, &taken, &reported).await {
+            match paths::learn_in_check(self.db, &taken, &reported, self.music_path).await {
                 Ok(learned) if !learned.is_empty() => {
                     named = self.song_naming(&candidates, &path).await?;
                 }
@@ -1803,6 +1804,117 @@ mod tests {
         );
         assert_eq!(learned_root(&lib).await, None);
         assert_eq!(lib.fake.ratings_set(), vec![]);
+    }
+
+    /// The library item of song s1's file, A/x.flac with s1's tags.
+    fn item_x() -> ImportedItem {
+        ImportedItem {
+            path: "A/x.flac".into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+        }
+    }
+
+    /// Alice's folder alice-mirror at `{root}/mirror/alice`, a copy of music/alice that kept
+    /// its times (rsync -a, cp -p) holding A/x.flac and A/y.flac; song s2 at
+    /// `{root}/music/alice/A/y.flac`, rated 1 by alice; and s1's file under music gone.
+    async fn mirrored_with_one_file_gone(lib: &Library) {
+        lib.folder("alice", "alice-mirror", "mirror/alice", false)
+            .await;
+        lib.song("s2", "alice/A/y.flac", b"other!");
+        lib.fake.rates("alice", "s2", 1);
+        for (rel, bytes) in [("A/x.flac", &b"audio"[..]), ("A/y.flac", &b"other!"[..])] {
+            let copy = lib.root.join("mirror/alice").join(rel);
+            std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+            std::fs::write(&copy, bytes).unwrap();
+            test_support::set_mtime(&copy, test_support::mtime());
+        }
+        std::fs::remove_file(lib.root.join("music/alice/A/x.flac")).unwrap();
+    }
+
+    /// Checks s1 by song and by its item in the mirror, both refused for the file gone under
+    /// the library's root, then s2, which must still be its file under music.
+    async fn only_the_gone_file_is_refused(lib: &Library) {
+        let no_file = (
+            FailureCode::DeletePathUnresolved,
+            format!(
+                "No file at {}",
+                lib.root.join("music/alice/A/x.flac").display()
+            ),
+        );
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
+            no_file
+        );
+        let f = lib
+            .guard()
+            .check_file(&lib.alice(), &item_x(), &lib.root.join("mirror/alice"), &[])
+            .await
+            .unwrap_err();
+        assert_eq!((f.code, f.message), no_file);
+        assert_eq!(lib.fake.ratings_set(), vec![]);
+        let checked = library_verdict(lib.guard().check_song(&lib.alice(), "s2").await);
+        assert_eq!(checked.path, canonical(&lib, "music/alice/A/y.flac"));
+        assert!(
+            lib.root.join("mirror/alice/A/x.flac").exists()
+                && lib.root.join("mirror/alice/A/y.flac").exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_gone_under_navidromes_own_root_teaches_no_root_from_a_mirror() {
+        // Navidrome's library path is here, so it is the root: the mirror's copy of the gone
+        // file proves another root, which must not become the library's.
+        let lib = Library::new().await;
+        mirrored_with_one_file_gone(&lib).await;
+        only_the_gone_file_is_refused(&lib).await;
+        assert_eq!(learned_root(&lib).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_file_gone_under_a_stored_root_keeps_that_root() {
+        // Navidrome mounts the music elsewhere and an import taught the root: one file gone
+        // under it neither replaces nor forgets it.
+        let lib = Library::new().await;
+        mounted_elsewhere(&lib, test_support::mtime());
+        let music = lib.root.join("music").to_string_lossy().into_owned();
+        crate::models::navidrome_library::NavidromeLibraryRow::upsert_in(
+            &lib.db,
+            &crate::models::navidrome_library::NavidromeLibraryRow {
+                library_id: 1,
+                navidrome_path: NAVIDROME_MOUNT.into(),
+                local_path: music.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        mirrored_with_one_file_gone(&lib).await;
+        only_the_gone_file_is_refused(&lib).await;
+        assert_eq!(learned_root(&lib).await, Some(music));
+    }
+
+    #[tokio::test]
+    async fn a_stored_root_that_is_gone_is_replaced_by_the_root_a_check_proves() {
+        let lib = Library::new().await;
+        mounted_elsewhere(&lib, test_support::mtime());
+        crate::models::navidrome_library::NavidromeLibraryRow::upsert_in(
+            &lib.db,
+            &crate::models::navidrome_library::NavidromeLibraryRow {
+                library_id: 1,
+                navidrome_path: NAVIDROME_MOUNT.into(),
+                local_path: lib.root.join("old-mount").to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let checked = library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+        assert_eq!(checked.path, canonical(&lib, "music/alice/A/x.flac"));
+        assert_eq!(
+            learned_root(&lib).await,
+            Some(lib.root.join("music").to_string_lossy().into_owned())
+        );
     }
 
     #[tokio::test]
