@@ -118,7 +118,7 @@ pub(super) async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> 
 ///
 /// Every row it sends carries its slot and is recorded in `ledger`: failed
 /// files Failed, queued ones Downloading. The batch a file goes into is
-/// recorded before the backend hears of it, so a restart knows where a file
+/// stored before the backend hears of it, so a restart knows where a file
 /// slskd took may be. A file one of the user's batches
 /// already downloads into this folder dismisses its slot, as that batch
 /// pursues it. A slot the request got no answer for is recorded Failed but
@@ -165,11 +165,15 @@ pub(super) async fn queue_and_watch(
     let claimed = claim_request(&backend, items.clone(), fresh.owned_by(&ctx));
     if claimed.sends() {
         let batch = claimed.batch();
-        ledger.record(JobEvent::Enqueued {
-            job: job.clone(),
-            monitor_batch_id: batch.owner.batch_id.clone(),
-            batch_label: batch.label.clone(),
-        });
+        // Stored before the backend hears of a file, so a restart after it took one finds the
+        // batch. A write the ledger refused is logged there, and the request goes on.
+        let _ = ledger
+            .record_stored(JobEvent::Enqueued {
+                job: job.clone(),
+                monitor_batch_id: batch.owner.batch_id.clone(),
+                batch_label: batch.label.clone(),
+            })
+            .await;
     }
     let enq = claimed.enqueue(&backend).await;
     let refusal = enq.refusal();
@@ -904,5 +908,67 @@ mod tests {
             })
             .collect();
         assert_eq!(after, vec![Some(JobState::Downloading), None]);
+    }
+
+    #[tokio::test]
+    async fn the_backend_hears_of_a_file_only_once_its_batch_is_stored() {
+        let db = crate::db::test_db::migrated().await;
+        let folder_id = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        ledger
+            .create(
+                NewJob {
+                    id: "j1".into(),
+                    user: UserId::new("alice"),
+                    folder_id,
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Queued,
+                    search_id: None,
+                    picked: numbered(vec![
+                        item("p", "Zero", "slow/0.flac"),
+                        item("p", "One", "slow/1.flac"),
+                    ]),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let (reached, release) = stub.hold_downloads();
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        // Joining a running batch, so no monitor starts.
+        let running = batch("Come Over");
+        TransferRegistry::global().claim(&[key(&backend, "p", "slow/0.flac")], &running);
+        let fresh = new_batch_beside(&running, running.target.clone());
+        // A slow writer: the pool's one connection is taken until the test lets it go.
+        let busy = db.acquire().await.unwrap();
+        let ctx = ctx_of(&running);
+        let request = tokio::spawn({
+            let ledger = ledger.clone();
+            async move {
+                let items = vec![
+                    item("p", "Zero", "slow/0.flac"),
+                    item("p", "One", "slow/1.flac"),
+                ];
+                enqueue_and_watch(&ledger, &ctx, backend, fresh, acquisition(items, vec![])).await
+            }
+        });
+
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), reached.notified());
+        assert!(
+            early.await.is_err(),
+            "the backend heard of the file before its batch was stored"
+        );
+        drop(busy);
+        reached.notified().await;
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT monitor_batch_id FROM jobs WHERE id = 'j1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(stored, Some(running.owner.batch_id.clone()));
+        release.notify_one();
+        request.await.unwrap().unwrap();
     }
 }

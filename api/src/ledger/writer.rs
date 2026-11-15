@@ -46,6 +46,11 @@ pub(super) enum Write {
         reply: Reply<Pruned>,
     },
     Event(JobEvent),
+    /// An event whose sender waits until it is stored.
+    Stored {
+        event: Box<JobEvent>,
+        reply: Reply<()>,
+    },
     #[cfg(test)]
     Settled {
         reply: Reply<()>,
@@ -167,18 +172,30 @@ impl Writer {
                 answer(reply, "remove expired rows", prune(db, now).await)
             }
             Write::Event(event) => {
-                if let Err(e) = self.record(event).await {
+                if let Err(e) = self.event(event).await {
                     warn!("Could not record a job's change in the job ledger: {e}");
-                    // The keys may name rows the failed transaction did not
-                    // store; a slot without one stores its next row.
-                    self.stored.clear();
                 }
+            }
+            Write::Stored { event, reply } => {
+                let stored = self.event(*event).await;
+                answer(reply, "record a job's change", stored)
             }
             #[cfg(test)]
             Write::Settled { reply } => {
                 let _ = reply.send(Ok(()));
             }
         }
+    }
+
+    /// Records `event`, forgetting the stored row keys when it fails.
+    async fn event(&mut self, event: JobEvent) -> Result<(), LedgerError> {
+        let recorded = self.record(event).await;
+        if recorded.is_err() {
+            // The keys may name rows the failed transaction did not
+            // store; a slot without one stores its next row.
+            self.stored.clear();
+        }
+        recorded
     }
 
     async fn record(&mut self, event: JobEvent) -> Result<(), LedgerError> {

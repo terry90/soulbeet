@@ -289,6 +289,22 @@ impl Ledger {
         let _ = self.writes.send(Write::Event(event));
     }
 
+    /// Records `event` and waits until the writer has stored it, after every write sent before
+    /// it. The writer logs one the database refused. A recording ledger records it and answers
+    /// at once.
+    pub async fn record_stored(&self, event: JobEvent) -> Result<(), LedgerError> {
+        #[cfg(test)]
+        if self.recording {
+            self.record(event);
+            return Ok(());
+        }
+        self.write(|reply| Write::Stored {
+            event: Box::new(event),
+            reply,
+        })
+        .await
+    }
+
     /// A ledger whose writer runs on `db` (tests, and start_server_ledger).
     pub fn start(db: SqlitePool) -> Ledger {
         let (ledger, inbox) = Ledger::channel();
