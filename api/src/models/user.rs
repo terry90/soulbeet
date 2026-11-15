@@ -38,6 +38,8 @@ pub struct User {
 pub enum UserChangeError {
     NotFound,
     LastAdmin,
+    /// Another account has this name, in any letter case.
+    UsernameTaken,
     Db(String),
 }
 
@@ -47,6 +49,7 @@ impl fmt::Display for UserChangeError {
         match self {
             Self::NotFound => f.write_str("User not found"),
             Self::LastAdmin => f.write_str("Soulful needs at least one admin"),
+            Self::UsernameTaken => f.write_str("That username is taken"),
             Self::Db(e) => f.write_str(e),
         }
     }
@@ -62,15 +65,30 @@ pub fn username_fits(username: &str) -> bool {
     username.len() <= MAX_USERNAME_BYTES
 }
 
-/// The Soulful rows a name Navidrome verified can belong to. Navidrome
-/// compares names without letter case, so `Bob` signs in as `bob`.
+/// The rows a name belongs to. Names are unique and matched without regard
+/// to ASCII letter case (as Navidrome does), so `Bob` signs in as `bob`.
 #[cfg(feature = "server")]
 #[derive(Debug)] // User has no PartialEq; tests match on the variant
-pub enum NavidromeNameMatch {
+pub enum NameMatch {
     None,
     One(User),
-    /// No row has the exact name and several match it without case.
+    /// Rows from before the rule whose names differ only in letter case.
+    /// None of them can sign in until an admin deletes the extra ones.
     Several,
+}
+
+/// What the triggers of the username migration raise for a taken name.
+#[cfg(feature = "server")]
+const USERNAME_TAKEN_RAISED: &str = "username taken";
+
+#[cfg(feature = "server")]
+fn change_error(e: sqlx::Error) -> UserChangeError {
+    match &e {
+        sqlx::Error::Database(d) if d.message() == USERNAME_TAKEN_RAISED => {
+            UserChangeError::UsernameTaken
+        }
+        _ => UserChangeError::Db(e.to_string()),
+    }
 }
 
 #[cfg(feature = "server")]
@@ -84,7 +102,7 @@ fn hash_password(password: &str) -> Result<String, String> {
 
 #[cfg(feature = "server")]
 impl User {
-    pub async fn create(username: &str, password: &str) -> Result<User, String> {
+    pub async fn create(username: &str, password: &str) -> Result<User, UserChangeError> {
         Self::create_in(&DB, username, password).await
     }
 
@@ -92,8 +110,8 @@ impl User {
         db: &SqlitePool,
         username: &str,
         password: &str,
-    ) -> Result<User, String> {
-        let password_hash = hash_password(password)?;
+    ) -> Result<User, UserChangeError> {
+        let password_hash = hash_password(password).map_err(UserChangeError::Db)?;
         let id = Uuid::new_v4().to_string();
 
         sqlx::query_as::<_, User>(
@@ -107,22 +125,7 @@ impl User {
         .bind(shared::system::NavidromeStatus::Unknown.as_str())
         .fetch_one(db)
         .await
-        .map_err(|e| e.to_string())
-    }
-
-    /// The user whose name and password these are, or `None` for an unknown
-    /// name or a wrong password. `Err` is a database failure.
-    pub(crate) async fn verify_in(
-        db: &SqlitePool,
-        username: &str,
-        password: &str,
-    ) -> Result<Option<User>, String> {
-        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
-            .bind(username)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(user.filter(|u| u.password_matches(password)))
+        .map_err(change_error)
     }
 
     pub fn password_matches(&self, password: &str) -> bool {
@@ -184,13 +187,21 @@ impl User {
         .ok_or_else(|| UserChangeError::NotFound.to_string())
     }
 
-    pub async fn update_username(id: &str, new_username: &str) -> Result<(), String> {
+    pub async fn update_username(id: &str, new_username: &str) -> Result<(), UserChangeError> {
+        Self::update_username_in(&DB, id, new_username).await
+    }
+
+    pub(crate) async fn update_username_in(
+        db: &SqlitePool,
+        id: &str,
+        new_username: &str,
+    ) -> Result<(), UserChangeError> {
         sqlx::query("UPDATE users SET username = ? WHERE id = ?")
             .bind(new_username)
             .bind(id)
-            .execute(&*DB)
+            .execute(db)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(change_error)?;
         Ok(())
     }
 
@@ -248,34 +259,35 @@ impl User {
         }
     }
 
-    pub async fn get_by_username(username: &str) -> Result<Option<User>, String> {
-        sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
-            .bind(username)
-            .fetch_optional(&*DB)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// The row with exactly this name, else the only row whose name matches
-    /// it without letter case, the way Navidrome compares names.
-    pub(crate) async fn match_navidrome_name_in(
+    /// The account a name belongs to, matched without ASCII letter case.
+    pub(crate) async fn find_by_name_in(
         db: &SqlitePool,
         username: &str,
-    ) -> Result<NavidromeNameMatch, String> {
+    ) -> Result<NameMatch, String> {
         let mut rows =
             sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ? COLLATE NOCASE")
                 .bind(username)
                 .fetch_all(db)
                 .await
                 .map_err(|e| e.to_string())?;
-        if let Some(i) = rows.iter().position(|u| u.username == username) {
-            return Ok(NavidromeNameMatch::One(rows.swap_remove(i)));
-        }
         Ok(match rows.len() {
-            0 => NavidromeNameMatch::None,
-            1 => NavidromeNameMatch::One(rows.remove(0)),
-            _ => NavidromeNameMatch::Several,
+            0 => NameMatch::None,
+            1 => NameMatch::One(rows.remove(0)),
+            _ => NameMatch::Several,
         })
+    }
+
+    /// Names that another account also has in other letter case, from before
+    /// names were unique without case. Ordered so case variants sit together.
+    pub(crate) async fn case_collisions_in(db: &SqlitePool) -> Result<Vec<String>, String> {
+        sqlx::query_scalar(
+            "SELECT u.username FROM users u WHERE EXISTS (SELECT 1 FROM users o \
+             WHERE o.id <> u.id AND o.username = u.username COLLATE NOCASE) \
+             ORDER BY u.username COLLATE NOCASE, u.username",
+        )
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())
     }
 
     pub(crate) async fn link_navidrome_in(
@@ -328,6 +340,21 @@ impl User {
             .fetch_all(&*DB)
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+/// Startup check: accounts whose names differ only in letter case cannot
+/// sign in until an admin deletes the extra ones.
+#[cfg(feature = "server")]
+pub async fn log_username_collisions() {
+    match User::case_collisions_in(&DB).await {
+        Ok(names) if !names.is_empty() => tracing::warn!(
+            "These accounts cannot sign in because their names differ only in letter case: {}. \
+             An admin can delete the ones that are not used in Settings > Users.",
+            names.join(", ")
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Could not check usernames: {e}"),
     }
 }
 
@@ -423,6 +450,57 @@ mod tests {
             Err(UserChangeError::NotFound)
         );
         assert!(User::find_by_id_in(&db, "nobody").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn names_are_unique_without_letter_case() {
+        let db = test_db::migrated().await;
+        let bob = User::create_in(&db, "bob", "pw").await.unwrap();
+        assert_eq!(
+            User::create_in(&db, "BOB", "pw").await.unwrap_err(),
+            UserChangeError::UsernameTaken
+        );
+        let eve = User::create_in(&db, "eve", "pw").await.unwrap();
+        assert_eq!(
+            User::update_username_in(&db, &eve.id, "Bob").await,
+            Err(UserChangeError::UsernameTaken)
+        );
+        // A change of one's own name's letter case is not a collision.
+        User::update_username_in(&db, &bob.id, "Bob").await.unwrap();
+        assert!(matches!(
+            User::find_by_name_in(&db, "bOB").await.unwrap(),
+            NameMatch::One(u) if u.id == bob.id
+        ));
+        assert!(matches!(
+            User::find_by_name_in(&db, "nobody").await.unwrap(),
+            NameMatch::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn rows_that_collide_from_before_the_rule_are_several_and_listed() {
+        let db = test_db::migrated_before(test_db::USERNAME_CASE).await;
+        for (id, name) in [("u1", "bob"), ("u2", "Bob"), ("u3", "eve")] {
+            sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')")
+                .bind(id)
+                .bind(name)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        test_db::apply(&db, test_db::USERNAME_CASE).await;
+        assert!(matches!(
+            User::find_by_name_in(&db, "bob").await.unwrap(),
+            NameMatch::Several
+        ));
+        assert_eq!(
+            User::case_collisions_in(&db).await.unwrap(),
+            vec!["Bob".to_string(), "bob".to_string()]
+        );
+        assert_eq!(
+            User::create_in(&db, "BOB", "pw").await.unwrap_err(),
+            UserChangeError::UsernameTaken
+        );
     }
 
     #[test]

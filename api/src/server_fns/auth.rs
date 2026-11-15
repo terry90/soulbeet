@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use crate::{
     auth::{self, RegistrationMode},
-    base_url::{request_base, BaseUrl},
+    base_url::{request_base_with, BaseUrl, BaseUrlError},
     config::CONFIG,
     login_limiter::{LoginLimiter, LOGIN_LIMITER},
     models,
@@ -13,7 +13,7 @@ use crate::{
 };
 
 #[cfg(feature = "server")]
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Uri};
 
 #[cfg(feature = "server")]
 use tower_cookies::{
@@ -59,8 +59,20 @@ pub(crate) struct SessionCookie {
 
 #[cfg(feature = "server")]
 impl SessionCookie {
-    pub(crate) fn for_request(headers: &HeaderMap) -> Result<SessionCookie, ServerFnError> {
-        let base = request_base(headers)
+    pub(crate) fn for_request(
+        headers: &HeaderMap,
+        uri: &Uri,
+    ) -> Result<SessionCookie, ServerFnError> {
+        Self::for_request_with(headers, uri, CONFIG.public_url())
+    }
+
+    /// `for_request` with `public_url`, the parsed `PUBLIC_URL`.
+    pub(crate) fn for_request_with(
+        headers: &HeaderMap,
+        uri: &Uri,
+        public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+    ) -> Result<SessionCookie, ServerFnError> {
+        let base = request_base_with(headers, uri, public_url)
             .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
         let origin = headers
             .get(axum::http::header::ORIGIN)
@@ -78,7 +90,12 @@ pub(crate) fn issue_session_cookie(
     session: &SessionCookie,
     user: &models::user::User,
 ) -> Result<(), ServerFnError> {
-    let token = auth::create_token(&user.id, user.credentials_version).map_err(server_error)?;
+    let token = auth::create_token(
+        crate::secret_key::current(),
+        &user.id,
+        user.credentials_version,
+    )
+    .map_err(server_error)?;
     cookies.add(build_auth_cookie(token, session.secure));
     Ok(())
 }
@@ -121,7 +138,7 @@ pub async fn register(username: String, password: String) -> Result<(), ServerFn
     super::user::check_username_length(&username)?;
     models::user::User::create(&username, &password)
         .await
-        .map_err(server_error)
+        .map_err(super::user::user_change_error)
         .map(|_| ())
 }
 
@@ -181,6 +198,15 @@ async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResu
     }
 }
 
+/// Why a name that matches several accounts cannot sign in.
+#[cfg(feature = "server")]
+fn several_accounts(username: &str) -> String {
+    format!(
+        "Several Soulful accounts match '{username}' when letter case is ignored, so none of \
+         them can sign in. Ask an admin to delete the accounts that are not yours."
+    )
+}
+
 /// Who the credentials belong to, once the limiter has let the attempt through.
 #[cfg(feature = "server")]
 enum Credentials {
@@ -198,6 +224,9 @@ enum Credentials {
 /// account. A database error records nothing. The clock is read when each
 /// decision is made, so a slow Navidrome call does not backdate a recorded
 /// failure.
+///
+/// For an account linked to Navidrome, Navidrome's refusal is final; its
+/// local password counts only while Navidrome is unreachable or not set up.
 #[cfg(feature = "server")]
 async fn authenticate_in(
     db: &sqlx::SqlitePool,
@@ -207,6 +236,7 @@ async fn authenticate_in(
     clock: impl Fn() -> std::time::Instant,
     navidrome: impl std::future::Future<Output = NavidromeAuthResult>,
 ) -> Result<Credentials, ServerFnError> {
+    use models::user::NameMatch;
     use shared::system::NavidromeStatus;
 
     // No account has a longer name, so nothing is counted for it: the limiter
@@ -224,12 +254,19 @@ async fn authenticate_in(
         return Ok(Credentials::Navidrome);
     }
 
-    // Navidrome rejected the credentials, is down, or is not set up: fall back
-    // to the local password.
-    let Some(user) = models::user::User::verify_in(db, username, password)
+    let user = match models::user::User::find_by_name_in(db, username)
         .await
         .map_err(server_error)?
-    else {
+    {
+        // Not a wrong password, so nothing is counted.
+        NameMatch::Several => return Err(refusal_error(several_accounts(username))),
+        NameMatch::None => None,
+        NameMatch::One(user) => Some(user),
+    };
+    let refused_by_navidrome = matches!(result, NavidromeAuthResult::AuthFailed);
+    let Some(user) = user.filter(|u| {
+        !(refused_by_navidrome && u.navidrome_token.is_some()) && u.password_matches(password)
+    }) else {
         attempt.failed(clock());
         return Err(unauthorized_error("Invalid username or password"));
     };
@@ -329,19 +366,13 @@ pub(crate) async fn apply_navidrome_login(
     mode: RegistrationMode,
 ) -> Result<LoginOutcome, String> {
     use crate::security;
-    use models::user::{NavidromeNameMatch, User};
+    use models::user::{NameMatch, User};
     use shared::system::NavidromeStatus;
 
-    let existing = match User::match_navidrome_name_in(db, username).await? {
-        NavidromeNameMatch::None => None,
-        NavidromeNameMatch::One(user) => Some(user),
-        NavidromeNameMatch::Several => {
-            return Ok(LoginOutcome::Refused(format!(
-                "Several Soulful accounts match '{username}' when letter case is ignored, as \
-                 Navidrome compares names. Sign in with the exact name of your account, or ask \
-                 an admin to delete the accounts that are not yours."
-            )));
-        }
+    let existing = match User::find_by_name_in(db, username).await? {
+        NameMatch::None => None,
+        NameMatch::One(user) => Some(user),
+        NameMatch::Several => return Ok(LoginOutcome::Refused(several_accounts(username))),
     };
     let connected = NavidromeStatus::Connected.as_str();
     let existing = existing.map(|u| {
@@ -367,7 +398,9 @@ pub(crate) async fn apply_navidrome_login(
             )));
         }
         LoginPlan::Create => {
-            let user = User::create_in(db, username, password).await?;
+            let user = User::create_in(db, username, password)
+                .await
+                .map_err(|e| e.to_string())?;
             User::update_navidrome_token_in(db, &user.id, Some(encrypted_password), connected)
                 .await?;
             user.id
@@ -395,7 +428,7 @@ pub(crate) async fn apply_navidrome_login(
         .ok_or_else(|| "User not found".to_string())
 }
 
-#[post("/api/auth/login", cookies: Cookies, headers: HeaderMap)]
+#[post("/api/auth/login", cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn login(username: String, password: String) -> Result<AuthResponse, ServerFnError> {
     use crate::crypto;
     use crate::db::DB;
@@ -404,7 +437,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
     use shared::system::NavidromeStatus;
     use std::time::Instant;
 
-    let session = SessionCookie::for_request(&headers)?;
+    let session = SessionCookie::for_request(&headers, &uri)?;
     let rename_allowed = CONFIG.navidrome_url().is_none();
 
     let credentials = authenticate_in(
@@ -419,7 +452,8 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
 
     match credentials {
         Credentials::Navidrome => {
-            let encrypted = crypto::encrypt(&password).map_err(server_error)?;
+            let encrypted =
+                crypto::encrypt(crate::secret_key::current(), &password).map_err(server_error)?;
             let user = match apply_navidrome_login(
                 &DB,
                 &username,
@@ -478,21 +512,49 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
     }
 }
 
-#[post("/api/auth/refresh", auth: AuthSession, cookies: Cookies, headers: HeaderMap)]
+#[post("/api/auth/refresh", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn refresh_token() -> Result<(), ServerFnError> {
-    let session = SessionCookie::for_request(&headers)?;
+    let session = SessionCookie::for_request(&headers, &uri)?;
     start_session(&cookies, &session, &auth.0.user_id)
         .await
         .map(|_| ())
 }
 
+/// Ends the session of `token` on the server, so a copy of the cookie stops
+/// working too. The user's other sessions stay. A token that no longer
+/// verifies has nothing to end.
+#[cfg(feature = "server")]
+pub(crate) async fn end_session_in(
+    db: &sqlx::SqlitePool,
+    key: &crate::secret_key::SecretKey,
+    token: &str,
+    now: i64,
+) -> Result<(), String> {
+    let Ok(claims) = auth::verify_token(key, token) else {
+        return Ok(());
+    };
+    models::revoked_session::RevokedSession::revoke_in(db, &claims.jti, claims.exp as i64, now)
+        .await
+}
+
 #[post("/api/auth/logout", cookies: Cookies)]
 pub async fn logout() -> Result<(), ServerFnError> {
+    let token = cookies.get(AUTH_COOKIE_NAME).map(|c| c.value().to_string());
+
     let mut cookie = Cookie::new(AUTH_COOKIE_NAME, "");
     cookie.set_path("/");
-
     cookies.remove(cookie);
 
+    if let Some(token) = token {
+        end_session_in(
+            &crate::db::DB,
+            crate::secret_key::current(),
+            &token,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .map_err(server_error)?;
+    }
     Ok(())
 }
 
@@ -537,8 +599,19 @@ mod tests {
             .collect()
     }
 
+    fn path_only() -> Uri {
+        Uri::from_static("/api/auth/login")
+    }
+
+    fn cookie_for(
+        pairs: &[(&str, &str)],
+        public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+    ) -> Result<SessionCookie, ServerFnError> {
+        SessionCookie::for_request_with(&headers(pairs), &path_only(), public_url)
+    }
+
     fn secure_cookie_for(pairs: &[(&str, &str)]) -> bool {
-        SessionCookie::for_request(&headers(pairs)).unwrap().secure
+        cookie_for(pairs, None).unwrap().secure
     }
 
     #[test]
@@ -580,8 +653,30 @@ mod tests {
 
     #[test]
     fn a_request_without_an_address_is_refused() {
-        let err = SessionCookie::for_request(&HeaderMap::new()).err().unwrap();
+        let err = cookie_for(&[], None).err().unwrap();
         assert_eq!(code(&err), 409);
+    }
+
+    #[test]
+    fn the_public_url_pin_decides_the_cookie() {
+        let pin = BaseUrl::parse("https://music.example.com");
+        assert!(
+            cookie_for(&[("host", "192.168.1.5:9765")], Some(&pin))
+                .unwrap()
+                .secure
+        );
+        let bad = BaseUrl::parse("music.example.com");
+        let err = cookie_for(&[("host", "music.example.com")], Some(&bad))
+            .err()
+            .unwrap();
+        assert_eq!(code(&err), 409);
+    }
+
+    #[test]
+    fn an_http2_request_without_host_gets_a_cookie() {
+        let uri = Uri::from_static("http://music.example.com/api/auth/login");
+        let session = SessionCookie::for_request_with(&HeaderMap::new(), &uri, None).unwrap();
+        assert!(session.secure);
     }
 
     #[test]
@@ -1024,28 +1119,172 @@ mod tests {
         assert!(row(&db, "Bob").await.is_none());
     }
 
-    #[tokio::test]
-    async fn the_exact_name_wins_and_an_ambiguous_one_is_refused() {
-        let db = test_db::migrated().await;
-        User::create_in(&db, "bob", "pw").await.unwrap();
-        let big_bob = User::create_in(&db, "Bob", "pw").await.unwrap();
-        let u = signed_in(
-            apply_navidrome_login(&db, "Bob", "pw", "enc", RegistrationMode::Navidrome)
-                .await
-                .unwrap(),
-        );
-        assert_eq!(u.id, big_bob.id);
+    /// The migrated database plus rows whose names differ only in letter
+    /// case, as an install from before the rule can hold.
+    async fn colliding(names: &[&str]) -> sqlx::SqlitePool {
+        let db = test_db::migrated_before(test_db::USERNAME_CASE).await;
+        for name in names {
+            User::create_in(&db, name, "pw").await.unwrap();
+        }
+        test_db::apply(&db, test_db::USERNAME_CASE).await;
+        db
+    }
 
+    #[tokio::test]
+    async fn names_that_collide_without_case_are_refused_everywhere() {
+        let db = colliding(&["bob", "Bob"]).await;
         let before = user_count(&db).await;
-        let outcome = apply_navidrome_login(&db, "BOB", "pw", "enc", RegistrationMode::Navidrome)
-            .await
-            .unwrap();
-        match outcome {
-            LoginOutcome::Refused(msg) => {
-                assert!(msg.starts_with("Several Soulful accounts"), "{msg}")
+        for name in ["bob", "Bob", "BOB"] {
+            let outcome =
+                apply_navidrome_login(&db, name, "pw", "enc", RegistrationMode::Navidrome)
+                    .await
+                    .unwrap();
+            match outcome {
+                LoginOutcome::Refused(msg) => {
+                    assert!(msg.starts_with("Several Soulful accounts"), "{msg}")
+                }
+                other => panic!("expected a refusal, got {other:?}"),
             }
-            other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(user_count(&db).await, before);
+
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..=FREE_FAILURES {
+            let err = sign_in(
+                &db,
+                &limiter,
+                "bob",
+                "pw",
+                now,
+                NavidromeAuthResult::NotConfigured,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(code(&err), 409);
+            assert!(
+                err.to_string().contains("Several Soulful accounts"),
+                "{err}"
+            );
+        }
+        // A refusal is not a wrong password, so nothing was counted.
+        assert!(limiter.begin("bob", now).is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_sign_in_ignores_letter_case() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "right").await.unwrap();
+        let limiter = LoginLimiter::new();
+        let ok = sign_in(
+            &db,
+            &limiter,
+            "ANN",
+            "right",
+            Instant::now(),
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(ok, Credentials::Local { user, .. } if user.id == ann.id));
+    }
+
+    #[tokio::test]
+    async fn navidrome_refusing_a_linked_account_refuses_the_sign_in() {
+        let db = test_db::migrated().await;
+        linked_bob(&db, "pw").await;
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..=FREE_FAILURES {
+            // The local password matches, but Navidrome said no.
+            let err = sign_in(
+                &db,
+                &limiter,
+                "bob",
+                "pw",
+                now,
+                NavidromeAuthResult::AuthFailed,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(code(&err), 401);
+        }
+        assert!(matches!(
+            limiter.begin("bob", now).err(),
+            Some(LoginBlock::Account { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_linked_account_signs_in_locally_while_navidrome_is_away() {
+        let db = test_db::migrated().await;
+        let bob = linked_bob(&db, "pw").await;
+        let limiter = LoginLimiter::new();
+        for (result, expected) in [
+            (
+                NavidromeAuthResult::Unreachable,
+                shared::system::NavidromeStatus::Offline,
+            ),
+            (
+                NavidromeAuthResult::NotConfigured,
+                shared::system::NavidromeStatus::Unknown,
+            ),
+        ] {
+            let ok = sign_in(&db, &limiter, "bob", "pw", Instant::now(), result)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&ok, Credentials::Local { user, status } if user.id == bob.id && *status == expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unlinked_account_keeps_local_sign_in_when_navidrome_refuses() {
+        let db = test_db::migrated().await;
+        User::create_in(&db, "ann", "right").await.unwrap();
+        let limiter = LoginLimiter::new();
+        let ok = sign_in(
+            &db,
+            &limiter,
+            "ann",
+            "right",
+            Instant::now(),
+            NavidromeAuthResult::AuthFailed,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            ok,
+            Credentials::Local {
+                status: shared::system::NavidromeStatus::InvalidCredentials,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn signing_out_ends_that_token_and_no_other() {
+        use crate::secret_key::SecretKey;
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let key = SecretKey::new("k".repeat(32));
+        let this_device = auth::create_token(&key, &ann.id, 0).unwrap();
+        let other_device = auth::create_token(&key, &ann.id, 0).unwrap();
+
+        end_session_in(&db, &key, &this_device, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+
+        let load = |t: String| {
+            let (db, key) = (db.clone(), &key);
+            async move { crate::server_fns::guard::load_session(Some(&t), &db, key).await }
+        };
+        assert_eq!(load(this_device).await.unwrap_err().0.as_u16(), 401);
+        assert_eq!(load(other_device).await.unwrap().user_id, ann.id);
+        // A token that does not verify has nothing to end.
+        end_session_in(&db, &key, "not-a-token", 0).await.unwrap();
     }
 }

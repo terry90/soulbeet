@@ -14,9 +14,14 @@ use tokio::sync::broadcast;
 
 #[cfg(feature = "server")]
 use crate::{
-    server_fns::{refusal_error, refusal_error_with, server_error},
+    base_url::BaseUrl,
+    server_fns::{forbidden_error, refusal_error, refusal_error_with, server_error},
     AuthSession,
 };
+#[cfg(feature = "server")]
+use axum::http::{HeaderMap, Uri};
+#[cfg(feature = "server")]
+use tower_cookies::Cookies;
 
 #[cfg(feature = "server")]
 use crate::globals::{
@@ -88,13 +93,57 @@ fn auto_batch_label(group: &shared::download::DownloadableGroup) -> String {
     }
 }
 
+/// How often an open download socket checks that its session still counts.
+#[cfg(feature = "server")]
+const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether a socket upgrade may come from the page at `origin`: one on the
+/// host this request was made to. A request with no `Origin` is not from a
+/// browser page, so no other site can be riding on the user's cookie.
+#[cfg(feature = "server")]
+pub(crate) fn origin_allowed(origin: Option<&str>, base: &BaseUrl) -> bool {
+    match origin {
+        None => true,
+        Some(origin) => BaseUrl::parse(origin).is_ok_and(|o| o.same_host(base)),
+    }
+}
+
+/// Whether the socket's token still gives `user` a session: not signed out,
+/// no credential change since, the account still there.
+#[cfg(feature = "server")]
+pub(crate) async fn session_still_valid(
+    token: Option<&str>,
+    db: &sqlx::SqlitePool,
+    key: &crate::secret_key::SecretKey,
+    user: &UserId,
+) -> bool {
+    super::guard::load_session(token, db, key)
+        .await
+        .is_ok_and(|ctx| ctx.id() == *user)
+}
+
 /// WebSocket endpoint for real-time download updates.
 /// Uses WebSocket instead of HTTP streaming for more reliable delivery.
-#[get("/api/downloads/updates", auth: AuthSession)]
+#[get("/api/downloads/updates", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn download_updates_ws(
     options: WebSocketOptions,
 ) -> Result<Websocket<(), DownloadEvent>, ServerFnError> {
     let user = auth.0.id();
+
+    let base = crate::base_url::request_base(&headers, &uri)
+        .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    if !origin_allowed(origin, &base) {
+        warn!("Refused a download updates socket for user {user} from another origin");
+        return Err(forbidden_error(
+            "Download updates can only be opened from Soulful's own page",
+        ));
+    }
+    let token = cookies
+        .get(crate::AUTH_COOKIE_NAME)
+        .map(|c| c.value().to_string());
 
     let rx = {
         let map = USER_CHANNELS.read().await;
@@ -113,10 +162,27 @@ pub async fn download_updates_ws(
     Ok(options.on_upgrade(move |mut socket| async move {
         let mut rx = rx;
         info!("WebSocket connected for user: {}", user);
+        let mut recheck = tokio::time::interval_at(
+            tokio::time::Instant::now() + SESSION_RECHECK,
+            SESSION_RECHECK,
+        );
 
         loop {
             // handle both broadcast messages and potential socket closure
             tokio::select! {
+                _ = recheck.tick() => {
+                    let valid = session_still_valid(
+                        token.as_deref(),
+                        &crate::db::DB,
+                        crate::secret_key::current(),
+                        &user,
+                    )
+                    .await;
+                    if !valid {
+                        info!("WebSocket closed for user {}: the session ended", user);
+                        break;
+                    }
+                }
                 result = rx.recv() => {
                     match result {
                         Ok(downloads) => {
@@ -497,6 +563,66 @@ mod tests {
     fn cancel_needs_a_listed_transfer_with_that_id_and_peer() {
         assert_eq!(cancel_key(&listed(), "slskd", "peer_a", "t-2"), None);
         assert_eq!(cancel_key(&listed(), "slskd", "peer_b", "t-1"), None);
+    }
+
+    #[test]
+    fn only_this_hosts_pages_may_open_the_socket() {
+        let base = BaseUrl::parse("https://music.example.com").unwrap();
+        assert!(origin_allowed(Some("https://music.example.com"), &base));
+        assert!(!origin_allowed(Some("https://evil.example"), &base));
+        assert!(!origin_allowed(
+            Some("https://music.example.com:8443"),
+            &base
+        ));
+        assert!(!origin_allowed(Some("null"), &base));
+        assert!(origin_allowed(None, &base));
+        // http://nas:9765 typed in the browser: the base calls the host https.
+        let lan = BaseUrl::parse("https://nas:9765").unwrap();
+        assert!(origin_allowed(Some("http://nas:9765"), &lan));
+    }
+
+    #[tokio::test]
+    async fn the_socket_session_ends_with_the_session() {
+        use crate::models::revoked_session::RevokedSession;
+        use crate::secret_key::SecretKey;
+
+        let db = crate::db::test_db::migrated().await;
+        let key = SecretKey::new("k".repeat(32));
+        let ann = crate::models::user::User::create_in(&db, "ann", "pw")
+            .await
+            .unwrap();
+        let id = UserId::new(&ann.id);
+        let token = crate::auth::create_token(&key, &ann.id, 0).unwrap();
+        let valid = |t: &str| {
+            let (db, key, id, t) = (db.clone(), &key, id.clone(), t.to_string());
+            async move { session_still_valid(Some(&t), &db, key, &id).await }
+        };
+        assert!(valid(&token).await);
+        assert!(!session_still_valid(None, &db, &key, &id).await);
+        assert!(!session_still_valid(Some(&token), &db, &key, &UserId::new("other")).await);
+
+        // Signed out.
+        let jti = crate::auth::verify_token(&key, &token).unwrap().jti;
+        RevokedSession::revoke_in(&db, &jti, i64::MAX, 0)
+            .await
+            .unwrap();
+        assert!(!valid(&token).await);
+
+        // Password changed.
+        let token = crate::auth::create_token(&key, &ann.id, 0).unwrap();
+        assert!(valid(&token).await);
+        crate::models::user::User::update_password_in(&db, &ann.id, "new")
+            .await
+            .unwrap();
+        assert!(!valid(&token).await);
+
+        // Account deleted.
+        let token = crate::auth::create_token(&key, &ann.id, 1).unwrap();
+        assert!(valid(&token).await);
+        crate::models::user::User::delete_in(&db, &ann.id)
+            .await
+            .unwrap();
+        assert!(!valid(&token).await);
     }
 
     #[test]

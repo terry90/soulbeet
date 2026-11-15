@@ -13,6 +13,8 @@ pub mod importer_health;
 #[cfg(feature = "server")]
 pub mod login_limiter;
 pub mod models;
+#[cfg(feature = "server")]
+pub mod secret_key;
 pub mod security;
 pub mod services;
 #[cfg(feature = "server")]

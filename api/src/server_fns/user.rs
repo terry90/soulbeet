@@ -10,7 +10,7 @@ use crate::{
     auth::UserCtx, config::CONFIG, services::evict_navidrome_client, AdminSession, AuthSession,
 };
 #[cfg(feature = "server")]
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Uri};
 use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use tower_cookies::Cookies;
@@ -46,16 +46,9 @@ pub async fn create_user(
         return Err(refusal_error("Username and password are required"));
     }
     check_username_length(&username)?;
-    if User::get_by_username(&username)
-        .await
-        .map_err(server_error)?
-        .is_some()
-    {
-        return Err(refusal_error("That username is taken"));
-    }
     User::create(&username, &password)
         .await
-        .map_err(server_error)
+        .map_err(user_change_error)
 }
 
 #[post("/api/users/username", auth: AuthSession)]
@@ -71,7 +64,7 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
     check_username_length(new_username.trim())?;
     models::user::User::update_username(&auth.0.user_id, new_username.trim())
         .await
-        .map_err(server_error)
+        .map_err(user_change_error)
 }
 
 /// Whether `actor` may set the password of `target_user_id`: their own, or any as an admin.
@@ -82,10 +75,12 @@ pub(crate) fn may_set_password(actor: &UserCtx, target_user_id: &str) -> bool {
 
 /// Refusals a person can act on are shown; database failures are not.
 #[cfg(feature = "server")]
-fn user_change_error(e: models::user::UserChangeError) -> ServerFnError {
+pub(crate) fn user_change_error(e: models::user::UserChangeError) -> ServerFnError {
     use models::user::UserChangeError;
     match e {
-        UserChangeError::NotFound | UserChangeError::LastAdmin => refusal_error(e),
+        UserChangeError::NotFound | UserChangeError::LastAdmin | UserChangeError::UsernameTaken => {
+            refusal_error(e)
+        }
         UserChangeError::Db(_) => server_error(e),
     }
 }
@@ -97,7 +92,7 @@ pub async fn set_user_role(user_id: String, role: Role) -> Result<(), ServerFnEr
         .map_err(user_change_error)
 }
 
-#[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap)]
+#[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn update_user_password(user_id: String, password: String) -> Result<(), ServerFnError> {
     if password.is_empty() {
         return Err(refusal_error("Password cannot be empty"));
@@ -107,7 +102,7 @@ pub async fn update_user_password(user_id: String, password: String) -> Result<(
     }
     // The bump ends every session of this user; the caller's own is renewed.
     let own_session = if user_id == auth.0.user_id {
-        Some(SessionCookie::for_request(&headers)?)
+        Some(SessionCookie::for_request(&headers, &uri)?)
     } else {
         None
     };

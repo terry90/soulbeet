@@ -11,44 +11,6 @@ use crate::auth::RegistrationMode;
 #[cfg(feature = "server")]
 use crate::base_url::{BaseUrl, BaseUrlError};
 
-#[cfg(feature = "server")]
-const DEFAULT_SECRET_KEY: &str = "secret";
-
-/// Why the configured `SECRET_KEY` is not safe to expose to the internet.
-#[cfg(feature = "server")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SecretKeyWeakness {
-    NotSet,
-    Default,
-    TooShort,
-}
-
-#[cfg(feature = "server")]
-impl SecretKeyWeakness {
-    pub fn message(&self) -> String {
-        let problem = match self {
-            Self::NotSet => "SECRET_KEY is not set.",
-            Self::Default => "SECRET_KEY is the built-in default.",
-            Self::TooShort => "SECRET_KEY is shorter than 32 bytes.",
-        };
-        format!(
-            "{problem} Set it to a random value of at least 32 bytes, for example the output of \
-             `openssl rand -hex 32`. Changing SECRET_KEY makes the stored Navidrome passwords \
-             unreadable: each user is asked to sign in again once."
-        )
-    }
-}
-
-#[cfg(feature = "server")]
-pub(crate) fn secret_key_weakness(value: Option<&str>) -> Option<SecretKeyWeakness> {
-    match value {
-        None => Some(SecretKeyWeakness::NotSet),
-        Some(DEFAULT_SECRET_KEY) => Some(SecretKeyWeakness::Default),
-        Some(v) if v.len() < 32 => Some(SecretKeyWeakness::TooShort),
-        Some(_) => None,
-    }
-}
-
 /// Reads `REGISTRATION`. Unset follows whether Navidrome is configured; an
 /// unknown value falls to the closed mode.
 #[cfg(feature = "server")]
@@ -116,10 +78,6 @@ fn parse_bool_env(key: &str, default: bool) -> bool {
 pub struct AppConfig {
     /// SQLite database URL (default: "sqlite:soulbeet.db")
     database_url: String,
-    /// JWT signing secret (MUST be set in production)
-    secret_key: String,
-    /// Why `secret_key` is weak, computed before the default is substituted
-    secret_key_weakness: Option<SecretKeyWeakness>,
     /// Directory where downloads are saved (default: "/downloads")
     download_path: PathBuf,
     /// Path to beets configuration file (default: "beets_config.yaml")
@@ -146,13 +104,6 @@ pub struct AppConfig {
 impl AppConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
-        let secret_key_env = std::env::var("SECRET_KEY").ok();
-        let secret_key_weakness = secret_key_weakness(secret_key_env.as_deref());
-        if let Some(w) = secret_key_weakness {
-            tracing::error!("{}", w.message());
-        }
-        let secret_key = secret_key_env.unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string());
-
         // Left as a bare name when it is not on PATH, so the spawn error names it.
         let beet_bin =
             soulbeet::beets::resolve_on_path("beet").unwrap_or_else(|| PathBuf::from("beet"));
@@ -185,8 +136,6 @@ impl AppConfig {
         Self {
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite:soulbeet.db".to_string()),
-            secret_key,
-            secret_key_weakness,
             download_path: PathBuf::from(
                 std::env::var("DOWNLOAD_PATH").unwrap_or_else(|_| "/downloads".to_string()),
             ),
@@ -210,16 +159,6 @@ impl AppConfig {
     /// Get the database URL.
     pub fn database_url(&self) -> &str {
         &self.database_url
-    }
-
-    /// Get the JWT secret key.
-    pub fn secret_key(&self) -> &str {
-        &self.secret_key
-    }
-
-    /// Why the secret key is weak, if it is.
-    pub fn secret_key_weakness(&self) -> Option<SecretKeyWeakness> {
-        self.secret_key_weakness
     }
 
     /// Get the download path.
@@ -279,20 +218,6 @@ pub static CONFIG: LazyLock<AppConfig> = LazyLock::new(AppConfig::from_env);
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn secret_key_strength() {
-        assert_eq!(secret_key_weakness(None), Some(SecretKeyWeakness::NotSet));
-        assert_eq!(
-            secret_key_weakness(Some("secret")),
-            Some(SecretKeyWeakness::Default)
-        );
-        assert_eq!(
-            secret_key_weakness(Some(&"a".repeat(31))),
-            Some(SecretKeyWeakness::TooShort)
-        );
-        assert_eq!(secret_key_weakness(Some(&"a".repeat(32))), None);
-    }
 
     #[test]
     fn an_unusable_public_url_is_reported() {

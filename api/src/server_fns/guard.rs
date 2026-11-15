@@ -1,7 +1,10 @@
 use crate::auth::UserCtx;
 
 #[cfg(feature = "server")]
-use crate::{auth::Claims, db::DB, models::user::User};
+use crate::{
+    auth::Claims, db::DB, models::revoked_session::RevokedSession, models::user::User,
+    secret_key::SecretKey,
+};
 #[cfg(feature = "server")]
 use axum::{extract::FromRequestParts, http::StatusCode};
 #[cfg(feature = "server")]
@@ -17,6 +20,8 @@ pub struct AdminSession(pub UserCtx);
 pub const SESSION_GONE: &str = "Session ended: the account no longer exists";
 #[cfg(feature = "server")]
 pub const SESSION_STALE: &str = "Session ended: sign in again";
+#[cfg(feature = "server")]
+pub const SESSION_SIGNED_OUT: &str = "Session ended: signed out";
 #[cfg(feature = "server")]
 pub const ADMIN_ONLY: &str = "Only an admin can do this";
 
@@ -52,22 +57,32 @@ pub(crate) fn require_admin(ctx: UserCtx) -> Result<UserCtx, (StatusCode, String
 pub(crate) async fn load_session(
     token: Option<&str>,
     db: &SqlitePool,
+    key: &SecretKey,
 ) -> Result<UserCtx, (StatusCode, String)> {
     let Some(token) = token else {
         tracing::warn!("Auth failure: No auth token found in request cookies");
         return Err((StatusCode::UNAUTHORIZED, "No auth token found".to_string()));
     };
-    let claims = crate::auth::verify_token(token).map_err(|e| {
+    let claims = crate::auth::verify_token(key, token).map_err(|e| {
         tracing::warn!("Auth failure: invalid token: {}", e);
         (StatusCode::UNAUTHORIZED, format!("Invalid token: {e}"))
     })?;
-    let user = User::find_by_id_in(db, &claims.sub).await.map_err(|e| {
-        tracing::error!("Could not load the session's user: {e}");
+    let check_failed = |e: String| {
+        tracing::error!("Could not check the session: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Could not check the session".to_string(),
         )
-    })?;
+    };
+    if RevokedSession::is_revoked_in(db, &claims.jti)
+        .await
+        .map_err(check_failed)?
+    {
+        return Err((StatusCode::UNAUTHORIZED, SESSION_SIGNED_OUT.to_string()));
+    }
+    let user = User::find_by_id_in(db, &claims.sub)
+        .await
+        .map_err(check_failed)?;
     session_from(&claims, user.as_ref())
 }
 
@@ -96,7 +111,9 @@ where
             .get(crate::AUTH_COOKIE_NAME)
             .map(|c| c.value().to_string());
 
-        load_session(token.as_deref(), &DB).await.map(AuthSession)
+        load_session(token.as_deref(), &DB, crate::secret_key::current())
+            .await
+            .map(AuthSession)
     }
 }
 
@@ -119,7 +136,7 @@ where
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use crate::auth::{create_token, Role};
+    use crate::auth::{create_token as create_token_with, Role};
     use crate::db::test_db;
     use crate::models::user::User;
     use crate::security::SEEDED_ADMIN_ID;
@@ -141,9 +158,22 @@ mod tests {
         Claims {
             sub: sub.into(),
             ver,
+            jti: "t".into(),
             iat: 0,
             exp: 0,
         }
+    }
+
+    fn key() -> SecretKey {
+        SecretKey::new("k".repeat(32))
+    }
+
+    fn create_token(user_id: &str, ver: i64) -> Result<String, String> {
+        create_token_with(&key(), user_id, ver)
+    }
+
+    async fn load(token: Option<&str>, db: &SqlitePool) -> Result<UserCtx, (StatusCode, String)> {
+        load_session(token, db, &key()).await
     }
 
     fn ctx(role: Role) -> UserCtx {
@@ -194,7 +224,7 @@ mod tests {
             .await
             .unwrap();
         insert_user(&db, "id-b", "old-name").await;
-        let ctx = load_session(Some(&token), &db).await.unwrap();
+        let ctx = load(Some(&token), &db).await.unwrap();
         assert_eq!(
             (ctx.user_id.as_str(), ctx.username.as_str()),
             ("id-a", "renamed")
@@ -232,7 +262,7 @@ mod tests {
     async fn no_cookie_is_unauthorized() {
         let db = db_with_user().await;
         assert_eq!(
-            load_session(None, &db).await.unwrap_err(),
+            load(None, &db).await.unwrap_err(),
             (StatusCode::UNAUTHORIZED, "No auth token found".to_string())
         );
     }
@@ -240,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn a_forged_cookie_is_unauthorized() {
         let db = db_with_user().await;
-        let err = load_session(Some("not-a-token"), &db).await.unwrap_err();
+        let err = load(Some("not-a-token"), &db).await.unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
         assert!(err.1.starts_with("Invalid token: "), "{}", err.1);
     }
@@ -254,7 +284,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            load_session(Some(&token), &db).await.unwrap_err(),
+            load(Some(&token), &db).await.unwrap_err(),
             (StatusCode::UNAUTHORIZED, SESSION_STALE.to_string())
         );
     }
@@ -262,7 +292,7 @@ mod tests {
     #[tokio::test]
     async fn a_user_cookie_is_forbidden_for_admin_functions() {
         let db = db_with_user().await;
-        let ctx = load_session(Some(&create_token("u1", 0).unwrap()), &db)
+        let ctx = load(Some(&create_token("u1", 0).unwrap()), &db)
             .await
             .unwrap();
         assert_eq!(
@@ -274,9 +304,36 @@ mod tests {
     #[tokio::test]
     async fn an_admin_cookie_passes() {
         let db = db_with_user().await;
-        let ctx = load_session(Some(&create_token(SEEDED_ADMIN_ID, 0).unwrap()), &db)
+        let ctx = load(Some(&create_token(SEEDED_ADMIN_ID, 0).unwrap()), &db)
             .await
             .unwrap();
         assert_eq!(require_admin(ctx).unwrap().role, Role::Admin);
+    }
+
+    #[tokio::test]
+    async fn a_session_signed_with_the_old_built_in_key_ends() {
+        // An install that ran without SECRET_KEY used "secret"; it now gets
+        // a generated key, so its cookies no longer verify.
+        let db = db_with_user().await;
+        let old = create_token_with(&SecretKey::new("secret".into()), "u1", 0).unwrap();
+        let generated = crate::secret_key::resolve(None, tempfile::tempdir().unwrap().path())
+            .unwrap()
+            .0;
+        let err = load_session(Some(&old), &db, &generated).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_token_is_unauthorized() {
+        let db = db_with_user().await;
+        let token = create_token("u1", 0).unwrap();
+        let jti = crate::auth::verify_token(&key(), &token).unwrap().jti;
+        RevokedSession::revoke_in(&db, &jti, i64::MAX, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            load(Some(&token), &db).await.unwrap_err(),
+            (StatusCode::UNAUTHORIZED, SESSION_SIGNED_OUT.to_string())
+        );
     }
 }

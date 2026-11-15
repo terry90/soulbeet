@@ -47,6 +47,11 @@ fn main() {
         use tower_cookies::CookieManagerLayer;
 
         dioxus::serve(|| async move {
+            // Nothing may sign a session or read a stored password without it.
+            if let Err(e) = api::secret_key::load() {
+                dioxus::logger::tracing::error!("{e}");
+                std::process::exit(1);
+            }
             // Start background cleanup task for user channels
             api::globals::start_channel_cleanup_task();
             // Check the beets config in the background; never awaited here.
@@ -54,6 +59,7 @@ fn main() {
 
             api::security::check_seeded_admin().await;
             api::folder_policy::log_folder_conflicts().await;
+            api::models::user::log_username_collisions().await;
             for reason in api::security::gate_reasons() {
                 dioxus::logger::tracing::warn!("MCP stays off: {}", reason.message);
             }

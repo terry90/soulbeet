@@ -1,6 +1,6 @@
 //! The address Soulful is reached at, derived from request headers or pinned by `PUBLIC_URL`.
 
-use axum::http::{header, HeaderMap};
+use axum::http::{header, HeaderMap, Uri};
 use url::{Host, Url};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +65,12 @@ impl BaseUrl {
 
     pub fn is_https(&self) -> bool {
         self.scheme == Scheme::Https
+    }
+
+    /// Same host and port, whatever the scheme: a browser on plain http to a
+    /// host the rules call https is still on this host.
+    pub fn same_host(&self, other: &BaseUrl) -> bool {
+        self.host == other.host && self.port == other.port
     }
 }
 
@@ -134,8 +140,14 @@ fn host_url(scheme: Scheme, host: &str) -> Result<Url, BaseUrlError> {
         .map_err(|_| BaseUrlError::InvalidHost(host.to_string()))
 }
 
-/// Work out the address a request was made to. `pin` (from `PUBLIC_URL`) replaces the headers.
-pub fn derive_base(headers: &HeaderMap, pin: Option<&BaseUrl>) -> Result<BaseUrl, BaseUrlError> {
+/// Work out the address a request was made to. `pin` (from `PUBLIC_URL`)
+/// replaces the headers. `authority` is the request URI's, which HTTP/2 sends
+/// in place of a Host header.
+pub fn derive_base(
+    headers: &HeaderMap,
+    authority: Option<&str>,
+    pin: Option<&BaseUrl>,
+) -> Result<BaseUrl, BaseUrlError> {
     if let Some(pin) = pin {
         return Ok(pin.clone());
     }
@@ -145,6 +157,8 @@ pub fn derive_base(headers: &HeaderMap, pin: Option<&BaseUrl>) -> Result<BaseUrl
     } else if let Some(h) = first_element(headers, "x-forwarded-host") {
         h.to_string()
     } else if let Some(h) = first_element(headers, header::HOST.as_str()) {
+        h.to_string()
+    } else if let Some(h) = authority.map(str::trim).filter(|a| !a.is_empty()) {
         h.to_string()
     } else {
         return Err(BaseUrlError::MissingHost);
@@ -170,13 +184,23 @@ pub fn derive_base(headers: &HeaderMap, pin: Option<&BaseUrl>) -> Result<BaseUrl
     BaseUrl::from_url(&host_url(scheme, &host)?, &host)
 }
 
-/// `derive_base` with the configured `PUBLIC_URL`.
-pub fn request_base(headers: &HeaderMap) -> Result<BaseUrl, BaseUrlError> {
-    match crate::config::CONFIG.public_url() {
-        None => derive_base(headers, None),
-        Some(Ok(pin)) => derive_base(headers, Some(pin)),
+/// `derive_base` for a request, with `public_url`, the parsed `PUBLIC_URL`.
+pub fn request_base_with(
+    headers: &HeaderMap,
+    uri: &Uri,
+    public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+) -> Result<BaseUrl, BaseUrlError> {
+    let authority = uri.authority().map(|a| a.as_str());
+    match public_url {
+        None => derive_base(headers, authority, None),
+        Some(Ok(pin)) => derive_base(headers, authority, Some(pin)),
         Some(Err(e)) => Err(BaseUrlError::InvalidPublicUrl(e.to_string())),
     }
+}
+
+/// `derive_base` for a request, with the configured `PUBLIC_URL`.
+pub fn request_base(headers: &HeaderMap, uri: &Uri) -> Result<BaseUrl, BaseUrlError> {
+    request_base_with(headers, uri, crate::config::CONFIG.public_url())
 }
 
 #[cfg(test)]
@@ -196,7 +220,9 @@ mod tests {
     }
 
     fn base(pairs: &[(&str, &str)]) -> String {
-        derive_base(&headers(pairs), None).unwrap().to_string()
+        derive_base(&headers(pairs), None, None)
+            .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -290,7 +316,7 @@ mod tests {
 
     #[test]
     fn bad_values_are_refused() {
-        let err = |pairs: &[(&str, &str)]| derive_base(&headers(pairs), None).unwrap_err();
+        let err = |pairs: &[(&str, &str)]| derive_base(&headers(pairs), None, None).unwrap_err();
         assert_eq!(err(&[("host", "user@host")]), BaseUrlError::Userinfo);
         assert_eq!(
             err(&[("host", "a.example"), ("x-forwarded-proto", "ftp")]),
@@ -306,8 +332,38 @@ mod tests {
     #[test]
     fn public_url_pin_replaces_derivation() {
         let pin = BaseUrl::parse("https://pinned.example").unwrap();
-        let d = derive_base(&headers(&[("host", "other.example")]), Some(&pin)).unwrap();
+        let d = derive_base(&headers(&[("host", "other.example")]), None, Some(&pin)).unwrap();
         assert_eq!(d.to_string(), "https://pinned.example");
+    }
+
+    #[test]
+    fn an_http2_request_without_host_uses_the_uri_authority() {
+        // h2c through a proxy: `:authority` lands in the URI, no Host header.
+        let uri: Uri = "http://music.example.com:8443/api/auth/login"
+            .parse()
+            .unwrap();
+        let base = request_base_with(&HeaderMap::new(), &uri, None).unwrap();
+        assert_eq!(base.to_string(), "https://music.example.com:8443");
+
+        // A Host header still wins over the authority.
+        let host = headers(&[("host", "192.168.1.5:9765")]);
+        let base = request_base_with(&host, &uri, None).unwrap();
+        assert_eq!(base.to_string(), "http://192.168.1.5:9765");
+
+        // HTTP/1 sends only a path, so nothing is left to use.
+        let path_only: Uri = "/api/auth/login".parse().unwrap();
+        assert_eq!(
+            request_base_with(&HeaderMap::new(), &path_only, None).unwrap_err(),
+            BaseUrlError::MissingHost
+        );
+    }
+
+    #[test]
+    fn same_host_ignores_the_scheme_only() {
+        let a = |s: &str| BaseUrl::parse(s).unwrap();
+        assert!(a("http://nas:9765").same_host(&a("https://nas:9765")));
+        assert!(!a("http://nas:9765").same_host(&a("http://nas:9766")));
+        assert!(!a("https://evil.example").same_host(&a("https://music.example.com")));
     }
 
     #[test]

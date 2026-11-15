@@ -9,10 +9,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "server")]
-use crate::config::CONFIG;
+use crate::secret_key::SecretKey;
 
 #[cfg(feature = "server")]
-fn derive_key(secret: &str) -> [u8; 32] {
+fn derive_key(secret: &SecretKey) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
     let result = hasher.finalize();
@@ -22,19 +22,9 @@ fn derive_key(secret: &str) -> [u8; 32] {
 }
 
 #[cfg(feature = "server")]
-pub fn encrypt(plaintext: &str) -> Result<String, String> {
-    encrypt_with(&derive_key(CONFIG.secret_key()), plaintext)
-}
-
-#[cfg(feature = "server")]
-pub fn decrypt(encoded: &str) -> Result<String, String> {
-    decrypt_with(&derive_key(CONFIG.secret_key()), encoded)
-}
-
-#[cfg(feature = "server")]
-pub(crate) fn encrypt_with(key: &[u8; 32], plaintext: &str) -> Result<String, String> {
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Failed to create cipher: {e}"))?;
+pub fn encrypt(secret: &SecretKey, plaintext: &str) -> Result<String, String> {
+    let cipher = Aes256Gcm::new_from_slice(&derive_key(secret))
+        .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ciphertext = cipher
         .encrypt(&nonce, plaintext.as_bytes())
@@ -46,7 +36,7 @@ pub(crate) fn encrypt_with(key: &[u8; 32], plaintext: &str) -> Result<String, St
 }
 
 #[cfg(feature = "server")]
-pub(crate) fn decrypt_with(key: &[u8; 32], encoded: &str) -> Result<String, String> {
+pub fn decrypt(secret: &SecretKey, encoded: &str) -> Result<String, String> {
     let combined = BASE64
         .decode(encoded)
         .map_err(|e| format!("Base64 decode failed: {e}"))?;
@@ -58,8 +48,8 @@ pub(crate) fn decrypt_with(key: &[u8; 32], encoded: &str) -> Result<String, Stri
     let (nonce_bytes, ciphertext) = combined.split_at(12);
     let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
 
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Failed to create cipher: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&derive_key(secret))
+        .map_err(|e| format!("Failed to create cipher: {e}"))?;
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
         .map_err(|e| format!("Decryption failed: {e}"))?;
@@ -73,10 +63,10 @@ mod tests {
 
     #[test]
     fn a_value_encrypted_under_another_key_does_not_decrypt() {
-        let a = derive_key("a".repeat(32).as_str());
-        let b = derive_key("b".repeat(32).as_str());
-        let ct = encrypt_with(&a, "pw").unwrap();
-        assert_eq!(decrypt_with(&a, &ct).unwrap(), "pw");
-        assert!(decrypt_with(&b, &ct).is_err());
+        let a = SecretKey::new("a".repeat(32));
+        let b = SecretKey::new("b".repeat(32));
+        let ct = encrypt(&a, "pw").unwrap();
+        assert_eq!(decrypt(&a, &ct).unwrap(), "pw");
+        assert!(decrypt(&b, &ct).is_err());
     }
 }

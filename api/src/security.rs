@@ -5,9 +5,6 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(feature = "server")]
-use crate::config::{SecretKeyWeakness, CONFIG};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GateCode {
@@ -37,25 +34,33 @@ pub const SEEDED_ADMIN_ID: &str = "00000000-0000-0000-0000-000000000000";
 #[cfg(feature = "server")]
 static SEEDED_ADMIN_HAS_DEFAULT_PASSWORD: AtomicBool = AtomicBool::new(true);
 
+#[cfg(feature = "server")]
+const WEAK_SECRET_KEY: &str = "SECRET_KEY is shorter than 32 bytes. Set it to a random value \
+     of at least 32 bytes, for example the output of `openssl rand -hex 32`, or remove it so \
+     Soulful generates one. Changing SECRET_KEY ends every session and makes the stored \
+     Navidrome passwords unreadable: each user is asked to sign in again once.";
+
 /// The reasons the instance is not safe to expose. Empty means open. Never hashes.
 #[cfg(feature = "server")]
 pub fn gate_reasons() -> Vec<GateReason> {
     gate_reasons_from(
-        CONFIG.secret_key_weakness(),
-        SEEDED_ADMIN_HAS_DEFAULT_PASSWORD.load(Ordering::Relaxed),
+        crate::secret_key::current().is_weak(),
+        seeded_admin_has_default_password(),
     )
 }
 
 #[cfg(feature = "server")]
-pub(crate) fn gate_reasons_from(
-    weakness: Option<SecretKeyWeakness>,
-    default_admin_password: bool,
-) -> Vec<GateReason> {
+fn seeded_admin_has_default_password() -> bool {
+    SEEDED_ADMIN_HAS_DEFAULT_PASSWORD.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn gate_reasons_from(weak_key: bool, default_admin_password: bool) -> Vec<GateReason> {
     let mut reasons = Vec::new();
-    if let Some(w) = weakness {
+    if weak_key {
         reasons.push(GateReason {
             code: GateCode::WeakSecretKey,
-            message: w.message(),
+            message: WEAK_SECRET_KEY.to_string(),
         });
     }
     if default_admin_password {
@@ -120,8 +125,8 @@ mod tests {
 
     #[test]
     fn gate_lists_each_reason() {
-        assert!(gate_reasons_from(None, false).is_empty());
-        let r = gate_reasons_from(Some(SecretKeyWeakness::TooShort), true);
+        assert!(gate_reasons_from(false, false).is_empty());
+        let r = gate_reasons_from(true, true);
         assert_eq!(
             r.iter().map(|g| g.code).collect::<Vec<_>>(),
             vec![GateCode::WeakSecretKey, GateCode::DefaultAdminPassword]
@@ -146,12 +151,8 @@ mod tests {
     #[test]
     fn setting_the_seeded_password_updates_the_flag() {
         note_password_set(SEEDED_ADMIN_ID, "changed");
-        assert!(!gate_reasons()
-            .iter()
-            .any(|g| g.code == GateCode::DefaultAdminPassword));
+        assert!(!seeded_admin_has_default_password());
         note_password_set("someone-else", "admin");
-        assert!(!gate_reasons()
-            .iter()
-            .any(|g| g.code == GateCode::DefaultAdminPassword));
+        assert!(!seeded_admin_has_default_password());
     }
 }

@@ -7,6 +7,8 @@ pub mod engine_report;
 pub mod folder;
 #[cfg(feature = "server")]
 pub mod folder_root;
+#[cfg(feature = "server")]
+pub mod revoked_session;
 pub mod user;
 pub mod user_profile;
 pub mod user_settings;

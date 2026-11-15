@@ -211,25 +211,7 @@ pub async fn navidrome_client_for_user(user_id: &str) -> Result<Arc<NavidromeCli
         .await?
         .ok_or("User not found")?;
 
-    let encrypted_token = user
-        .navidrome_token
-        .ok_or("Navidrome not configured for user")?;
-
-    let password = match crate::crypto::decrypt(&encrypted_token) {
-        Ok(password) => password,
-        Err(_) => {
-            tracing::warn!("Stored Navidrome password of user {user_id} cannot be decrypted");
-            if user.navidrome_status != shared::system::NavidromeStatus::InvalidCredentials.as_str()
-            {
-                if let Err(e) =
-                    mark_password_unreadable(&crate::db::DB, user_id, &encrypted_token).await
-                {
-                    tracing::warn!("Could not mark user {user_id} for a new sign-in: {e}");
-                }
-            }
-            return Err(STORED_PASSWORD_UNREADABLE.to_string());
-        }
-    };
+    let password = stored_password_in(&crate::db::DB, crate::secret_key::current(), &user).await?;
 
     let url = crate::config::CONFIG
         .navidrome_url()
@@ -252,6 +234,34 @@ pub async fn navidrome_client_for_user(user_id: &str) -> Result<Arc<NavidromeCli
 
 #[cfg(feature = "server")]
 pub const STORED_PASSWORD_UNREADABLE: &str = "The stored Navidrome password cannot be decrypted, probably because SECRET_KEY changed. Sign in again to store it.";
+
+/// The user's stored Navidrome password. One that cannot be decrypted
+/// (SECRET_KEY changed) marks the user for a new sign-in, once: a user
+/// already marked is not marked or logged again.
+#[cfg(feature = "server")]
+pub(crate) async fn stored_password_in(
+    db: &sqlx::SqlitePool,
+    key: &crate::secret_key::SecretKey,
+    user: &crate::models::user::User,
+) -> Result<String, String> {
+    let encrypted = user
+        .navidrome_token
+        .as_deref()
+        .ok_or("Navidrome not configured for user")?;
+    if let Ok(password) = crate::crypto::decrypt(key, encrypted) {
+        return Ok(password);
+    }
+    if user.navidrome_status != shared::system::NavidromeStatus::InvalidCredentials.as_str() {
+        tracing::warn!(
+            "Stored Navidrome password of user {} cannot be decrypted; they are asked to sign in again",
+            user.id
+        );
+        if let Err(e) = mark_password_unreadable(db, &user.id, encrypted).await {
+            tracing::warn!("Could not mark user {} for a new sign-in: {e}", user.id);
+        }
+    }
+    Err(STORED_PASSWORD_UNREADABLE.to_string())
+}
 
 /// Keeps the undecryptable token and asks the user to sign in again.
 #[cfg(feature = "server")]
@@ -338,6 +348,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dismissed, 0);
+    }
+
+    #[tokio::test]
+    async fn a_password_stored_under_the_old_built_in_key_asks_for_a_new_sign_in_once() {
+        use crate::models::user::User;
+        use crate::secret_key::SecretKey;
+
+        let db = test_db::migrated().await;
+        let old = SecretKey::new("secret".into());
+        let generated = crate::secret_key::resolve(None, tempfile::tempdir().unwrap().path())
+            .unwrap()
+            .0;
+        let cipher = crate::crypto::encrypt(&old, "navidrome-pw").unwrap();
+        sqlx::query(
+            "UPDATE users SET navidrome_token = ?, navidrome_status = 'connected' WHERE id = ?",
+        )
+        .bind(&cipher)
+        .bind(SEEDED_ADMIN_ID)
+        .execute(&db)
+        .await
+        .unwrap();
+        let user = || async {
+            User::find_by_id_in(&db, SEEDED_ADMIN_ID)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        assert_eq!(
+            stored_password_in(&db, &old, &user().await).await.unwrap(),
+            "navidrome-pw"
+        );
+        assert_eq!(
+            stored_password_in(&db, &generated, &user().await).await,
+            Err(STORED_PASSWORD_UNREADABLE.to_string())
+        );
+        assert_eq!(user().await.navidrome_status, "invalid_credentials");
+
+        // Already marked: the banner the user dismissed since stays dismissed.
+        sqlx::query("UPDATE user_settings SET navidrome_banner_dismissed = 1 WHERE user_id = ?")
+            .bind(SEEDED_ADMIN_ID)
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(stored_password_in(&db, &generated, &user().await)
+            .await
+            .is_err());
+        let dismissed: i64 = sqlx::query_scalar(
+            "SELECT navidrome_banner_dismissed FROM user_settings WHERE user_id = ?",
+        )
+        .bind(SEEDED_ADMIN_ID)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(dismissed, 1);
     }
 
     #[tokio::test]

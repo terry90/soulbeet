@@ -9,13 +9,19 @@ use crate::config::CONFIG;
 #[cfg(feature = "server")]
 pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// The file a `sqlite:` database URL names; `None` for an in-memory database
+/// or another kind of URL.
+#[cfg(feature = "server")]
+pub(crate) fn database_file(database_url: &str) -> Option<&std::path::Path> {
+    let path = database_url.strip_prefix("sqlite:")?;
+    (!path.is_empty() && path != ":memory:").then(|| std::path::Path::new(path))
+}
+
 #[cfg(feature = "server")]
 pub static DB: Lazy<SqlitePool> = Lazy::new(|| async move {
     let database_url = CONFIG.database_url();
 
-    if database_url.starts_with("sqlite:") {
-        let path_str = database_url.trim_start_matches("sqlite:");
-        let path = std::path::Path::new(path_str);
+    if let Some(path) = database_file(database_url) {
         if !path.exists() {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("Failed to create database directory");
@@ -41,6 +47,7 @@ pub(crate) mod test_db {
     use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 
     pub const HARDENING: i64 = 20261114000000;
+    pub const USERNAME_CASE: i64 = 20261115000001;
 
     async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()

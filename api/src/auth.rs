@@ -82,7 +82,7 @@ pub struct AuthResponse {
 }
 
 #[cfg(feature = "server")]
-use crate::config::CONFIG;
+use crate::secret_key::SecretKey;
 #[cfg(feature = "server")]
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 
@@ -93,13 +93,19 @@ pub struct Claims {
     pub sub: String, // user_id
     /// The user's credentials version when the token was issued.
     pub ver: i64,
+    /// This token's own id, so signing out can end it alone.
+    pub jti: String,
     pub iat: usize,
     pub exp: usize,
 }
 
 #[cfg(feature = "server")]
-pub fn create_token(user_id: &str, credentials_version: i64) -> Result<String, String> {
-    let encoding_key = EncodingKey::from_secret(CONFIG.secret_key().as_bytes());
+pub fn create_token(
+    key: &SecretKey,
+    user_id: &str,
+    credentials_version: i64,
+) -> Result<String, String> {
+    let encoding_key = EncodingKey::from_secret(key.as_bytes());
     let now = chrono::Utc::now();
     let iat = now.timestamp() as usize;
 
@@ -111,6 +117,7 @@ pub fn create_token(user_id: &str, credentials_version: i64) -> Result<String, S
     let claims = Claims {
         sub: user_id.to_string(),
         ver: credentials_version,
+        jti: uuid::Uuid::new_v4().to_string(),
         iat,
         exp: exp as usize,
     };
@@ -121,10 +128,10 @@ pub fn create_token(user_id: &str, credentials_version: i64) -> Result<String, S
 }
 
 #[cfg(feature = "server")]
-pub fn verify_token(token: &str) -> Result<Claims, String> {
+pub fn verify_token(key: &SecretKey, token: &str) -> Result<Claims, String> {
     let token_data = decode::<Claims>(
         token,
-        &DecodingKey::from_secret(CONFIG.secret_key().as_bytes()),
+        &DecodingKey::from_secret(key.as_bytes()),
         &Validation::default(),
     )
     .map_err(|e| e.to_string())?;
@@ -138,7 +145,27 @@ mod tests {
 
     #[test]
     fn tokens_carry_the_version_and_no_name() {
-        let claims = verify_token(&create_token("id-a", 7).unwrap()).unwrap();
+        let key = SecretKey::new("k".repeat(32));
+        let claims = verify_token(&key, &create_token(&key, "id-a", 7).unwrap()).unwrap();
         assert_eq!((claims.sub.as_str(), claims.ver), ("id-a", 7));
+    }
+
+    #[test]
+    fn each_token_has_its_own_id() {
+        let key = SecretKey::new("k".repeat(32));
+        let jti = || {
+            verify_token(&key, &create_token(&key, "id-a", 0).unwrap())
+                .unwrap()
+                .jti
+        };
+        assert_ne!(jti(), jti());
+    }
+
+    #[test]
+    fn a_token_signed_with_another_key_is_refused() {
+        // An install that ran on the old built-in key gets a generated one.
+        let old = SecretKey::new("secret".to_string());
+        let new = SecretKey::new("n".repeat(64));
+        assert!(verify_token(&new, &create_token(&old, "id-a", 0).unwrap()).is_err());
     }
 }
