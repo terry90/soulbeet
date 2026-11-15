@@ -103,6 +103,7 @@ mod tests {
             user_id: user_id.to_string(),
             name: "Music".to_string(),
             path: "/music".to_string(),
+            shared: false,
         }
     }
 

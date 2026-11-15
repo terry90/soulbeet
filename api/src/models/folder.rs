@@ -11,6 +11,7 @@ pub struct Folder {
     pub user_id: String,
     pub name: String,
     pub path: String,
+    pub shared: bool,
 }
 
 #[cfg(feature = "server")]
@@ -32,6 +33,13 @@ impl Folder {
         Ok(folder)
     }
 
+    pub async fn get_all() -> Result<Vec<Folder>, String> {
+        sqlx::query_as::<_, Folder>("SELECT * FROM folders")
+            .fetch_all(&*DB)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn get_all_by_user(user_id: &str) -> Result<Vec<Folder>, String> {
         sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE user_id = ?")
             .bind(user_id)
@@ -44,6 +52,16 @@ impl Folder {
         sqlx::query("UPDATE folders SET name = ?, path = ? WHERE id = ?")
             .bind(name)
             .bind(path)
+            .bind(id)
+            .execute(&*DB)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub async fn set_shared(id: &str, shared: bool) -> Result<(), String> {
+        sqlx::query("UPDATE folders SET shared = ? WHERE id = ?")
+            .bind(shared)
             .bind(id)
             .execute(&*DB)
             .await
@@ -112,6 +130,7 @@ mod tests {
             user_id: "u".into(),
             name: "n".into(),
             path: p.into(),
+            shared: false,
         };
         let folders = vec![f("/music/rock"), f("/music/jazz/")];
         assert_eq!(

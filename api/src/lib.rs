@@ -4,6 +4,7 @@ pub mod base_url;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod folder_policy;
 pub mod globals;
 #[cfg(feature = "server")]
 pub mod import_queue;
