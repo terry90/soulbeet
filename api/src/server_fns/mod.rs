@@ -61,6 +61,12 @@ pub fn failure_error(failure: shared::failure::Failure) -> ServerFnError {
     refusal_error_with(&failure.message, &failure)
 }
 
+/// A refused retry or matches request as the browser gets it: the failure's
+/// message, and as details the failure with what stays kept for the row.
+pub fn import_refusal_error(refusal: shared::download::ImportRefusal) -> ServerFnError {
+    refusal_error_with(&refusal.failure.message, &refusal)
+}
+
 /// Status of a request refused because of the caller's role.
 pub const FORBIDDEN_CODE: u16 = 403;
 

@@ -296,6 +296,13 @@ pub enum KeptImport {
     Kept,
 }
 
+/// A refused retry or matches request: why, and what the server still keeps for the row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRefusal {
+    pub failure: Failure,
+    pub kept: KeptImport,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatchKind {
     Track,

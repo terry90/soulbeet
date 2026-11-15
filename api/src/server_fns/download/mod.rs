@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 #[cfg(feature = "server")]
 use crate::{
     base_url::{BaseUrl, BaseUrlError},
-    server_fns::{forbidden_error, refusal_error, refusal_error_with, server_error},
+    server_fns::{forbidden_error, import_refusal_error, refusal_error, server_error},
     AuthSession,
 };
 #[cfg(feature = "server")]
@@ -515,19 +515,13 @@ async fn queue_and_watch(
 pub async fn retry_import(item: String, choice: ImportChoice) -> Result<(), ServerFnError> {
     crate::import_queue::retry_import_for(&auth.0.id(), &item, choice)
         .await
-        .map_err(kept_import_refusal)
+        .map_err(import_refusal_error)
 }
 
 /// The matches a skipped row can be imported with.
 #[post("/api/downloads/import-choices", auth: AuthSession)]
 pub async fn import_choices(item: String) -> Result<MatchChoices, ServerFnError> {
-    crate::import_queue::import_choices_for(&auth.0.id(), &item).map_err(kept_import_refusal)
-}
-
-/// A refused retry or matches request, with what stays kept for the row.
-#[cfg(feature = "server")]
-fn kept_import_refusal(refusal: crate::import_queue::Refusal) -> ServerFnError {
-    refusal_error_with(refusal.message, refusal.kept)
+    crate::import_queue::import_choices_for(&auth.0.id(), &item).map_err(import_refusal_error)
 }
 
 /// Drops the stored imports of rows the user cleared.

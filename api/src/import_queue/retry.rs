@@ -2,10 +2,15 @@
 //! retried without the client naming any path. Kept in memory per user and
 //! lost on restart.
 
-use super::choice::{resolve, Refusal};
+#![allow(
+    clippy::result_large_err,
+    reason = "import refusals carry a Failure by value, as core functions do"
+)]
+
+use super::choice::{files_gone, nothing_to_retry, resolve};
 use super::{ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
-use shared::download::{ImportChoice, MatchChoices, MatchKind};
+use shared::download::{ImportChoice, ImportRefusal, MatchChoices, MatchKind};
 use soulbeet::audio::count_audio_files;
 use soulbeet::{ImportMode, ImportOutcome, ImportResult, SkipReason};
 use std::collections::HashMap;
@@ -93,14 +98,11 @@ impl RetryStore {
         &self,
         owner: &UserId,
         item: &str,
-        accept: impl FnOnce(&ImportJob) -> Result<T, Refusal>,
-    ) -> Result<(Arc<ImportJob>, T), Refusal> {
+        accept: impl FnOnce(&ImportJob) -> Result<T, ImportRefusal>,
+    ) -> Result<(Arc<ImportJob>, T), ImportRefusal> {
         let mut store = self.store();
-        let user = store
-            .users
-            .get_mut(owner)
-            .ok_or_else(Refusal::nothing_to_retry)?;
-        let kept = user.get(item).ok_or_else(Refusal::nothing_to_retry)?;
+        let user = store.users.get_mut(owner).ok_or_else(nothing_to_retry)?;
+        let kept = user.get(item).ok_or_else(nothing_to_retry)?;
         let accepted = accept(&kept.job)?;
         let job = kept.job.clone();
         user.retain(|_, kept| kept.job.sources != job.sources);
@@ -135,14 +137,14 @@ impl ImportQueue {
         user: &UserId,
         item: &str,
         choice: ImportChoice,
-    ) -> Result<(), Refusal> {
+    ) -> Result<(), ImportRefusal> {
         let (job, choice) = self
             .shared
             .retries
             .take(user, item, |job| resolve(&choice, job))?;
         let sources: Vec<&Path> = job.sources.iter().map(PathBuf::as_path).collect();
         if count_audio_files(&sources).await == 0 {
-            return Err(Refusal::files_gone());
+            return Err(files_gone());
         }
         self.submit(ImportJob {
             choice,
@@ -153,12 +155,12 @@ impl ImportQueue {
     }
 
     /// What the kept job of `item` can pick from, leaving it kept.
-    pub fn import_choices(&self, user: &UserId, item: &str) -> Result<MatchChoices, Refusal> {
+    pub fn import_choices(&self, user: &UserId, item: &str) -> Result<MatchChoices, ImportRefusal> {
         let job = self
             .shared
             .retries
             .peek(user, item)
-            .ok_or_else(Refusal::nothing_to_retry)?;
+            .ok_or_else(nothing_to_retry)?;
         Ok(job.choices.as_deref().cloned().unwrap_or(MatchChoices {
             kind: match job.mode {
                 ImportMode::Album => MatchKind::Album,
@@ -177,11 +179,11 @@ pub async fn retry_import_for(
     user: &UserId,
     item: &str,
     choice: ImportChoice,
-) -> Result<(), Refusal> {
+) -> Result<(), ImportRefusal> {
     IMPORT_QUEUE.retry(user, item, choice).await
 }
 
-pub fn import_choices_for(user: &UserId, item: &str) -> Result<MatchChoices, Refusal> {
+pub fn import_choices_for(user: &UserId, item: &str) -> Result<MatchChoices, ImportRefusal> {
     IMPORT_QUEUE.import_choices(user, item)
 }
 
@@ -192,25 +194,20 @@ pub fn forget_retries(user: &UserId, items: &[String]) {
 #[cfg(test)]
 mod tests {
     use crate::auth::UserId;
+    use crate::import_queue::choice::{
+        files_gone, no_choices, not_an_id, nothing_to_retry, unknown_candidate,
+    };
     use crate::import_queue::test_support::{
         alice, bob, broken, candidate, no_match, ready, track_choices, RecordingDeps, StubImporter,
     };
     use crate::import_queue::tests::{file, finish, job, owned, queue};
-    use crate::import_queue::{ImportJob, ImportMode, ImportQueue, Refusal};
+    use crate::import_queue::{ImportJob, ImportMode, ImportQueue};
     use shared::download::{
-        DownloadProgress, DownloadState, ImportChoice, KeptImport, MatchChoices, MatchKind,
+        DownloadProgress, DownloadState, ImportChoice, MatchChoices, MatchKind,
     };
     use soulbeet::{DriverChoice, FailKind, ImportResult};
     use std::sync::Arc;
     use std::time::Duration;
-
-    /// A refusal of the choice sent, which keeps the job and its matches.
-    fn bad_choice(message: &str) -> Refusal {
-        Refusal {
-            message: message.into(),
-            kept: KeptImport::Kept,
-        }
-    }
 
     async fn until_imported(deps: &RecordingDeps, item: &str) {
         let done = || {
@@ -309,10 +306,7 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(
-            queue.import_choices(&alice(), "a"),
-            Err(Refusal::nothing_to_retry())
-        );
+        assert_eq!(queue.import_choices(&alice(), "a"), Err(nothing_to_retry()));
     }
 
     #[tokio::test]
@@ -326,15 +320,13 @@ mod tests {
         };
         assert_eq!(
             queue.retry(&alice(), "a", unknown).await,
-            Err(bad_choice(
-                "That match is not one beets found for this import"
-            ))
+            Err(unknown_candidate())
         );
         assert_eq!(
             queue
                 .retry(&alice(), "a", ImportChoice::MusicBrainz("nope".into()))
                 .await,
-            Err(bad_choice("That is not a MusicBrainz link or ID"))
+            Err(not_an_id())
         );
         assert_eq!(queue.import_choices(&alice(), "a"), Ok(found()));
 
@@ -387,10 +379,7 @@ mod tests {
             data_source: "FakeSrc".into(),
             id: "w1".into(),
         };
-        assert_eq!(
-            queue.retry(&alice(), "a", pick).await,
-            Err(Refusal::no_choices())
-        );
+        assert_eq!(queue.retry(&alice(), "a", pick).await, Err(no_choices()));
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::AsIs).await, Ok(()));
     }
 
@@ -440,14 +429,8 @@ mod tests {
     async fn choices_need_a_kept_job_of_this_user() {
         let tmp = tempfile::tempdir().unwrap();
         let (queue, stub, _, _) = skipped(tmp.path()).await;
-        assert_eq!(
-            queue.import_choices(&bob(), "a"),
-            Err(Refusal::nothing_to_retry())
-        );
-        assert_eq!(
-            queue.import_choices(&alice(), "b"),
-            Err(Refusal::nothing_to_retry())
-        );
+        assert_eq!(queue.import_choices(&bob(), "a"), Err(nothing_to_retry()));
+        assert_eq!(queue.import_choices(&alice(), "b"), Err(nothing_to_retry()));
 
         stub.script(ImportResult::failed(
             FailKind::Beets,
@@ -491,7 +474,7 @@ mod tests {
         // The whole album went back in, so its other row has nothing left.
         assert_eq!(
             queue.retry(&alice(), "b", ImportChoice::Auto).await,
-            Err(Refusal::nothing_to_retry())
+            Err(nothing_to_retry())
         );
 
         // An import that succeeds later drops the stored job too.
@@ -503,7 +486,7 @@ mod tests {
         finish(queue.submit(failing).await).await;
         assert_eq!(
             queue.retry(&alice(), "a", ImportChoice::Auto).await,
-            Err(Refusal::nothing_to_retry())
+            Err(nothing_to_retry())
         );
     }
 
@@ -523,7 +506,7 @@ mod tests {
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
         assert_eq!(
             queue.retry(&alice(), "a", ImportChoice::Auto).await,
-            Err(Refusal::nothing_to_retry())
+            Err(nothing_to_retry())
         );
         until_imported(&deps, "a").await;
         assert_eq!(stub.calls(), 1);
@@ -548,11 +531,11 @@ mod tests {
 
         assert_eq!(
             queue.retry(&alice(), "a", ImportChoice::Auto).await,
-            Err(Refusal::files_gone())
+            Err(files_gone())
         );
         assert_eq!(
             queue.retry(&alice(), "a", ImportChoice::Auto).await,
-            Err(Refusal::nothing_to_retry())
+            Err(nothing_to_retry())
         );
         assert_eq!(stub.calls(), 1);
     }
@@ -576,7 +559,7 @@ mod tests {
 
         assert_eq!(
             queue.retry(&alice(), "a", ImportChoice::Auto).await,
-            Err(Refusal::nothing_to_retry())
+            Err(nothing_to_retry())
         );
         assert_eq!(stub.calls(), 1);
     }
@@ -613,10 +596,7 @@ mod tests {
         record(&bob(), "0");
 
         let take = |user: &UserId, item: &str| store.take(user, item, |_| Ok(()));
-        assert_eq!(
-            take(&alice(), "0").unwrap_err(),
-            Refusal::nothing_to_retry()
-        );
+        assert_eq!(take(&alice(), "0").unwrap_err(), nothing_to_retry());
         for i in 1..=MAX_PER_USER {
             assert!(take(&alice(), &format!("{i}")).is_ok(), "row {i}");
         }
@@ -643,11 +623,11 @@ mod tests {
             queue
                 .retry(&UserId::new("alice"), "a", ImportChoice::Auto)
                 .await,
-            Err(Refusal::nothing_to_retry())
+            Err(nothing_to_retry())
         );
         assert_ne!(
             queue.retry(&alice, "a", ImportChoice::Auto).await,
-            Err(Refusal::nothing_to_retry())
+            Err(nothing_to_retry())
         );
     }
 
@@ -674,11 +654,11 @@ mod tests {
 
         assert_eq!(
             queue.retry(&alice(), "a", ImportChoice::Auto).await,
-            Err(Refusal::nothing_to_retry())
+            Err(nothing_to_retry())
         );
         assert_eq!(
             queue.retry(&bob(), "b", ImportChoice::Auto).await,
-            Err(Refusal::nothing_to_retry())
+            Err(nothing_to_retry())
         );
         assert_eq!(queue.retry(&alice(), "b", ImportChoice::Auto).await, Ok(()));
     }

@@ -4,7 +4,9 @@ use std::pin::Pin;
 
 use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
-use shared::download::{DownloadProgress, DownloadState, ImportChoice, KeptImport, MatchChoices};
+use shared::download::{
+    DownloadProgress, DownloadState, ImportChoice, ImportRefusal, KeptImport, MatchChoices,
+};
 
 mod item;
 mod picker;
@@ -221,7 +223,9 @@ fn kept_after(error: &ServerFnError) -> Option<KeptImport> {
             code: api::REFUSAL_CODE,
             details: Some(details),
             ..
-        } => serde_json::from_value(details.clone()).ok(),
+        } => serde_json::from_value::<ImportRefusal>(details.clone())
+            .ok()
+            .map(|refusal| refusal.kept),
         _ => None,
     }
 }
@@ -258,6 +262,7 @@ fn sorted_rows(downloads: &HashMap<String, DownloadProgress>) -> Vec<DownloadPro
 mod tests {
     use super::*;
     use dioxus::fullstack::RequestError;
+    use shared::failure::{FailureCode, RetryAdvice, Stage};
 
     fn row(item: &str, state: DownloadState) -> (String, DownloadProgress) {
         let p =
@@ -291,7 +296,16 @@ mod tests {
     /// A refusal as the client gets it: built by the server's helper and
     /// sent through JSON.
     fn refused(message: &str, kept: KeptImport) -> ServerFnError {
-        let sent = serde_json::to_value(api::refusal_error_with(message, kept)).unwrap();
+        let refusal = ImportRefusal {
+            failure: shared::failure::Failure::new(
+                FailureCode::ImportChoiceInvalid,
+                Stage::Input,
+                RetryAdvice::NeedsDecision,
+                message,
+            ),
+            kept,
+        };
+        let sent = serde_json::to_value(api::import_refusal_error(refusal)).unwrap();
         serde_json::from_value(sent).unwrap()
     }
 
@@ -317,8 +331,24 @@ mod tests {
     fn the_server_says_what_a_refusal_keeps() {
         let kept = KeptImport::Kept;
         assert_eq!(kept_after(&refused("x", kept)), Some(kept));
-        let plain = api::refusal_error("Folder not found");
+        let plain = api::failure_error(shared::failure::Failure::new(
+            FailureCode::UnknownHandle,
+            Stage::Input,
+            RetryAdvice::NotRetryable,
+            "Folder not found",
+        ));
         assert_eq!(kept_after(&plain), None);
+        let ServerFnError::ServerError {
+            message, details, ..
+        } = refused("Nothing to retry", KeptImport::Gone)
+        else {
+            panic!("not a server error")
+        };
+        let back: ImportRefusal = serde_json::from_value(details.unwrap()).unwrap();
+        assert_eq!(
+            (message.as_str(), back.failure.message.as_str(), back.kept),
+            ("Nothing to retry", "Nothing to retry", KeptImport::Gone)
+        );
     }
 
     #[test]
