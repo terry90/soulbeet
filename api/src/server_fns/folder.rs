@@ -9,11 +9,10 @@ use crate::auth::UserCtx;
 use crate::folder_policy::FolderAdminView;
 #[cfg(feature = "server")]
 use crate::folder_policy::{
-    canonical_folder_path, check_folder_path, folder_conflicts, load_policy_inputs,
-    FolderAdminEntry, FolderRefusal,
+    canonical_folder_path, check_folder_path, check_folder_update, FolderRefusal, PolicyRows,
 };
 #[cfg(feature = "server")]
-use crate::models::{folder_root::FolderRoot, user::User};
+use crate::models::folder_root::FolderRoot;
 #[cfg(feature = "server")]
 use crate::services::music_importer;
 #[cfg(feature = "server")]
@@ -35,7 +34,7 @@ pub async fn create_user_folder(
     name: String,
     path: String,
 ) -> Result<models::folder::Folder, ServerFnError> {
-    let canonical = checked_folder_path(&auth.0, &path, true).await?;
+    let canonical = checked_folder_path(&auth.0, &path, FolderChange::Create).await?;
     models::folder::Folder::create(&auth.0.user_id, &name, path_str(&canonical))
         .await
         .map_err(server_error)
@@ -46,20 +45,38 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("canonical paths are UTF-8")
 }
 
+/// What a folder path is checked for.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy)]
+enum FolderChange<'a> {
+    Create,
+    /// An existing folder, currently stored at `stored`.
+    Update {
+        stored: &'a str,
+    },
+}
+
 /// The canonical form of `path` once the folder rules allow `actor` to keep a
-/// folder there. With `create`, the directory is made only after the checks
+/// folder there. On create, the directory is made only after the checks
 /// pass, and its canonical path must not move while it is made.
 #[cfg(feature = "server")]
 async fn checked_folder_path(
     actor: &UserCtx,
     path: &str,
-    create: bool,
+    change: FolderChange<'_>,
 ) -> Result<PathBuf, ServerFnError> {
     let candidate = canonical_folder_path(Path::new(path))
         .map_err(|e| refusal_error(FolderRefusal::Path(e)))?;
-    let (folders, roots) = load_policy_inputs().await.map_err(server_error)?;
-    check_folder_path(&candidate, actor, &folders, &roots).map_err(refusal_error)?;
-    if create {
+    let rows = PolicyRows::load().await.map_err(server_error)?;
+    let (folders, roots) = rows.inputs();
+    match change {
+        FolderChange::Create => check_folder_path(&candidate, actor, &folders, &roots),
+        FolderChange::Update { stored } => {
+            check_folder_update(&candidate, stored, actor, &folders, &roots)
+        }
+    }
+    .map_err(refusal_error)?;
+    if let FolderChange::Create = change {
         tokio::fs::create_dir_all(&candidate)
             .await
             .map_err(|e| server_error(format!("Failed to create directory: {}", e)))?;
@@ -93,8 +110,15 @@ pub async fn update_folder(
     let folder = models::folder::Folder::get_by_id(&folder_id)
         .await
         .map_err(server_error)?;
-    ensure_owner(folder, &auth.0.user_id)?;
-    let canonical = checked_folder_path(&auth.0, &path, false).await?;
+    let folder = ensure_owner(folder, &auth.0.user_id)?;
+    let canonical = checked_folder_path(
+        &auth.0,
+        &path,
+        FolderChange::Update {
+            stored: &folder.path,
+        },
+    )
+    .await?;
     models::folder::Folder::update(&folder_id, &name, path_str(&canonical))
         .await
         .map_err(server_error)
@@ -113,32 +137,19 @@ pub async fn delete_folder(folder_id: String) -> Result<(), ServerFnError> {
 
 #[get("/api/folders/admin", _: AdminSession)]
 pub async fn get_folder_admin() -> Result<FolderAdminView, ServerFnError> {
-    let users = User::get_all().await.map_err(server_error)?;
-    let (policy_folders, policy_roots) = load_policy_inputs().await.map_err(server_error)?;
-    let folders = models::folder::Folder::get_all()
+    PolicyRows::load()
         .await
-        .map_err(server_error)?
-        .into_iter()
-        .map(|folder| {
-            let owner = users.iter().find(|u| u.id == folder.user_id);
-            FolderAdminEntry {
-                owner: owner.map_or_else(|| folder.user_id.clone(), |u| u.username.clone()),
-                owner_is_admin: owner.is_some_and(|u| u.role.is_admin()),
-                folder,
-            }
-        })
-        .collect();
-    let roots = FolderRoot::get_all()
+        .map(PolicyRows::admin_view)
+        .map_err(server_error)
+}
+
+/// Deletes any user's folder, so an admin can clear one that blocks others.
+/// Only the folder entry goes; its files stay on disk.
+#[delete("/api/folders/admin/delete", _: AdminSession)]
+pub async fn delete_any_folder(folder_id: String) -> Result<(), ServerFnError> {
+    models::folder::Folder::delete(&folder_id)
         .await
-        .map_err(server_error)?
-        .into_iter()
-        .map(|r| r.path)
-        .collect();
-    Ok(FolderAdminView {
-        roots,
-        folders,
-        conflicts: folder_conflicts(&policy_folders, &policy_roots),
-    })
+        .map_err(server_error)
 }
 
 #[post("/api/folders/roots", _: AdminSession)]

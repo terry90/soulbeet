@@ -1,48 +1,50 @@
-use api::security::GateReason;
+use api::security::SecurityStatus;
 use dioxus::prelude::*;
 
+use super::panel::{LoadError, Loading, Panel};
+use crate::auth::use_auth;
 use crate::friendly_error;
 
-/// Admin-only panel listing what keeps Claude (MCP) access off.
+/// Admin-only panel listing what stops sign-ins and what keeps Claude (MCP)
+/// access off.
 #[component]
 pub fn SecurityStatusPanel() -> Element {
-    let mut status = use_resource(|| async { api::get_security_status().await });
+    let auth = use_auth();
+    let mut status =
+        use_resource(move || async move { auth.call(api::get_security_status()).await });
 
     rsx! {
-        div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
-            h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Security Checks" }
+        Panel { title: "Security Checks",
             match &*status.read() {
-                None => rsx! {
-                    div { class: "animate-pulse text-gray-400 font-mono", "Loading..." }
-                },
+                None => rsx! { Loading {} },
                 Some(Err(e)) => rsx! {
-                    div { class: "text-red-400 text-sm font-mono mb-3", "{friendly_error(e)}" }
-                    button {
-                        class: "text-xs font-mono text-gray-400 hover:text-white underline decoration-dotted cursor-pointer",
-                        onclick: move |_| status.restart(),
-                        "Retry"
-                    }
+                    LoadError { message: friendly_error(e), on_retry: move |_| status.restart() }
                 },
-                Some(Ok(s)) => rsx! { GateReasonList { reasons: s.mcp_blocked_by.clone() } },
+                Some(Ok(s)) => rsx! { SecurityChecks { status: s.clone() } },
             }
         }
     }
 }
 
 #[component]
-fn GateReasonList(reasons: Vec<GateReason>) -> Element {
-    if reasons.is_empty() {
+fn SecurityChecks(status: SecurityStatus) -> Element {
+    if status.sign_in_problem.is_none() && status.mcp_blocked_by.is_empty() {
         return rsx! {
             p { class: "text-sm font-mono text-gray-300", "All security checks pass." }
         };
     }
     rsx! {
-        p { class: "text-sm font-mono text-gray-300 mb-3",
-            "Claude (MCP) access stays off until these are fixed:"
+        if let Some(problem) = status.sign_in_problem {
+            p { class: "text-sm font-mono text-red-400 mb-3", "{problem}" }
         }
-        ul { class: "list-disc pl-5 space-y-1 text-sm font-mono text-yellow-400",
-            for reason in reasons {
-                li { "{reason.message}" }
+        if !status.mcp_blocked_by.is_empty() {
+            p { class: "text-sm font-mono text-gray-300 mb-3",
+                "Claude (MCP) access stays off until these are fixed:"
+            }
+            ul { class: "list-disc pl-5 space-y-1 text-sm font-mono text-yellow-400",
+                for reason in status.mcp_blocked_by {
+                    li { "{reason.message}" }
+                }
             }
         }
     }
@@ -51,29 +53,47 @@ fn GateReasonList(reasons: Vec<GateReason>) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use api::security::GateCode;
+    use api::security::{GateCode, GateReason};
 
-    fn render(reasons: Vec<GateReason>) -> String {
+    fn render(status: SecurityStatus) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |reasons: Vec<GateReason>| rsx! { GateReasonList { reasons } },
-            reasons,
+            |status: SecurityStatus| rsx! { SecurityChecks { status } },
+            status,
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
     }
 
-    #[test]
-    fn gate_list_says_when_all_checks_pass() {
-        assert!(render(vec![]).contains("All security checks pass."));
+    fn status(mcp_blocked_by: Vec<GateReason>, sign_in_problem: Option<&str>) -> SecurityStatus {
+        SecurityStatus {
+            mcp_blocked_by,
+            sign_in_problem: sign_in_problem.map(Into::into),
+        }
     }
 
     #[test]
-    fn gate_list_shows_each_reason() {
-        let html = render(vec![GateReason {
-            code: GateCode::DefaultAdminPassword,
-            message: "The seeded admin account still has the password 'admin'. Change it in Settings > Users.".into(),
-        }]);
+    fn checks_say_when_all_pass() {
+        assert!(render(status(vec![], None)).contains("All security checks pass."));
+    }
+
+    #[test]
+    fn checks_show_each_gate_reason() {
+        let html = render(status(
+            vec![GateReason {
+                code: GateCode::DefaultAdminPassword,
+                message: "The seeded admin account still has the password 'admin'. Change it in Settings > Users.".into(),
+            }],
+            None,
+        ));
         assert!(html.contains("Claude (MCP) access stays off until these are fixed:"));
         assert!(html.contains("still has the password"));
+    }
+
+    #[test]
+    fn checks_show_a_sign_in_problem() {
+        let html = render(status(vec![], Some("PUBLIC_URL is not usable: bad.")));
+        assert!(html.contains("PUBLIC_URL is not usable: bad."));
+        assert!(!html.contains("All security checks pass."));
+        assert!(!html.contains("Claude (MCP) access stays off"));
     }
 }

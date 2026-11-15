@@ -1,4 +1,5 @@
 use crate::db::DB;
+use sqlx::SqlitePool;
 
 /// A directory under which non-admins may create folders.
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
@@ -8,9 +9,9 @@ pub struct FolderRoot {
 }
 
 impl FolderRoot {
-    pub async fn get_all() -> Result<Vec<FolderRoot>, String> {
+    pub(crate) async fn get_all_in(db: &SqlitePool) -> Result<Vec<FolderRoot>, String> {
         sqlx::query_as::<_, FolderRoot>("SELECT * FROM folder_roots ORDER BY path")
-            .fetch_all(&*DB)
+            .fetch_all(db)
             .await
             .map_err(|e| e.to_string())
     }

@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use shared::system::NavidromeStatus;
 
 use super::connection_status_row::{beets_row, ConnectionStatusRow, ImporterDetails};
+use super::panel::{LoadError, Loading, Messages, Panel, LABEL_CLASS};
 use crate::friendly_error;
 use crate::settings_context::use_settings;
 use crate::{use_auth, use_system_health, TextInput};
@@ -9,27 +10,20 @@ use crate::{use_auth, use_system_health, TextInput};
 #[component]
 pub fn AppConfigManager() -> Element {
     let mut settings = use_settings();
-    let mut config_resource = use_resource(|| async { api::get_app_config().await });
+    let auth = use_auth();
+    let mut config_resource =
+        use_resource(move || async move { auth.call(api::get_app_config()).await });
 
     let config = match &*config_resource.read() {
         None => {
             return rsx! {
-                div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
-                    div { class: "animate-pulse text-gray-400 font-mono", "Loading..." }
-                }
+                Panel { title: "Connections", Loading {} }
             };
         }
         Some(Err(e)) => {
-            let msg = friendly_error(e);
             return rsx! {
-                div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
-                    h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Connections" }
-                    div { class: "text-red-400 text-sm font-mono mb-3", "{msg}" }
-                    button {
-                        class: "text-xs font-mono text-gray-400 hover:text-white underline decoration-dotted cursor-pointer",
-                        onclick: move |_| config_resource.restart(),
-                        "Retry"
-                    }
+                Panel { title: "Connections",
+                    LoadError { message: friendly_error(e), on_retry: move |_| config_resource.restart() }
                 }
             };
         }
@@ -52,7 +46,7 @@ pub fn AppConfigManager() -> Element {
             slskd_api_key: Some(slskd_api_key()),
         };
 
-        match api::update_app_config(config).await {
+        match auth.call(api::update_app_config(config)).await {
             Ok(_) => {
                 let _ = settings.refresh_providers().await;
                 success_msg.set("Configuration saved".to_string());
@@ -63,19 +57,8 @@ pub fn AppConfigManager() -> Element {
     };
 
     rsx! {
-        div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
-            h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Connections" }
-
-            if !error().is_empty() {
-                div { class: "mb-4 p-4 bg-red-900/20 border border-red-500/50 rounded text-red-400 font-mono text-sm",
-                    "{error}"
-                }
-            }
-            if !success_msg().is_empty() {
-                div { class: "mb-4 p-4 bg-green-900/20 border border-green-500/50 rounded text-green-400 font-mono text-sm",
-                    "{success_msg}"
-                }
-            }
+        Panel { title: "Connections",
+            Messages { error: error(), success: success_msg() }
 
             div { class: "space-y-6 mb-6",
                 // Soulseek
@@ -83,7 +66,7 @@ pub fn AppConfigManager() -> Element {
                     h3 { class: "text-sm font-semibold text-white mb-3", "Soulseek (slskd)" }
                     div { class: "space-y-4",
                         div {
-                            label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider", "slskd URL" }
+                            label { class: LABEL_CLASS, "slskd URL" }
                             TextInput {
                                 value: slskd_url(),
                                 oninput: move |v| slskd_url.set(v),
@@ -91,7 +74,7 @@ pub fn AppConfigManager() -> Element {
                             }
                         }
                         div {
-                            label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider", "slskd API Key" }
+                            label { class: LABEL_CLASS, "slskd API Key" }
                             TextInput {
                                 value: slskd_api_key(),
                                 oninput: move |v| slskd_api_key.set(v),
@@ -120,8 +103,7 @@ pub fn ConnectionStatusPanel() -> Element {
     let health = use_system_health();
 
     rsx! {
-        div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
-            h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Status" }
+        Panel { title: "Status",
             div { class: "space-y-6",
                 {
                     let (dot_class, summary) = match auth.navidrome_status() {

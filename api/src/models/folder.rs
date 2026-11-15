@@ -1,6 +1,10 @@
 #[cfg(feature = "server")]
+use crate::auth::Role;
+#[cfg(feature = "server")]
 use crate::db::DB;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "server")]
+use sqlx::SqlitePool;
 #[cfg(feature = "server")]
 use uuid::Uuid;
 
@@ -12,6 +16,16 @@ pub struct Folder {
     pub name: String,
     pub path: String,
     pub shared: bool,
+}
+
+/// A folder with its owner's name and role, as the folder rules read it.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct OwnedFolder {
+    #[sqlx(flatten)]
+    pub folder: Folder,
+    pub owner: String,
+    pub owner_role: Role,
 }
 
 #[cfg(feature = "server")]
@@ -33,11 +47,17 @@ impl Folder {
         Ok(folder)
     }
 
-    pub async fn get_all() -> Result<Vec<Folder>, String> {
-        sqlx::query_as::<_, Folder>("SELECT * FROM folders")
-            .fetch_all(&*DB)
-            .await
-            .map_err(|e| e.to_string())
+    /// Every folder with its owner, ordered by owner and name.
+    pub(crate) async fn get_all_with_owners_in(
+        db: &SqlitePool,
+    ) -> Result<Vec<OwnedFolder>, String> {
+        sqlx::query_as::<_, OwnedFolder>(
+            "SELECT f.*, u.username AS owner, u.role AS owner_role \
+             FROM folders f JOIN users u ON u.id = f.user_id ORDER BY u.username, f.name",
+        )
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())
     }
 
     pub async fn get_all_by_user(user_id: &str) -> Result<Vec<Folder>, String> {
@@ -79,9 +99,13 @@ impl Folder {
     }
 
     pub async fn get_by_id(id: &str) -> Result<Option<Folder>, String> {
+        Self::get_by_id_in(&DB, id).await
+    }
+
+    pub(crate) async fn get_by_id_in(db: &SqlitePool, id: &str) -> Result<Option<Folder>, String> {
         sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE id = ?")
             .bind(id)
-            .fetch_optional(&*DB)
+            .fetch_optional(db)
             .await
             .map_err(|e| e.to_string())
     }

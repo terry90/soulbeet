@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 
+use super::panel::{Messages, Panel, LABEL_CLASS};
 use crate::settings_context::use_settings;
 use crate::{friendly_error, FIELD_CLASS};
 
@@ -63,25 +64,12 @@ pub fn PreferencesManager() -> Element {
     };
 
     rsx! {
-        div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
-            h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Search Preferences" }
-
-            if !error().is_empty() {
-                div { class: "mb-4 p-4 bg-red-900/20 border border-red-500/50 rounded text-red-400 font-mono text-sm",
-                    "{error}"
-                }
-            }
-            if !success_msg().is_empty() {
-                div { class: "mb-4 p-4 bg-green-900/20 border border-green-500/50 rounded text-green-400 font-mono text-sm",
-                    "{success_msg}"
-                }
-            }
+        Panel { title: "Search Preferences",
+            Messages { error: error(), success: success_msg() }
 
             div { class: "space-y-4 mb-6",
                 div {
-                    label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
-                        "Default Metadata Provider"
-                    }
+                    label { class: LABEL_CLASS, "Default Metadata Provider" }
                     select {
                         class: FIELD_CLASS,
                         value: "{selected_provider}",

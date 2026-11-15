@@ -8,7 +8,7 @@ use crate::models::app_config::AppConfig;
 use crate::{AdminSession, AuthSession};
 
 #[cfg(feature = "server")]
-use super::server_error;
+use super::{folder::ensure_owner, server_error};
 
 /// Get current user's settings
 #[get("/api/settings", auth: AuthSession)]
@@ -25,6 +25,7 @@ pub async fn update_user_settings(
 ) -> Result<UserSettings, ServerFnError> {
     #[cfg(feature = "server")]
     {
+        check_folder_choices(&crate::db::DB, &auth.0.user_id, &update).await?;
         let old = UserSettings::get(&auth.0.user_id)
             .await
             .map_err(server_error)?;
@@ -40,6 +41,28 @@ pub async fn update_user_settings(
         let _ = update;
         unreachable!()
     }
+}
+
+/// Refuses a discovery or default download folder the user does not own,
+/// as "Folder not found", the same as for a folder that does not exist.
+/// Discovery downloads into that folder and deletes files there. An empty
+/// id clears the choice.
+#[cfg(feature = "server")]
+async fn check_folder_choices(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+    update: &UpdateUserSettings,
+) -> Result<(), ServerFnError> {
+    use crate::models::folder::Folder;
+    let chosen = [
+        &update.discovery_folder_id,
+        &update.default_download_folder_id,
+    ];
+    for id in chosen.into_iter().flatten().filter(|id| !id.is_empty()) {
+        let folder = Folder::get_by_id_in(db, id).await.map_err(server_error)?;
+        ensure_owner(folder, user_id)?;
+    }
+    Ok(())
 }
 
 /// Delete Navidrome smart playlists that are no longer valid because
@@ -203,4 +226,75 @@ pub async fn update_app_config(config: AppConfigValues) -> Result<AppConfigValue
     reload_providers().await;
 
     get_app_config().await
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use crate::db::test_db;
+
+    async fn folder_of(db: &sqlx::SqlitePool, user: &str) -> String {
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')")
+            .bind(user)
+            .bind(user)
+            .execute(db)
+            .await
+            .unwrap();
+        let id = format!("{user}-folder");
+        sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES (?, ?, 'f', ?)")
+            .bind(&id)
+            .bind(user)
+            .bind(format!("/music/{user}"))
+            .execute(db)
+            .await
+            .unwrap();
+        id
+    }
+
+    fn refusal(e: ServerFnError) -> (u16, String) {
+        match e {
+            ServerFnError::ServerError { code, message, .. } => (code, message),
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn another_users_folder_cannot_be_chosen() {
+        let db = test_db::migrated().await;
+        let alice_folder = folder_of(&db, "alice").await;
+        folder_of(&db, "bob").await;
+        for update in [
+            UpdateUserSettings {
+                discovery_folder_id: Some(alice_folder.clone()),
+                ..Default::default()
+            },
+            UpdateUserSettings {
+                default_download_folder_id: Some(alice_folder.clone()),
+                ..Default::default()
+            },
+        ] {
+            let err = check_folder_choices(&db, "bob", &update).await.unwrap_err();
+            assert_eq!(refusal(err), (409, "Folder not found".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn own_folders_and_an_empty_choice_are_accepted() {
+        let db = test_db::migrated().await;
+        let bob_folder = folder_of(&db, "bob").await;
+        let update = UpdateUserSettings {
+            discovery_folder_id: Some(bob_folder.clone()),
+            default_download_folder_id: Some(bob_folder),
+            ..Default::default()
+        };
+        check_folder_choices(&db, "bob", &update).await.unwrap();
+        let cleared = UpdateUserSettings {
+            discovery_folder_id: Some(String::new()),
+            ..Default::default()
+        };
+        check_folder_choices(&db, "bob", &cleared).await.unwrap();
+        check_folder_choices(&db, "bob", &UpdateUserSettings::default())
+            .await
+            .unwrap();
+    }
 }

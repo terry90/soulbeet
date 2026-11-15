@@ -2,6 +2,7 @@ mod app_config;
 mod connection_status_row;
 mod folder_admin;
 mod folder_manager;
+mod panel;
 mod preferences;
 mod security_status;
 mod user_manager;

@@ -4,30 +4,12 @@ use api::{
 };
 use dioxus::prelude::*;
 
+use super::panel::{ListRow, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
 use crate::{FieldLook, TextInput};
 
-const PANEL_CLASS: &str =
-    "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10";
-const LABEL_CLASS: &str = "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider";
 const LINK_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer";
-
-#[component]
-fn Messages(error: String, success: String) -> Element {
-    rsx! {
-      if !error.is_empty() {
-        div { class: "mb-4 p-4 bg-red-900/20 border border-red-500/50 rounded text-red-400 font-mono text-sm",
-          "{error}"
-        }
-      }
-      if !success.is_empty() {
-        div { class: "mb-4 p-4 bg-green-900/20 border border-green-500/50 rounded text-green-400 font-mono text-sm",
-          "{success}"
-        }
-      }
-    }
-}
 
 /// The signed-in user's own username and password, for every role.
 #[component]
@@ -77,10 +59,7 @@ pub fn AccountPanel() -> Element {
     };
 
     rsx! {
-      div { class: PANEL_CLASS,
-        h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display",
-          "Your Account"
-        }
+      Panel { title: "Your Account",
         Messages { error: error(), success: success_msg() }
 
         if auth.rename_allowed() {
@@ -200,10 +179,7 @@ pub fn UserManager() -> Element {
     };
 
     rsx! {
-      div { class: PANEL_CLASS,
-        h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display",
-          "User Management"
-        }
+      Panel { title: "User Management",
         Messages { error: error(), success: success_msg() }
 
         // Create User
@@ -233,9 +209,7 @@ pub fn UserManager() -> Element {
         }
 
         // User List
-        h3 { class: "text-lg font-bold mb-2 text-white font-display border-b border-white/10 pb-2",
-          "Existing Users"
-        }
+        SectionTitle { title: "Existing Users" }
         if users.read().is_empty() {
           p { class: "text-gray-500 font-mono italic", "No users found." }
         } else {
@@ -256,7 +230,7 @@ pub fn UserManager() -> Element {
                             ("user", Role::Admin, "Make admin")
                         };
                         rsx! {
-                          li { class: "bg-white/5 border border-white/5 p-3 rounded hover:border-beet-accent/30 transition-colors",
+                          ListRow {
                             if editing_user_id() == Some(user.id.clone()) {
                               div { class: "flex flex-col gap-2",
                                 div { class: "font-bold text-white font-display", "{user.username}" }
@@ -303,7 +277,7 @@ pub fn UserManager() -> Element {
                                     "Password"
                                   }
                                   button {
-                                    class: "text-xs font-mono text-gray-400 hover:text-red-400 transition-colors underline decoration-dotted cursor-pointer",
+                                    class: REMOVE_BUTTON_CLASS,
                                     onclick: move |_| handle_delete_user(id_delete.clone()),
                                     "Delete"
                                   }
