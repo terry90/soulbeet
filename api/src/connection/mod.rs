@@ -1,7 +1,7 @@
-//! The paths Claude (MCP) connects through, `/.well-known/...` and
-//! `/oauth/...`, behind one guard that refuses them while MCP is switched
-//! off, the instance is unsafe to expose, or the request's address is not
-//! https.
+//! The paths Claude (MCP) connects through, `/.well-known/...`,
+//! `/oauth/...` and `/mcp`, behind one guard that refuses them while MCP is
+//! switched off, the instance is unsafe to expose, or the request's address
+//! is not https.
 
 use std::sync::Arc;
 
@@ -68,8 +68,13 @@ pub fn router(state: ConnectionState) -> Router {
     let state = Arc::new(state);
     Router::new()
         .merge(crate::oauth::routes())
+        .merge(crate::mcp::routes(state.clone()))
+        .route("/.well-known/", any(not_found))
         .route("/.well-known/{*rest}", any(not_found))
+        .route("/oauth/", any(not_found))
         .route("/oauth/{*rest}", any(not_found))
+        .route("/mcp/", any(not_found))
+        .route("/mcp/{*rest}", any(not_found))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -80,7 +85,7 @@ async fn not_found() -> Response {
 
 /// Refuses the request or runs the route with its `RequestBase`, then marks
 /// the answer uncached and dependent on the headers its address was read
-/// from.
+/// from, next to any `Vary` the route set.
 async fn guard(
     State(state): State<Arc<ConnectionState>>,
     mut request: Request,
@@ -95,7 +100,7 @@ async fn guard(
     };
     let headers = response.headers_mut();
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(
+    headers.append(
         VARY,
         HeaderValue::from_static("Forwarded, X-Forwarded-Host, X-Forwarded-Proto, Host"),
     );
@@ -288,6 +293,24 @@ mod tests {
             body,
             json!({"error": "not_found", "message": "Nothing is served here"})
         );
+    }
+
+    #[tokio::test]
+    async fn the_bare_prefixes_are_not_found() {
+        for path in ["/.well-known/", "/oauth/"] {
+            let (status, _, body) = get_json(
+                router(ConnectionState::for_test(test_db::migrated().await)),
+                path,
+                &[("host", HOST)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(
+                body,
+                json!({"error": "not_found", "message": "Nothing is served here"}),
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]

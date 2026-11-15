@@ -12,6 +12,12 @@ pub(crate) fn mcp_url(base: &BaseUrl) -> String {
     format!("{base}/mcp")
 }
 
+/// Where the metadata of the resource `mcp_url(base)` is served: the
+/// RFC 9728 section 3.1 path-insertion URL.
+pub(crate) fn resource_metadata_url(base: &BaseUrl) -> String {
+    format!("{base}/.well-known/oauth-protected-resource/mcp")
+}
+
 /// RFC 9728 metadata of the resource `mcp_url(base)`.
 pub(crate) fn protected_resource(base: &BaseUrl) -> Value {
     json!({
@@ -135,6 +141,27 @@ mod tests {
                 Some("https://tunnel.example.net/mcp")
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_discovery_document_answers_get_only() {
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+        ] {
+            let (status, headers, body) = post_json(app().await, path, json!({})).await;
+            assert_eq!(
+                (status, headers["allow"].to_str().unwrap()),
+                (StatusCode::METHOD_NOT_ALLOWED, "GET,HEAD"),
+                "{path}"
+            );
+            assert_eq!(
+                body,
+                json!({"error": "method_not_allowed", "message": "Only GET is served here"}),
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]

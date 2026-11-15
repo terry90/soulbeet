@@ -13,14 +13,16 @@ use sqlx::SqlitePool;
 use tower::ServiceExt;
 use url::Url;
 
-use super::ConnectionState;
+use super::{router, ConnectionState};
+use crate::db::test_db;
 use crate::oauth::cimd::{
     client_id_url, parse_document, CimdError, ClientDocument, ClientDocuments,
 };
 use crate::oauth::clients::{find_in, insert_dcr_in, NewClient, DCR_CAP};
 use crate::oauth::codes::{store_code_in, PendingRequest};
-use crate::oauth::grants::CodeRedemption;
+use crate::oauth::grants::{redeem_code_in, CodeRedemption};
 use crate::oauth::limits::Limits;
+use crate::oauth::now_unix;
 use crate::oauth::secrets::new_secret;
 use crate::secret_key::SecretKey;
 
@@ -302,15 +304,75 @@ pub(crate) async fn post_json(
 
 async fn send_json(app: Router, req: Request<Body>) -> (StatusCode, HeaderMap, serde_json::Value) {
     let (status, headers, body) = send(app, req).await;
-    let json = if body.is_empty() {
-        serde_json::Value::Null
+    (status, headers, json_of(status, &body))
+}
+
+/// `body` parsed as JSON, `Null` when empty.
+fn json_of(status: StatusCode, body: &[u8]) -> serde_json::Value {
+    if body.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::from_slice(body).unwrap_or_else(|e| {
+        panic!(
+            "{status} body is not JSON ({e}): {}",
+            String::from_utf8_lossy(body)
+        )
+    })
+}
+
+/// An `initialize` request of the 2025-11-25 revision.
+pub(crate) const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+
+/// An access token of `user_id` (who must exist) for `resource`, issued now
+/// through a code and its redemption.
+pub(crate) async fn access_token(db: &SqlitePool, user_id: &str, resource: &str) -> String {
+    let code = issue_code(db, user_id, "soulful offline_access", resource, now_unix()).await;
+    let redemption = CodeRedemption {
+        resource,
+        ..good(&code)
+    };
+    redeem_code_in(db, &redemption, now_unix())
+        .await
+        .unwrap()
+        .access_token
+}
+
+/// A router on a database where u1 (alice) exists, and u1's access token for music.example.com.
+pub(crate) async fn mcp_app() -> (SqlitePool, Router, String) {
+    let db = test_db::migrated().await;
+    add_user(&db, "u1", "alice").await;
+    let token = access_token(&db, "u1", RESOURCE).await;
+    (db.clone(), router(ConnectionState::for_test(db)), token)
+}
+
+/// A `POST` of the JSON-RPC message `body` to `/mcp` with `headers`. The
+/// answer's body is the JSON of the first non-empty SSE `data:` line, or the
+/// body itself when it is not an event stream (`Null` when empty).
+pub(crate) async fn post_rpc(
+    app: Router,
+    headers: &[(&str, &str)],
+    body: serde_json::Value,
+) -> (StatusCode, HeaderMap, serde_json::Value) {
+    let mut req = Request::post("/mcp")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let (status, headers, body) = send(app, req.body(Body::from(body.to_string())).unwrap()).await;
+    let is_stream = headers
+        .get("content-type")
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+    let json = if is_stream {
+        let text = String::from_utf8(body.to_vec()).expect("an event stream is UTF-8");
+        text.lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .find(|data| !data.is_empty())
+            .map(|data| json_of(status, data.as_bytes()))
+            .unwrap_or(serde_json::Value::Null)
     } else {
-        serde_json::from_slice(&body).unwrap_or_else(|e| {
-            panic!(
-                "{status} body is not JSON ({e}): {}",
-                String::from_utf8_lossy(&body)
-            )
-        })
+        json_of(status, &body)
     };
     (status, headers, json)
 }

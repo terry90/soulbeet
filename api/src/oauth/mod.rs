@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::base_url::BaseUrl;
-use crate::connection::{ConnectionState, RequestBase};
+use crate::connection::{refusal, ConnectionState, RequestBase};
 
 pub(crate) mod authorize;
 pub(crate) mod cimd;
@@ -38,15 +38,15 @@ pub(crate) fn routes() -> Router<Arc<ConnectionState>> {
     Router::new()
         .route(
             "/.well-known/oauth-protected-resource/mcp",
-            get(protected_resource),
+            get(protected_resource).fallback(only_get),
         )
         .route(
             "/.well-known/oauth-protected-resource",
-            get(protected_resource),
+            get(protected_resource).fallback(only_get),
         )
         .route(
             "/.well-known/oauth-authorization-server",
-            get(authorization_server),
+            get(authorization_server).fallback(only_get),
         )
         .route("/oauth/register", post(register::register))
         .route(
@@ -162,6 +162,15 @@ pub(crate) fn resource_matches(sent: &str, base: &BaseUrl) -> bool {
 /// The clock of every OAuth handler, in unix seconds.
 pub(crate) fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// Another method on a discovery document: axum adds `Allow: GET,HEAD`.
+async fn only_get() -> Response {
+    refusal(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "Only GET is served here",
+    )
 }
 
 async fn protected_resource(Extension(RequestBase(base)): Extension<RequestBase>) -> Json<Value> {

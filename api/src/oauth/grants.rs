@@ -270,6 +270,54 @@ pub(crate) async fn refresh_in(
     Err(TokenRefusal::InvalidGrant(REFRESH_REUSED))
 }
 
+/// How long a grant's `last_used_at` stands before an access token's use
+/// marks it again, in seconds.
+const MARK_USED_EVERY: i64 = 60;
+
+/// What a live access token gives access to.
+pub(crate) struct Access {
+    pub resource: String,
+}
+
+/// The grant behind a live access token; marks the grant used
+/// (`last_used_at = now`) when it was last marked more than 60 s ago, so
+/// most calls only read. None for anything else.
+pub(crate) async fn access_in(
+    db: &SqlitePool,
+    token: &str,
+    now: i64,
+) -> Result<Option<Access>, String> {
+    let database = |e: sqlx::Error| e.to_string();
+    let row: Option<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT g.id, g.resource, g.last_used_at \
+         FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id \
+         WHERE t.token_hash = ? AND t.kind = 'access' AND t.expires_at > ?",
+    )
+    .bind(hash(token))
+    .bind(now)
+    .fetch_optional(db)
+    .await
+    .map_err(database)?;
+    let Some((grant_id, resource, last_used_at)) = row else {
+        return Ok(None);
+    };
+    if last_used_at.is_none_or(|at| now - at > MARK_USED_EVERY) {
+        // The statement repeats the read's condition, so it acts on what is
+        // there when it runs.
+        sqlx::query(
+            "UPDATE oauth_grants SET last_used_at = ? \
+             WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)",
+        )
+        .bind(now)
+        .bind(&grant_id)
+        .bind(now - MARK_USED_EVERY)
+        .execute(db)
+        .await
+        .map_err(database)?;
+    }
+    Ok(Some(Access { resource }))
+}
+
 /// Whether `code` was issued to `client_id`, redeemed or not. A plain read
 /// that keeps junk codes from taking the write lock or the client's budget.
 pub(crate) async fn code_of_client_in(
@@ -498,6 +546,36 @@ mod tests {
             ),
             (0, 0)
         );
+    }
+
+    #[tokio::test]
+    async fn an_access_token_marks_its_grant_used_at_most_once_a_minute() {
+        let (db, code) = issue("soulful").await;
+        let access = redeem_code_in(&db, &good(&code), T)
+            .await
+            .unwrap()
+            .access_token;
+        assert_eq!(
+            access_in(&db, &access, T + 1)
+                .await
+                .unwrap()
+                .map(|a| a.resource),
+            Some(RESOURCE.to_string())
+        );
+        assert_eq!(grant_last_used(&db).await, Some(T + 1));
+        access_in(&db, &access, T + 30).await.unwrap();
+        assert_eq!(grant_last_used(&db).await, Some(T + 1));
+        access_in(&db, &access, T + 62).await.unwrap();
+        assert_eq!(grant_last_used(&db).await, Some(T + 62));
+        assert!(access_in(&db, &access, T + 3600).await.unwrap().is_none());
+        assert!(access_in(&db, "made-up", T + 2).await.unwrap().is_none());
+    }
+
+    async fn grant_last_used(db: &SqlitePool) -> Option<i64> {
+        sqlx::query_scalar("SELECT last_used_at FROM oauth_grants")
+            .fetch_one(db)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

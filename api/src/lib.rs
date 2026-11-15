@@ -19,6 +19,8 @@ pub mod importer_health;
 pub mod ledger;
 #[cfg(feature = "server")]
 pub mod login_limiter;
+#[cfg(feature = "server")]
+pub mod mcp;
 pub mod models;
 #[cfg(feature = "server")]
 pub mod oauth;
