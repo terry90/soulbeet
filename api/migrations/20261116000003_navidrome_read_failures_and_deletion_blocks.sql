@@ -6,12 +6,14 @@ CREATE TABLE navidrome_read_failures (
     since TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- The tracks auto-delete kept at a user's last sync, and why.
+-- The tracks auto-delete kept at a user's last sync, and why: the refusal's code, so a reader
+-- can tell why without parsing text, and its message.
 CREATE TABLE deletion_blocks (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     song_id TEXT NOT NULL,
     title TEXT NOT NULL,
     artist TEXT NOT NULL,
+    code TEXT NOT NULL,
     message TEXT NOT NULL,
     PRIMARY KEY (user_id, song_id)
 );
