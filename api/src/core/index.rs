@@ -1,5 +1,6 @@
 //! The index wait: after an import, whether Navidrome lists the imported files (design 11.7).
 
+use super::delete_guard::paths;
 use crate::auth::UserId;
 use crate::globals::send_user_event;
 use crate::ledger::store::{self, IndexingSlot};
@@ -130,68 +131,86 @@ fn lookup_text(item: &ImportedItem) -> Option<String> {
 /// lookup_text (D7), paging LOOKUP_PAGE at a time until a short page or a match, or, with no text
 /// Navidrome keeps, among the NEWEST_PAGES pages of the songs it added last, where a file just
 /// imported is. Each candidate is checked with is_imported_file against the size of
-/// wait.library.join(item.path) on disk. An item whose file cannot be read is not listed.
+/// wait.library.join(item.path) on disk. An item whose file cannot be read is not listed. The
+/// song found for an item teaches where its library is on this machine (paths::learn_in).
 pub(crate) async fn listed(
+    db: &SqlitePool,
     navi: &NavidromeClient,
     wait: &IndexWait,
 ) -> Result<bool, NavidromeError> {
     for item in &wait.items {
-        let Ok(file) = tokio::fs::metadata(wait.library.join(&item.path)).await else {
+        let local = wait.library.join(&item.path);
+        let Ok(file) = tokio::fs::metadata(&local).await else {
             return Ok(false);
         };
         let size = file.len();
         let mut found = match &item.recording_mbid {
             Some(mbid) => lists(navi, mbid, &item.path, size).await?,
-            None => false,
+            None => None,
         };
-        if !found {
+        if found.is_none() {
             found = match lookup_text(item) {
                 Some(text) => lists(navi, &text, &item.path, size).await?,
                 None => among_newest(navi, &item.path, size).await?,
             };
         }
-        if !found {
+        let Some(song) = found else {
             return Ok(false);
+        };
+        if let Err(e) = paths::learn_in(db, &song, &local).await {
+            warn!(
+                "Could not learn where Navidrome library {} is on this machine from {}: {e}",
+                song.library_id,
+                local.display()
+            );
         }
     }
     Ok(true)
 }
 
-/// Whether the file at `item` of `size` bytes is among the NEWEST_PAGES pages of LOOKUP_PAGE songs
-/// Navidrome added last.
+/// The song among the NEWEST_PAGES pages of LOOKUP_PAGE songs Navidrome added last that is the
+/// file at `item` of `size` bytes.
 async fn among_newest(
     navi: &NavidromeClient,
     item: &Path,
     size: u64,
-) -> Result<bool, NavidromeError> {
+) -> Result<Option<NativeSong>, NavidromeError> {
     for page in 0..NEWEST_PAGES {
         let start = page * LOOKUP_PAGE;
         let songs = navi.newest_songs(start, start + LOOKUP_PAGE).await?;
-        if songs.iter().any(|song| is_imported_file(song, item, size)) {
-            return Ok(true);
+        let short = songs.len() < LOOKUP_PAGE as usize;
+        if let Some(song) = songs
+            .into_iter()
+            .find(|song| is_imported_file(song, item, size))
+        {
+            return Ok(Some(song));
         }
-        if songs.len() < LOOKUP_PAGE as usize {
-            return Ok(false);
+        if short {
+            return Ok(None);
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
-/// Whether a song the native `title` filter matches for `text` is the file at `item`.
+/// The song the native `title` filter matches for `text` that is the file at `item`.
 async fn lists(
     navi: &NavidromeClient,
     text: &str,
     item: &Path,
     size: u64,
-) -> Result<bool, NavidromeError> {
+) -> Result<Option<NativeSong>, NavidromeError> {
     let mut start = 0;
     loop {
         let page = navi.find_songs(text, start, start + LOOKUP_PAGE).await?;
-        if page.iter().any(|song| is_imported_file(song, item, size)) {
-            return Ok(true);
+        let short = page.len() < LOOKUP_PAGE as usize;
+        if let Some(song) = page
+            .into_iter()
+            .find(|song| is_imported_file(song, item, size))
+        {
+            return Ok(Some(song));
         }
-        if page.len() < LOOKUP_PAGE as usize {
-            return Ok(false);
+        if short {
+            return Ok(None);
         }
         start += LOOKUP_PAGE;
     }
@@ -374,9 +393,14 @@ pub(crate) async fn index_round(
         };
         match read {
             Ok((navi, status)) => {
+                let read = Reading {
+                    user: &user,
+                    navi: &navi,
+                    status: &status,
+                };
                 let mut scan = Vec::new();
                 for import in imports {
-                    let next = advance(ledger, runner, &user, &navi, &status, import, now).await;
+                    let next = advance(db, ledger, runner, &read, import, now).await;
                     if let Some(asks) = next {
                         scan.push(asks);
                     }
@@ -451,21 +475,28 @@ struct ScanAsk {
     unasked: IndexWait,
 }
 
+/// A user's Navidrome as one round read it: the user, the client and its scan status.
+struct Reading<'a> {
+    user: &'a UserId,
+    navi: &'a NavidromeClient,
+    status: &'a ScanStatus,
+}
+
 /// Looks the import up when Navidrome scanned since it last did, and takes the next step. An
 /// import that asks for a scan is given back for start_scan.
 async fn advance(
+    db: &SqlitePool,
     ledger: &Ledger,
     runner: &mut IndexRunner,
-    user: &UserId,
-    navi: &NavidromeClient,
-    status: &ScanStatus,
+    read: &Reading<'_>,
     import: Import,
     now: i64,
 ) -> Option<ScanAsk> {
+    let Reading { user, navi, status } = *read;
     let mut wait = import.wait.clone();
     let mut found = false;
     if !status.scanning && wait.checked != Some(status.last_scan) {
-        match listed(navi, &wait).await {
+        match listed(db, navi, &wait).await {
             Ok(listed) => {
                 found = listed;
                 wait.checked = Some(status.last_scan);
@@ -634,6 +665,7 @@ mod tests {
     use super::*;
     use crate::auth::UserId;
     use crate::ledger::{store, IndexWait, JobEvent, JobState, Ledger, NewJob, ScanBaseline};
+    use crate::models::navidrome_library::NavidromeLibraryRow;
     use crate::server_fns::download::test_support::item;
     use crate::services::NavidromeLookupError;
     use crate::test_navidrome::NavidromeStub;
@@ -931,6 +963,7 @@ mod tests {
     async fn another_copy_of_the_recording_is_not_the_imported_file() {
         let library = tempfile::tempdir().unwrap();
         let wait = imported_in(library.path());
+        let db = crate::db::test_db::migrated().await;
         let navi = NavidromeStub::start();
         // The MBID finds a copy of another size; the text finds one in another album.
         navi.answer(
@@ -940,7 +973,7 @@ mod tests {
                 &song_json("Zzqx Artist/Best Of/01 Song Number 1.mp3", 4),
             ],
         );
-        assert!(!listed(&navi.client(), &wait).await.unwrap());
+        assert!(!listed(&db, &navi.client(), &wait).await.unwrap());
         navi.answer(
             "/api/song",
             &[&song_json(
@@ -948,7 +981,7 @@ mod tests {
                 4,
             )],
         );
-        assert!(listed(&navi.client(), &wait).await.unwrap());
+        assert!(listed(&db, &navi.client(), &wait).await.unwrap());
     }
 
     const IDLE: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"scanStatus":{"scanning":false,"count":1342,"folderCount":120,"lastScan":"2026-11-15T10:02:00Z","scanType":"quick","elapsedTime":4000000000}}}"#;
@@ -1059,6 +1092,36 @@ mod tests {
             vec![Some(IndexState::Waiting), Some(IndexState::Listed)]
         );
         assert!(!navi.asked().contains(&"/rest/startScan".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_listed_file_teaches_where_its_navidrome_library_is() {
+        let library = tempfile::tempdir().unwrap();
+        let (ledger, db, _rx, _) = indexing(imported_in(library.path())).await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        navi.answer(
+            "/api/song",
+            &[&song_json("Zzqx Artist/Qzz Album/01 Song Number 1.mp3", 4)],
+        );
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Ok(navi.client())),
+            &mut IndexRunner::default(),
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Done));
+        assert_eq!(
+            NavidromeLibraryRow::get_in(&db, 1).await.unwrap(),
+            Some(NavidromeLibraryRow {
+                library_id: 1,
+                navidrome_path: "/music".into(),
+                local_path: library.path().to_str().unwrap().into(),
+            })
+        );
     }
 
     #[tokio::test]
