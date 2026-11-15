@@ -13,6 +13,7 @@ use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
     download::EnqueueStatus,
+    failure::{Failure, FailureCode, RetryAdvice, Service, Stage},
     metadata::{Album, Track},
     slskd::{AlbumResult, DownloadResponse, FileEntry, FlattenedFiles, SearchState, TrackResult},
 };
@@ -555,12 +556,7 @@ impl SoulseekClient {
 
             // The batches route only exists since slskd 0.26.
             if status.as_u16() == 404 {
-                return Err(SoulseekError::Api {
-                    status: 404,
-                    message: format!(
-                        "transfers/downloads/batches not found; slskd 0.26 or newer is required ({resp_text})"
-                    ),
-                });
+                return Err(SoulseekError::SlskdTooOld { body: resp_text });
             }
 
             // An earlier attempt created this batch and its answer was lost.
@@ -789,7 +785,7 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remo
 
 /// slskd's exact answer for a file it already has an unfinished transfer
 /// of (`DownloadService.EnqueueAsync`).
-const ALREADY_IN_PROGRESS: &str = "Skipped: Already in progress";
+pub const ALREADY_IN_PROGRESS: &str = "Skipped: Already in progress";
 
 /// `value` as one path segment. URL parsing resolves `.` and `..` as dot
 /// segments even when percent-encoded, so those cannot be sent at all.
@@ -907,9 +903,8 @@ where
     // Cap exponential backoff at 30 seconds to prevent excessive waits
     const MAX_BACKOFF_MS: u64 = 30_000;
 
-    let mut last_error: Option<SoulseekError> = None;
-
-    for attempt in 0..=config.max_retries {
+    let mut attempt = 0;
+    let last_error = loop {
         if attempt > 0 {
             let delay = std::cmp::min(
                 config.retry_base_delay_ms * (1 << (attempt - 1)),
@@ -922,36 +917,42 @@ where
             tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
         }
 
-        match send(batch).await {
+        let e = match send(batch).await {
             Ok(responses) => return responses,
-            Err(e) => {
-                warn!(
-                    "Batch {} for '{}' attempt {} failed: {}",
-                    batch.index, batch.username, attempt, e
-                );
-                // Stop retrying for non-retryable errors (e.g. user offline)
-                if !e.is_retryable() {
-                    warn!(
-                        "Batch {} for '{}': error is non-retryable, stopping",
-                        batch.index, batch.username
-                    );
-                    return batch.responses(EnqueueStatus::Failed(e.to_string()));
-                }
-                last_error = Some(e);
-            }
+            Err(e) => e,
+        };
+        warn!(
+            "Batch {} for '{}' attempt {} failed: {}",
+            batch.index, batch.username, attempt, e
+        );
+        // Stop retrying for non-retryable errors (e.g. user offline)
+        if !e.is_retryable() {
+            warn!(
+                "Batch {} for '{}': error is non-retryable, stopping",
+                batch.index, batch.username
+            );
+            let failure = e.failure(Stage::Enqueue, e.to_string());
+            return batch.responses(EnqueueStatus::Failed(failure));
         }
-    }
+        if attempt == config.max_retries {
+            break e;
+        }
+        attempt += 1;
+    };
 
-    let error_msg = last_error
-        .map(|e| format!("Failed after {} retries: {}", config.max_retries, e))
-        .unwrap_or_else(|| format!("Failed after {} retries", config.max_retries));
+    let error_msg = format!(
+        "Failed after {} retries: {}",
+        config.max_retries, last_error
+    );
 
     warn!(
         "Batch {} for '{}' failed after all retries: {}",
         batch.index, batch.username, error_msg
     );
 
-    batch.responses(EnqueueStatus::Failed(error_msg))
+    batch.responses(EnqueueStatus::Failed(
+        last_error.failure(Stage::Enqueue, error_msg),
+    ))
 }
 
 /// Answers for a batch slskd already holds (409 on a retried POST): its own
@@ -976,9 +977,12 @@ fn replayed_batch_responses(batch: &PendingBatch, listing: &[FileEntry]) -> Vec<
                 transfer_id: transfer.map(|t| t.id.clone()),
                 status: match transfer {
                     Some(_) => EnqueueStatus::Enqueued,
-                    None => EnqueueStatus::Failed(
-                        "Not found in slskd after a retried enqueue".to_string(),
-                    ),
+                    None => EnqueueStatus::Failed(Failure::new(
+                        FailureCode::EnqueueFailed,
+                        Stage::Enqueue,
+                        RetryAdvice::SameSourceLater,
+                        "Not found in slskd after a retried enqueue",
+                    )),
                 },
             }
         })
@@ -1014,10 +1018,21 @@ fn parse_batch_enqueue_response(
                 (None, Some(f)) if f.message == ALREADY_IN_PROGRESS => {
                     EnqueueStatus::AlreadyInFlight
                 }
-                (None, Some(f)) => EnqueueStatus::Failed(f.message.clone()),
-                (None, None) => {
-                    EnqueueStatus::Failed("Not reported in slskd enqueue response".to_string())
-                }
+                (None, Some(f)) => EnqueueStatus::Failed(
+                    Failure::new(
+                        FailureCode::EnqueueFailed,
+                        Stage::Enqueue,
+                        RetryAdvice::OtherSource,
+                        f.message.clone(),
+                    )
+                    .with_cause(Service::Slskd, None, f.message.clone()),
+                ),
+                (None, None) => EnqueueStatus::Failed(Failure::new(
+                    FailureCode::EnqueueFailed,
+                    Stage::Enqueue,
+                    RetryAdvice::OtherSource,
+                    "Not reported in slskd enqueue response",
+                )),
             };
 
             DownloadResponse {
@@ -1104,6 +1119,11 @@ mod tests {
     use super::*;
     use shared::download::EnqueueStatus;
 
+    /// `status` is Failed with this code and message.
+    fn failed_with(status: &EnqueueStatus, code: FailureCode, message: &str) -> bool {
+        matches!(status, EnqueueStatus::Failed(f) if f.code == code && f.message == message)
+    }
+
     fn batch(files: &[&str]) -> Vec<DownloadRequestFile> {
         files
             .iter()
@@ -1167,11 +1187,24 @@ mod tests {
         .unwrap();
         assert_eq!(results[0].status, EnqueueStatus::Enqueued);
         assert_eq!(results[1].filename, r"a\album\2.mp3");
-        assert_eq!(
-            results[1].status,
-            EnqueueStatus::Failed("Error: something broke".into())
-        );
+        assert!(failed_with(
+            &results[1].status,
+            FailureCode::EnqueueFailed,
+            "Error: something broke"
+        ));
         assert_eq!(results[1].transfer_id, None);
+        let EnqueueStatus::Failed(f) = &results[1].status else {
+            unreachable!()
+        };
+        assert_eq!(
+            (f.stage, f.retry),
+            (Stage::Enqueue, RetryAdvice::OtherSource)
+        );
+        let cause = f.cause.as_ref().unwrap();
+        assert_eq!(
+            (cause.service, cause.status, cause.raw.as_str()),
+            (Service::Slskd, None, "Error: something broke")
+        );
     }
 
     #[test]
@@ -1183,10 +1216,11 @@ mod tests {
             &body(&[], &[(r"a\album\1.mp3", "Error: rejected")]),
         )
         .unwrap();
-        assert_eq!(
-            results[0].status,
-            EnqueueStatus::Failed("Error: rejected".into())
-        );
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Error: rejected"
+        ));
     }
 
     #[test]
@@ -1211,10 +1245,11 @@ mod tests {
             &body(&[], &[(r"a\album\1.mp3", "Already in progress")]),
         )
         .unwrap();
-        assert_eq!(
-            results[0].status,
-            EnqueueStatus::Failed("Already in progress".into())
-        );
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Already in progress"
+        ));
     }
 
     #[test]
@@ -1231,10 +1266,11 @@ mod tests {
     fn file_missing_from_response_is_an_error() {
         let files = batch(&[r"a\album\1.mp3"]);
         let results = parse_batch_enqueue_response("peer", &files, &body(&[], &[])).unwrap();
-        assert_eq!(
-            results[0].status,
-            EnqueueStatus::Failed("Not reported in slskd enqueue response".into())
-        );
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Not reported in slskd enqueue response"
+        ));
     }
 
     #[test]
@@ -1247,7 +1283,11 @@ mod tests {
         })
         .to_string();
         let results = parse_batch_enqueue_response("peer", &files, &body).unwrap();
-        assert_eq!(results[0].status, EnqueueStatus::Failed("Error: x".into()));
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Error: x"
+        ));
     }
 
     #[test]
@@ -1362,6 +1402,66 @@ mod tests {
         assert_eq!(sent[0]["id"], sent[1]["id"]);
     }
 
+    #[tokio::test]
+    async fn an_offline_peer_fails_its_batch_at_once_with_peer_offline() {
+        let batches = plan_batches(vec![wanted("peer", r"music\A\01.flac")], "A [1]", 3);
+        let config = DownloadConfig {
+            batch_size: 3,
+            batch_delay_ms: 0,
+            max_retries: 3,
+            retry_base_delay_ms: 0,
+        };
+        let mut sent = 0;
+        let results = retry_batch(&config, &batches[0], |_| {
+            sent += 1;
+            async {
+                Err(SoulseekError::UserOffline {
+                    username: "peer".into(),
+                })
+            }
+        })
+        .await;
+        assert_eq!(sent, 1);
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::PeerOffline,
+            "User 'peer' is offline"
+        ));
+    }
+
+    #[tokio::test]
+    async fn spent_retries_keep_the_last_error_and_its_code() {
+        let batches = plan_batches(vec![wanted("peer", r"music\A\01.flac")], "A [1]", 3);
+        let config = DownloadConfig {
+            batch_size: 3,
+            batch_delay_ms: 0,
+            max_retries: 2,
+            retry_base_delay_ms: 0,
+        };
+        let mut sent = 0;
+        let results = retry_batch(&config, &batches[0], |_| {
+            sent += 1;
+            async {
+                Err(SoulseekError::Api {
+                    status: 429,
+                    message: "Only one concurrent operation is permitted. Wait until the previous request completes".into(),
+                })
+            }
+        })
+        .await;
+        assert_eq!(sent, 3);
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Failed after 2 retries: API error: 429 - Only one concurrent operation is permitted. Wait until the previous request completes"
+        ));
+        let EnqueueStatus::Failed(f) = &results[0].status else {
+            unreachable!()
+        };
+        assert_eq!(f.retry, RetryAdvice::SameSourceLater);
+        assert_eq!(f.cause.as_ref().unwrap().status, Some(429));
+    }
+
     fn listed(id: &str, filename: &str, batch_id: Option<&str>) -> FileEntry {
         let mut entry = serde_json::json!({
             "id": id,
@@ -1406,7 +1506,11 @@ mod tests {
 
         assert_eq!(results[0].status, EnqueueStatus::Enqueued);
         assert_eq!(results[0].transfer_id.as_deref(), Some("t-01"));
-        assert!(matches!(results[1].status, EnqueueStatus::Failed(_)));
+        assert!(failed_with(
+            &results[1].status,
+            FailureCode::EnqueueFailed,
+            "Not found in slskd after a retried enqueue"
+        ));
         assert_eq!(results[1].transfer_id, None);
     }
 }

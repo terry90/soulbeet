@@ -380,7 +380,7 @@ pub enum EnqueueStatus {
     /// The backend already has an unfinished transfer of this file from this
     /// peer and did not start another one.
     AlreadyInFlight,
-    Failed(String),
+    Failed(Failure),
 }
 
 /// Response from queueing downloads

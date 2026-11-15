@@ -4,7 +4,9 @@
 //! anything, and releases each key whose file was not enqueued.
 
 use shared::download::{DownloadProgress, DownloadableItem, EnqueueStatus, QueuedDownload};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
+use soulbeet::slskd::ALREADY_IN_PROGRESS;
 use soulbeet::DownloadBackend;
 use std::sync::Arc;
 
@@ -20,8 +22,54 @@ pub const ALREADY_IN_SLSKD: &str = "already downloading in slskd";
 /// Refusal for a request whose files the same user is already downloading
 /// into another library folder.
 pub const ANOTHER_FOLDER: &str = "already downloading into another folder";
+/// Log text for a file the same user's batch is already downloading.
+pub const ALREADY_MINE: &str = "already downloading for this user";
 /// Row text for a file that joined a batch whose monitor had stopped.
 pub const MONITOR_STOPPED: &str = "Download monitoring stopped";
+/// Reason for a file the backend answered nothing for.
+pub const NOTHING_ENQUEUED: &str = "nothing enqueued";
+
+/// Another user's batch is downloading the file.
+pub fn other_user() -> Failure {
+    Failure::new(
+        FailureCode::AlreadyInFlightOtherUser,
+        Stage::Enqueue,
+        RetryAdvice::OtherSource,
+        OTHER_USER,
+    )
+}
+
+/// slskd is fetching the file outside every batch of ours, so there is no
+/// run to follow.
+pub fn already_in_slskd() -> Failure {
+    Failure::new(
+        FailureCode::EnqueueFailed,
+        Stage::Enqueue,
+        RetryAdvice::OtherSource,
+        ALREADY_IN_SLSKD,
+    )
+    .with_cause(Service::Slskd, None, ALREADY_IN_PROGRESS)
+}
+
+/// The same user's batch is downloading the file into another folder.
+pub fn another_folder(retry: RetryAdvice) -> Failure {
+    Failure::new(
+        FailureCode::AlreadyInFlightOtherFolder,
+        Stage::Enqueue,
+        retry,
+        ANOTHER_FOLDER,
+    )
+}
+
+/// The same user's batch is downloading the file into this folder.
+pub fn already_running() -> Failure {
+    Failure::new(
+        FailureCode::AlreadyRunning,
+        Stage::Enqueue,
+        RetryAdvice::OtherSource,
+        ALREADY_MINE,
+    )
+}
 
 pub fn transfer_key(backend: &'static str, peer: &str, filename: &str) -> TransferKey {
     TransferKey {
@@ -37,7 +85,7 @@ fn item_key(backend: &'static str, item: &DownloadableItem) -> TransferKey {
 
 /// Why a file gets a Failed row. `None` when it was enqueued, or when one of
 /// the user's batches is already downloading it and shows its row.
-pub fn failed_reason(status: &EnqueueStatus) -> Option<&str> {
+pub fn failed_reason(status: &EnqueueStatus) -> Option<&Failure> {
     match status {
         EnqueueStatus::Failed(reason) => Some(reason),
         EnqueueStatus::Enqueued | EnqueueStatus::AlreadyInFlight => None,
@@ -64,7 +112,7 @@ pub async fn enqueue_claimed(
     };
     for q in &mut queued {
         if q.status == EnqueueStatus::AlreadyInFlight {
-            q.status = EnqueueStatus::Failed(ALREADY_IN_SLSKD.to_string());
+            q.status = EnqueueStatus::Failed(already_in_slskd());
         }
     }
     // Includes files the backend dropped without answering for them.
@@ -165,7 +213,7 @@ pub async fn enqueue_request(
             claim
                 .other_user
                 .iter()
-                .map(|key| not_enqueued(key, EnqueueStatus::Failed(OTHER_USER.to_string()))),
+                .map(|key| not_enqueued(key, EnqueueStatus::Failed(other_user()))),
         )
         .collect();
     let watcher = match reservation {
@@ -251,9 +299,9 @@ pub fn stopped_rows(lost: &[AddedSlot], batch: &BatchRef) -> Vec<DownloadProgres
 mod tests {
     use super::*;
     use crate::server_fns::download::test_support::{
-        batch, item, key, Cancel, ScriptedOutcome, StubBackend,
+        batch, item, key, same_user_into, Cancel, ScriptedOutcome, StubBackend,
     };
-    use crate::transfer_registry::TransferOwner;
+    use shared::failure::{FailureCode, RetryAdvice, Stage};
     use std::path::PathBuf;
 
     /// Another batch of `running`'s user, importing into the same folder.
@@ -261,24 +309,74 @@ mod tests {
         same_user_into(running, running.target.clone())
     }
 
-    fn same_user_into(running: &BatchRef, target: PathBuf) -> BatchRef {
-        BatchRef::new(
-            TransferOwner {
-                user_id: running.owner.user_id.clone(),
-                batch_id: uuid::Uuid::new_v4().to_string(),
-            },
-            "Come Over".to_string(),
-            target,
-        )
+    /// An `EnqueueStatus` with a failure reduced to its code.
+    #[derive(Debug, PartialEq)]
+    enum Answer {
+        Enqueued,
+        AlreadyInFlight,
+        Failed(FailureCode),
     }
 
-    fn statuses(results: &[QueuedDownload]) -> Vec<(String, EnqueueStatus)> {
+    fn statuses(results: &[QueuedDownload]) -> Vec<(String, Answer)> {
         let mut statuses: Vec<_> = results
             .iter()
-            .map(|q| (q.item.clone(), q.status.clone()))
+            .map(|q| {
+                let answer = match &q.status {
+                    EnqueueStatus::Enqueued => Answer::Enqueued,
+                    EnqueueStatus::AlreadyInFlight => Answer::AlreadyInFlight,
+                    EnqueueStatus::Failed(f) => Answer::Failed(f.code),
+                };
+                (q.item.clone(), answer)
+            })
             .collect();
         statuses.sort_by(|a, b| a.0.cmp(&b.0));
         statuses
+    }
+
+    #[test]
+    fn enqueue_refusals_keep_their_text() {
+        use RetryAdvice::*;
+        for (f, code, retry, message) in [
+            (
+                other_user(),
+                FailureCode::AlreadyInFlightOtherUser,
+                OtherSource,
+                OTHER_USER,
+            ),
+            (
+                already_in_slskd(),
+                FailureCode::EnqueueFailed,
+                OtherSource,
+                ALREADY_IN_SLSKD,
+            ),
+            (
+                another_folder(OtherSource),
+                FailureCode::AlreadyInFlightOtherFolder,
+                OtherSource,
+                ANOTHER_FOLDER,
+            ),
+            (
+                another_folder(NotRetryable),
+                FailureCode::AlreadyInFlightOtherFolder,
+                NotRetryable,
+                ANOTHER_FOLDER,
+            ),
+            (
+                already_running(),
+                FailureCode::AlreadyRunning,
+                OtherSource,
+                ALREADY_MINE,
+            ),
+        ] {
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message.as_str()),
+                (code, Stage::Enqueue, retry, message)
+            );
+        }
+        assert_eq!(
+            already_in_slskd().cause.unwrap().raw,
+            "Skipped: Already in progress"
+        );
     }
 
     #[tokio::test]
@@ -298,8 +396,8 @@ mod tests {
         assert_eq!(
             statuses(&enq.results),
             vec![
-                ("01.flac".to_string(), EnqueueStatus::AlreadyInFlight),
-                ("02.flac".to_string(), EnqueueStatus::Enqueued),
+                ("01.flac".to_string(), Answer::AlreadyInFlight),
+                ("02.flac".to_string(), Answer::Enqueued),
             ]
         );
         assert_eq!(enq.batch.owner, running.owner);
@@ -347,7 +445,7 @@ mod tests {
         // The running batch shows the shared file's row.
         assert_eq!(
             statuses(&enq.results),
-            vec![("02.flac".to_string(), EnqueueStatus::Enqueued)]
+            vec![("02.flac".to_string(), Answer::Enqueued)]
         );
         assert_eq!(enq.refusal(), None);
         assert!(matches!(enq.watcher, Watcher::Own));
@@ -381,8 +479,8 @@ mod tests {
         assert_eq!(
             statuses(&enq.results),
             vec![
-                ("02.flac".to_string(), EnqueueStatus::AlreadyInFlight),
-                ("03.flac".to_string(), EnqueueStatus::Enqueued),
+                ("02.flac".to_string(), Answer::AlreadyInFlight),
+                ("03.flac".to_string(), Answer::Enqueued),
             ]
         );
     }
@@ -429,7 +527,7 @@ mod tests {
 
         assert_eq!(
             statuses(&enq.results),
-            vec![("01.flac".to_string(), EnqueueStatus::AlreadyInFlight)]
+            vec![("01.flac".to_string(), Answer::AlreadyInFlight)]
         );
         assert!(stub.destinations().is_empty());
         assert!(matches!(enq.watcher, Watcher::Own));
@@ -457,8 +555,12 @@ mod tests {
             statuses(&enq.results),
             vec![(
                 "01.flac".to_string(),
-                EnqueueStatus::Failed(OTHER_USER.to_string())
+                Answer::Failed(FailureCode::AlreadyInFlightOtherUser)
             )]
+        );
+        assert_eq!(
+            failed_reason(&enq.results[0].status).unwrap().message,
+            OTHER_USER
         );
         assert!(stub.destinations().is_empty());
         // Still theirs: a third batch may not take it over.
@@ -479,8 +581,14 @@ mod tests {
             statuses(&enq.results),
             vec![(
                 "01.flac".to_string(),
-                EnqueueStatus::Failed(ALREADY_IN_SLSKD.to_string())
+                Answer::Failed(FailureCode::EnqueueFailed)
             )]
+        );
+        let failure = failed_reason(&enq.results[0].status).unwrap();
+        assert_eq!(failure.message, ALREADY_IN_SLSKD);
+        assert_eq!(
+            failure.cause.as_ref().unwrap().raw,
+            "Skipped: Already in progress"
         );
         assert!(TransferRegistry::global()
             .may_adopt(&key(&backend, "peer_a", "01.flac"), &batch("Other").owner));

@@ -48,7 +48,7 @@ use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
 use crate::server_fns::download::enqueue::{
-    enqueue_claimed, failed_reason, transfer_key, OTHER_USER,
+    enqueue_claimed, failed_reason, transfer_key, ALREADY_MINE, NOTHING_ENQUEUED, OTHER_USER,
 };
 #[cfg(feature = "server")]
 use crate::server_fns::download::failover::{self, SourcePool};
@@ -412,30 +412,43 @@ async fn settle_poll(
                 registry.release(&qt.key, &qt.batch.owner);
                 failed.insert(id);
             }
-            Outcome::Failed => match qt.pool.enqueue_next(0, backend, &qt.batch).await {
-                Some(next) => {
-                    info!(
-                        "Discovery: '{}' - {} failed from {}, retrying from {}",
-                        qt.artist, qt.track, qt.key.peer, next.source
+            Outcome::Failed => {
+                let next = qt.pool.enqueue_next(0, backend, &qt.batch).await;
+                for refused in &next.refused {
+                    warn!(
+                        "Discovery: '{}' - {} failover source {} refused: {:?}: {}",
+                        qt.artist,
+                        qt.track,
+                        refused.source,
+                        refused.failure.code,
+                        refused.failure.message
                     );
-                    // The new peer serves this track under its own remote
-                    // path and transfer id, so the whole identity moves at
-                    // once, and the fresh transfer starts with no failure
-                    // recorded.
-                    let dead = std::mem::replace(
-                        &mut qt.key,
-                        transfer_key(backend.id(), &next.source, &next.item),
-                    );
-                    registry.release(&dead, &qt.batch.owner);
-                    qt.transfer_id = next.id.clone();
-                    qt.failing_since = None;
-                    pending.insert(next.id);
                 }
-                None => {
-                    registry.release(&qt.key, &qt.batch.owner);
-                    failed.insert(id);
+                match next.queued {
+                    Some(next) => {
+                        info!(
+                            "Discovery: '{}' - {} failed from {}, retrying from {}",
+                            qt.artist, qt.track, qt.key.peer, next.source
+                        );
+                        // The new peer serves this track under its own remote
+                        // path and transfer id, so the whole identity moves at
+                        // once, and the fresh transfer starts with no failure
+                        // recorded.
+                        let dead = std::mem::replace(
+                            &mut qt.key,
+                            transfer_key(backend.id(), &next.source, &next.item),
+                        );
+                        registry.release(&dead, &qt.batch.owner);
+                        qt.transfer_id = next.id.clone();
+                        qt.failing_since = None;
+                        pending.insert(next.id);
+                    }
+                    None => {
+                        registry.release(&qt.key, &qt.batch.owner);
+                        failed.insert(id);
+                    }
                 }
-            },
+            }
         }
     }
 }
@@ -746,7 +759,7 @@ pub async fn generate_discovery_playlist_internal(
                         .claim(std::slice::from_ref(&transfer), &track_batch);
                     if claim.claimed.is_empty() {
                         let owner = if claim.other_user.is_empty() {
-                            "already downloading for this user"
+                            ALREADY_MINE
                         } else {
                             OTHER_USER
                         };
@@ -818,7 +831,8 @@ pub async fn generate_discovery_playlist_internal(
                         let reason = download_results
                             .iter()
                             .find_map(|dl| failed_reason(&dl.status))
-                            .unwrap_or("nothing enqueued");
+                            .map(|f| f.message.as_str())
+                            .unwrap_or(NOTHING_ENQUEUED);
                         info!(
                             "Download source {} refused '{}' - {} ({}), trying next",
                             attempt_idx + 1,

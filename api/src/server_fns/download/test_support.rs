@@ -10,9 +10,11 @@ use shared::download::{
     DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, EnqueueStatus,
     QueuedDownload, SearchResult,
 };
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::DownloadBackend;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -59,7 +61,19 @@ pub fn batch(label: &str) -> BatchRef {
             batch_id: format!("12345678-{unique}"),
         },
         label.to_string(),
-        std::path::PathBuf::from("/music"),
+        PathBuf::from("/music"),
+    )
+}
+
+/// Another batch of `running`'s user, importing into `target`.
+pub fn same_user_into(running: &BatchRef, target: PathBuf) -> BatchRef {
+    BatchRef::new(
+        TransferOwner {
+            user_id: running.owner.user_id.clone(),
+            batch_id: uuid::Uuid::new_v4().to_string(),
+        },
+        "Come Over".to_string(),
+        target,
     )
 }
 
@@ -231,12 +245,20 @@ impl DownloadBackend for StubBackend {
             }
             ScriptedOutcome::Rejected => answer(
                 item.id.clone(),
-                EnqueueStatus::Failed("peer offline".to_string()),
+                EnqueueStatus::Failed(Failure::new(
+                    FailureCode::PeerOffline,
+                    Stage::Enqueue,
+                    RetryAdvice::OtherSource,
+                    "peer offline",
+                )),
             ),
-            // LockError stands in for any transport-level failure; its
-            // meaning doesn't matter here, only that `download` itself
+            // An unreadable answer stands in for any failure of the call;
+            // its meaning doesn't matter here, only that `download` itself
             // errors rather than returning an Ok with a rejected item.
-            ScriptedOutcome::TransportError => Err(SoulseekError::LockError),
+            ScriptedOutcome::TransportError => Err(SoulseekError::InvalidResponse(
+                "batch enqueue response: expected value at line 1 column 1 (body 20 bytes)"
+                    .to_string(),
+            )),
         }
     }
     async fn get_downloads_for(&self, sources: &[String]) -> SoulResult<Vec<DownloadProgress>> {

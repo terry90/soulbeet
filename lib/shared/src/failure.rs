@@ -53,17 +53,8 @@ impl Failure {
         self
     }
 
-    pub fn with_user_action(
-        mut self,
-        code: UserActionCode,
-        what: impl Into<String>,
-        where_: impl Into<String>,
-    ) -> Self {
-        self.user_action = Some(UserAction {
-            code,
-            what: what.into(),
-            where_: where_.into(),
-        });
+    pub fn with_user_action(mut self, action: UserAction) -> Self {
+        self.user_action = Some(action);
         self
     }
 
@@ -86,6 +77,24 @@ pub struct UserAction {
     pub what: String,
     #[serde(rename = "where")]
     pub where_: String,
+}
+
+impl UserAction {
+    pub fn configure_backend() -> Self {
+        Self {
+            code: UserActionCode::ConfigureBackend,
+            what: "Set the slskd URL and API key".to_string(),
+            where_: "Settings > Config".to_string(),
+        }
+    }
+
+    pub fn upgrade_backend() -> Self {
+        Self {
+            code: UserActionCode::UpgradeBackend,
+            what: "Upgrade slskd to 0.26 or newer".to_string(),
+            where_: "slskd".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -332,16 +341,37 @@ mod tests {
             RetryAdvice::NeedsUser,
             "x",
         )
-        .with_user_action(
-            UserActionCode::UpgradeBackend,
-            "Upgrade slskd to 0.26 or newer",
-            "slskd",
-        );
+        .with_user_action(UserAction::upgrade_backend());
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(
             v["user_action"],
             serde_json::json!({"code": "upgrade_backend",
                 "what": "Upgrade slskd to 0.26 or newer", "where": "slskd"})
+        );
+    }
+
+    #[test]
+    fn user_actions_carry_their_texts() {
+        let action = |code, what: &str, where_: &str| UserAction {
+            code,
+            what: what.to_string(),
+            where_: where_.to_string(),
+        };
+        assert_eq!(
+            UserAction::configure_backend(),
+            action(
+                UserActionCode::ConfigureBackend,
+                "Set the slskd URL and API key",
+                "Settings > Config"
+            )
+        );
+        assert_eq!(
+            UserAction::upgrade_backend(),
+            action(
+                UserActionCode::UpgradeBackend,
+                "Upgrade slskd to 0.26 or newer",
+                "slskd"
+            )
         );
     }
 

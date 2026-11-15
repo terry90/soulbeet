@@ -382,7 +382,18 @@ impl DownloadMonitor {
         let Some(pool) = self.pool.as_mut() else {
             return false;
         };
-        let Some(queued) = pool.enqueue_next(slot, backend, &self.batch).await else {
+        let next = pool.enqueue_next(slot, backend, &self.batch).await;
+        for refused in &next.refused {
+            warn!(
+                "Failover source {} refused {} for {}: {:?}: {}",
+                refused.source,
+                refused.item,
+                self.tracked_files[slot].filename,
+                refused.failure.code,
+                refused.failure.message
+            );
+        }
+        let Some(queued) = next.queued else {
             return false;
         };
 
