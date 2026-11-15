@@ -197,11 +197,10 @@ impl TransferRegistry {
 
     /// Releases `key`, and its cancel mark, if `owner` still holds it. A key
     /// released and claimed again by someone else meanwhile stays theirs.
-    pub fn release(&self, key: &TransferKey, owner: &TransferOwner) {
+    /// Returns whether `owner` held it marked cancelled.
+    pub fn release(&self, key: &TransferKey, owner: &TransferOwner) -> bool {
         let mut held = self.held();
-        if held.held_by(key, owner) {
-            held.remove(key);
-        }
+        held.held_by(key, owner) && held.remove(key)
     }
 
     /// Releases every key the batch still holds, with their cancel marks.

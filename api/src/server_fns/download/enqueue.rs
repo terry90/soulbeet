@@ -151,8 +151,9 @@ pub async fn enqueue_claimed(
     let queued = match backend.download(items, &batch.destination).await {
         Ok(queued) => queued,
         Err(e) => {
-            keys.iter()
-                .for_each(|key| registry.release(key, &batch.owner));
+            for key in &keys {
+                registry.release(key, &batch.owner);
+            }
             return Err(e);
         }
     };

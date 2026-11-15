@@ -93,6 +93,11 @@ impl SourcePool {
         }
     }
 
+    /// How many slots the pool has.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     /// How many sources this slot has consumed, including the original.
     pub fn attempts_used(&self, slot: usize) -> usize {
         self.slots.get(slot).map(|s| s.used).unwrap_or(0)
@@ -160,7 +165,8 @@ impl SourcePool {
     }
 }
 
-/// The items of `rest` offering `track` (same normalized title), best group
+/// The items of `rest` offering `track` (same normalized title), in `rest`'s
+/// order. `rest` must be sorted by descending score, so the best group comes
 /// first. Matching is by title, never by filename: the same track has a
 /// completely different remote path on each peer.
 pub fn alternates_for(
