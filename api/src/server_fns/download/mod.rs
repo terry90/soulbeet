@@ -299,6 +299,8 @@ pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnE
         import_output: None,
         retryable: false,
         can_choose_import: false,
+        failure: None,
+        skip: None,
     };
     let _ = tx.send(DownloadEvent::Progress(vec![cancelled]));
 

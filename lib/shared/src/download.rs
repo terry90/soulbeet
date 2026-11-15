@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::failure::Failure;
 use crate::metadata::{Album, Track};
 
 #[derive(Serialize, Clone, PartialEq, Deserialize, Debug, Default)]
@@ -168,6 +169,21 @@ pub struct DownloadProgress {
     /// user can pick one or import it as-is
     #[serde(default)]
     pub can_choose_import: bool,
+    /// Why the row failed or was skipped, typed
+    #[serde(default)]
+    pub failure: Option<Failure>,
+    /// Which kind of skip an ImportSkipped row is
+    #[serde(default)]
+    pub skip: Option<SkipKind>,
+}
+
+/// Why an import was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipKind {
+    AlreadyInLibrary,
+    NoMatch { candidates: Option<u32> },
+    NothingToImport,
 }
 
 impl DownloadProgress {
@@ -189,6 +205,8 @@ impl DownloadProgress {
             import_output: None,
             retryable: false,
             can_choose_import: false,
+            failure: None,
+            skip: None,
         }
     }
 
@@ -210,7 +228,20 @@ impl DownloadProgress {
             import_output: None,
             retryable: false,
             can_choose_import: false,
+            failure: None,
+            skip: None,
         }
+    }
+
+    /// The one writer of `error` for a failure: error = Some(failure.message),
+    /// a Failed(_) state gets failure.message as its payload, other states are kept.
+    pub fn with_failure(mut self, failure: Failure) -> Self {
+        self.error = Some(failure.message.clone());
+        if let DownloadState::Failed(note) = &mut self.state {
+            note.clone_from(&failure.message);
+        }
+        self.failure = Some(failure);
+        self
     }
 
     pub fn with_backend(mut self, backend: impl Into<String>) -> Self {
@@ -420,6 +451,7 @@ pub enum AutoDownloadEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::failure::{FailureCode, RetryAdvice, Stage};
 
     #[test]
     fn rows_from_older_servers_deserialize() {
@@ -428,6 +460,49 @@ mod tests {
         let row: DownloadProgress = serde_json::from_value(v).unwrap();
         assert_eq!(row.local_path, None);
         assert_eq!(row.import_output, None);
+        assert_eq!(row.failure, None);
+        assert_eq!(row.skip, None);
+    }
+
+    #[test]
+    fn with_failure_writes_error_and_the_failed_payload_from_the_message() {
+        let f = Failure::new(
+            FailureCode::TransferNeverAppeared,
+            Stage::Transfer,
+            RetryAdvice::OtherSource,
+            "Download never appeared in slskd",
+        );
+        let row = DownloadProgress::queued("1".into(), "p".into(), "a.flac".into(), 1)
+            .with_state(DownloadState::Failed("old".into()))
+            .with_failure(f.clone());
+        assert_eq!(
+            row.state,
+            DownloadState::Failed("Download never appeared in slskd".into())
+        );
+        assert_eq!(
+            row.error.as_deref(),
+            Some("Download never appeared in slskd")
+        );
+        assert_eq!(row.failure, Some(f.clone()));
+        let skipped = DownloadProgress::queued("1".into(), "p".into(), "a.flac".into(), 1)
+            .with_state(DownloadState::ImportSkipped)
+            .with_failure(f);
+        assert_eq!(skipped.state, DownloadState::ImportSkipped);
+    }
+
+    #[test]
+    fn skip_kind_round_trips() {
+        let k = SkipKind::NoMatch {
+            candidates: Some(2),
+        };
+        assert_eq!(
+            serde_json::to_value(k).unwrap(),
+            serde_json::json!({"no_match": {"candidates": 2}})
+        );
+        assert_eq!(
+            serde_json::to_value(SkipKind::AlreadyInLibrary).unwrap(),
+            serde_json::json!("already_in_library")
+        );
     }
 
     #[test]

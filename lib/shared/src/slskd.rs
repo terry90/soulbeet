@@ -579,6 +579,8 @@ impl From<FileEntry> for crate::download::DownloadProgress {
             import_output: None,
             retryable: false,
             can_choose_import: false,
+            failure: None,
+            skip: None,
         }
     }
 }
