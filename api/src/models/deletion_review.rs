@@ -113,7 +113,6 @@ impl DeletionReviewRow {
         .collect()
     }
 
-    /// "artist:title" lowercased, of the user's tracks deleted as disliked.
     /// The song id and path of each of the user's recorded deletions.
     pub(crate) async fn deleted_files_in(
         db: &SqlitePool,
@@ -128,6 +127,7 @@ impl DeletionReviewRow {
         .map_err(|e| e.to_string())
     }
 
+    /// "artist:title" lowercased, of the user's tracks deleted as disliked.
     pub async fn disliked_keys(user_id: &str) -> Result<Vec<String>, String> {
         Self::disliked_keys_in(&DB, user_id).await
     }
