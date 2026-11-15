@@ -232,6 +232,10 @@ pub struct NativeSong {
     pub library_path: String,
     /// The file is no longer found in the library's folder.
     pub missing: bool,
+    /// The file's modification time as Navidrome's scanner last read it (model/mediafile.go:104,
+    /// model/metadata/map_mediafile.go:80), or when Navidrome last marked the song missing or
+    /// found again (persistence/mediafile_repository.go:461, :477).
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub artist: String,
     pub album: String,
     pub album_artist: String,

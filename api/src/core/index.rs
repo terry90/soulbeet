@@ -716,6 +716,7 @@ pub fn start() {
 mod tests {
     use super::*;
     use crate::auth::UserId;
+    use crate::core::delete_guard::test_support::{mtime, set_mtime};
     use crate::ledger::{store, IndexWait, JobEvent, JobState, Ledger, NewJob, ScanBaseline};
     use crate::models::navidrome_library::NavidromeLibraryRow;
     use crate::server_fns::download::test_support::item;
@@ -945,6 +946,7 @@ mod tests {
             library_id: 1,
             library_path: "/music".into(),
             missing: false,
+            updated_at: mtime(),
             artist: "Zzqx Artist".into(),
             album: "Qzz Album".into(),
             album_artist: "Zzqx Artist".into(),
@@ -985,11 +987,13 @@ mod tests {
         ));
     }
 
-    /// A native song row (model/mediafile.go json tags, as Task 2's fixture).
+    /// A native song row (model/mediafile.go json tags, as Task 2's fixture), of a file last
+    /// modified at test_support's mtime().
     fn song_json(path: &str, size: u64) -> String {
         format!(
             r#"[{{"id":"f2c4d1a8b0e94c37a6d5e8b1c2a3f405","libraryId":1,"libraryPath":"/music","path":"{path}",
-        "title":"Song Number 1","album":"Qzz Album","artist":"Zzqx Artist","albumArtist":"Zzqx Artist","size":{size},"suffix":"mp3","missing":false}}]"#
+        "title":"Song Number 1","album":"Qzz Album","artist":"Zzqx Artist","albumArtist":"Zzqx Artist","size":{size},"suffix":"mp3","missing":false,
+        "updatedAt":"2026-11-15T10:01:30.123456789Z"}}]"#
         )
     }
 
@@ -998,6 +1002,7 @@ mod tests {
         let path = Path::new("Zzqx Artist/Qzz Album/01 Song Number 1.mp3");
         std::fs::create_dir_all(library.join(path).parent().unwrap()).unwrap();
         std::fs::write(library.join(path), b"mp3!").unwrap();
+        set_mtime(&library.join(path), mtime());
         IndexWait {
             library: library.to_path_buf(),
             items: vec![ImportedItem {
@@ -1071,7 +1076,8 @@ mod tests {
         let record = |id: &str, path: &str| {
             format!(
                 r#"{{"id":"{id}","libraryId":1,"libraryPath":"/music","path":"{path}","title":"O Holy Night",
-                "album":"Winter Songs","artist":"Marrow Choir","albumArtist":"Marrow Choir","size":5,"suffix":"flac","missing":false}}"#
+                "album":"Winter Songs","artist":"Marrow Choir","albumArtist":"Marrow Choir","size":5,"suffix":"flac","missing":false,
+                "updatedAt":"2026-11-15T10:01:30.123456789Z"}}"#
             )
         };
         let first = record(
@@ -1448,6 +1454,7 @@ mod tests {
             library_id: 1,
             library_path: "/music".into(),
             missing: false,
+            updated_at: mtime(),
             artist: "Zzqx Artist".into(),
             album: "Qzz Album".into(),
             album_artist: "Zzqx Artist".into(),

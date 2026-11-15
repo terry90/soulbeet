@@ -388,7 +388,7 @@ impl Listeners for FakeNavidrome {
     }
 }
 
-/// A temp library: users alice and bob linked to Navidrome (navidrome_token 'cipher'), carol not;
+/// A temp library (every file modified at mtime()): users alice and bob linked to Navidrome (navidrome_token 'cipher'), carol not;
 /// Navidrome's users are alice and bob, and neither is an admin;
 /// folders alice-music at `{root}/music/alice`, bob-music at `{root}/music/bob`, stored as the
 /// tempdir gave the paths; `{root}/music/alice/A/x.flac` (5 bytes) is song "s1" (album "al1";
@@ -441,6 +441,7 @@ impl Library {
                 library_id: 1,
                 library_path: lib.root.join("music").to_string_lossy().into_owned(),
                 missing: false,
+                updated_at: mtime(),
                 artist: "Marrow Choir".into(),
                 album: "Winter Songs".into(),
                 album_artist: "Marrow Choir".into(),
@@ -466,11 +467,12 @@ impl Library {
         UserId::new("alice")
     }
 
-    /// Writes `bytes` at `{root}/music/{rel}`.
+    /// Writes `bytes` at `{root}/music/{rel}`, modified at mtime(), as the records say.
     pub fn write(&self, rel: &str, bytes: &[u8]) {
         let path = self.root.join("music").join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, bytes).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        set_mtime(&path, mtime());
     }
 
     /// Adds song `id` (album "al1") at `{root}/music/{rel}` with `bytes`, seen by alice and bob, unrated.
@@ -589,6 +591,21 @@ impl Library {
             .await
             .unwrap()
     }
+}
+
+/// The modification time the test files are given, and Navidrome's records of them carry.
+pub(crate) fn mtime() -> chrono::DateTime<chrono::Utc> {
+    "2026-11-15T10:01:30.123456789Z".parse().unwrap()
+}
+
+/// Sets the modification time of the file at `path` to `at`.
+pub(crate) fn set_mtime(path: &Path, at: chrono::DateTime<chrono::Utc>) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(at.into())
+        .unwrap();
 }
 
 /// A job's `wanted` for one track (Track.id "lastfm-track-1", no album fields).

@@ -1535,6 +1535,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_copy_navidrome_lists_before_the_imported_file_never_reaches_it() {
+        // Dave's shared folder is Navidrome's whole library 1 and holds his own A/x.flac, of the
+        // size of the A/x.flac alice imported into music/alice, written at another time.
+        // Navidrome has not listed alice's file yet: the index lookup of her import finds only
+        // dave's song "t", which she rated 1.
+        let lib = Library::new().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('dave', 'dave', 'x')")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        lib.folder("dave", "dave-music", "music", true).await;
+        lib.write("A/x.flac", b"audio");
+        let written: chrono::DateTime<chrono::Utc> =
+            "2026-10-03T21:14:09.583201447Z".parse().unwrap();
+        test_support::set_mtime(&lib.root.join("music/A/x.flac"), written);
+        lib.fake.file(
+            NativeSong {
+                id: "t".into(),
+                path: "A/x.flac".into(),
+                updated_at: written,
+                ..lib.record("s1")
+            },
+            "al1",
+        );
+        lib.fake.unsee("alice", "s1");
+        lib.fake.unsee("bob", "s1");
+        lib.fake.sees("alice", "t");
+        lib.fake.rates("alice", "t", 1);
+        let imported = lib.root.join("music/alice/A/x.flac");
+        assert_eq!(
+            paths::learn_in(&lib.db, &[lib.record("t")], &imported)
+                .await
+                .unwrap(),
+            Vec::<i64>::new()
+        );
+        // Unlearned, t's file is dave's own, outside alice's folders.
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "t").await),
+            (
+                FailureCode::DeleteOutsideLibrary,
+                format!(
+                    "{} is not inside one of your library folders",
+                    canonical(&lib, "music/A/x.flac").display()
+                )
+            )
+        );
+        assert!(imported.exists() && lib.root.join("music/A/x.flac").exists());
+        assert_eq!(lib.fake.ratings_set(), vec![]);
+    }
+
+    #[tokio::test]
     async fn another_users_song_that_links_to_the_file_is_the_same_file() {
         // Navidrome follows links and lists bob's link as a song of its own.
         let lib = Library::new().await;

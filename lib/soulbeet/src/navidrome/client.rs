@@ -784,7 +784,8 @@ mod tests {
     async fn songs_are_found_by_text_among_present_files() {
         let songs = r#"[{"id":"f2c4d1a8b0e94c37a6d5e8b1c2a3f405","libraryId":1,"libraryPath":"/music",
         "path":"Zzqx Artist/Qzz Album/01 Song Number 1.mp3","title":"Song Number 1","album":"Qzz Album",
-        "artist":"Zzqx Artist","albumArtist":"Zzqx Artist","size":32032,"suffix":"mp3","missing":false}]"#;
+        "artist":"Zzqx Artist","albumArtist":"Zzqx Artist","size":32032,"suffix":"mp3","missing":false,
+        "updatedAt":"2026-11-14T20:58:41.208733912Z"}]"#;
         let (url, seen) = serve(vec![
             Reply {
                 status: 200,
@@ -906,7 +907,7 @@ mod tests {
     const ALBUM: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"album":{"id":"7hQ2nLr5VxZ0cYbM8wTkAf","name":"Winter Songs","artist":"Marrow Choir","artistId":"2kD9pWq4ZxC1vBnM6yTjLs","songCount":12,"duration":2841,"starred":"2026-11-03T09:12:40.004Z","year":2019,"userRating":0,"genres":[],"musicBrainzId":"","isCompilation":false,"sortName":"","discTitles":[],"song":[]}}}"#;
     /// What a legacy client gets: no OpenSubsonic part, so no userRating (helpers.go:427-431).
     const LEGACY_ALBUM: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"album":{"id":"7hQ2nLr5VxZ0cYbM8wTkAf","name":"Winter Songs","artist":"Marrow Choir","songCount":12,"duration":2841,"year":2019,"song":[]}}}"#;
-    const NATIVE_SONG: &str = r#"[{"id":"3sG8kPq0WmZ1xYbN4vTcDe","libraryId":1,"libraryPath":"/music","libraryName":"Music Library","folderId":"5tR1yUi8OpA3sDf6GhJ9kL","path":"Marrow Choir/Winter Songs/03 - O Holy Night.flac","title":"O Holy Night","album":"Winter Songs","artist":"Marrow Choir","albumArtist":"Marrow Choir","albumId":"7hQ2nLr5VxZ0cYbM8wTkAf","size":28734112,"suffix":"flac","duration":263.4,"bitRate":912,"mbzRecordingID":"0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c","missing":false,"rating":1,"playCount":3}]"#;
+    const NATIVE_SONG: &str = r#"[{"id":"3sG8kPq0WmZ1xYbN4vTcDe","libraryId":1,"libraryPath":"/music","libraryName":"Music Library","folderId":"5tR1yUi8OpA3sDf6GhJ9kL","path":"Marrow Choir/Winter Songs/03 - O Holy Night.flac","title":"O Holy Night","album":"Winter Songs","artist":"Marrow Choir","albumArtist":"Marrow Choir","albumId":"7hQ2nLr5VxZ0cYbM8wTkAf","size":28734112,"suffix":"flac","duration":263.4,"bitRate":912,"mbzRecordingID":"0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c","missing":false,"birthTime":"2026-11-01T18:20:03.114208655+01:00","createdAt":"2026-11-01T18:20:07.551902337+01:00","updatedAt":"2026-11-01T18:20:03.114208655+01:00","rating":1,"playCount":3}]"#;
     const LOGIN: &str = r#"{"id":"8uY3tR6eW9qA2sD5fG8hJ1","name":"Alice","username":"alice","isAdmin":false,"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.c2ln"}"#;
 
     fn failed(code: u32, message: &str) -> String {
@@ -1080,6 +1081,13 @@ mod tests {
         assert_eq!(
             song.mbz_recording_id.as_deref(),
             Some("0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c")
+        );
+        // Go's RFC 3339 with nanoseconds and the server's offset, read as the same instant.
+        assert_eq!(
+            song.updated_at,
+            "2026-11-01T17:20:03.114208655Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
         );
         assert!(c.get_native_song("gone").await.unwrap().is_none());
         assert!(c.get_native_song("").await.unwrap().is_none());

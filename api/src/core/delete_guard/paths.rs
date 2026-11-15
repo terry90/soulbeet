@@ -214,9 +214,13 @@ pub(crate) async fn learn_in(
 }
 
 /// Learns `song`'s library root from `local`: when `local` is a regular file of `song.size`
-/// bytes that ends with `song.path` by whole components, the part before is the root, and the
-/// root's canonical path joined with `song.path` must be the canonical `local` (no link below
-/// the root, as local_file_in refuses one). A root already stored for the same Navidrome path
+/// bytes, with the modification time Navidrome read for `song` (`updated_at`), that ends with
+/// `song.path` by whole components, the part before is the root, and the root's canonical path
+/// joined with `song.path` must be the canonical `local` (no link below the root, as
+/// local_file_in refuses one). The modification time tells the imported file from another of
+/// its size whose path ends like it (another user's copy of the release, listed before
+/// Navidrome lists the import), which would give a root one level too deep: a copy is written
+/// at another time. A root already stored for the same Navidrome path
 /// is replaced only when it no longer resolves here; one that resolves to another directory
 /// means one of the two was learned from another file, so both are forgotten and the conflict
 /// is logged. Ok(true) when a root is stored or already known.
@@ -232,6 +236,10 @@ async fn learn_one(db: &SqlitePool, song: &NativeSong, local: &Path) -> Result<b
         .await
         .map_err(unreadable)?;
     if !file.is_file() || file.len() != song.size {
+        return Ok(false);
+    }
+    let modified = file.modified().map_err(unreadable)?;
+    if chrono::DateTime::<chrono::Utc>::from(modified) != song.updated_at {
         return Ok(false);
     }
     let kept = local.components().count() - relative.components().count();
@@ -279,6 +287,7 @@ async fn learn_one(db: &SqlitePool, song: &NativeSong, local: &Path) -> Result<b
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{mtime, set_mtime};
     use super::*;
     use crate::db::test_db;
     use crate::models::navidrome_library::NavidromeLibraryRow;
@@ -289,6 +298,7 @@ mod tests {
     /// No library learned.
     const NONE: Vec<i64> = Vec::new();
 
+    /// As Navidrome sends it for a file `write` wrote.
     fn native(library_path: &Path, path: &str, size: u64) -> NativeSong {
         NativeSong {
             id: "3sG8kPq0WmZ1xYbN4vTcDe".into(),
@@ -298,6 +308,7 @@ mod tests {
             library_path: library_path.to_string_lossy().into_owned(),
             size,
             missing: false,
+            updated_at: mtime(),
             artist: "Marrow Choir".into(),
             album: "Winter Songs".into(),
             album_artist: "Marrow Choir".into(),
@@ -307,9 +318,11 @@ mod tests {
         }
     }
 
+    /// Writes `bytes` at `path`, modified at test_support's mtime.
     fn write(path: &Path, bytes: &[u8]) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
+        set_mtime(path, mtime());
     }
 
     #[tokio::test]
@@ -560,6 +573,23 @@ mod tests {
                 .map(|row| row.local_path),
             Some(dir.path().join("data/music").to_string_lossy().into_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn another_users_copy_listed_before_the_imported_file_teaches_nothing() {
+        // Navidrome has not listed alice's import yet; dave's copy, written at another time, is
+        // the one song of the library the lookup takes for it.
+        let (db, dir) = (test_db::migrated().await, tempfile::tempdir().unwrap());
+        let alices = shared_parent(dir.path());
+        let written: chrono::DateTime<chrono::Utc> =
+            "2026-10-03T21:14:09.583201447Z".parse().unwrap();
+        set_mtime(&dir.path().join("data/music/Artist/Album/03.flac"), written);
+        let daves_song = NativeSong {
+            updated_at: written,
+            ..native(Path::new("/music"), "Artist/Album/03.flac", 5)
+        };
+        assert_eq!(learn_in(&db, &[daves_song], &alices).await.unwrap(), NONE);
+        assert_eq!(NavidromeLibraryRow::get_in(&db, 1).await.unwrap(), None);
     }
 
     #[tokio::test]
