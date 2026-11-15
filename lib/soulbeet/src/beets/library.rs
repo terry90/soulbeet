@@ -193,12 +193,12 @@ struct Problem {
 
 /// The failure of a move that went wrong as `problems` say, None when nothing did: coded
 /// import_beets_failed, it names the first problem, with its retry advice and its own cause.
-/// When there are others, the cause instead lists their texts, one per line, as Soulful's own
-/// (each text holds its own cause), so none is dropped.
+/// When there are others, the cause is Soulful's list, one per line: the first problem's own
+/// cause, then each other problem's text followed by its own cause, so no detail is dropped.
 fn move_failure(problems: Vec<Problem>) -> Option<Failure> {
     let mut problems = problems.into_iter();
     let first = problems.next()?;
-    let others: Vec<String> = problems.map(|p| p.message).collect();
+    let others: Vec<Problem> = problems.collect();
     let failure = Failure::new(
         FailureCode::ImportBeetsFailed,
         Stage::Import,
@@ -207,7 +207,14 @@ fn move_failure(problems: Vec<Problem>) -> Option<Failure> {
     );
     let cause = match others.is_empty() {
         true => first.cause,
-        false => Some(Cause::new(Service::Soulful, None, others.join("\n"))),
+        false => {
+            let mut lines: Vec<String> = first.cause.into_iter().map(|c| c.raw).collect();
+            for other in others {
+                lines.push(other.message);
+                lines.extend(other.cause.map(|c| c.raw));
+            }
+            Some(Cause::new(Service::Soulful, None, lines.join("\n")))
+        }
     };
     Some(Failure { cause, ..failure })
 }
@@ -786,7 +793,8 @@ mod tests {
         };
 
         // beets' move failed, item 7 is outside the library and item 9 cannot be read: the
-        // move failure is the message, and the cause lists the other two in Soulful's words.
+        // move failure is the message, and the cause holds beets' output, then the other two
+        // in Soulful's words, item 9's with the line beets printed for it.
         let (dir, settings) = moving_out_and_unreadable(true).await;
         let relocation = move_items(&settings, dir.path(), &[7, 9]).await;
         assert_eq!(relocation.now, vec![(7, "/elsewhere/03.flac".into())]);
@@ -806,7 +814,8 @@ mod tests {
                 Service::Soulful,
                 None,
                 format!(
-                    "{}\nSoulful could not read where beets left item 9: {why_9}",
+                    "error: permission denied\n{}\nSoulful could not read where beets left item \
+                     9: {why_9}\n9|||broken",
                     outside(dir.path())
                 )
             ))
@@ -830,7 +839,50 @@ mod tests {
                 None,
                 format!(
                     "beets may have moved the new copy, and Soulful could not read where item 9 \
-                     is: {why_9}"
+                     is: {why_9}\n9|||broken"
+                )
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lines_beets_printed_for_each_unread_item_stay_in_the_cause() {
+        // beets' move fails; its export gives item 7 twice and item 8 for item 9.
+        let sevens = [
+            r#"{"id": "7","path": "/lib/A/03.flac"}"#,
+            r#"{"id": "7","path": "/lib/B/03.flac"}"#,
+        ];
+        let eight = r#"{"id": "8","path": "/lib/A/04.flac"}"#;
+        let (dir, settings) = fake_library(&format!(
+            "{LOG}\ncase \"$*\" in\n\
+             *' move '*) echo 'error: permission denied' >&2; exit 1;;\n\
+             *' export '*' , '*|*' export '*id:7) echo '{}'; echo '{}';;\n\
+             *' export '*id:9) echo '{eight}';;\n\
+             esac",
+            sevens[0], sevens[1]
+        ))
+        .await;
+        let relocation = move_items(&settings, dir.path(), &[7, 9]).await;
+        assert_eq!(relocation.now, vec![]);
+        assert!(
+            failure_of(&relocation)
+                .2
+                .starts_with("Could not move the new copy into place: beet move failed ("),
+            "{:?}",
+            relocation.failure
+        );
+        assert_eq!(
+            relocation.failure.unwrap().cause,
+            Some(Cause::new(
+                Service::Soulful,
+                None,
+                format!(
+                    "error: permission denied\n\
+                     Soulful could not read where beets left item 7: beet export listed 2 items \
+                     for item 7\n{}\n{}\n\
+                     Soulful could not read where beets left item 9: beet export gave item 8 for \
+                     item 9\n{eight}",
+                    sevens[0], sevens[1]
                 )
             ))
         );
