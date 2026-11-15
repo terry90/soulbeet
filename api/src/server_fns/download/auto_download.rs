@@ -8,13 +8,13 @@ use shared::download::{
 };
 use shared::failure::Failure;
 #[cfg(feature = "server")]
-use shared::failure::{FailureCode, RetryAdvice, Service, Stage};
-#[cfg(feature = "server")]
-use soulbeet::error::SoulseekError;
+use shared::failure::{RetryAdvice, Stage};
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::info;
 
+#[cfg(feature = "server")]
+use crate::core::acquire::{auto_batch_label, fresh_batch, prepare_target, queue_failed};
 #[cfg(feature = "server")]
 use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
 #[cfg(feature = "server")]
@@ -23,8 +23,6 @@ use crate::core::{backend_unavailable, folders, sources};
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
 #[cfg(feature = "server")]
 use crate::services::download_backend;
-#[cfg(feature = "server")]
-use crate::transfer_registry::{BatchRef, TransferOwner};
 #[cfg(feature = "server")]
 use crate::AuthSession;
 
@@ -47,22 +45,6 @@ const AUTO_SELECT_SCORE_THRESHOLD: f64 = 0.7;
 #[cfg(feature = "server")]
 fn queue_failure(results: &[QueuedDownload]) -> Failure {
     not_enqueued_failure(results).with_message("All downloads failed to queue")
-}
-
-#[cfg(feature = "server")]
-fn target_unwritable(e: &std::io::Error) -> Failure {
-    Failure::new(
-        FailureCode::ImportTargetUnwritable,
-        Stage::Import,
-        RetryAdvice::NotRetryable,
-        format!("Failed to create target directory: {e}"),
-    )
-    .with_cause(Service::Filesystem, None, e.to_string())
-}
-
-#[cfg(feature = "server")]
-fn queue_failed(e: &SoulseekError) -> Failure {
-    e.failure(Stage::Enqueue, format!("Download queue failed: {e}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,7 +116,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
 
     // Spawn the entire search-score-pick-download pipeline onto a background task.
     // This avoids blocking the HTTP response during the search-poll loop (Research Pitfall 4).
-    let folder_path = folder.path;
+    let ctx = auth.0.clone();
     let mut query = req.query;
 
     tokio::spawn(async move {
@@ -234,17 +216,18 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             query_desc
         );
 
-        let batch_label = super::auto_batch_label(&picked);
+        let batch_label = auto_batch_label(&picked);
 
-        // Create target directory
-        let target_path_buf = std::path::Path::new(&folder_path).to_path_buf();
-        if let Err(e) = tokio::fs::create_dir_all(&target_path_buf).await {
-            let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
-                batch_id: batch_id.clone(),
-                failure: target_unwritable(&e),
-            }));
-            return;
-        }
+        let target = match prepare_target(&folder).await {
+            Ok(target) => target,
+            Err(failure) => {
+                let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
+                    batch_id: batch_id.clone(),
+                    failure,
+                }));
+                return;
+            }
+        };
 
         // Queue download with the backend
         let items = picked.items.clone();
@@ -259,14 +242,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             }
         };
 
-        let fresh = BatchRef::new(
-            TransferOwner {
-                user_id: user.clone(),
-                batch_id: batch_id.clone(),
-            },
-            batch_label,
-            target_path_buf,
-        );
+        let fresh = fresh_batch(&ctx, batch_id.clone(), batch_label, target);
         let enq = enqueue_request(&backend, items, fresh).await;
         let refused = enq.refusal().is_some();
         let RequestEnqueue {
@@ -402,6 +378,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use shared::failure::FailureCode;
 
     #[test]
     fn queue_failure_names_why_the_files_failed() {
@@ -423,44 +400,5 @@ mod tests {
             (FailureCode::PeerOffline, "All downloads failed to queue")
         );
         assert_eq!(queue_failure(&[]).code, FailureCode::EnqueueFailed);
-    }
-
-    #[test]
-    fn pipeline_failures_keep_their_text() {
-        use RetryAdvice::*;
-        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        let slskd = SoulseekError::Api {
-            status: 503,
-            message: "down".into(),
-        };
-        let (dir, queue) = (
-            format!("Failed to create target directory: {io}"),
-            format!("Download queue failed: {slskd}"),
-        );
-        for (f, code, stage, retry, message) in [
-            (
-                target_unwritable(&io),
-                FailureCode::ImportTargetUnwritable,
-                Stage::Import,
-                NotRetryable,
-                dir.as_str(),
-            ),
-            (
-                queue_failed(&slskd),
-                FailureCode::BackendUnreachable,
-                Stage::Enqueue,
-                SameSourceLater,
-                queue.as_str(),
-            ),
-        ] {
-            assert_eq!(
-                (f.code, f.stage, f.retry, f.message.as_str()),
-                (code, stage, retry, message)
-            );
-        }
-        assert_eq!(
-            target_unwritable(&io).cause.unwrap().service,
-            Service::Filesystem
-        );
     }
 }
