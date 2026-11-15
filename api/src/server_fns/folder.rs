@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use shared::library::DuplicateReport;
 
 #[cfg(feature = "server")]
-use super::server_error;
+use super::{refusal_error, server_error};
 #[cfg(feature = "server")]
 use crate::services::music_importer;
 #[cfg(feature = "server")]
@@ -32,19 +32,39 @@ pub async fn create_user_folder(
         .map_err(server_error)
 }
 
-#[put("/api/folders/update", _: AuthSession)]
+/// The folder, when `user_id` owns it. Another user's folder is reported as
+/// missing, the same as one that does not exist.
+#[cfg(feature = "server")]
+pub(crate) fn ensure_owner(
+    folder: Option<models::folder::Folder>,
+    user_id: &str,
+) -> Result<models::folder::Folder, ServerFnError> {
+    folder
+        .filter(|f| f.user_id == user_id)
+        .ok_or_else(|| refusal_error("Folder not found"))
+}
+
+#[put("/api/folders/update", auth: AuthSession)]
 pub async fn update_folder(
     folder_id: String,
     name: String,
     path: String,
 ) -> Result<(), ServerFnError> {
+    let folder = models::folder::Folder::get_by_id(&folder_id)
+        .await
+        .map_err(server_error)?;
+    ensure_owner(folder, &auth.0.user_id)?;
     models::folder::Folder::update(&folder_id, &name, &path)
         .await
         .map_err(server_error)
 }
 
-#[delete("/api/folders/delete", _: AuthSession)]
+#[delete("/api/folders/delete", auth: AuthSession)]
 pub async fn delete_folder(folder_id: String) -> Result<(), ServerFnError> {
+    let folder = models::folder::Folder::get_by_id(&folder_id)
+        .await
+        .map_err(server_error)?;
+    ensure_owner(folder, &auth.0.user_id)?;
     models::folder::Folder::delete(&folder_id)
         .await
         .map_err(server_error)
@@ -70,4 +90,29 @@ pub async fn get_folder_duplicates() -> Result<DuplicateReport, ServerFnError> {
 
     let importer = music_importer(None).await.map_err(server_error)?;
     importer.find_duplicates(&paths).await.map_err(server_error)
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use crate::models::folder::Folder;
+
+    fn folder(id: &str, user_id: &str) -> Folder {
+        Folder {
+            id: id.to_string(),
+            user_id: user_id.to_string(),
+            name: "Music".to_string(),
+            path: "/music".to_string(),
+        }
+    }
+
+    #[test]
+    fn another_users_folder_is_not_found() {
+        let err = ensure_owner(Some(folder("f1", "user-b")), "user-a").unwrap_err();
+        assert!(
+            matches!(err, ServerFnError::ServerError { code: 409, ref message, .. } if message == "Folder not found")
+        );
+        assert!(ensure_owner(None, "user-a").is_err());
+        assert!(ensure_owner(Some(folder("f1", "user-a")), "user-a").is_ok());
+    }
 }

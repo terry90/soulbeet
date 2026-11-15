@@ -48,14 +48,14 @@ pub(crate) mod test_support;
 
 #[cfg(feature = "server")]
 use self::enqueue::{
-    deliver, enqueue_request, failed_reason, stopped_rows, RequestEnqueue, Watcher,
+    deliver, enqueue_request, failed_reason, stopped_rows, transfer_key, RequestEnqueue, Watcher,
 };
 #[cfg(feature = "server")]
 use self::monitor::{DownloadMonitor, WatchedTransfer};
 #[cfg(feature = "server")]
 use crate::auth::UserId;
 #[cfg(feature = "server")]
-use crate::transfer_registry::{BatchRef, TransferOwner};
+use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
 #[cfg(feature = "server")]
 use soulbeet::{error::SoulseekError, DownloadBackend};
 #[cfg(feature = "server")]
@@ -162,6 +162,22 @@ pub struct CancelDownloadRequest {
     pub backend: Option<String>,
 }
 
+/// The registry key of the transfer the backend lists with exactly this peer
+/// and id, built from the backend's own filename. `None` when it lists no
+/// such transfer.
+#[cfg(feature = "server")]
+pub(crate) fn cancel_key(
+    listed: &[DownloadProgress],
+    backend: &'static str,
+    source: &str,
+    id: &str,
+) -> Option<TransferKey> {
+    listed
+        .iter()
+        .find(|row| row.source == source && row.id == id)
+        .map(|row| transfer_key(backend, &row.source, &row.item))
+}
+
 #[post("/api/downloads/cancel", auth: AuthSession)]
 pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnError> {
     let user = auth.0.id();
@@ -169,6 +185,19 @@ pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnE
     let backend = download_backend(req.backend.as_deref())
         .await
         .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
+
+    // The client's `item` is never trusted: the key comes from the transfer
+    // the backend lists under that id, so a user cannot pair their own file
+    // with another user's transfer id on the same peer.
+    let listed = backend
+        .get_downloads_for(std::slice::from_ref(&req.source))
+        .await
+        .map_err(server_error)?;
+    let owned = cancel_key(&listed, backend.id(), &req.source, &req.id)
+        .is_some_and(|key| TransferRegistry::global().owned_by(&key, &user));
+    if !owned {
+        return Err(refusal_error("Download not found"));
+    }
 
     backend
         .cancel_download(&req.source, &req.id, false)
@@ -447,6 +476,29 @@ mod tests {
         assert_eq!(auto_batch_label(&group), "Northern Line");
     }
 
+    fn listed() -> Vec<DownloadProgress> {
+        vec![test_support::transfer(
+            "peer_a",
+            "Music\\A\\01.flac",
+            "t-1",
+            shared::download::DownloadState::Queued,
+        )]
+    }
+
+    #[test]
+    fn cancel_uses_the_listed_filename_not_the_clients_text() {
+        assert_eq!(
+            cancel_key(&listed(), "slskd", "peer_a", "t-1"),
+            Some(transfer_key("slskd", "peer_a", "Music\\A\\01.flac"))
+        );
+    }
+
+    #[test]
+    fn cancel_needs_a_listed_transfer_with_that_id_and_peer() {
+        assert_eq!(cancel_key(&listed(), "slskd", "peer_a", "t-2"), None);
+        assert_eq!(cancel_key(&listed(), "slskd", "peer_b", "t-1"), None);
+    }
+
     #[test]
     fn manual_label_is_the_shared_album_else_the_first_title() {
         let same_album = vec![item("p", "One", "1.flac"), item("p", "Two", "2.flac")];
@@ -465,7 +517,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_dropped_mid_enqueue_still_hands_its_transfers_over() {
-        use crate::transfer_registry::TransferRegistry;
         use test_support::{batch, key, ScriptedOutcome, StubBackend};
 
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);

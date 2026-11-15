@@ -199,6 +199,13 @@ impl TransferRegistry {
             .get(key)
             .is_none_or(|held| held.owner == *owner)
     }
+
+    /// Whether one of `user`'s batches holds `key`.
+    pub fn owned_by(&self, key: &TransferKey, user: &UserId) -> bool {
+        self.owners()
+            .get(key)
+            .is_some_and(|held| &held.owner.user_id == user)
+    }
 }
 
 /// A transfer a joining request enqueued into a running batch.
@@ -558,6 +565,34 @@ mod tests {
             !registry.may_adopt(&key("03.flac"), &mine.owner),
             "another user"
         );
+    }
+
+    #[test]
+    fn only_the_owning_user_holds_a_transfer() {
+        let reg = TransferRegistry::default();
+        let (a, b) = (UserId::new("user-a"), UserId::new("user-b"));
+        reg.claim(&[key("1.flac")], &batch("user-a", "b1"));
+
+        assert!(reg.owned_by(&key("1.flac"), &a));
+        assert!(!reg.owned_by(&key("1.flac"), &b));
+
+        reg.release_batch(&batch("user-a", "b1").owner);
+        assert!(!reg.owned_by(&key("1.flac"), &a));
+    }
+
+    #[test]
+    fn a_transfer_rebound_by_failover_is_owned_under_its_new_peer() {
+        let reg = TransferRegistry::default();
+        let mine = batch("user-a", "b1");
+        reg.claim(&[key("1.flac")], &mine);
+        let moved = TransferKey {
+            peer: "peer_b".into(),
+            ..key("1.flac")
+        };
+
+        assert!(reg.rebind(&key("1.flac"), moved.clone(), &mine));
+        assert!(reg.owned_by(&moved, &UserId::new("user-a")));
+        assert!(!reg.owned_by(&key("1.flac"), &UserId::new("user-a")));
     }
 
     #[test]
