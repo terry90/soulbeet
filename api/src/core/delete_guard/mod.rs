@@ -1918,6 +1918,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_folder_that_cannot_be_read_may_hold_a_second_copy_so_no_root_is_learned() {
+        use std::os::unix::fs::PermissionsExt;
+        // With no root here, alice's music/alice proves one; her backup/alice cannot be
+        // searched, so a second copy may be there.
+        let lib = Library::new().await;
+        mounted_elsewhere(&lib, test_support::mtime());
+        lib.folder("alice", "alice-backup", "backup/alice", false)
+            .await;
+        let locked = lib.root.join("backup/alice/A");
+        std::fs::create_dir_all(&locked).unwrap();
+        let unreadable = std::fs::canonicalize(&locked).unwrap().join("x.flac");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let checked = lib.guard().check_song(&lib.alice(), "s1").await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let f = match checked {
+            Err(f) => f,
+            Ok(_) => panic!("allowed"),
+        };
+        assert_eq!(
+            (f.code, f.message.as_str()),
+            (
+                FailureCode::DeletePathUnresolved,
+                format!("No file at {NAVIDROME_MOUNT}/alice/A/x.flac").as_str()
+            )
+        );
+        assert_eq!(
+            f.cause,
+            Some(Cause::new(
+                Service::Filesystem,
+                None,
+                format!(
+                    "{}: {}",
+                    unreadable.display(),
+                    std::io::Error::from_raw_os_error(13) // EACCES
+                )
+            ))
+        );
+        assert_eq!(learned_root(&lib).await, None);
+        assert_eq!(lib.fake.ratings_set(), vec![]);
+
+        // A folder that holds nothing at the song's path is no second copy.
+        let checked = library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+        assert_eq!(checked.path, canonical(&lib, "music/alice/A/x.flac"));
+        assert_eq!(
+            learned_root(&lib).await,
+            Some(lib.root.join("music").to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
     async fn another_users_song_that_links_to_the_file_is_the_same_file() {
         // Navidrome follows links and lists bob's link as a song of its own.
         let lib = Library::new().await;

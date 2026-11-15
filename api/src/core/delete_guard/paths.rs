@@ -49,8 +49,8 @@ pub(super) async fn local_file_in(
 /// local_file_in, and when no file is found under the song's root and its library has no root
 /// on this machine (rootless), learns the root from the files the folders of `owner` that
 /// resolve may hold for the song (learn_from_folders) and looks again. With no proof the first
-/// answer stands. A root that is here keeps the first answer: the file is gone, not the
-/// library.
+/// answer stands, with a candidate that could not be read as its cause when one was skipped.
+/// A root that is here keeps the first answer: the file is gone, not the library.
 pub(super) async fn local_file_learning(
     db: &SqlitePool,
     song: &NativeSong,
@@ -78,8 +78,9 @@ pub(super) async fn local_file_learning(
         .filter_map(|f| f.path.as_deref().ok())
         .collect();
     match learn_from_folders(db, song, &owned).await {
-        Ok(true) => local_file_in(db, song, music_path).await,
-        Ok(false) => Err(no_file),
+        Ok(FromFolders::Learned) => local_file_in(db, song, music_path).await,
+        Ok(FromFolders::Unproven) => Err(no_file),
+        Ok(FromFolders::Unreadable(raw)) => Err(no_file.with_cause(Service::Filesystem, None, raw)),
         Err(e) => {
             warn!(
                 "Could not learn where Navidrome library {} ({}) is on this machine from song {}: {e}",
@@ -383,22 +384,35 @@ async fn learn_one(
     }
 }
 
+/// What the folders of one user taught of a library root.
+enum FromFolders {
+    /// A root is stored or already known.
+    Learned,
+    /// No file proves a root, or more than one does.
+    Unproven,
+    /// A file that may be the song's could not be read ("{path}: {error}", the first one), so
+    /// "exactly one proves a root" cannot be shown.
+    Unreadable(String),
+}
+
 /// Learns `song`'s library root, at a deletion check, from the files `folders` (canonical
 /// folders of one user) may hold for it: each folder joined with `song.path`, and with what
 /// follows each leading part of `song.path` the folder's path ends with (a folder inside
-/// Navidrome's library). Those that are there are taken through proven_root, and only when
-/// exactly one root is proven is it stored (store_root): two files that each prove a root may
-/// each be the song's. Ok(true) when a root is stored or already known.
+/// Navidrome's library). One that is not there is skipped; one that cannot be read is logged
+/// and skipped, and then nothing is learned, since it may be a second copy. The others are
+/// taken through proven_root, and only when exactly one root is proven is it stored
+/// (store_root): two files that each prove a root may each be the song's.
 async fn learn_from_folders(
     db: &SqlitePool,
     song: &NativeSong,
     folders: &[&Path],
-) -> Result<bool, String> {
+) -> Result<FromFolders, String> {
     let Some(relative) = inside(&song.path) else {
-        return Ok(false);
+        return Ok(FromFolders::Unproven);
     };
     let parts: Vec<Component> = relative.components().collect();
     let mut proven: Vec<Proven> = Vec::new();
+    let mut unreadable: Option<String> = None;
     for folder in folders {
         for skipped in 0..parts.len() {
             let leading: PathBuf = parts[..skipped].iter().collect();
@@ -408,7 +422,7 @@ async fn learn_from_folders(
             let local = parts[skipped..]
                 .iter()
                 .fold(folder.to_path_buf(), |path, part| path.join(part));
-            match tokio::fs::symlink_metadata(&local).await {
+            let found = match tokio::fs::symlink_metadata(&local).await {
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -417,22 +431,39 @@ async fn learn_from_folders(
                 {
                     continue
                 }
-                _ => {}
-            }
-            if let Some(found) = proven_root(song, &local).await? {
-                if !proven
-                    .iter()
-                    .any(|p| p.canonical_root == found.canonical_root)
-                {
-                    proven.push(found);
+                Err(e) => Err(format!("{}: {e}", local.display())),
+                Ok(_) => proven_root(song, &local).await,
+            };
+            match found {
+                Ok(Some(found)) => {
+                    if !proven
+                        .iter()
+                        .any(|p| p.canonical_root == found.canonical_root)
+                    {
+                        proven.push(found);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        "Could not read whether song {} of Navidrome library {} is the file at \
+                         {e}, so the library's root is not learned from {}",
+                        song.id,
+                        song.library_id,
+                        folder.display()
+                    );
+                    unreadable.get_or_insert(e);
                 }
             }
         }
     }
-    match proven.as_slice() {
-        [one] => store_root(db, song, one, Learner::Check).await,
-        _ => Ok(false),
+    if let Some(raw) = unreadable {
+        return Ok(FromFolders::Unreadable(raw));
     }
+    Ok(match proven.as_slice() {
+        [one] if store_root(db, song, one, Learner::Check).await? => FromFolders::Learned,
+        _ => FromFolders::Unproven,
+    })
 }
 
 /// A library root a file proves: as `local` is written, and canonical.
