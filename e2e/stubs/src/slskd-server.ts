@@ -153,6 +153,26 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
         },
       },
       {
+        // slskd looks the transfer up by id alone and answers it whatever
+        // its removed flag (TransfersController.cs:549-573,
+        // DownloadService.cs:688-704).
+        method: 'GET',
+        pattern: '/api/v0/transfers/downloads/:username/:id',
+        handler: ({ res, params }) => {
+          const id = parseGuid(params.id as string);
+          if (id === null) {
+            sendEmpty(res, 400);
+            return;
+          }
+          const transfer = state.downloadJson(id);
+          if (transfer === null) {
+            sendEmpty(res, 404);
+            return;
+          }
+          sendJson(res, 200, transfer);
+        },
+      },
+      {
         method: 'DELETE',
         pattern: '/api/v0/transfers/downloads/:username/:id',
         handler: ({ res, params, url }) => {

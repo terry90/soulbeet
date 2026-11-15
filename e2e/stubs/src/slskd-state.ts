@@ -755,6 +755,15 @@ export class SlskdState {
     return json;
   }
 
+  /**
+   * GET /api/v0/transfers/downloads/{username}/{id}: the transfer with that
+   * id, removed or not, or null for one slskd never listed.
+   */
+  downloadJson(id: string): Record<string, unknown> | null {
+    const transfer = this.transfers.find((t) => t.id === id && !t.hidden);
+    return transfer ? this.transferJson(transfer) : null;
+  }
+
   /** GET /api/v0/transfers/downloads shape: user -> directories -> files. */
   downloadsJson(includeRemoved: boolean): Array<Record<string, unknown>> {
     const byUser = new Map<string, TransferRecord[]>();
