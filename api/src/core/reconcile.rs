@@ -80,12 +80,15 @@ fn is_from(row: &DownloadProgress, item: &DownloadableItem) -> bool {
     row.source == item.source && row.item == item.id
 }
 
-/// The transfer `backend` holds of `item`, preferring one still running:
-/// what an enqueue Soulful stopped during left. None when it holds none or
-/// cannot be asked.
+/// The transfer of `item` that `backend` took for a job made at `since`,
+/// preferring one still running: what an enqueue Soulful stopped during left.
+/// Only a transfer requested no earlier than the job was made is the job's;
+/// an older record of the same file from the same source is an earlier
+/// download's. None when it holds none or cannot be asked.
 async fn sent(
     backend: &Arc<dyn DownloadBackend>,
     item: &DownloadableItem,
+    since: i64,
 ) -> Option<DownloadProgress> {
     let listed = match backend
         .get_downloads_for(std::slice::from_ref(&item.source))
@@ -101,7 +104,9 @@ async fn sent(
             return None;
         }
     };
-    let mut ours = listed.into_iter().filter(|t| is_from(t, item));
+    let mut ours = listed
+        .into_iter()
+        .filter(|t| is_from(t, item) && t.requested_at.is_some_and(|at| at >= since));
     let first = ours.next()?;
     if !is_terminal_state(&first.state) {
         return Some(first);
@@ -146,11 +151,13 @@ struct Lookup {
 /// current transfer is its last row's, unless its newest attempt names
 /// another source the backend holds a transfer of the file from: a failover
 /// records its next source before it enqueues it. Its last attempt says
-/// whether it was adopted. `base` is the download folder.
+/// whether it was adopted. `base` is the download folder; `since` is when
+/// the batch's job was made.
 pub(crate) async fn resume_downloads(
     backend: &Arc<dyn DownloadBackend>,
     base: &Path,
     batch: &BatchRef,
+    since: i64,
     slots: Vec<(JobSlot, SlotRecord)>,
 ) -> Resumed {
     let mut resumed = Resumed::default();
@@ -164,7 +171,7 @@ pub(crate) async fn resume_downloads(
         let mut row = row.with_job(slot.clone());
         if let Some(Some(next)) = record.attempts.last() {
             if !is_from(&row, next) {
-                if let Some(transfer) = sent(backend, next).await {
+                if let Some(transfer) = sent(backend, next, since).await {
                     resumed.abandon.push((row.source.clone(), row.id.clone()));
                     row = transfer
                         .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
@@ -403,6 +410,8 @@ fn share(
 struct Downloads {
     ctx: UserCtx,
     batch: BatchRef,
+    /// When the earliest job of the batch was made.
+    since: i64,
     slots: Vec<(JobSlot, SlotRecord)>,
     pools: HashMap<JobSlot, (Vec<DownloadableItem>, usize)>,
 }
@@ -435,10 +444,14 @@ fn batch_of<'a>(
         .iter()
         .position(|d| d.batch.owner.user_id == user && d.batch.owner.batch_id == batch_id)
     {
-        Some(at) => at,
+        Some(at) => {
+            downloads[at].since = downloads[at].since.min(job.created_at);
+            at
+        }
         None => {
             downloads.push(Downloads {
                 ctx: job.ctx.clone(),
+                since: job.created_at,
                 batch: BatchRef::new(
                     TransferOwner {
                         user_id: user,
@@ -758,7 +771,7 @@ async fn adopt_sent(
     let mut rows = Vec::new();
     for (slot, mut record) in std::mem::take(&mut queued.slots) {
         let held = match record.attempts.first() {
-            Some(Some(first)) => sent(backend, first).await,
+            Some(Some(first)) => sent(backend, first, queued.job.created_at).await,
             _ => None,
         };
         let Some(transfer) = held else {
@@ -800,6 +813,7 @@ async fn resume_batch(
     let Downloads {
         ctx,
         batch,
+        since,
         slots,
         mut pools,
     } = downloads;
@@ -811,7 +825,7 @@ async fn resume_batch(
         failed: lost,
         rebound,
         abandon,
-    } = resume_downloads(backend, download_base, &batch, slots).await;
+    } = resume_downloads(backend, download_base, &batch, since, slots).await;
     fail_rows(ledger, &user, lost).await;
     if !rebound.is_empty() {
         ledger.record(JobEvent::Slots {
@@ -998,6 +1012,7 @@ mod tests {
             &backend,
             base.path(),
             &b,
+            0,
             vec![(
                 slot.clone(),
                 record(
@@ -1041,6 +1056,7 @@ mod tests {
             &backend,
             base.path(),
             &batch("X"),
+            0,
             vec![
                 (
                     slot(0),
@@ -1110,6 +1126,7 @@ mod tests {
             &backend,
             base.path(),
             &b,
+            0,
             vec![
                 (
                     slot(0),
@@ -1915,13 +1932,6 @@ mod tests {
         let (ledger, db) = ledger().await;
         let tmp = tempfile::tempdir().unwrap();
         let stub = StubBackend::new(vec![]);
-        // Soulful stopped while slskd took the batch: it holds 01 but not 02.
-        stub.set_listing(vec![transfer(
-            "peer_a",
-            "q/01.flac",
-            "t-q01",
-            DownloadState::Queued,
-        )]);
         let started = Started::on(stub.clone());
         let picked = || {
             vec![
@@ -1934,6 +1944,11 @@ mod tests {
         // Stopped before its batch was recorded: slskd heard of nothing it holds.
         job_of(&ledger, &db, "unsent", JobState::Queued, None, picked()).await;
         ledger.settled().await;
+        // Soulful stopped while slskd took the batch: it holds 01 but not 02.
+        stub.set_listing(vec![requested(
+            transfer("peer_a", "q/01.flac", "t-q01", DownloadState::Queued),
+            chrono::Utc::now().timestamp(),
+        )]);
 
         reconcile_in(&db, &ledger, &queue(), &started, tmp.path()).await;
         ledger.settled().await;
@@ -1973,6 +1988,98 @@ mod tests {
         assert_eq!(
             (row.id.as_str(), row.batch_id.as_deref()),
             ("t-q01", Some("b1"))
+        );
+    }
+
+    /// `row` as the backend lists a transfer it took at `at`.
+    fn requested(row: DownloadProgress, at: i64) -> DownloadProgress {
+        DownloadProgress {
+            requested_at: Some(at),
+            ..row
+        }
+    }
+
+    /// When job `id` was made, as stored.
+    async fn created_at(db: &SqlitePool, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT created_at FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_record_of_an_earlier_download_of_the_file_is_not_the_jobs() {
+        let (ledger, db) = ledger().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = StubBackend::new(vec![]);
+        let started = Started::on(stub.clone());
+        job_of(
+            &ledger,
+            &db,
+            "j1",
+            JobState::Queued,
+            None,
+            vec![
+                (0, item("peer_a", "One", "q/01.flac")),
+                (1, item("peer_a", "Two", "q/02.flac")),
+            ],
+        )
+        .await;
+        enqueued_in_b1(&ledger, "j1");
+        ledger.settled().await;
+        let made = created_at(&db, "j1").await;
+        // An hour before the job, peer_a's 01 finished once and failed once; slskd took 02 for it.
+        stub.set_listing(vec![
+            requested(
+                transfer("peer_a", "q/01.flac", "t-old1", DownloadState::Completed),
+                made - 3600,
+            ),
+            requested(
+                transfer(
+                    "peer_a",
+                    "q/01.flac",
+                    "t-old2",
+                    DownloadState::Failed("Transfer failed".into()),
+                ),
+                made - 3600,
+            ),
+            requested(
+                transfer("peer_a", "q/02.flac", "t-q02", DownloadState::Queued),
+                made,
+            ),
+        ]);
+
+        reconcile_in(&db, &ledger, &queue(), &started, tmp.path()).await;
+        ledger.settled().await;
+
+        let watched: Vec<Vec<(String, JobSlot)>> = started
+            .watched
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(.., transfers)| transfers.clone())
+            .collect();
+        assert_eq!(
+            watched,
+            vec![vec![(
+                "t-q02".to_string(),
+                JobSlot {
+                    job: "j1".into(),
+                    slot: 1
+                }
+            )]]
+        );
+        let enqueued: Vec<(String, Vec<(u32, String)>)> = started
+            .enqueued
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(job, items, ..)| (job.clone(), items.clone()))
+            .collect();
+        assert_eq!(
+            enqueued,
+            vec![("j1".to_string(), vec![(0, "q/01.flac".to_string())])]
         );
     }
 
@@ -2125,7 +2232,10 @@ mod tests {
         // recorded the row; peer_a's transfer was not cancelled yet.
         stub.set_listing(vec![
             transfer("peer_a", "a/01.flac", "t-a01", DownloadState::InProgress),
-            transfer("peer_b", "b/01.flac", "t-b01", DownloadState::Queued),
+            DownloadProgress {
+                requested_at: Some(0),
+                ..transfer("peer_b", "b/01.flac", "t-b01", DownloadState::Queued)
+            },
         ]);
         let backend: Arc<dyn DownloadBackend> = stub;
         let slot = JobSlot {
@@ -2136,6 +2246,7 @@ mod tests {
             &backend,
             base.path(),
             &batch("X"),
+            0,
             vec![(
                 slot.clone(),
                 record(
@@ -2188,6 +2299,7 @@ mod tests {
             &backend,
             base.path(),
             &b,
+            0,
             vec![(
                 slot.clone(),
                 record(

@@ -550,6 +550,21 @@ impl From<AlbumResult> for crate::download::DownloadableGroup {
     }
 }
 
+/// Unix seconds of a slskd timestamp, None when it cannot be read. slskd sets them from
+/// `DateTime.UtcNow` (Transfers/Downloads/DownloadService.cs:486) and lists transfers from its
+/// database (`List`, `:890-903`), which gives `RequestedAt` back with no kind, as only `StartedAt`
+/// and `EndedAt` are converted to UTC (Transfers/TransfersDbContext.cs:76-86): the text then has
+/// no offset and is UTC all the same.
+fn unix_seconds(text: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map(|at| at.timestamp())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
+                .map(|at| at.and_utc().timestamp())
+        })
+        .ok()
+}
+
 impl FileEntry {
     /// The row for this transfer under slskd's `retry_limit` (its
     /// `transfers.download.retry.attempts`).
@@ -610,6 +625,7 @@ impl FileEntry {
             queued_at_source,
             pending_retry: None,
             job: None,
+            requested_at: unix_seconds(&self.requested_at),
             index: None,
         };
         match failure {
@@ -875,6 +891,31 @@ mod tests {
         }
         let entry: FileEntry = serde_json::from_value(entry).expect("FileEntry should deserialize");
         entry.into_progress(3)
+    }
+
+    #[test]
+    fn a_row_says_when_slskd_took_the_request_with_or_without_an_offset() {
+        let at = |requested: &str| {
+            let mut entry: FileEntry = serde_json::from_value(json!({
+                "id": "890f943c-02e1-4d45-af76-d55e3d855684",
+                "username": "peer",
+                "direction": "Download",
+                "filename": "shared\\Artist\\Album\\01. Track.flac",
+                "size": 1024,
+                "state": "Queued, Remotely",
+                "requestedAt": "2026-07-19T05:11:22Z",
+                "bytesTransferred": 0,
+                "percentComplete": 0.0
+            }))
+            .unwrap();
+            entry.requested_at = requested.to_string();
+            entry.into_progress(3).requested_at
+        };
+        // 2026-07-19T05:11:22Z
+        assert_eq!(at("2026-07-19T05:11:22Z"), Some(1_784_437_882));
+        assert_eq!(at("2026-07-19T05:11:22.1234567"), Some(1_784_437_882));
+        assert_eq!(at("2026-07-19T07:11:22+02:00"), Some(1_784_437_882));
+        assert_eq!(at("yesterday"), None);
     }
 
     #[test]

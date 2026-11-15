@@ -194,6 +194,10 @@ pub struct DownloadProgress {
     /// The ledger job slot this row is the file of. Never sent to the browser.
     #[serde(skip)]
     pub job: Option<JobSlot>,
+    /// When the backend took the request for this transfer, in Unix seconds; None when it did
+    /// not say. Never sent to the browser.
+    #[serde(skip)]
+    pub requested_at: Option<i64>,
     /// For an imported row, whether Navidrome lists its file; None before its wait and without Navidrome
     #[serde(default)]
     pub index: Option<IndexState>,
@@ -247,6 +251,7 @@ impl DownloadProgress {
             queued_at_source: false,
             pending_retry: None,
             job: None,
+            requested_at: None,
             index: None,
         }
     }

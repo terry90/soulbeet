@@ -155,6 +155,8 @@ pub struct UnfinishedJob {
     pub search_id: Option<String>,
     pub monitor_batch_id: Option<String>,
     pub batch_label: Option<String>,
+    /// When the job was made, in Unix seconds on Soulful's clock.
+    pub created_at: i64,
     pub slots: Vec<SlotRecord>,
 }
 
@@ -175,6 +177,7 @@ struct UnfinishedRow {
     search_id: Option<String>,
     monitor_batch_id: Option<String>,
     batch_label: Option<String>,
+    created_at: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -211,7 +214,8 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
     let jobs: Vec<UnfinishedRow> = sqlx::query_as(&format!(
         "SELECT j.id, j.user_id, u.username, u.role, j.folder_id, f.user_id AS folder_owner, \
                 f.name AS folder_name, f.path AS folder_path, f.shared AS folder_shared, \
-                j.wanted, j.import_mode, j.state, j.search_id, j.monitor_batch_id, j.batch_label \
+                j.wanted, j.import_mode, j.state, j.search_id, j.monitor_batch_id, j.batch_label, \
+                j.created_at \
          FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
          WHERE j.state NOT IN {TERMINAL_SQL} ORDER BY j.created_at, j.rowid"
     ))
@@ -285,6 +289,7 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
                 search_id: row.search_id,
                 monitor_batch_id: row.monitor_batch_id,
                 batch_label: row.batch_label,
+                created_at: row.created_at,
                 slots: by_job.remove(&row.id).unwrap_or_default(),
                 id: row.id.clone(),
             })
