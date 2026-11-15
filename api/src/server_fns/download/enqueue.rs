@@ -29,6 +29,16 @@ pub const MONITOR_STOPPED: &str = "Download monitoring stopped";
 /// Reason for a file the backend answered nothing for.
 pub const NOTHING_ENQUEUED: &str = "nothing enqueued";
 
+/// A file that joined a batch whose monitor had stopped.
+pub fn monitor_stopped() -> Failure {
+    Failure::new(
+        FailureCode::TransferCancelled,
+        Stage::Transfer,
+        RetryAdvice::SameSourceLater,
+        MONITOR_STOPPED,
+    )
+}
+
 /// Another user's batch is downloading the file.
 pub fn other_user() -> Failure {
     Failure::new(
@@ -288,7 +298,7 @@ pub fn stopped_rows(lost: &[AddedSlot], batch: &BatchRef) -> Vec<DownloadProgres
                 slot.transfer_id.clone(),
                 slot.source.clone(),
                 slot.filename.clone(),
-                MONITOR_STOPPED.to_string(),
+                monitor_stopped(),
             )
             .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
         })

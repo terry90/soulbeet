@@ -421,7 +421,7 @@ async fn queue_and_watch(
                 d.id.clone(),
                 d.source.clone(),
                 d.item.clone(),
-                reason.message.clone(),
+                reason.clone(),
             )))
         })
         .collect();

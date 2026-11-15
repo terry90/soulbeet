@@ -210,27 +210,10 @@ impl DownloadProgress {
         }
     }
 
-    pub fn failed(id: String, source: String, item: String, error: String) -> Self {
-        Self {
-            id,
-            source,
-            item,
-            size: 0,
-            transferred: 0,
-            state: DownloadState::Failed(error.clone()),
-            percent: 0.0,
-            speed: 0.0,
-            error: Some(error),
-            backend: None,
-            batch_id: None,
-            batch_label: None,
-            local_path: None,
-            import_output: None,
-            retryable: false,
-            can_choose_import: false,
-            failure: None,
-            skip: None,
-        }
+    pub fn failed(id: String, source: String, item: String, failure: Failure) -> Self {
+        Self::queued(id, source, item, 0)
+            .with_state(DownloadState::Failed(String::new()))
+            .with_failure(failure)
     }
 
     /// The one writer of `error` for a failure: error = Some(failure.message),

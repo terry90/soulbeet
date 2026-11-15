@@ -352,7 +352,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                     d.id.clone(),
                     d.source.clone(),
                     d.item.clone(),
-                    reason.message.clone(),
+                    reason.clone(),
                 )))
             })
             .collect();

@@ -1,5 +1,6 @@
 use dioxus::logger::tracing::{info, warn};
 use shared::download::{DownloadProgress, DownloadState};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::{DriverChoice, ImportMode};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -69,11 +70,13 @@ const UNRESOLVED: &str = "Could not resolve file path";
 
 /// The Failed row of a finished download whose file was not found.
 pub fn unresolved_row(row: DownloadProgress) -> DownloadProgress {
-    DownloadProgress {
-        state: DownloadState::Failed(UNRESOLVED.into()),
-        error: Some(UNRESOLVED.into()),
-        ..row
-    }
+    row.with_state(DownloadState::Failed(UNRESOLVED.into()))
+        .with_failure(Failure::new(
+            FailureCode::FileNotFoundAfterDownload,
+            Stage::FileLookup,
+            RetryAdvice::SameSourceLater,
+            UNRESOLVED,
+        ))
 }
 
 /// A finished slot whose file was found on disk. `destination` is the batch
@@ -149,6 +152,24 @@ pub fn album_jobs(
 mod tests {
     use super::*;
     use crate::import_queue::test_support::row;
+
+    #[test]
+    fn unresolved_row_fails_with_file_not_found_after_download() {
+        let failed = unresolved_row(row("a"));
+
+        assert_eq!(failed.state, DownloadState::Failed(UNRESOLVED.into()));
+        assert_eq!(failed.error.as_deref(), Some(UNRESOLVED));
+        let f = failed.failure.expect("a failure");
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::FileNotFoundAfterDownload,
+                Stage::FileLookup,
+                RetryAdvice::SameSourceLater,
+                UNRESOLVED
+            )
+        );
+    }
 
     #[test]
     fn an_album_imports_its_batch_folder_once_and_adopted_files_alone() {

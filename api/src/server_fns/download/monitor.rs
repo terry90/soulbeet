@@ -9,6 +9,7 @@
 
 use dioxus::logger::tracing::{debug, info, warn};
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, QueuedDownload};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction};
 use soulbeet::error::SoulseekError;
 use soulbeet::{DownloadBackend, ImportMode};
 use std::collections::HashSet;
@@ -79,8 +80,66 @@ const BACKEND_STALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// so must judge them by the same rule.
 pub(crate) const FAILED_STATE_CONFIRM: Duration = Duration::from_secs(4);
 
-/// Row text for a slot that ran past `PER_TRACK_TIMEOUT` with no peer left.
-const TIMED_OUT: &str = "Download timed out after 1 hour";
+fn transfer_failure(code: FailureCode, retry: RetryAdvice, message: &str) -> Failure {
+    Failure::new(code, Stage::Transfer, retry, message)
+}
+
+/// A transfer slskd never listed.
+fn never_appeared() -> Failure {
+    transfer_failure(
+        FailureCode::TransferNeverAppeared,
+        RetryAdvice::OtherSource,
+        "Download never appeared in slskd",
+    )
+}
+
+/// A transfer slskd listed and then dropped.
+fn disappeared() -> Failure {
+    transfer_failure(
+        FailureCode::TransferDisappeared,
+        RetryAdvice::SameSourceLater,
+        "Download disappeared from slskd",
+    )
+}
+
+/// A slot that ran past `PER_TRACK_TIMEOUT` with no peer left.
+fn per_track_timeout() -> Failure {
+    transfer_failure(
+        FailureCode::TransferTimedOut,
+        RetryAdvice::OtherSource,
+        "Per-track timeout",
+    )
+}
+
+/// slskd's transfer list stayed unreadable for `BACKEND_STALL_TIMEOUT`.
+fn stalled() -> Failure {
+    transfer_failure(
+        FailureCode::TransferListUnreadable,
+        RetryAdvice::SameSourceLater,
+        &format!(
+            "slskd's transfer list was unreadable for {} minutes",
+            BACKEND_STALL_TIMEOUT.as_secs() / 60
+        ),
+    )
+}
+
+/// No download backend could be reached for `MAX_BACKEND_FAILURES` polls.
+fn backend_unavailable() -> Failure {
+    transfer_failure(
+        FailureCode::BackendNotConfigured,
+        RetryAdvice::NeedsUser,
+        "Download backend unavailable",
+    )
+    .with_user_action(UserAction::configure_backend())
+}
+
+/// slskd's downloads list kept failing to parse.
+fn list_unreadable(e: &SoulseekError) -> Failure {
+    e.failure(
+        Stage::Transfer,
+        format!("Could not read slskd downloads list: {e}"),
+    )
+}
 
 /// Where a slot is in its life. Only a `Watching` slot is looked at, shown
 /// or rebound: the others belong to the import queue or are finished.
@@ -350,12 +409,13 @@ impl DownloadMonitor {
         if self.last_readable_poll.elapsed() <= BACKEND_STALL_TIMEOUT {
             return false;
         }
-        let reason = format!(
-            "slskd's transfer list was unreadable for {} minutes",
-            BACKEND_STALL_TIMEOUT.as_secs() / 60
+        let failure = stalled();
+        warn!(
+            "{} - giving up on batch {:?}",
+            failure.message,
+            self.filenames()
         );
-        warn!("{} - giving up on batch {:?}", reason, self.filenames());
-        self.fail_unprocessed_tracks(&reason);
+        self.fail_unprocessed_tracks(failure);
         true
     }
 
@@ -511,7 +571,7 @@ impl DownloadMonitor {
                         backend_failures, MAX_BACKEND_FAILURES, e
                     );
                     if backend_failures >= MAX_BACKEND_FAILURES {
-                        self.fail_unprocessed_tracks("Download backend unavailable");
+                        self.fail_unprocessed_tracks(backend_unavailable());
                         break;
                     }
                     interval.tick().await;
@@ -557,9 +617,7 @@ impl DownloadMonitor {
                         invalid_responses, MAX_INVALID_RESPONSES, e
                     );
                     if invalid_responses >= MAX_INVALID_RESPONSES {
-                        self.fail_unprocessed_tracks(&format!(
-                            "Could not read slskd downloads list: {e}"
-                        ));
+                        self.fail_unprocessed_tracks(list_unreadable(&e));
                         break;
                     }
                 }
@@ -926,11 +984,10 @@ impl DownloadMonitor {
                     }
                     self.abandon(slot, backend).await;
                     self.settle(slot, SlotPhase::TimedOut, backend.id());
-                    let timeout_entry = DownloadProgress {
-                        state: DownloadState::Failed(TIMED_OUT.into()),
-                        error: Some("Per-track timeout".into()),
-                        ..download.clone()
-                    };
+                    let timeout_entry = download
+                        .clone()
+                        .with_state(DownloadState::Failed(String::new()))
+                        .with_failure(per_track_timeout());
                     let entries = self.stamp_batch(vec![timeout_entry]);
                     let _ = self.tx.send(DownloadEvent::Progress(entries));
                     continue;
@@ -1020,34 +1077,33 @@ impl DownloadMonitor {
                 continue;
             }
 
-            let absent_reason = match self.track_states[slot].first_seen {
+            let absent = match self.track_states[slot].first_seen {
                 None if self.track_states[slot].bound_at.elapsed() > ABSENT_TRACK_TIMEOUT => {
-                    Some("Download never appeared in slskd")
+                    Some(never_appeared())
                 }
                 Some(_) => {
                     let missing_since = self.track_states[slot]
                         .missing_since
                         .get_or_insert_with(Instant::now);
-                    (missing_since.elapsed() > ABSENT_TRACK_TIMEOUT)
-                        .then_some("Download disappeared from slskd")
+                    (missing_since.elapsed() > ABSENT_TRACK_TIMEOUT).then(disappeared)
                 }
                 None => None,
             };
 
-            if let Some(reason) = absent_reason {
+            if let Some(failure) = absent {
                 // Logged only once the track is really being written off:
                 // a successful failover reports its own retry instead.
-                if self.try_failover(slot, backend, reason).await {
+                if self.try_failover(slot, backend, &failure.message).await {
                     continue;
                 }
                 warn!(
                     "{} after {}s, marking failed: {}",
-                    reason,
+                    failure.message,
                     ABSENT_TRACK_TIMEOUT.as_secs(),
                     self.tracked_files[slot].filename
                 );
                 self.settle(slot, SlotPhase::Settled, backend.id());
-                failed.push(make_failed_progress(&self.tracked_files[slot], reason));
+                failed.push(make_failed_progress(&self.tracked_files[slot], failure));
             }
         }
 
@@ -1069,7 +1125,7 @@ impl DownloadMonitor {
     /// two wait. A batch with more than one track only reaches them because
     /// a sibling showed up.
     async fn retry_or_fail_absent_batch(&mut self, backend: &Arc<dyn DownloadBackend>) -> bool {
-        const REASON: &str = "Download never appeared in slskd";
+        let failure = never_appeared();
         let mut retried = false;
         let mut failed: Vec<DownloadProgress> = Vec::new();
 
@@ -1077,14 +1133,17 @@ impl DownloadMonitor {
             if !self.watching(slot) {
                 continue;
             }
-            if self.try_failover(slot, backend, REASON).await {
+            if self.try_failover(slot, backend, &failure.message).await {
                 retried = true;
                 continue;
             }
             // Without this, rows whose transfer never surfaced in slskd would
             // sit at "Queued" in the UI forever.
             self.settle(slot, SlotPhase::Settled, backend.id());
-            failed.push(make_failed_progress(&self.tracked_files[slot], REASON));
+            failed.push(make_failed_progress(
+                &self.tracked_files[slot],
+                failure.clone(),
+            ));
         }
 
         if !failed.is_empty() {
@@ -1097,12 +1156,15 @@ impl DownloadMonitor {
     /// Mark every watched track as failed and notify the UI. Used when
     /// monitoring must stop early so downloads are never left dangling. With
     /// no backend at hand their keys are released when the monitor drops.
-    fn fail_unprocessed_tracks(&mut self, reason: &str) {
+    fn fail_unprocessed_tracks(&mut self, failure: Failure) {
         let mut failed: Vec<DownloadProgress> = Vec::new();
         for slot in 0..self.tracked_files.len() {
             if self.watching(slot) {
                 self.track_states[slot].phase = SlotPhase::Settled;
-                failed.push(make_failed_progress(&self.tracked_files[slot], reason));
+                failed.push(make_failed_progress(
+                    &self.tracked_files[slot],
+                    failure.clone(),
+                ));
             }
         }
         if !failed.is_empty() {
@@ -1305,12 +1367,12 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
 
 /// Build a synthetic terminal progress entry for a track slskd no longer
 /// reports, so the UI can settle its row.
-fn make_failed_progress(tracked: &TrackedFile, reason: &str) -> DownloadProgress {
+fn make_failed_progress(tracked: &TrackedFile, failure: Failure) -> DownloadProgress {
     DownloadProgress::failed(
         tracked.transfer_id.clone(),
         tracked.source.clone(),
         tracked.filename.clone(),
-        reason.to_string(),
+        failure,
     )
 }
 
@@ -1384,10 +1446,18 @@ pub fn filenames_match(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use crate::auth::UserId;
+    use crate::server_fns::download::enqueue::{monitor_stopped, MONITOR_STOPPED};
     use crate::server_fns::download::test_support::{
         batch, item, key, transfer, Cancel, ScriptedOutcome, StubBackend,
     };
+    use shared::failure::UserActionCode;
     use tokio::sync::broadcast;
+
+    fn assert_failed(row: &DownloadProgress, code: FailureCode, message: &str) {
+        assert_eq!(row.state, DownloadState::Failed(message.into()));
+        assert_eq!(row.error.as_deref(), Some(message));
+        assert_eq!(row.failure.as_ref().map(|f| f.code), Some(code));
+    }
 
     /// An instant `d` in the past, so a test can reach the monitor's
     /// elapsed-time windows without sleeping through them.
@@ -1479,14 +1549,18 @@ mod tests {
     }
 
     /// The states the monitor sent for `item`, in order.
-    fn states_for(rx: &mut broadcast::Receiver<DownloadEvent>, item: &str) -> Vec<DownloadState> {
-        let mut states = Vec::new();
+    fn rows_for(rx: &mut broadcast::Receiver<DownloadEvent>, item: &str) -> Vec<DownloadProgress> {
+        let mut sent = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let DownloadEvent::Progress(rows) = event {
-                states.extend(rows.into_iter().filter(|r| r.item == item).map(|r| r.state));
+                sent.extend(rows.into_iter().filter(|r| r.item == item));
             }
         }
-        states
+        sent
+    }
+
+    fn states_for(rx: &mut broadcast::Receiver<DownloadEvent>, item: &str) -> Vec<DownloadState> {
+        rows_for(rx, item).into_iter().map(|r| r.state).collect()
     }
 
     fn phase(m: &DownloadMonitor, slot: usize) -> SlotPhase {
@@ -1797,10 +1871,13 @@ mod tests {
             panic!("the UI was never told the batch died");
         };
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|e| e
-            .error
-            .as_deref()
-            .is_some_and(|msg| msg.contains("unreadable"))));
+        for e in &entries {
+            assert_failed(
+                e,
+                FailureCode::TransferListUnreadable,
+                "slskd's transfer list was unreadable for 10 minutes",
+            );
+        }
     }
 
     #[tokio::test]
@@ -1855,13 +1932,13 @@ mod tests {
                 );
             }
 
+            let rows = rows_for(&mut rx, "one.flac");
             assert_eq!(
-                states_for(&mut rx, "one.flac"),
-                vec![DownloadState::Failed(
-                    "Download timed out after 1 hour".into()
-                )],
+                rows.iter().map(|r| r.state.clone()).collect::<Vec<_>>(),
+                vec![DownloadState::Failed("Per-track timeout".into())],
                 "album_mode={album_mode}"
             );
+            assert_failed(&rows[0], FailureCode::TransferTimedOut, "Per-track timeout");
             assert!(stub
                 .cancelled()
                 .contains(&Cancel::only("peer_a", &id_of("one.flac"))));
@@ -1942,7 +2019,7 @@ mod tests {
     async fn a_never_appeared_batch_with_no_peers_left_is_still_written_off() {
         // The fallback has to stay reachable, or an absent batch with a dry
         // pool would poll forever.
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, mut rx) = failover_monitor();
         // Every alternate is refused, so the pool yields nothing.
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let mut consecutive_empty = MAX_CONSECUTIVE_EMPTY - 1;
@@ -1953,6 +2030,97 @@ mod tests {
 
         assert!(stop);
         assert_eq!(phase(&m, 0), SlotPhase::Settled);
+        let mut rows = Vec::new();
+        while let Ok(DownloadEvent::Progress(sent)) = rx.try_recv() {
+            rows.extend(sent);
+        }
+        assert_eq!(rows.len(), 1);
+        assert_failed(
+            &rows[0],
+            FailureCode::TransferNeverAppeared,
+            "Download never appeared in slskd",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vanished_transfer_fails_with_transfer_disappeared() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        m.track_states[0].first_seen = Some(ago(Duration::from_secs(5)));
+        m.track_states[0].missing_since = Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1)));
+
+        poll_tracks(&mut m, &[], &backend).await;
+
+        let Ok(DownloadEvent::Progress(rows)) = rx.try_recv() else {
+            panic!("the vanished transfer was never reported");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_failed(
+            &rows[0],
+            FailureCode::TransferDisappeared,
+            "Download disappeared from slskd",
+        );
+    }
+
+    #[test]
+    fn monitor_failures_keep_their_text() {
+        use RetryAdvice::*;
+        let e = SoulseekError::InvalidResponse("bad json".into());
+        let unreadable = format!("Could not read slskd downloads list: {e}");
+        for (f, code, retry, message) in [
+            (
+                never_appeared(),
+                FailureCode::TransferNeverAppeared,
+                OtherSource,
+                "Download never appeared in slskd",
+            ),
+            (
+                disappeared(),
+                FailureCode::TransferDisappeared,
+                SameSourceLater,
+                "Download disappeared from slskd",
+            ),
+            (
+                per_track_timeout(),
+                FailureCode::TransferTimedOut,
+                OtherSource,
+                "Per-track timeout",
+            ),
+            (
+                stalled(),
+                FailureCode::TransferListUnreadable,
+                SameSourceLater,
+                "slskd's transfer list was unreadable for 10 minutes",
+            ),
+            (
+                backend_unavailable(),
+                FailureCode::BackendNotConfigured,
+                NeedsUser,
+                "Download backend unavailable",
+            ),
+            (
+                list_unreadable(&e),
+                FailureCode::TransferListUnreadable,
+                SameSourceLater,
+                unreadable.as_str(),
+            ),
+            (
+                monitor_stopped(),
+                FailureCode::TransferCancelled,
+                SameSourceLater,
+                MONITOR_STOPPED,
+            ),
+        ] {
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message.as_str()),
+                (code, Stage::Transfer, retry, message)
+            );
+        }
+        assert_eq!(
+            backend_unavailable().user_action.unwrap().code,
+            UserActionCode::ConfigureBackend
+        );
     }
 
     #[tokio::test]
@@ -2252,13 +2420,13 @@ mod tests {
             stub.cancelled().is_empty(),
             "a succeeded record was removed although its file was never found"
         );
-        assert_eq!(
-            import_events(&mut imports)
-                .into_iter()
-                .flatten()
-                .map(|r| r.state)
-                .collect::<Vec<_>>(),
-            vec![DownloadState::Failed("Could not resolve file path".into())]
+        let rows: Vec<DownloadProgress> =
+            import_events(&mut imports).into_iter().flatten().collect();
+        assert_eq!(rows.len(), 1);
+        assert_failed(
+            &rows[0],
+            FailureCode::FileNotFoundAfterDownload,
+            "Could not resolve file path",
         );
         assert!(TransferRegistry::global().may_adopt(&held, &batch("Y").owner));
     }
@@ -2415,10 +2583,7 @@ mod tests {
         let Ok(DownloadEvent::Progress(rows)) = rx.try_recv() else {
             panic!("the undrained slot was never written off");
         };
-        assert_eq!(
-            rows[0].error.as_deref(),
-            Some(crate::server_fns::download::enqueue::MONITOR_STOPPED)
-        );
+        assert_failed(&rows[0], FailureCode::TransferCancelled, MONITOR_STOPPED);
         assert_eq!(stub.cancelled(), vec![Cancel::only("peer_b", "t-02")]);
         let record = transfer("peer_b", "02.flac", "t-02", DownloadState::Cancelled);
         assert!(m.owns(&record), "its record is removed at cleanup");
