@@ -130,10 +130,20 @@ pub(crate) async fn session_still_valid(
         .is_ok_and(|ctx| ctx.id() == *user)
 }
 
+/// Whether a download socket opens with the build frame. A bundle older than
+/// the frame does not ask for it: it cannot decode the variant and would
+/// reconnect on every try.
+#[cfg(feature = "server")]
+fn sends_build_frame(build_frame: Option<bool>) -> bool {
+    build_frame == Some(true)
+}
+
 /// WebSocket endpoint for real-time download updates.
 /// Uses WebSocket instead of HTTP streaming for more reliable delivery.
-#[get("/api/downloads/updates", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
+/// A client that passes `build_frame=true` gets `DownloadEvent::Build` first.
+#[get("/api/downloads/updates?build_frame", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn download_updates_ws(
+    build_frame: Option<bool>,
     options: WebSocketOptions,
 ) -> Result<Websocket<(), DownloadEvent>, ServerFnError> {
     let user = auth.0.id();
@@ -167,6 +177,12 @@ pub async fn download_updates_ws(
     Ok(options.on_upgrade(move |mut socket| async move {
         let mut rx = rx;
         info!("WebSocket connected for user: {}", user);
+        if sends_build_frame(build_frame) {
+            // A client already gone ends the loop below at its first receive.
+            let _ = socket
+                .send(DownloadEvent::Build(crate::build_id::BUILD_ID.to_string()))
+                .await;
+        }
         let mut recheck = tokio::time::interval_at(
             tokio::time::Instant::now() + SESSION_RECHECK,
             SESSION_RECHECK,
@@ -526,6 +542,14 @@ pub async fn forget_import_retries(items: Vec<String>) -> Result<(), ServerFnErr
 mod tests {
     use super::*;
     use test_support::item;
+
+    #[test]
+    fn only_a_client_that_asks_gets_the_build_frame() {
+        assert!(sends_build_frame(Some(true)));
+        assert!(!sends_build_frame(Some(false)));
+        // An older bundle does not send the parameter.
+        assert!(!sends_build_frame(None));
+    }
 
     #[test]
     fn auto_label_is_the_group_title_else_its_items_name() {

@@ -41,6 +41,12 @@ RUN rm -rf node_modules package-lock.json && npm install
 # Build the Tailwind CSS
 RUN npx @tailwindcss/cli -i ./web/assets/input.css -o ./web/assets/tailwind.css
 
+# The build's id, which an open tab compares with its own to tell that the
+# server was updated (api/build.rs). .git is not in the build context, so CI
+# passes the commit: --build-arg BUILD_ID=$(git rev-parse --short HEAD).
+# Without it the id is the version plus a hash of the Rust sources.
+ARG BUILD_ID
+
 # Build the application
 RUN dx bundle --package web --release
 

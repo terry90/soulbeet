@@ -136,26 +136,41 @@ fn WebNavbar() -> Element {
     let mut auto_download_signal = use_signal(|| None::<shared::download::AutoDownloadEvent>);
     use_context_provider(|| AutoDownloadSignal(auto_download_signal));
 
+    // Set once the server names another build than this bundle's.
+    #[allow(unused_mut)] // mutated in websocket callback (web feature only)
+    let mut outdated = use_signal(|| false);
+
     #[cfg(feature = "web")]
     use_resilient_websocket(
-        || api::download_updates_ws(WebSocketOptions::new()),
-        move |event: DownloadEvent| match event {
-            DownloadEvent::Progress(data) => {
-                let mut map = downloads.write();
-                for file in data {
-                    map.insert(file.item.clone(), file);
+        || api::download_updates_ws(Some(true), WebSocketOptions::new()),
+        move |event: DownloadEvent| {
+            // This bundle may misread what another build sends.
+            if *outdated.peek() {
+                return;
+            }
+            match event {
+                DownloadEvent::Progress(data) => {
+                    let mut map = downloads.write();
+                    for file in data {
+                        map.insert(file.item.clone(), file);
+                    }
                 }
-            }
-            DownloadEvent::Replaced {
-                previous_item,
-                entry,
-            } => {
-                let mut map = downloads.write();
-                map.remove(&previous_item);
-                map.insert(entry.item.clone(), *entry);
-            }
-            DownloadEvent::AutoDownload(auto_event) => {
-                auto_download_signal.set(Some(auto_event));
+                DownloadEvent::Replaced {
+                    previous_item,
+                    entry,
+                } => {
+                    let mut map = downloads.write();
+                    map.remove(&previous_item);
+                    map.insert(entry.item.clone(), *entry);
+                }
+                DownloadEvent::AutoDownload(auto_event) => {
+                    auto_download_signal.set(Some(auto_event));
+                }
+                DownloadEvent::Build(server_build) => {
+                    if !api::build_id::is_current(&server_build) {
+                        outdated.set(true);
+                    }
+                }
             }
         },
     );
@@ -276,6 +291,22 @@ fn WebNavbar() -> Element {
                 }
             }
 
+            if outdated() {
+                StatusBanner {
+                    dot_class: "bg-beet-accent",
+                    label: "UPDATE",
+                    message: "Soulful was updated. Reload this page.".to_string(),
+                    button {
+                        class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted cursor-pointer",
+                        onclick: |_| {
+                            if let Some(window) = web_sys::window() {
+                                let _ = window.location().reload();
+                            }
+                        },
+                        "Reload"
+                    }
+                }
+            }
             ImporterBanner {}
             NavidromeBanner {}
             if let Some(message) = logout_error() {

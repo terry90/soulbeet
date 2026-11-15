@@ -408,6 +408,9 @@ pub enum DownloadEvent {
     },
     /// Auto-download lifecycle events (displayed inline on search rows, not in download panel)
     AutoDownload(AutoDownloadEvent),
+    /// The server's build id, the first frame on a socket whose client asked
+    /// for it. A bundle from another build may misread every event after it.
+    Build(String),
 }
 
 /// Events from the auto-download pipeline, sent over WebSocket

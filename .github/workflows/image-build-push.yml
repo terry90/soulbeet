@@ -91,6 +91,12 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      # The build id (api/build.rs). The image has no .git, so it is passed
+      # in: the commit checked out above.
+      - name: Read the commit
+        id: commit
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Generate platform-specific tags
         id: platform-tags
         shell: bash
@@ -127,6 +133,7 @@ jobs:
           labels: ${{ needs.metadata.outputs.labels }}
           build-args: |
             TIER=${{ matrix.tier }}
+            BUILD_ID=${{ steps.commit.outputs.sha }}
           cache-from: |
             type=gha,scope=${{ github.workflow }}-${{ matrix.platform }}-${{ matrix.tier }}
             type=gha,scope=${{ github.workflow }}-${{ matrix.platform }}-rust
