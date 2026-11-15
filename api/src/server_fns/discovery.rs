@@ -60,7 +60,9 @@ use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferReg
 use crate::AuthSession;
 
 #[cfg(feature = "server")]
-use super::{refusal_error, server_error};
+use super::{failure_error, server_error};
+#[cfg(feature = "server")]
+use shared::failure::Stage;
 
 /// Get the current user's discovery configuration
 #[get("/api/discovery/config", auth: AuthSession)]
@@ -111,27 +113,9 @@ pub struct TrackActionRequest {
 
 #[post("/api/discovery/promote", auth: AuthSession)]
 pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    let track = DiscoveryTrackRow::get_by_id(&req.track_id)
-        .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("Track not found"))?;
-
-    let folder = Folder::get_by_id(&track.folder_id)
-        .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("Folder not found"))?;
-
-    if folder.user_id != auth.0.user_id {
-        return Err(server_error("Not authorized to modify this track"));
-    }
-
-    use super::navidrome::PromoteError;
     super::navidrome::promote_discovery_track_internal(&req.track_id, &auth.0.user_id)
         .await
-        .map_err(|e| match e {
-            PromoteError::Refused(reason) => refusal_error(reason),
-            PromoteError::Failed(e) => server_error(e),
-        })
+        .map_err(failure_error)
 }
 
 #[post("/api/discovery/remove", auth: AuthSession)]
@@ -139,19 +123,10 @@ pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), Serve
     #[cfg(feature = "server")]
     use crate::models::discovery_history::DiscoveryHistoryRow;
 
-    let track = DiscoveryTrackRow::get_by_id(&req.track_id)
-        .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("Track not found"))?;
-
-    let folder = Folder::get_by_id(&track.folder_id)
-        .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("Folder not found"))?;
-
-    if folder.user_id != auth.0.user_id {
-        return Err(server_error("Not authorized to modify this track"));
-    }
+    let (track, folder) =
+        super::navidrome::owned_discovery_track(&req.track_id, &auth.0.user_id, Stage::Delete)
+            .await
+            .map_err(failure_error)?;
 
     let path = std::path::Path::new(&track.path);
     if path.exists() {

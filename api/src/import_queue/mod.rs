@@ -15,6 +15,7 @@ use crate::auth::UserId;
 use async_trait::async_trait;
 use futures::FutureExt;
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, MatchChoices};
+use shared::failure::Failure;
 use soulbeet::audio::{count_audio_files, is_audio_path};
 use soulbeet::{
     DriverChoice, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult, MusicImporter,
@@ -497,8 +498,9 @@ pub async fn canonical_target(target: &Path) -> std::io::Result<PathBuf> {
     tokio::fs::canonicalize(target).await
 }
 
-/// Imports one file into a library folder and waits for it (promote).
-pub async fn import_to_library(src: &Path, target: &Path) -> Result<(), String> {
+/// Imports one file into a library folder and waits for it (promote). Ok when
+/// the file imported, else the outcome's failure.
+pub async fn import_to_library(src: &Path, target: &Path) -> Result<(), Failure> {
     let outcome = IMPORT_QUEUE
         .submit(ImportJob {
             sources: vec![src.to_path_buf()],
@@ -513,10 +515,7 @@ pub async fn import_to_library(src: &Path, target: &Path) -> Result<(), String> 
         .await
         .wait()
         .await;
-    match outcome.result.outcome {
-        ImportOutcome::Imported { .. } => Ok(()),
-        _ => Err(outcome.result.to_string()),
-    }
+    import_failure(&outcome.result).map_or(Ok(()), Err)
 }
 
 struct LiveDeps;

@@ -5,6 +5,10 @@ use shared::navidrome::{DeletionReview, LibraryStats, SyncResult};
 use dioxus::logger::tracing::{info, warn};
 
 #[cfg(feature = "server")]
+use crate::core::database_failure;
+#[cfg(feature = "server")]
+use crate::core::folders::folder_not_found;
+#[cfg(feature = "server")]
 use crate::folder_policy::{
     canonical_folder_path, file_owner, FileOwner, PolicyFolder, PolicyRows,
 };
@@ -25,7 +29,9 @@ use crate::services::navidrome_client_for_user;
 #[cfg(feature = "server")]
 use crate::AuthSession;
 #[cfg(feature = "server")]
-use shared::navidrome::DiscoveryStatus;
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+#[cfg(feature = "server")]
+use shared::navidrome::{DiscoveryStatus, DiscoveryTrack};
 #[cfg(feature = "server")]
 use soulbeet::ForgetOutcome;
 #[cfg(feature = "server")]
@@ -183,7 +189,7 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
             if let Some(track) = matching_track {
                 if user_rating >= promote_threshold {
                     if let Err(e) = promote_discovery_track_internal(&track.id, user_id).await {
-                        warn!("Failed to promote track {}: {}", track.title, e);
+                        warn!("Failed to promote track {}: {}", track.title, e.message);
                     } else {
                         promoted_tracks += 1;
                     }
@@ -507,39 +513,6 @@ pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
     })
 }
 
-/// Why a promote did not happen.
-#[cfg(feature = "server")]
-#[derive(Debug)]
-pub(crate) enum PromoteError {
-    /// Written for the user: the track's state or the import outcome.
-    Refused(String),
-    /// Internal, such as a database error.
-    Failed(String),
-}
-
-#[cfg(feature = "server")]
-impl std::fmt::Display for PromoteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PromoteError::Refused(m) | PromoteError::Failed(m) => f.write_str(m),
-        }
-    }
-}
-
-#[cfg(feature = "server")]
-impl From<String> for PromoteError {
-    fn from(e: String) -> Self {
-        PromoteError::Failed(e)
-    }
-}
-
-#[cfg(feature = "server")]
-impl From<&str> for PromoteError {
-    fn from(e: &str) -> Self {
-        PromoteError::Failed(e.to_string())
-    }
-}
-
 /// Promotes in its own task, so the status and history updates always follow
 /// the import even when the request that started it goes away while the
 /// import waits in the library's queue.
@@ -547,47 +520,123 @@ impl From<&str> for PromoteError {
 pub(crate) async fn promote_discovery_track_internal(
     track_id: &str,
     user_id: &str,
-) -> Result<(), PromoteError> {
+) -> Result<(), Failure> {
     let (track_id, user_id) = (track_id.to_string(), user_id.to_string());
     tokio::spawn(async move { promote_detached(&track_id, &user_id).await })
         .await
-        .unwrap_or_else(|e| Err(PromoteError::Failed(format!("Promote stopped: {e}"))))
+        .unwrap_or_else(|e| Err(promote_stopped(&e)))
 }
 
 #[cfg(feature = "server")]
-async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), PromoteError> {
+fn discovery_track_not_found() -> Failure {
+    Failure::new(
+        FailureCode::UnknownHandle,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "Discovery track not found",
+    )
+}
+
+#[cfg(feature = "server")]
+fn not_your_track() -> Failure {
+    Failure::new(
+        FailureCode::NotOwner,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "Not authorized to modify this track",
+    )
+}
+
+#[cfg(feature = "server")]
+fn promote_not_pending() -> Failure {
+    Failure::new(
+        FailureCode::ExpiredHandle,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "Track is no longer pending (already promoted, removed, or being promoted)",
+    )
+}
+
+#[cfg(feature = "server")]
+fn promote_file_gone() -> Failure {
+    Failure::new(
+        FailureCode::ImportFilesGone,
+        Stage::Import,
+        RetryAdvice::NotRetryable,
+        "The downloaded file is gone",
+    )
+}
+
+/// A promote task that panicked, coded like a panicked import job.
+#[cfg(feature = "server")]
+fn promote_stopped(e: &tokio::task::JoinError) -> Failure {
+    Failure::new(
+        FailureCode::ImportBeetsFailed,
+        Stage::Import,
+        RetryAdvice::SameSourceLater,
+        format!("Promote stopped: {e}"),
+    )
+}
+
+/// The track's folder when `user_id` owns it: `folder_not_found` for none,
+/// `not_your_track` for another user's.
+#[cfg(feature = "server")]
+fn track_folder_of(folder: Option<Folder>, user_id: &str) -> Result<Folder, Failure> {
+    let folder = folder.ok_or_else(folder_not_found)?;
+    if folder.user_id == user_id {
+        Ok(folder)
+    } else {
+        Err(not_your_track())
+    }
+}
+
+/// The track (`discovery_track_not_found` when missing) and its folder
+/// (`track_folder_of`). Database errors are `database_failure(stage, e)`.
+#[cfg(feature = "server")]
+pub(crate) async fn owned_discovery_track(
+    track_id: &str,
+    user_id: &str,
+    stage: Stage,
+) -> Result<(DiscoveryTrack, Folder), Failure> {
+    let track = DiscoveryTrackRow::get_by_id(track_id)
+        .await
+        .map_err(|e| database_failure(stage, e))?
+        .ok_or_else(discovery_track_not_found)?;
+    let folder = Folder::get_by_id(&track.folder_id)
+        .await
+        .map_err(|e| database_failure(stage, e))?;
+    let folder = track_folder_of(folder, user_id)?;
+    Ok((track, folder))
+}
+
+#[cfg(feature = "server")]
+async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), Failure> {
     use crate::models::discovery_history::DiscoveryHistoryRow;
 
+    // Check the owner before claiming, so another user's track is never left promoting.
+    let (track, folder) = owned_discovery_track(track_id, user_id, Stage::Import).await?;
+
     // CAS guard: only one caller can promote a given track
-    if !DiscoveryTrackRow::try_set_promoting(track_id).await? {
-        return Err(PromoteError::Refused(
-            "Track is no longer pending (already promoted, removed, or being promoted)".to_string(),
-        ));
+    if !DiscoveryTrackRow::try_set_promoting(track_id)
+        .await
+        .map_err(|e| database_failure(Stage::Import, e))?
+    {
+        return Err(promote_not_pending());
     }
-
-    let track = DiscoveryTrackRow::get_by_id(track_id)
-        .await?
-        .ok_or("Discovery track not found")?;
-
-    let folder = Folder::get_by_id(&track.folder_id)
-        .await?
-        .ok_or("Folder not found")?;
 
     let src = std::path::PathBuf::from(&track.path);
     if !src.exists() {
         // File missing -- revert to Pending so expiry can handle it
         let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
         warn!("Promote of '{}': {} is gone", track.title, track.path);
-        return Err(PromoteError::Refused(
-            "The downloaded file is gone".to_string(),
-        ));
+        return Err(promote_file_gone());
     }
 
     let target = std::path::PathBuf::from(&folder.path);
-    if let Err(outcome) = crate::import_queue::import_to_library(&src, &target).await {
+    if let Err(failure) = crate::import_queue::import_to_library(&src, &target).await {
         // Import failed -- revert to Pending
         let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
-        return Err(PromoteError::Refused(outcome));
+        return Err(failure);
     }
 
     if let Some(parent) = src.parent() {
@@ -595,7 +644,9 @@ async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), PromoteEr
         let _ = super::cleanup_empty_ancestors(parent, std::path::Path::new(&profile_root)).await;
     }
 
-    DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Promoted).await?;
+    DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Promoted)
+        .await
+        .map_err(|e| database_failure(Stage::Import, e))?;
 
     if let Err(e) =
         DiscoveryHistoryRow::update_outcome(user_id, &track.artist, &track.title, "promoted").await
@@ -659,6 +710,78 @@ mod tests {
             std::fs::write(&path, b"audio").unwrap();
         }
         (dir, tmp)
+    }
+
+    #[test]
+    fn promote_refusals_keep_their_text() {
+        use FailureCode::*;
+        use RetryAdvice::*;
+        for (f, code, stage, retry, message) in [
+            (
+                discovery_track_not_found(),
+                UnknownHandle,
+                Stage::Input,
+                NotRetryable,
+                "Discovery track not found",
+            ),
+            (
+                not_your_track(),
+                NotOwner,
+                Stage::Input,
+                NotRetryable,
+                "Not authorized to modify this track",
+            ),
+            (
+                promote_not_pending(),
+                ExpiredHandle,
+                Stage::Input,
+                NotRetryable,
+                "Track is no longer pending (already promoted, removed, or being promoted)",
+            ),
+            (
+                promote_file_gone(),
+                ImportFilesGone,
+                Stage::Import,
+                NotRetryable,
+                "The downloaded file is gone",
+            ),
+        ] {
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message.as_str()),
+                (code, stage, retry, message)
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_folder_owner_may_change_a_discovery_track() {
+        let folder = |user_id: &str| Folder {
+            id: "f1".into(),
+            user_id: user_id.into(),
+            name: "Music".into(),
+            path: "/music".into(),
+            shared: false,
+        };
+        assert_eq!(
+            track_folder_of(Some(folder("user-b")), "user-a"),
+            Err(not_your_track())
+        );
+        assert_eq!(track_folder_of(None, "user-a"), Err(folder_not_found()));
+        assert_eq!(
+            track_folder_of(Some(folder("user-a")), "user-a"),
+            Ok(folder("user-a"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_promote_that_panics_is_an_import_that_stopped() {
+        let e = tokio::spawn(async { panic!("boom") }).await.unwrap_err();
+        let f = promote_stopped(&e);
+        assert_eq!(
+            (f.code, f.retry),
+            (FailureCode::ImportBeetsFailed, RetryAdvice::SameSourceLater)
+        );
+        assert_eq!(f.message, format!("Promote stopped: {e}"));
     }
 
     fn folder(path: &Path) -> Folder {
