@@ -176,10 +176,6 @@ pub struct DownloadProgress {
     /// The server keeps this row's import job, so Retry import can resubmit it
     #[serde(default)]
     pub retryable: bool,
-    /// The kept job has the matches of a skipped automatic import, so the
-    /// user can pick one or import it as-is
-    #[serde(default)]
-    pub can_choose_import: bool,
     /// Why the row failed or was skipped, typed
     #[serde(default)]
     pub failure: Option<Failure>,
@@ -215,7 +211,6 @@ impl DownloadProgress {
             local_path: None,
             import_output: None,
             retryable: false,
-            can_choose_import: false,
             failure: None,
             skip: None,
         }
@@ -296,10 +291,9 @@ pub enum ImportChoice {
 pub enum KeptImport {
     /// Nothing: the kept import is gone.
     Gone,
-    /// The import, with no matches to pick from.
-    WithoutMatches,
-    /// The import and its matches. Only the choice sent was refused.
-    WithMatches,
+    /// The import stays kept, with whatever matches beets recorded for it.
+    /// Only the choice sent, if any, was refused.
+    Kept,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

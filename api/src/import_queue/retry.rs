@@ -5,9 +5,9 @@
 use super::choice::{resolve, Refusal};
 use super::{ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
-use shared::download::{ImportChoice, MatchChoices};
+use shared::download::{ImportChoice, MatchChoices, MatchKind};
 use soulbeet::audio::count_audio_files;
-use soulbeet::{ImportOutcome, ImportResult, SkipReason};
+use soulbeet::{ImportMode, ImportOutcome, ImportResult, SkipReason};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -159,10 +159,13 @@ impl ImportQueue {
             .retries
             .peek(user, item)
             .ok_or_else(Refusal::nothing_to_retry)?;
-        job.choices
-            .as_deref()
-            .cloned()
-            .ok_or_else(Refusal::no_choices)
+        Ok(job.choices.as_deref().cloned().unwrap_or(MatchChoices {
+            kind: match job.mode {
+                ImportMode::Album => MatchKind::Album,
+                ImportMode::Singleton => MatchKind::Track,
+            },
+            candidates: vec![],
+        }))
     }
 
     pub fn forget_retries(&self, user: &UserId, items: &[String]) {
@@ -195,7 +198,7 @@ mod tests {
     use crate::import_queue::tests::{file, finish, job, owned, queue};
     use crate::import_queue::{ImportJob, ImportMode, ImportQueue, Refusal};
     use shared::download::{
-        DownloadProgress, DownloadState, ImportChoice, KeptImport, MatchChoices,
+        DownloadProgress, DownloadState, ImportChoice, KeptImport, MatchChoices, MatchKind,
     };
     use soulbeet::{DriverChoice, FailKind, ImportResult};
     use std::sync::Arc;
@@ -205,7 +208,7 @@ mod tests {
     fn bad_choice(message: &str) -> Refusal {
         Refusal {
             message: message.into(),
-            kept: KeptImport::WithMatches,
+            kept: KeptImport::Kept,
         }
     }
 
@@ -285,7 +288,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (queue, stub, deps, _) = skipped(tmp.path()).await;
 
-        assert!(done_row(&deps, "a", 1).await.can_choose_import);
+        assert!(done_row(&deps, "a", 1).await.retryable);
         // Looking does not use up the row.
         assert_eq!(queue.import_choices(&alice(), "a"), Ok(found()));
         assert_eq!(queue.import_choices(&alice(), "a"), Ok(found()));
@@ -355,7 +358,7 @@ mod tests {
         };
         assert_eq!(queue.retry(&alice(), "a", pick).await, Ok(()));
         let failed_pick = done_row(&deps, "a", 2).await;
-        assert!(failed_pick.retryable && failed_pick.can_choose_import);
+        assert!(failed_pick.retryable);
         assert_eq!(queue.import_choices(&alice(), "a"), Ok(found()));
 
         stub.script(ImportResult::failed(
@@ -363,7 +366,7 @@ mod tests {
             "Import as-is needs tags".into(),
         ));
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::AsIs).await, Ok(()));
-        assert!(done_row(&deps, "a", 3).await.can_choose_import);
+        assert!(done_row(&deps, "a", 3).await.retryable);
 
         // An automatic run that ends some other way leaves nothing to pick.
         stub.script(ImportResult::failed(
@@ -372,15 +375,23 @@ mod tests {
         ));
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
         let failed_auto = done_row(&deps, "a", 4).await;
-        assert!(failed_auto.retryable && !failed_auto.can_choose_import);
+        assert!(failed_auto.retryable);
         assert_eq!(
             queue.import_choices(&alice(), "a"),
-            Err(Refusal::no_choices())
+            Ok(MatchChoices {
+                kind: MatchKind::Track,
+                candidates: vec![]
+            })
         );
+        let pick = ImportChoice::Candidate {
+            data_source: "FakeSrc".into(),
+            id: "w1".into(),
+        };
         assert_eq!(
-            queue.retry(&alice(), "a", ImportChoice::AsIs).await,
+            queue.retry(&alice(), "a", pick).await,
             Err(Refusal::no_choices())
         );
+        assert_eq!(queue.retry(&alice(), "a", ImportChoice::AsIs).await, Ok(()));
     }
 
     #[tokio::test]
@@ -391,14 +402,14 @@ mod tests {
         stub.set_health(broken());
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
         let refused = done_row(&deps, "a", 2).await;
-        assert!(refused.retryable && refused.can_choose_import);
+        assert!(refused.retryable);
         assert_eq!(queue.import_choices(&alice(), "a"), Ok(found()));
 
         stub.set_health(ready());
         stub.panic_next();
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
         let stopped = done_row(&deps, "a", 3).await;
-        assert!(stopped.retryable && stopped.can_choose_import);
+        assert!(stopped.retryable);
         assert_eq!(queue.import_choices(&alice(), "a"), Ok(found()));
     }
 
@@ -450,7 +461,10 @@ mod tests {
         finish(queue.submit(failing).await).await;
         assert_eq!(
             queue.import_choices(&alice(), "b"),
-            Err(Refusal::no_choices())
+            Ok(MatchChoices {
+                kind: MatchKind::Track,
+                candidates: vec![]
+            })
         );
     }
 

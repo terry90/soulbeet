@@ -63,22 +63,23 @@ impl Refusal {
 
     /// The job is kept, but no automatic run of it left matches to pick from.
     pub(super) fn no_choices() -> Self {
-        Self::new(NO_CHOICES, KeptImport::WithoutMatches)
+        Self::new(NO_CHOICES, KeptImport::Kept)
     }
 
     /// The job and its matches stay kept; only this choice cannot be imported.
     fn bad_choice(message: impl Into<String>) -> Self {
-        Self::new(message, KeptImport::WithMatches)
+        Self::new(message, KeptImport::Kept)
     }
 }
 
-/// The importer's choice for `choice` on `job`. Anything but Auto needs the
-/// matches of a skipped automatic run, and a listed match must be one of them.
+/// The importer's choice for `choice` on `job`. As-is and a MusicBrainz link
+/// work on any kept job; a listed match needs the matches of a skipped
+/// automatic run and must be one of them.
 pub(super) fn resolve(choice: &ImportChoice, job: &ImportJob) -> Result<DriverChoice, Refusal> {
     let choices = || job.choices.as_deref().ok_or_else(Refusal::no_choices);
     match choice {
         ImportChoice::Auto => Ok(DriverChoice::Auto),
-        ImportChoice::AsIs => choices().map(|_| DriverChoice::AsIs),
+        ImportChoice::AsIs => Ok(DriverChoice::AsIs),
         ImportChoice::Candidate { data_source, id } => {
             let found = choices()?
                 .candidates
@@ -92,13 +93,10 @@ pub(super) fn resolve(choice: &ImportChoice, job: &ImportJob) -> Result<DriverCh
                 false => Err(Refusal::bad_choice(UNKNOWN_CANDIDATE)),
             }
         }
-        ImportChoice::MusicBrainz(text) => {
-            choices()?;
-            Ok(DriverChoice::Pick {
-                data_source: MUSICBRAINZ.to_string(),
-                id: musicbrainz_id(text, job.mode).map_err(Refusal::bad_choice)?,
-            })
-        }
+        ImportChoice::MusicBrainz(text) => Ok(DriverChoice::Pick {
+            data_source: MUSICBRAINZ.to_string(),
+            id: musicbrainz_id(text, job.mode).map_err(Refusal::bad_choice)?,
+        }),
     }
 }
 
@@ -191,24 +189,39 @@ mod tests {
         assert_eq!(resolve(&ImportChoice::Auto, &plain), Ok(DriverChoice::Auto));
     }
 
-    #[test]
-    fn every_other_choice_needs_the_kept_matches() {
-        let plain = job(PathBuf::from("/dl/a.flac"), Path::new("/music"));
-        for choice in [
-            ImportChoice::AsIs,
-            ImportChoice::Candidate {
-                data_source: "FakeSrc".into(),
-                id: "x".into(),
-            },
-            ImportChoice::MusicBrainz(MBID.into()),
-        ] {
-            assert_eq!(
-                resolve(&choice, &plain),
-                Err(Refusal::no_choices()),
-                "{choice:?}"
-            );
+    fn job_without_choices(mode: ImportMode) -> ImportJob {
+        ImportJob {
+            mode,
+            ..job(PathBuf::from("/dl/a.flac"), Path::new("/music"))
         }
-        // An empty list still allows as-is and a typed ID.
+    }
+
+    #[test]
+    fn as_is_and_musicbrainz_need_no_kept_candidates() {
+        let job = job_without_choices(ImportMode::Singleton);
+        assert_eq!(resolve(&ImportChoice::AsIs, &job), Ok(DriverChoice::AsIs));
+        assert_eq!(
+            resolve(
+                &ImportChoice::MusicBrainz(format!("https://musicbrainz.org/recording/{MBID}")),
+                &job
+            ),
+            Ok(pick(MUSICBRAINZ, MBID))
+        );
+        assert_eq!(
+            resolve(
+                &ImportChoice::Candidate {
+                    data_source: "MusicBrainz".into(),
+                    id: MBID.into()
+                },
+                &job
+            ),
+            Err(Refusal::no_choices())
+        );
+        assert_eq!(Refusal::no_choices().kept, KeptImport::Kept);
+    }
+
+    #[test]
+    fn an_empty_candidate_list_allows_as_is_and_a_typed_id() {
         let empty = with_choices(ImportMode::Singleton, vec![]);
         assert_eq!(resolve(&ImportChoice::AsIs, &empty), Ok(DriverChoice::AsIs));
         assert_eq!(
@@ -374,12 +387,12 @@ mod tests {
             (
                 Refusal::no_choices(),
                 "This import has no matches to pick from",
-                KeptImport::WithoutMatches,
+                KeptImport::Kept,
             ),
             (
                 Refusal::bad_choice(NOT_AN_ID),
                 "That is not a MusicBrainz link or ID",
-                KeptImport::WithMatches,
+                KeptImport::Kept,
             ),
         ];
         for (refusal, message, kept) in refusals {

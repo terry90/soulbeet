@@ -123,12 +123,6 @@ fn shows_retry(row: &DownloadProgress) -> bool {
     ) && row.retryable
 }
 
-/// A kept row whose last automatic import recorded matches can also import
-/// as-is or with a picked match.
-fn shows_choices(row: &DownloadProgress) -> bool {
-    shows_retry(row) && row.can_choose_import
-}
-
 #[component]
 pub fn DownloadItem(
     file: DownloadProgress,
@@ -269,12 +263,10 @@ pub fn DownloadItem(
         if shows_retry(&file) {
           div { class: "mt-2 flex flex-wrap gap-2",
             RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::Auto), "Retry import" }
-            if shows_choices(&file) {
-              RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::AsIs), "Import as-is" }
-            }
+            RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::AsIs), "Import as-is" }
           }
         }
-        if shows_choices(&file) {
+        if shows_retry(&file) {
           MatchPicker {
             item: file.item.clone(),
             busy: busy(),
@@ -329,6 +321,7 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::download::MatchChoices;
 
     fn row(state: DownloadState, kept: Option<&str>) -> DownloadProgress {
         DownloadProgress {
@@ -414,26 +407,45 @@ mod tests {
         assert!(!shows_retry(&nothing_kept));
     }
 
+    fn render(file: DownloadProgress) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |file: DownloadProgress| {
+                let on_cancel: CancelHandler = Callback::new(|_: DownloadProgress| {
+                    Box::pin(async { Ok(()) }) as Pin<Box<dyn Future<Output = Result<(), String>>>>
+                });
+                let on_import: ImportHandler = Callback::new(|_: (String, ImportChoice)| {
+                    Box::pin(async { Ok(()) }) as Pin<Box<dyn Future<Output = Result<(), Failure>>>>
+                });
+                let on_load_choices: ChoicesLoader = Callback::new(|_: String| {
+                    Box::pin(async { Err(Failure::OnRow) })
+                        as Pin<Box<dyn Future<Output = Result<MatchChoices, Failure>>>>
+                });
+                rsx! { DownloadItem { file, on_cancel, on_import, on_load_choices } }
+            },
+            file,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
     #[test]
-    fn choices_show_only_on_kept_rows_with_matches() {
-        let with_choices = |state| DownloadProgress {
-            can_choose_import: true,
-            ..row(state, Some("/dl/X"))
-        };
-        assert!(shows_choices(&with_choices(DownloadState::ImportSkipped)));
-        // A failed pick keeps the matches.
-        assert!(shows_choices(&with_choices(DownloadState::Failed(
-            "MusicBrainz has no recording x".into()
-        ))));
-        assert!(!shows_choices(&with_choices(DownloadState::Importing)));
-        assert!(!shows_choices(&row(
+    fn a_kept_row_offers_every_import_action() {
+        for state in [
             DownloadState::ImportSkipped,
-            Some("/dl/X")
-        )));
-        let nothing_kept = DownloadProgress {
-            retryable: false,
-            ..with_choices(DownloadState::ImportSkipped)
-        };
-        assert!(!shows_choices(&nothing_kept));
+            DownloadState::Failed("beets exited with code 1".into()),
+        ] {
+            let html = render(row(state.clone(), Some("/dl/X")));
+            assert!(html.contains("Retry import"), "{html}");
+            assert!(html.contains("Import as-is"), "{html}");
+            assert!(html.contains("Show matches"), "{html}");
+
+            let gone = DownloadProgress {
+                retryable: false,
+                ..row(state, Some("/dl/X"))
+            };
+            let html = render(gone);
+            assert!(!html.contains("Import as-is"), "{html}");
+            assert!(!html.contains("Show matches"), "{html}");
+        }
     }
 }

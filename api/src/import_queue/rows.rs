@@ -106,7 +106,6 @@ pub fn rows_for_done(
     };
     // Same rule as the retry store, so a row offers Retry only when one is kept.
     let retryable = keeps_retry(&result.outcome);
-    let can_choose_import = retryable && job.choices.is_some();
     let local_path = retryable.then(|| kept_in(job)).flatten();
     let output = (!result.output_tail.is_empty()).then(|| result.output_tail.clone());
     let skip = match &result.outcome {
@@ -123,7 +122,6 @@ pub fn rows_for_done(
                 failure: None,
                 skip,
                 retryable,
-                can_choose_import,
                 ..row.clone()
             }
             .with_import_details(local_path.clone(), output.clone().filter(|_| i == 0));
@@ -148,12 +146,11 @@ fn kept_in(job: &ImportJob) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::import_queue::test_support::{candidate, imported, no_match, row, track_choices};
+    use crate::import_queue::test_support::{imported, row};
     use crate::import_queue::{ImportJob, JobOutcome};
     use shared::failure::{UserAction, UserActionCode};
     use soulbeet::{DriverChoice, TaskCount};
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -486,30 +483,6 @@ mod tests {
             (&rows[0].failure, rows[0].skip, &rows[0].error),
             (&None, None, &None)
         );
-    }
-
-    #[test]
-    fn rows_offer_choices_only_while_a_kept_job_has_them() {
-        let with_choices = ImportJob {
-            choices: Some(Arc::new(track_choices(vec![candidate("FakeSrc", "w1")]))),
-            ..job("/dl/a.flac", ImportMode::Singleton)
-        };
-        let choosable = |job: &ImportJob, result: ImportResult| {
-            rows_for_done(&[row("a")], job, &done(result))[0].can_choose_import
-        };
-        assert!(choosable(&with_choices, no_match(1)));
-        assert!(choosable(
-            &with_choices,
-            ImportResult::failed(
-                FailKind::ChoiceInvalid,
-                "FakeSrc has no recording w1".into()
-            )
-        ));
-        assert!(!choosable(&with_choices, imported()));
-        assert!(!choosable(
-            &job("/dl/a.flac", ImportMode::Singleton),
-            no_match(1)
-        ));
     }
 
     #[test]

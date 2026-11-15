@@ -314,7 +314,6 @@ pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnE
         local_path: None,
         import_output: None,
         retryable: false,
-        can_choose_import: false,
         failure: None,
         skip: None,
     };

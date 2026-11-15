@@ -590,7 +590,6 @@ impl FileEntry {
             local_path: None,
             import_output: None,
             retryable: false,
-            can_choose_import: false,
             failure: None,
             skip: None,
         };
