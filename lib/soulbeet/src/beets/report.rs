@@ -504,6 +504,7 @@ mod tests {
             untagged: false,
             warnings: vec![],
             items: vec![],
+            failure: None,
         });
         let already = result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
             existing: vec![],
@@ -588,6 +589,7 @@ mod tests {
             untagged: false,
             warnings: vec![],
             items: vec![],
+            failure: None,
         });
         let applied = Report::parse(text).unwrap().apply(
             imported,
@@ -622,6 +624,7 @@ mod tests {
             untagged: false,
             warnings: vec![],
             items: vec![],
+            failure: None,
         });
         let result = Report::parse(text).unwrap().apply(
             imported,
@@ -725,6 +728,7 @@ mod tests {
             untagged: false,
             warnings: vec![],
             items: vec![],
+            failure: None,
         });
         let applied = Report::parse(text).unwrap().apply(
             imported,
@@ -798,6 +802,7 @@ mod tests {
             untagged: false,
             warnings: vec![],
             items: vec![],
+            failure: None,
         });
         let applied = Report::parse(text).unwrap().apply(
             imported,

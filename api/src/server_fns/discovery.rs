@@ -1717,6 +1717,7 @@ mod tests {
                     untagged: false,
                     warnings: vec![],
                     items: vec![],
+                    failure: None,
                 },
                 DiscoveryImport::Imported,
             ),

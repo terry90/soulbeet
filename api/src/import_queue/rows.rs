@@ -90,9 +90,11 @@ pub fn rows_with_state(rows: &[DownloadProgress], state: DownloadState) -> Vec<D
         .collect()
 }
 
-/// The rows of a finished job: the outcome's failure and text, the folder the
-/// files were kept in when a retry is kept for them, whether that retry can
-/// pick a match, and the output tail on the first row only.
+/// The rows of a finished job: the outcome's failure and text (an imported
+/// row's note, and the failure of a step after the import that it reports,
+/// such as a new copy not moved into place), the folder the files were kept in
+/// when a retry is kept for them, whether that retry can pick a match, and the
+/// output tail on the first row only.
 pub fn rows_for_done(
     rows: &[DownloadProgress],
     job: &ImportJob,
@@ -102,12 +104,19 @@ pub fn rows_for_done(
     // The result's text, unlike the outcome's, carries the task count.
     let text = result.to_string();
     let state = row_state(&result.outcome);
-    // The note on an imported row is not a failure; with_failure writes the rest.
-    let error = match &result.outcome {
+    // The note on an imported row is not the failure it may carry; with_failure
+    // writes the rest.
+    let (error, after) = match &result.outcome {
         ImportOutcome::Imported {
-            untagged, warnings, ..
-        } if *untagged || !warnings.is_empty() => Some(text),
-        _ => None,
+            untagged,
+            warnings,
+            failure,
+            ..
+        } => (
+            (*untagged || !warnings.is_empty()).then_some(text),
+            failure.clone(),
+        ),
+        _ => (None, None),
     };
     // Same rule as the retry store, so a row offers Retry only when one is kept.
     let retryable = keeps_retry(&result.outcome);
@@ -124,7 +133,7 @@ pub fn rows_for_done(
             let built = DownloadProgress {
                 state: state.clone(),
                 error: error.clone(),
-                failure: None,
+                failure: after.clone(),
                 skip,
                 retryable,
                 ..row.clone()
@@ -167,6 +176,7 @@ mod tests {
                     untagged: true,
                     warnings: vec![],
                     items: vec![],
+                    failure: None,
                 },
                 DownloadState::Imported,
             ),
@@ -312,6 +322,7 @@ mod tests {
                 untagged: true,
                 warnings: vec!["1 file(s) were not imported".into()],
                 items: vec![],
+                failure: None,
             },
             ..imported()
         };
@@ -470,6 +481,40 @@ mod tests {
         let f = import_failure(&refused.with_user_action(action.clone())).unwrap();
         assert_eq!(f.code, FailureCode::ImporterBroken);
         assert_eq!(f.user_action, Some(action));
+    }
+
+    #[test]
+    fn an_imported_row_carries_the_failure_of_a_copy_not_moved_into_place() {
+        // As move_items words a move beets made out of the library.
+        let unmoved = Failure::new(
+            FailureCode::ImportBeetsFailed,
+            Stage::Import,
+            RetryAdvice::NotRetryable,
+            "beets moved item 7 to /elsewhere/03.flac, which is not inside /music/alice",
+        );
+        let result = ImportResult {
+            outcome: ImportOutcome::Imported {
+                untagged: false,
+                warnings: vec![
+                    "replaced the library's earlier copy A/x.flac".into(),
+                    unmoved.message.clone(),
+                ],
+                items: vec![],
+                failure: Some(unmoved.clone()),
+            },
+            ..imported()
+        };
+        let rows = rows_for_done(
+            &[row("a")],
+            &job("/dl/a.flac", ImportMode::Singleton),
+            &done(result),
+        );
+        assert_eq!(rows[0].state, DownloadState::Imported);
+        assert_eq!(
+            rows[0].error.as_deref(),
+            Some("Imported; replaced the library's earlier copy A/x.flac; beets moved item 7 to /elsewhere/03.flac, which is not inside /music/alice")
+        );
+        assert_eq!(rows[0].failure, Some(unmoved));
     }
 
     #[test]

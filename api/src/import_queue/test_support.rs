@@ -13,7 +13,7 @@ use shared::library::DuplicateReport;
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::{
     DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    ImportedItem, MusicImporter, SkipReason, TaskCount,
+    ImportedItem, MusicImporter, Relocation, SkipReason, TaskCount,
 };
 use sqlx::SqlitePool;
 use std::collections::VecDeque;
@@ -35,6 +35,7 @@ pub fn imported() -> ImportResult {
                 title: "a".into(),
                 album: "Qzz Album".into(),
             }],
+            failure: None,
         },
         output_tail: "imported tail".into(),
         tasks: TaskCount {
@@ -135,7 +136,7 @@ pub struct StubImporter {
     forget_answer: Mutex<ForgetOutcome>,
     forgets: Mutex<Vec<(PathBuf, PathBuf)>>,
     relocations: Mutex<Vec<(PathBuf, Vec<u64>)>>,
-    relocate_answer: Mutex<Result<Vec<(u64, PathBuf)>, String>>,
+    relocate_answer: Mutex<Relocation>,
 }
 
 impl StubImporter {
@@ -156,7 +157,10 @@ impl StubImporter {
             forget_answer: Mutex::new(ForgetOutcome::Removed),
             forgets: Mutex::new(vec![]),
             relocations: Mutex::new(vec![]),
-            relocate_answer: Mutex::new(Ok(vec![])),
+            relocate_answer: Mutex::new(Relocation {
+                now: vec![],
+                failure: None,
+            }),
         }
     }
 
@@ -195,7 +199,7 @@ impl StubImporter {
         *self.forget_answer.lock().unwrap() = outcome;
     }
 
-    pub fn script_relocate(&self, answer: Result<Vec<(u64, PathBuf)>, String>) {
+    pub fn script_relocate(&self, answer: Relocation) {
         *self.relocate_answer.lock().unwrap() = answer;
     }
 
@@ -313,11 +317,7 @@ impl MusicImporter for StubImporter {
             .unwrap_or_else(imported)
     }
 
-    async fn relocate(
-        &self,
-        library: &Path,
-        item_ids: &[u64],
-    ) -> Result<Vec<(u64, PathBuf)>, String> {
+    async fn relocate(&self, library: &Path, item_ids: &[u64]) -> Relocation {
         self.relocations
             .lock()
             .unwrap()

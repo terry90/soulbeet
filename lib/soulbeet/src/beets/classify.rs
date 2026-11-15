@@ -402,6 +402,7 @@ impl Classifier {
             untagged: self.autotag_off || self.stdout_asis || has(RunLogAction::Asis),
             warnings,
             items: Vec::new(),
+            failure: None,
         }
     }
 }
@@ -496,6 +497,7 @@ mod tests {
             untagged,
             warnings: warnings.iter().map(|w| w.to_string()).collect(),
             items: Vec::new(),
+            failure: None,
         }
     }
 

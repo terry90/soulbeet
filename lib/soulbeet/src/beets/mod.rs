@@ -11,7 +11,7 @@ pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 use crate::audio::count_audio_files;
 use crate::{
     DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    MusicImporter,
+    MusicImporter, Relocation,
 };
 use classify::{parse_run_log, Classifier};
 use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
@@ -320,11 +320,7 @@ impl MusicImporter for BeetsImporter {
         )
     }
 
-    async fn relocate(
-        &self,
-        library: &Path,
-        item_ids: &[u64],
-    ) -> Result<Vec<(u64, PathBuf)>, String> {
+    async fn relocate(&self, library: &Path, item_ids: &[u64]) -> Relocation {
         library::move_items(&self.settings, library, item_ids).await
     }
 

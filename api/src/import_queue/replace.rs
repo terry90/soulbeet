@@ -3,6 +3,7 @@
 use crate::auth::UserId;
 use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin};
 use crate::core::logged;
+use shared::failure::Failure;
 use shared::navidrome::DeletionReason;
 use soulbeet::{
     duplicate_note, DuplicateNote, ImportOutcome, ImportResult, ImportedItem, MusicImporter,
@@ -18,9 +19,10 @@ const OVERLAPS: &str = "this import already replaced or added one of these files
 
 /// Settles the removals beets wanted in `result`, an import into `target` (the canonical
 /// library folder beets ran on), as one run, and appends what became of each earlier copy to
-/// the outcome's warnings. The removals are taken out of `result`, which keeps none. Only an
-/// Imported outcome is settled: any other is returned with nothing removed, so a run the row
-/// reports as failed deletes nothing.
+/// the outcome's warnings, and the first new copy that could not be moved into place to its
+/// failure. The removals are taken out of `result`, which keeps none. Only an Imported outcome
+/// is settled: any other is returned with nothing removed, so a run the row reports as failed
+/// deletes nothing.
 pub(super) async fn settle_removals(
     guard: &Guard<'_>,
     importer: &dyn MusicImporter,
@@ -32,7 +34,10 @@ pub(super) async fn settle_removals(
 ) -> ImportResult {
     let removals = std::mem::take(&mut result.removals);
     let ImportOutcome::Imported {
-        warnings, items, ..
+        warnings,
+        items,
+        failure,
+        ..
     } = &mut result.outcome
     else {
         return result;
@@ -55,9 +60,13 @@ pub(super) async fn settle_removals(
                     .flat_map(|r| r.imported.iter().map(|(_, p)| p.clone())),
             )
             .collect(),
+        unmoved: None,
     };
     for removal in &removals {
         warnings.extend(run.settle(removal, items).await);
+    }
+    if failure.is_none() {
+        *failure = run.unmoved;
     }
     result
 }
@@ -78,6 +87,8 @@ struct Run<'a> {
     /// touch: every file the run imported, and each file an earlier removal deleted or moved a
     /// new file to.
     taken: HashSet<PathBuf>,
+    /// The failure of the first new copy that could not be moved into place.
+    unmoved: Option<Failure>,
 }
 
 impl Run<'_> {
@@ -85,7 +96,8 @@ impl Run<'_> {
     /// reached the library (D2). One that names no earlier item is skipped too: there is
     /// nothing it may replace. One that names a path `taken` holds is refused (OVERLAPS). Every
     /// earlier item is checked before any is deleted; the new items are moved into place only
-    /// once all are deleted and forgotten cleanly, and `items` then names them where they are.
+    /// once all are deleted and forgotten cleanly, and `items` then names them where the
+    /// importer has them after the move, failed or not.
     async fn settle(&mut self, removal: &WantedRemoval, items: &mut [ImportedItem]) -> Vec<String> {
         if removal.imported.is_empty() || removal.existing.is_empty() {
             return vec![];
@@ -179,12 +191,18 @@ impl Run<'_> {
         // items stay where beets put them.
         if warnings.is_empty() {
             let ids: Vec<u64> = removal.imported.iter().map(|(id, _)| *id).collect();
-            match replace.importer.relocate(target, &ids).await {
-                Ok(moved) => {
-                    self.taken.extend(moved.iter().map(|(_, now)| now.clone()));
-                    renamed(items, &removal.imported, &moved);
-                }
-                Err(e) => notes.push(format!("Could not move the new copy into place: {e}")),
+            let moved = replace.importer.relocate(target, &ids).await;
+            self.taken
+                .extend(moved.now.iter().map(|(_, now)| now.clone()));
+            renamed(items, &removal.imported, &moved.now);
+            if let Some(f) = moved.failure {
+                warn!(
+                    "Moving the new copy of an import into {}: {}",
+                    target.display(),
+                    logged(&f)
+                );
+                notes.push(f.message.clone());
+                self.unmoved.get_or_insert(f);
             }
         }
         notes.extend(warnings);
@@ -242,7 +260,7 @@ mod tests {
     use super::*;
     use crate::core::delete_guard::test_support::{wanted, Library};
     use crate::import_queue::test_support::{imported, StubImporter};
-    use soulbeet::{FailKind, ForgetOutcome};
+    use soulbeet::{FailKind, ForgetOutcome, Relocation};
 
     /// An earlier library item by "Marrow Choir" on "Winter Songs", as Report::apply hands it
     /// over: its path relative to the library folder.
@@ -286,6 +304,7 @@ mod tests {
                 untagged: false,
                 warnings: vec![],
                 items,
+                failure: None,
             },
             removals,
             ..imported()
@@ -330,7 +349,10 @@ mod tests {
         let lib = Library::new().await;
         let stub = StubImporter::new();
         let target = lib.root.join("music/alice");
-        stub.script_relocate(Ok(vec![(7, "Marrow Choir/Winter Songs/03.flac".into())]));
+        stub.script_relocate(Relocation {
+            now: vec![(7, "Marrow Choir/Winter Songs/03.flac".into())],
+            failure: None,
+        });
         let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
         let done = settle(&lib, &stub, &[], &target, result).await;
         assert_eq!(
@@ -476,22 +498,82 @@ mod tests {
         assert_eq!(item_paths(&done), vec![new_copy(7, 3).1]);
     }
 
+    fn failure_of(result: &ImportResult) -> Option<Failure> {
+        match &result.outcome {
+            ImportOutcome::Imported { failure, .. } => failure.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[tokio::test]
-    async fn a_new_copy_that_cannot_be_moved_says_so() {
+    async fn a_new_copy_that_cannot_be_moved_says_so_and_names_the_items_where_they_are() {
+        // As move_items words a move beets failed part way, and one out of the library.
+        let failed = |retry, message: &str| {
+            Failure::new(
+                shared::failure::FailureCode::ImportBeetsFailed,
+                shared::failure::Stage::Import,
+                retry,
+                message,
+            )
+        };
+        for (now, failure) in [
+            (
+                new_copy(7, 3).1,
+                failed(
+                    shared::failure::RetryAdvice::SameSourceLater,
+                    "Could not move the new copy into place: beet move failed (exit status: 1): error",
+                ),
+            ),
+            (
+                PathBuf::from("/elsewhere/03.flac"),
+                failed(
+                    shared::failure::RetryAdvice::NotRetryable,
+                    "beets moved item 7 to /elsewhere/03.flac, which is not inside /music/alice",
+                ),
+            ),
+        ] {
+            let lib = Library::new().await;
+            let stub = StubImporter::new();
+            stub.script_relocate(Relocation {
+                now: vec![(7, now.clone())],
+                failure: Some(failure.clone()),
+            });
+            let target = lib.root.join("music/alice");
+            let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
+            let done = settle(&lib, &stub, &[], &target, result).await;
+            assert_eq!(
+                notes(&done),
+                vec![
+                    "replaced the library's earlier copy A/x.flac".to_string(),
+                    failure.message.clone(),
+                ]
+            );
+            assert_eq!(item_paths(&done), vec![now]);
+            assert_eq!(failure_of(&done), Some(failure));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_whose_path_beets_cannot_be_read_for_keeps_its_path_and_says_it_may_have_moved()
+    {
         let lib = Library::new().await;
         let stub = StubImporter::new();
-        stub.script_relocate(Err("beets exited with code 1".into()));
+        let unread = Failure::new(
+            shared::failure::FailureCode::ImportBeetsFailed,
+            shared::failure::Stage::Import,
+            shared::failure::RetryAdvice::SameSourceLater,
+            "beets may have moved the new copy, and Soulful could not read where item 7 is: beet export failed (exit status: 1): ",
+        );
+        stub.script_relocate(Relocation {
+            now: vec![],
+            failure: Some(unread.clone()),
+        });
         let target = lib.root.join("music/alice");
         let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
         let done = settle(&lib, &stub, &[], &target, result).await;
-        assert_eq!(
-            notes(&done),
-            vec![
-                "replaced the library's earlier copy A/x.flac".to_string(),
-                "Could not move the new copy into place: beets exited with code 1".to_string(),
-            ]
-        );
+        assert_eq!(notes(&done)[1], unread.message);
         assert_eq!(item_paths(&done), vec![new_copy(7, 3).1]);
+        assert_eq!(failure_of(&done), Some(unread));
     }
 
     #[test]
@@ -598,7 +680,10 @@ mod tests {
         let lib = Library::new().await;
         let stub = StubImporter::new();
         let target = lib.root.join("music/alice");
-        stub.script_relocate(Ok(vec![(7, "A/x.flac".into())]));
+        stub.script_relocate(Relocation {
+            now: vec![(7, "A/x.flac".into())],
+            failure: None,
+        });
         let result = imported_with(vec![
             removal("A/x.flac", vec![new_copy(7, 3)]),
             removal("A/x.flac", vec![new_copy(8, 4)]),

@@ -176,7 +176,8 @@ pub struct DownloadProgress {
     /// The server keeps this row's import job, so Retry import can resubmit it
     #[serde(default)]
     pub retryable: bool,
-    /// Why the row failed or was skipped, typed
+    /// Why the row failed or was skipped, typed; on an imported row, the step after the import
+    /// that failed, which its note also says
     #[serde(default)]
     pub failure: Option<Failure>,
     /// Which kind of skip an ImportSkipped row is

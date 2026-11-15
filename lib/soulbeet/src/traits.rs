@@ -4,7 +4,7 @@ use shared::{
     download::{
         DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult, SkipKind,
     },
-    failure::UserAction,
+    failure::{Failure, UserAction},
     library::DuplicateReport,
     metadata::{Album, AlbumWithTracks, Provider, SearchResult as MetadataSearchResult, Track},
     recommendation::{
@@ -116,6 +116,17 @@ pub struct WantedRemoval {
     pub imported: Vec<(u64, PathBuf)>,
 }
 
+/// What a relocate did with the items it was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relocation {
+    /// Each item the importer could be read for after the move, with the path its file has now:
+    /// relative to the library folder when inside it, else as the importer gives it.
+    pub now: Vec<(u64, PathBuf)>,
+    /// Why the move is not done: the importer failed to move the items, moved one out of the
+    /// library, or could not be read for one (whose id is then not in `now`).
+    pub failure: Option<Failure>,
+}
+
 /// One file beets imported, as it stored it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportedItem {
@@ -136,6 +147,9 @@ pub enum ImportOutcome {
         untagged: bool,
         warnings: Vec<String>,
         items: Vec<ImportedItem>,
+        /// The first step after the import that failed, as `warnings` also says (a new copy that
+        /// could not be moved into place), typed for the row.
+        failure: Option<Failure>,
     },
     Skipped(SkipReason),
     LookupFailed {
@@ -377,14 +391,9 @@ pub trait MusicImporter: Send + Sync {
         duplicates: DuplicateRun,
     ) -> ImportResult;
 
-    /// Moves the items with `item_ids` of the library of `library` to the paths beets gives
-    /// them, and returns each id with the path its file now has, relative to `library`; a move
-    /// out of `library` is an error.
-    async fn relocate(
-        &self,
-        library: &Path,
-        item_ids: &[u64],
-    ) -> std::result::Result<Vec<(u64, PathBuf)>, String>;
+    /// Moves the items with `item_ids` of the library of `library` to the paths the importer
+    /// gives them, then reads where each item's file is, also when the move failed.
+    async fn relocate(&self, library: &Path, item_ids: &[u64]) -> Relocation;
 
     /// The result of a job not run because of `issue`, the title of one of
     /// this importer's blocking health issues.
