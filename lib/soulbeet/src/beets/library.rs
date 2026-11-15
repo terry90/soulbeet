@@ -3,10 +3,11 @@
 use super::runner::{run_beet, RunEnd, RunLimits, RunSpec, Stream};
 use super::BeetsSettings;
 use crate::traits::ForgetOutcome;
+use serde::Deserialize;
 use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tracing::{info, warn};
 
 /// Starts every `beet ls` row, so text a plugin prints before it (a prompt
@@ -15,7 +16,14 @@ const ROW_MARKER: &str = "@@sb@@";
 const FIELD_SEP: &str = "|||";
 const LS_FORMAT: &str = "@@sb@@$path|||$artist|||$title|||$album|||$albumartist";
 const ID_FORMAT: &str = "@@sb@@$id";
-const ID_PATH_FORMAT: &str = "@@sb@@$id|||$path";
+
+/// One item as `beet export -l -f jsonlines -i id,path` prints it: beets' formatted values,
+/// so the id is text (beetsplug/export.py, beetsplug/info.py library_data_emitter).
+#[derive(Deserialize)]
+struct ExportedItem {
+    id: String,
+    path: PathBuf,
+}
 
 pub(crate) fn library_db(root: &Path) -> PathBuf {
     root.join(".beets_library.db")
@@ -53,7 +61,13 @@ pub(crate) async fn query_library(
         return Ok(Vec::new());
     }
     let library = library_db(root).to_string_lossy().into_owned();
-    let rows = run_library(s, root, vec!["ls".into(), "-f".into(), LS_FORMAT.into()]).await?;
+    let rows = run_library(
+        s,
+        root,
+        None,
+        vec!["ls".into(), "-f".into(), LS_FORMAT.into()],
+    )
+    .await?;
     Ok(rows
         .iter()
         .filter_map(|row| parse_row(row, &library))
@@ -71,7 +85,7 @@ pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> 
     let mut query = OsString::from("path:");
     query.push(file);
     let ls = vec!["ls".into(), "-f".into(), ID_FORMAT.into(), query];
-    let ids = match run_library(s, root, ls).await {
+    let ids = match run_library(s, root, None, ls).await {
         Ok(ids) => ids,
         Err(e) => return ForgetOutcome::Failed(e),
     };
@@ -89,15 +103,17 @@ pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> 
     };
     // Without remove's own -d, beets leaves the file alone; -f skips the prompt.
     let remove = vec!["remove".into(), "-f".into(), format!("id:{id}").into()];
-    match run_library(s, root, remove).await {
+    match run_library(s, root, None, remove).await {
         Ok(_) => ForgetOutcome::Removed,
         Err(e) => ForgetOutcome::Failed(e),
     }
 }
 
 /// Moves the items with `item_ids` of the library under `root` to the paths
-/// beets gives them, and returns each id with the absolute path its file has
-/// after the move.
+/// beets gives them, and returns each id with the path its file has after the
+/// move, relative to `root`. The paths are read from beets' own JSON export,
+/// so no character of a file name can be taken for a separator; a path
+/// outside `root` is refused.
 pub(crate) async fn move_items(
     s: &BeetsSettings,
     root: &Path,
@@ -117,23 +133,34 @@ pub(crate) async fn move_items(
     }
     let mut command: Vec<OsString> = vec!["move".into()];
     command.extend(query.iter().cloned());
-    run_library(s, root, command).await?;
+    run_library(s, root, None, command).await?;
 
-    let mut ls: Vec<OsString> = vec!["ls".into(), "-f".into(), ID_PATH_FORMAT.into()];
-    ls.extend(query);
+    let mut export: Vec<OsString> = ["export", "-l", "-f", "jsonlines", "-i", "id,path"]
+        .map(OsString::from)
+        .to_vec();
+    export.extend(query);
     let mut moved = Vec::new();
-    for row in run_library(s, root, ls).await? {
-        let parsed = row
-            .split_once(FIELD_SEP)
-            .and_then(|(id, path)| Some((id.parse::<u64>().ok()?, PathBuf::from(path))));
-        match parsed {
-            Some(item) => moved.push(item),
-            None => {
-                return Err(format!(
-                    "beet ls gave a row that is not an id and a path: {row}"
-                ))
-            }
-        }
+    for row in run_library(s, root, Some("export"), export).await? {
+        let item: ExportedItem = serde_json::from_str(&row).map_err(|e| {
+            format!("beet export gave a line that is not an item's id and path ({e}): {row}")
+        })?;
+        let id: u64 = item
+            .id
+            .parse()
+            .map_err(|_| format!("beet export gave an item id that is not a number: {row}"))?;
+        let inside = item
+            .path
+            .strip_prefix(root)
+            .ok()
+            .filter(|p| p.components().all(|c| matches!(c, Component::Normal(_))));
+        let Some(relative) = inside.filter(|p| p.components().next().is_some()) else {
+            return Err(format!(
+                "beets moved item {id} to {}, which is not inside {}",
+                item.path.display(),
+                root.display()
+            ));
+        };
+        moved.push((id, relative.to_path_buf()));
     }
     let mut listed: Vec<u64> = moved.iter().map(|(id, _)| *id).collect();
     let mut wanted = item_ids.to_vec();
@@ -142,18 +169,20 @@ pub(crate) async fn move_items(
     wanted.dedup();
     if listed != wanted {
         return Err(format!(
-            "beet ls listed items {listed:?} after moving items {wanted:?}"
+            "beet export listed items {listed:?} after moving items {wanted:?}"
         ));
     }
     Ok(moved)
 }
 
-/// Runs `beet {command}` on the library under `root` and returns the text
-/// after the row marker of each line that has one. Retried once when the
-/// library db is locked.
+/// Runs `beet {command}` on the library under `root` and returns its rows: the
+/// text after the row marker of each line that has one, or, with `plugin`,
+/// every line, as `beet -p {plugin}` loads that plugin alone and no other one
+/// can print to stdout. Retried once when the library db is locked.
 async fn run_library(
     s: &BeetsSettings,
     root: &Path,
+    plugin: Option<&str>,
     command: Vec<OsString>,
 ) -> Result<Vec<String>, String> {
     let subcommand = command[0].to_string_lossy().into_owned();
@@ -162,6 +191,11 @@ async fn run_library(
         let mut rows = Vec::new();
         let mut locked = false;
         let mut on_line = |stream: Stream, line: &str| match stream {
+            Stream::Stdout if plugin.is_some() => {
+                if !line.is_empty() {
+                    rows.push(line.to_string());
+                }
+            }
             Stream::Stdout => {
                 if let Some((_, row)) = line.rsplit_once(ROW_MARKER) {
                     rows.push(row.to_string());
@@ -179,6 +213,9 @@ async fn run_library(
             "-d".into(),
             root.into(),
         ];
+        if let Some(plugin) = plugin {
+            args.extend(["-p".into(), plugin.into()]);
+        }
         args.extend(command.iter().cloned());
         let spec = RunSpec {
             program: &s.beet,
@@ -315,19 +352,27 @@ mod tests {
         );
     }
 
+    /// A fake `beet` that logs each call and, for `beet export`, prints `lines`, each with
+    /// `$PWD` standing for the library folder.
+    async fn exporting(lines: &[&str]) -> (tempfile::TempDir, BeetsSettings) {
+        let printed: String = lines.iter().map(|l| format!("{l}\\n")).collect();
+        fake_library(&format!(
+            "{LOG}\ncase \"$*\" in *' export '*) printf '{printed}' | sed \"s|\\$PWD|$PWD|g\";; esac"
+        ))
+        .await
+    }
+
     #[tokio::test]
     async fn new_items_are_moved_by_id_in_one_call() {
-        let (dir, settings) = fake_library(&format!(
-            "{LOG}\ncase \"$*\" in *' ls '*) printf '@@sb@@7|||%s/A/B/03.flac\\n@@sb@@9|||%s/A/B/04.flac\\n' \"$PWD\" \"$PWD\";; esac"
-        ))
+        let (dir, settings) = exporting(&[
+            r#"{"id": "7","path": "$PWD/A/B/03.flac"}"#,
+            r#"{"id": "9","path": "$PWD/A/B/04.flac"}"#,
+        ])
         .await;
         let moved = move_items(&settings, dir.path(), &[7, 9]).await.unwrap();
         assert_eq!(
             moved,
-            vec![
-                (7, dir.path().join("A/B/03.flac")),
-                (9, dir.path().join("A/B/04.flac"))
-            ]
+            vec![(7, "A/B/03.flac".into()), (9, "A/B/04.flac".into())]
         );
         let calls = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
         let base = format!(
@@ -340,9 +385,46 @@ mod tests {
             calls.lines().collect::<Vec<_>>(),
             vec![
                 format!("{base} move id:7 , id:9"),
-                format!("{base} ls -f @@sb@@$id|||$path id:7 , id:9"),
+                format!("{base} -p export export -l -f jsonlines -i id,path id:7 , id:9"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_moved_path_is_read_whole_whatever_its_name_holds() {
+        // As beets 2.11's export prints a name with a newline and the old row separator.
+        let (dir, settings) =
+            exporting(&[r#"{"id": "7","path": "$PWD/A/B/0\\n3|||x.flac"}"#]).await;
+        assert_eq!(
+            move_items(&settings, dir.path(), &[7]).await.unwrap(),
+            vec![(7, "A/B/0\n3|||x.flac".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_move_beets_reports_outside_the_library_or_unreadably_is_a_failure() {
+        for (line, expected) in [
+            (
+                r#"{"id": "7","path": "/elsewhere/03.flac"}"#,
+                "beets moved item 7 to /elsewhere/03.flac, which is not inside ".to_string(),
+            ),
+            (
+                r#"{"id": "7","path": "$PWD/../03.flac"}"#,
+                "beets moved item 7 to ".to_string(),
+            ),
+            (
+                r#"{"id": "x7","path": "$PWD/A/03.flac"}"#,
+                "beet export gave an item id that is not a number: ".to_string(),
+            ),
+            (
+                "7|||$PWD/A/03.flac",
+                "beet export gave a line that is not an item's id and path".to_string(),
+            ),
+        ] {
+            let (dir, settings) = exporting(&[line]).await;
+            let e = move_items(&settings, dir.path(), &[7]).await.unwrap_err();
+            assert!(e.starts_with(&expected), "{line}: {e}");
+        }
     }
 
     #[tokio::test]
@@ -357,10 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_moved_item_beets_does_not_list_is_a_failure() {
-        let (dir, settings) = fake_library(&format!(
-            "{LOG}\ncase \"$*\" in *' ls '*) echo \"@@sb@@7|||$PWD/A/B/03.flac\";; esac"
-        ))
-        .await;
+        let (dir, settings) = exporting(&[r#"{"id": "7","path": "$PWD/A/B/03.flac"}"#]).await;
         assert!(move_items(&settings, dir.path(), &[7, 9]).await.is_err());
     }
 

@@ -378,7 +378,8 @@ pub trait MusicImporter: Send + Sync {
     ) -> ImportResult;
 
     /// Moves the items with `item_ids` of the library of `library` to the paths beets gives
-    /// them, and returns each id with the absolute path its file now has.
+    /// them, and returns each id with the path its file now has, relative to `library`; a move
+    /// out of `library` is an error.
     async fn relocate(
         &self,
         library: &Path,

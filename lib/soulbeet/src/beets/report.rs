@@ -59,7 +59,7 @@ enum RawDuplicate {
 #[derive(Debug, Deserialize)]
 struct RawItem {
     /// Where beets stored the file.
-    path: String,
+    path: PathBuf,
     recording_mbid: Option<String>,
     artist: String,
     title: String,
@@ -69,7 +69,7 @@ struct RawItem {
 impl RawItem {
     fn imported_item(self, target: &Path) -> ImportedItem {
         ImportedItem {
-            path: in_library(Path::new(&self.path), target),
+            path: in_library(&self.path, target),
             recording_mbid: self.recording_mbid,
             artist: self.artist,
             title: self.title,
