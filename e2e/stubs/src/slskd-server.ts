@@ -50,6 +50,20 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
             version: { full: '0.99.0-e2e' },
           }),
       },
+      {
+        // The part of slskd's options soulbeet reads: the download retry
+        // limit, slskd's default (Core/Options.cs:997).
+        method: 'GET',
+        pattern: '/api/v0/options',
+        handler: ({ res }) =>
+          sendJson(res, 200, {
+            transfers: {
+              download: {
+                retry: { attempts: 3, delay: 5000, maxDelay: 60000, partial: 'resume' },
+              },
+            },
+          }),
+      },
 
       // ---- searches -------------------------------------------------------
       {

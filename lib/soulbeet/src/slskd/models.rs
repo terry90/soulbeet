@@ -19,7 +19,9 @@ pub(crate) struct SearchResponse {
     pub files: Vec<SearchResponseFile>,
     pub has_free_upload_slot: bool,
     pub upload_speed: i32,
-    pub queue_length: i32,
+    /// A `long` (`Search/Types/Response.cs:45`): a peer may report more than
+    /// 32 bits hold, and one such peer would fail the whole response list.
+    pub queue_length: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

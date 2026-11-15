@@ -129,6 +129,8 @@ pub struct SoulseekClient {
     rate_limit_window: Duration,
     download_config: DownloadConfig,
     circuit_breaker: Arc<CircuitBreaker>,
+    /// slskd's download retry limit, read on the first listing.
+    retry_limit: tokio::sync::OnceCell<u32>,
 }
 
 #[derive(Default)]
@@ -205,6 +207,7 @@ impl SoulseekClientBuilder {
             rate_limit_window: Duration::seconds(self.rate_limit_window_seconds.unwrap_or(220)),
             download_config: self.download_config.unwrap_or_default(),
             circuit_breaker: Arc::new(CircuitBreaker::default()),
+            retry_limit: tokio::sync::OnceCell::new(),
         })
     }
 }
@@ -649,6 +652,20 @@ impl SoulseekClient {
         parse_batch_enqueue_response(&batch.username, &batch.files, &resp_text)
     }
 
+    /// How many attempts slskd makes at a download. Concurrent first callers
+    /// wait for one read; a failed read is tried again on the next call.
+    async fn retry_limit(&self) -> Result<u32> {
+        self.retry_limit
+            .get_or_try_init(|| async {
+                let options: serde_json::Value = self
+                    .make_request(Method::GET, "options", None::<()>)
+                    .await?;
+                retry_limit_from_options(&options)
+            })
+            .await
+            .copied()
+    }
+
     /// Every transfer slskd holds, across every peer.
     ///
     /// Unbounded on slskd's side, so this is reserved for the one case that
@@ -867,6 +884,21 @@ fn path_segment(value: &str) -> Result<String> {
         });
     }
     Ok(utf8_percent_encode(value, PATH_SEGMENT).to_string())
+}
+
+/// slskd's `transfers.download.retry.attempts` from its `GET options`
+/// answer (`Core/Options.cs:264,913,980,997`, camelCase per
+/// `Program.cs:977-982`), at least 1 (`[Range(1, int.MaxValue)]`, `:996`).
+fn retry_limit_from_options(options: &serde_json::Value) -> Result<u32> {
+    options["transfers"]["download"]["retry"]["attempts"]
+        .as_u64()
+        .and_then(|attempts| u32::try_from(attempts).ok())
+        .filter(|&attempts| attempts > 0)
+        .ok_or_else(|| {
+            SoulseekError::InvalidResponse(
+                "slskd options without transfers.download.retry.attempts".into(),
+            )
+        })
 }
 
 fn user_downloads_endpoint(username: &str) -> Result<String> {
@@ -1166,13 +1198,21 @@ impl crate::DownloadBackend for SoulseekClient {
         &self,
         sources: &[String],
     ) -> Result<Vec<shared::download::DownloadProgress>> {
+        let limit = self.retry_limit().await?;
         let entries = self.get_downloads_for_users(sources).await?;
-        Ok(entries.into_iter().map(Into::into).collect())
+        Ok(entries
+            .into_iter()
+            .map(|e| e.into_progress(limit))
+            .collect())
     }
 
     async fn get_downloads(&self) -> Result<Vec<shared::download::DownloadProgress>> {
+        let limit = self.retry_limit().await?;
         let entries = self.get_all_downloads().await?;
-        Ok(entries.into_iter().map(Into::into).collect())
+        Ok(entries
+            .into_iter()
+            .map(|e| e.into_progress(limit))
+            .collect())
     }
 
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()> {
@@ -1756,6 +1796,89 @@ mod tests {
         let score = |user: &str| albums.iter().find(|a| a.username == user).unwrap().score;
         assert!((score("carol_shares") - score("dave_shares") - 0.3 * 3.0 / 13.0).abs() < 1e-9);
         assert!(score("dave_shares") > 0.7);
+    }
+
+    #[test]
+    fn a_peer_with_a_huge_queue_length_does_not_break_the_search() {
+        let body = one_response()
+            .body
+            .replace(r#""queueLength":0"#, r#""queueLength":4294967295"#);
+        assert!(body.contains("4294967295"));
+        let responses: Vec<SearchResponse> = serde_json::from_str(&body).unwrap();
+        let albums = processing::process_search_responses(
+            &responses,
+            "Marrow Choir",
+            None,
+            &[WantedTrack {
+                title: "O Holy Night".into(),
+                duration_s: None,
+            }],
+        );
+        assert_eq!(albums[0].queue_length, 4_294_967_295);
+        assert_eq!(albums[0].tracks[0].base.queue_length, 4_294_967_295);
+    }
+
+    #[test]
+    fn slskds_retry_limit_comes_from_its_options() {
+        let options = serde_json::json!({"transfers": {"download": {"retry":
+            {"attempts": 5, "delay": 5000, "maxDelay": 60000, "partial": "resume"}}}});
+        assert_eq!(retry_limit_from_options(&options).unwrap(), 5);
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"transfers": {"download": {"retry": {"attempts": 0}}}}),
+        ] {
+            assert!(matches!(
+                retry_limit_from_options(&bad),
+                Err(SoulseekError::InvalidResponse(_))
+            ));
+        }
+    }
+
+    /// Through the trait, as the monitor and discovery call it. slskd answers an
+    /// empty 404 for a peer it holds no transfer from (`TransfersController.cs:530-533`).
+    #[tokio::test]
+    async fn the_retry_limit_is_read_once_per_client() {
+        let options = r#"{"transfers":{"download":{"retry":{"attempts":3}}}}"#;
+        let none = || Reply {
+            status: 404,
+            body: String::new(),
+        };
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: options.into(),
+            },
+            none(),
+            none(),
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        let sources = ["carol_shares".to_string()];
+        assert!(crate::DownloadBackend::get_downloads_for(&client, &sources)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(crate::DownloadBackend::get_downloads_for(&client, &sources)
+            .await
+            .unwrap()
+            .is_empty());
+        let targets: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.target.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                "/api/v0/options",
+                "/api/v0/transfers/downloads/carol_shares",
+                "/api/v0/transfers/downloads/carol_shares"
+            ]
+        );
     }
 
     fn empty() -> Reply {
