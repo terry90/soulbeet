@@ -144,24 +144,27 @@ class Beets:
         args = self.beet_args(*sources, singleton=singleton)
         return self._run([sys.executable, "-P", "-m", "beets", *args], env)
 
-    def library(self):
-        """(title, artist, album, mb_trackid, path relative to music) per item."""
-        out = subprocess.run(
+    def ls(self, fmt, *query):
+        """The lines `beet ls -f fmt query...` prints for the library."""
+        return subprocess.run(
             [
                 sys.executable, "-P", "-m", "beets",
                 "-c", str(self.config),
                 "-l", str(self.music / ".beets_library.db"),
                 "-d", str(self.music),
-                "ls", "-f", "$title\t$artist\t$album\t$mb_trackid\t$path",
+                "ls", "-f", fmt, *query,
             ],
             capture_output=True,
             text=True,
             env=self._env(),
             cwd=self.root,
             check=True,
-        ).stdout
+        ).stdout.splitlines()
+
+    def library(self):
+        """(title, artist, album, mb_trackid, path relative to music) per item."""
         rows = []
-        for line in out.splitlines():
+        for line in self.ls("$title\t$artist\t$album\t$mb_trackid\t$path"):
             title, artist, album, trackid, path = line.split("\t")
             relative = str(Path(path).relative_to(self.music))
             rows.append((title, artist, album, trackid, relative))

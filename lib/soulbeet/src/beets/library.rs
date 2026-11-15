@@ -33,17 +33,25 @@ fn parse_row(row: &str, library: &str) -> Option<LibraryTrack> {
     })
 }
 
+/// Whether the folder `root` has a library db. A folder that cannot be read
+/// is an error, not a folder without one.
+async fn has_library(root: &Path) -> Result<bool, String> {
+    let db = library_db(root);
+    tokio::fs::try_exists(&db)
+        .await
+        .map_err(|e| format!("Could not read {}: {e}", db.display()))
+}
+
 /// Every track in the library under `root`. A folder without a library db has
 /// no tracks.
 pub(crate) async fn query_library(
     s: &BeetsSettings,
     root: &Path,
 ) -> Result<Vec<LibraryTrack>, String> {
-    let db = library_db(root);
-    if !tokio::fs::try_exists(&db).await.unwrap_or(false) {
+    if !has_library(root).await? {
         return Ok(Vec::new());
     }
-    let library = db.to_string_lossy().into_owned();
+    let library = library_db(root).to_string_lossy().into_owned();
     let rows = run_library(s, root, vec!["ls".into(), "-f".into(), LS_FORMAT.into()]).await?;
     Ok(rows
         .iter()
@@ -54,11 +62,10 @@ pub(crate) async fn query_library(
 /// Drops the item at exactly `file` from the library under `root`, leaving
 /// the file on disk.
 pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> ForgetOutcome {
-    if !tokio::fs::try_exists(library_db(root))
-        .await
-        .unwrap_or(false)
-    {
-        return ForgetOutcome::NotInLibrary;
+    match has_library(root).await {
+        Ok(true) => {}
+        Ok(false) => return ForgetOutcome::NotInLibrary,
+        Err(e) => return ForgetOutcome::Failed(e),
     }
     let mut query = OsString::from("path:");
     query.push(file);
@@ -297,5 +304,29 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_library_folder_that_cannot_be_read_is_a_failure() {
+        // A file where the folder should be: looking for the db inside it
+        // fails with "Not a directory", which says nothing about the library.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("music");
+        std::fs::write(&root, b"").unwrap();
+        let settings = BeetsSettings {
+            config: dir.path().join("config.yaml"),
+            beet: dir.path().join("beet"),
+            python: None,
+            limits: RunLimits::default(),
+        };
+        let expected = format!("Could not read {}: ", library_db(&root).display());
+        assert!(matches!(
+            forget_item(&settings, &root, &root.join("a.flac")).await,
+            ForgetOutcome::Failed(e) if e.starts_with(&expected)
+        ));
+        assert!(matches!(
+            query_library(&settings, &root).await,
+            Err(e) if e.starts_with(&expected)
+        ));
     }
 }

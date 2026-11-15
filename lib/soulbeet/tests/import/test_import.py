@@ -1,7 +1,5 @@
 import ast
 import os
-import subprocess
-import sys
 import zipfile
 from pathlib import Path
 
@@ -158,21 +156,8 @@ def test_a_path_query_finds_the_one_file_at_that_path(beets_env):
     first = beets_env.music / beets_env.library()[0][4]
 
     def ids(path):
-        out = subprocess.run(
-            [
-                sys.executable, "-P", "-m", "beets",
-                "-c", str(beets_env.config),
-                "-l", str(beets_env.music / ".beets_library.db"),
-                "-d", str(beets_env.music),
-                "ls", "-f", "@@sb@@$id", f"path:{path}",
-            ],
-            capture_output=True,
-            text=True,
-            env=beets_env._env(),
-            cwd=beets_env.root,
-            check=True,
-        ).stdout
-        return [line for line in out.splitlines() if line.startswith("@@sb@@")]
+        rows = beets_env.ls("@@sb@@$id", f"path:{path}")
+        return [row for row in rows if row.startswith("@@sb@@")]
 
     assert len(ids(first)) == 1
     assert len(ids(first.parent)) == 2
@@ -181,29 +166,42 @@ def test_a_path_query_finds_the_one_file_at_that_path(beets_env):
 REPORTED_STATUS = {"duplicate-replace": "replaced", "duplicate-keep": "kept"}
 
 
-# How many times merge logs duplicate-keep depends on beets: 2.11 logs it twice
-# and ends in a skip (fixture dup_merge/runlog.txt), 2.8 finds no duplicate of
-# the merged task and imports it after one.
-@pytest.mark.parametrize(
-    "action,reported", [("skip", set()), ("keep", {"kept"}), ("merge", {"kept"})]
-)
-def test_a_duplicate_decision_is_reported_as_beets_logged_it(
-    beets_env, action, reported
-):
+def import_twice(beets_env, duplicate_action):
+    """The second import of one album under `duplicate_action`."""
     cfg = yaml.safe_load(beets_env.config.read_text())
-    cfg["import"]["duplicate_action"] = action
+    cfg["import"]["duplicate_action"] = duplicate_action
     beets_env.config.write_text(yaml.safe_dump(cfg))
     beets_env.album(beets_env.src)
     beets_env.driver("auto", env={"FAKESRC_MODE": "strong"})
     beets_env.album(beets_env.src)
-    run = beets_env.driver("auto", env={"FAKESRC_MODE": "strong"})
+    return beets_env.driver("auto", env={"FAKESRC_MODE": "strong"})
 
-    actions = [d["action"] for d in run.report["duplicates"]]
+
+@pytest.mark.parametrize(
+    "action,statuses,reported",
+    [("skip", ["duplicate-skip"], []), ("keep", ["duplicate-keep"], ["kept"])],
+)
+def test_a_duplicate_decision_is_reported_as_beets_logged_it(
+    beets_env, action, statuses, reported
+):
+    run = import_twice(beets_env, action)
+
+    assert [line.split(" ", 1)[0] for line in run.runlog_lines] == statuses, run
+    assert [d["action"] for d in run.report["duplicates"]] == reported, run
+
+
+# How many times merge logs duplicate-keep depends on beets: 2.11 logs it twice
+# and ends in a skip (fixture dup_merge/runlog.txt), 2.8 finds no duplicate of
+# the merged task and imports it after one.
+def test_a_merge_is_reported_as_the_keep_beets_logs(beets_env):
+    run = import_twice(beets_env, "merge")
+
     statuses = [line.split(" ", 1)[0] for line in run.runlog_lines]
-    # merge logs its decision as keep.
-    assert statuses[0] == ("duplicate-skip" if action == "skip" else "duplicate-keep")
+    assert statuses, run
+    assert statuses[0] == "duplicate-keep", run
+    actions = [d["action"] for d in run.report["duplicates"]]
     assert actions == [REPORTED_STATUS[s] for s in statuses if s in REPORTED_STATUS]
-    assert set(actions) == reported, run
+    assert set(actions) == {"kept"}, run
 
 
 def test_pick_applies_a_weak_track_and_tags_it(beets_env):

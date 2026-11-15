@@ -61,7 +61,8 @@ impl Refusal {
         Self::new(FILES_GONE, KeptImport::Gone)
     }
 
-    /// The job is kept, but no automatic run of it left matches to pick from.
+    /// A listed match was picked, but no automatic run of the kept job left
+    /// matches to pick from. The job stays kept for as-is and MusicBrainz.
     pub(super) fn no_choices() -> Self {
         Self::new(NO_CHOICES, KeptImport::Kept)
     }
