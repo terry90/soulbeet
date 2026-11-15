@@ -39,7 +39,7 @@ pub async fn build_profile(provider: &dyn ScrobbleProvider) -> Result<UserMusicP
                     *artist_counts.entry(l.artist.clone()).or_default() += 1;
                 }
                 let mut artists: Vec<_> = artist_counts.into_iter().collect();
-                artists.sort_by(|a, b| b.1.cmp(&a.1));
+                artists.sort_by_key(|a| std::cmp::Reverse(a.1));
                 top_artists_alltime = artists
                     .into_iter()
                     .map(|(name, play_count)| shared::recommendation::RankedArtist {
@@ -61,7 +61,7 @@ pub async fn build_profile(provider: &dyn ScrobbleProvider) -> Result<UserMusicP
                         .or_default() += 1;
                 }
                 let mut tracks: Vec<_> = track_counts.into_iter().collect();
-                tracks.sort_by(|a, b| b.1.cmp(&a.1));
+                tracks.sort_by_key(|a| std::cmp::Reverse(a.1));
                 top_tracks_alltime = tracks
                     .into_iter()
                     .map(
@@ -296,7 +296,7 @@ async fn build_momentum_artists(
             }
         }
         let mut sorted: Vec<_> = counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
         recent_artists = sorted
             .into_iter()
             .take(50)

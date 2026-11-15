@@ -438,7 +438,7 @@ pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
     };
 
     let mut genre_vec: Vec<(String, u32)> = genres.into_iter().collect();
-    genre_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    genre_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
     genre_vec.truncate(20);
 
     Ok(LibraryStats {
