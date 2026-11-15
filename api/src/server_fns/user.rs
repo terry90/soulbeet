@@ -65,16 +65,21 @@ pub(crate) fn may_set_password(actor: &UserCtx, target_user_id: &str) -> bool {
     actor.user_id == target_user_id || actor.role.is_admin()
 }
 
+/// Refusals a person can act on are shown; database failures are not.
+#[cfg(feature = "server")]
+fn user_change_error(e: models::user::UserChangeError) -> ServerFnError {
+    use models::user::UserChangeError;
+    match e {
+        UserChangeError::NotFound | UserChangeError::LastAdmin => refusal_error(e),
+        UserChangeError::Db(_) => server_error(e),
+    }
+}
+
 #[post("/api/users/role", _: AdminSession)]
 pub async fn set_user_role(user_id: String, role: Role) -> Result<(), ServerFnError> {
-    use models::user::UserChangeError;
-
     models::user::User::set_role(&user_id, role)
         .await
-        .map_err(|e| match e {
-            UserChangeError::Db(_) => server_error(e),
-            _ => refusal_error(e),
-        })
+        .map_err(user_change_error)
 }
 
 #[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap)]
@@ -102,14 +107,9 @@ pub async fn update_user_password(user_id: String, password: String) -> Result<(
 
 #[delete("/api/users/delete", _: AdminSession)]
 pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
-    use models::user::UserChangeError;
-
     models::user::User::delete(&user_id)
         .await
-        .map_err(|e| match e {
-            UserChangeError::Db(_) => server_error(e),
-            _ => refusal_error(e),
-        })?;
+        .map_err(user_change_error)?;
     evict_navidrome_client(&user_id).await;
     Ok(())
 }
