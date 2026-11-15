@@ -464,6 +464,27 @@ async fn stored_search(db: &SqlitePool, id: &str, user: &UserId) -> Option<Store
     })
 }
 
+/// The jobs some of whose slots' stored state cannot be read.
+fn partly_unreadable(slots: &[(JobSlot, sqlx::Error)]) -> HashSet<String> {
+    slots.iter().map(|(slot, _)| slot.job.clone()).collect()
+}
+
+/// Why `job` ends without resuming when it is queued with no slot to resume: the stored state
+/// of its files cannot be read (it is one of `partly_unreadable`), or it stopped before it had
+/// files. None for any other job.
+fn queued_without_files(
+    job: &UnfinishedJob,
+    partly_unreadable: &HashSet<String>,
+) -> Option<&'static str> {
+    if job.state != JobState::Queued || !job.slots.is_empty() {
+        return None;
+    }
+    Some(match partly_unreadable.contains(&job.id) {
+        true => "the stored state of its files cannot be read",
+        false => "it stopped before it had files to download",
+    })
+}
+
 /// Ends `job` failed: Soulful stopped where nothing can pick it up again.
 fn end_interrupted(ledger: &Ledger, job: &str, why: &str) {
     warn!("Ending job {job}, which cannot resume: {why}");
@@ -563,10 +584,7 @@ pub(crate) async fn resume_unfinished(
             &format!("its stored state cannot be read: {e}"),
         );
     }
-    let partly_unreadable: HashSet<String> = unreadable_slots
-        .iter()
-        .map(|(slot, _)| slot.job.clone())
-        .collect();
+    let partly_unreadable = partly_unreadable(&unreadable_slots);
     if !unreadable_slots.is_empty() {
         for (slot, e) in &unreadable_slots {
             warn!("Ending {slot:?}, whose stored state cannot be read: {e}");
@@ -598,12 +616,7 @@ pub(crate) async fn resume_unfinished(
             }
             continue;
         }
-        if job.state == JobState::Queued && job.slots.is_empty() {
-            let why = if partly_unreadable.contains(&job.id) {
-                "the stored state of its files cannot be read"
-            } else {
-                "it stopped before it had files to download"
-            };
+        if let Some(why) = queued_without_files(&job, &partly_unreadable) {
             end_interrupted(ledger, &job.id, why);
             continue;
         }
@@ -2158,44 +2171,8 @@ mod tests {
         );
     }
 
-    /// Keeps the message of every event logged while it is this thread's subscriber.
-    struct Logged(Arc<Mutex<Vec<String>>>);
-
-    impl tracing::Subscriber for Logged {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Message<'a>(&'a mut String);
-            impl tracing::field::Visit for Message<'_> {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        *self.0 = format!("{value:?}");
-                    }
-                }
-            }
-            let mut message = String::new();
-            event.record(&mut Message(&mut message));
-            self.0.lock().unwrap().push(message);
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
     #[tokio::test]
     async fn a_queued_job_whose_files_cannot_be_read_ends_saying_so() {
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        // A current-thread runtime: everything the test runs logs here.
-        let _logging = tracing::subscriber::set_default(Logged(lines.clone()));
         let (ledger, db) = ledger().await;
         let tmp = tempfile::tempdir().unwrap();
         let started = Started::on(StubBackend::new(vec![]));
@@ -2213,27 +2190,31 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
-        // A callsite another test registered while this subscriber was being set may have
-        // cached that nothing listens: ask every callsite again.
-        tracing::callsite::rebuild_interest_cache();
 
-        reconcile_in(&db, &ledger, &queue(), &started, tmp.path()).await;
+        // j2 stopped before it had files at all.
+        job_of(&ledger, &db, "j2", JobState::Queued, None, vec![]).await;
         ledger.settled().await;
 
-        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
-        let ended: Vec<String> = lines
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|line| line.starts_with("Ending job j1"))
-            .cloned()
-            .collect();
+        // Each job is read with no slot left to resume, and ends for its own reason.
+        let unfinished = read_unfinished(&db).await.unwrap();
+        let partly = partly_unreadable(&unfinished.unreadable_slots);
+        let why = |id: &str| {
+            let job = unfinished.jobs.iter().find(|job| job.id == id).unwrap();
+            queued_without_files(job, &partly)
+        };
         assert_eq!(
-            ended,
-            vec![
-                "Ending job j1, which cannot resume: the stored state of its files cannot be read"
-            ]
+            (why("j1"), why("j2")),
+            (
+                Some("the stored state of its files cannot be read"),
+                Some("it stopped before it had files to download")
+            )
         );
+        resume_unfinished(&db, &ledger, &queue(), &started, tmp.path(), unfinished).await;
+        ledger.settled().await;
+
+        for job in ["j1", "j2"] {
+            assert_eq!(store::job_state(&db, job).await, Some(JobState::Failed));
+        }
         assert!(started.nothing());
     }
 
