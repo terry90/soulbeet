@@ -16,6 +16,7 @@ use serde_json::json;
 
 use crate::base_url::{explain_request, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
+use crate::mcp::status::{LiveStatus, StatusSource};
 use crate::oauth::cimd::{CimdFetcher, ClientDocuments, UnbuiltFetcher};
 use crate::oauth::limits::Limits;
 use crate::security::GateReason;
@@ -34,6 +35,8 @@ pub struct ConnectionState {
     pub(crate) key: &'static crate::secret_key::SecretKey,
     /// Where apps' client metadata documents are fetched from.
     pub(crate) documents: Arc<dyn ClientDocuments>,
+    /// Where `get_status` reads its facts.
+    pub(crate) status: Arc<dyn StatusSource>,
 }
 
 impl ConnectionState {
@@ -53,6 +56,7 @@ impl ConnectionState {
                     Arc::new(UnbuiltFetcher(e))
                 }
             },
+            status: Arc::new(LiveStatus),
         }
     }
 }

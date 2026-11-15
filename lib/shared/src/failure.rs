@@ -53,6 +53,11 @@ impl Failure {
         self.message = message.into();
         self
     }
+
+    pub fn with_retry_after(mut self, seconds: u32) -> Self {
+        self.retry_after_seconds = Some(seconds);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,5 +538,17 @@ mod tests {
         let one_over = raw_of(format!("{}x", "é".repeat(RAW_MAX_CHARS)));
         assert!(one_over.chars().count() <= RAW_MAX_CHARS);
         assert!(one_over.ends_with("éx") && one_over.contains(" characters left out]"));
+    }
+
+    #[test]
+    fn retry_after_is_kept() {
+        let f = Failure::new(
+            FailureCode::RateLimited,
+            Stage::Input,
+            RetryAdvice::SameSourceLater,
+            "x",
+        )
+        .with_retry_after(7);
+        assert_eq!(f.retry_after_seconds, Some(7));
     }
 }

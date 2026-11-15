@@ -69,6 +69,20 @@ pub fn keeps_song_averages(server_version: &str) -> bool {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UserBody {
+    pub user: SubsonicUser,
+}
+
+/// The signed-in user's own record (server/subsonic/responses/responses.go
+/// `User`); Navidrome answers no other user's (server/subsonic/users.go
+/// `GetUser`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubsonicUser {
+    pub admin_role: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ScanStatusBody {
     #[serde(rename = "scanStatus")]
     pub scan_status: ScanStatus,

@@ -215,6 +215,12 @@ impl NavidromeClient {
         Ok(body.scan_status)
     }
 
+    /// getUser of the user this client signs in as.
+    pub async fn get_own_user(&self) -> Result<SubsonicUser> {
+        let body: UserBody = self.get("getUser", &[("username", &self.username)]).await?;
+        Ok(body.user)
+    }
+
     /// getSong, as this user sees the song; Ok(None) on DATA_NOT_FOUND.
     pub async fn get_song(&self, id: &str) -> Result<Option<SubsonicSong>> {
         let Some(body) = found(self.get::<SongBody>("getSong", &[("id", id)]).await)? else {
@@ -778,6 +784,26 @@ mod tests {
             "2026-11-14T21:03:11.519322+00:00"
         );
         assert_eq!(status.error, "");
+    }
+
+    // server/subsonic/users.go:16-33, responses/responses.go:363-380
+    const USER: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"user":{"username":"alice","scrobblingEnabled":true,"adminRole":false,"settingsRole":false,"downloadRole":true,"uploadRole":false,"playlistRole":false,"coverArtRole":false,"commentRole":false,"podcastRole":false,"streamRole":true,"jukeboxRole":false,"shareRole":false,"videoConversionRole":false,"folder":[1]}}}"#;
+
+    #[tokio::test]
+    async fn the_own_user_says_whether_it_is_an_admin() {
+        let (url, seen) = serve(vec![Reply {
+            status: 200,
+            body: USER.into(),
+        }]);
+        let user = client(&url).get_own_user().await.unwrap();
+        assert!(!user.admin_role);
+        let sent = seen.lock().unwrap()[0].clone();
+        // client(&url) signs in as alice
+        assert!(
+            sent.target.starts_with("/rest/getUser?") && sent.target.contains("username=alice"),
+            "{}",
+            sent.target
+        );
     }
 
     #[tokio::test]

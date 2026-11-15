@@ -69,6 +69,9 @@ impl From<String> for NavidromeStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SystemHealth {
     pub downloader_online: bool,
+    /// Why the download backend could not be looked up, when it could not.
+    #[serde(default)]
+    pub downloader_failure: Option<Failure>,
     #[serde(default)]
     pub importer: ImporterHealth,
     pub navidrome_online: bool,

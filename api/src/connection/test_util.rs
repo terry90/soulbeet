@@ -13,8 +13,18 @@ use sqlx::SqlitePool;
 use tower::ServiceExt;
 use url::Url;
 
+use rmcp::model::CallToolResult;
+use shared::failure::Failure;
+use shared::system::{HealthIssue, HealthLevel, ImporterHealth, SystemHealth};
+use soulbeet::navidrome::ScanStatus;
+
 use super::{router, ConnectionState};
+use crate::auth::{Role, UserCtx};
+use crate::base_url::BaseUrl;
 use crate::db::test_db;
+use crate::mcp::status::{FolderFacts, NavidromeFacts, StatusFacts, StatusSource};
+use crate::mcp::McpCaller;
+use crate::models::folder::Folder;
 use crate::oauth::cimd::{
     client_id_url, parse_document, CimdError, ClientDocument, ClientDocuments,
 };
@@ -25,10 +35,11 @@ use crate::oauth::limits::Limits;
 use crate::oauth::now_unix;
 use crate::oauth::secrets::new_secret;
 use crate::secret_key::SecretKey;
+use crate::transfer_registry::RunningBatch;
 
 impl ConnectionState {
     /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits,
-    /// `test_key()`, and no client metadata documents.
+    /// `test_key()`, no client metadata documents, and `sample_facts()`.
     pub(crate) fn for_test(db: SqlitePool) -> ConnectionState {
         ConnectionState {
             mcp_enabled: true,
@@ -38,6 +49,7 @@ impl ConnectionState {
             limits: Arc::new(Limits::default()),
             key: test_key(),
             documents: FixedDocuments::new(vec![]),
+            status: Arc::new(FixedStatus(Ok(sample_facts()))),
         }
     }
 }
@@ -383,4 +395,89 @@ pub(crate) async fn count(db: &SqlitePool, table: &str) -> i64 {
         .fetch_one(db)
         .await
         .unwrap()
+}
+
+/// The text of a tool result's first block.
+pub(crate) fn text_of(r: &CallToolResult) -> &str {
+    r.content[0]
+        .as_text()
+        .expect("a tool result's first block is text")
+        .text
+        .as_str()
+}
+
+/// Answers a clone of its value for every user.
+pub(crate) struct FixedStatus(pub Result<StatusFacts, Failure>);
+
+#[async_trait]
+impl StatusSource for FixedStatus {
+    async fn gather(&self, _ctx: &UserCtx) -> Result<StatusFacts, Failure> {
+        self.0.clone()
+    }
+}
+
+/// A status where everything answers: slskd online, beets degraded by Soulful's
+/// own probe issue, alice not a Navidrome admin, one default folder, one
+/// running batch.
+pub(crate) fn sample_facts() -> StatusFacts {
+    StatusFacts {
+        health: SystemHealth {
+            downloader_online: true,
+            downloader_failure: None,
+            // Soulful's own beets probe issue, lib/soulbeet/src/beets/probe.rs:121-125
+            importer: ImporterHealth {
+                level: HealthLevel::Degraded,
+                facts: vec![],
+                issues: vec![HealthIssue {
+                    severity: HealthLevel::Degraded,
+                    title: "beets config check timed out".into(),
+                    detail: "A plugin may be waiting on the network or for input.".into(),
+                }],
+            },
+            navidrome_online: true,
+            navidrome_failure: None,
+        },
+        navidrome: Some(NavidromeFacts {
+            admin: Ok(false),
+            scan: Ok(ScanStatus {
+                scanning: false,
+                count: 1342,
+                // the lastScan of Navidrome's answer in the client tests
+                // (lib/soulbeet/src/navidrome/client.rs SCAN_STATUS)
+                last_scan: "2026-11-14T21:03:11.519322Z".parse().unwrap(),
+                error: String::new(),
+                elapsed_time: 0,
+            }),
+        }),
+        folders: vec![FolderFacts {
+            folder: Folder {
+                id: "f1".into(),
+                user_id: "u1".into(),
+                name: "Music".into(),
+                path: "/music/alice".into(),
+                shared: false,
+            },
+            free: Ok(1000),
+        }],
+        default_folder_id: Some("f1".into()),
+        running_batches: vec![RunningBatch {
+            batch_id: "b1".into(),
+            label: "Come Over".into(),
+            transfers: 2,
+        }],
+    }
+}
+
+/// alice (u1, a plain user) calling through grant g1 at `HOST`.
+pub(crate) fn alice_caller(allow_delete: bool) -> McpCaller {
+    McpCaller {
+        ctx: UserCtx {
+            user_id: "u1".into(),
+            username: "alice".into(),
+            role: Role::User,
+        },
+        grant_id: "g1".into(),
+        allow_delete,
+        base: BaseUrl::parse("https://music.example.com").unwrap(),
+    }
 }

@@ -8,6 +8,8 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use super::secrets::{hash, new_secret, s256, successor, valid_verifier};
 use super::OFFLINE_ACCESS;
+use crate::auth::UserCtx;
+use crate::models::user::User;
 use crate::secret_key::SecretKey;
 
 /// How long an access token is accepted, in seconds (D4).
@@ -274,22 +276,27 @@ pub(crate) async fn refresh_in(
 /// marks it again, in seconds.
 const MARK_USED_EVERY: i64 = 60;
 
-/// What a live access token gives access to.
+/// What a live access token gives access to, and who it acts for.
 pub(crate) struct Access {
+    pub grant_id: String,
     pub resource: String,
+    pub allow_delete: bool,
+    /// The user as their row stands now.
+    pub ctx: UserCtx,
 }
 
-/// The grant behind a live access token; marks the grant used
-/// (`last_used_at = now`) when it was last marked more than 60 s ago, so
-/// most calls only read. None for anything else.
+/// The grant behind a live access token, with its user's current row;
+/// marks the grant used (`last_used_at = now`) when it was last marked more
+/// than 60 s ago, so most calls only read. None for anything else, a token
+/// whose user row is gone included.
 pub(crate) async fn access_in(
     db: &SqlitePool,
     token: &str,
     now: i64,
 ) -> Result<Option<Access>, String> {
     let database = |e: sqlx::Error| e.to_string();
-    let row: Option<(String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT g.id, g.resource, g.last_used_at \
+    let row: Option<(String, String, bool, String, Option<i64>)> = sqlx::query_as(
+        "SELECT g.id, g.resource, g.allow_delete, g.user_id, g.last_used_at \
          FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id \
          WHERE t.token_hash = ? AND t.kind = 'access' AND t.expires_at > ?",
     )
@@ -298,7 +305,10 @@ pub(crate) async fn access_in(
     .fetch_optional(db)
     .await
     .map_err(database)?;
-    let Some((grant_id, resource, last_used_at)) = row else {
+    let Some((grant_id, resource, allow_delete, user_id, last_used_at)) = row else {
+        return Ok(None);
+    };
+    let Some(user) = User::find_by_id_in(db, &user_id).await? else {
         return Ok(None);
     };
     if last_used_at.is_none_or(|at| now - at > MARK_USED_EVERY) {
@@ -315,7 +325,16 @@ pub(crate) async fn access_in(
         .await
         .map_err(database)?;
     }
-    Ok(Some(Access { resource }))
+    Ok(Some(Access {
+        grant_id,
+        resource,
+        allow_delete,
+        ctx: UserCtx {
+            user_id: user.id,
+            username: user.username,
+            role: user.role,
+        },
+    }))
 }
 
 /// Whether `code` was issued to `client_id`, redeemed or not. A plain read
@@ -475,6 +494,7 @@ mod tests {
     use sqlx::SqlitePool;
 
     use super::*;
+    use crate::auth::Role;
     use crate::connection::test_util::*;
     use crate::db::test_db;
     use crate::oauth::clients::find_in;
@@ -569,6 +589,44 @@ mod tests {
         assert_eq!(grant_last_used(&db).await, Some(T + 62));
         assert!(access_in(&db, &access, T + 3600).await.unwrap().is_none());
         assert!(access_in(&db, "made-up", T + 2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_access_token_carries_its_grant_switch_and_its_users_current_row() {
+        let (db, code) = issue("soulful").await;
+        let token = redeem_code_in(&db, &good(&code), T)
+            .await
+            .unwrap()
+            .access_token;
+        sqlx::query("UPDATE users SET role = 'admin', username = 'alice2' WHERE id = 'u1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        let access = access_in(&db, &token, T + 1).await.unwrap().unwrap();
+        let grant: String = sqlx::query_scalar("SELECT id FROM oauth_grants")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                access.grant_id,
+                access.allow_delete,
+                access.resource.as_str()
+            ),
+            (grant, true, RESOURCE)
+        );
+        assert_eq!(
+            access.ctx,
+            UserCtx {
+                user_id: "u1".into(),
+                username: "alice2".into(),
+                role: Role::Admin
+            }
+        );
     }
 
     async fn grant_last_used(db: &SqlitePool) -> Option<i64> {

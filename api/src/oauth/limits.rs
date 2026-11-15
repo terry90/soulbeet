@@ -38,6 +38,11 @@ impl WindowLimiter {
         }
     }
 
+    /// The hits a window admits.
+    pub(crate) fn limit(&self) -> u32 {
+        self.limit
+    }
+
     /// Counts one hit for `key` in the current fixed window; Err is the time
     /// left in it.
     pub(crate) fn admit(&self, key: &str, now: Instant) -> Result<(), Duration> {
@@ -77,6 +82,8 @@ pub(crate) struct Limits {
     pub(crate) token_client: WindowLimiter,
     /// Refreshes, per grant id.
     pub(crate) token_grant: WindowLimiter,
+    /// MCP tool calls, per grant id.
+    pub(crate) tool_calls: WindowLimiter,
 }
 
 impl Default for Limits {
@@ -86,6 +93,7 @@ impl Default for Limits {
             cimd_fetch: WindowLimiter::new(10, Duration::from_secs(60)),
             token_client: WindowLimiter::new(30, Duration::from_secs(60)),
             token_grant: WindowLimiter::new(10, Duration::from_secs(60)),
+            tool_calls: WindowLimiter::new(120, Duration::from_secs(60)),
         }
     }
 }

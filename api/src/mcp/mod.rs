@@ -11,13 +11,16 @@ use axum::middleware::{from_fn_with_state, Next};
 use axum::response::Response;
 use axum::{Extension, Router};
 
+use crate::auth::UserCtx;
 use crate::base_url::BaseUrl;
 use crate::connection::{refusal, ConnectionState, RequestBase};
 use crate::oauth::grants::access_in;
 use crate::oauth::metadata::{mcp_url, resource_metadata_url};
 use crate::oauth::{now_unix, oauth_error, SCOPE};
 
+pub(crate) mod contract;
 pub(crate) mod server;
+pub(crate) mod status;
 
 const NO_TOKEN: &str = "No access token was sent";
 const UNKNOWN_TOKEN: &str = "The access token is unknown, expired or revoked";
@@ -28,8 +31,18 @@ const OTHER_ADDRESS: &str = "The access token was issued for another address of 
 /// A route layer, so the router this merges into keeps its own fallback.
 pub(crate) fn routes(state: Arc<ConnectionState>) -> Router<Arc<ConnectionState>> {
     Router::new()
-        .route_service("/mcp", server::service())
+        .route_service("/mcp", server::service(state.clone()))
         .route_layer(from_fn_with_state(state, gatekeeper))
+}
+
+/// Who a tool call acts for: the token's user as their row stands, its
+/// grant and deletion switch, and the address the call came to.
+#[derive(Clone, Debug)]
+pub(crate) struct McpCaller {
+    pub ctx: UserCtx,
+    pub grant_id: String,
+    pub allow_delete: bool,
+    pub base: BaseUrl,
 }
 
 /// An `Origin` a page that DNS rebinding points at this server cannot send:
@@ -53,17 +66,20 @@ pub(crate) fn challenge(base: &BaseUrl, description: &str) -> HeaderValue {
 }
 
 /// Refuses a request from a refused `Origin`, then one without a live token
-/// issued for this address; passes the rest to the MCP service. Every answer
-/// depends on `Origin`, so it says so in `Vary`.
+/// issued for this address; passes the rest to the MCP service with its
+/// `McpCaller`. Every answer depends on `Origin`, so it says so in `Vary`.
 async fn gatekeeper(
     State(state): State<Arc<ConnectionState>>,
     Extension(RequestBase(base)): Extension<RequestBase>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let mut response = match admit(&state, &base, request.headers()).await {
+    let mut response = match admit(&state, base, request.headers()).await {
         Err(refused) => refused,
-        Ok(()) => next.run(request).await,
+        Ok(caller) => {
+            request.extensions_mut().insert(caller);
+            next.run(request).await
+        }
     };
     response
         .headers_mut()
@@ -73,12 +89,12 @@ async fn gatekeeper(
 
 async fn admit(
     state: &ConnectionState,
-    base: &BaseUrl,
+    base: BaseUrl,
     headers: &HeaderMap,
-) -> Result<(), Response> {
+) -> Result<McpCaller, Response> {
     for origin in headers.get_all(ORIGIN) {
         let origin = String::from_utf8_lossy(origin.as_bytes());
-        if !origin_allowed(&origin, base) {
+        if !origin_allowed(&origin, &base) {
             return Err(refusal(
                 StatusCode::FORBIDDEN,
                 "origin_not_allowed",
@@ -87,7 +103,7 @@ async fn admit(
         }
     }
     let Some(token) = bearer_token(headers) else {
-        return Err(invalid_token(base, NO_TOKEN));
+        return Err(invalid_token(&base, NO_TOKEN));
     };
     match access_in(&state.db, token, now_unix()).await {
         Err(e) => {
@@ -98,11 +114,16 @@ async fn admit(
                 "Soulful's database is unavailable",
             ))
         }
-        Ok(None) => Err(invalid_token(base, UNKNOWN_TOKEN)),
-        Ok(Some(access)) if access.resource != mcp_url(base) => {
-            Err(invalid_token(base, OTHER_ADDRESS))
+        Ok(None) => Err(invalid_token(&base, UNKNOWN_TOKEN)),
+        Ok(Some(access)) if access.resource != mcp_url(&base) => {
+            Err(invalid_token(&base, OTHER_ADDRESS))
         }
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(access)) => Ok(McpCaller {
+            ctx: access.ctx,
+            grant_id: access.grant_id,
+            allow_delete: access.allow_delete,
+            base,
+        }),
     }
 }
 
@@ -361,7 +382,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["result"]["tools"], json!([]));
+        assert_eq!(body["result"]["tools"][0]["name"], "get_status");
     }
 
     #[tokio::test]
