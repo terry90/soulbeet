@@ -1308,11 +1308,11 @@ mod tests {
         let silent = track("Marrow Choir", "Silent Night");
         let winter = album("Marrow Choir ", "Winter Songs");
         assert_eq!(
-            search_text(None, &[night.clone()]).unwrap(),
+            search_text(None, std::slice::from_ref(&night)).unwrap(),
             "Marrow Choir O Holy Night"
         );
         assert_eq!(
-            search_text(Some(&winter), &[night.clone()]).unwrap(),
+            search_text(Some(&winter), std::slice::from_ref(&night)).unwrap(),
             "Marrow Choir O Holy Night"
         );
         assert_eq!(

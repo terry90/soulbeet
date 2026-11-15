@@ -14,7 +14,7 @@ use shared::metadata::{Album, Track};
 #[cfg(feature = "server")]
 use soulbeet::error::SoulseekError;
 #[cfg(feature = "server")]
-use soulbeet::DownloadBackend;
+use soulbeet::{DownloadBackend, MetadataError};
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
@@ -27,6 +27,8 @@ use std::time::Duration;
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
 #[cfg(feature = "server")]
 use crate::models::folder::Folder;
+#[cfg(feature = "server")]
+use crate::server_fns::search::{hydrate_album_tracks, tracklist_message};
 #[cfg(feature = "server")]
 use crate::services::{
     available_download_backends, download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND,
@@ -234,6 +236,12 @@ async fn usable_backends() -> Result<(Searched, Vec<Searched>), BackendLookupErr
     }
 }
 
+/// The tracklist of the album `album_title` could not be looked up.
+#[cfg(feature = "server")]
+fn tracklist_failure(album_title: &str, e: &MetadataError) -> Failure {
+    e.failure(Stage::Metadata, tracklist_message(album_title, e))
+}
+
 #[cfg(feature = "server")]
 fn queue_failed(e: &SoulseekError) -> Failure {
     e.failure(Stage::Enqueue, format!("Download queue failed: {e}"))
@@ -279,11 +287,6 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
 
     let (tx, _) = get_or_create_user_channel(&user).await;
 
-    let mut req = req;
-    if let Err(e) = crate::server_fns::search::hydrate_album_tracks(&mut req.query).await {
-        return Ok(AutoDownloadResult::Error(e));
-    }
-
     // Build search description for logging and events
     let query_desc = req
         .query
@@ -320,8 +323,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
     // Spawn the entire search-score-pick-download pipeline onto a background task.
     // This avoids blocking the HTTP response during the search-poll loop (Research Pitfall 4).
     let folder_path = folder.path;
-    let album = req.query.album.clone();
-    let tracks = req.query.tracks.clone();
+    let mut query = req.query;
 
     tokio::spawn(async move {
         // Send Searching event
@@ -330,6 +332,18 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             query: query_desc.clone(),
             backend_count: 1 + rest.len(),
         }));
+
+        if let Err(e) = hydrate_album_tracks(&mut query).await {
+            // Only an album query looks its tracklist up.
+            let album = query.album.as_ref().map_or("", |a| a.title.as_str());
+            let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
+                batch_id: batch_id.clone(),
+                failure: tracklist_failure(album, &e),
+            }));
+            info!("Auto-download: no tracklist for '{}': {}", query_desc, e);
+            return;
+        }
+        let (album, tracks) = (query.album, query.tracks);
 
         info!(
             "Auto-download: searching {} backends for '{}'",
@@ -852,6 +866,24 @@ mod tests {
         );
         let cause = f.cause.unwrap();
         assert_eq!((cause.status, cause.raw.as_str()), (Some(400), body));
+    }
+
+    #[test]
+    fn a_tracklist_that_cannot_be_read_fails_at_the_metadata_stage() {
+        let e = MetadataError::Unavailable {
+            service: Service::Musicbrainz,
+            status: Some(503),
+            raw: "no answer within 15 s".into(),
+        };
+        let f = tracklist_failure("Winter Songs", &e);
+        assert_eq!(
+            (f.code, f.stage),
+            (FailureCode::MetadataUnavailable, Stage::Metadata)
+        );
+        assert_eq!(
+            f.message,
+            "could not resolve tracklist for 'Winter Songs': MusicBrainz is unavailable: no answer within 15 s"
+        );
     }
 
     #[test]

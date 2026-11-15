@@ -17,6 +17,8 @@ use crate::{
     AuthSession,
 };
 #[cfg(feature = "server")]
+use soulbeet::MetadataError;
+#[cfg(feature = "server")]
 use std::collections::HashMap;
 #[cfg(feature = "server")]
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -53,9 +55,7 @@ pub async fn search_album(input: SearchQuery) -> Result<SearchResults, ServerFnE
     let provider = metadata_provider(
         input.provider.as_deref(),
         user_settings.lastfm_api_key.as_deref(),
-    )
-    .await
-    .map_err(server_error)?;
+    );
 
     let provider_enum: Provider = provider.id().parse().unwrap_or_default();
     let results = provider
@@ -77,9 +77,7 @@ pub async fn search_track(input: SearchQuery) -> Result<SearchResults, ServerFnE
     let provider = metadata_provider(
         input.provider.as_deref(),
         user_settings.lastfm_api_key.as_deref(),
-    )
-    .await
-    .map_err(server_error)?;
+    );
 
     let provider_enum: Provider = provider.id().parse().unwrap_or_default();
     let results = provider
@@ -102,34 +100,33 @@ pub async fn find_album(input: AlbumQuery) -> Result<AlbumWithTracks, ServerFnEr
     let provider = metadata_provider(
         provider_str.as_deref(),
         user_settings.lastfm_api_key.as_deref(),
-    )
-    .await
-    .map_err(server_error)?;
+    );
 
     provider.get_album(&input.id).await.map_err(server_error)
 }
 
 /// Album queries arrive from the UI with an empty track list; source matching
 /// scores candidate files against expected track titles, so resolve the
-/// album's tracklist through the metadata provider before searching.
+/// album's tracklist through the metadata provider before searching. Fails
+/// only for an album query.
 #[cfg(feature = "server")]
-pub(crate) async fn hydrate_album_tracks(query: &mut DownloadQuery) -> Result<(), String> {
+pub(crate) async fn hydrate_album_tracks(query: &mut DownloadQuery) -> Result<(), MetadataError> {
     if !query.tracks.is_empty() {
         return Ok(());
     }
-    let Some(album) = query.album.clone() else {
+    let Some(album) = query.album.as_ref() else {
         return Ok(());
     };
 
-    let provider = metadata_provider(None, None)
-        .await
-        .map_err(|e| format!("metadata provider unavailable: {e}"))?;
-    let album_with_tracks = provider
-        .get_album(&album.id)
-        .await
-        .map_err(|e| format!("could not resolve tracklist for '{}': {e}", album.title))?;
+    let album_with_tracks = metadata_provider(None, None).get_album(&album.id).await?;
     query.tracks = album_with_tracks.tracks;
     Ok(())
+}
+
+/// What a failed tracklist lookup for the album `album_title` says.
+#[cfg(feature = "server")]
+pub(crate) fn tracklist_message(album_title: &str, e: &MetadataError) -> String {
+    format!("could not resolve tracklist for '{album_title}': {e}")
 }
 
 /// How long a started search stays readable by the user who started it.
@@ -179,9 +176,11 @@ static SEARCH_OWNERS: LazyLock<SearchOwners> = LazyLock::new(SearchOwners::defau
 #[post("/api/download/search/start", auth: AuthSession)]
 pub async fn start_download_search(data: DownloadQuery) -> Result<String, ServerFnError> {
     let mut data = data;
-    hydrate_album_tracks(&mut data)
-        .await
-        .map_err(server_error)?;
+    if let Err(e) = hydrate_album_tracks(&mut data).await {
+        // Only an album query looks its tracklist up.
+        let album = data.album.as_ref().map_or("", |a| a.title.as_str());
+        return Err(server_error(tracklist_message(album, &e)));
+    }
 
     let backend = download_backend(data.backend.as_deref())
         .await

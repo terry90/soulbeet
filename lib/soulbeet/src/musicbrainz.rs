@@ -7,10 +7,13 @@ use musicbrainz_rs::{
     },
     Fetch, MusicBrainzClient, Search,
 };
+use shared::failure::Service;
 use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
+
+use crate::MetadataError;
 
 /// Timeout for individual MusicBrainz requests (15 seconds)
 const REQUEST_TIMEOUT_SECS: u64 = 15;
@@ -70,108 +73,87 @@ fn format_duration(duration_ms: &Option<u32>) -> Option<String> {
     })
 }
 
-/// Check if an error is retryable (transient network/server issues)
-fn is_retryable_error(error: &musicbrainz_rs::Error) -> bool {
-    let error_str = format!("{:?}", error);
-    let error_lower = error_str.to_lowercase();
-
-    // Retry on timeout, connection, and 5xx server errors
-    if error_lower.contains("timeout")
-        || error_lower.contains("connection")
-        || error_lower.contains("timed out")
-        || error_lower.contains("503")
-        || error_lower.contains("502")
-        || error_lower.contains("500")
-        || error_lower.contains("429") // Rate limited - should retry after backoff
-        || error_lower.contains("service unavailable")
-    {
-        return true;
+impl From<musicbrainz_rs::Error> for MetadataError {
+    fn from(e: musicbrainz_rs::Error) -> Self {
+        use musicbrainz_rs::Error;
+        let service = Service::Musicbrainz;
+        match e {
+            Error::NotFound(_) => MetadataError::NotFound {
+                service,
+                raw: e.to_string(),
+            },
+            // MusicBrainz's own `{error, help}` body, other than "Not Found"
+            // (musicbrainz_rs `src/entity/api.rs:8-24`).
+            Error::MusicbrainzError(query, body) => MetadataError::Rejected {
+                service,
+                status: None,
+                raw: format!(
+                    "{query}: {}",
+                    serde_json::to_string(&body).expect("two strings serialize")
+                ),
+            },
+            // musicbrainz_rs retries MusicBrainz's 503 rate-limit answer
+            // (`src/config.rs:9`, `src/fetching.rs:33-59`) until it gives up.
+            Error::MaxRetriesExceeded => MetadataError::RateLimited {
+                service,
+                raw: e.to_string(),
+            },
+            Error::ReqwestError(e) => MetadataError::Unavailable {
+                service,
+                status: e.status().map(|s| s.as_u16()),
+                raw: e.to_string(),
+            },
+            Error::SerdeJsonError(e) => MetadataError::Unreadable {
+                service,
+                raw: e.to_string(),
+            },
+            Error::MissingRetryToken | Error::InvalidUserAgent(_) => unreachable!(
+                "musicbrainz_rs 44c25c8 never constructs MissingRetryToken, and gives \
+                 InvalidUserAgent only from MusicBrainzClient::new, which Soulful calls \
+                 once under expect: {e}"
+            ),
+        }
     }
-
-    // Don't retry client errors (4xx except 429)
-    if error_lower.contains("400")
-        || error_lower.contains("401")
-        || error_lower.contains("403")
-        || error_lower.contains("404")
-        || error_lower.contains("bad request")
-        || error_lower.contains("not found")
-        || error_lower.contains("unauthorized")
-    {
-        return false;
-    }
-
-    // Default to retrying for unknown errors (network issues, etc.)
-    true
 }
 
 /// Retries an async operation with exponential backoff and request timeout.
-/// Only retries transient errors (network issues, timeouts, 5xx responses).
-/// Does NOT retry client errors (4xx) or permanent failures.
-async fn with_retry<T, F, Fut>(
-    operation_name: &str,
-    mut operation: F,
-) -> Result<T, musicbrainz_rs::Error>
+/// Only retries transient errors (`MetadataError::is_transient`): no answer
+/// within REQUEST_TIMEOUT_SECS, or an HTTP exchange that failed.
+async fn with_retry<T, F, Fut>(operation_name: &str, mut operation: F) -> Result<T, MetadataError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, musicbrainz_rs::Error>>,
 {
-    let mut last_error = None;
-
-    for attempt in 0..MAX_RETRIES {
+    let mut attempt = 0;
+    loop {
         // Respect MusicBrainz rate limit (1 req/sec)
         crate::http::mb_rate_limit().await;
 
-        // Apply timeout to each request
         let result =
             tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), operation()).await;
-
-        match result {
+        let e = match result {
             Ok(Ok(value)) => return Ok(value),
-            Ok(Err(e)) => {
-                // Check if this error is retryable
-                if !is_retryable_error(&e) {
-                    warn!(
-                        "{} failed with non-retryable error: {:?}",
-                        operation_name, e
-                    );
-                    return Err(e);
-                }
-
-                last_error = Some(e);
-                if attempt < MAX_RETRIES - 1 {
-                    let delay = std::cmp::min(BASE_DELAY_MS * 2u64.pow(attempt), MAX_BACKOFF_MS);
-                    warn!(
-                        "{} failed (attempt {}/{}), retrying in {}ms: {:?}",
-                        operation_name,
-                        attempt + 1,
-                        MAX_RETRIES,
-                        delay,
-                        last_error
-                    );
-                    sleep(Duration::from_millis(delay)).await;
-                }
-            }
-            Err(_timeout) => {
-                // Request timed out
-                warn!(
-                    "{} timed out after {}s (attempt {}/{})",
-                    operation_name,
-                    REQUEST_TIMEOUT_SECS,
-                    attempt + 1,
-                    MAX_RETRIES
-                );
-                last_error = Some(musicbrainz_rs::Error::MaxRetriesExceeded);
-                if attempt < MAX_RETRIES - 1 {
-                    let delay = std::cmp::min(BASE_DELAY_MS * 2u64.pow(attempt), MAX_BACKOFF_MS);
-                    sleep(Duration::from_millis(delay)).await;
-                }
-            }
+            Ok(Err(e)) => MetadataError::from(e),
+            Err(_timeout) => MetadataError::Unavailable {
+                service: Service::Musicbrainz,
+                status: None,
+                raw: format!("no answer within {REQUEST_TIMEOUT_SECS} s"),
+            },
+        };
+        attempt += 1;
+        if !e.is_transient() || attempt == MAX_RETRIES {
+            warn!(
+                "{} failed (attempt {}/{}): {}",
+                operation_name, attempt, MAX_RETRIES, e
+            );
+            return Err(e);
         }
-    }
-
-    match last_error {
-        Some(e) => Err(e),
-        None => Err(musicbrainz_rs::Error::MaxRetriesExceeded),
+        let delay = std::cmp::min(BASE_DELAY_MS * 2u64.pow(attempt - 1), MAX_BACKOFF_MS);
+        warn!(
+            "{} failed (attempt {}/{}), retrying in {}ms: {}",
+            operation_name, attempt, MAX_RETRIES, delay, e
+        );
+        sleep(Duration::from_millis(delay)).await;
     }
 }
 
@@ -188,7 +170,7 @@ pub async fn search(
     query: &str,
     search_type: SearchType,
     limit: u8,
-) -> Result<Vec<SearchResult>, musicbrainz_rs::Error> {
+) -> Result<Vec<SearchResult>, MetadataError> {
     let client = musicbrainz_client();
     let mut results = Vec::new();
 
@@ -323,7 +305,7 @@ pub async fn search(
 }
 
 /// Fetches a release (album) by its ID and returns it with its full tracklist.
-pub async fn find_album(release_id: &str) -> Result<AlbumWithTracks, musicbrainz_rs::Error> {
+pub async fn find_album(release_id: &str) -> Result<AlbumWithTracks, MetadataError> {
     let client = musicbrainz_client();
 
     // Fetch the release with recordings (tracks) and artist credits for the tracks.
@@ -406,14 +388,9 @@ impl crate::MetadataProvider for MusicBrainzProvider {
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> crate::error::Result<Vec<SearchResult>> {
+    ) -> Result<Vec<SearchResult>, MetadataError> {
         let artist_opt = artist.map(String::from);
-        search(&artist_opt, query, SearchType::Album, limit.min(100) as u8)
-            .await
-            .map_err(|e| crate::error::SoulseekError::Api {
-                status: 500,
-                message: e.to_string(),
-            })
+        search(&artist_opt, query, SearchType::Album, limit.min(100) as u8).await
     }
 
     async fn search_tracks(
@@ -421,22 +398,59 @@ impl crate::MetadataProvider for MusicBrainzProvider {
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> crate::error::Result<Vec<SearchResult>> {
+    ) -> Result<Vec<SearchResult>, MetadataError> {
         let artist_opt = artist.map(String::from);
-        search(&artist_opt, query, SearchType::Track, limit.min(100) as u8)
-            .await
-            .map_err(|e| crate::error::SoulseekError::Api {
-                status: 500,
-                message: e.to_string(),
-            })
+        search(&artist_opt, query, SearchType::Track, limit.min(100) as u8).await
     }
 
-    async fn get_album(&self, id: &str) -> crate::error::Result<AlbumWithTracks> {
-        find_album(id)
+    async fn get_album(&self, id: &str) -> Result<AlbumWithTracks, MetadataError> {
+        find_album(id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn musicbrainz_errors_keep_their_kind() {
+        let mb_error: musicbrainz_rs::entity::api::MusicbrainzError =
+            serde_json::from_value(serde_json::json!({"error": "Invalid mbid.", "help": "For usage, please see: https://musicbrainz.org/development/mmd"})).unwrap();
+        let parse = serde_json::from_str::<u8>("x").unwrap_err();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let refused = reqwest::get(format!("http://127.0.0.1:{port}"))
             .await
-            .map_err(|e| crate::error::SoulseekError::Api {
-                status: 500,
-                message: e.to_string(),
-            })
+            .unwrap_err();
+        let kinds: Vec<&str> = [
+            musicbrainz_rs::Error::NotFound("q".into()),
+            musicbrainz_rs::Error::MusicbrainzError("q".into(), mb_error),
+            musicbrainz_rs::Error::MaxRetriesExceeded,
+            musicbrainz_rs::Error::SerdeJsonError(parse),
+            musicbrainz_rs::Error::ReqwestError(refused),
+        ]
+        .into_iter()
+        .map(|e| match MetadataError::from(e) {
+            MetadataError::NotFound { .. } => "not_found",
+            MetadataError::Rejected { .. } => "rejected",
+            MetadataError::RateLimited { .. } => "rate_limited",
+            MetadataError::Unreadable { .. } => "unreadable",
+            MetadataError::Unavailable { .. } => "unavailable",
+            MetadataError::NotConfigured { .. } => "not_configured",
+        })
+        .collect();
+        assert_eq!(
+            kinds,
+            [
+                "not_found",
+                "rejected",
+                "rate_limited",
+                "unreadable",
+                "unavailable"
+            ]
+        );
     }
 }

@@ -17,6 +17,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::Result;
+use crate::MetadataError;
 
 #[async_trait]
 pub trait MetadataProvider: Send + Sync {
@@ -28,16 +29,16 @@ pub trait MetadataProvider: Send + Sync {
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<MetadataSearchResult>>;
+    ) -> std::result::Result<Vec<MetadataSearchResult>, MetadataError>;
 
     async fn search_tracks(
         &self,
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<MetadataSearchResult>>;
+    ) -> std::result::Result<Vec<MetadataSearchResult>, MetadataError>;
 
-    async fn get_album(&self, id: &str) -> Result<AlbumWithTracks>;
+    async fn get_album(&self, id: &str) -> std::result::Result<AlbumWithTracks, MetadataError>;
 }
 
 #[async_trait]
@@ -318,81 +319,6 @@ pub trait MusicImporter: Send + Sync {
     /// Whether what the last check depended on has changed since. True before
     /// the first check, false while one is running.
     async fn health_stale(&self) -> bool;
-}
-
-pub struct FallbackMetadataProvider {
-    providers: Vec<Box<dyn MetadataProvider>>,
-}
-
-impl FallbackMetadataProvider {
-    pub fn new(providers: Vec<Box<dyn MetadataProvider>>) -> Self {
-        Self { providers }
-    }
-}
-
-#[async_trait]
-impl MetadataProvider for FallbackMetadataProvider {
-    fn id(&self) -> &'static str {
-        "fallback"
-    }
-
-    fn name(&self) -> &'static str {
-        "Fallback"
-    }
-
-    async fn search_albums(
-        &self,
-        artist: Option<&str>,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<MetadataSearchResult>> {
-        for provider in &self.providers {
-            match provider.search_albums(artist, query, limit).await {
-                Ok(results) if !results.is_empty() => return Ok(results),
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!("{} failed: {}", provider.name(), e);
-                    continue;
-                }
-            }
-        }
-        Ok(vec![])
-    }
-
-    async fn search_tracks(
-        &self,
-        artist: Option<&str>,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<MetadataSearchResult>> {
-        for provider in &self.providers {
-            match provider.search_tracks(artist, query, limit).await {
-                Ok(results) if !results.is_empty() => return Ok(results),
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!("{} failed: {}", provider.name(), e);
-                    continue;
-                }
-            }
-        }
-        Ok(vec![])
-    }
-
-    async fn get_album(&self, id: &str) -> Result<AlbumWithTracks> {
-        for provider in &self.providers {
-            match provider.get_album(id).await {
-                Ok(album) => return Ok(album),
-                Err(e) => {
-                    tracing::warn!("{} failed: {}", provider.name(), e);
-                    continue;
-                }
-            }
-        }
-        Err(crate::error::SoulseekError::Api {
-            status: 404,
-            message: "Album not found".to_string(),
-        })
-    }
 }
 
 #[async_trait]

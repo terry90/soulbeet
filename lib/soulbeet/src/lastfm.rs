@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde::Deserialize;
+use shared::failure::{Service, UserAction, UserActionCode};
 use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
 use shared::recommendation::{
     ArtistPopularity, Listen, RankedArtist, RankedTrack, SimilarArtist, SimilarTrack, TimePeriod,
@@ -8,8 +9,117 @@ use shared::recommendation::{
 use tracing::{info, warn};
 
 use crate::error::{Result, SoulseekError};
+use crate::http::SendError;
+use crate::MetadataError;
 
 const LASTFM_API_BASE: &str = "https://ws.audioscrobbler.com/2.0/";
+
+/// The `resilient_send` context of every Last.fm request.
+const LASTFM_CONTEXT: &str = "Last.fm API";
+
+/// Last.fm refused the API key Soulful sent.
+pub(crate) fn configure_lastfm() -> UserAction {
+    UserAction::new(
+        UserActionCode::ConfigureProvider,
+        "Set a valid Last.fm API key",
+        "Settings > Library",
+    )
+}
+
+/// What a Last.fm request got instead of the answer it asked for.
+#[derive(Debug)]
+enum LastFmFailure {
+    /// No successful HTTP answer, and none with Last.fm's error body.
+    Send(SendError),
+    /// Last.fm's own error body, `{"error": code, "message": ...}`.
+    Api { code: u32, message: String },
+    /// A successful answer that does not parse.
+    Parse(String),
+}
+
+/// The body Last.fm answers an API error with.
+#[derive(Deserialize)]
+struct LastFmErrorBody {
+    error: u32,
+    #[serde(default)]
+    message: String,
+}
+
+impl From<LastFmErrorBody> for LastFmFailure {
+    fn from(body: LastFmErrorBody) -> Self {
+        LastFmFailure::Api {
+            code: body.error,
+            message: body.message,
+        }
+    }
+}
+
+impl From<SendError> for LastFmFailure {
+    fn from(e: SendError) -> Self {
+        match serde_json::from_str::<LastFmErrorBody>(&e.body) {
+            Ok(body) => body.into(),
+            Err(_) => LastFmFailure::Send(e),
+        }
+    }
+}
+
+impl From<LastFmFailure> for SoulseekError {
+    fn from(f: LastFmFailure) -> Self {
+        match f {
+            LastFmFailure::Send(e) => e.into(),
+            LastFmFailure::Api { code, message } => SoulseekError::Api {
+                status: 500,
+                message: format!("Last.fm error {code}: {message}"),
+            },
+            LastFmFailure::Parse(e) => SoulseekError::Api {
+                status: 500,
+                message: format!("Failed to parse Last.fm response: {e}"),
+            },
+        }
+    }
+}
+
+/// Last.fm's error codes, from its API documentation (the `album.getInfo`
+/// page lists them): 4 authentication failed, 10 invalid API key, 26
+/// suspended API key; 29 rate limit exceeded; 8 operation failed, 11 service
+/// offline, 16 temporary error; 6 invalid parameters, which `album.getInfo`
+/// answers for an album it does not have.
+impl From<LastFmFailure> for MetadataError {
+    fn from(f: LastFmFailure) -> Self {
+        let service = Service::Lastfm;
+        match f {
+            LastFmFailure::Api { code, message: raw } => match code {
+                4 | 10 | 26 => MetadataError::NotConfigured { service, raw },
+                29 => MetadataError::RateLimited { service, raw },
+                8 | 11 | 16 => MetadataError::Unavailable {
+                    service,
+                    status: None,
+                    raw,
+                },
+                6 => MetadataError::NotFound { service, raw },
+                _ => MetadataError::Rejected {
+                    service,
+                    status: None,
+                    raw,
+                },
+            },
+            LastFmFailure::Send(SendError { status, body, .. }) => match status {
+                Some(429) => MetadataError::RateLimited { service, raw: body },
+                None | Some(500..=599) => MetadataError::Unavailable {
+                    service,
+                    status,
+                    raw: body,
+                },
+                Some(_) => MetadataError::Rejected {
+                    service,
+                    status,
+                    raw: body,
+                },
+            },
+            LastFmFailure::Parse(raw) => MetadataError::Unreadable { service, raw },
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct LastFmImage {
@@ -207,32 +317,38 @@ impl LastFmProvider {
         })
     }
 
-    /// Send a GET request to the Last.fm API with retries and deserialize the response.
+    /// Send a GET request to the Last.fm API with retries and deserialize the
+    /// response. A body with Last.fm's numeric `error` field is its error,
+    /// whatever the HTTP status.
     async fn api_request<T: serde::de::DeserializeOwned>(
         &self,
         params: &[(&str, &str)],
-    ) -> Result<T> {
+    ) -> std::result::Result<T, LastFmFailure> {
         let mut all_params: Vec<(&str, &str)> = params.to_vec();
         all_params.push(("api_key", &self.api_key));
         all_params.push(("format", "json"));
 
-        let url = reqwest::Url::parse_with_params(LASTFM_API_BASE, &all_params).map_err(|e| {
-            SoulseekError::Api {
-                status: 500,
-                message: format!("Failed to build URL: {}", e),
-            }
-        })?;
+        let url = reqwest::Url::parse_with_params(LASTFM_API_BASE, &all_params)
+            .expect("LASTFM_API_BASE parses, and parameters are only encoded into its query");
 
         crate::http::lastfm_rate_limit().await;
 
         let client = self.client.clone();
         let url_str = url.to_string();
-        let response = crate::http::resilient_send(|| client.get(&url_str), "Last.fm API").await?;
+        let response = crate::http::resilient_send(|| client.get(&url_str), LASTFM_CONTEXT).await?;
+        // The connection failed while the body was read.
+        let body = response.bytes().await.map_err(|e| {
+            LastFmFailure::Send(SendError {
+                context: LASTFM_CONTEXT.to_string(),
+                status: None,
+                body: e.to_string(),
+            })
+        })?;
 
-        response.json().await.map_err(|e| SoulseekError::Api {
-            status: 500,
-            message: format!("Failed to parse Last.fm response: {}", e),
-        })
+        if let Ok(error) = serde_json::from_slice::<LastFmErrorBody>(&body) {
+            return Err(error.into());
+        }
+        serde_json::from_slice(&body).map_err(|e| LastFmFailure::Parse(e.to_string()))
     }
 
     // --- Metadata search internals (used by MetadataProvider) ---
@@ -242,7 +358,7 @@ impl LastFmProvider {
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<LastFmAlbum>> {
+    ) -> std::result::Result<Vec<LastFmAlbum>, LastFmFailure> {
         let album_query = if let Some(artist) = artist {
             format!("{} {}", artist, query)
         } else {
@@ -266,7 +382,7 @@ impl LastFmProvider {
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<LastFmTrack>> {
+    ) -> std::result::Result<Vec<LastFmTrack>, LastFmFailure> {
         let limit_str = limit.to_string();
         let mut params = vec![
             ("method", "track.search"),
@@ -282,7 +398,11 @@ impl LastFmProvider {
         Ok(data.results.track_matches.track)
     }
 
-    async fn get_album_info(&self, artist: &str, album: &str) -> Result<LastFmAlbumInfo> {
+    async fn get_album_info(
+        &self,
+        artist: &str,
+        album: &str,
+    ) -> std::result::Result<LastFmAlbumInfo, LastFmFailure> {
         info!("Fetching album info from Last.fm: {} - {}", artist, album);
         let data: AlbumInfoResponse = self
             .api_request(&[
@@ -751,7 +871,7 @@ impl crate::MetadataProvider for LastFmProvider {
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> std::result::Result<Vec<SearchResult>, MetadataError> {
         let albums = self.search_albums_internal(artist, query, limit).await?;
 
         Ok(albums
@@ -779,7 +899,7 @@ impl crate::MetadataProvider for LastFmProvider {
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> std::result::Result<Vec<SearchResult>, MetadataError> {
         let tracks = self.search_tracks_internal(artist, query, limit).await?;
 
         Ok(tracks
@@ -804,7 +924,7 @@ impl crate::MetadataProvider for LastFmProvider {
             .collect())
     }
 
-    async fn get_album(&self, id: &str) -> Result<AlbumWithTracks> {
+    async fn get_album(&self, id: &str) -> std::result::Result<AlbumWithTracks, MetadataError> {
         if let Some(rest) = id.strip_prefix("lastfm:") {
             if let Some((artist, album)) = rest.split_once(':') {
                 let info = self.get_album_info(artist, album).await?;
@@ -857,9 +977,10 @@ impl crate::MetadataProvider for LastFmProvider {
         }
 
         warn!("Cannot fetch album by MBID from Last.fm: {}", id);
-        Err(SoulseekError::Api {
-            status: 400,
-            message: "Last.fm requires artist:album format, not MBID".to_string(),
+        Err(MetadataError::Rejected {
+            service: Service::Lastfm,
+            status: Some(400),
+            raw: "Last.fm requires artist:album format, not MBID".to_string(),
         })
     }
 }
@@ -1040,5 +1161,75 @@ impl crate::ScrobbleProvider for LastFmProvider {
                 play_count: parse_u64(&t.play_count),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kind(e: MetadataError) -> &'static str {
+        match e {
+            MetadataError::NotFound { .. } => "not_found",
+            MetadataError::RateLimited { .. } => "rate_limited",
+            MetadataError::Unavailable { .. } => "unavailable",
+            MetadataError::NotConfigured { .. } => "not_configured",
+            MetadataError::Rejected { .. } => "rejected",
+            MetadataError::Unreadable { .. } => "unreadable",
+        }
+    }
+
+    #[test]
+    fn lastfm_errors_come_from_its_error_code() {
+        let api = |code: u32, message: &str| LastFmFailure::Api {
+            code,
+            message: message.into(),
+        };
+        let by_code: Vec<&str> = [
+            api(6, "Album not found"),
+            api(
+                10,
+                "Invalid API key - You must be granted a valid key by last.fm",
+            ),
+            api(29, "Rate Limit Exceeded"),
+            api(11, "Service Offline"),
+            api(13, "Invalid method signature supplied"),
+        ]
+        .into_iter()
+        .map(|f| kind(MetadataError::from(f)))
+        .collect();
+        assert_eq!(
+            by_code,
+            [
+                "not_found",
+                "not_configured",
+                "rate_limited",
+                "unavailable",
+                "rejected"
+            ]
+        );
+
+        let send = |status: Option<u16>| SendError {
+            context: "Last.fm API".into(),
+            status,
+            body: "b".into(),
+        };
+        let by_status: Vec<&str> = [None, Some(503), Some(429), Some(400)]
+            .into_iter()
+            .map(|s| kind(MetadataError::from(LastFmFailure::Send(send(s)))))
+            .collect();
+        assert_eq!(
+            by_status,
+            ["unavailable", "unavailable", "rate_limited", "rejected"]
+        );
+
+        let refused_key = LastFmFailure::from(SendError {
+            body: r#"{"message":"Invalid API key - You must be granted a valid key by last.fm","error":10}"#.into(),
+            ..send(Some(403))
+        });
+        assert!(
+            matches!(refused_key, LastFmFailure::Api { code: 10, .. }),
+            "{refused_key:?}"
+        );
     }
 }

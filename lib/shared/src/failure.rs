@@ -185,6 +185,8 @@ pub enum UserActionCode {
     FreeDiskSpace,
     RelinkNavidrome,
     ConfigureNavidrome,
+    /// A metadata provider refused Soulful's key for it.
+    ConfigureProvider,
     EnableDeletion,
     EnableIndexing,
     AddFolder,

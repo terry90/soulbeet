@@ -5,6 +5,7 @@ pub mod error;
 pub mod http;
 pub mod lastfm;
 pub mod listenbrainz;
+pub mod metadata_error;
 pub mod musicbrainz;
 pub mod navidrome;
 pub mod services;
@@ -15,10 +16,11 @@ pub mod traits;
 
 pub use lastfm::LastFmProvider;
 pub use listenbrainz::ListenBrainzProvider;
+pub use metadata_error::MetadataError;
 pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
 pub use services::{Services, ServicesBuilder};
 pub use traits::{
-    CandidateGenerator, DownloadBackend, DriverChoice, FailKind, FallbackMetadataProvider,
-    ImportMode, ImportOutcome, ImportResult, MetadataProvider, MusicImporter, ScrobbleProvider,
-    SkipReason, TaskCount, TimeoutKind,
+    CandidateGenerator, DownloadBackend, DriverChoice, FailKind, ImportMode, ImportOutcome,
+    ImportResult, MetadataProvider, MusicImporter, ScrobbleProvider, SkipReason, TaskCount,
+    TimeoutKind,
 };

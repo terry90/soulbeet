@@ -73,13 +73,20 @@ pub struct Track {
 impl Track {
     /// `duration` in seconds. Both providers write `{minutes}:{SS}`, with any
     /// number of minute digits and two second digits; anything else is `None`.
+    /// A zero length is `None` too: Last.fm album tracklists give 0 for a
+    /// length they do not know.
     pub fn duration_secs(&self) -> Option<u32> {
         let (minutes, seconds) = self.duration.as_deref()?.split_once(':')?;
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         if !digits(minutes) || seconds.len() != 2 || !digits(seconds) {
             return None;
         }
-        Some(minutes.parse::<u32>().ok()? * 60 + seconds.parse::<u32>().ok()?)
+        let secs = minutes
+            .parse::<u32>()
+            .ok()?
+            .checked_mul(60)?
+            .checked_add(seconds.parse::<u32>().ok()?)?;
+        (secs > 0).then_some(secs)
     }
 }
 
@@ -136,6 +143,8 @@ mod tests {
         assert_eq!(with(Some("04:23")).duration_secs(), Some(263));
         assert_eq!(with(Some("75:03")).duration_secs(), Some(4503));
         assert_eq!(with(Some("4:7")).duration_secs(), None);
+        assert_eq!(with(Some("00:00")).duration_secs(), None);
+        assert_eq!(with(Some("71582789:00")).duration_secs(), None);
         assert_eq!(with(Some("")).duration_secs(), None);
         assert_eq!(with(None).duration_secs(), None);
     }

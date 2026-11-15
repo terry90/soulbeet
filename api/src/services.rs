@@ -36,10 +36,6 @@ pub mod importers {
 }
 
 #[cfg(feature = "server")]
-static METADATA_PROVIDERS: LazyLock<RwLock<HashMap<String, Arc<dyn MetadataProvider>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-#[cfg(feature = "server")]
 static DOWNLOAD_BACKENDS: LazyLock<RwLock<HashMap<String, Arc<dyn DownloadBackend>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -67,22 +63,6 @@ pub fn available_download_backends() -> Vec<(&'static str, &'static str)> {
 #[cfg(feature = "server")]
 pub fn available_importers() -> Vec<(&'static str, &'static str)> {
     vec![(importers::BEETS, "Beets")]
-}
-
-#[cfg(feature = "server")]
-async fn init_metadata_provider(
-    id: &str,
-    lastfm_api_key: Option<&str>,
-) -> Result<Arc<dyn MetadataProvider>, String> {
-    match id {
-        providers::LASTFM => {
-            let api_key = lastfm_api_key
-                .filter(|k| !k.is_empty())
-                .ok_or("Last.fm API key not configured")?;
-            Ok(Arc::new(LastFmProvider::new(api_key.to_string())))
-        }
-        _ => Ok(Arc::new(MusicBrainzProvider::new())),
-    }
 }
 
 /// Why `download_backend` has no backend to give. Its Display is the text
@@ -163,37 +143,22 @@ async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, Bac
     }
 }
 
+/// The key, when one is saved.
 #[cfg(feature = "server")]
-pub async fn metadata_provider(
+pub(crate) fn usable_lastfm_key(key: Option<&str>) -> Option<&str> {
+    key.filter(|k| !k.is_empty())
+}
+
+/// Last.fm when it is asked for and a key is saved, else MusicBrainz.
+#[cfg(feature = "server")]
+pub fn metadata_provider(
     id: Option<&str>,
     lastfm_api_key: Option<&str>,
-) -> Result<Arc<dyn MetadataProvider>, String> {
-    let requested = id.unwrap_or(providers::MUSICBRAINZ);
-
-    // Don't cache Last.fm providers since keys are per-user
-    if requested != providers::LASTFM {
-        if let Some(provider) = METADATA_PROVIDERS.read().await.get(requested) {
-            return Ok(provider.clone());
-        }
+) -> Arc<dyn MetadataProvider> {
+    match (id, usable_lastfm_key(lastfm_api_key)) {
+        (Some(providers::LASTFM), Some(key)) => Arc::new(LastFmProvider::new(key)),
+        _ => Arc::new(MusicBrainzProvider::new()),
     }
-
-    let (key, provider) = match init_metadata_provider(requested, lastfm_api_key).await {
-        Ok(p) => (requested.to_string(), p),
-        Err(_) if requested != providers::MUSICBRAINZ => (
-            providers::MUSICBRAINZ.to_string(),
-            init_metadata_provider(providers::MUSICBRAINZ, None).await?,
-        ),
-        Err(e) => return Err(e),
-    };
-
-    // Only cache non-Last.fm providers
-    if key != providers::LASTFM {
-        METADATA_PROVIDERS
-            .write()
-            .await
-            .insert(key, provider.clone());
-    }
-    Ok(provider)
 }
 
 /// The backend `download_backend(None)` gives.
@@ -419,7 +384,6 @@ pub async fn evict_navidrome_client(user_id: &str) {
 
 #[cfg(feature = "server")]
 pub async fn reload_providers() {
-    METADATA_PROVIDERS.write().await.clear();
     DOWNLOAD_BACKENDS.write().await.clear();
     // MUSIC_IMPORTERS stays: importers are built from the environment only,
     // and dropping one would drop its cached health.
@@ -645,6 +609,26 @@ mod tests {
                 (FailureCode::InvalidInput, stage, RetryAdvice::NotRetryable)
             );
         }
+    }
+
+    #[test]
+    fn a_lastfm_lookup_without_a_key_is_answered_by_musicbrainz() {
+        assert_eq!(
+            metadata_provider(
+                Some(providers::LASTFM),
+                Some("0123456789abcdef0123456789abcdef")
+            )
+            .id(),
+            "lastfm"
+        );
+        for key in [None, Some("")] {
+            assert_eq!(
+                metadata_provider(Some(providers::LASTFM), key).id(),
+                "musicbrainz"
+            );
+        }
+        assert_eq!(metadata_provider(None, None).id(), "musicbrainz");
+        assert_eq!(usable_lastfm_key(Some("")), None);
     }
 
     #[tokio::test]

@@ -95,6 +95,34 @@ fn is_retryable(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+/// Why `resilient_send` got no successful answer: `status` and `body` are the
+/// last answer's, or no status and the transport error's text when the last
+/// attempt got no answer.
+#[derive(Debug)]
+pub struct SendError {
+    pub context: String,
+    pub status: Option<u16>,
+    pub body: String,
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            None => write!(f, "{}: {}", self.context, self.body),
+            Some(status) => write!(f, "{} ({}): {}", self.context, status, self.body),
+        }
+    }
+}
+
+impl From<SendError> for SoulseekError {
+    fn from(e: SendError) -> Self {
+        SoulseekError::Api {
+            status: e.status.unwrap_or(0),
+            message: e.to_string(),
+        }
+    }
+}
+
 /// Execute an HTTP request with retries and exponential backoff.
 ///
 /// Retries on network errors, 429, 500, 502, 503, 504.
@@ -102,64 +130,47 @@ fn is_retryable(status: u16) -> bool {
 pub async fn resilient_send(
     build_request: impl Fn() -> RequestBuilder,
     context: &str,
-) -> Result<Response> {
-    let mut last_err = SoulseekError::Api {
-        status: 0,
-        message: format!("{}: no attempts made", context),
+) -> std::result::Result<Response, SendError> {
+    let failed = |status, body| SendError {
+        context: context.to_string(),
+        status,
+        body,
     };
-
-    for attempt in 0..=MAX_RETRIES {
+    let mut attempt = 0;
+    loop {
         if attempt > 0 {
             let delay = (BASE_DELAY_MS * 2u64.pow(attempt - 1)).min(MAX_DELAY_MS);
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
 
-        let resp = match build_request().send().await {
-            Ok(r) => r,
+        match build_request().send().await {
             Err(e) => {
-                let is_timeout = e.is_timeout();
                 warn!("{}: attempt {} network error: {}", context, attempt + 1, e);
-                last_err = SoulseekError::Api {
-                    status: 0,
-                    message: format!("{}: {}", context, e),
-                };
                 // Timeouts indicate the server is hanging, not a transient blip.
                 // Retry once in case it was a one-off, but don't keep waiting.
-                if is_timeout && attempt >= 1 {
-                    break;
+                if attempt == MAX_RETRIES || (e.is_timeout() && attempt >= 1) {
+                    return Err(failed(None, e.to_string()));
                 }
-                continue;
             }
-        };
-
-        let status = resp.status().as_u16();
-
-        if resp.status().is_success() || status == 204 {
-            return Ok(resp);
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if resp.status().is_success() || status == 204 {
+                    return Ok(resp);
+                }
+                if !is_retryable(status) || attempt == MAX_RETRIES {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(failed(Some(status), body));
+                }
+                warn!(
+                    "{}: attempt {} got {}, retrying",
+                    context,
+                    attempt + 1,
+                    status
+                );
+            }
         }
-
-        if is_retryable(status) && attempt < MAX_RETRIES {
-            warn!(
-                "{}: attempt {} got {}, retrying",
-                context,
-                attempt + 1,
-                status
-            );
-            last_err = SoulseekError::Api {
-                status,
-                message: format!("{}: HTTP {}", context, status),
-            };
-            continue;
-        }
-
-        let body = resp.text().await.unwrap_or_default();
-        return Err(SoulseekError::Api {
-            status,
-            message: format!("{} ({}): {}", context, status, body),
-        });
+        attempt += 1;
     }
-
-    Err(last_err)
 }
 
 /// Build a reqwest Client with standard timeouts.
@@ -504,4 +515,28 @@ pub async fn cached_recording_lookup(client: &Client, mbid: &str) -> Result<Opti
         .await
         .insert(mbid.to_string(), Some(info.clone()));
     Ok(Some(info))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_errors_read_as_before() {
+        let refused = SoulseekError::from(SendError {
+            context: "Last.fm API".into(),
+            status: Some(400),
+            body: "b".into(),
+        });
+        assert_eq!(refused.to_string(), "API error: 400 - Last.fm API (400): b");
+        let unsent = SoulseekError::from(SendError {
+            context: "Last.fm API".into(),
+            status: None,
+            body: "error sending request".into(),
+        });
+        assert_eq!(
+            unsent.to_string(),
+            "API error: 0 - Last.fm API: error sending request"
+        );
+    }
 }
