@@ -191,6 +191,16 @@ pub struct DownloadProgress {
     /// `RETRY_PENDING_FOR`.
     #[serde(skip)]
     pub pending_retry: Option<Failure>,
+    /// The ledger job slot this row is the file of. Never sent to the browser.
+    #[serde(skip)]
+    pub job: Option<JobSlot>,
+}
+
+/// One file of a ledger job: the job's id and the file's slot in it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct JobSlot {
+    pub job: String,
+    pub slot: u32,
 }
 
 /// Why an import was skipped.
@@ -224,6 +234,7 @@ impl DownloadProgress {
             skip: None,
             queued_at_source: false,
             pending_retry: None,
+            job: None,
         }
     }
 
@@ -268,6 +279,11 @@ impl DownloadProgress {
     pub fn with_batch(mut self, batch_id: String, batch_label: String) -> Self {
         self.batch_id = Some(batch_id);
         self.batch_label = Some(batch_label);
+        self
+    }
+
+    pub fn with_job(mut self, job: JobSlot) -> Self {
+        self.job = Some(job);
         self
     }
 
@@ -505,6 +521,13 @@ mod tests {
         assert_eq!(row.failure, None);
         assert_eq!(row.skip, None);
         assert!(!row.queued_at_source);
+        assert_eq!(row.job, None);
+        let sent = serde_json::to_value(row.with_job(JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        }))
+        .unwrap();
+        assert!(sent.get("job").is_none(), "{sent}");
     }
 
     #[test]

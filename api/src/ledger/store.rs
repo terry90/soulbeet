@@ -1,9 +1,8 @@
 //! Reads of the ledger, straight from the pool.
 
-#[cfg(test)]
-use super::JobState;
+use super::{JobState, TERMINAL};
 use crate::auth::UserId;
-use shared::download::{DownloadQuery, DownloadableGroup};
+use shared::download::{DownloadProgress, DownloadQuery, DownloadableGroup, JobSlot};
 use sqlx::SqlitePool;
 
 /// A source search as stored: what it looked for, where, and what it found.
@@ -44,6 +43,34 @@ pub async fn search_of(
         })
     })
     .transpose()
+}
+
+/// The last row of every slot, not dismissed, of `user`'s unfinished jobs, oldest job first,
+/// each with its `job` set. A slot with no row yet has none to show.
+pub async fn open_rows(
+    db: &SqlitePool,
+    user: &UserId,
+) -> Result<Vec<DownloadProgress>, sqlx::Error> {
+    let terminal = vec!["?"; TERMINAL.len()].join(", ");
+    // created_at has one-second resolution: insertion order breaks its ties.
+    let open = format!(
+        "SELECT t.job_id, t.slot, t.last_row FROM job_tracks t JOIN jobs j ON j.id = t.job_id \
+         WHERE j.user_id = ? AND j.state NOT IN ({terminal}) AND t.state != ? \
+           AND t.last_row IS NOT NULL \
+         ORDER BY j.created_at, j.rowid, t.slot"
+    );
+    let rows: Vec<(String, u32, String)> = TERMINAL
+        .iter()
+        .fold(
+            sqlx::query_as(&open).bind(user.to_string()),
+            |query, state| query.bind(state.as_str()),
+        )
+        .bind(JobState::Dismissed.as_str())
+        .fetch_all(db)
+        .await?;
+    rows.into_iter()
+        .map(|(job, slot, row)| Ok(json::<DownloadProgress>(&row)?.with_job(JobSlot { job, slot })))
+        .collect()
 }
 
 #[cfg(test)]

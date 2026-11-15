@@ -609,6 +609,7 @@ impl FileEntry {
             skip: None,
             queued_at_source,
             pending_retry: None,
+            job: None,
         };
         match failure {
             Some(failure) if pending => crate::download::DownloadProgress {

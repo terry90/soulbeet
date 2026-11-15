@@ -4,9 +4,13 @@
 //! order they were made; reads go to the pool (`store`).
 
 use crate::auth::UserId;
-use shared::download::{DownloadQuery, DownloadableGroup};
-use soulbeet::ImportMode;
+use serde::{Deserialize, Serialize};
+use shared::download::{
+    DownloadProgress, DownloadQuery, DownloadableGroup, DownloadableItem, JobSlot, MatchChoices,
+};
+use soulbeet::{ImportMode, ImportedItem};
 use sqlx::SqlitePool;
+use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
@@ -78,6 +82,112 @@ impl JobState {
     }
 }
 
+/// The state of a job whose slots are in `slots` (D6). `slots` is never empty.
+pub fn job_state(slots: &[JobState]) -> JobState {
+    use JobState::*;
+    // While a slot is unfinished the job is at its earliest one; once all
+    // ended, a failure outweighs a done file, which outweighs a cancel.
+    [
+        Searching,
+        NeedsSourceChoice,
+        Queued,
+        Downloading,
+        Importing,
+        Indexing,
+        NeedsDecision,
+        Failed,
+        Done,
+        Cancelled,
+    ]
+    .into_iter()
+    .find(|state| slots.contains(state))
+    .unwrap_or(Dismissed)
+}
+
+/// An import as the ledger keeps it, to run it again after a restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredImport {
+    pub sources: Vec<PathBuf>,
+    pub target: PathBuf,
+    pub album: bool,
+    pub cleanup_root: Option<PathBuf>,
+    pub choices: Option<MatchChoices>,
+    pub rows: Vec<(JobSlot, DownloadProgress)>,
+}
+
+/// Navidrome's two scan times at the first look with Navidrome idle (D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanBaseline {
+    pub last_scan: chrono::DateTime<chrono::Utc>,
+    pub started: chrono::DateTime<chrono::Utc>,
+}
+
+/// What an index wait knows so far (Task 10 reads and advances it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexWait {
+    /// The import's first source, which names it: the slots of one import wait together.
+    pub import: String,
+    /// The library folder the items are relative to.
+    pub library: PathBuf,
+    /// Never empty: an import with no items is done at once (D14).
+    pub items: Vec<ImportedItem>,
+    /// When the import ended, on Soulful's clock.
+    pub since: i64,
+    /// Set at the first idle look, when the runner asks for a scan (D8).
+    pub baseline: Option<ScanBaseline>,
+    /// Navidrome's lastScan when the items were last looked up.
+    pub checked: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobEvent {
+    NeedsSourceChoice {
+        job: String,
+    },
+    /// Slots and their first attempts: the job is queued.
+    Picked {
+        job: String,
+        items: Vec<(u32, DownloadableItem)>,
+    },
+    Enqueued {
+        job: String,
+        monitor_batch_id: String,
+        batch_label: String,
+    },
+    /// Rows of slots now in `state`, each carrying its slot. Rows without a job are ignored.
+    Slots {
+        state: JobState,
+        rows: Vec<DownloadProgress>,
+    },
+    /// The slot's next source; None for a transfer it adopted.
+    Attempt {
+        slot: JobSlot,
+        candidate: Option<DownloadableItem>,
+    },
+    ImportQueued(Box<StoredImport>),
+    /// `next` is Indexing (with `index`), Done (an import with no items, D14), NeedsDecision
+    /// (the import is kept) or Failed.
+    ImportDone(Box<ImportDone>),
+    Indexing {
+        slots: Vec<JobSlot>,
+        wait: Box<IndexWait>,
+    },
+    Dismiss(Vec<JobSlot>),
+    /// A job ended before or without its slots: every unfinished slot takes `state` too.
+    Ended {
+        job: String,
+        state: JobState,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDone {
+    pub import: StoredImport,
+    pub rows: Vec<DownloadProgress>,
+    pub next: JobState,
+    pub index: Option<IndexWait>,
+}
+
 /// How long a search stays its starter's to poll and pick from.
 pub const SEARCH_KEPT_SECS: i64 = 24 * 60 * 60;
 /// How long a finished job stays in the ledger after its last change.
@@ -102,7 +212,7 @@ pub struct NewSearch {
 }
 
 /// What one prune removed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pruned {
     pub searches: u64,
     pub dismissed: u64,
@@ -130,12 +240,40 @@ impl std::fmt::Display for LedgerError {
 #[derive(Clone)]
 pub struct Ledger {
     writes: mpsc::UnboundedSender<Write>,
+    /// No writer reads `writes`: requests are answered at once, events wait for `Recorded`.
+    #[cfg(test)]
+    recording: bool,
 }
 
 impl Ledger {
     fn channel() -> (Ledger, mpsc::UnboundedReceiver<Write>) {
         let (writes, inbox) = mpsc::unbounded_channel();
-        (Ledger { writes }, inbox)
+        let ledger = Ledger {
+            writes,
+            #[cfg(test)]
+            recording: false,
+        };
+        (ledger, inbox)
+    }
+
+    /// A ledger with no writer whose events a test reads. Requests that wait for a reply
+    /// (create, record_search, store_candidates, claim_source_choice, prune, settled) are
+    /// answered at once with Ok and the empty answer (no claimed job, nothing pruned) and
+    /// are not recorded.
+    #[cfg(test)]
+    pub fn recording() -> (Ledger, Recorded) {
+        let (ledger, inbox) = Ledger::channel();
+        let ledger = Ledger {
+            recording: true,
+            ..ledger
+        };
+        (ledger, Recorded { inbox })
+    }
+
+    /// Records `event`. The writer logs one the database refused.
+    pub fn record(&self, event: JobEvent) {
+        // The writer stops only with the runtime.
+        let _ = self.writes.send(Write::Event(event));
     }
 
     /// A ledger whose writer runs on `db` (tests, and start_server_ledger).
@@ -146,7 +284,14 @@ impl Ledger {
     }
 
     /// Sends the write `make` builds around its reply and waits for the answer.
-    async fn write<T>(&self, make: impl FnOnce(Reply<T>) -> Write) -> Result<T, LedgerError> {
+    async fn write<T: Default>(
+        &self,
+        make: impl FnOnce(Reply<T>) -> Write,
+    ) -> Result<T, LedgerError> {
+        #[cfg(test)]
+        if self.recording {
+            return Ok(T::default());
+        }
         let stopped = || LedgerError("the job ledger's writer has stopped".into());
         let (reply, answer) = oneshot::channel();
         self.writes.send(make(reply)).map_err(|_| stopped())?;
@@ -222,6 +367,25 @@ impl Ledger {
     }
 }
 
+/// The events a `Ledger::recording` was given.
+#[cfg(test)]
+pub struct Recorded {
+    inbox: mpsc::UnboundedReceiver<Write>,
+}
+
+#[cfg(test)]
+impl Recorded {
+    /// Every event recorded since the last call.
+    pub fn events(&mut self) -> Vec<JobEvent> {
+        std::iter::from_fn(|| self.inbox.try_recv().ok())
+            .map(|write| match write {
+                Write::Event(event) => event,
+                _ => unreachable!("a recording ledger sends only its events"),
+            })
+            .collect()
+    }
+}
+
 /// LEDGER's writer inbox, until start_server_ledger takes it.
 static SERVER_INBOX: Mutex<Option<mpsc::UnboundedReceiver<Write>>> = Mutex::new(None);
 
@@ -267,6 +431,7 @@ pub fn start_server_ledger() {
 mod tests {
     use super::*;
     use crate::server_fns::download::test_support::{group, item};
+    use shared::download::{DownloadProgress, DownloadState};
 
     async fn ledger() -> (Ledger, SqlitePool, String, String) {
         let db = crate::db::test_db::migrated().await;
@@ -472,6 +637,293 @@ mod tests {
             store::job_state(&db, "running").await,
             Some(JobState::Downloading)
         );
+    }
+
+    #[test]
+    fn a_job_follows_its_earliest_unfinished_slot_and_ends_with_the_last() {
+        use JobState::*;
+        for (slots, job) in [
+            (vec![Downloading, NeedsDecision, Done], Downloading),
+            (vec![Indexing, Importing], Importing),
+            (vec![NeedsDecision, Failed], NeedsDecision),
+            (vec![Done, Failed, Cancelled], Failed),
+            (vec![Done, Dismissed, Cancelled], Done),
+            (vec![Cancelled, Dismissed], Cancelled),
+            (vec![Dismissed, Dismissed], Dismissed),
+        ] {
+            assert_eq!(job_state(&slots), job, "{slots:?}");
+        }
+    }
+
+    fn row_of(
+        job: &str,
+        slot: u32,
+        item: &str,
+        state: DownloadState,
+        transferred: u64,
+    ) -> DownloadProgress {
+        DownloadProgress {
+            transferred,
+            ..DownloadProgress::queued(format!("t-{item}"), "peer_a".into(), item.into(), 100)
+                .with_state(state)
+                .with_job(JobSlot {
+                    job: job.into(),
+                    slot,
+                })
+        }
+    }
+
+    #[tokio::test]
+    async fn slot_rows_move_the_slot_and_its_job() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![
+                (0, item("peer_a", "One", "01.flac")),
+                (1, item("peer_a", "Two", "02.flac")),
+            ],
+        });
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![row_of("j1", 0, "01.flac", DownloadState::InProgress, 10)],
+        });
+        ledger.record(JobEvent::Slots {
+            state: JobState::Failed,
+            rows: vec![row_of(
+                "j1",
+                1,
+                "02.flac",
+                DownloadState::Failed("Per-track timeout".into()),
+                0,
+            )],
+        });
+        ledger.settled().await;
+        assert_eq!(
+            store::job_state(&db, "j1").await,
+            Some(JobState::Downloading)
+        );
+        ledger.record(JobEvent::Slots {
+            state: JobState::Cancelled,
+            rows: vec![row_of("j1", 0, "01.flac", DownloadState::Cancelled, 10)],
+        });
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
+    }
+
+    #[tokio::test]
+    async fn progress_ticks_reach_the_disk_only_when_the_state_changes() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![(0, item("peer_a", "One", "01.flac"))],
+        });
+        for transferred in [10, 20, 30] {
+            ledger.record(JobEvent::Slots {
+                state: JobState::Downloading,
+                rows: vec![row_of(
+                    "j1",
+                    0,
+                    "01.flac",
+                    DownloadState::InProgress,
+                    transferred,
+                )],
+            });
+        }
+        ledger.settled().await;
+        let rows = store::open_rows(&db, &UserId::new("alice")).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.state.clone(), r.transferred))
+                .collect::<Vec<_>>(),
+            vec![(DownloadState::InProgress, 10)]
+        );
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![row_of("j1", 0, "01.flac", DownloadState::Completed, 100)],
+        });
+        ledger.settled().await;
+        let rows = store::open_rows(&db, &UserId::new("alice")).await.unwrap();
+        assert_eq!(
+            (rows[0].state.clone(), rows[0].transferred),
+            (DownloadState::Completed, 100)
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rows_are_the_rows_of_unfinished_jobs_without_dismissed_slots() {
+        let (ledger, db, alice, _) = ledger().await;
+        for id in ["open", "finished"] {
+            ledger
+                .create(job(id, "alice", &alice, JobState::Queued, None), None)
+                .await
+                .unwrap();
+            ledger.record(JobEvent::Picked {
+                job: id.into(),
+                items: vec![
+                    (0, item("peer_a", "One", "01.flac")),
+                    (1, item("peer_a", "Two", "02.flac")),
+                ],
+            });
+        }
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![row_of("open", 0, "01.flac", DownloadState::InProgress, 10)],
+        });
+        ledger.record(JobEvent::Dismiss(vec![JobSlot {
+            job: "open".into(),
+            slot: 1,
+        }]));
+        ledger.record(JobEvent::Ended {
+            job: "finished".into(),
+            state: JobState::Failed,
+        });
+        ledger.settled().await;
+        let rows = store::open_rows(&db, &UserId::new("alice")).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.item.as_str(), r.job.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                "01.flac",
+                Some(JobSlot {
+                    job: "open".into(),
+                    slot: 0
+                })
+            )]
+        );
+        assert!(store::open_rows(&db, &UserId::new("bob"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_import_is_kept_only_for_a_decision_and_an_indexed_one_keeps_its_wait() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![
+                (0, item("peer_a", "One", "01.flac")),
+                (1, item("peer_a", "Two", "02.flac")),
+            ],
+        });
+        let import = |slot: u32, file: &str| StoredImport {
+            sources: vec![PathBuf::from(format!("/downloads/b/{file}"))],
+            target: "/music".into(),
+            album: false,
+            cleanup_root: None,
+            choices: None,
+            rows: vec![(
+                JobSlot {
+                    job: "j1".into(),
+                    slot,
+                },
+                DownloadProgress::queued(format!("t-{file}"), "peer_a".into(), file.into(), 100)
+                    .with_state(DownloadState::ImportQueued(1)),
+            )],
+        };
+        for (slot, file) in [(0, "01.flac"), (1, "02.flac")] {
+            ledger.record(JobEvent::ImportQueued(Box::new(import(slot, file))));
+        }
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Importing));
+        let wait = IndexWait {
+            import: "/downloads/b/01.flac".into(),
+            library: "/music".into(),
+            items: vec![ImportedItem {
+                path: "Zzqx Artist/Qzz Album/01 One.flac".into(),
+                recording_mbid: None,
+                artist: "Zzqx Artist".into(),
+                title: "One".into(),
+            }],
+            since: 0,
+            baseline: None,
+            checked: None,
+        };
+        ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
+            import: import(0, "01.flac"),
+            rows: vec![row_of("j1", 0, "01.flac", DownloadState::Imported, 100)],
+            next: JobState::Indexing,
+            index: Some(wait.clone()),
+        })));
+        ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
+            import: import(1, "02.flac"),
+            rows: vec![row_of(
+                "j1",
+                1,
+                "02.flac",
+                DownloadState::ImportSkipped,
+                100,
+            )],
+            next: JobState::NeedsDecision,
+            index: None,
+        })));
+        ledger.settled().await;
+        let slots: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT state, import_job, index_wait FROM job_tracks WHERE job_id = 'j1' ORDER BY slot",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        let parsed = slots
+            .iter()
+            .map(|(state, import, wait)| {
+                (
+                    state.as_str(),
+                    import.as_deref().map(|j| serde_json::from_str(j).unwrap()),
+                    wait.as_deref().map(|j| serde_json::from_str(j).unwrap()),
+                )
+            })
+            .collect::<Vec<(&str, Option<StoredImport>, Option<IndexWait>)>>();
+        assert_eq!(
+            parsed,
+            vec![
+                ("indexing", None, Some(wait)),
+                ("needs_decision", Some(import(1, "02.flac")), None),
+            ]
+        );
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Indexing));
+        let rows = store::open_rows(&db, &UserId::new("alice")).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.state.clone()).collect::<Vec<_>>(),
+            vec![DownloadState::Imported, DownloadState::ImportSkipped]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recording_ledger_answers_requests_at_once_and_keeps_only_events() {
+        let (ledger, mut recorded) = Ledger::recording();
+        ledger
+            .create(job("j1", "alice", "f1", JobState::Queued, None), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger
+                .claim_source_choice(&UserId::new("alice"), "s1", "f1")
+                .await,
+            Ok(None)
+        );
+        assert_eq!(ledger.prune(0).await, Ok(Pruned::default()));
+        ledger.settled().await;
+        let ended = JobEvent::Ended {
+            job: "j1".into(),
+            state: JobState::Failed,
+        };
+        ledger.record(ended.clone());
+        assert_eq!(recorded.events(), vec![ended]);
+        assert!(recorded.events().is_empty());
     }
 
     #[test]
