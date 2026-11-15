@@ -59,9 +59,8 @@ test('opens the folder menu with a long-press instead of downloading', async ({
   await dispatchPointer(button, 'pointerup');
 
   // Long-press opens the folder picker; the tap-download must NOT have fired,
-  // so the menu lists the folder instead of the row showing a spinner. The
-  // menu shortens long names, so the row is found by its full-name title.
-  await expect(row.getByTitle(folder.name, { exact: true })).toBeVisible();
+  // so the menu lists the folder instead of the row showing a spinner.
+  await expect(row.getByText(folder.name)).toBeVisible();
 });
 
 test('cancels the long-press when the touch turns into a scroll', async ({ context, page }) => {
