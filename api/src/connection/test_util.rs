@@ -17,7 +17,11 @@ use super::ConnectionState;
 use crate::oauth::cimd::{
     client_id_url, parse_document, CimdError, ClientDocument, ClientDocuments,
 };
+use crate::oauth::clients::{find_in, insert_dcr_in, NewClient, DCR_CAP};
+use crate::oauth::codes::{store_code_in, PendingRequest};
+use crate::oauth::grants::CodeRedemption;
 use crate::oauth::limits::Limits;
+use crate::oauth::secrets::new_secret;
 use crate::secret_key::SecretKey;
 
 impl ConnectionState {
@@ -110,6 +114,65 @@ pub(crate) async fn serve_on_loopback(app: Router) -> (SocketAddr, tokio::task::
 
 /// The S256 code challenge of RFC 7636 appendix B.
 pub(crate) const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+/// The code verifier of RFC 7636 appendix B, `CHALLENGE`'s.
+pub(crate) const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+/// The MCP endpoint at `HOST`.
+pub(crate) const RESOURCE: &str = "https://music.example.com/mcp";
+
+/// A request reaching Soulful through a tunnel: it derives
+/// `https://tunnel.example.net`.
+pub(crate) const TUNNEL: &[(&str, &str)] = &[
+    ("host", "soulful:9765"),
+    ("x-forwarded-host", "tunnel.example.net"),
+    ("x-forwarded-proto", "https"),
+];
+
+/// A code of `user_id` (who must exist) for the registered client `dcr_c`,
+/// `CLAUDE_CALLBACK`, `CHALLENGE`, `scope` and `resource`, issued at `at`;
+/// `dcr_c` is registered at `at` when it is not yet known.
+pub(crate) async fn issue_code(
+    db: &SqlitePool,
+    user_id: &str,
+    scope: &str,
+    resource: &str,
+    at: i64,
+) -> String {
+    if find_in(db, "dcr_c").await.unwrap().is_none() {
+        let client = NewClient {
+            client_name: Some("Claude".into()),
+            redirect_uris: vec![CLAUDE_CALLBACK.into()],
+        };
+        insert_dcr_in(db, "dcr_c", &client, at, DCR_CAP)
+            .await
+            .unwrap();
+    }
+    let request = PendingRequest {
+        user_id: user_id.into(),
+        client: find_in(db, "dcr_c").await.unwrap().unwrap(),
+        redirect_uri: CLAUDE_CALLBACK.into(),
+        state: None,
+        code_challenge: CHALLENGE.into(),
+        scope: scope.into(),
+        resource: resource.into(),
+    };
+    let code = new_secret();
+    store_code_in(db, &code, &request, at).await.unwrap();
+    code
+}
+
+/// The redemption of `code` that `issue_code` issued: `dcr_c`,
+/// `CLAUDE_CALLBACK`, `VERIFIER`, `RESOURCE`.
+pub(crate) fn good(code: &str) -> CodeRedemption<'_> {
+    CodeRedemption {
+        code,
+        client_id: "dcr_c",
+        redirect_uri: CLAUDE_CALLBACK,
+        verifier: VERIFIER,
+        resource: RESOURCE,
+    }
+}
 
 /// The key `ConnectionState::for_test` signs and checks sessions with.
 pub(crate) fn test_key() -> &'static SecretKey {

@@ -44,7 +44,9 @@ pub static DB: Lazy<SqlitePool> = Lazy::new(|| async move {
 #[cfg(all(test, feature = "server"))]
 pub(crate) mod test_db {
     use super::MIGRATOR;
-    use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::SqlitePool;
+    use std::path::Path;
 
     pub const HARDENING: i64 = 20261114000000;
     pub const USERNAME_CASE: i64 = 20261115000001;
@@ -63,6 +65,22 @@ pub(crate) mod test_db {
 
     pub async fn migrated() -> SqlitePool {
         let pool = empty().await;
+        MIGRATOR.run(&pool).await.expect("migrations");
+        pool
+    }
+
+    /// A migrated database in `dir/oauth.db` with up to 4 connections, for
+    /// tests of writers running at once (`migrated` has one connection, which
+    /// serializes them).
+    pub async fn migrated_file(dir: &Path) -> SqlitePool {
+        let options = SqliteConnectOptions::new()
+            .filename(dir.join("oauth.db"))
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("file database");
         MIGRATOR.run(&pool).await.expect("migrations");
         pool
     }
@@ -386,6 +404,17 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_database_holds_four_connections_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db::migrated_file(dir.path()).await;
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(db.acquire().await.unwrap());
+        }
+        assert_eq!(db.size(), 4);
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ use super::consent::{consent_page, error_page, ConsentView};
 use super::limits::retry_after_seconds;
 use super::metadata::mcp_url;
 use super::secrets::new_secret;
-use super::{now_unix, resource_matches, OFFLINE_ACCESS, SCOPE};
+use super::{now_unix, resource_matches, Params, OFFLINE_ACCESS, SCOPE};
 use crate::auth::UserCtx;
 use crate::base_url::BaseUrl;
 use crate::connection::{ConnectionState, RequestBase};
@@ -57,41 +57,17 @@ const NOT_UNDERSTOOD: &str =
 const DATABASE_UNAVAILABLE: &str =
     "Soulful's database is unavailable. Start the connection again from the app.";
 
-/// The parameters Soulful reads from a query or form. Following RFC 6749
-/// section 3.1, a parameter without a value counts as absent, other
-/// parameters are ignored, and one sent twice refuses the request.
-struct Params(Vec<(&'static str, String)>);
-
-impl Params {
-    fn read(raw: &[u8], names: &[&'static str]) -> Result<Params, Response> {
-        let mut found: Vec<(&'static str, String)> = Vec::new();
-        for (name, value) in url::form_urlencoded::parse(raw) {
-            let Some(&name) = names.iter().find(|n| **n == name) else {
-                continue;
-            };
-            if value.is_empty() {
-                continue;
-            }
-            if found.iter().any(|(seen, _)| *seen == name) {
-                return Err(error_page(
-                    StatusCode::BAD_REQUEST,
-                    &format!(
-                        "This app sent {name} more than once. Start the connection again from \
-                         the app."
-                    ),
-                ));
-            }
-            found.push((name, value.into_owned()));
-        }
-        Ok(Params(found))
-    }
-
-    fn get(&self, name: &str) -> Option<&str> {
-        self.0
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, value)| value.as_str())
-    }
+/// The parameters of `raw` named in `names`, or the page refusing a request
+/// that sent one twice.
+fn read_params(raw: &[u8], names: &[&'static str]) -> Result<Params, Response> {
+    Params::read(raw, names).map_err(|name| {
+        error_page(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "This app sent {name} more than once. Start the connection again from the app."
+            ),
+        )
+    })
 }
 
 /// The user the session cookie signs in, if it still counts.
@@ -110,7 +86,7 @@ pub(crate) async fn show(
     cookies: Cookies,
     uri: Uri,
 ) -> Response {
-    let params = match Params::read(uri.query().unwrap_or("").as_bytes(), AUTHORIZE_PARAMS) {
+    let params = match read_params(uri.query().unwrap_or("").as_bytes(), AUTHORIZE_PARAMS) {
         Ok(params) => params,
         Err(refused) => return refused,
     };
@@ -283,7 +259,7 @@ pub(crate) async fn answer(
     cookies: Cookies,
     body: Bytes,
 ) -> Response {
-    let params = match Params::read(&body, ANSWER_PARAMS) {
+    let params = match read_params(&body, ANSWER_PARAMS) {
         Ok(params) => params,
         Err(refused) => return refused,
     };

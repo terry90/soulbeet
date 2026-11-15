@@ -61,6 +61,7 @@ fn main() {
             api::core::reconcile::start().await;
             // Start background cleanup task for user channels
             api::globals::start_channel_cleanup_task();
+            api::oauth::start_prune_task();
             // Check the beets config in the background; never awaited here.
             api::importer_health::start_startup_probe();
 

@@ -1,8 +1,10 @@
 //! The OAuth 2.1 authorization server Claude connects through.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::http::header::{CONTENT_TYPE, RETRY_AFTER};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -17,10 +19,12 @@ pub(crate) mod cimd;
 pub(crate) mod clients;
 pub(crate) mod codes;
 pub(crate) mod consent;
+pub(crate) mod grants;
 pub(crate) mod limits;
 pub(crate) mod metadata;
 pub(crate) mod register;
 pub(crate) mod secrets;
+pub(crate) mod token;
 
 /// The scope every grant carries.
 pub(crate) const SCOPE: &str = "soulful";
@@ -49,7 +53,12 @@ pub(crate) fn routes() -> Router<Arc<ConnectionState>> {
             shared::oauth::AUTHORIZE_PATH,
             get(authorize::show).post(authorize::answer),
         )
+        .route("/oauth/token", post(token::token))
+        .route("/oauth/revoke", post(token::revoke))
 }
+
+/// How often `start_prune_task` prunes (D4).
+const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
 /// An OAuth error answer, `{"error", "error_description"}` (RFC 6749
 /// section 5.2, RFC 7591 section 3.2.2).
@@ -60,6 +69,85 @@ pub(crate) fn oauth_error(
 ) -> Response {
     let body = json!({ "error": error, "error_description": description.into() });
     (status, Json(body)).into_response()
+}
+
+/// A 429 `rate_limited` answer with `Retry-After`, saying "{what}. Try
+/// again in {n} seconds."
+pub(crate) fn rate_limited(wait: Duration, what: &str) -> Response {
+    let seconds = limits::retry_after_seconds(wait);
+    let mut refused = oauth_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        format!("{what}. Try again in {seconds} seconds."),
+    );
+    refused.headers_mut().insert(RETRY_AFTER, seconds.into());
+    refused
+}
+
+/// The request's media type is `essence`, parameters aside.
+pub(crate) fn has_media_type(headers: &HeaderMap, essence: &str) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|sent| sent.trim().eq_ignore_ascii_case(essence))
+}
+
+/// The parameters Soulful reads from a query or form. Following RFC 6749
+/// sections 3.1 and 3.2, a parameter without a value counts as absent and
+/// other parameters are ignored.
+pub(crate) struct Params(Vec<(&'static str, String)>);
+
+impl Params {
+    /// The parameters of `raw` named in `names`; Err is the first one sent
+    /// more than once.
+    pub(crate) fn read(raw: &[u8], names: &[&'static str]) -> Result<Params, &'static str> {
+        let mut found: Vec<(&'static str, String)> = Vec::new();
+        for (name, value) in url::form_urlencoded::parse(raw) {
+            let Some(&name) = names.iter().find(|n| **n == name) else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            if found.iter().any(|(seen, _)| *seen == name) {
+                return Err(name);
+            }
+            found.push((name, value.into_owned()));
+        }
+        Ok(Params(found))
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Prunes expired OAuth state from the database now and every hour (D4).
+pub fn start_prune_task() {
+    tokio::spawn(async {
+        let mut every = tokio::time::interval(PRUNE_EVERY);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            every.tick().await;
+            match grants::prune_in(&crate::db::DB, now_unix()).await {
+                Ok(grants::Pruned {
+                    requests,
+                    codes,
+                    tokens,
+                    grants,
+                    clients,
+                }) => tracing::debug!(
+                    "Pruned OAuth state: {requests} consent requests, {codes} codes, \
+                     {tokens} tokens, {grants} grants, {clients} clients"
+                ),
+                Err(e) => tracing::error!("Could not prune OAuth state: {e}"),
+            }
+        }
+    });
 }
 
 /// `sent` names the MCP endpoint at `base`: once parsed it is

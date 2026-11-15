@@ -2,7 +2,10 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+
+use crate::secret_key::SecretKey;
 
 /// 32 random bytes in unpadded base64url, 43 characters (D3).
 pub(crate) fn new_secret() -> String {
@@ -15,6 +18,38 @@ pub(crate) fn hash(secret: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// The S256 code challenge of `verifier`: base64url(SHA-256(verifier))
+/// without padding (RFC 7636 section 4.2).
+pub(crate) fn s256(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// 43 to 128 characters of `[A-Za-z0-9-._~]` (RFC 7636 section 4.1).
+pub(crate) fn valid_verifier(verifier: &str) -> bool {
+    (43..=128).contains(&verifier.len())
+        && verifier
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~'))
+}
+
+/// The (access, refresh) pair that replaces refresh token `refresh`: each an
+/// HMAC-SHA256 of `refresh` under `key` with its own label, in unpadded
+/// base64url (D3). A repeat of `refresh` recomputes the same pair, so no
+/// token is ever stored in the clear.
+pub(crate) fn successor(key: &SecretKey, refresh: &str) -> (String, String) {
+    let derive = |label: &[u8]| {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes a key of any length");
+        mac.update(label);
+        mac.update(refresh.as_bytes());
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    };
+    (
+        derive(b"soulful-oauth-successor-access\0"),
+        derive(b"soulful-oauth-successor-refresh\0"),
+    )
 }
 
 #[cfg(test)]
@@ -31,6 +66,37 @@ mod tests {
                     .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
             "{a}"
         );
+    }
+
+    #[test]
+    fn pkce_s256_matches_rfc_7636_appendix_b() {
+        assert_eq!(
+            s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        assert!(valid_verifier(
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        ));
+        assert!(
+            !valid_verifier(&"a".repeat(42))
+                && valid_verifier(&"a".repeat(128))
+                && !valid_verifier(&"a".repeat(129))
+        );
+        assert!(
+            valid_verifier(&format!("{}~._-", "a".repeat(40)))
+                && !valid_verifier(&format!("{}+", "a".repeat(43)))
+        );
+    }
+
+    #[test]
+    fn a_successor_depends_on_the_token_and_the_key() {
+        let k1 = SecretKey::new("k".repeat(32));
+        let k2 = SecretKey::new("j".repeat(32));
+        let r = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(successor(&k1, r), successor(&k1, r));
+        assert_ne!(successor(&k1, r), successor(&k2, r));
+        let (a, b) = successor(&k1, r);
+        assert!(a != b && a.len() == 43 && b.len() == 43);
     }
 
     #[test]

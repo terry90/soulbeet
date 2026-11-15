@@ -37,6 +37,7 @@ tracing = "0.1.41"
 axum = { version = "0.8.7", optional = true }
 aes-gcm = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12.1", optional = true }
 base64 = { version = "0.22", optional = true }
 futures = { version = "0.3", optional = true }
 async-trait = { version = "0.1", optional = true }
@@ -67,6 +68,7 @@ server = [
   "dep:axum",
   "dep:aes-gcm",
   "dep:sha2",
+  "dep:hmac",
   "dep:base64",
   "dep:futures",
   "dep:async-trait",

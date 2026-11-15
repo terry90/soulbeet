@@ -72,6 +72,11 @@ pub(crate) struct Limits {
     pub(crate) register: WindowLimiter,
     /// Client metadata document fetches, per signed-in user id.
     pub(crate) cimd_fetch: WindowLimiter,
+    /// Token requests naming a code or refresh token of the client, per
+    /// client id.
+    pub(crate) token_client: WindowLimiter,
+    /// Refreshes, per grant id.
+    pub(crate) token_grant: WindowLimiter,
 }
 
 impl Default for Limits {
@@ -79,6 +84,8 @@ impl Default for Limits {
         Limits {
             register: WindowLimiter::new(30, Duration::from_secs(3600)),
             cimd_fetch: WindowLimiter::new(10, Duration::from_secs(60)),
+            token_client: WindowLimiter::new(30, Duration::from_secs(60)),
+            token_grant: WindowLimiter::new(10, Duration::from_secs(60)),
         }
     }
 }

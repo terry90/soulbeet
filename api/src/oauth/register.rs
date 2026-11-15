@@ -6,16 +6,14 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{CONTENT_TYPE, RETRY_AFTER};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Map, Value};
 
 use super::clients::{insert_dcr_in, redirect_uri_allowed, InsertRefusal, NewClient, DCR_CAP};
-use super::limits::retry_after_seconds;
 use super::secrets::new_secret;
-use super::{now_unix, oauth_error};
+use super::{has_media_type, now_unix, oauth_error, rate_limited};
 use crate::connection::ConnectionState;
 
 /// Room for 10 redirect URIs of 2,000 characters and the other members a
@@ -30,18 +28,11 @@ pub(crate) async fn register(
     request: Request,
 ) -> Response {
     if let Err(wait) = state.limits.register.admit("register", Instant::now()) {
-        let seconds = retry_after_seconds(wait);
-        let mut refused = oauth_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            format!("Too many app registrations on this server. Try again in {seconds} seconds."),
-        );
-        refused.headers_mut().insert(RETRY_AFTER, seconds.into());
-        return refused;
+        return rate_limited(wait, "Too many app registrations on this server");
     }
     // RFC 7591 3.1 registers with application/json. A cross-site form can
     // post text/plain without a preflight.
-    if !is_json(request.headers()) {
+    if !has_media_type(request.headers(), "application/json") {
         return invalid_metadata("The registration must be sent as application/json");
     }
     let client = match read_client(request.into_body()).await {
@@ -85,15 +76,6 @@ pub(crate) async fn register(
     );
     doc.insert("response_types".into(), json!(["code"]));
     (StatusCode::CREATED, Json(Value::Object(doc))).into_response()
-}
-
-/// The media type's essence is `application/json`, parameters aside.
-fn is_json(headers: &HeaderMap) -> bool {
-    headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"))
 }
 
 fn invalid_metadata(description: &str) -> Response {
