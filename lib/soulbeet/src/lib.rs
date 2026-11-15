@@ -13,7 +13,7 @@ pub mod traits;
 
 pub use lastfm::LastFmProvider;
 pub use listenbrainz::ListenBrainzProvider;
-pub use navidrome::{NavidromeClient, NavidromeClientBuilder};
+pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
 pub use services::{Services, ServicesBuilder};
 pub use traits::{
     CandidateGenerator, DownloadBackend, DriverChoice, FallbackMetadataProvider, ImportMode,

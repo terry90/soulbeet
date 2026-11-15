@@ -3,9 +3,9 @@ use std::time::Duration as StdDuration;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::error::{Result, SoulseekError};
 use crate::http::{resolve_docker_url, CircuitBreaker};
 
+use super::error::{NavidromeError, Result};
 use super::models::*;
 
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -50,28 +50,25 @@ impl NavidromeClientBuilder {
     }
 
     pub fn build(self) -> Result<NavidromeClient> {
-        let base_url_str = self.base_url.ok_or(SoulseekError::NotConfigured)?;
+        let base_url_str = self
+            .base_url
+            .ok_or_else(|| NavidromeError::Config("base URL missing".to_string()))?;
         let mut normalized = base_url_str.trim_end_matches('/').to_string();
         normalized.push('/');
         let base_url = Url::parse(&normalized)?;
-        let username = self.username.ok_or_else(|| SoulseekError::Api {
-            status: 0,
-            message: "Navidrome username not configured".to_string(),
-        })?;
-        let password = self.password.ok_or_else(|| SoulseekError::Api {
-            status: 0,
-            message: "Navidrome password not configured".to_string(),
-        })?;
+        let username = self
+            .username
+            .ok_or_else(|| NavidromeError::Config("username missing".to_string()))?;
+        let password = self
+            .password
+            .ok_or_else(|| NavidromeError::Config("password missing".to_string()))?;
 
         let client = Client::builder()
             .connect_timeout(StdDuration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
             .timeout(StdDuration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
             .pool_idle_timeout(StdDuration::from_secs(90))
             .build()
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("Failed to build HTTP client: {}", e),
-            })?;
+            .map_err(|e| NavidromeError::Config(format!("HTTP client cannot be built: {e}")))?;
 
         Ok(NavidromeClient {
             base_url,
@@ -114,19 +111,10 @@ impl NavidromeClient {
     ) -> Result<T> {
         if self.circuit_breaker.is_open().await {
             warn!("Circuit breaker open, rejecting request to {}", endpoint);
-            return Err(SoulseekError::Api {
-                status: 503,
-                message: "Circuit breaker open - Navidrome appears unavailable".to_string(),
-            });
+            return Err(NavidromeError::CircuitOpen);
         }
 
-        let mut url = self
-            .base_url
-            .join(&format!("rest/{}", endpoint))
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("URL error: {}", e),
-            })?;
+        let mut url = self.base_url.join(&format!("rest/{}", endpoint))?;
 
         {
             let mut query = url.query_pairs_mut();
@@ -146,37 +134,30 @@ impl NavidromeClient {
             Ok(resp) => resp,
             Err(e) => {
                 self.circuit_breaker.record_failure().await;
-                return Err(SoulseekError::Api {
-                    status: if e.is_timeout() { 408 } else { 503 },
-                    message: format!("Navidrome request failed: {}", e.without_url()),
-                });
+                return Err(transport(e));
             }
         };
 
         if !response.status().is_success() {
             self.circuit_breaker.record_failure().await;
-            return Err(SoulseekError::Api {
+            return Err(NavidromeError::Http {
+                action: "Navidrome request",
                 status: response.status().as_u16(),
-                message: format!("Navidrome HTTP error: {}", response.status()),
+                body: None,
             });
         }
 
         self.circuit_breaker.record_success().await;
 
-        let envelope: SubsonicEnvelope<T> =
-            response.json().await.map_err(|e| SoulseekError::Api {
-                status: 500,
-                message: format!("Failed to parse Navidrome response: {}", e.without_url()),
-            })?;
+        let envelope: SubsonicEnvelope<T> = response.json().await.map_err(parse)?;
 
         if envelope.response.status != "ok" {
-            let err = envelope.response.error.unwrap_or(SubsonicError {
-                code: 0,
-                message: "Unknown error".to_string(),
-            });
-            return Err(SoulseekError::Api {
-                status: err.code as u16,
-                message: err.message,
+            return Err(match envelope.response.error {
+                Some(SubsonicError { code, message }) => NavidromeError::Subsonic { code, message },
+                None => NavidromeError::Parse(format!(
+                    "status '{}' without an error",
+                    envelope.response.status
+                )),
             });
         }
 
@@ -243,10 +224,8 @@ impl NavidromeClient {
 
     pub async fn get_album(&self, id: &str) -> Result<SubsonicAlbumDetail> {
         let body: AlbumBody = self.get("getAlbum", &[("id", id)]).await?;
-        body.album.ok_or_else(|| SoulseekError::Api {
-            status: 404,
-            message: format!("Album {} not found", id),
-        })
+        body.album
+            .ok_or_else(|| NavidromeError::Missing(format!("Album {} not found", id)))
     }
 
     pub async fn get_all_songs_with_ratings(&self) -> Result<Vec<SubsonicSong>> {
@@ -276,9 +255,8 @@ impl NavidromeClient {
             params.push(("songId", id));
         }
         let body: PlaylistBody = self.get("createPlaylist", &params).await?;
-        body.playlist.ok_or_else(|| SoulseekError::Api {
-            status: 500,
-            message: "No playlist returned after creation".to_string(),
+        body.playlist.ok_or_else(|| {
+            NavidromeError::Missing("No playlist returned after creation".to_string())
         })
     }
 
@@ -369,13 +347,7 @@ impl NavidromeClient {
 
     /// Fetch a fresh JWT token from Navidrome, replacing any cached value.
     async fn native_login_fresh(&self) -> Result<String> {
-        let url = self
-            .base_url
-            .join("auth/login")
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("URL error: {}", e),
-            })?;
+        let url = self.base_url.join("auth/login")?;
 
         #[derive(serde::Serialize)]
         struct LoginReq {
@@ -396,22 +368,17 @@ impl NavidromeClient {
             })
             .send()
             .await
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("Native login failed: {}", e),
-            })?;
+            .map_err(transport)?;
 
         if !resp.status().is_success() {
-            return Err(SoulseekError::Api {
+            return Err(NavidromeError::Http {
+                action: "Navidrome native login",
                 status: resp.status().as_u16(),
-                message: "Navidrome native login failed".to_string(),
+                body: None,
             });
         }
 
-        let login: LoginResp = resp.json().await.map_err(|e| SoulseekError::Api {
-            status: 0,
-            message: format!("Failed to parse login response: {}", e),
-        })?;
+        let login: LoginResp = resp.json().await.map_err(parse)?;
         *self.native_token.lock().await = Some(login.token.clone());
         Ok(login.token)
     }
@@ -425,24 +392,12 @@ impl NavidromeClient {
 
         let token = self.native_token().await?;
         let retry_req = req.try_clone();
-        let resp = send(req, &token)
-            .send()
-            .await
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("Native API request failed: {}", e),
-            })?;
+        let resp = send(req, &token).send().await.map_err(transport)?;
 
         if resp.status().as_u16() == 401 {
             if let Some(retry_req) = retry_req {
                 let token = self.native_login_fresh().await?;
-                return send(retry_req, &token)
-                    .send()
-                    .await
-                    .map_err(|e| SoulseekError::Api {
-                        status: 0,
-                        message: format!("Native API request failed: {}", e),
-                    });
+                return send(retry_req, &token).send().await.map_err(transport);
             }
         }
 
@@ -456,13 +411,7 @@ impl NavidromeClient {
         comment: &str,
         filepath_contains: &str,
     ) -> Result<String> {
-        let url = self
-            .base_url
-            .join("api/playlist")
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("URL error: {}", e),
-            })?;
+        let url = self.base_url.join("api/playlist")?;
 
         let body = serde_json::json!({
             "name": name,
@@ -484,9 +433,10 @@ impl NavidromeClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(SoulseekError::Api {
+            return Err(NavidromeError::Http {
+                action: "Create smart playlist",
                 status,
-                message: format!("Create smart playlist failed ({}): {}", status, body),
+                body: Some(body),
             });
         }
 
@@ -495,10 +445,7 @@ impl NavidromeClient {
             id: String,
         }
 
-        let pl: PlaylistResp = resp.json().await.map_err(|e| SoulseekError::Api {
-            status: 0,
-            message: format!("Failed to parse playlist response: {}", e),
-        })?;
+        let pl: PlaylistResp = resp.json().await.map_err(parse)?;
         Ok(pl.id)
     }
 
@@ -506,19 +453,15 @@ impl NavidromeClient {
     pub async fn delete_smart_playlist(&self, playlist_id: &str) -> Result<()> {
         let url = self
             .base_url
-            .join(&format!("api/playlist/{}", playlist_id))
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("URL error: {}", e),
-            })?;
+            .join(&format!("api/playlist/{}", playlist_id))?;
 
         let resp = self.native_request(self.client.delete(url)).await?;
 
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            return Err(SoulseekError::Api {
-                status,
-                message: format!("Delete smart playlist failed ({})", status),
+            return Err(NavidromeError::Http {
+                action: "Delete smart playlist",
+                status: resp.status().as_u16(),
+                body: None,
             });
         }
 
@@ -533,13 +476,7 @@ impl NavidromeClient {
         prefix: &str,
         limit: u32,
     ) -> Result<Vec<NativeSong>> {
-        let url = self
-            .base_url
-            .join("api/song")
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("URL error: {}", e),
-            })?;
+        let url = self.base_url.join("api/song")?;
 
         let resp = self
             .native_request(self.client.get(url).query(&[
@@ -551,17 +488,14 @@ impl NavidromeClient {
             .await?;
 
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            return Err(SoulseekError::Api {
-                status,
-                message: format!("Get songs failed ({})", status),
+            return Err(NavidromeError::Http {
+                action: "Get songs",
+                status: resp.status().as_u16(),
+                body: None,
             });
         }
 
-        let songs: Vec<NativeSong> = resp.json().await.map_err(|e| SoulseekError::Api {
-            status: 0,
-            message: format!("Failed to parse songs response: {}", e),
-        })?;
+        let songs: Vec<NativeSong> = resp.json().await.map_err(parse)?;
 
         Ok(songs
             .into_iter()
@@ -572,34 +506,118 @@ impl NavidromeClient {
     /// List all players visible to the authenticated user via Navidrome's native API.
     /// Non-admin users only see their own players.
     pub async fn get_players(&self) -> Result<Vec<PlayerInfo>> {
-        let url = self
-            .base_url
-            .join("api/player")
-            .map_err(|e| SoulseekError::Api {
-                status: 0,
-                message: format!("URL error: {}", e),
-            })?;
+        let url = self.base_url.join("api/player")?;
 
         let resp = self.native_request(self.client.get(url)).await?;
 
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            return Err(SoulseekError::Api {
-                status,
-                message: format!("Get players failed ({})", status),
+            return Err(NavidromeError::Http {
+                action: "Get players",
+                status: resp.status().as_u16(),
+                body: None,
             });
         }
 
-        resp.json().await.map_err(|e| SoulseekError::Api {
-            status: 0,
-            message: format!("Failed to parse players response: {}", e),
-        })
+        resp.json().await.map_err(parse)
     }
+}
+
+/// A request that got no HTTP answer, without the URL it was sent to.
+fn transport(e: reqwest::Error) -> NavidromeError {
+    NavidromeError::Transport(e.without_url().to_string())
+}
+
+/// An answer that could not be read, without the URL it came from.
+fn parse(e: reqwest::Error) -> NavidromeError {
+    NavidromeError::Parse(e.without_url().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+
+    fn client(base_url: &str) -> NavidromeClient {
+        NavidromeClientBuilder::new()
+            .base_url(base_url)
+            .username("alice")
+            .password("secret-password")
+            .build()
+            .unwrap()
+    }
+
+    /// A local address that answers one request with `status` and `body`.
+    fn serve_once(status: &'static str, body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        url
+    }
+
+    /// Navidrome's answer to a Subsonic request it refuses with `code`
+    /// (server/subsonic/api.go `sendError`, always HTTP 200).
+    fn subsonic_failure(code: u32) -> &'static str {
+        match code {
+            40 => {
+                r#"{"subsonic-response":{"status":"failed","version":"1.16.1","type":"navidrome","serverVersion":"0.58.0","openSubsonic":true,"error":{"code":40,"message":"Wrong username or password"}}}"#
+            }
+            10 => {
+                r#"{"subsonic-response":{"status":"failed","version":"1.16.1","type":"navidrome","serverVersion":"0.58.0","openSubsonic":true,"error":{"code":10,"message":"required 'u' parameter is missing"}}}"#
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_login_is_subsonic_error_40() {
+        let url = serve_once("200 OK", subsonic_failure(40));
+        let err = client(&url).ping().await.unwrap_err();
+        assert!(
+            matches!(err, NavidromeError::Subsonic { code: 40, .. }),
+            "{err:?}"
+        );
+        assert!(err.is_wrong_credentials());
+    }
+
+    #[tokio::test]
+    async fn another_subsonic_error_keeps_its_code_and_is_not_a_refusal() {
+        let url = serve_once("200 OK", subsonic_failure(10));
+        let err = client(&url).ping().await.unwrap_err();
+        assert!(
+            matches!(err, NavidromeError::Subsonic { code: 10, .. }),
+            "{err:?}"
+        );
+        assert!(!err.is_wrong_credentials());
+    }
+
+    #[tokio::test]
+    async fn a_proxy_error_is_an_http_status() {
+        let url = serve_once("502 Bad Gateway", "<html>Bad Gateway</html>");
+        let err = client(&url).ping().await.unwrap_err();
+        assert!(
+            matches!(err, NavidromeError::Http { status: 502, .. }),
+            "{err:?}"
+        );
+        assert!(!err.is_wrong_credentials());
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_subsonic_is_a_parse_error() {
+        let url = serve_once("200 OK", "<html>a login page</html>");
+        let err = client(&url).ping().await.unwrap_err();
+        assert!(matches!(err, NavidromeError::Parse(_)), "{err:?}");
+        assert!(!err.is_wrong_credentials());
+    }
 
     #[tokio::test]
     async fn a_failed_request_does_not_reveal_the_subsonic_token() {
@@ -609,15 +627,13 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let client = NavidromeClientBuilder::new()
-            .base_url(&format!("http://127.0.0.1:{port}"))
-            .username("alice")
-            .password("secret-password")
-            .build()
-            .unwrap();
+        let err = client(&format!("http://127.0.0.1:{port}"))
+            .ping()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NavidromeError::Transport(_)), "{err:?}");
 
-        let message = client.ping().await.unwrap_err().to_string();
-
+        let message = err.to_string();
         assert!(message.contains("Navidrome request failed"), "{message}");
         for leak in ["u=alice", "t=", "s=", "rest/ping"] {
             assert!(!message.contains(leak), "{leak} in {message}");

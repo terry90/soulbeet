@@ -144,22 +144,22 @@ pub async fn register(username: String, password: String) -> Result<(), ServerFn
 
 /// Categorized result of a Navidrome ping attempt.
 #[cfg(feature = "server")]
+#[derive(Debug)]
 enum NavidromeAuthResult {
     /// Credentials accepted by Navidrome.
     Success,
-    /// Navidrome responded but credentials were wrong (Subsonic error code 40).
+    /// Navidrome refused the credentials (Subsonic error code 40).
     AuthFailed,
-    /// Navidrome could not be reached (network / timeout / circuit breaker).
+    /// Navidrome gave no verdict on the credentials: it could not be reached,
+    /// a proxy in front of it answered with an HTTP error, its answer could
+    /// not be read, or it sent a Subsonic error other than 40.
     Unreachable,
     /// NAVIDROME_URL is unset or empty: this instance runs without Navidrome.
     NotConfigured,
 }
 
-/// Try to authenticate against Navidrome with the given credentials.
-///
-/// Builds a temporary NavidromeClient and calls `ping()`. The error type from
-/// soulbeet lets us distinguish auth rejection (Subsonic error codes) from
-/// network failures (status 408, 503, or request-level errors).
+/// Try to authenticate against Navidrome with the given credentials, with a
+/// temporary client's `ping()`.
 #[cfg(feature = "server")]
 async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResult {
     use soulbeet::NavidromeClientBuilder;
@@ -168,33 +168,38 @@ async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResu
         return NavidromeAuthResult::NotConfigured;
     };
 
-    let client = match NavidromeClientBuilder::new()
+    let ping = match NavidromeClientBuilder::new()
         .base_url(url)
         .username(username)
         .password(password)
         .build()
     {
-        Ok(c) => c,
-        Err(_) => return NavidromeAuthResult::Unreachable,
+        Ok(client) => client.ping().await,
+        Err(e) => Err(e),
     };
-
-    match client.ping().await {
-        Ok(()) => NavidromeAuthResult::Success,
-        Err(e) => {
-            let err_str = e.to_string();
-            // Network-level failures include timeouts (408), service unavailable
-            // (503), and connection errors. Subsonic auth failures produce API
-            // error code 40 ("Wrong username or password") with a lower status.
-            if err_str.contains("Navidrome request failed")
-                || err_str.contains("Circuit breaker open")
-            {
-                tracing::warn!("Navidrome unreachable during login: {}", err_str);
-                NavidromeAuthResult::Unreachable
-            } else {
-                tracing::info!("Navidrome auth failed for {}: {}", username, err_str);
-                NavidromeAuthResult::AuthFailed
+    let result = ping_verdict(&ping);
+    if let Err(e) = &ping {
+        match result {
+            NavidromeAuthResult::AuthFailed => {
+                tracing::info!("Navidrome refused the credentials for {username}: {e}")
             }
+            _ => tracing::warn!("Navidrome gave no verdict during login: {e}"),
         }
+    }
+    result
+}
+
+/// What a login ping's outcome says about the credentials. Only Navidrome's
+/// own refusal counts against them. Navidrome sends no other code for a
+/// login ping that would: 10 means a required parameter was missing, 0 an
+/// internal error, and 41 (token authentication not supported) does not
+/// exist in Navidrome, which always accepts tokens.
+#[cfg(feature = "server")]
+fn ping_verdict(ping: &Result<(), soulbeet::NavidromeError>) -> NavidromeAuthResult {
+    match ping {
+        Ok(()) => NavidromeAuthResult::Success,
+        Err(e) if e.is_wrong_credentials() => NavidromeAuthResult::AuthFailed,
+        Err(_) => NavidromeAuthResult::Unreachable,
     }
 }
 
@@ -1263,6 +1268,67 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn only_navidromes_own_refusal_is_a_failed_login() {
+        use soulbeet::NavidromeError as E;
+        let verdict = |e: E| ping_verdict(&Err(e));
+        let subsonic = |code| E::Subsonic {
+            code,
+            message: "from Navidrome".to_string(),
+        };
+
+        assert!(matches!(
+            ping_verdict(&Ok(())),
+            NavidromeAuthResult::Success
+        ));
+        assert!(matches!(
+            verdict(subsonic(40)),
+            NavidromeAuthResult::AuthFailed
+        ));
+
+        let no_verdict = [
+            // Missing parameter, generic error, and codes Navidrome never
+            // sends for a ping.
+            subsonic(10),
+            subsonic(0),
+            subsonic(41),
+            subsonic(50),
+            // A proxy in front of a Navidrome that is down.
+            E::Http {
+                action: "Navidrome request",
+                status: 502,
+                body: None,
+            },
+            E::Http {
+                action: "Navidrome request",
+                status: 503,
+                body: None,
+            },
+            E::Http {
+                action: "Navidrome request",
+                status: 504,
+                body: None,
+            },
+            E::Http {
+                action: "Navidrome request",
+                status: 401,
+                body: None,
+            },
+            E::Parse("expected value at line 1 column 1".to_string()),
+            E::Url(url::ParseError::EmptyHost),
+            E::Config("base URL missing".to_string()),
+            E::Transport("connection refused".to_string()),
+            E::CircuitOpen,
+        ];
+        for e in no_verdict {
+            let shown = format!("{e:?}");
+            assert!(
+                matches!(verdict(e), NavidromeAuthResult::Unreachable),
+                "{shown}"
+            );
+        }
     }
 
     #[tokio::test]

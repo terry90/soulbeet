@@ -30,17 +30,15 @@ pub async fn get_system_health() -> Result<SystemHealth, ServerFnError> {
         let navidrome_online = match navidrome_client_for_user(&auth.0.user_id).await {
             Ok(client) => match client.ping().await {
                 Ok(()) => true,
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("Circuit breaker open") {
-                        debug!(
-                            "Evicted stale Navidrome client for user {} after circuit-breaker-open ping",
-                            auth.0.user_id
-                        );
-                        evict_navidrome_client(&auth.0.user_id).await;
-                    }
+                Err(soulbeet::NavidromeError::CircuitOpen) => {
+                    debug!(
+                        "Evicted stale Navidrome client for user {} after circuit-breaker-open ping",
+                        auth.0.user_id
+                    );
+                    evict_navidrome_client(&auth.0.user_id).await;
                     false
                 }
+                Err(_) => false,
             },
             Err(_) => false,
         };
