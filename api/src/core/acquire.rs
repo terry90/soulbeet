@@ -8,12 +8,12 @@ use crate::core::{backend_unavailable, sources, target_unwritable};
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{
-    another_folder, deliver, enqueue_request, failed_reason, not_enqueued_failure, stopped_rows,
-    transfer_key, RequestEnqueue, Watcher,
+    deliver, enqueue_request, failed_reason, not_enqueued_failure, stopped_rows, transfer_key,
+    RequestEnqueue, Watcher,
 };
 use crate::server_fns::download::failover::{align_pool_tracks, SourcePool};
 use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
-use crate::services::download_backend;
+use crate::services::{download_backend, BackendLookupError};
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
 use dioxus::logger::tracing::info;
 use shared::download::{
@@ -22,7 +22,8 @@ use shared::download::{
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::SoulseekError;
-use soulbeet::DownloadBackend;
+use soulbeet::{DownloadBackend, ImportMode};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -66,18 +67,38 @@ fn request_stopped(e: &tokio::task::JoinError) -> Failure {
     )
 }
 
-/// A new batch of `ctx`'s user, downloading into `batch_folder(label,
-/// batch_id)` and importing into `target`.
-fn fresh_batch(ctx: &UserCtx, batch_id: String, label: String, target: PathBuf) -> BatchRef {
-    BatchRef::new(
-        TransferOwner {
-            user_id: ctx.id(),
-            batch_id,
-        },
+/// The batch a request starts when it joins no running one. It downloads
+/// into `batch_folder(label, batch_id)` and imports into `target` in
+/// `import_mode`; the request's user owns it.
+pub struct NewBatch {
+    pub batch_id: String,
+    pub label: String,
+    pub target: PathBuf,
+    pub import_mode: ImportMode,
+}
+
+impl NewBatch {
+    fn owned_by(self, ctx: &UserCtx) -> BatchRef {
+        BatchRef::new(
+            TransferOwner {
+                user_id: ctx.id(),
+                batch_id: self.batch_id,
+            },
+            self.label,
+            self.target,
+            self.import_mode,
+        )
+    }
+}
+
+/// A new batch importing into `target` in the configured import mode.
+fn fresh_batch(batch_id: String, label: String, target: PathBuf) -> NewBatch {
+    NewBatch {
+        batch_id,
         label,
         target,
-        CONFIG.import_mode(),
-    )
+        import_mode: CONFIG.import_mode(),
+    }
 }
 
 /// Creates `folder`'s directory, and returns its path as the import target.
@@ -89,10 +110,10 @@ async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> {
     Ok(target)
 }
 
-/// Claims and enqueues a request's files, shows their rows, and hands the
-/// enqueued ones to a monitor: the running batch's when the request joined
-/// one, else a new one. Either fails a slot over to its track's
-/// `alternates`.
+/// Claims and enqueues `ctx`'s request for `items`, shows their rows on its
+/// user's channel, and hands the enqueued ones to a monitor: the running
+/// batch's when the request joined one of the user's, else one of `fresh`.
+/// Either fails a slot over to its track's `alternates`.
 ///
 /// Runs as its own task. Registry keys are claimed from its start, and the
 /// client may disconnect at any await and drop the caller: dropping the
@@ -102,7 +123,7 @@ pub async fn enqueue_and_watch(
     ctx: &UserCtx,
     backend: Arc<dyn DownloadBackend>,
     items: Vec<DownloadableItem>,
-    fresh: BatchRef,
+    fresh: NewBatch,
     alternates: Vec<DownloadableGroup>,
 ) -> Result<Vec<QueuedDownload>, Failure> {
     tokio::spawn(queue_and_watch(
@@ -121,11 +142,11 @@ async fn queue_and_watch(
     ctx: UserCtx,
     backend: Arc<dyn DownloadBackend>,
     items: Vec<DownloadableItem>,
-    fresh: BatchRef,
+    fresh: NewBatch,
     alternates: Vec<DownloadableGroup>,
 ) -> Result<Vec<QueuedDownload>, Failure> {
-    let enq = enqueue_request(&backend, items.clone(), fresh).await;
-    let refused = enq.refusal().is_some();
+    let enq = enqueue_request(&backend, items.clone(), fresh.owned_by(&ctx)).await;
+    let refusal = enq.refusal();
     let RequestEnqueue {
         batch,
         results,
@@ -134,6 +155,8 @@ async fn queue_and_watch(
         ..
     } = enq;
 
+    // A request only ever joins a batch of its own user, so every row of it
+    // goes to that user's channel.
     let user = ctx.id();
     let tx = get_or_create_user_channel(&user).await;
     let row = |p: DownloadProgress| {
@@ -225,8 +248,8 @@ async fn queue_and_watch(
     if let Some(e) = error {
         return Err(queue_failed(&e));
     }
-    if refused {
-        return Err(another_folder(RetryAdvice::NotRetryable));
+    if let Some(failure) = refusal {
+        return Err(failure);
     }
     Ok(results)
 }
@@ -239,15 +262,34 @@ pub async fn download(
     items: Vec<DownloadableItem>,
     backend: Option<&str>,
 ) -> Result<Vec<QueuedDownload>, Failure> {
-    if let Some(failure) = crate::importer_health::blocking_failure().await {
+    download_with(
+        ctx,
+        folder,
+        items,
+        crate::importer_health::blocking_failure(),
+        download_backend(backend),
+    )
+    .await
+}
+
+/// `download`, given the importer's gate and the backend lookup. Each is
+/// awaited only once the steps before it passed: the gate, then the target
+/// folder, then the backend.
+async fn download_with(
+    ctx: &UserCtx,
+    folder: &Folder,
+    items: Vec<DownloadableItem>,
+    gate: impl Future<Output = Option<Failure>>,
+    backend: impl Future<Output = Result<Arc<dyn DownloadBackend>, BackendLookupError>>,
+) -> Result<Vec<QueuedDownload>, Failure> {
+    if let Some(failure) = gate.await {
         return Err(failure);
     }
     let target = prepare_target(folder).await?;
-    let backend = download_backend(backend)
+    let backend = backend
         .await
         .map_err(|e| backend_unavailable(Stage::Enqueue, &e))?;
     let fresh = fresh_batch(
-        ctx,
         uuid::Uuid::new_v4().to_string(),
         manual_batch_label(&items),
         target,
@@ -454,7 +496,7 @@ pub async fn auto_download(
             }
         };
 
-        let fresh = fresh_batch(&ctx, batch_id.clone(), auto_batch_label(&picked), target);
+        let fresh = fresh_batch(batch_id.clone(), auto_batch_label(&picked), target);
         let outcome = enqueue_and_watch(&ctx, backend, picked.items, fresh, all_groups).await;
         send(enqueue_outcome(batch_id, &outcome));
     });
@@ -489,7 +531,8 @@ fn cancel_key(
 
 /// Cancels the transfer the named backend, or the default one, lists under
 /// `transfer_id` from `source`, when one of `ctx`'s batches holds it. Its
-/// monitor stops it and shows it Cancelled on its next poll.
+/// watcher stops it on its next poll: a monitor shows it Cancelled, and a
+/// discovery run moves the track on.
 pub async fn cancel(
     ctx: &UserCtx,
     backend: Option<&str>,
@@ -499,7 +542,16 @@ pub async fn cancel(
     let backend = download_backend(backend)
         .await
         .map_err(|e| backend_unavailable(Stage::Transfer, &e))?;
+    cancel_on(ctx, &backend, source, transfer_id).await
+}
 
+/// `cancel` on `backend`.
+async fn cancel_on(
+    ctx: &UserCtx,
+    backend: &Arc<dyn DownloadBackend>,
+    source: &str,
+    transfer_id: &str,
+) -> Result<(), Failure> {
     // The key comes from the transfer the backend lists under that id, never
     // from text the client sends, so a user cannot pair their own file with
     // another user's transfer id on the same peer.
@@ -521,15 +573,40 @@ pub async fn cancel(
 mod tests {
     use super::*;
     use crate::core::test_ctx;
-    use crate::server_fns::download::enqueue::{other_user, transfer_key};
+    use crate::server_fns::download::enqueue::{another_folder, other_user, transfer_key};
     use crate::server_fns::download::test_support::{
-        batch, group, item, key, same_user_into, transfer, ScriptedOutcome, StubBackend,
+        batch, group, item, key, transfer, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::failure::{Cause, Service};
 
     fn ctx_of(batch: &BatchRef) -> UserCtx {
         test_ctx(&batch.owner.user_id.to_string())
+    }
+
+    /// A user of its own, so tests sharing the process-wide registry never
+    /// see each other's claims.
+    fn own_ctx() -> UserCtx {
+        test_ctx(&format!("tester-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// A new batch importing into `target` in `running`'s import mode.
+    fn new_batch_beside(running: &BatchRef, target: PathBuf) -> NewBatch {
+        NewBatch {
+            batch_id: uuid::Uuid::new_v4().to_string(),
+            label: "Come Over".to_string(),
+            target,
+            import_mode: running.import_mode,
+        }
+    }
+
+    fn new_batch(label: &str) -> NewBatch {
+        NewBatch {
+            batch_id: uuid::Uuid::new_v4().to_string(),
+            label: label.to_string(),
+            target: PathBuf::from("/music"),
+            import_mode: ImportMode::Singleton,
+        }
     }
 
     #[test]
@@ -636,7 +713,7 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let running = batch("Come Over");
         TransferRegistry::global().claim(&[key(&backend, "p", "1.flac")], &running);
-        let fresh = same_user_into(&running, running.target.clone());
+        let fresh = new_batch_beside(&running, running.target.clone());
         let items = vec![item("p", "One", "1.flac"), item("p", "Two", "2.flac")];
 
         // The handler is dropped while slskd is still answering the enqueue,
@@ -672,7 +749,7 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let running = batch("Come Over");
         TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
-        let fresh = same_user_into(&running, running.target.clone());
+        let fresh = new_batch_beside(&running, running.target.clone());
         let rest = vec![group(
             "peer_b",
             vec![item("peer_b", "Two", "b/02.flac")],
@@ -706,7 +783,7 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let running = batch("Come Over");
         TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
-        let fresh = same_user_into(&running, PathBuf::from("/other-library"));
+        let fresh = new_batch_beside(&running, PathBuf::from("/other-library"));
         let got = enqueue_and_watch(
             &ctx_of(&running),
             backend,
@@ -723,12 +800,11 @@ mod tests {
     async fn a_failed_backend_call_is_the_requests_failure() {
         let backend: Arc<dyn DownloadBackend> =
             StubBackend::new(vec![ScriptedOutcome::TransportError]);
-        let fresh = batch("X");
         let f = enqueue_and_watch(
-            &ctx_of(&fresh),
+            &own_ctx(),
             backend,
             vec![item("peer_a", "One", "01.flac")],
-            fresh.clone(),
+            new_batch("X"),
             Vec::new(),
         )
         .await
@@ -749,15 +825,17 @@ mod tests {
     #[tokio::test]
     async fn failed_rows_reach_the_users_channel_stamped_with_batch_and_backend() {
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Rejected]);
-        let fresh = batch("Come Over");
-        let mut rx = crate::globals::get_or_create_user_channel(&fresh.owner.user_id)
+        let ctx = own_ctx();
+        let fresh = new_batch("Come Over");
+        let batch_id = fresh.batch_id.clone();
+        let mut rx = crate::globals::get_or_create_user_channel(&ctx.id())
             .await
             .subscribe();
         let results = enqueue_and_watch(
-            &ctx_of(&fresh),
+            &ctx,
             backend.clone(),
             vec![item("peer_a", "One", "01.flac")],
-            fresh.clone(),
+            fresh,
             Vec::new(),
         )
         .await
@@ -768,7 +846,7 @@ mod tests {
         };
         assert_eq!(
             (rows[0].batch_id.as_deref(), rows[0].backend.as_deref()),
-            (Some(fresh.owner.batch_id.as_str()), Some(backend.id()))
+            (Some(batch_id.as_str()), Some(backend.id()))
         );
         assert_eq!(
             rows[0].failure.as_ref().map(|f| f.code),
@@ -797,6 +875,94 @@ mod tests {
     fn cancel_needs_a_listed_transfer_with_that_id_and_peer() {
         assert_eq!(cancel_key(&listed(), "slskd", "peer_a", "t-2"), None);
         assert_eq!(cancel_key(&listed(), "slskd", "peer_b", "t-1"), None);
+    }
+
+    #[tokio::test]
+    async fn another_users_transfer_id_cannot_be_cancelled() {
+        let stub = StubBackend::new(vec![]);
+        stub.set_listing(listed());
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let theirs = batch("Come Over");
+        let held = transfer_key(backend.id(), "peer_a", "Music\\A\\01.flac");
+        let registry = TransferRegistry::global();
+        registry.claim(std::slice::from_ref(&held), &theirs);
+
+        assert_eq!(
+            cancel_on(&own_ctx(), &backend, "peer_a", "t-1").await,
+            Err(download_not_found())
+        );
+        assert!(!registry.is_cancelled(&held, &theirs.owner));
+
+        assert_eq!(
+            cancel_on(&ctx_of(&theirs), &backend, "peer_a", "t-1").await,
+            Ok(())
+        );
+        assert!(registry.is_cancelled(&held, &theirs.owner));
+        assert!(stub.cancelled().is_empty(), "its watcher stops it");
+    }
+
+    /// A lookup the code under test must never reach.
+    async fn unreached_backend() -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+        panic!("the backend was looked up")
+    }
+
+    fn folder_at(path: &std::path::Path) -> Folder {
+        Folder {
+            id: "f1".into(),
+            user_id: "user-a".into(),
+            name: "Music".into(),
+            path: path.to_string_lossy().into_owned(),
+            shared: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_download_checks_the_importer_then_the_folder_then_the_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("music");
+        std::fs::write(&file, b"").unwrap();
+        let unwritable = folder_at(&file.join("Come Over"));
+        let items = || vec![item("peer_a", "One", "01.flac")];
+        let importer = Failure::new(
+            FailureCode::ImporterBroken,
+            Stage::Import,
+            RetryAdvice::NeedsUser,
+            "No metadata source plugin loaded",
+        );
+
+        let gated = download_with(
+            &own_ctx(),
+            &unwritable,
+            items(),
+            std::future::ready(Some(importer.clone())),
+            unreached_backend(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(gated, importer);
+
+        let unwritable_target = download_with(
+            &own_ctx(),
+            &unwritable,
+            items(),
+            std::future::ready(None),
+            unreached_backend(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unwritable_target.code, FailureCode::ImportTargetUnwritable);
+
+        let unknown = BackendLookupError::Unknown("nicotine".into());
+        let no_backend = download_with(
+            &own_ctx(),
+            &folder_at(&dir.path().join("library")),
+            items(),
+            std::future::ready(None),
+            std::future::ready(Err(BackendLookupError::Unknown("nicotine".into()))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(no_backend, backend_unavailable(Stage::Enqueue, &unknown));
     }
 
     #[test]

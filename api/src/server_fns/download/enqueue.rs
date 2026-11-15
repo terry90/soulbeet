@@ -193,14 +193,14 @@ pub struct RequestEnqueue {
 }
 
 impl RequestEnqueue {
-    /// Why the request did nothing, when that is because its files are
+    /// The request's failure when it did nothing because its files are
     /// already downloading into another folder.
-    pub fn refusal(&self) -> Option<&'static str> {
+    pub fn refusal(&self) -> Option<Failure> {
         let enqueued = self
             .results
             .iter()
             .any(|q| q.status == EnqueueStatus::Enqueued);
-        (self.another_folder && !enqueued).then_some(ANOTHER_FOLDER)
+        (self.another_folder && !enqueued).then(|| another_folder(RetryAdvice::NotRetryable))
     }
 }
 
@@ -576,6 +576,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_delivered_transfer_no_item_lines_up_with_gets_no_alternates() {
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let running = batch("Come Over");
+        let reservation = running.inbox.reserve().expect("open inbox");
+        // The backend answered for a file the request never named.
+        let enqueued = vec![QueuedDownload {
+            id: "t-02.flac".to_string(),
+            source: "peer_a".to_string(),
+            item: "02.flac".to_string(),
+            size: 0,
+            status: EnqueueStatus::Enqueued,
+        }];
+        let rest = vec![group(
+            "peer_b",
+            vec![item("peer_b", "Two", "b/02.flac")],
+            0.8,
+        )];
+
+        let lost = deliver(
+            reservation,
+            &enqueued,
+            &[item("peer_a", "One", "01.flac")],
+            &rest,
+            &backend,
+            &running,
+        )
+        .await;
+
+        assert!(lost.is_empty());
+        assert_eq!(
+            running.inbox.take(),
+            vec![AddedSlot {
+                source: "peer_a".to_string(),
+                filename: "02.flac".to_string(),
+                transfer_id: "t-02.flac".to_string(),
+                alternates: Vec::new(),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn a_repeat_request_for_another_folder_does_not_join() {
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
@@ -650,7 +691,10 @@ mod tests {
             enq.results.is_empty(),
             "no row would replace the running one"
         );
-        assert_eq!(enq.refusal(), Some(ANOTHER_FOLDER));
+        assert_eq!(
+            enq.refusal(),
+            Some(another_folder(RetryAdvice::NotRetryable))
+        );
         assert!(stub.destinations().is_empty());
         assert!(
             running.inbox.close_if_idle(),
