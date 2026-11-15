@@ -9,6 +9,8 @@ use crate::folder_policy::{
     canonical_folder_path, file_owner, FileOwner, PolicyFolder, PolicyRows,
 };
 #[cfg(feature = "server")]
+use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
+#[cfg(feature = "server")]
 use crate::models::deletion_review::DeletionReviewRow;
 #[cfg(feature = "server")]
 use crate::models::discovery_history::DiscoveryHistoryRow;
@@ -24,6 +26,8 @@ use crate::services::navidrome_client_for_user;
 use crate::AuthSession;
 #[cfg(feature = "server")]
 use shared::navidrome::DiscoveryStatus;
+#[cfg(feature = "server")]
+use soulbeet::ForgetOutcome;
 #[cfg(feature = "server")]
 use std::path::{Path, PathBuf};
 
@@ -116,7 +120,14 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                                 &folders,
                                 navidrome_music_path.as_deref(),
                             );
-                            match auto_delete_file(local, &everyones_folders, user_id).await {
+                            match auto_delete_file(
+                                &IMPORT_QUEUE,
+                                local,
+                                &everyones_folders,
+                                user_id,
+                            )
+                            .await
+                            {
                                 AutoDelete::Deleted(path) => {
                                     DeletionReviewRow::upsert(
                                         &song.id,
@@ -269,10 +280,12 @@ enum AutoDelete {
 }
 
 /// Removes the local file `local` when the deepest folder holding it, among
-/// `everyones_folders`, is `user_id`'s, then the directories that leaves
-/// empty up to the user's folder.
+/// `everyones_folders`, is `user_id`'s, then drops it from that folder's
+/// library through `queue` and removes the directories that leaves empty up
+/// to the user's folder.
 #[cfg(feature = "server")]
 async fn auto_delete_file(
+    queue: &ImportQueue,
     local: LocalPath,
     everyones_folders: &[PolicyFolder],
     user_id: &str,
@@ -312,6 +325,29 @@ async fn auto_delete_file(
         return AutoDelete::Kept;
     }
     info!("Auto-deleted {}", path.display());
+    // The file is gone whatever the library says, so the delete counts.
+    match queue.forget(&folder, &path).await {
+        ForgetOutcome::Removed => info!(
+            "Removed {} from the library of {}",
+            path.display(),
+            folder.display()
+        ),
+        ForgetOutcome::NotInLibrary => warn!(
+            "{} was not in the library of {}",
+            path.display(),
+            folder.display()
+        ),
+        ForgetOutcome::Several(n) => warn!(
+            "Left {} in the library of {}: {n} items have that path",
+            path.display(),
+            folder.display()
+        ),
+        ForgetOutcome::Failed(e) => warn!(
+            "Could not remove {} from the library of {}: {e}",
+            path.display(),
+            folder.display()
+        ),
+    }
     if let Some(parent) = path.parent() {
         let _ = super::cleanup_empty_ancestors(parent, &folder).await;
     }
@@ -592,7 +628,9 @@ async fn remove_discovery_track_internal(track_id: &str) -> Result<(), String> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use std::os::unix::fs::symlink;
+    use std::sync::Arc;
 
     /// `tmp/music/alice/A/x.flac`, `tmp/music/bob/B/y.flac`, `tmp/outside/z.flac`.
     fn library() -> (tempfile::TempDir, PathBuf) {
@@ -764,16 +802,23 @@ mod tests {
         std::fs::write(path, b"audio").unwrap();
     }
 
+    /// A queue whose importer records what it is asked to forget.
+    fn import_queue() -> (ImportQueue, Arc<StubImporter>) {
+        let stub = Arc::new(StubImporter::new());
+        (ImportQueue::new(RecordingDeps::new(stub.clone())), stub)
+    }
+
     /// What auto-delete does with the file Navidrome reports at `file`, for
     /// `user`, whose own folders are `own`.
     async fn rate_one_star(
+        queue: &ImportQueue,
         file: &Path,
         own: &[PathBuf],
         everyones: &[PolicyFolder],
         user: &str,
     ) -> AutoDelete {
         let local = resolve_navidrome_path(file.to_str().unwrap(), own, None);
-        auto_delete_file(local, everyones, user).await
+        auto_delete_file(queue, local, everyones, user).await
     }
 
     #[tokio::test]
@@ -792,13 +837,14 @@ mod tests {
             owned("bob", &x, false),
         ];
         let own = [music.clone(), a.clone()];
+        let (queue, stub) = import_queue();
 
         // The only file in Alice's /music/x/a, two levels down: the walk
         // stops at her deepest folder, so Bob's /music/x stays.
         let alices = a.join("Artist/Album/s.flac");
         write_file(&alices);
         assert_eq!(
-            rate_one_star(&alices, &own, &everyones, "alice").await,
+            rate_one_star(&queue, &alices, &own, &everyones, "alice").await,
             AutoDelete::Deleted(alices.clone())
         );
         assert!(!a.join("Artist").exists());
@@ -809,10 +855,11 @@ mod tests {
         let bobs = x.join("B/t.flac");
         write_file(&bobs);
         assert_eq!(
-            rate_one_star(&bobs, &own, &everyones, "alice").await,
+            rate_one_star(&queue, &bobs, &own, &everyones, "alice").await,
             AutoDelete::Kept
         );
         assert!(bobs.is_file());
+        assert_eq!(stub.forgets(), vec![(a, alices)]);
     }
 
     #[tokio::test]
@@ -829,9 +876,17 @@ mod tests {
         ];
         let bobs = bob.join("B/y.flac");
         write_file(&bobs);
+        let (queue, stub) = import_queue();
 
         assert_eq!(
-            rate_one_star(&bobs, std::slice::from_ref(&music), &everyones, "alice").await,
+            rate_one_star(
+                &queue,
+                &bobs,
+                std::slice::from_ref(&music),
+                &everyones,
+                "alice"
+            )
+            .await,
             AutoDelete::Kept
         );
         assert!(bobs.is_file());
@@ -840,10 +895,18 @@ mod tests {
         let alices = music.join("alice/A/x.flac");
         write_file(&alices);
         assert_eq!(
-            rate_one_star(&alices, std::slice::from_ref(&music), &everyones, "alice").await,
-            AutoDelete::Deleted(alices)
+            rate_one_star(
+                &queue,
+                &alices,
+                std::slice::from_ref(&music),
+                &everyones,
+                "alice"
+            )
+            .await,
+            AutoDelete::Deleted(alices.clone())
         );
         assert!(bob.is_dir());
+        assert_eq!(stub.forgets(), vec![(music, alices)]);
     }
 
     #[test]

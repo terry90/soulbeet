@@ -9,7 +9,9 @@ pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
 pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 
 use crate::audio::count_audio_files;
-use crate::{DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, MusicImporter};
+use crate::{
+    DriverChoice, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult, MusicImporter,
+};
 use classify::{parse_run_log, Classifier};
 use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
 use report::Report;
@@ -311,6 +313,10 @@ impl MusicImporter for BeetsImporter {
         library::find_duplicates_across_libraries(&self.settings, libraries).await
     }
 
+    async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
+        library::forget_item(&self.settings, library, file).await
+    }
+
     fn health(&self) -> ImporterHealth {
         self.state().health.clone()
     }
@@ -419,7 +425,7 @@ mod tests {
     /// Writes an executable script. A child process writes it, so no fd in
     /// this process ever has it open for writing: a fork from another test
     /// thread would inherit such an fd and exec would fail with ETXTBSY.
-    async fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    pub(super) async fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         let mut child = tokio::process::Command::new("/bin/sh")
             .arg("-c")

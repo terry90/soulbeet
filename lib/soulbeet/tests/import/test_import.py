@@ -1,5 +1,7 @@
 import ast
 import os
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -148,6 +150,32 @@ def test_replaced_singletons_are_reported_with_the_tracks_they_replaced(beets_en
     assert [d["action"] for d in run.report["duplicates"]] == ["replaced", "replaced"], run
     assert [len(d["existing"]) for d in run.report["duplicates"]] == [1, 1]
     assert sorted(p for d in run.report["duplicates"] for p in d["existing"]) == old
+
+
+def test_a_path_query_finds_the_one_file_at_that_path(beets_env):
+    beets_env.album(beets_env.src)
+    beets_env.driver("auto", env={"FAKESRC_MODE": "strong"})
+    first = beets_env.music / beets_env.library()[0][4]
+
+    def ids(path):
+        out = subprocess.run(
+            [
+                sys.executable, "-P", "-m", "beets",
+                "-c", str(beets_env.config),
+                "-l", str(beets_env.music / ".beets_library.db"),
+                "-d", str(beets_env.music),
+                "ls", "-f", "@@sb@@$id", f"path:{path}",
+            ],
+            capture_output=True,
+            text=True,
+            env=beets_env._env(),
+            cwd=beets_env.root,
+            check=True,
+        ).stdout
+        return [line for line in out.splitlines() if line.startswith("@@sb@@")]
+
+    assert len(ids(first)) == 1
+    assert len(ids(first.parent)) == 2
 
 
 REPORTED_STATUS = {"duplicate-replace": "replaced", "duplicate-keep": "kept"}

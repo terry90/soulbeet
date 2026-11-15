@@ -9,7 +9,8 @@ use shared::download::{
 use shared::library::DuplicateReport;
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::{
-    DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter, SkipReason, TaskCount,
+    DriverChoice, ForgetOutcome, ImportMode, ImportOutcome, ImportResult, MusicImporter,
+    SkipReason, TaskCount,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -100,7 +101,8 @@ pub fn row(item: &str) -> DownloadProgress {
     }
 }
 
-/// Answers imports from a script (Imported once it runs out).
+/// Answers imports from a script (Imported once it runs out), and forgets
+/// with one answer (Removed unless scripted).
 pub struct StubImporter {
     results: Mutex<VecDeque<ImportResult>>,
     delay: Duration,
@@ -114,6 +116,8 @@ pub struct StubImporter {
     max_active: AtomicUsize,
     seen: Mutex<Vec<(Vec<PathBuf>, PathBuf)>>,
     choices: Mutex<Vec<DriverChoice>>,
+    forget_answer: Mutex<ForgetOutcome>,
+    forgets: Mutex<Vec<(PathBuf, PathBuf)>>,
 }
 
 impl StubImporter {
@@ -130,6 +134,8 @@ impl StubImporter {
             max_active: AtomicUsize::new(0),
             seen: Mutex::new(vec![]),
             choices: Mutex::new(vec![]),
+            forget_answer: Mutex::new(ForgetOutcome::Removed),
+            forgets: Mutex::new(vec![]),
         }
     }
 
@@ -164,6 +170,10 @@ impl StubImporter {
         self.results.lock().unwrap().push_back(result);
     }
 
+    pub fn script_forget(&self, outcome: ForgetOutcome) {
+        *self.forget_answer.lock().unwrap() = outcome;
+    }
+
     pub fn panic_next(&self) {
         self.panic_next.store(true, Ordering::SeqCst);
     }
@@ -183,6 +193,11 @@ impl StubImporter {
     /// Sources and target of every import, in call order.
     pub fn seen(&self) -> Vec<(Vec<PathBuf>, PathBuf)> {
         self.seen.lock().unwrap().clone()
+    }
+
+    /// Library and file of every forget, in call order.
+    pub fn forgets(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.forgets.lock().unwrap().clone()
     }
 
     /// The choice of every import, in call order.
@@ -267,6 +282,14 @@ impl MusicImporter for StubImporter {
 
     async fn find_duplicates(&self, _: &[&Path]) -> Result<DuplicateReport, String> {
         unreachable!()
+    }
+
+    async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
+        self.forgets
+            .lock()
+            .unwrap()
+            .push((library.to_path_buf(), file.to_path_buf()));
+        self.forget_answer.lock().unwrap().clone()
     }
 
     fn health(&self) -> ImporterHealth {

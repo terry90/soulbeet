@@ -54,7 +54,7 @@ impl RunLimits {
         drain: Duration::from_secs(3),
     };
 
-    /// `beet ls` of a library, which has no import to wait for.
+    /// `beet ls` or `beet remove` on a library, which has no import to wait for.
     pub const LIBRARY_LS: RunLimits = RunLimits {
         idle: Duration::from_secs(60),
         total: Duration::from_secs(5 * 60),

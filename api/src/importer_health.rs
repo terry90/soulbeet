@@ -75,7 +75,7 @@ pub async fn refusal(importer: &dyn MusicImporter) -> Option<String> {
 mod tests {
     use super::*;
     use shared::library::DuplicateReport;
-    use soulbeet::{DriverChoice, ImportMode, ImportResult};
+    use soulbeet::{DriverChoice, ForgetOutcome, ImportMode, ImportResult};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -117,6 +117,9 @@ mod tests {
             unreachable!()
         }
         async fn find_duplicates(&self, _: &[&Path]) -> Result<DuplicateReport, String> {
+            unreachable!()
+        }
+        async fn forget(&self, _: &Path, _: &Path) -> ForgetOutcome {
             unreachable!()
         }
         fn health(&self) -> ImporterHealth {

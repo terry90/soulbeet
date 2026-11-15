@@ -16,13 +16,15 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, MatchChoices};
 use soulbeet::audio::{count_audio_files, is_audio_path};
-use soulbeet::{DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, MusicImporter};
+use soulbeet::{
+    DriverChoice, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult, MusicImporter,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
 use retry::RetryStore;
@@ -116,12 +118,32 @@ struct Waiting {
     state: watch::Sender<JobState>,
 }
 
-/// A target's worker and the jobs waiting for it. The entry exists exactly
+/// What a target's worker runs, one at a time.
+enum Work {
+    Import(Waiting),
+    /// Drops `file` from the target's library.
+    Forget {
+        file: PathBuf,
+        done: oneshot::Sender<ForgetOutcome>,
+    },
+}
+
+impl Work {
+    /// Who the rows of an import belong to. Other work has no rows.
+    fn owner(&self) -> Option<&JobOwner> {
+        match self {
+            Work::Import(waiting) => waiting.job.owner.as_ref(),
+            Work::Forget { .. } => None,
+        }
+    }
+}
+
+/// A target's worker and the work waiting for it. The entry exists exactly
 /// as long as its worker runs.
 struct TargetEntry {
     generation: u64,
     running: bool,
-    queue: VecDeque<Waiting>,
+    queue: VecDeque<Work>,
 }
 
 /// Rows to send, grouped by user in first-seen order.
@@ -172,22 +194,7 @@ impl ImportQueue {
 
         let owner = job.owner.clone();
         let (state, rx) = watch::channel(JobState::Queued { position: 0 });
-        let new_worker = {
-            let mut targets = self.shared.targets();
-            let spawn = !targets.contains_key(&key);
-            let entry = targets.entry(key.clone()).or_insert_with(|| TargetEntry {
-                generation: self.shared.next_generation.fetch_add(1, Ordering::Relaxed),
-                running: false,
-                queue: VecDeque::new(),
-            });
-            let position = u32::from(entry.running) + entry.queue.len() as u32;
-            state.send_replace(JobState::Queued { position });
-            entry.queue.push_back(Waiting { job, state });
-            spawn.then_some(entry.generation)
-        };
-        if let Some(generation) = new_worker {
-            tokio::spawn(work(self.shared.clone(), key, generation));
-        }
+        self.enqueue(key, Work::Import(Waiting { job, state }));
 
         if let Some(owner) = owner {
             let _emit = self.shared.emit_lock.lock().await;
@@ -204,6 +211,55 @@ impl ImportQueue {
             }
         }
         ImportHandle { rx }
+    }
+
+    /// Drops `file` from the library of `library` once the work queued on
+    /// that library before it has run. A library folder that does not exist
+    /// is not created.
+    pub async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
+        let key = match tokio::fs::canonicalize(library).await {
+            Ok(key) => key,
+            Err(e) => {
+                return ForgetOutcome::Failed(format!(
+                    "Could not resolve {}: {e}",
+                    library.display()
+                ))
+            }
+        };
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(
+            key,
+            Work::Forget {
+                file: file.to_path_buf(),
+                done,
+            },
+        );
+        outcome
+            .await
+            .unwrap_or_else(|_| ForgetOutcome::Failed(WORKER_STOPPED.into()))
+    }
+
+    /// Queues `item` on `key`, starting the target's worker if none runs. An
+    /// import's state is set to its position.
+    fn enqueue(&self, key: PathBuf, item: Work) {
+        let new_worker = {
+            let mut targets = self.shared.targets();
+            let spawn = !targets.contains_key(&key);
+            let entry = targets.entry(key.clone()).or_insert_with(|| TargetEntry {
+                generation: self.shared.next_generation.fetch_add(1, Ordering::Relaxed),
+                running: false,
+                queue: VecDeque::new(),
+            });
+            if let Work::Import(waiting) = &item {
+                let position = u32::from(entry.running) + entry.queue.len() as u32;
+                waiting.state.send_replace(JobState::Queued { position });
+            }
+            entry.queue.push_back(item);
+            spawn.then_some(entry.generation)
+        };
+        if let Some(generation) = new_worker {
+            tokio::spawn(work(self.shared.clone(), key, generation));
+        }
     }
 }
 
@@ -232,10 +288,10 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
         key: key.clone(),
         generation,
     };
-    while let Some((job, state, moved)) = shared.next_job(&key, generation) {
+    while let Some((item, moved)) = shared.next_work(&key, generation) {
         {
             let _emit = shared.emit_lock.lock().await;
-            if let Some(owner) = &job.owner {
+            if let Some(owner) = item.owner() {
                 let rows = rows_with_state(&owner.rows, DownloadState::Importing);
                 shared
                     .deps
@@ -246,14 +302,32 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                 shared.deps.emit(&user, DownloadEvent::Progress(rows)).await;
             }
         }
-        let outcome = AssertUnwindSafe(shared.execute(&key, &job))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| {
-                warn!("Import into {} panicked", key.display());
-                JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
-            });
-        shared.finish(&job, outcome, &state).await;
+        match item {
+            Work::Import(Waiting { job, state }) => {
+                let outcome = AssertUnwindSafe(shared.execute(&key, &job))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("Import into {} panicked", key.display());
+                        JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
+                    });
+                shared.finish(&job, outcome, &state).await;
+            }
+            Work::Forget { file, done } => {
+                let outcome = AssertUnwindSafe(shared.forget(&key, &file))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Forgetting {} in {} panicked",
+                            file.display(),
+                            key.display()
+                        );
+                        ForgetOutcome::Failed(WORKER_STOPPED.into())
+                    });
+                let _ = done.send(outcome);
+            }
+        }
     }
 }
 
@@ -262,13 +336,9 @@ impl Shared {
         self.targets.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Starts the next job on `key`, or removes the entry when none is left.
+    /// Starts the next work on `key`, or removes the entry when none is left.
     /// Also returns the waiting rows whose position moved up.
-    fn next_job(
-        &self,
-        key: &Path,
-        generation: u64,
-    ) -> Option<(ImportJob, watch::Sender<JobState>, UserRows)> {
+    fn next_work(&self, key: &Path, generation: u64) -> Option<(Work, UserRows)> {
         let mut targets = self.targets();
         let entry = targets
             .get_mut(key)
@@ -277,11 +347,16 @@ impl Shared {
             targets.remove(key);
             return None;
         };
-        // Positions count the running job, so they only move when one ran before.
+        // Positions count the running work, so they only move when some ran before.
         let moved_up = std::mem::replace(&mut entry.running, true);
-        next.state.send_replace(JobState::Running);
+        if let Work::Import(waiting) = &next {
+            waiting.state.send_replace(JobState::Running);
+        }
         let mut moved: UserRows = Vec::new();
-        for (i, waiting) in entry.queue.iter().enumerate() {
+        for (i, item) in entry.queue.iter().enumerate() {
+            let Work::Import(waiting) = item else {
+                continue;
+            };
             let position = i as u32 + 1;
             waiting.state.send_replace(JobState::Queued { position });
             if let (true, Some(owner)) = (moved_up, &waiting.job.owner) {
@@ -292,7 +367,14 @@ impl Shared {
                 }
             }
         }
-        Some((next.job, next.state, moved))
+        Some((next, moved))
+    }
+
+    async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
+        match self.deps.importer().await {
+            Ok(importer) => importer.forget(library, file).await,
+            Err(e) => ForgetOutcome::Failed(e),
+        }
     }
 
     async fn execute(&self, target: &Path, job: &ImportJob) -> JobOutcome {
@@ -458,7 +540,7 @@ mod tests {
     use super::test_support::{alice, broken, row, RecordingDeps, StubImporter};
     use super::*;
     use shared::download::DownloadState;
-    use soulbeet::{ImportOutcome, SkipReason};
+    use soulbeet::{ForgetOutcome, ImportOutcome, SkipReason};
     use std::time::Duration;
 
     pub(super) fn queue(
@@ -741,6 +823,54 @@ mod tests {
 
         assert!(!deps.progress_for(&alice).is_empty());
         assert!(deps.progress_for(&UserId::new("alice")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_forget_waits_for_the_import_running_on_its_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new().held());
+        let queue = Arc::new(queue);
+        let handle = queue
+            .submit(job(file(dir.path(), "src/a.flac"), &dir.path().join("lib")))
+            .await;
+        let forget = tokio::spawn({
+            let (queue, lib) = (queue.clone(), dir.path().join("lib"));
+            async move { queue.forget(&lib, &lib.join("x.flac")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(stub.forgets().is_empty());
+        stub.release(1);
+        handle.wait().await;
+        assert_eq!(forget.await.unwrap(), ForgetOutcome::Removed);
+        let lib = std::fs::canonicalize(dir.path().join("lib")).unwrap();
+        assert_eq!(
+            stub.forgets(),
+            vec![(lib.clone(), dir.path().join("lib/x.flac"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forget_answers_what_the_importer_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        stub.script_forget(ForgetOutcome::NotInLibrary);
+        assert_eq!(
+            queue.forget(dir.path(), &dir.path().join("x.flac")).await,
+            ForgetOutcome::NotInLibrary
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forget_on_a_missing_library_fails_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let lib = dir.path().join("lib");
+        assert!(matches!(
+            queue.forget(&lib, &lib.join("x.flac")).await,
+            ForgetOutcome::Failed(_)
+        ));
+        assert!(!lib.exists());
+        assert!(stub.forgets().is_empty());
     }
 
     #[tokio::test]

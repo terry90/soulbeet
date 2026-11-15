@@ -288,6 +288,17 @@ impl fmt::Display for ImportResult {
     }
 }
 
+/// What became of a request to drop one file from a library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetOutcome {
+    Removed,
+    /// The library holds no item at that path, or the folder has no library.
+    NotInLibrary,
+    /// Several items have that path; none was removed.
+    Several(usize),
+    Failed(String),
+}
+
 #[async_trait]
 pub trait MusicImporter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -309,6 +320,10 @@ pub trait MusicImporter: Send + Sync {
         &self,
         libraries: &[&Path],
     ) -> std::result::Result<DuplicateReport, String>;
+
+    /// Removes the item at exactly `file` from the library of `library`,
+    /// leaving the file alone.
+    async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome;
 
     /// The last known health, without waiting. `Checking` before the first check.
     fn health(&self) -> ImporterHealth;
