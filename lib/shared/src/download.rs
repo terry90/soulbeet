@@ -481,6 +481,9 @@ pub enum AutoDownloadEvent {
     /// Best score below threshold, client should show manual source picker
     FallbackToManual {
         batch_id: String,
+        /// The stored search `results` came from, which a pick names.
+        #[serde(default)]
+        search_id: String,
         results: Vec<DownloadableGroup>,
         best_score: f64,
         threshold: f64,

@@ -193,23 +193,29 @@ pub fn alternates_for(
 /// Feeding `items` straight to `from_tracks` would hand slot N the alternates
 /// of a different track.
 ///
-/// Matching keys on both `id` and `source`: `QueuedDownload::item` is the
-/// item's `id` verbatim, both being the remote filename, and the same
-/// filename can be offered by more than one peer. A download that matches no
-/// item stays `None` so the slots after it keep their index.
+/// A download that matches no item (`item_index`) stays `None` so the slots
+/// after it keep their index.
 pub fn align_pool_tracks(
     queued: &[QueuedDownload],
     items: &[DownloadableItem],
 ) -> Vec<Option<DownloadableItem>> {
     queued
         .iter()
-        .map(|d| {
-            items
-                .iter()
-                .find(|item| item.id == d.item && item.source == d.source)
-                .cloned()
-        })
+        .map(|d| item_index(d, items).map(|at| items[at].clone()))
         .collect()
+}
+
+/// The index in `items` of the item `queued` was enqueued from (same id and
+/// source). Matching keys on both: `QueuedDownload::item` is the item's `id`
+/// verbatim, both being the remote filename, and the same filename can be
+/// offered by more than one peer.
+pub fn item_index<'a>(
+    queued: &QueuedDownload,
+    items: impl IntoIterator<Item = &'a DownloadableItem>,
+) -> Option<usize> {
+    items
+        .into_iter()
+        .position(|item| item.id == queued.item && item.source == queued.source)
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -369,6 +375,18 @@ mod tests {
                 None,
                 Some("dirB/03.flac".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn item_index_finds_the_item_of_the_same_file_from_the_same_peer() {
+        assert_eq!(
+            item_index(&queued("peer_a", "dirB/02.flac"), &searched()),
+            Some(1)
+        );
+        assert_eq!(
+            item_index(&queued("peer_b", "dirB/02.flac"), &searched()),
+            None
         );
     }
 

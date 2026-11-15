@@ -40,6 +40,15 @@ use toast::{FallbackToast, FallbackToastData};
 mod search_type_toggle;
 use search_type_toggle::{SearchType, SearchTypeToggle};
 
+/// The sources a search found, to pick files from, and the search a pick
+/// names.
+#[derive(Clone, PartialEq, Debug)]
+pub struct SourceChoices {
+    /// Empty while the search is starting, when there is nothing to pick.
+    pub search_id: String,
+    pub groups: Vec<DownloadableGroup>,
+}
+
 /// A download query for `album`, which a search by `provider` gave.
 fn album_query(album: &Album, provider: Provider) -> DownloadQuery {
     DownloadQuery::new(vec![])
@@ -58,7 +67,7 @@ pub fn Search() -> Element {
     let mut loading = use_signal(|| false);
     let mut expanded_albums = use_signal::<HashSet<String>>(HashSet::new);
     let mut album_cache = use_signal::<HashMap<String, AlbumWithTracks>>(HashMap::new);
-    let mut download_options = use_signal::<Option<Vec<DownloadableGroup>>>(|| None);
+    let mut download_options = use_signal::<Option<SourceChoices>>(|| None);
     let mut is_downloading = use_signal(|| false);
     let mut download_error = use_signal(String::new);
     let search_reset = try_use_context::<SearchReset>();
@@ -203,7 +212,10 @@ pub fn Search() -> Element {
                     });
                 }
                 AutoDownloadEvent::FallbackToManual {
-                    batch_id, results, ..
+                    batch_id,
+                    search_id,
+                    results,
+                    ..
                 } => {
                     download_states
                         .write()
@@ -219,6 +231,7 @@ pub fn Search() -> Element {
                     fallback_toasts.write().push(FallbackToastData {
                         id: batch_id,
                         track_name,
+                        search_id,
                         results,
                     });
 
@@ -308,7 +321,10 @@ pub fn Search() -> Element {
                     });
                 }
                 AutoDownloadEvent::FallbackToManual {
-                    batch_id, results, ..
+                    batch_id,
+                    search_id,
+                    results,
+                    ..
                 } => {
                     download_states
                         .write()
@@ -322,6 +338,7 @@ pub fn Search() -> Element {
                     fallback_toasts.write().push(FallbackToastData {
                         id: batch_id,
                         track_name,
+                        search_id,
                         results,
                     });
                     spawn(async move {
@@ -438,7 +455,10 @@ pub fn Search() -> Element {
     let download = move |query: DownloadQuery| async move {
         loading.set(true);
         download_error.set(String::new());
-        download_options.set(Some(vec![]));
+        download_options.set(Some(SourceChoices {
+            search_id: String::new(),
+            groups: vec![],
+        }));
 
         let search_id = match auth.call(api::start_download_search(query)).await {
             Ok(id) => id,
@@ -448,6 +468,12 @@ pub fn Search() -> Element {
                 return;
             }
         };
+        // Unless the panel was closed or shows other choices meanwhile.
+        download_options.with_mut(|current| {
+            if let Some(choices) = current.as_mut().filter(|c| c.search_id.is_empty()) {
+                choices.search_id = search_id.clone();
+            }
+        });
 
         loop {
             match auth
@@ -458,7 +484,9 @@ pub fn Search() -> Element {
             {
                 Ok(response) => {
                     download_options.with_mut(|current| {
-                        if let Some(list) = current {
+                        if let Some(SourceChoices { groups: list, .. }) =
+                            current.as_mut().filter(|c| c.search_id == search_id)
+                        {
                             for new_group in response.groups {
                                 if let Some(pos) = list.iter().position(|x| {
                                     x.source == new_group.source && x.group_id == new_group.group_id
@@ -492,24 +520,26 @@ pub fn Search() -> Element {
         loading.set(false);
     };
 
-    let download_tracks = move |(items, folder): (Vec<DownloadableItem>, String)| async move {
-        download_error.set(String::new());
-        match auth
-            .call(api::download(api::DownloadRequest {
-                items,
-                target_folder: folder,
-                backend: None,
-            }))
-            .await
-        {
-            Ok(_res) => info!("Downloads started"),
-            Err(e) => {
-                warn!("Failed to start downloads: {:?}", e);
-                download_error.set(crate::friendly_error(&e));
+    let download_tracks =
+        move |search_id: String, (items, folder): (Vec<DownloadableItem>, String)| async move {
+            download_error.set(String::new());
+            match auth
+                .call(api::download(api::DownloadRequest {
+                    items,
+                    target_folder: folder,
+                    backend: None,
+                    search_id,
+                }))
+                .await
+            {
+                Ok(_res) => info!("Downloads started"),
+                Err(e) => {
+                    warn!("Failed to start downloads: {:?}", e);
+                    download_error.set(crate::friendly_error(&e));
+                }
             }
-        }
-        is_downloading.set(false);
-    };
+            is_downloading.set(false);
+        };
 
     let perform_search = move || async move {
         loading.set(true);
@@ -725,13 +755,13 @@ pub fn Search() -> Element {
         }
 
         // Results
-        if let Some(results) = download_options.read().clone() {
+        if let Some(choices) = download_options.read().clone() {
           DownloadResults {
-            results,
+            results: choices.groups,
             is_searching: loading(),
             is_downloading,
             on_download: move |data| {
-                spawn(download_tracks(data));
+                spawn(download_tracks(choices.search_id.clone(), data));
             },
             on_back: move |_| {
                 download_options.set(None);
@@ -880,8 +910,8 @@ pub fn Search() -> Element {
               FallbackToast {
                 key: "{toast_data.id}",
                 toast: toast_data.clone(),
-                on_pick_source: move |results: Vec<DownloadableGroup>| {
-                    download_options.set(Some(results));
+                on_pick_source: move |choices: SourceChoices| {
+                    download_options.set(Some(choices));
                 },
                 on_dismiss: move |id: String| {
                     fallback_toasts.write().retain(|t| t.id != id);

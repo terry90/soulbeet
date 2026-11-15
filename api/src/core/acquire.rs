@@ -4,21 +4,24 @@
 use crate::auth::UserCtx;
 use crate::config::CONFIG;
 use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
-use crate::core::{backend_unavailable, sources, target_unwritable};
+use crate::core::sources::{self, Searched};
+use crate::core::{backend_unavailable, database_failure, target_unwritable};
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
+use crate::ledger::store::StoredSearch;
+use crate::ledger::{JobEvent, JobState, Ledger, NewJob, NewSearch, LEDGER};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{
-    deliver, enqueue_request, failed_reason, not_enqueued_failure, stopped_rows, transfer_key,
-    RequestEnqueue, Watcher,
+    another_folder, deliver, enqueue_request, failed_reason, not_enqueued_failure,
+    nothing_enqueued, stopped_rows, transfer_key, RequestEnqueue, Watcher,
 };
-use crate::server_fns::download::failover::{align_pool_tracks, SourcePool};
+use crate::server_fns::download::failover::{align_pool_tracks, item_index, SourcePool};
 use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
 use crate::services::{download_backend, BackendLookupError};
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
-use dioxus::logger::tracing::info;
+use dioxus::logger::tracing::{info, warn};
 use shared::download::{
     AutoDownloadEvent, DownloadEvent, DownloadProgress, DownloadQuery, DownloadableGroup,
-    DownloadableItem, EnqueueStatus, QueuedDownload,
+    DownloadableItem, EnqueueStatus, JobSlot, QueuedDownload,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::SoulseekError;
@@ -91,14 +94,17 @@ impl NewBatch {
     }
 }
 
-/// A new batch importing into `target` in the configured import mode.
-fn fresh_batch(batch_id: String, label: String, target: PathBuf) -> NewBatch {
-    NewBatch {
-        batch_id,
-        label,
-        target,
-        import_mode: CONFIG.import_mode(),
-    }
+/// What one job asks the backend for: its files by slot, and other sources
+/// for them.
+pub struct Acquisition {
+    pub job: String,
+    pub items: Vec<(u32, DownloadableItem)>,
+    pub alternates: Vec<DownloadableGroup>,
+}
+
+/// `items` as the slots 0..n of a job.
+fn numbered(items: Vec<DownloadableItem>) -> Vec<(u32, DownloadableItem)> {
+    (0..).zip(items).collect()
 }
 
 /// Creates `folder`'s directory, and returns its path as the import target.
@@ -110,28 +116,36 @@ async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> {
     Ok(target)
 }
 
-/// Claims and enqueues `ctx`'s request for `items`, shows their rows on its
-/// user's channel, and hands the enqueued ones to a monitor: the running
-/// batch's when the request joined one of the user's, else one of `fresh`.
-/// Either fails a slot over to its track's `alternates`.
+/// Claims and enqueues the files of `acquisition`'s job for `ctx`, shows
+/// their rows on its user's channel, and hands the enqueued ones to a
+/// monitor: the running batch's when the request joined one of the user's,
+/// else one of `fresh`. Either fails a slot over to its track's alternates.
+///
+/// Every row it sends carries its slot and is recorded in `ledger`: failed
+/// files Failed, queued ones Downloading. A file one of the user's batches
+/// already downloads into this folder dismisses its slot, as that batch
+/// pursues it. A slot the request got no answer for is recorded Failed but
+/// not sent, the request's own answer showing why: the same user downloads
+/// it into another folder, the backend call failed, or the backend answered
+/// nothing for it.
 ///
 /// Runs as its own task. Registry keys are claimed from its start, and the
 /// client may disconnect at any await and drop the caller: dropping the
 /// task's handle does not stop it, so the request always gets as far as a
 /// monitor or a release.
-pub async fn enqueue_and_watch(
+pub(crate) async fn enqueue_and_watch(
+    ledger: &Ledger,
     ctx: &UserCtx,
     backend: Arc<dyn DownloadBackend>,
-    items: Vec<DownloadableItem>,
     fresh: NewBatch,
-    alternates: Vec<DownloadableGroup>,
+    acquisition: Acquisition,
 ) -> Result<Vec<QueuedDownload>, Failure> {
     tokio::spawn(queue_and_watch(
+        ledger.clone(),
         ctx.clone(),
         backend,
-        items,
         fresh,
-        alternates,
+        acquisition,
     ))
     .await
     .map_err(|e| request_stopped(&e))?
@@ -139,12 +153,18 @@ pub async fn enqueue_and_watch(
 
 /// `enqueue_and_watch`'s work, in the task it runs as.
 async fn queue_and_watch(
+    ledger: Ledger,
     ctx: UserCtx,
     backend: Arc<dyn DownloadBackend>,
-    items: Vec<DownloadableItem>,
     fresh: NewBatch,
-    alternates: Vec<DownloadableGroup>,
+    acquisition: Acquisition,
 ) -> Result<Vec<QueuedDownload>, Failure> {
+    let Acquisition {
+        job,
+        items: picked,
+        alternates,
+    } = acquisition;
+    let items: Vec<DownloadableItem> = picked.iter().map(|(_, item)| item.clone()).collect();
     let enq = enqueue_request(&backend, items.clone(), fresh.owned_by(&ctx)).await;
     let refusal = enq.refusal();
     let RequestEnqueue {
@@ -152,55 +172,110 @@ async fn queue_and_watch(
         results,
         watcher,
         error,
-        ..
+        elsewhere,
     } = enq;
+
+    // The answer for each slot, by its index in `picked`.
+    let mut answers: Vec<Option<&QueuedDownload>> = vec![None; picked.len()];
+    for q in &results {
+        match item_index(q, &items) {
+            Some(at) => answers[at] = Some(q),
+            None => warn!(
+                "{} answered for {} from {}, which the request did not ask for",
+                backend.name(),
+                q.item,
+                q.source
+            ),
+        }
+    }
+    let slot = |n: u32| JobSlot {
+        job: job.clone(),
+        slot: n,
+    };
+    let (enqueued_slots, enqueued): (Vec<u32>, Vec<QueuedDownload>) = picked
+        .iter()
+        .zip(&answers)
+        .filter_map(|((n, _), answer)| {
+            answer
+                .filter(|q| q.status == EnqueueStatus::Enqueued)
+                .map(|q| (*n, q.clone()))
+        })
+        .unzip();
+    // Before any row, so a slot recorded downloading always has its batch.
+    if !enqueued.is_empty() {
+        ledger.record(JobEvent::Enqueued {
+            job: job.clone(),
+            monitor_batch_id: batch.owner.batch_id.clone(),
+            batch_label: batch.label.clone(),
+        });
+    }
 
     // A request only ever joins a batch of its own user, so every row of it
     // goes to that user's channel.
     let user = ctx.id();
     let tx = get_or_create_user_channel(&user).await;
-    let row = |p: DownloadProgress| {
-        let mut p = p.with_batch(batch.owner.batch_id.clone(), batch.label.clone());
-        p.backend = Some(backend.id().to_string());
-        p
+    let row = |p: DownloadProgress, n: u32| {
+        p.with_batch(batch.owner.batch_id.clone(), batch.label.clone())
+            .with_backend(backend.id())
+            .with_job(slot(n))
     };
 
-    let failed_entries: Vec<DownloadProgress> = results
-        .iter()
-        .filter_map(|d| {
-            let reason = failed_reason(&d.status)?;
-            Some(row(DownloadProgress::failed(
-                d.id.clone(),
-                d.source.clone(),
-                d.item.clone(),
-                reason,
-            )))
-        })
-        .collect();
-    if !failed_entries.is_empty() {
-        let _ = tx.send(DownloadEvent::Progress(failed_entries));
+    let mut failed = Vec::new();
+    let mut unanswered = Vec::new();
+    let mut queued = Vec::new();
+    let mut dismissed = Vec::new();
+    for ((n, item), answer) in picked.iter().zip(answers) {
+        let Some(q) = answer else {
+            let failure = if elsewhere.contains(&transfer_key(backend.id(), &item.source, &item.id))
+            {
+                another_folder(RetryAdvice::OtherSource)
+            } else if let Some(e) = &error {
+                queue_failed(e)
+            } else {
+                nothing_enqueued()
+            };
+            let p = DownloadProgress::failed(
+                item.id.clone(),
+                item.source.clone(),
+                item.id.clone(),
+                failure,
+            );
+            unanswered.push(row(p, *n));
+            continue;
+        };
+        match failed_reason(&q.status) {
+            Some(reason) => failed.push(row(
+                DownloadProgress::failed(q.id.clone(), q.source.clone(), q.item.clone(), reason),
+                *n,
+            )),
+            None if q.status == EnqueueStatus::Enqueued => queued.push(row(
+                DownloadProgress::queued(q.id.clone(), q.source.clone(), q.item.clone(), q.size),
+                *n,
+            )),
+            None => dismissed.push(slot(*n)),
+        }
     }
 
-    let enqueued: Vec<QueuedDownload> = results
-        .iter()
-        .filter(|d| d.status == EnqueueStatus::Enqueued)
-        .cloned()
-        .collect();
-
+    if !failed.is_empty() {
+        let _ = tx.send(DownloadEvent::Progress(failed.clone()));
+    }
+    failed.extend(unanswered);
+    if !failed.is_empty() {
+        ledger.record(JobEvent::Slots {
+            state: JobState::Failed,
+            rows: failed,
+        });
+    }
     // Send initial "Queued" state immediately so UI shows the downloads right away
-    let queued_entries: Vec<DownloadProgress> = enqueued
-        .iter()
-        .map(|d| {
-            row(DownloadProgress::queued(
-                d.id.clone(),
-                d.source.clone(),
-                d.item.clone(),
-                d.size,
-            ))
-        })
-        .collect();
-    if !queued_entries.is_empty() {
-        let _ = tx.send(DownloadEvent::Progress(queued_entries));
+    if !queued.is_empty() {
+        let _ = tx.send(DownloadEvent::Progress(queued.clone()));
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: queued,
+        });
+    }
+    if !dismissed.is_empty() {
+        ledger.record(JobEvent::Dismiss(dismissed));
     }
 
     match watcher {
@@ -213,14 +288,20 @@ async fn queue_and_watch(
             let lost = deliver(
                 reservation,
                 &enqueued,
-                &items,
+                &picked,
                 &alternates,
                 &backend,
                 &batch,
+                &job,
             )
             .await;
             if !lost.is_empty() {
-                let _ = tx.send(DownloadEvent::Progress(stopped_rows(&lost, &batch)));
+                let rows = stopped_rows(&lost, &batch);
+                let _ = tx.send(DownloadEvent::Progress(rows.clone()));
+                ledger.record(JobEvent::Slots {
+                    state: JobState::Failed,
+                    rows,
+                });
             }
         }
         Watcher::Own if enqueued.is_empty() && batch.inbox.close_if_idle() => {}
@@ -231,17 +312,19 @@ async fn queue_and_watch(
                 "Started monitoring downloads: {:?}",
                 enqueued.iter().map(|d| &d.item).collect::<Vec<_>>()
             );
-            let transfers = enqueued.iter().map(WatchedTransfer::from).collect();
+            let transfers = enqueued
+                .iter()
+                .zip(enqueued_slots)
+                .map(|(q, n)| WatchedTransfer::enqueued(q, slot(n)))
+                .collect();
             // Pool slots must line up with the monitor's slots, which follow
             // `enqueued`, not `items`.
             let pool = SourcePool::from_tracks(&align_pool_tracks(&enqueued, &items), &alternates);
-            register_user_task(&user).await;
-            tokio::spawn(async move {
-                let mut monitor = DownloadMonitor::new(transfers, batch.target.clone(), tx, batch)
-                    .with_failover(pool);
-                monitor.run().await;
-                unregister_user_task(&user).await;
-            });
+            let target = batch.target.clone();
+            spawn_monitor(
+                &ctx,
+                DownloadMonitor::new(transfers, target, tx, batch).with_failover(pool),
+            );
         }
     }
 
@@ -254,47 +337,136 @@ async fn queue_and_watch(
     Ok(results)
 }
 
-/// A hand-picked download of `items` into `folder`, from the named backend
-/// or the default one. The picks carry no alternates.
+/// Registers `ctx`'s user task and runs `monitor` in it.
+pub(crate) fn spawn_monitor(ctx: &UserCtx, mut monitor: DownloadMonitor) {
+    let user = ctx.id();
+    tokio::spawn(async move {
+        register_user_task(&user).await;
+        monitor.run().await;
+        unregister_user_task(&user).await;
+    });
+}
+
+/// The search's groups without the picked files, best score first, empty
+/// groups dropped.
+pub(crate) fn alternates_from(
+    groups: &[DownloadableGroup],
+    picked: &[DownloadableItem],
+) -> Vec<DownloadableGroup> {
+    let mut left: Vec<DownloadableGroup> = groups
+        .iter()
+        .map(|group| DownloadableGroup {
+            items: group
+                .items
+                .iter()
+                .filter(|item| {
+                    !picked
+                        .iter()
+                        .any(|p| p.id == item.id && p.source == item.source)
+                })
+                .cloned()
+                .collect(),
+            ..group.clone()
+        })
+        .filter(|group| !group.items.is_empty())
+        .collect();
+    left.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    left
+}
+
+/// A hand-picked download of `items` into `folder` from `ctx`'s search
+/// `search_id`, from the named backend or the default one. It continues the
+/// job waiting for a source from that search, else starts one, and the
+/// search's other candidates stand by as alternates.
 pub async fn download(
     ctx: &UserCtx,
     folder: &Folder,
     items: Vec<DownloadableItem>,
     backend: Option<&str>,
+    search_id: &str,
 ) -> Result<Vec<QueuedDownload>, Failure> {
     download_with(
+        &LEDGER,
         ctx,
         folder,
         items,
         crate::importer_health::blocking_failure(),
+        sources::owned_search(&crate::db::DB, ctx, search_id),
         download_backend(backend),
     )
     .await
 }
 
-/// `download`, given the importer's gate and the backend lookup. Each is
-/// awaited only once the steps before it passed: the gate, then the target
-/// folder, then the backend.
+/// `download`, given the ledger, the importer's gate, the search lookup and
+/// the backend lookup. Each is awaited only once the steps before it passed:
+/// the gate, then the search, then the target folder, then the backend.
 async fn download_with(
+    ledger: &Ledger,
     ctx: &UserCtx,
     folder: &Folder,
     items: Vec<DownloadableItem>,
     gate: impl Future<Output = Option<Failure>>,
+    search: impl Future<Output = Result<StoredSearch, Failure>>,
     backend: impl Future<Output = Result<Arc<dyn DownloadBackend>, BackendLookupError>>,
 ) -> Result<Vec<QueuedDownload>, Failure> {
     if let Some(failure) = gate.await {
         return Err(failure);
     }
+    let search = search.await?;
     let target = prepare_target(folder).await?;
     let backend = backend
         .await
         .map_err(|e| backend_unavailable(Stage::Enqueue, &e))?;
-    let fresh = fresh_batch(
-        uuid::Uuid::new_v4().to_string(),
-        manual_batch_label(&items),
+
+    let claimed = ledger
+        .claim_source_choice(&ctx.id(), &search.id, &folder.id)
+        .await
+        .map_err(|e| database_failure(Stage::Enqueue, e))?;
+    let (job, import_mode) = match claimed {
+        Some(claimed) => (claimed.id, claimed.import_mode),
+        None => {
+            let (id, import_mode) = (uuid::Uuid::new_v4().to_string(), CONFIG.import_mode());
+            ledger
+                .create(
+                    NewJob {
+                        id: id.clone(),
+                        user: ctx.id(),
+                        folder_id: folder.id.clone(),
+                        wanted: search.query,
+                        import_mode,
+                        state: JobState::Queued,
+                        search_id: Some(search.id),
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| database_failure(Stage::Enqueue, e))?;
+            (id, import_mode)
+        }
+    };
+
+    let alternates = alternates_from(search.candidates.as_deref().unwrap_or_default(), &items);
+    let fresh = NewBatch {
+        batch_id: uuid::Uuid::new_v4().to_string(),
+        label: manual_batch_label(&items),
         target,
-    );
-    enqueue_and_watch(ctx, backend, items, fresh, Vec::new()).await
+        import_mode,
+    };
+    let items = numbered(items);
+    ledger.record(JobEvent::Picked {
+        job: job.clone(),
+        items: items.clone(),
+    });
+    let acquisition = Acquisition {
+        job,
+        items,
+        alternates,
+    };
+    enqueue_and_watch(ledger, ctx, backend, fresh, acquisition).await
 }
 
 /// Score threshold for automatic source selection (per D-04).
@@ -334,22 +506,104 @@ fn enqueue_outcome(
     }
 }
 
+/// Where a search pipeline reports: the UI's batch id, the job, its stored
+/// search, and the import mode the job was recorded with.
+pub(crate) struct AutoRun {
+    pub batch_id: String,
+    pub job: String,
+    pub search_id: String,
+    pub import_mode: ImportMode,
+}
+
 /// Searches every backend for `query`, picks the best source when it scores
 /// well enough, and downloads it into `folder`, the other sources standing by
-/// as alternates. Everything after the backend lookup runs in the background
-/// and reports on the user's channel; the batch id is returned at once.
+/// as alternates. The request is a job from the start. Everything after the
+/// backend lookup runs in the background and reports on the user's channel;
+/// the batch id is returned at once.
 pub async fn auto_download(
     ctx: &UserCtx,
     folder: Folder,
-    mut query: DownloadQuery,
+    query: DownloadQuery,
 ) -> Result<String, Failure> {
     if let Some(failure) = crate::importer_health::blocking_failure().await {
         return Err(failure);
     }
     let key = lastfm_key(ctx).await?;
 
+    // Search every configured backend (per D-06).
+    let backends = match sources::usable_backends().await {
+        Ok(backends) => backends,
+        Err(failure) => {
+            let _ = get_or_create_user_channel(&ctx.id())
+                .await
+                .send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
+                    batch_id: uuid::Uuid::new_v4().to_string(),
+                    failure: failure.clone(),
+                }));
+            return Err(failure);
+        }
+    };
+
+    // Generate batch_id upfront so we can return it immediately (per D-10)
+    let run = AutoRun {
+        batch_id: uuid::Uuid::new_v4().to_string(),
+        job: uuid::Uuid::new_v4().to_string(),
+        search_id: uuid::Uuid::new_v4().to_string(),
+        import_mode: CONFIG.import_mode(),
+    };
+    LEDGER
+        .create(
+            NewJob {
+                id: run.job.clone(),
+                user: ctx.id(),
+                folder_id: folder.id.clone(),
+                wanted: query.clone(),
+                import_mode: run.import_mode,
+                state: JobState::Searching,
+                search_id: Some(run.search_id.clone()),
+            },
+            Some(NewSearch {
+                id: run.search_id.clone(),
+                user: ctx.id(),
+                backend: None,
+                query: query.clone(),
+            }),
+        )
+        .await
+        .map_err(|e| database_failure(Stage::SourceSearch, e))?;
+    let batch_id = run.batch_id.clone();
+
+    // Spawn the entire search-score-pick-download pipeline onto a background task.
+    // This avoids blocking the HTTP response during the search-poll loop (Research Pitfall 4).
+    tokio::spawn(run_search(
+        LEDGER.clone(),
+        ctx.clone(),
+        folder,
+        query,
+        key,
+        backends,
+        run,
+    ));
+
+    Ok(batch_id)
+}
+
+/// The spawned part of `auto_download`: searches, stores what it found as
+/// the search's candidates, then waits for a choice from them when no source
+/// scores well enough, else downloads the best one with the rest as
+/// alternates.
+pub(crate) async fn run_search(
+    ledger: Ledger,
+    ctx: UserCtx,
+    folder: Folder,
+    mut query: DownloadQuery,
+    lastfm_key: Option<String>,
+    backends: (Searched, Vec<Searched>),
+    run: AutoRun,
+) {
+    let (first, rest) = backends;
     let tx = get_or_create_user_channel(&ctx.id()).await;
-    let send = move |event| {
+    let send = |event| {
         let _ = tx.send(DownloadEvent::AutoDownload(event));
     };
 
@@ -366,142 +620,150 @@ pub async fn auto_download(
                 .unwrap_or_else(|| "Unknown query".to_string())
         });
 
-    // Search every configured backend (per D-06).
-    let (first, rest) = match sources::usable_backends().await {
-        Ok(backends) => backends,
+    send(AutoDownloadEvent::Searching {
+        batch_id: run.batch_id.clone(),
+        query: query_desc.clone(),
+        backend_count: 1 + rest.len(),
+    });
+
+    if let Err(failure) = hydrate_album_tracks(&mut query, lastfm_key.as_deref()).await {
+        info!(
+            "Auto-download: no tracklist for '{}': {}",
+            query_desc, failure.message
+        );
+        return fail_job(&ledger, &ctx, &run, failure).await;
+    }
+    let (album, tracks) = (query.album, query.tracks);
+
+    info!(
+        "Auto-download: searching {} backends for '{}'",
+        1 + rest.len(),
+        query_desc
+    );
+
+    // Search all backends in parallel (per D-06), best score first (per D-07)
+    let mut all_groups = match sources::search_ranked(&first, &rest, album.as_ref(), &tracks).await
+    {
+        Ok(groups) => groups,
         Err(failure) => {
-            send(AutoDownloadEvent::Failed {
-                batch_id: uuid::Uuid::new_v4().to_string(),
-                failure: failure.clone(),
-            });
-            return Err(failure);
+            info!("Auto-download: no results for '{}'", query_desc);
+            return fail_job(&ledger, &ctx, &run, failure).await;
+        }
+    };
+    if let Err(e) = ledger
+        .store_candidates(&run.search_id, all_groups.clone())
+        .await
+    {
+        return fail_job(
+            &ledger,
+            &ctx,
+            &run,
+            database_failure(Stage::SourceSearch, e),
+        )
+        .await;
+    }
+
+    let best_score = all_groups[0].score;
+
+    send(AutoDownloadEvent::ScoringResults {
+        batch_id: run.batch_id.clone(),
+        result_count: all_groups.len(),
+        best_score,
+    });
+
+    info!(
+        "Auto-download: {} results, best score {:.2} for '{}'",
+        all_groups.len(),
+        best_score,
+        query_desc
+    );
+
+    // Decide: auto-pick or fallback (per D-04)
+    if best_score < AUTO_SELECT_SCORE_THRESHOLD {
+        send(AutoDownloadEvent::FallbackToManual {
+            batch_id: run.batch_id.clone(),
+            search_id: run.search_id.clone(),
+            results: all_groups,
+            best_score,
+            threshold: AUTO_SELECT_SCORE_THRESHOLD,
+        });
+        ledger.record(JobEvent::NeedsSourceChoice {
+            job: run.job.clone(),
+        });
+        info!(
+            "Auto-download: score {:.2} < threshold {:.1}, falling back to manual for '{}'",
+            best_score, AUTO_SELECT_SCORE_THRESHOLD, query_desc
+        );
+        return;
+    }
+
+    // Pick the best source
+    let picked = all_groups.remove(0);
+
+    send(AutoDownloadEvent::PickedSource {
+        batch_id: run.batch_id.clone(),
+        source: picked.source.clone(),
+        score: picked.score,
+        quality: picked.quality.clone(),
+        track_count: picked.items.len(),
+    });
+
+    info!(
+        "Auto-download: picked source '{}' (score {:.2}, {} tracks) for '{}'",
+        picked.source,
+        picked.score,
+        picked.items.len(),
+        query_desc
+    );
+
+    let target = match prepare_target(&folder).await {
+        Ok(target) => target,
+        Err(failure) => return fail_job(&ledger, &ctx, &run, failure).await,
+    };
+
+    let backend = match download_backend(None).await {
+        Ok(b) => b,
+        Err(e) => {
+            let failure = backend_unavailable(Stage::Enqueue, &e);
+            return fail_job(&ledger, &ctx, &run, failure).await;
         }
     };
 
-    // Generate batch_id upfront so we can return it immediately (per D-10)
-    let batch_id = uuid::Uuid::new_v4().to_string();
-    let batch_id_for_response = batch_id.clone();
-
-    // Spawn the entire search-score-pick-download pipeline onto a background task.
-    // This avoids blocking the HTTP response during the search-poll loop (Research Pitfall 4).
-    let ctx = ctx.clone();
-    tokio::spawn(async move {
-        send(AutoDownloadEvent::Searching {
-            batch_id: batch_id.clone(),
-            query: query_desc.clone(),
-            backend_count: 1 + rest.len(),
-        });
-
-        if let Err(failure) = hydrate_album_tracks(&mut query, key.as_deref()).await {
-            info!(
-                "Auto-download: no tracklist for '{}': {}",
-                query_desc, failure.message
-            );
-            send(AutoDownloadEvent::Failed {
-                batch_id: batch_id.clone(),
-                failure,
-            });
-            return;
-        }
-        let (album, tracks) = (query.album, query.tracks);
-
-        info!(
-            "Auto-download: searching {} backends for '{}'",
-            1 + rest.len(),
-            query_desc
-        );
-
-        // Search all backends in parallel (per D-06), best score first (per D-07)
-        let mut all_groups =
-            match sources::search_ranked(&first, &rest, album.as_ref(), &tracks).await {
-                Ok(groups) => groups,
-                Err(failure) => {
-                    send(AutoDownloadEvent::Failed {
-                        batch_id: batch_id.clone(),
-                        failure,
-                    });
-                    info!("Auto-download: no results for '{}'", query_desc);
-                    return;
-                }
-            };
-
-        let best_score = all_groups[0].score;
-
-        send(AutoDownloadEvent::ScoringResults {
-            batch_id: batch_id.clone(),
-            result_count: all_groups.len(),
-            best_score,
-        });
-
-        info!(
-            "Auto-download: {} results, best score {:.2} for '{}'",
-            all_groups.len(),
-            best_score,
-            query_desc
-        );
-
-        // Decide: auto-pick or fallback (per D-04)
-        if best_score < AUTO_SELECT_SCORE_THRESHOLD {
-            send(AutoDownloadEvent::FallbackToManual {
-                batch_id: batch_id.clone(),
-                results: all_groups,
-                best_score,
-                threshold: AUTO_SELECT_SCORE_THRESHOLD,
-            });
-            info!(
-                "Auto-download: score {:.2} < threshold {:.1}, falling back to manual for '{}'",
-                best_score, AUTO_SELECT_SCORE_THRESHOLD, query_desc
-            );
-            return;
-        }
-
-        // Pick the best source
-        let picked = all_groups.remove(0);
-
-        send(AutoDownloadEvent::PickedSource {
-            batch_id: batch_id.clone(),
-            source: picked.source.clone(),
-            score: picked.score,
-            quality: picked.quality.clone(),
-            track_count: picked.items.len(),
-        });
-
-        info!(
-            "Auto-download: picked source '{}' (score {:.2}, {} tracks) for '{}'",
-            picked.source,
-            picked.score,
-            picked.items.len(),
-            query_desc
-        );
-
-        let target = match prepare_target(&folder).await {
-            Ok(target) => target,
-            Err(failure) => {
-                send(AutoDownloadEvent::Failed {
-                    batch_id: batch_id.clone(),
-                    failure,
-                });
-                return;
-            }
-        };
-
-        let backend = match download_backend(None).await {
-            Ok(b) => b,
-            Err(e) => {
-                send(AutoDownloadEvent::Failed {
-                    batch_id: batch_id.clone(),
-                    failure: backend_unavailable(Stage::Enqueue, &e),
-                });
-                return;
-            }
-        };
-
-        let fresh = fresh_batch(batch_id.clone(), auto_batch_label(&picked), target);
-        let outcome = enqueue_and_watch(&ctx, backend, picked.items, fresh, all_groups).await;
-        send(enqueue_outcome(batch_id, &outcome));
+    let fresh = NewBatch {
+        batch_id: run.batch_id.clone(),
+        label: auto_batch_label(&picked),
+        target,
+        import_mode: run.import_mode,
+    };
+    let items = numbered(picked.items);
+    ledger.record(JobEvent::Picked {
+        job: run.job.clone(),
+        items: items.clone(),
     });
+    let acquisition = Acquisition {
+        job: run.job.clone(),
+        items,
+        alternates: all_groups,
+    };
+    let outcome = enqueue_and_watch(&ledger, &ctx, backend, fresh, acquisition).await;
+    match enqueue_outcome(run.batch_id.clone(), &outcome) {
+        AutoDownloadEvent::Failed { failure, .. } => fail_job(&ledger, &ctx, &run, failure).await,
+        event => send(event),
+    }
+}
 
-    Ok(batch_id_for_response)
+/// Reports `failure` as the pipeline's and ends its job Failed.
+pub(crate) async fn fail_job(ledger: &Ledger, ctx: &UserCtx, run: &AutoRun, failure: Failure) {
+    let _ = get_or_create_user_channel(&ctx.id())
+        .await
+        .send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
+            batch_id: run.batch_id.clone(),
+            failure,
+        }));
+    ledger.record(JobEvent::Ended {
+        job: run.job.clone(),
+        state: JobState::Failed,
+    });
 }
 
 /// No transfer of the user's has that id on that peer.
@@ -572,12 +834,13 @@ async fn cancel_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::UserId;
     use crate::core::test_ctx;
-    use crate::server_fns::download::enqueue::{another_folder, other_user, transfer_key};
+    use crate::server_fns::download::enqueue::other_user;
     use crate::server_fns::download::test_support::{
-        batch, group, item, key, transfer, ScriptedOutcome, StubBackend,
+        batch, group, item, key, search_result, transfer, ScriptedOutcome, StubBackend,
     };
-    use crate::transfer_registry::TransferRegistry;
+    use shared::download::SearchState;
     use shared::failure::{Cause, Service};
 
     fn ctx_of(batch: &BatchRef) -> UserCtx {
@@ -597,6 +860,18 @@ mod tests {
             label: "Come Over".to_string(),
             target,
             import_mode: running.import_mode,
+        }
+    }
+
+    /// Job `j1` asking for `items` as slots 0..n, with `alternates`.
+    fn acquisition(
+        items: Vec<DownloadableItem>,
+        alternates: Vec<DownloadableGroup>,
+    ) -> Acquisition {
+        Acquisition {
+            job: "j1".into(),
+            items: numbered(items),
+            alternates,
         }
     }
 
@@ -720,7 +995,14 @@ mod tests {
         // as when the client disconnects.
         let ctx = ctx_of(&running);
         let handler = tokio::spawn(async move {
-            enqueue_and_watch(&ctx, backend, items, fresh, Vec::new()).await
+            enqueue_and_watch(
+                &Ledger::recording().0,
+                &ctx,
+                backend,
+                fresh,
+                acquisition(items, Vec::new()),
+            )
+            .await
         });
         reached.notified().await;
         handler.abort();
@@ -757,14 +1039,17 @@ mod tests {
         )];
 
         enqueue_and_watch(
+            &Ledger::recording().0,
             &ctx_of(&running),
             backend,
-            vec![
-                item("peer_a", "One", "01.flac"),
-                item("peer_a", "Two", "02.flac"),
-            ],
             fresh,
-            rest,
+            acquisition(
+                vec![
+                    item("peer_a", "One", "01.flac"),
+                    item("peer_a", "Two", "02.flac"),
+                ],
+                rest,
+            ),
         )
         .await
         .unwrap();
@@ -785,11 +1070,11 @@ mod tests {
         TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
         let fresh = new_batch_beside(&running, PathBuf::from("/other-library"));
         let got = enqueue_and_watch(
+            &Ledger::recording().0,
             &ctx_of(&running),
             backend,
-            vec![item("peer_a", "One", "01.flac")],
             fresh,
-            Vec::new(),
+            acquisition(vec![item("peer_a", "One", "01.flac")], Vec::new()),
         )
         .await;
         assert_eq!(got.unwrap_err(), another_folder(RetryAdvice::NotRetryable));
@@ -801,11 +1086,11 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> =
             StubBackend::new(vec![ScriptedOutcome::TransportError]);
         let f = enqueue_and_watch(
+            &Ledger::recording().0,
             &own_ctx(),
             backend,
-            vec![item("peer_a", "One", "01.flac")],
             new_batch("X"),
-            Vec::new(),
+            acquisition(vec![item("peer_a", "One", "01.flac")], Vec::new()),
         )
         .await
         .unwrap_err();
@@ -832,11 +1117,11 @@ mod tests {
             .await
             .subscribe();
         let results = enqueue_and_watch(
+            &Ledger::recording().0,
             &ctx,
             backend.clone(),
-            vec![item("peer_a", "One", "01.flac")],
             fresh,
-            Vec::new(),
+            acquisition(vec![item("peer_a", "One", "01.flac")], Vec::new()),
         )
         .await
         .unwrap();
@@ -917,7 +1202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_download_checks_the_importer_then_the_folder_then_the_backend() {
+    async fn a_download_checks_the_importer_then_the_search_then_the_folder_then_the_backend() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("music");
         std::fs::write(&file, b"").unwrap();
@@ -929,23 +1214,48 @@ mod tests {
             RetryAdvice::NeedsUser,
             "No metadata source plugin loaded",
         );
+        let stored = || StoredSearch {
+            id: "s1".into(),
+            backend: Some("slskd".into()),
+            query: DownloadQuery::new(vec![]),
+            candidates: None,
+            expires_at: i64::MAX,
+        };
+        let ledger = Ledger::recording().0;
 
         let gated = download_with(
+            &ledger,
             &own_ctx(),
             &unwritable,
             items(),
             std::future::ready(Some(importer.clone())),
+            std::future::ready(Err(sources::search_not_found())),
             unreached_backend(),
         )
         .await
         .unwrap_err();
         assert_eq!(gated, importer);
 
-        let unwritable_target = download_with(
+        let no_search = download_with(
+            &ledger,
             &own_ctx(),
             &unwritable,
             items(),
             std::future::ready(None),
+            std::future::ready(Err(sources::search_not_found())),
+            unreached_backend(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(no_search, sources::search_not_found());
+
+        let unwritable_target = download_with(
+            &ledger,
+            &own_ctx(),
+            &unwritable,
+            items(),
+            std::future::ready(None),
+            std::future::ready(Ok(stored())),
             unreached_backend(),
         )
         .await
@@ -954,15 +1264,444 @@ mod tests {
 
         let unknown = BackendLookupError::Unknown("nicotine".into());
         let no_backend = download_with(
+            &ledger,
             &own_ctx(),
             &folder_at(&dir.path().join("library")),
             items(),
             std::future::ready(None),
+            std::future::ready(Ok(stored())),
             std::future::ready(Err(BackendLookupError::Unknown("nicotine".into()))),
         )
         .await
         .unwrap_err();
         assert_eq!(no_backend, backend_unavailable(Stage::Enqueue, &unknown));
+    }
+
+    #[test]
+    fn a_hand_picked_download_keeps_the_other_sources_of_its_search() {
+        let groups = vec![
+            group(
+                "peer_a",
+                vec![
+                    item("peer_a", "One", "a/01.flac"),
+                    item("peer_a", "Two", "a/02.flac"),
+                ],
+                0.6,
+            ),
+            group("peer_b", vec![item("peer_b", "One", "b/01.flac")], 0.9),
+            group("peer_c", vec![item("peer_c", "Two", "c/02.flac")], 0.4),
+        ];
+        let picked = vec![
+            item("peer_a", "One", "a/01.flac"),
+            item("peer_a", "Two", "a/02.flac"),
+            item("peer_c", "Two", "c/02.flac"),
+        ];
+        let left = alternates_from(&groups, &picked);
+        assert_eq!(
+            left.iter()
+                .map(|g| (g.source.as_str(), g.items.len()))
+                .collect::<Vec<_>>(),
+            vec![("peer_b", 1)]
+        );
+    }
+
+    /// Each row's slot and failure.
+    type SlotRows = Vec<(Option<JobSlot>, Option<Failure>)>;
+
+    /// The Slots events of `events`: their state, and each row's slot and failure.
+    fn slot_events(events: Vec<JobEvent>) -> Vec<(JobState, SlotRows)> {
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                JobEvent::Slots { state, rows } => Some((
+                    state,
+                    rows.into_iter().map(|r| (r.job, r.failure)).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_failed_file_of_a_request_is_recorded_on_its_slot() {
+        let (ledger, mut recorded) = Ledger::recording();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Rejected]);
+        enqueue_and_watch(
+            &ledger,
+            &own_ctx(),
+            backend,
+            new_batch("Come Over"),
+            Acquisition {
+                job: "j1".into(),
+                items: vec![(0, item("peer_a", "One", "01.flac"))],
+                alternates: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let failed: Vec<(JobState, Vec<Option<FailureCode>>)> = slot_events(recorded.events())
+            .into_iter()
+            .map(|(state, rows)| {
+                (
+                    state,
+                    rows.into_iter().map(|(_, f)| f.map(|f| f.code)).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            failed,
+            vec![(JobState::Failed, vec![Some(FailureCode::PeerOffline)])]
+        );
+    }
+
+    #[tokio::test]
+    async fn files_a_request_got_no_answer_for_fail_their_slots() {
+        // The backend call fails: both slots fail with the request's own failure.
+        let (ledger, mut recorded) = Ledger::recording();
+        let backend: Arc<dyn DownloadBackend> =
+            StubBackend::new(vec![ScriptedOutcome::TransportError]);
+        let returned = enqueue_and_watch(
+            &ledger,
+            &own_ctx(),
+            backend,
+            new_batch("Come Over"),
+            Acquisition {
+                job: "j1".into(),
+                items: vec![
+                    (0, item("peer_a", "One", "01.flac")),
+                    (1, item("peer_a", "Two", "02.flac")),
+                ],
+                alternates: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+        let slot = |n| {
+            Some(JobSlot {
+                job: "j1".into(),
+                slot: n,
+            })
+        };
+        assert_eq!(
+            slot_events(recorded.events()),
+            vec![(
+                JobState::Failed,
+                vec![(slot(0), Some(returned.clone())), (slot(1), Some(returned))]
+            )]
+        );
+
+        // The same user downloads the only file into another folder.
+        let (ledger, mut recorded) = Ledger::recording();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = batch("Come Over");
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
+        let fresh = new_batch_beside(&running, PathBuf::from("/elsewhere"));
+        let refused = enqueue_and_watch(
+            &ledger,
+            &ctx_of(&running),
+            backend,
+            fresh,
+            Acquisition {
+                job: "j2".into(),
+                items: vec![(0, item("peer_a", "One", "01.flac"))],
+                alternates: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused, another_folder(RetryAdvice::NotRetryable));
+        assert_eq!(
+            slot_events(recorded.events()),
+            vec![(
+                JobState::Failed,
+                vec![(
+                    Some(JobSlot {
+                        job: "j2".into(),
+                        slot: 0
+                    }),
+                    Some(another_folder(RetryAdvice::OtherSource))
+                )]
+            )]
+        );
+        assert!(stub.destinations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_enqueue_fails_ends_its_job() {
+        let db = crate::db::test_db::migrated().await;
+        let folder_id = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        ledger
+            .create(
+                NewJob {
+                    id: "j1".into(),
+                    user: UserId::new("alice"),
+                    folder_id,
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Queued,
+                    search_id: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let items = vec![
+            (0, item("peer_a", "One", "01.flac")),
+            (1, item("peer_a", "Two", "02.flac")),
+        ];
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: items.clone(),
+        });
+        let backend: Arc<dyn DownloadBackend> =
+            StubBackend::new(vec![ScriptedOutcome::TransportError]);
+        enqueue_and_watch(
+            &ledger,
+            &own_ctx(),
+            backend,
+            new_batch("Come Over"),
+            Acquisition {
+                job: "j1".into(),
+                items,
+                alternates: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+        ledger.settled().await;
+        // Terminal, so Task 12's `unfinished` never returns it.
+        assert_eq!(
+            crate::ledger::store::job_state(&db, "j1").await,
+            Some(JobState::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_another_batch_already_downloads_dismisses_its_slot_and_names_that_batch() {
+        let (ledger, mut recorded) = Ledger::recording();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = batch("Come Over");
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
+        let fresh = new_batch_beside(&running, running.target.clone());
+        enqueue_and_watch(
+            &ledger,
+            &ctx_of(&running),
+            backend,
+            fresh,
+            Acquisition {
+                job: "j2".into(),
+                items: vec![
+                    (0, item("peer_a", "One", "01.flac")),
+                    (1, item("peer_a", "Two", "02.flac")),
+                ],
+                alternates: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let events = recorded.events();
+        assert!(events.contains(&JobEvent::Dismiss(vec![JobSlot {
+            job: "j2".into(),
+            slot: 0
+        }])));
+        assert!(events.contains(&JobEvent::Enqueued {
+            job: "j2".into(),
+            monitor_batch_id: running.owner.batch_id.clone(),
+            batch_label: "Come Over".into()
+        }));
+        assert_eq!(
+            running
+                .inbox
+                .take()
+                .iter()
+                .map(|s| s.job.clone())
+                .collect::<Vec<_>>(),
+            vec![JobSlot {
+                job: "j2".into(),
+                slot: 1
+            }]
+        );
+    }
+
+    /// `alice`'s folder `folder_id` at a new temporary directory.
+    fn alices_folder(folder_id: String, dir: &tempfile::TempDir) -> Folder {
+        Folder {
+            id: folder_id,
+            user_id: "alice".into(),
+            name: "f".into(),
+            path: dir.path().to_string_lossy().into_owned(),
+            shared: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pick_from_a_search_that_is_gone_is_refused_before_anything_downloads() {
+        let db = crate::db::test_db::migrated().await;
+        let folder_id = crate::core::folder_of(&db, "alice").await;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = alices_folder(folder_id, &dir);
+        let ledger = Ledger::start(db.clone());
+        let f = download_with(
+            &ledger,
+            &test_ctx("alice"),
+            &folder,
+            vec![item("peer_a", "One", "01.flac")],
+            std::future::ready(None),
+            sources::owned_search(&db, &test_ctx("alice"), "no-such-search"),
+            unreached_backend(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(f, sources::search_not_found());
+    }
+
+    #[tokio::test]
+    async fn a_pick_from_the_fallback_continues_its_job_with_the_searchs_other_sources() {
+        let db = crate::db::test_db::migrated().await;
+        let folder_id = crate::core::folder_of(&db, "alice").await;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = alices_folder(folder_id.clone(), &dir);
+        let ledger = Ledger::start(db.clone());
+        let candidates = vec![
+            group(
+                "peer_a",
+                vec![
+                    item("peer_a", "One", "01.flac"),
+                    item("peer_a", "Two", "02.flac"),
+                ],
+                0.5,
+            ),
+            group("peer_b", vec![item("peer_b", "Two", "b/02.flac")], 0.4),
+        ];
+        ledger
+            .create(
+                NewJob {
+                    id: "j1".into(),
+                    user: UserId::new("alice"),
+                    folder_id,
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::NeedsSourceChoice,
+                    search_id: Some("s1".into()),
+                },
+                Some(NewSearch {
+                    id: "s1".into(),
+                    user: UserId::new("alice"),
+                    backend: None,
+                    query: DownloadQuery::new(vec![]),
+                }),
+            )
+            .await
+            .unwrap();
+        ledger.store_candidates("s1", candidates).await.unwrap();
+        // Alice already downloads One into this folder, so Two joins that batch.
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = BatchRef::new(
+            TransferOwner {
+                user_id: UserId::new("alice"),
+                batch_id: uuid::Uuid::new_v4().to_string(),
+            },
+            "Come Over".into(),
+            dir.path().to_path_buf(),
+            ImportMode::Singleton,
+        );
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
+
+        let ctx = test_ctx("alice");
+        download_with(
+            &ledger,
+            &ctx,
+            &folder,
+            vec![
+                item("peer_a", "One", "01.flac"),
+                item("peer_a", "Two", "02.flac"),
+            ],
+            std::future::ready(None),
+            sources::owned_search(&db, &ctx, "s1"),
+            std::future::ready(Ok(backend)),
+        )
+        .await
+        .unwrap();
+        ledger.settled().await;
+
+        assert_eq!(
+            crate::ledger::store::job_state(&db, "j1").await,
+            Some(JobState::Downloading)
+        );
+        let joined = running.inbox.take();
+        assert_eq!(
+            joined
+                .iter()
+                .map(|s| (s.job.clone(), s.alternates.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                JobSlot {
+                    job: "j1".into(),
+                    slot: 1
+                },
+                vec![item("peer_b", "Two", "b/02.flac")]
+            )]
+        );
+    }
+
+    // Paused: search_ranked waits SEARCH_POLL_INTERVAL before each poll.
+    #[tokio::test(start_paused = true)]
+    async fn an_auto_download_with_no_confident_source_waits_for_a_choice_from_its_search() {
+        let (ledger, mut recorded) = Ledger::recording();
+        let ctx = test_ctx("auto-fallback");
+        let mut rx = crate::globals::get_or_create_user_channel(&ctx.id())
+            .await
+            .subscribe();
+        let folder = Folder {
+            id: "f1".into(),
+            user_id: ctx.user_id.clone(),
+            name: "Music".into(),
+            path: "/music".into(),
+            shared: false,
+        };
+        let stub = StubBackend::new(vec![]);
+        stub.script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            vec![group(
+                "peer_a",
+                vec![item("peer_a", "Wake Up", "a/07.flac")],
+                0.2,
+            )],
+        ))]);
+        let a: Arc<dyn DownloadBackend> = stub;
+        let run = AutoRun {
+            batch_id: "b1".into(),
+            job: "j1".into(),
+            search_id: "s1".into(),
+            import_mode: ImportMode::Singleton,
+        };
+
+        run_search(
+            ledger,
+            ctx,
+            folder,
+            DownloadQuery::new(vec![]),
+            None,
+            (("a".into(), a), vec![]),
+            run,
+        )
+        .await;
+
+        assert!(recorded
+            .events()
+            .contains(&JobEvent::NeedsSourceChoice { job: "j1".into() }));
+        let fallback = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|e| match e {
+            DownloadEvent::AutoDownload(AutoDownloadEvent::FallbackToManual {
+                search_id, ..
+            }) => Some(search_id),
+            _ => None,
+        });
+        assert_eq!(fallback, Some("s1".to_string()));
     }
 
     #[test]

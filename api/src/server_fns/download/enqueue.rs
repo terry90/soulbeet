@@ -4,14 +4,14 @@
 //! anything, and releases each key whose file was not enqueued.
 
 use shared::download::{
-    DownloadProgress, DownloadableGroup, DownloadableItem, EnqueueStatus, QueuedDownload,
+    DownloadProgress, DownloadableGroup, DownloadableItem, EnqueueStatus, JobSlot, QueuedDownload,
 };
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::DownloadBackend;
 use std::sync::Arc;
 
-use super::failover::{align_pool_tracks, alternates_for};
+use super::failover::{alternates_for, item_index};
 use crate::transfer_registry::{
     AddedSlot, BatchRef, Claim, InboxReservation, RequestClaim, TransferKey, TransferRegistry,
 };
@@ -110,20 +110,23 @@ pub fn failed_reason(status: &EnqueueStatus) -> Option<Failure> {
     }
 }
 
+/// A file the backend answered nothing for.
+pub fn nothing_enqueued() -> Failure {
+    Failure::new(
+        FailureCode::EnqueueFailed,
+        Stage::Enqueue,
+        RetryAdvice::OtherSource,
+        NOTHING_ENQUEUED,
+    )
+}
+
 /// Why none of `results` was enqueued: the first failed file's failure, else
-/// `nothing enqueued` for a backend that answered nothing for its files.
+/// `nothing_enqueued` for a backend that answered nothing for its files.
 pub fn not_enqueued_failure(results: &[QueuedDownload]) -> Failure {
     results
         .iter()
         .find_map(|q| failed_reason(&q.status))
-        .unwrap_or_else(|| {
-            Failure::new(
-                FailureCode::EnqueueFailed,
-                Stage::Enqueue,
-                RetryAdvice::OtherSource,
-                NOTHING_ENQUEUED,
-            )
-        })
+        .unwrap_or_else(nothing_enqueued)
 }
 
 /// Why `batch` could not claim its one key, when `claim` found it held:
@@ -189,8 +192,9 @@ pub struct RequestEnqueue {
     /// The backend call itself failed: `results` lacks the files sent in it,
     /// and their keys are released.
     pub error: Option<SoulseekError>,
-    /// Some files are already downloading into another folder.
-    another_folder: bool,
+    /// Keys the same user is already downloading into another folder: that
+    /// batch shows their rows, and they get no entry in `results`.
+    pub elsewhere: Vec<TransferKey>,
 }
 
 impl RequestEnqueue {
@@ -201,7 +205,7 @@ impl RequestEnqueue {
             .results
             .iter()
             .any(|q| q.status == EnqueueStatus::Enqueued);
-        (self.another_folder && !enqueued).then(|| another_folder(RetryAdvice::NotRetryable))
+        (!self.elsewhere.is_empty() && !enqueued).then(|| another_folder(RetryAdvice::NotRetryable))
     }
 }
 
@@ -276,32 +280,40 @@ pub async fn enqueue_request(
         results,
         watcher,
         error,
-        another_folder: !elsewhere.is_empty(),
+        elsewhere: elsewhere.into_iter().map(|(key, _)| key.clone()).collect(),
     }
 }
 
 /// Hands a joining request's enqueued transfers to `batch`'s monitor, each
-/// with the alternates `rest` holds for the item it came from among `items`,
-/// none for one it cannot be lined up with.
+/// as the slot of `job` its file has among `picked`, with the alternates
+/// `rest` holds for that file. A transfer no picked file lines up with is no
+/// slot of the job and is not handed over.
 /// Returns the ones nobody will watch because that monitor stopped first,
 /// with their keys released and their transfers cancelled, since they would
 /// download into the batch's folder with nobody to import them.
 pub async fn deliver(
     reservation: InboxReservation,
     enqueued: &[QueuedDownload],
-    items: &[DownloadableItem],
+    picked: &[(u32, DownloadableItem)],
     rest: &[DownloadableGroup],
     backend: &Arc<dyn DownloadBackend>,
     batch: &BatchRef,
+    job: &str,
 ) -> Vec<AddedSlot> {
     let slots = enqueued
         .iter()
-        .zip(align_pool_tracks(enqueued, items))
-        .map(|(q, track)| AddedSlot {
-            source: q.source.clone(),
-            filename: q.item.clone(),
-            transfer_id: q.id.clone(),
-            alternates: track.map_or_else(Vec::new, |track| alternates_for(&track, rest)),
+        .filter_map(|q| {
+            let (slot, item) = &picked[item_index(q, picked.iter().map(|(_, item)| item))?];
+            Some(AddedSlot {
+                source: q.source.clone(),
+                filename: q.item.clone(),
+                transfer_id: q.id.clone(),
+                alternates: alternates_for(item, rest),
+                job: JobSlot {
+                    job: job.to_string(),
+                    slot: *slot,
+                },
+            })
         })
         .collect();
     let lost = match reservation.deliver(slots) {
@@ -339,6 +351,7 @@ pub fn stopped_rows(lost: &[AddedSlot], batch: &BatchRef) -> Vec<DownloadProgres
                 monitor_stopped(),
             )
             .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
+            .with_job(slot.job.clone())
         })
         .collect()
 }
@@ -474,6 +487,7 @@ mod tests {
             )
         );
         assert_eq!(nothing.cause, None);
+        assert_eq!(nothing, nothing_enqueued());
     }
 
     #[tokio::test]
@@ -536,7 +550,8 @@ mod tests {
             0.8,
         )];
 
-        let enq = enqueue_request(&backend, items.clone(), fresh.clone()).await;
+        let picked: Vec<(u32, DownloadableItem)> = (0..).zip(items.clone()).collect();
+        let enq = enqueue_request(&backend, items, fresh.clone()).await;
 
         assert_eq!(
             statuses(&enq.results),
@@ -560,11 +575,17 @@ mod tests {
             .into_iter()
             .filter(|q| q.status == EnqueueStatus::Enqueued)
             .collect();
-        assert!(
-            deliver(reservation, &enqueued, &items, &rest, &backend, &running)
-                .await
-                .is_empty()
-        );
+        assert!(deliver(
+            reservation,
+            &enqueued,
+            &picked,
+            &rest,
+            &backend,
+            &running,
+            "j1"
+        )
+        .await
+        .is_empty());
         assert_eq!(
             running.inbox.take(),
             vec![AddedSlot {
@@ -572,12 +593,16 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02.flac".to_string(),
                 alternates: vec![item("peer_b", "Two", "b/02.flac")],
+                job: JobSlot {
+                    job: "j1".to_string(),
+                    slot: 1,
+                },
             }]
         );
     }
 
     #[tokio::test]
-    async fn a_delivered_transfer_no_item_lines_up_with_gets_no_alternates() {
+    async fn a_transfer_no_picked_file_lines_up_with_is_not_delivered() {
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let running = batch("Come Over");
         let reservation = running.inbox.reserve().expect("open inbox");
@@ -598,23 +623,16 @@ mod tests {
         let lost = deliver(
             reservation,
             &enqueued,
-            &[item("peer_a", "One", "01.flac")],
+            &[(0, item("peer_a", "One", "01.flac"))],
             &rest,
             &backend,
             &running,
+            "j1",
         )
         .await;
 
         assert!(lost.is_empty());
-        assert_eq!(
-            running.inbox.take(),
-            vec![AddedSlot {
-                source: "peer_a".to_string(),
-                filename: "02.flac".to_string(),
-                transfer_id: "t-02.flac".to_string(),
-                alternates: Vec::new(),
-            }]
-        );
+        assert!(running.inbox.take().is_empty(), "it is no slot of the job");
     }
 
     #[tokio::test]
@@ -837,10 +855,11 @@ mod tests {
         let lost = deliver(
             reservation,
             &enqueued,
-            &[item("peer_a", "One", "01.flac")],
+            &[(0, item("peer_a", "One", "01.flac"))],
             &[],
             &backend,
             &running,
+            "j1",
         )
         .await;
 

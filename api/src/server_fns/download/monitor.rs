@@ -8,7 +8,7 @@
 //! moving the file, which strands the file in slskd's incomplete folder.
 
 use dioxus::logger::tracing::{debug, info, warn};
-use shared::download::{DownloadEvent, DownloadProgress, DownloadState, QueuedDownload};
+use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, QueuedDownload};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::SoulseekError;
 use soulbeet::{DownloadBackend, ImportMode};
@@ -272,14 +272,22 @@ pub struct WatchedTransfer {
     pub source: String,
     pub filename: String,
     pub transfer_id: String,
+    /// The job slot it downloads for.
+    pub job: JobSlot,
+    /// The batch adopted it from another peer's retry (#62): slskd saved it
+    /// where its own enqueue said.
+    pub adopted: bool,
 }
 
-impl From<&QueuedDownload> for WatchedTransfer {
-    fn from(queued: &QueuedDownload) -> Self {
+impl WatchedTransfer {
+    /// The transfer `queued` names, enqueued into the batch's folder for `job`.
+    pub fn enqueued(queued: &QueuedDownload, job: JobSlot) -> Self {
         Self {
             source: queued.source.clone(),
             filename: queued.item.clone(),
             transfer_id: queued.id.clone(),
+            job,
+            adopted: false,
         }
     }
 }
@@ -294,6 +302,8 @@ struct TrackedFile {
     /// transfer this batch adopted, which slskd saves wherever its own
     /// enqueue said.
     destination: Option<String>,
+    /// The job slot the slot downloads for, kept through every rebind.
+    job: JobSlot,
 }
 
 /// Monitors download progress from slskd and hands finished files to the
@@ -344,7 +354,8 @@ impl DownloadMonitor {
                 source: t.source,
                 filename: t.filename,
                 transfer_id: t.transfer_id,
-                destination: Some(batch.destination.clone()),
+                destination: (!t.adopted).then(|| batch.destination.clone()),
+                job: t.job,
             })
             .collect();
 
@@ -480,6 +491,7 @@ impl DownloadMonitor {
                 filename: slot.filename,
                 transfer_id: slot.transfer_id,
                 destination: Some(self.batch.destination.clone()),
+                job: slot.job,
             });
             self.track_states.push(TrackState::bound_now());
             self.pool.push_slot(slot.alternates);
@@ -619,6 +631,7 @@ impl DownloadMonitor {
         // The new peer serves this track under a completely different remote
         // path and transfer id, so the slot must track both outright or the
         // monitor loses sight of it.
+        let job = self.tracked_files[slot].job.clone();
         let previous_item = std::mem::replace(
             &mut self.tracked_files[slot],
             TrackedFile {
@@ -626,13 +639,14 @@ impl DownloadMonitor {
                 filename: queued.item.clone(),
                 transfer_id: queued.id.clone(),
                 destination: Some(self.batch.destination.clone()),
+                job,
             },
         )
         .filename;
         self.track_states[slot] = TrackState::bound_now();
 
         let entry = DownloadProgress::queued(queued.id, queued.source, queued.item, queued.size);
-        let entry = self.stamp(entry);
+        let entry = self.stamp(slot, entry);
         // One slot is still one download, so the panel replaces the abandoned
         // peer's row instead of gaining a second one for the same track.
         let _ = self.tx.send(DownloadEvent::Replaced {
@@ -849,7 +863,7 @@ impl DownloadMonitor {
             let row = self.cancelled_row(slot, backend.id());
             self.abandon(slot, backend).await;
             self.settle(slot, SlotPhase::Settled, backend.id());
-            cancelled.push(self.stamp(row));
+            cancelled.push(self.stamp(slot, row));
         }
         if !cancelled.is_empty() {
             let _ = self.tx.send(DownloadEvent::Progress(cancelled));
@@ -1047,6 +1061,7 @@ impl DownloadMonitor {
         // Its record, failed or already gone, no longer belongs to a slot.
         self.abandoned
             .push((tracked.source.clone(), tracked.transfer_id.clone()));
+        let job = tracked.job.clone();
         let previous_item = std::mem::replace(
             &mut self.tracked_files[slot],
             TrackedFile {
@@ -1054,6 +1069,7 @@ impl DownloadMonitor {
                 filename: retry.item.clone(),
                 transfer_id: retry.id.clone(),
                 destination: None,
+                job,
             },
         )
         .filename;
@@ -1062,7 +1078,7 @@ impl DownloadMonitor {
         if previous_item != retry.item {
             let _ = self.tx.send(DownloadEvent::Replaced {
                 previous_item,
-                entry: Box::new(self.stamp(retry.clone())),
+                entry: Box::new(self.stamp(slot, retry.clone())),
             });
         }
         true
@@ -1092,7 +1108,7 @@ impl DownloadMonitor {
             .filter(|(slot, dl)| {
                 self.watching(*slot) && self.is_current(*slot, dl) && !is_failed(&dl.state)
             })
-            .map(|(_, dl)| self.stamp(dl.clone()))
+            .map(|(slot, dl)| self.stamp(*slot, dl.clone()))
             .collect();
         if entries.is_empty() {
             return;
@@ -1106,14 +1122,12 @@ impl DownloadMonitor {
         }
     }
 
-    /// Apply batch_id and batch_label to a progress entry.
-    fn stamp(&self, entry: DownloadProgress) -> DownloadProgress {
-        entry.with_batch(self.batch.owner.batch_id.clone(), self.batch.label.clone())
-    }
-
-    /// Apply batch_id and batch_label to a set of progress entries.
-    fn stamp_batch(&self, entries: Vec<DownloadProgress>) -> Vec<DownloadProgress> {
-        entries.into_iter().map(|entry| self.stamp(entry)).collect()
+    /// `entry` stamped with the batch and with `slot`'s job. Every row the
+    /// monitor sends is built for one slot.
+    fn stamp(&self, slot: usize, entry: DownloadProgress) -> DownloadProgress {
+        entry
+            .with_batch(self.batch.owner.batch_id.clone(), self.batch.label.clone())
+            .with_job(self.tracked_files[slot].job.clone())
     }
 
     /// The peers sending this batch a file on this poll: a watched slot on
@@ -1215,7 +1229,9 @@ impl DownloadMonitor {
                             backend.id(),
                             download.clone(),
                         );
-                        let _ = self.tx.send(DownloadEvent::Progress(vec![self.stamp(row)]));
+                        let _ = self
+                            .tx
+                            .send(DownloadEvent::Progress(vec![self.stamp(slot, row)]));
                     }
                 }
             } else {
@@ -1245,8 +1261,9 @@ impl DownloadMonitor {
         .with_state(DownloadState::Failed(String::new()))
         .with_failure(failure);
         let row = self.write_off(slot, SlotPhase::TimedOut, backend.id(), row);
-        let entries = self.stamp_batch(vec![row]);
-        let _ = self.tx.send(DownloadEvent::Progress(entries));
+        let _ = self
+            .tx
+            .send(DownloadEvent::Progress(vec![self.stamp(slot, row)]));
     }
 
     /// Hand a singleton slot's finished transfer to the import queue. Its
@@ -1258,7 +1275,7 @@ impl DownloadMonitor {
         download: &DownloadProgress,
         backend: &Arc<dyn DownloadBackend>,
     ) {
-        let row = self.stamp(download.clone());
+        let row = self.stamp(slot, download.clone());
         let _ = self.tx.send(DownloadEvent::Progress(vec![row.clone()]));
         self.track_states[slot].phase = SlotPhase::HandedOff;
         let handoff = Handoff {
@@ -1328,13 +1345,13 @@ impl DownloadMonitor {
                     self.tracked_files[slot].filename
                 );
                 let row = make_failed_progress(&self.tracked_files[slot], failure);
-                failed.push(self.write_off(slot, SlotPhase::Settled, backend.id(), row));
+                let row = self.write_off(slot, SlotPhase::Settled, backend.id(), row);
+                failed.push(self.stamp(slot, row));
             }
         }
 
         if !failed.is_empty() {
-            let entries = self.stamp_batch(failed);
-            let _ = self.tx.send(DownloadEvent::Progress(entries));
+            let _ = self.tx.send(DownloadEvent::Progress(failed));
         }
     }
 
@@ -1365,12 +1382,12 @@ impl DownloadMonitor {
             // Without this, rows whose transfer never surfaced in slskd would
             // sit at "Queued" in the UI forever.
             let row = make_failed_progress(&self.tracked_files[slot], failure.clone());
-            failed.push(self.write_off(slot, SlotPhase::Settled, backend.id(), row));
+            let row = self.write_off(slot, SlotPhase::Settled, backend.id(), row);
+            failed.push(self.stamp(slot, row));
         }
 
         if !failed.is_empty() {
-            let entries = self.stamp_batch(failed);
-            let _ = self.tx.send(DownloadEvent::Progress(entries));
+            let _ = self.tx.send(DownloadEvent::Progress(failed));
         }
         !retried
     }
@@ -1383,15 +1400,12 @@ impl DownloadMonitor {
         for slot in 0..self.tracked_files.len() {
             if self.watching(slot) {
                 self.track_states[slot].phase = SlotPhase::Settled;
-                failed.push(make_failed_progress(
-                    &self.tracked_files[slot],
-                    failure.clone(),
-                ));
+                let row = make_failed_progress(&self.tracked_files[slot], failure.clone());
+                failed.push(self.stamp(slot, row));
             }
         }
         if !failed.is_empty() {
-            let entries = self.stamp_batch(failed);
-            let _ = self.tx.send(DownloadEvent::Progress(entries));
+            let _ = self.tx.send(DownloadEvent::Progress(failed));
         }
     }
 
@@ -1443,7 +1457,7 @@ impl DownloadMonitor {
             .map(|(slot, dl)| {
                 (
                     *slot,
-                    self.stamp(dl.clone()),
+                    self.stamp(*slot, dl.clone()),
                     self.tracked_files[*slot].destination.clone(),
                 )
             })
@@ -1740,11 +1754,21 @@ mod tests {
         )
     }
 
-    fn watched(source: &str, filename: &str) -> WatchedTransfer {
+    /// Slot `slot` of job `j1`.
+    fn slot_of_j1(slot: u32) -> JobSlot {
+        JobSlot {
+            job: "j1".into(),
+            slot,
+        }
+    }
+
+    fn watched(source: &str, filename: &str, slot: u32) -> WatchedTransfer {
         WatchedTransfer {
             source: source.to_string(),
             filename: filename.to_string(),
             transfer_id: id_of(filename),
+            job: slot_of_j1(slot),
+            adopted: false,
         }
     }
 
@@ -1774,10 +1798,9 @@ mod tests {
         filenames: Vec<&str>,
     ) -> DownloadMonitor {
         DownloadMonitor::new(
-            sources
-                .into_iter()
-                .zip(filenames)
-                .map(|(source, filename)| watched(source, filename))
+            (0..)
+                .zip(sources.into_iter().zip(filenames))
+                .map(|(slot, (source, filename))| watched(source, filename, slot))
                 .collect(),
             PathBuf::from("/music"),
             tx,
@@ -1818,6 +1841,25 @@ mod tests {
 
     fn phase(m: &DownloadMonitor, slot: usize) -> SlotPhase {
         m.track_states[slot].phase
+    }
+
+    #[tokio::test]
+    async fn rows_the_monitor_sends_carry_their_slot() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+
+        poll_tracks(
+            &mut m,
+            &[
+                listed("peer_a", "one.flac", DownloadState::InProgress),
+                listed("peer_a", "two.flac", DownloadState::InProgress),
+            ],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(rows_for(&mut rx, "two.flac")[0].job, Some(slot_of_j1(1)));
     }
 
     #[tokio::test]
@@ -3249,6 +3291,7 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: id_of("02.flac"),
                 alternates: vec![],
+                job: slot_of_j1(1),
             }])
             .expect("delivered");
 
@@ -3287,6 +3330,7 @@ mod tests {
                 filename: "dirA/two.flac".into(),
                 transfer_id: id_of("dirA/two.flac"),
                 alternates: vec![item("peer_b", "Two", "dirB/two.flac")],
+                job: slot_of_j1(1),
             }])
             .expect("delivered");
         assert!(m.drain_inbox());
@@ -3355,6 +3399,7 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02".to_string(),
                 alternates: vec![],
+                job: slot_of_j1(1),
             }])
             .expect("delivered");
 
@@ -3386,6 +3431,7 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02".to_string(),
                 alternates: vec![],
+                job: slot_of_j1(1),
             }])
             .expect("delivered");
 

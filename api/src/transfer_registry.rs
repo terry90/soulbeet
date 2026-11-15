@@ -11,7 +11,7 @@
 //! The monitor only finishes once no reservation is outstanding.
 
 use crate::auth::UserId;
-use shared::download::{batch_folder, DownloadableItem};
+use shared::download::{batch_folder, DownloadableItem, JobSlot};
 use soulbeet::ImportMode;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -286,6 +286,8 @@ pub struct AddedSlot {
     /// Other sources for the same track, best first; empty when the request
     /// had none.
     pub alternates: Vec<DownloadableItem>,
+    /// The job slot the transfer downloads for.
+    pub job: JobSlot,
 }
 
 #[derive(Debug)]
@@ -410,6 +412,10 @@ mod tests {
             filename: filename.to_string(),
             transfer_id: format!("t-{filename}"),
             alternates: vec![],
+            job: JobSlot {
+                job: "j1".to_string(),
+                slot: 0,
+            },
         }
     }
 
