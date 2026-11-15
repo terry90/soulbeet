@@ -24,6 +24,8 @@ const LINE_CAP: usize = 8 * 1024;
 const TRUNCATED_MARKER: &str = " [truncated]";
 const TAIL_LINES: usize = 20;
 const TAIL_BYTES: usize = 2048;
+/// Starts a tail line cut to its end.
+const TAIL_CUT_MARKER: &str = "[truncated] ";
 
 static RE_ANSI: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])").unwrap()
@@ -276,6 +278,7 @@ impl LineSplitter {
 }
 
 /// The last `TAIL_LINES` non-blank lines, at most `TAIL_BYTES` once joined.
+/// A longer line keeps its end, where beets says what failed.
 #[derive(Default)]
 struct TailBuffer {
     lines: VecDeque<String>,
@@ -287,12 +290,17 @@ impl TailBuffer {
         if line.trim().is_empty() {
             return;
         }
-        let mut cut = line.len().min(TAIL_BYTES);
-        while !line.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        self.bytes += cut;
-        self.lines.push_back(line[..cut].to_string());
+        let kept = if line.len() <= TAIL_BYTES {
+            line.to_string()
+        } else {
+            let mut start = line.len() - (TAIL_BYTES - TAIL_CUT_MARKER.len());
+            while !line.is_char_boundary(start) {
+                start += 1;
+            }
+            format!("{TAIL_CUT_MARKER}{}", &line[start..])
+        };
+        self.bytes += kept.len();
+        self.lines.push_back(kept);
         while self.lines.len() > TAIL_LINES || self.joined_len() > TAIL_BYTES {
             if let Some(old) = self.lines.pop_front() {
                 self.bytes -= old.len();
@@ -608,5 +616,29 @@ mod tests {
         assert!(text.lines().count() <= 20);
         assert!(text.len() <= 2048);
         assert!(text.ends_with(&format!("050{}", "z".repeat(197))));
+    }
+
+    /// A line longer than the tail keeps its end, on a char boundary.
+    #[test]
+    fn a_long_last_line_keeps_its_end() {
+        let fatal = format!(
+            "Error: No space left on device while copying /src/{}.flac to /music/A/01.flac",
+            "é".repeat(1500)
+        );
+        let mut tail = TailBuffer::default();
+        tail.push("Sending event: import_task_start");
+        tail.push(&fatal);
+        let text = tail.render();
+        assert!(text.len() <= TAIL_BYTES);
+        assert!(text.starts_with(TAIL_CUT_MARKER), "{text}");
+        assert!(text.ends_with("to /music/A/01.flac"), "{text}");
+        assert!(fatal.ends_with(text.strip_prefix(TAIL_CUT_MARKER).unwrap()));
+
+        let mut short = TailBuffer::default();
+        short.push("Error: Permission denied while creating /music/A");
+        assert_eq!(
+            short.render(),
+            "Error: Permission denied while creating /music/A"
+        );
     }
 }
