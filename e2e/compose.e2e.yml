@@ -64,7 +64,7 @@ services:
       - ./.runtime/downloads:/downloads
 
   navidrome:
-    image: deluan/navidrome:0.58.0
+    image: deluan/navidrome:0.64.2
     ports:
       - "4533:4533"
     environment:
