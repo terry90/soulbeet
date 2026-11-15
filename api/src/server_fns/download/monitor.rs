@@ -1242,7 +1242,7 @@ impl DownloadMonitor {
         let mut missing = Vec::new();
         for ((slot, row, destination), path) in finished.into_iter().zip(paths) {
             match path {
-                Some(path) => {
+                Ok(path) => {
                     resolved.push(ResolvedSlot {
                         row,
                         path,
@@ -1250,9 +1250,9 @@ impl DownloadMonitor {
                     });
                     resolved_slots.push(slot);
                 }
-                None => {
+                Err(why) => {
                     self.settle(slot, SlotPhase::Settled, backend.id());
-                    missing.push(unresolved_row(row, &self.download_base));
+                    missing.push(unresolved_row(row, &self.download_base, why));
                 }
             }
         }
@@ -1327,21 +1327,24 @@ struct Handoff {
 /// found, so slskd has moved it out of its incomplete folder.
 async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
     let registry = TransferRegistry::global();
-    let Some(path) = resolve_on_disk(
+    let path = match resolve_on_disk(
         &h.row.item,
         &h.download_base,
         h.destination.as_deref(),
         &h.claimed,
     )
     .await
-    else {
-        send_user_event(
-            &h.owner.user_id,
-            DownloadEvent::Progress(vec![unresolved_row(h.row, &h.download_base)]),
-        )
-        .await;
-        registry.release(&h.key, &h.owner);
-        return;
+    {
+        Ok(path) => path,
+        Err(why) => {
+            send_user_event(
+                &h.owner.user_id,
+                DownloadEvent::Progress(vec![unresolved_row(h.row, &h.download_base, why)]),
+            )
+            .await;
+            registry.release(&h.key, &h.owner);
+            return;
+        }
     };
     if let Err(e) = backend
         .cancel_download(&h.row.source, &h.row.id, true)

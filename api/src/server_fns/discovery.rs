@@ -962,8 +962,8 @@ pub async fn generate_discovery_playlist_internal(
                 )
                 .await;
                 let src = match resolved {
-                    Some(p) => p,
-                    None => {
+                    Ok(p) => p,
+                    Err(_) => {
                         warn!(
                             "Could not find downloaded file for '{}' - {} (slskd: {})",
                             qt.artist, qt.track, qt.key.filename

@@ -135,6 +135,17 @@ pub fn file_id(path: &Path) -> Option<FileId> {
     })
 }
 
+/// Why no file was found for a finished download.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unresolved {
+    /// No file by its name is where Soulful looks.
+    NotOnDisk,
+    /// Files by its name are there, but each was already handed off for
+    /// another download.
+    Claimed,
+}
+
 /// Find a finished download in its batch folder `base/destination`.
 ///
 /// slskd keeps the remote basename (sanitized) and, when that name is already
@@ -148,20 +159,30 @@ pub fn resolve_in_destination(
     base: &Path,
     destination: &str,
     exclude: &HashSet<FileId>,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, Unresolved> {
     let normalized = filename.replace('\\', "/");
-    let remote_name = normalized.rsplit('/').find(|s| !s.is_empty())?;
+    let remote_name = normalized
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .ok_or(Unresolved::NotOnDisk)?;
     let folder = base.join(destination);
     let names = basename_candidates(remote_name);
 
-    let usable =
-        |path: &PathBuf| path.is_file() && file_id(path).is_some_and(|id| !exclude.contains(&id));
-    if let Some(plain) = names.iter().map(|n| folder.join(n)).find(usable) {
-        return Some(plain);
+    let mut excluded = false;
+    let mut usable = |path: &PathBuf| match path.is_file().then(|| file_id(path)).flatten() {
+        Some(id) if exclude.contains(&id) => {
+            excluded = true;
+            false
+        }
+        id => id.is_some(),
+    };
+    if let Some(plain) = names.iter().map(|n| folder.join(n)).find(&mut usable) {
+        return Ok(plain);
     }
 
     let mut copies: Vec<PathBuf> = std::fs::read_dir(&folder)
-        .ok()?
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
@@ -169,11 +190,15 @@ pub fn resolve_in_destination(
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| names.iter().any(|want| is_ticks_copy(n, want)))
         })
-        .filter(usable)
         .collect();
     // Equal-width ticks, so name order is age order.
     copies.sort();
-    copies.into_iter().next()
+    let copy = copies.into_iter().find(&mut usable);
+    match (copy, excluded) {
+        (Some(copy), _) => Ok(copy),
+        (None, true) => Err(Unresolved::Claimed),
+        (None, false) => Err(Unresolved::NotOnDisk),
+    }
 }
 
 /// Whether `name` is slskd's renamed copy of `original`: `<stem>_<18 digits><ext>`.
@@ -355,7 +380,7 @@ mod tests {
         claimed.insert(file_id(&second).unwrap());
         assert_eq!(
             resolve_in_destination(r"music\A\01.flac", &base, "F", &claimed),
-            None
+            Err(Unresolved::Claimed)
         );
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -373,7 +398,7 @@ mod tests {
         let claimed = HashSet::from([file_id(&path).unwrap()]);
         assert_eq!(
             resolve_in_destination("01.flac", &base, "F", &claimed),
-            None
+            Err(Unresolved::Claimed)
         );
 
         std::fs::remove_file(&path).unwrap();
@@ -381,7 +406,7 @@ mod tests {
 
         assert_eq!(
             resolve_in_destination("01.flac", &base, "F", &claimed),
-            Some(path)
+            Ok(path)
         );
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -401,11 +426,15 @@ mod tests {
         let claimed = HashSet::new();
         assert_eq!(
             resolve_in_destination("01.flac", &base, "F", &claimed),
-            Some(folder.join("01_639097129778484198.flac"))
+            Ok(folder.join("01_639097129778484198.flac"))
         );
         assert_eq!(
             resolve_in_destination("02.flac", &base, "F", &claimed),
-            None
+            Err(Unresolved::NotOnDisk)
+        );
+        assert_eq!(
+            resolve_in_destination("01.flac", &base, "missing", &claimed),
+            Err(Unresolved::NotOnDisk)
         );
 
         std::fs::remove_dir_all(&base).unwrap();
