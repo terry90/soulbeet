@@ -8,7 +8,9 @@
 //! moving the file, which strands the file in slskd's incomplete folder.
 
 use dioxus::logger::tracing::{debug, info, warn};
-use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, QueuedDownload};
+use shared::download::{
+    DownloadEvent, DownloadProgress, DownloadState, DownloadableItem, JobSlot, QueuedDownload,
+};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::SoulseekError;
 use soulbeet::{DownloadBackend, ImportMode};
@@ -28,6 +30,7 @@ use super::utils::FileId;
 use crate::config::CONFIG;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
+use crate::ledger::{JobEvent, JobState, Ledger};
 use crate::services::{download_backend, BackendLookupError};
 use crate::transfer_registry::{AddedSlot, BatchRef, TransferKey, TransferOwner, TransferRegistry};
 
@@ -335,17 +338,21 @@ pub struct DownloadMonitor {
     /// `(peer, transfer id)` of every transfer seen Completed, so only its
     /// first sighting counts as its peer sending this slskd a file.
     completed_seen: HashSet<(String, String)>,
+    /// Where every row the monitor sends is recorded with its slot's state.
+    ledger: Ledger,
 }
 
 impl DownloadMonitor {
     /// Create a new download monitor. The transfers must have been enqueued
     /// into `batch.destination`. Dropping the monitor closes the batch's
-    /// inbox and releases every registry key the batch holds.
+    /// inbox and releases every registry key the batch holds. Every row it
+    /// sends is recorded in `ledger`.
     pub fn new(
         transfers: Vec<WatchedTransfer>,
         target_path: PathBuf,
         tx: broadcast::Sender<DownloadEvent>,
         batch: BatchRef,
+        ledger: Ledger,
     ) -> Self {
         let tracked_files: Vec<TrackedFile> = transfers
             .into_iter()
@@ -376,6 +383,7 @@ impl DownloadMonitor {
             handoffs: Vec::new(),
             last_readable_poll: Instant::now(),
             completed_seen: HashSet::new(),
+            ledger,
         }
     }
 
@@ -509,10 +517,7 @@ impl DownloadMonitor {
                 self.batch.owner.batch_id,
                 unwatched.len()
             );
-            let _ = self.tx.send(DownloadEvent::Progress(stopped_rows(
-                &unwatched,
-                &self.batch,
-            )));
+            self.report(JobState::Failed, stopped_rows(&unwatched, &self.batch));
         }
         unwatched
     }
@@ -608,7 +613,7 @@ impl DownloadMonitor {
                 refused.failure.message
             );
         }
-        let Some(queued) = next.queued else {
+        let Some((candidate, queued)) = next.queued else {
             return false;
         };
 
@@ -645,15 +650,34 @@ impl DownloadMonitor {
         .filename;
         self.track_states[slot] = TrackState::bound_now();
 
+        self.record_attempt(slot, Some(candidate));
         let entry = DownloadProgress::queued(queued.id, queued.source, queued.item, queued.size);
-        let entry = self.stamp(slot, entry);
-        // One slot is still one download, so the panel replaces the abandoned
-        // peer's row instead of gaining a second one for the same track.
+        self.replace_row(previous_item, self.stamp(slot, entry));
+        true
+    }
+
+    /// Records that `slot` now downloads from `candidate`, or from a
+    /// transfer it adopted when `None`.
+    fn record_attempt(&self, slot: usize, candidate: Option<DownloadableItem>) {
+        self.ledger.record(JobEvent::Attempt {
+            slot: self.tracked_files[slot].job.clone(),
+            candidate,
+        });
+    }
+
+    /// Shows `entry`, the stamped row of a slot rebound to another transfer,
+    /// in place of `previous_item`'s row, and records it as downloading. One
+    /// slot is still one download, so the panel replaces the abandoned
+    /// peer's row instead of gaining a second one for the same track.
+    fn replace_row(&self, previous_item: String, entry: DownloadProgress) {
         let _ = self.tx.send(DownloadEvent::Replaced {
             previous_item,
-            entry: Box::new(entry),
+            entry: Box::new(entry.clone()),
         });
-        true
+        self.ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![entry],
+        });
     }
 
     /// Stop the transfer a slot is about to stop watching, and remember it
@@ -865,9 +889,7 @@ impl DownloadMonitor {
             self.settle(slot, SlotPhase::Settled, backend.id());
             cancelled.push(self.stamp(slot, row));
         }
-        if !cancelled.is_empty() {
-            let _ = self.tx.send(DownloadEvent::Progress(cancelled));
-        }
+        self.report(JobState::Cancelled, cancelled);
     }
 
     /// Process a poll result from slskd.
@@ -1076,11 +1098,9 @@ impl DownloadMonitor {
         .filename;
         // Reset state so the retried transfer is monitored and imported
         self.track_states[slot] = TrackState::bound_now();
+        self.record_attempt(slot, None);
         if previous_item != retry.item {
-            let _ = self.tx.send(DownloadEvent::Replaced {
-                previous_item,
-                entry: Box::new(self.stamp(slot, retry.clone())),
-            });
+            self.replace_row(previous_item, self.stamp(slot, retry.clone()));
         }
         true
     }
@@ -1111,10 +1131,39 @@ impl DownloadMonitor {
             })
             .map(|(slot, dl)| self.stamp(*slot, dl.clone()))
             .collect();
-        if entries.is_empty() {
+        self.report(JobState::Downloading, entries);
+    }
+
+    /// Sends `rows` (each stamped) as one Progress event and records them as `state`.
+    fn report(&self, state: JobState, rows: Vec<DownloadProgress>) {
+        if rows.is_empty() {
             return;
         }
-        if let Err(e) = self.tx.send(DownloadEvent::Progress(entries)) {
+        self.send_rows(rows.clone());
+        self.ledger.record(JobEvent::Slots { state, rows });
+    }
+
+    /// Sends the rows `write_off` gave (each stamped) as one Progress event,
+    /// and records each by its own state: Cancelled when its user cancelled
+    /// it or slskd shows its transfer cancelled, Failed otherwise.
+    fn report_settled(&self, rows: Vec<DownloadProgress>) {
+        if rows.is_empty() {
+            return;
+        }
+        self.send_rows(rows.clone());
+        let (cancelled, failed): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|row| row.state == DownloadState::Cancelled);
+        for (state, rows) in [(JobState::Cancelled, cancelled), (JobState::Failed, failed)] {
+            if !rows.is_empty() {
+                self.ledger.record(JobEvent::Slots { state, rows });
+            }
+        }
+    }
+
+    /// Sends `rows` to the UI as one Progress event.
+    fn send_rows(&self, rows: Vec<DownloadProgress>) {
+        if let Err(e) = self.tx.send(DownloadEvent::Progress(rows)) {
             if self.tx.receiver_count() == 0 {
                 info!("No receivers for download updates, but continuing monitoring");
             } else {
@@ -1230,9 +1279,7 @@ impl DownloadMonitor {
                             backend.id(),
                             download.clone(),
                         );
-                        let _ = self
-                            .tx
-                            .send(DownloadEvent::Progress(vec![self.stamp(slot, row)]));
+                        self.report_settled(vec![self.stamp(slot, row)]);
                     }
                 }
             } else {
@@ -1262,9 +1309,7 @@ impl DownloadMonitor {
         .with_state(DownloadState::Failed(String::new()))
         .with_failure(failure);
         let row = self.write_off(slot, SlotPhase::TimedOut, backend.id(), row);
-        let _ = self
-            .tx
-            .send(DownloadEvent::Progress(vec![self.stamp(slot, row)]));
+        self.report_settled(vec![self.stamp(slot, row)]);
     }
 
     /// Hand a singleton slot's finished transfer to the import queue. Its
@@ -1277,7 +1322,7 @@ impl DownloadMonitor {
         backend: &Arc<dyn DownloadBackend>,
     ) {
         let row = self.stamp(slot, download.clone());
-        let _ = self.tx.send(DownloadEvent::Progress(vec![row.clone()]));
+        self.report(JobState::Downloading, vec![row.clone()]);
         self.track_states[slot].phase = SlotPhase::HandedOff;
         let handoff = Handoff {
             row,
@@ -1287,6 +1332,7 @@ impl DownloadMonitor {
             target: self.target_path.clone(),
             download_base: self.download_base.clone(),
             claimed: Arc::clone(&self.claimed),
+            ledger: self.ledger.clone(),
         };
         // Spawned so the poll loop never waits on the file showing up.
         self.handoffs
@@ -1351,9 +1397,7 @@ impl DownloadMonitor {
             }
         }
 
-        if !failed.is_empty() {
-            let _ = self.tx.send(DownloadEvent::Progress(failed));
-        }
+        self.report_settled(failed);
     }
 
     /// Give every watched slot another peer after a batch's transfers never
@@ -1387,9 +1431,7 @@ impl DownloadMonitor {
             failed.push(self.stamp(slot, row));
         }
 
-        if !failed.is_empty() {
-            let _ = self.tx.send(DownloadEvent::Progress(failed));
-        }
+        self.report_settled(failed);
         !retried
     }
 
@@ -1405,9 +1447,7 @@ impl DownloadMonitor {
                 failed.push(self.stamp(slot, row));
             }
         }
-        if !failed.is_empty() {
-            let _ = self.tx.send(DownloadEvent::Progress(failed));
-        }
+        self.report(JobState::Failed, failed);
     }
 
     /// Check if all downloads are complete. Returns true if monitoring should stop.
@@ -1495,7 +1535,15 @@ impl DownloadMonitor {
             }
         }
         if !missing.is_empty() {
-            send_user_event(&self.batch.owner.user_id, DownloadEvent::Progress(missing)).await;
+            send_user_event(
+                &self.batch.owner.user_id,
+                DownloadEvent::Progress(missing.clone()),
+            )
+            .await;
+            self.ledger.record(JobEvent::Slots {
+                state: JobState::Failed,
+                rows: missing,
+            });
         }
 
         for slot in &resolved_slots {
@@ -1558,6 +1606,8 @@ struct Handoff {
     target: PathBuf,
     download_base: PathBuf,
     claimed: Arc<Mutex<HashSet<FileId>>>,
+    /// Where a row it sends is recorded.
+    ledger: Ledger,
 }
 
 /// Find the file on disk, remove its slskd record, import it and free its
@@ -1575,11 +1625,12 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
     {
         Ok(path) => path,
         Err(why) => {
-            send_user_event(
-                &h.owner.user_id,
-                DownloadEvent::Progress(vec![unresolved_row(h.row, &h.download_base, why)]),
-            )
-            .await;
+            let row = unresolved_row(h.row, &h.download_base, why);
+            send_user_event(&h.owner.user_id, DownloadEvent::Progress(vec![row.clone()])).await;
+            h.ledger.record(JobEvent::Slots {
+                state: JobState::Failed,
+                rows: vec![row],
+            });
             registry.release(&h.key, &h.owner);
             return;
         }
@@ -1689,6 +1740,7 @@ pub fn filenames_match(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use crate::auth::UserId;
+    use crate::ledger::Recorded;
     use crate::server_fns::download::enqueue::{monitor_stopped, MONITOR_STOPPED};
     use crate::server_fns::download::test_support::{
         batch, item, key, transfer, Cancel, ScriptedOutcome, StubBackend,
@@ -1776,29 +1828,35 @@ mod tests {
     /// A monitor watching one track with two alternates behind it, plus the
     /// receiver its events land in. Holding the receiver keeps the broadcast
     /// live, so tests see what the UI would.
-    fn failover_monitor() -> (DownloadMonitor, broadcast::Receiver<DownloadEvent>) {
+    fn failover_monitor() -> (
+        DownloadMonitor,
+        broadcast::Receiver<DownloadEvent>,
+        Recorded,
+    ) {
         let (tx, rx) = broadcast::channel(16);
-        let m = monitor_on(tx, vec!["peer_a"], vec!["dirA/aaa.flac"]).with_failover(
-            SourcePool::single(vec![
-                item("peer_a", "Wake Up", "dirA/aaa.flac"),
-                item("peer_b", "Wake Up", "dirB/bbb.flac"),
-                item("peer_c", "Wake Up", "dirC/ccc.flac"),
-            ]),
-        );
-        (m, rx)
+        let (m, recorded) = monitor_on(tx, vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let m = m.with_failover(SourcePool::single(vec![
+            item("peer_a", "Wake Up", "dirA/aaa.flac"),
+            item("peer_b", "Wake Up", "dirB/bbb.flac"),
+            item("peer_c", "Wake Up", "dirC/ccc.flac"),
+        ]));
+        (m, rx, recorded)
     }
 
-    fn monitor(sources: Vec<&str>, filenames: Vec<&str>) -> DownloadMonitor {
+    fn monitor(sources: Vec<&str>, filenames: Vec<&str>) -> (DownloadMonitor, Recorded) {
         let (tx, _rx) = broadcast::channel(16);
         monitor_on(tx, sources, filenames)
     }
 
+    /// A monitor of job `j1`, slot n watching `filenames[n]` from
+    /// `sources[n]`, recording to the ledger whose events it returns.
     fn monitor_on(
         tx: broadcast::Sender<DownloadEvent>,
         sources: Vec<&str>,
         filenames: Vec<&str>,
-    ) -> DownloadMonitor {
-        DownloadMonitor::new(
+    ) -> (DownloadMonitor, Recorded) {
+        let (ledger, recorded) = Ledger::recording();
+        let m = DownloadMonitor::new(
             (0..)
                 .zip(sources.into_iter().zip(filenames))
                 .map(|(slot, (source, filename))| watched(source, filename, slot))
@@ -1806,7 +1864,26 @@ mod tests {
             PathBuf::from("/music"),
             tx,
             batch("X"),
-        )
+            ledger,
+        );
+        (m, recorded)
+    }
+
+    /// A recorded `Slots` event: its state, and each row's item and slot.
+    type SlotsEvent = (JobState, Vec<(String, Option<JobSlot>)>);
+
+    /// The `Slots` events recorded since the last call.
+    fn slots_recorded(recorded: &mut Recorded) -> Vec<SlotsEvent> {
+        recorded
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                JobEvent::Slots { state, rows } => {
+                    Some((state, rows.into_iter().map(|r| (r.item, r.job)).collect()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// The track handling and row updates of one poll, as
@@ -1848,7 +1925,8 @@ mod tests {
     #[tokio::test]
     async fn rows_the_monitor_sends_carry_their_slot() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
+        let (mut m, _recorded) =
+            monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
 
         poll_tracks(
@@ -1865,6 +1943,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_row_the_monitor_sends_is_recorded_with_its_slot_and_state() {
+        let (tx, _rx) = broadcast::channel(16);
+        let (mut m, mut recorded) =
+            monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        m.track_states[1].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[
+                listed("peer_a", "one.flac", DownloadState::InProgress),
+                failed_transfer("peer_a", "two.flac"),
+            ],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(
+            slots_recorded(&mut recorded),
+            vec![
+                (
+                    JobState::Failed,
+                    vec![("two.flac".into(), Some(slot_of_j1(1)))]
+                ),
+                (
+                    JobState::Downloading,
+                    vec![("one.flac".into(), Some(slot_of_j1(0)))]
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_that_fails_over_records_its_next_source() {
+        let (mut m, _rx, mut recorded) = failover_monitor();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[failed_transfer("peer_a", "dirA/aaa.flac")],
+            &backend,
+        )
+        .await;
+
+        let attempts: Vec<(JobSlot, Option<String>)> = recorded
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                JobEvent::Attempt { slot, candidate } => Some((slot, candidate.map(|c| c.id))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attempts,
+            vec![(slot_of_j1(0), Some("dirB/bbb.flac".into()))]
+        );
+    }
+
+    #[tokio::test]
     async fn one_failure_fails_over_once_per_poll() {
         // process_tracks and handle_absent_tracks run back to back on the SAME
         // poll. Once process_tracks has rebound the slot, the alternate's
@@ -1872,7 +2010,7 @@ mod tests {
         // absence window ran from the batch's start would be declared "never
         // appeared" and fail over a second time in the same poll, orphaning
         // the transfer just enqueued.
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, _rx, _recorded) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
 
@@ -1901,7 +2039,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failover_enqueues_into_the_batch_folder_and_its_row_carries_the_transfer_id() {
-        let (mut m, mut rx) = failover_monitor();
+        let (mut m, mut rx, _recorded) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
@@ -1930,7 +2068,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failover_frees_the_abandoned_key() {
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, _rx, _recorded) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let abandoned = key(&backend, "peer_a", "dirA/aaa.flac");
         TransferRegistry::global().claim(std::slice::from_ref(&abandoned), &m.batch);
@@ -1956,11 +2094,11 @@ mod tests {
     async fn an_adopted_transfer_is_not_looked_for_in_the_batch_folder() {
         // Another peer's live transfer of the file was not enqueued by this
         // batch, so slskd saves it wherever its own enqueue said.
-        let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let (mut m, mut recorded) = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let retried = transfer("peer_b", "dirB/aaa.flac", "t-b", DownloadState::InProgress);
 
-        let matched = m.find_matching_downloads(&[retried], &backend);
+        let matched = m.find_matching_downloads(std::slice::from_ref(&retried), &backend);
 
         assert_eq!(matched.len(), 1);
         assert_eq!(m.tracked_files[0].source, "peer_b");
@@ -1970,6 +2108,20 @@ mod tests {
             !TransferRegistry::global()
                 .may_adopt(&key(&backend, "peer_b", "dirB/aaa.flac"), &batch("Y").owner),
             "the adopted transfer is now the batch's"
+        );
+        assert_eq!(
+            recorded.events(),
+            vec![
+                JobEvent::Attempt {
+                    slot: slot_of_j1(0),
+                    candidate: None
+                },
+                JobEvent::Slots {
+                    state: JobState::Downloading,
+                    rows: vec![m.stamp(0, retried)]
+                },
+            ],
+            "an adopted transfer is no candidate of the slot's"
         );
     }
 
@@ -1982,7 +2134,7 @@ mod tests {
             mine.owner.user_id = UserId::new("tester");
             mine
         }] {
-            let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+            let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
             m.batch.owner.user_id = UserId::new("tester");
             let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
             TransferRegistry::global().claim(&[key(&backend, "peer_b", "dirB/aaa.flac")], &owner);
@@ -2002,7 +2154,7 @@ mod tests {
     async fn a_transfer_another_slot_watches_is_not_adopted() {
         // Two slots of one batch hold the same basename from different peers.
         // The second slot's transfer is the batch's own, but not the first's.
-        let mut m = monitor(vec!["peer_a", "peer_b"], vec!["a/01.flac", "b/01.flac"]);
+        let (mut m, _recorded) = monitor(vec!["peer_a", "peer_b"], vec!["a/01.flac", "b/01.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
 
         let matched = m.find_matching_downloads(
@@ -2017,7 +2169,7 @@ mod tests {
 
     #[tokio::test]
     async fn slots_with_the_same_basename_match_their_own_ids() {
-        let mut m = monitor(
+        let (mut m, _recorded) = monitor(
             vec!["peer_a", "peer_a"],
             vec!["music\\A\\01 - One.flac", "music\\B\\01 - One.flac"],
         );
@@ -2045,7 +2197,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rebound_slot_follows_its_new_transfer_id() {
-        let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         m.find_matching_downloads(
             &[transfer(
@@ -2073,7 +2225,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_removes_this_batchs_failed_transfers_by_id() {
-        let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].phase = SlotPhase::Settled;
@@ -2105,7 +2257,7 @@ mod tests {
     async fn cleanup_removes_this_batchs_transfers_left_pending_a_retry() {
         // A transfer cancelled during slskd's retry delay keeps reading as a
         // pending retry for good.
-        let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].phase = SlotPhase::Settled;
@@ -2123,7 +2275,7 @@ mod tests {
     async fn a_timed_out_transfer_that_succeeded_late_keeps_its_record() {
         // slskd finished it between the listing and the cancel. Its file may
         // still be on its way out of the incomplete folder.
-        let mut m = monitor(vec!["peer_a"], vec!["one.flac"]);
+        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["one.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].first_seen = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(60)));
@@ -2149,7 +2301,7 @@ mod tests {
     async fn cleanup_leaves_a_finished_transfer_whose_file_was_never_found() {
         // The monitor stopped before handing it off: slskd may not have moved
         // the file yet, and removing the record now would strand it.
-        let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         stub.set_listing(vec![listed(
@@ -2171,7 +2323,7 @@ mod tests {
         // download, which is what grew RSS to gigabytes on a long-lived
         // instance (#78).
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["a.flac", "b.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["a.flac", "b.flac"]);
         let mut invalid = 0;
         let circuit_open = || SoulseekError::Api {
             status: 503,
@@ -2219,7 +2371,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_api_key_ends_the_monitor_asking_for_the_settings() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
         m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
 
         let refused = SoulseekError::Api {
@@ -2248,7 +2400,7 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_listing_fails_the_batch_after_its_fuse() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
         let drift =
             || SoulseekError::InvalidResponse("JSON parse error: missing field `id`".into());
         let mut invalid = 0;
@@ -2282,7 +2434,7 @@ mod tests {
         // The abandoned peer is still sending at the per-track timeout.
         // Leaving it running would put two peers on one track, and whatever
         // it finally delivers lands under a path no slot maps to any more.
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, _rx, _recorded) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].first_seen = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(1)));
@@ -2307,7 +2459,8 @@ mod tests {
     async fn a_timed_out_slot_is_cancelled_and_not_resent() {
         for album_mode in [false, true] {
             let (tx, mut rx) = broadcast::channel(64);
-            let mut m = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
+            let (mut m, _recorded) =
+                monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
             m.batch.import_mode = match album_mode {
                 true => ImportMode::Album,
                 false => ImportMode::Singleton,
@@ -2349,7 +2502,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_slot_waiting_in_the_source_queue_too_long_fails_over() {
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, _rx, _recorded) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].first_seen = Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
@@ -2368,7 +2521,7 @@ mod tests {
     #[tokio::test]
     async fn a_slot_with_no_source_left_fails_stuck_in_remote_queue() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         m.track_states[0].first_seen = Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
         m.track_states[0].queued_at_source_since =
@@ -2389,7 +2542,7 @@ mod tests {
     #[tokio::test]
     async fn a_slot_queued_locally_is_not_held_to_the_remote_queue_limit() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.track_states[0].first_seen = Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
@@ -2414,7 +2567,8 @@ mod tests {
         // The peer sends this batch one file at a time and answers every
         // request with Queued, so two.flac waits while one.flac comes in.
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
+        let (mut m, _recorded) =
+            monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
         // A finished file stays watched until the album is done.
         m.batch.import_mode = ImportMode::Album;
         let stub = StubBackend::new(vec![]);
@@ -2459,7 +2613,7 @@ mod tests {
         // one file at a time: other.flac is no slot's here, and one.flac
         // waits behind it all the same.
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let past_the_limit = || Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
@@ -2496,7 +2650,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_poll_that_does_not_list_a_slot_stops_its_remote_queue_clock() {
-        let mut m = monitor(vec!["peer_a"], vec!["one.flac"]);
+        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["one.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         m.track_states[0].first_seen = Some(Instant::now());
         m.track_states[0].queued_at_source_since = Some(ago(Duration::from_secs(60)));
@@ -2509,7 +2663,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_remote_queue_clock_starts_at_the_first_sighting() {
-        let mut m = monitor(vec!["peer_a"], vec!["one.flac"]);
+        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["one.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         poll_tracks(&mut m, &[at_source("peer_a", "one.flac")], &backend).await;
         assert!(m.track_states[0].queued_at_source_since.is_some());
@@ -2541,7 +2695,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pending_retry_held_past_its_bound_fails_over() {
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, _rx, _recorded) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         m.track_states[0].retry_pending_since = Some(ago(RETRY_PENDING_FOR));
         m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
@@ -2560,7 +2714,7 @@ mod tests {
     async fn another_peers_record_pending_a_retry_is_not_adopted() {
         // No watcher's clock bounds another peer's record, so one cancelled
         // during slskd's retry delay would read Queued for good.
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, _rx, _recorded) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
 
@@ -2583,7 +2737,7 @@ mod tests {
     async fn the_absence_window_restarts_on_every_rebind() {
         // The same guarantee stated directly: a slot that has just been
         // rebound is young, however old the batch is.
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, _rx, _recorded) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> =
             StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
         m.track_states[0].bound_at = ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1));
@@ -2604,7 +2758,7 @@ mod tests {
         // The panel keys rows by remote path and each peer serves the track
         // under its own, so a plain progress update would leave the dead
         // peer's row beside the retry's: one track, two rows.
-        let (mut m, mut rx) = failover_monitor();
+        let (mut m, mut rx, _recorded) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
 
@@ -2633,7 +2787,7 @@ mod tests {
         // A lone track has no sibling to keep the batch non-empty, so
         // process_tracks and handle_absent_tracks never see it: the empty
         // poll fuse is the only place its failover can fire.
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, _rx, _recorded) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let mut consecutive_empty = MAX_CONSECUTIVE_EMPTY - 1;
 
@@ -2651,7 +2805,7 @@ mod tests {
     async fn a_never_appeared_batch_with_no_peers_left_is_still_written_off() {
         // The fallback has to stay reachable, or an absent batch with a dry
         // pool would poll forever.
-        let (mut m, mut rx) = failover_monitor();
+        let (mut m, mut rx, _recorded) = failover_monitor();
         // Every alternate is refused, so the pool yields nothing.
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let mut consecutive_empty = MAX_CONSECUTIVE_EMPTY - 1;
@@ -2677,7 +2831,7 @@ mod tests {
     #[tokio::test]
     async fn a_vanished_transfer_fails_with_transfer_disappeared() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         m.track_states[0].first_seen = Some(ago(Duration::from_secs(5)));
         m.track_states[0].missing_since = Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1)));
@@ -2804,7 +2958,7 @@ mod tests {
         // A retry from a failed row re-requests the same file, and the
         // registry refuses it while this batch still holds the key.
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["dirA/fail.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["dirA/fail.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let own = key(&backend, "peer_a", "dirA/fail.flac");
         TransferRegistry::global().claim(std::slice::from_ref(&own), &m.batch);
@@ -2828,7 +2982,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_transfer_settles_without_failing_over() {
-        let (mut m, _rx) = failover_monitor();
+        let (mut m, _rx, _recorded) = failover_monitor();
         let backend: Arc<dyn DownloadBackend> =
             StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
         m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
@@ -2847,7 +3001,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_slot_is_stopped_once_and_never_failed_over() {
-        let (mut m, mut rx) = failover_monitor();
+        let (mut m, mut rx, mut recorded) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let own = key(&backend, "peer_a", "dirA/aaa.flac");
@@ -2877,12 +3031,19 @@ mod tests {
                 .map(|f| (f.code, f.message.as_str())),
             Some((FailureCode::TransferCancelled, "Cancelled on request"))
         );
+        assert_eq!(
+            slots_recorded(&mut recorded),
+            vec![(
+                JobState::Cancelled,
+                vec![("dirA/aaa.flac".into(), Some(slot_of_j1(0)))]
+            )]
+        );
         assert!(TransferRegistry::global().may_adopt(&own, &batch("Y").owner));
     }
 
     #[tokio::test]
     async fn a_cancel_that_arrives_during_failover_follows_the_slot() {
-        let (mut m, mut rx) = failover_monitor();
+        let (mut m, mut rx, _recorded) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let registry = TransferRegistry::global();
@@ -2932,10 +3093,14 @@ mod tests {
                 Some(FailureCode::TransferCancelled)
             );
         };
+        let one_cancelled = (
+            JobState::Cancelled,
+            vec![("one.flac".to_string(), Some(slot_of_j1(0)))],
+        );
 
         // Its transfer failed and no other source is left.
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let (mut m, mut recorded) = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let own = key(&backend, "peer_a", "one.flac");
         registry.claim(std::slice::from_ref(&own), &m.batch);
@@ -2947,27 +3112,45 @@ mod tests {
         let sending = m.peers_sending(&listing);
         m.process_tracks(&matched, &sending, &backend).await;
         cancelled(&mut rx);
+        assert_eq!(slots_recorded(&mut recorded), vec![one_cancelled.clone()]);
         assert_eq!(phase(&m, 0), SlotPhase::Settled);
         assert!(registry.may_adopt(&own, &batch("Y").owner));
 
-        // It has been missing from slskd's list too long.
+        // It has been missing from slskd's list too long, and so has a slot
+        // nobody cancelled, which is written off with it.
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let (mut m, mut recorded) =
+            monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
         let own = key(&backend, "peer_a", "one.flac");
         registry.claim(std::slice::from_ref(&own), &m.batch);
-        m.track_states[0].first_seen = Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(2)));
-        m.track_states[0].missing_since = Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1)));
+        for slot in 0..2 {
+            m.track_states[slot].first_seen =
+                Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(2)));
+            m.track_states[slot].missing_since =
+                Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1)));
+        }
         m.apply_cancels(&[], &backend).await;
         assert!(registry.request_cancel(&own, &m.batch.owner.user_id));
         m.handle_absent_tracks(&[], &backend).await;
         cancelled(&mut rx);
+        assert_eq!(
+            slots_recorded(&mut recorded),
+            vec![
+                one_cancelled,
+                (
+                    JobState::Failed,
+                    vec![("two.flac".to_string(), Some(slot_of_j1(1)))]
+                ),
+            ]
+        );
         assert_eq!(phase(&m, 0), SlotPhase::Settled);
     }
 
     #[tokio::test]
     async fn a_finished_transfer_is_imported_even_when_cancelled() {
         let user = UserId::new("monitor-cancel-finished");
-        let (mut m, _base, _rx) = disk_monitor(&user, &["one.flac"], &["one.flac"]).await;
+        let (mut m, _base, _rx, _recorded) =
+            disk_monitor(&user, &["one.flac"], &["one.flac"]).await;
         m.batch.import_mode = ImportMode::Singleton;
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
@@ -3002,11 +3185,12 @@ mod tests {
         DownloadMonitor,
         tempfile::TempDir,
         broadcast::Receiver<DownloadEvent>,
+        Recorded,
     ) {
         let base = tempfile::tempdir().unwrap();
         std::fs::write(base.path().join("not-a-dir"), b"x").unwrap();
         let (tx, _rx) = broadcast::channel(64);
-        let mut m = monitor_on(tx, vec!["peer_a"; watched.len()], watched.to_vec());
+        let (mut m, recorded) = monitor_on(tx, vec!["peer_a"; watched.len()], watched.to_vec());
         m.batch.import_mode = ImportMode::Album;
         m.download_base = base.path().to_path_buf();
         m.target_path = base.path().join("not-a-dir").join("library");
@@ -3017,7 +3201,7 @@ mod tests {
         }
         let user_tx = crate::globals::get_or_create_user_channel(user).await;
         m.batch.owner.user_id = user.clone();
-        (m, base, user_tx.subscribe())
+        (m, base, user_tx.subscribe(), recorded)
     }
 
     /// The rows of each Progress event the import queue has sent so far.
@@ -3045,7 +3229,7 @@ mod tests {
     #[tokio::test]
     async fn a_handed_off_slot_is_not_resent() {
         let (tx, mut rx) = broadcast::channel(64);
-        let (mut m, _base, _imports) = disk_monitor(
+        let (mut m, _base, _imports, _recorded) = disk_monitor(
             &UserId::new("monitor-handed-off"),
             &["one.flac", "two.flac"],
             &["one.flac"],
@@ -3082,7 +3266,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_singleton_handoff_removes_the_record_only_once_the_file_is_found() {
-        let (mut m, base, _imports) = disk_monitor(
+        let (mut m, base, _imports, _recorded) = disk_monitor(
             &UserId::new("monitor-singleton-on-disk"),
             &["one.flac"],
             &[],
@@ -3128,7 +3312,7 @@ mod tests {
 
     #[tokio::test]
     async fn album_mode_deletes_nothing_until_every_file_is_on_disk() {
-        let (mut m, base, mut imports) = disk_monitor(
+        let (mut m, base, mut imports, _recorded) = disk_monitor(
             &UserId::new("monitor-album-on-disk"),
             &["01.flac", "02.flac"],
             &["01.flac"],
@@ -3182,7 +3366,7 @@ mod tests {
 
     #[tokio::test]
     async fn album_mode_removes_only_its_own_ids() {
-        let (mut m, _base, _imports) = disk_monitor(
+        let (mut m, _base, _imports, _recorded) = disk_monitor(
             &UserId::new("monitor-own-ids"),
             &["dirA/01.flac"],
             &["01.flac"],
@@ -3219,7 +3403,7 @@ mod tests {
     // real time.
     #[tokio::test(start_paused = true)]
     async fn an_album_file_that_never_appears_keeps_its_completed_record() {
-        let (mut m, _base, mut imports) =
+        let (mut m, _base, mut imports, _recorded) =
             disk_monitor(&UserId::new("monitor-album-missing"), &["01.flac"], &[]).await;
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
@@ -3254,7 +3438,8 @@ mod tests {
     #[tokio::test]
     async fn monitor_rows_reach_the_channel_of_the_batch_owner_id() {
         let alice = UserId::new("id-alice-monitor");
-        let (mut m, _base, mut imports) = disk_monitor(&alice, &["01.flac"], &["01.flac"]).await;
+        let (mut m, _base, mut imports, _recorded) =
+            disk_monitor(&alice, &["01.flac"], &["01.flac"]).await;
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
 
         let mut empty = 0;
@@ -3287,7 +3472,8 @@ mod tests {
     async fn import_rows_carry_the_batch_id() {
         for album_mode in [false, true] {
             let user = UserId::new(&format!("monitor-batch-rows-{album_mode}"));
-            let (mut m, _base, mut imports) = disk_monitor(&user, &["01.flac"], &["01.flac"]).await;
+            let (mut m, _base, mut imports, _recorded) =
+                disk_monitor(&user, &["01.flac"], &["01.flac"]).await;
             m.batch.import_mode = match album_mode {
                 true => ImportMode::Album,
                 false => ImportMode::Singleton,
@@ -3319,7 +3505,7 @@ mod tests {
 
     #[tokio::test]
     async fn added_slots_are_monitored() {
-        let (mut m, _base, mut imports) = disk_monitor(
+        let (mut m, _base, mut imports, _recorded) = disk_monitor(
             &UserId::new("monitor-added-slots"),
             &["01.flac"],
             &["01.flac", "02.flac"],
@@ -3362,7 +3548,7 @@ mod tests {
     #[tokio::test]
     async fn a_slot_a_joining_request_added_fails_over_to_its_own_alternates() {
         let (tx, _rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["dirA/aaa.flac"]);
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.batch
@@ -3403,7 +3589,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_monitor_waits_for_reserved_slots_before_finishing_an_album() {
-        let (mut m, _base, mut imports) = disk_monitor(
+        let (mut m, _base, mut imports, _recorded) = disk_monitor(
             &UserId::new("monitor-reserved-slots"),
             &["01.flac"],
             &["01.flac"],
@@ -3431,7 +3617,7 @@ mod tests {
     #[tokio::test]
     async fn slots_written_off_at_the_end_of_a_run_are_cancelled() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut m = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.batch
@@ -3461,7 +3647,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_monitor_closes_its_inbox_and_frees_its_keys() {
         let (tx, mut rx) = broadcast::channel(16);
-        let m = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
+        let (m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
         let inbox = Arc::clone(&m.batch.inbox);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let held = key(&backend, "peer_a", "01.flac");

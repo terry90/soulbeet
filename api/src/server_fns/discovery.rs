@@ -507,7 +507,7 @@ async fn settle_poll(
                     );
                 }
                 match next.queued {
-                    Some(next) => {
+                    Some((_, next)) => {
                         info!(
                             "Discovery: '{}' - {} failed from {}, retrying from {}",
                             qt.artist, qt.track, qt.key.peer, next.source

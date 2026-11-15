@@ -32,9 +32,9 @@ pub struct RefusedAlternate {
 
 /// What `enqueue_next` did with a slot.
 pub struct NextSource {
-    /// The accepted alternate. `None` when the slot is out of sources or
-    /// budget.
-    pub queued: Option<QueuedDownload>,
+    /// The accepted alternate and its download. `None` when the slot is out
+    /// of sources or budget.
+    pub queued: Option<(DownloadableItem, QueuedDownload)>,
     /// Every alternate refused before it, in the order tried.
     pub refused: Vec<RefusedAlternate>,
 }
@@ -136,14 +136,14 @@ impl SourcePool {
             let failure = if claim.claimed.is_empty() {
                 held_failure(&claim, batch)
             } else {
-                match enqueue_claimed(backend, vec![item], batch).await {
+                match enqueue_claimed(backend, vec![item.clone()], batch).await {
                     Ok(queued) => {
                         if let Some(ok) =
                             queued.iter().find(|d| d.status == EnqueueStatus::Enqueued)
                         {
                             info!("Failover enqueued {} from {}", ok.item, ok.source);
                             return NextSource {
-                                queued: Some(ok.clone()),
+                                queued: Some((item, ok.clone())),
                                 refused,
                             };
                         }
@@ -517,7 +517,7 @@ mod tests {
         let mut pool = SourcePool::single(items);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
 
-        let queued = pool
+        let (_, queued) = pool
             .enqueue_next(0, &backend, &batch("X"))
             .await
             .queued
@@ -537,7 +537,7 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> =
             StubBackend::new(vec![ScriptedOutcome::Rejected, ScriptedOutcome::Enqueued]);
 
-        let queued = pool
+        let (_, queued) = pool
             .enqueue_next(0, &backend, &batch("X"))
             .await
             .queued
@@ -559,7 +559,7 @@ mod tests {
             ScriptedOutcome::Enqueued,
         ]);
 
-        let queued = pool
+        let (_, queued) = pool
             .enqueue_next(0, &backend, &batch("X"))
             .await
             .queued
@@ -580,11 +580,15 @@ mod tests {
             ScriptedOutcome::Enqueued,
         ]);
 
-        let queued = pool
+        let (candidate, queued) = pool
             .enqueue_next(0, &backend, &batch("X"))
             .await
             .queued
             .expect("enqueued");
+        assert_eq!(
+            (candidate.source.as_str(), candidate.id.as_str()),
+            ("peer_c", "c.flac")
+        );
         assert_eq!(queued.source, "peer_c");
         assert_eq!(queued.id, "t-c.flac");
         assert_eq!(pool.attempts_used(0), 3);
@@ -622,7 +626,7 @@ mod tests {
         let mine = batch("X");
         let someone_else = batch("Y").owner;
 
-        let queued = pool
+        let (_, queued) = pool
             .enqueue_next(0, &backend, &mine)
             .await
             .queued
@@ -656,7 +660,7 @@ mod tests {
 
         let next = pool.enqueue_next(0, &backend, &batch("X")).await;
 
-        assert_eq!(next.queued.expect("enqueued").source, "peer_c");
+        assert_eq!(next.queued.expect("enqueued").1.source, "peer_c");
         assert_eq!(
             next.refused[0].failure.code,
             FailureCode::AlreadyInFlightOtherUser
@@ -723,7 +727,7 @@ mod tests {
             ScriptedOutcome::Enqueued,
         ]);
         let next = pool.enqueue_next(0, &backend, &batch("X")).await;
-        assert_eq!(next.queued.unwrap().source, "peer_d");
+        assert_eq!(next.queued.unwrap().1.source, "peer_d");
         let refused: Vec<(&str, FailureCode)> = next
             .refused
             .iter()
@@ -758,7 +762,7 @@ mod tests {
             &same_user_into(&mine, PathBuf::from("/music")),
         );
         let next = pool.enqueue_next(0, &backend, &mine).await;
-        assert_eq!(next.queued.unwrap().source, "peer_d");
+        assert_eq!(next.queued.unwrap().1.source, "peer_d");
         let refused: Vec<(&str, FailureCode, &str)> = next
             .refused
             .iter()

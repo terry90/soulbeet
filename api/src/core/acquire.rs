@@ -323,7 +323,7 @@ async fn queue_and_watch(
             let target = batch.target.clone();
             spawn_monitor(
                 &ctx,
-                DownloadMonitor::new(transfers, target, tx, batch).with_failover(pool),
+                DownloadMonitor::new(transfers, target, tx, batch, ledger).with_failover(pool),
             );
         }
     }
