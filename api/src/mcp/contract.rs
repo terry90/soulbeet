@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 
-use crate::oauth::limits::retry_after_seconds;
+use crate::oauth::limits::{retry_after_seconds, try_again_in};
 
 /// A call that can still be tried, with its arguments.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -84,7 +84,10 @@ pub(crate) fn rate_limited(per_minute: u32, wait: Duration) -> ToolError {
         FailureCode::RateLimited,
         Stage::Input,
         RetryAdvice::SameSourceLater,
-        format!("Too many tool calls from this app: at most {per_minute} a minute. Try again in {n} seconds."),
+        format!(
+            "Too many tool calls from this app: at most {per_minute} a minute. {}",
+            try_again_in(n)
+        ),
     )
     .with_retry_after(n);
     ToolError {
@@ -162,6 +165,12 @@ mod tests {
             "Too many tool calls from this app: at most 120 a minute. Try again in 13 seconds."
         );
         assert!(e.next.is_empty() && e.facts.is_empty());
+        assert_eq!(
+            rate_limited(120, Duration::from_millis(400))
+                .failure
+                .message,
+            "Too many tool calls from this app: at most 120 a minute. Try again in 1 second."
+        );
     }
 
     #[test]

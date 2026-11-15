@@ -48,13 +48,18 @@ pub(crate) fn routes() -> Router<Arc<ConnectionState>> {
             "/.well-known/oauth-authorization-server",
             get(authorization_server).fallback(only_get),
         )
-        .route("/oauth/register", post(register::register))
+        .route(
+            "/oauth/register",
+            post(register::register).fallback(only_post),
+        )
         .route(
             shared::oauth::AUTHORIZE_PATH,
-            get(authorize::show).post(authorize::answer),
+            get(authorize::show)
+                .post(authorize::answer)
+                .fallback(|| method_not_allowed("Only GET and POST are served here")),
         )
-        .route("/oauth/token", post(token::token))
-        .route("/oauth/revoke", post(token::revoke))
+        .route("/oauth/token", post(token::token).fallback(only_post))
+        .route("/oauth/revoke", post(token::revoke).fallback(only_post))
 }
 
 /// How often `start_prune_task` prunes (D4).
@@ -78,7 +83,7 @@ pub(crate) fn rate_limited(wait: Duration, what: &str) -> Response {
     let mut refused = oauth_error(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limited",
-        format!("{what}. Try again in {seconds} seconds."),
+        format!("{what}. {}", limits::try_again_in(seconds)),
     );
     refused.headers_mut().insert(RETRY_AFTER, seconds.into());
     refused
@@ -164,13 +169,22 @@ pub(crate) fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// Another method on a discovery document: axum adds `Allow: GET,HEAD`.
-async fn only_get() -> Response {
+/// Another method than a route serves, in D1's shape: axum adds the
+/// `Allow` header naming the methods it serves.
+async fn method_not_allowed(message: &'static str) -> Response {
     refusal(
         StatusCode::METHOD_NOT_ALLOWED,
         "method_not_allowed",
-        "Only GET is served here",
+        message,
     )
+}
+
+async fn only_get() -> Response {
+    method_not_allowed("Only GET is served here").await
+}
+
+async fn only_post() -> Response {
+    method_not_allowed("Only POST is served here").await
 }
 
 async fn protected_resource(Extension(RequestBase(base)): Extension<RequestBase>) -> Json<Value> {

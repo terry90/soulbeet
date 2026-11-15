@@ -1,6 +1,7 @@
 //! Registered OAuth clients and the rules their redirect URIs follow.
 
-use sqlx::SqlitePool;
+use serde_json::{Map, Value};
+use sqlx::{SqliteExecutor, SqlitePool};
 use url::Url;
 
 use super::cimd::ClientDocument;
@@ -11,6 +12,60 @@ pub(crate) const DCR_CAP: i64 = 100;
 
 const REDIRECT_REFUSED: &str =
     "redirect URIs must be https, or http on a loopback address, with no fragment";
+
+/// The most redirect URIs a client may name, and their longest length.
+const MAX_REDIRECT_URIS: usize = 10;
+const MAX_REDIRECT_URI_CHARS: usize = 2_000;
+/// The longest `client_name`, which the consent page and Settings show.
+const MAX_CLIENT_NAME_CHARS: usize = 200;
+
+/// A client metadata member that breaks a rule, and the rule.
+#[derive(Debug, PartialEq)]
+pub(crate) enum MetadataRefusal {
+    ClientName(&'static str),
+    RedirectUris(&'static str),
+}
+
+/// The name and redirect URIs of a client's metadata, from a registration
+/// or a Client ID Metadata Document alike: `client_name`, when present and
+/// not empty, a string of at most 200 characters; `redirect_uris`, 1 to 10
+/// strings of at most 2,000 characters, each one `redirect_uri_allowed`
+/// accepts.
+pub(crate) fn client_metadata(doc: &Map<String, Value>) -> Result<NewClient, MetadataRefusal> {
+    let uris: Option<Vec<&str>> = doc
+        .get("redirect_uris")
+        .and_then(Value::as_array)
+        .filter(|uris| (1..=MAX_REDIRECT_URIS).contains(&uris.len()))
+        .and_then(|uris| uris.iter().map(Value::as_str).collect());
+    let Some(uris) = uris.filter(|uris| {
+        uris.iter()
+            .all(|uri| uri.chars().count() <= MAX_REDIRECT_URI_CHARS)
+    }) else {
+        return Err(MetadataRefusal::RedirectUris(
+            "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
+        ));
+    };
+    for uri in &uris {
+        redirect_uri_allowed(uri).map_err(MetadataRefusal::RedirectUris)?;
+    }
+    let client_name = match doc.get("client_name") {
+        None => None,
+        Some(Value::String(name)) if name.is_empty() => None,
+        Some(Value::String(name)) if name.chars().count() <= MAX_CLIENT_NAME_CHARS => {
+            Some(name.clone())
+        }
+        Some(Value::String(_)) => {
+            return Err(MetadataRefusal::ClientName(
+                "client_name must be at most 200 characters",
+            ))
+        }
+        Some(_) => return Err(MetadataRefusal::ClientName("client_name must be a string")),
+    };
+    Ok(NewClient {
+        client_name,
+        redirect_uris: uris.into_iter().map(str::to_owned).collect(),
+    })
+}
 
 /// A redirect URI is `https` with a host, or `http` on a loopback host, with
 /// no fragment. It must also be written as an RFC 3986 URI with a host,
@@ -155,8 +210,9 @@ pub(crate) enum InsertRefusal {
 }
 
 /// Inserts a DCR client; at `cap` DCR clients, first deletes the one with no
-/// grant whose COALESCE(last_used_at, created_at) is oldest (D4), in one
-/// BEGIN IMMEDIATE transaction. CIMD clients neither count nor make room.
+/// grant, code or consent request whose COALESCE(last_used_at, created_at)
+/// is oldest (D4), as the prune keeps them, in one BEGIN IMMEDIATE
+/// transaction. CIMD clients neither count nor make room.
 pub(crate) async fn insert_dcr_in(
     db: &SqlitePool,
     client_id: &str,
@@ -179,7 +235,9 @@ pub(crate) async fn insert_dcr_in(
                  SELECT c.client_id FROM oauth_clients c \
                  WHERE c.kind = 'dcr' \
                    AND NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id) \
-                 ORDER BY COALESCE(c.last_used_at, c.created_at) LIMIT 1)",
+                   AND NOT EXISTS (SELECT 1 FROM oauth_codes o WHERE o.client_id = c.client_id) \
+                   AND NOT EXISTS (SELECT 1 FROM oauth_requests r WHERE r.client_id = c.client_id) \
+                 ORDER BY COALESCE(c.last_used_at, c.created_at), c.client_id LIMIT 1)",
         )
         .execute(&mut *tx)
         .await
@@ -205,8 +263,8 @@ pub(crate) async fn insert_dcr_in(
 /// Stores a CIMD client as its document reads now: inserted at its first
 /// allowed authorization, its name and redirect URIs replaced at each later
 /// one.
-pub(crate) async fn upsert_cimd_in(
-    db: &SqlitePool,
+pub(crate) async fn upsert_cimd_in<'e>(
+    db: impl SqliteExecutor<'e>,
     doc: &ClientDocument,
     now: i64,
 ) -> Result<(), String> {
@@ -230,9 +288,76 @@ pub(crate) async fn upsert_cimd_in(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
-    use crate::connection::test_util::CLAUDE_CALLBACK;
+    use crate::connection::test_util::{behind_a_writer, CLAUDE_CALLBACK};
     use crate::db::test_db;
+
+    fn metadata(doc: Value) -> Result<NewClient, MetadataRefusal> {
+        client_metadata(doc.as_object().unwrap())
+    }
+
+    #[test]
+    fn client_metadata_names_the_rule_it_breaks() {
+        let long = format!("https://claude.ai/{}", "a".repeat(2000));
+        let eleven: Vec<String> = (0..11).map(|i| format!("https://a.example/{i}")).collect();
+        for (doc, refused) in [
+            (
+                json!({"redirect_uris": [CLAUDE_CALLBACK], "client_name": "c".repeat(201)}),
+                MetadataRefusal::ClientName("client_name must be at most 200 characters"),
+            ),
+            (
+                json!({"redirect_uris": [CLAUDE_CALLBACK], "client_name": 7}),
+                MetadataRefusal::ClientName("client_name must be a string"),
+            ),
+            (
+                json!({"redirect_uris": []}),
+                MetadataRefusal::RedirectUris(
+                    "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
+                ),
+            ),
+            (
+                json!({}),
+                MetadataRefusal::RedirectUris(
+                    "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
+                ),
+            ),
+            (
+                json!({"redirect_uris": eleven}),
+                MetadataRefusal::RedirectUris(
+                    "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
+                ),
+            ),
+            (
+                json!({"redirect_uris": [long]}),
+                MetadataRefusal::RedirectUris(
+                    "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
+                ),
+            ),
+            (
+                json!({"redirect_uris": [CLAUDE_CALLBACK, 7]}),
+                MetadataRefusal::RedirectUris(
+                    "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
+                ),
+            ),
+            (
+                json!({"redirect_uris": ["http://claude.ai/api/mcp/auth_callback"]}),
+                MetadataRefusal::RedirectUris(REDIRECT_REFUSED),
+            ),
+            (
+                json!({"redirect_uris": ["https://claude.ai/cb#x"]}),
+                MetadataRefusal::RedirectUris(REDIRECT_REFUSED),
+            ),
+        ] {
+            assert_eq!(metadata(doc.clone()).err(), Some(refused), "{doc}");
+        }
+        let ok = metadata(json!({"redirect_uris": [CLAUDE_CALLBACK], "client_name": ""})).unwrap();
+        assert_eq!(
+            (ok.client_name, ok.redirect_uris),
+            (None, vec![CLAUDE_CALLBACK.to_string()])
+        );
+    }
 
     #[test]
     fn redirect_uris_must_be_https_or_loopback() {
@@ -341,8 +466,9 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO oauth_grants (id, user_id, client_id, resource, scope, created_at) \
-             VALUES (?, 'u1', ?, 'https://music.example.com/mcp', 'soulful', 0)",
+            "INSERT INTO oauth_grants (id, user_id, client_id, redirect_uri, resource, scope, created_at) \
+             VALUES (?, 'u1', ?, 'https://claude.ai/api/mcp/auth_callback', \
+             'https://music.example.com/mcp', 'soulful', 0)",
         )
         .bind(format!("g-{client_id}"))
         .bind(client_id)
@@ -383,6 +509,80 @@ mod tests {
             Err(InsertRefusal::Full)
         ));
         assert_eq!(client_ids(&db).await, ["dcr_a", "dcr_c", "dcr_d"]);
+    }
+
+    #[tokio::test]
+    async fn at_the_cap_a_client_signing_in_is_kept_and_ties_go_by_client_id() {
+        let db = test_db::migrated().await;
+        let client = NewClient {
+            client_name: None,
+            redirect_uris: vec![CLAUDE_CALLBACK.into()],
+        };
+        // Three clients registered in the same second.
+        for id in ["dcr_c", "dcr_a", "dcr_b"] {
+            insert_dcr_in(&db, id, &client, 5, 3).await.unwrap();
+        }
+        // dcr_a has a code out and dcr_b a consent request waiting.
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1', 'bob', 'x')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_codes (code_hash, user_id, client_id, redirect_uri, code_challenge, \
+             scope, resource, expires_at) VALUES ('h', 'u1', 'dcr_a', ?, 'x', 'soulful', 'r', 99)",
+        )
+        .bind(CLAUDE_CALLBACK)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_requests (id_hash, user_id, client_id, client_kind, \
+             client_redirect_uris, redirect_uri, code_challenge, scope, resource, expires_at) \
+             VALUES ('q', 'u1', 'dcr_b', 'dcr', '[]', ?, 'x', 'soulful', 'r', 99)",
+        )
+        .bind(CLAUDE_CALLBACK)
+        .execute(&db)
+        .await
+        .unwrap();
+        insert_dcr_in(&db, "dcr_d", &client, 6, 3).await.unwrap();
+        assert_eq!(client_ids(&db).await, ["dcr_a", "dcr_b", "dcr_d"]);
+        // With none signing in, the tie goes to the smallest client id.
+        sqlx::query("DELETE FROM oauth_codes")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM oauth_requests")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE oauth_clients SET created_at = 5")
+            .execute(&db)
+            .await
+            .unwrap();
+        insert_dcr_in(&db, "dcr_e", &client, 7, 3).await.unwrap();
+        assert_eq!(client_ids(&db).await, ["dcr_b", "dcr_d", "dcr_e"]);
+    }
+
+    // The count is read before the insert: begun with BEGIN IMMEDIATE the
+    // registration waits for another writer, a plain BEGIN fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_waits_for_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db::migrated_file(dir.path()).await;
+        let registered = behind_a_writer(&db, {
+            let db = db.clone();
+            async move {
+                let client = NewClient {
+                    client_name: None,
+                    redirect_uris: vec![CLAUDE_CALLBACK.into()],
+                };
+                insert_dcr_in(&db, "dcr_a", &client, 0, DCR_CAP)
+                    .await
+                    .map_err(|e| format!("{e:?}"))
+            }
+        })
+        .await;
+        assert_eq!(registered, Ok(()));
     }
 
     #[tokio::test]

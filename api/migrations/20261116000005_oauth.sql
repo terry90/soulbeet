@@ -11,9 +11,10 @@ CREATE TABLE oauth_clients (
 );
 -- An authorize request waiting for the user's consent, with the client as
 -- authorize validated it: a CIMD client gets its oauth_clients row only at
--- consent.
+-- consent. seq orders a user's requests from oldest to newest.
 CREATE TABLE oauth_requests (
-    id_hash TEXT PRIMARY KEY NOT NULL,
+    seq INTEGER PRIMARY KEY,
+    id_hash TEXT NOT NULL UNIQUE,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     client_id TEXT NOT NULL,
     client_kind TEXT NOT NULL CHECK (client_kind IN ('dcr', 'cimd')),
@@ -30,6 +31,8 @@ CREATE TABLE oauth_grants (
     id TEXT PRIMARY KEY NOT NULL,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     client_id TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+    -- The redirect URI the user allowed: a registered app is named by its host.
+    redirect_uri TEXT NOT NULL,
     resource TEXT NOT NULL,
     scope TEXT NOT NULL,
     allow_delete INTEGER NOT NULL DEFAULT 0,

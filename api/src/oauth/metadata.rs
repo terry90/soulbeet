@@ -165,6 +165,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_other_oauth_paths_answer_a_wrong_method_in_json() {
+        for (method, path, allow, message) in [
+            ("GET", "/oauth/token", "POST", "Only POST is served here"),
+            ("GET", "/oauth/register", "POST", "Only POST is served here"),
+            ("GET", "/oauth/revoke", "POST", "Only POST is served here"),
+            (
+                "PUT",
+                "/oauth/authorize",
+                "GET,HEAD,POST",
+                "Only GET and POST are served here",
+            ),
+        ] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", HOST)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, headers, body) = send(app().await, req).await;
+            assert_eq!(
+                (status, headers["allow"].to_str().unwrap()),
+                (StatusCode::METHOD_NOT_ALLOWED, allow),
+                "{path}"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                json!({"error": "method_not_allowed", "message": message}),
+                "{path}"
+            );
+            assert_eq!(headers["cache-control"], "no-store", "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_discovery_documents_are_uncached_and_vary_on_the_address_headers() {
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+        ] {
+            let (status, headers, _) = get_json(app().await, path, &[("host", HOST)]).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(headers["cache-control"], "no-store", "{path}");
+            assert_eq!(
+                headers.get_all("vary").iter().collect::<Vec<_>>(),
+                ["Forwarded, X-Forwarded-Host, X-Forwarded-Proto, Host"],
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn there_is_no_openid_configuration() {
         let (status, _, body) = get_json(
             app().await,

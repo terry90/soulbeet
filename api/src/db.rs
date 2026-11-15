@@ -244,8 +244,9 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO oauth_grants (id, user_id, client_id, resource, scope, created_at) \
-             VALUES (?, ?, 'dcr_c', 'https://music.example.com/mcp', 'soulful', 0)",
+            "INSERT INTO oauth_grants (id, user_id, client_id, redirect_uri, resource, scope, created_at) \
+             VALUES (?, ?, 'dcr_c', 'https://claude.ai/api/mcp/auth_callback', \
+             'https://music.example.com/mcp', 'soulful', 0)",
         )
         .bind(format!("g-{user}"))
         .bind(user)

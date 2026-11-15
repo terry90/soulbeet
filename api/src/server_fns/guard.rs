@@ -59,6 +59,19 @@ pub(crate) async fn load_session(
     db: &SqlitePool,
     key: &SecretKey,
 ) -> Result<UserCtx, (StatusCode, String)> {
+    load_session_claims(token, db, key)
+        .await
+        .map(|(ctx, _)| ctx)
+}
+
+/// `load_session`, with the token's claims, so a later write can check that
+/// the credentials version and the session it names still stand.
+#[cfg(feature = "server")]
+pub(crate) async fn load_session_claims(
+    token: Option<&str>,
+    db: &SqlitePool,
+    key: &SecretKey,
+) -> Result<(UserCtx, Claims), (StatusCode, String)> {
     let Some(token) = token else {
         tracing::warn!("Auth failure: No auth token found in request cookies");
         return Err((StatusCode::UNAUTHORIZED, "No auth token found".to_string()));
@@ -83,7 +96,8 @@ pub(crate) async fn load_session(
     let user = User::find_by_id_in(db, &claims.sub)
         .await
         .map_err(check_failed)?;
-    session_from(&claims, user.as_ref())
+    let ctx = session_from(&claims, user.as_ref())?;
+    Ok((ctx, claims))
 }
 
 #[cfg(feature = "server")]

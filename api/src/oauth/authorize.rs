@@ -19,20 +19,18 @@ use shared::oauth::AUTHORIZE_PATH;
 use tower_cookies::Cookies;
 use url::Url;
 
-use super::cimd::{client_id_url, CimdError, ClientDocument};
-use super::clients::{
-    find_in, is_loopback_uri, redirect_matches, upsert_cimd_in, ClientKind, KnownClient,
-};
-use super::codes::{store_code_in, store_request_in, take_request_in, PendingRequest};
+use super::cimd::{client_id_url, CimdError};
+use super::clients::{find_in, is_loopback_uri, redirect_matches, ClientKind, KnownClient};
+use super::codes::{answer_in, store_request_in, Answered, PendingRequest, Refused, SessionCheck};
 use super::consent::{consent_page, error_page, ConsentView};
-use super::limits::retry_after_seconds;
+use super::limits::{retry_after_seconds, try_again_in};
 use super::metadata::mcp_url;
 use super::secrets::new_secret;
 use super::{now_unix, resource_matches, Params, OFFLINE_ACCESS, SCOPE};
 use crate::auth::UserCtx;
 use crate::base_url::BaseUrl;
 use crate::connection::{ConnectionState, RequestBase};
-use crate::server_fns::guard::load_session;
+use crate::server_fns::guard::load_session_claims;
 
 const AUTHORIZE_PARAMS: &[&str] = &[
     "response_type",
@@ -70,14 +68,36 @@ fn read_params(raw: &[u8], names: &[&'static str]) -> Result<Params, Response> {
     })
 }
 
-/// The user the session cookie signs in, if it still counts.
-async fn session(state: &ConnectionState, cookies: &Cookies) -> Option<UserCtx> {
+/// What the session cookie says about the browser's user.
+enum Session {
+    /// Signed in, with what a later write checks again.
+    SignedIn(UserCtx, SessionCheck),
+    /// No cookie, or one that no longer counts.
+    SignedOut,
+    /// The database could not say.
+    Unavailable,
+}
+
+async fn session(state: &ConnectionState, cookies: &Cookies) -> Session {
     let token = cookies
         .get(crate::AUTH_COOKIE_NAME)
         .map(|c| c.value().to_string());
-    load_session(token.as_deref(), &state.db, state.key)
-        .await
-        .ok()
+    match load_session_claims(token.as_deref(), &state.db, state.key).await {
+        Ok((ctx, claims)) => Session::SignedIn(
+            ctx,
+            SessionCheck {
+                credentials_version: claims.ver,
+                session_id: claims.jti,
+            },
+        ),
+        // load_session_claims has logged the database's failure.
+        Err((StatusCode::INTERNAL_SERVER_ERROR, _)) => Session::Unavailable,
+        Err(_) => Session::SignedOut,
+    }
+}
+
+fn database_unavailable() -> Response {
+    error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE)
 }
 
 pub(crate) async fn show(
@@ -90,13 +110,17 @@ pub(crate) async fn show(
         Ok(params) => params,
         Err(refused) => return refused,
     };
-    let Some(user) = session(&state, &cookies).await else {
-        let back = match uri.query() {
-            Some(query) => format!("{AUTHORIZE_PATH}?{query}"),
-            None => AUTHORIZE_PATH.to_string(),
-        };
-        let back: String = url::form_urlencoded::byte_serialize(back.as_bytes()).collect();
-        return Redirect::to(&format!("/login?return_to={back}")).into_response();
+    let (user, check) = match session(&state, &cookies).await {
+        Session::SignedIn(user, check) => (user, check),
+        Session::Unavailable => return database_unavailable(),
+        Session::SignedOut => {
+            let back = match uri.query() {
+                Some(query) => format!("{AUTHORIZE_PATH}?{query}"),
+                None => AUTHORIZE_PATH.to_string(),
+            };
+            let back: String = url::form_urlencoded::byte_serialize(back.as_bytes()).collect();
+            return Redirect::to(&format!("/login?return_to={back}")).into_response();
+        }
     };
     let Some(client_id) = params.get("client_id") else {
         return error_page(StatusCode::BAD_REQUEST, UNKNOWN_APP);
@@ -114,7 +138,7 @@ pub(crate) async fn show(
             Ok(None) => return error_page(StatusCode::BAD_REQUEST, UNKNOWN_APP),
             Err(e) => {
                 tracing::error!("Could not read an OAuth client: {e}");
-                return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
+                return database_unavailable();
             }
         }
     };
@@ -152,9 +176,14 @@ pub(crate) async fn show(
         scope,
         resource: mcp_url(&base),
     };
-    if let Err(e) = store_request_in(&state.db, &request_id, &pending, now_unix()).await {
-        tracing::error!("Could not store an OAuth authorize request: {e}");
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
+    match store_request_in(&state.db, &check, &request_id, &pending, now_unix()).await {
+        Ok(()) => {}
+        // Signed out or credentials changed while the document was fetched.
+        Err(Refused::SessionEnded) => return error_page(StatusCode::UNAUTHORIZED, SESSION_ENDED),
+        Err(Refused::Database(e)) => {
+            tracing::error!("Could not store an OAuth authorize request: {e}");
+            return database_unavailable();
+        }
     }
     consent_page(&ConsentView {
         app_host: client_id_host.as_deref().unwrap_or(&redirect_host),
@@ -178,6 +207,9 @@ async fn document_client(
     client_id: &str,
 ) -> Result<(KnownClient, String), Response> {
     let unusable = |e: CimdError| {
+        if let CimdError::Fetch(causes) = &e {
+            tracing::warn!("Could not fetch the client metadata at {client_id}: {causes}");
+        }
         error_page(
             StatusCode::BAD_REQUEST,
             &format!("Soulful could not use this app's client metadata at {client_id}: {e}"),
@@ -188,7 +220,10 @@ async fn document_client(
         let seconds = retry_after_seconds(wait);
         let mut refused = error_page(
             StatusCode::TOO_MANY_REQUESTS,
-            &format!("Too many app sign-ins in a minute. Try again in {seconds} seconds."),
+            &format!(
+                "Too many app sign-ins in a minute. {}",
+                try_again_in(seconds)
+            ),
         );
         refused.headers_mut().insert(RETRY_AFTER, seconds.into());
         return Err(refused);
@@ -198,7 +233,7 @@ async fn document_client(
     let client = KnownClient {
         client_id: doc.client_id,
         kind: ClientKind::Cimd,
-        client_name: Some(doc.client_name),
+        client_name: doc.client_name,
         redirect_uris: doc.redirect_uris,
     };
     Ok((client, host))
@@ -223,6 +258,12 @@ fn validate<'a>(
         (Some(challenge), Some("S256")) => challenge,
         _ => return Err(("invalid_request", "PKCE with S256 is required".into())),
     };
+    if !is_s256_challenge(code_challenge) {
+        return Err((
+            "invalid_request",
+            "code_challenge must be 43 base64url characters, an S256 challenge".into(),
+        ));
+    }
     let requested: Vec<&str> = params
         .get("scope")
         .map(|scope| scope.split(' ').collect())
@@ -253,6 +294,15 @@ fn validate<'a>(
     Ok((scope, code_challenge))
 }
 
+/// An S256 challenge is a SHA-256 in unpadded base64url: 43 characters of
+/// `[A-Za-z0-9-_]` (RFC 7636 section 4.2).
+fn is_s256_challenge(challenge: &str) -> bool {
+    challenge.len() == 43
+        && challenge
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+}
+
 pub(crate) async fn answer(
     State(state): State<Arc<ConnectionState>>,
     Extension(RequestBase(base)): Extension<RequestBase>,
@@ -263,8 +313,10 @@ pub(crate) async fn answer(
         Ok(params) => params,
         Err(refused) => return refused,
     };
-    let Some(user) = session(&state, &cookies).await else {
-        return error_page(StatusCode::UNAUTHORIZED, SESSION_ENDED);
+    let (user, check) = match session(&state, &cookies).await {
+        Session::SignedIn(user, check) => (user, check),
+        Session::Unavailable => return database_unavailable(),
+        Session::SignedOut => return error_page(StatusCode::UNAUTHORIZED, SESSION_ENDED),
     };
     let (Some(request_id), Some(allow)) = (
         params.get("request"),
@@ -276,47 +328,32 @@ pub(crate) async fn answer(
     ) else {
         return error_page(StatusCode::BAD_REQUEST, NOT_UNDERSTOOD);
     };
-    let now = now_unix();
-    let pending = match take_request_in(&state.db, request_id, &user.user_id, now).await {
-        Ok(Some(pending)) => pending,
-        Ok(None) => return error_page(StatusCode::BAD_REQUEST, REQUEST_GONE),
-        Err(e) => {
-            tracing::error!("Could not read an OAuth authorize request: {e}");
-            return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
-        }
-    };
-    if !allow {
-        return back_to_app(
+    match answer_in(
+        &state.db,
+        &user.user_id,
+        &check,
+        request_id,
+        allow,
+        now_unix(),
+    )
+    .await
+    {
+        Ok(Answered::Gone) => error_page(StatusCode::BAD_REQUEST, REQUEST_GONE),
+        Ok(Answered::Denied(pending)) => back_to_app(
             &pending,
             &base,
             &[
                 ("error", "access_denied"),
                 ("error_description", "The user did not allow the connection"),
             ],
-        );
-    }
-    // The code's client must exist: a CIMD client is stored once allowed.
-    if pending.client.kind == ClientKind::Cimd {
-        let Some(client_name) = pending.client.client_name.clone() else {
-            tracing::error!("A stored CIMD authorize request has no client name");
-            return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
-        };
-        let doc = ClientDocument {
-            client_id: pending.client.client_id.clone(),
-            client_name,
-            redirect_uris: pending.client.redirect_uris.clone(),
-        };
-        if let Err(e) = upsert_cimd_in(&state.db, &doc, now).await {
-            tracing::error!("Could not store an OAuth client: {e}");
-            return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
+        ),
+        Ok(Answered::Allowed(pending, code)) => back_to_app(&pending, &base, &[("code", &code)]),
+        Err(Refused::SessionEnded) => error_page(StatusCode::UNAUTHORIZED, SESSION_ENDED),
+        Err(Refused::Database(e)) => {
+            tracing::error!("Could not answer an OAuth authorize request: {e}");
+            database_unavailable()
         }
     }
-    let code = new_secret();
-    if let Err(e) = store_code_in(&state.db, &code, &pending, now).await {
-        tracing::error!("Could not store an OAuth authorization code: {e}");
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
-    }
-    back_to_app(&pending, &base, &[("code", &code)])
 }
 
 /// A 303 to the request's redirect URI with `first`, then `state` when the
@@ -324,7 +361,7 @@ pub(crate) async fn answer(
 fn back_to_app(pending: &PendingRequest, base: &BaseUrl, first: &[(&str, &str)]) -> Response {
     let Ok(mut to) = Url::parse(&pending.redirect_uri) else {
         tracing::error!("A stored OAuth redirect URI does not parse");
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
+        return database_unavailable();
     };
     {
         let mut query = to.query_pairs_mut();
@@ -351,7 +388,7 @@ mod tests {
     use crate::connection::test_util::*;
     use crate::connection::{router, ConnectionState};
     use crate::db::test_db;
-    use crate::oauth::cimd::{CimdError, ClientDocument};
+    use crate::oauth::cimd::{CimdError, ClientDocument, ClientDocuments};
     use crate::oauth::clients::{insert_dcr_in, NewClient, DCR_CAP};
     use crate::oauth::limits::{Limits, WindowLimiter};
     use crate::oauth::now_unix;
@@ -516,6 +553,20 @@ mod tests {
                 ("code_challenge_method", Some("plain")),
                 "invalid_request",
                 "PKCE with S256 is required",
+            ),
+            (
+                ("code_challenge", Some("abc")),
+                "invalid_request",
+                "code_challenge must be 43 base64url characters, an S256 challenge",
+            ),
+            (
+                // RFC 7636 appendix B's challenge padded, as base64 and not base64url writes it.
+                (
+                    "code_challenge",
+                    Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw+cM="),
+                ),
+                "invalid_request",
+                "code_challenge must be 43 base64url characters, an S256 challenge",
             ),
             (
                 ("scope", Some("soulful admin")),
@@ -754,6 +805,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_database_failure_while_checking_the_session_is_the_500_page() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (_, _, page) = get(
+            app.clone(),
+            &format!("/oauth/authorize?{}", query()),
+            Some(&cookie),
+        )
+        .await;
+        let id = request_id_of(&page);
+        db.close().await;
+        let (status, _, page) = post_form(
+            app.clone(),
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(page.contains(
+            "Soulful&#39;s database is unavailable. Start the connection again from the app."
+        ));
+        let (status, headers, _) =
+            get(app, &format!("/oauth/authorize?{}", query()), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(headers.get("location").is_none());
+    }
+
+    /// Answers Claude Code's document after changing alice's password, as
+    /// a password change that commits while the fetch is in flight.
+    struct ChangedDuringFetch(SqlitePool);
+
+    #[async_trait::async_trait]
+    impl ClientDocuments for ChangedDuringFetch {
+        async fn fetch(&self, _url: &Url) -> Result<ClientDocument, CimdError> {
+            sqlx::query(
+                "UPDATE users SET credentials_version = credentials_version + 1 WHERE id = 'u1'",
+            )
+            .execute(&self.0)
+            .await
+            .unwrap();
+            Ok(claude_code())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_password_change_during_the_document_fetch_ends_the_request() {
+        let db = test_db::migrated().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let app = router(ConnectionState {
+            documents: Arc::new(ChangedDuringFetch(db.clone())),
+            ..ConnectionState::for_test(db.clone())
+        })
+        .layer(CookieManagerLayer::new());
+        let (status, _, page) = get(
+            app,
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("http://localhost:3118/callback")
+            ),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            page.contains("Your Soulful session ended. Start the connection again from the app.")
+        );
+        assert_eq!(count(&db, "oauth_requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_session_cannot_answer() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (_, _, page) = get(
+            app.clone(),
+            &format!("/oauth/authorize?{}", query()),
+            Some(&cookie),
+        )
+        .await;
+        let id = request_id_of(&page);
+        let token = cookie.split_once('=').unwrap().1;
+        let claims = crate::auth::verify_token(test_key(), token).unwrap();
+        sqlx::query("INSERT INTO revoked_sessions (jti, expires_at) VALUES (?, 9999999999)")
+            .bind(&claims.jti)
+            .execute(&db)
+            .await
+            .unwrap();
+        let (status, _, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(count(&db, "oauth_codes").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_metadata_document_without_a_name_is_shown_by_its_host_alone() {
+        let unnamed = ClientDocument {
+            client_name: None,
+            ..claude_code()
+        };
+        let (db, _, app) = cimd_app(Ok(unnamed)).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let q = claude_code_query("http://localhost:3118/callback");
+        let (status, _, page) =
+            get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("Connect claude.ai to Soulful") && !page.contains("It calls itself"));
+        let (status, _, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &request_id_of(&page)), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let name: Option<String> = sqlx::query_scalar("SELECT client_name FROM oauth_clients")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(name, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_says_only_that_it_failed() {
+        let failed = CimdError::Fetch(
+            "error sending request: dns error: the name resolves only to private or local addresses"
+                .into(),
+        );
+        let (db, _, app) = cimd_app(Err(failed)).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (status, _, page) = get(
+            app,
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("http://localhost:3118/callback")
+            ),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains(
+            "Soulful could not use this app&#39;s client metadata at \
+             https://claude.ai/oauth/claude-code-client-metadata: Soulful could not fetch it"
+        ));
+        assert!(!page.contains("private"));
+    }
+
+    #[tokio::test]
     async fn denying_sends_access_denied() {
         let (db, app) = app().await;
         let cookie = signed_in(&db, "u1", "alice").await;
@@ -893,7 +1097,7 @@ mod tests {
         let db = test_db::migrated().await;
         let cookie = signed_in(&db, "u1", "alice").await;
         let renamed = ClientDocument {
-            client_name: "Claude Code 2".into(),
+            client_name: Some("Claude Code 2".into()),
             ..claude_code()
         };
         for doc in [claude_code(), renamed] {
@@ -983,14 +1187,13 @@ mod tests {
         assert_eq!(count(&db, "oauth_requests").await, 0);
     }
 
-    // Limits gains fields in later tasks; a test sets the one limit it needs
-    // by assignment, so it does not change when they come.
-    #[allow(clippy::field_reassign_with_default)]
     #[tokio::test]
     async fn metadata_fetches_per_user_are_limited() {
         let db = test_db::migrated().await;
-        let mut limits = Limits::default();
-        limits.cimd_fetch = WindowLimiter::new(1, Duration::from_secs(60));
+        let limits = Limits {
+            cimd_fetch: WindowLimiter::new(1, Duration::from_secs(60)),
+            ..Limits::default()
+        };
         let docs = FixedDocuments::new(vec![(CLAUDE_CODE_ID, Ok(claude_code()))]);
         let app = router(ConnectionState {
             documents: docs.clone(),

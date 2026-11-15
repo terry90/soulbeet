@@ -30,7 +30,7 @@ use crate::oauth::cimd::{
     client_id_url, parse_document, CimdError, ClientDocument, ClientDocuments,
 };
 use crate::oauth::clients::{find_in, insert_dcr_in, NewClient, DCR_CAP};
-use crate::oauth::codes::{store_code_in, PendingRequest};
+use crate::oauth::codes::{store_code_in, PendingRequest, SessionCheck};
 use crate::oauth::grants::{redeem_code_in, CodeRedemption};
 use crate::oauth::limits::Limits;
 use crate::oauth::now_unix;
@@ -216,6 +216,37 @@ pub(crate) async fn add_user(db: &SqlitePool, user_id: &str, username: &str) {
         .execute(db)
         .await
         .unwrap();
+}
+
+/// The session check of a session `signed_in` issued: credentials version
+/// 0, never signed out.
+pub(crate) fn fresh_session() -> SessionCheck {
+    SessionCheck {
+        credentials_version: 0,
+        session_id: "fresh-session".into(),
+    }
+}
+
+/// Runs `write` while another connection of `db` holds the write lock with
+/// a write of its own, which it commits 200 ms later. A transaction that
+/// reads before it takes the write lock fails behind it: SQLite answers its
+/// first write SQLITE_BUSY at once instead of waiting, since waiting could
+/// deadlock. One begun with BEGIN IMMEDIATE waits for the lock and succeeds.
+/// `db` is a `test_db::migrated_file` database, with several connections.
+pub(crate) async fn behind_a_writer<T: Send + 'static>(
+    db: &SqlitePool,
+    write: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    let mut writer = db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("INSERT INTO revoked_sessions (jti, expires_at) VALUES (?, 0)")
+        .bind(new_secret())
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let write = tokio::spawn(write);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    writer.commit().await.unwrap();
+    write.await.unwrap()
 }
 
 /// Adds the user and answers the `Cookie` header value of their session: the

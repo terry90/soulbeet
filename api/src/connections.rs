@@ -33,8 +33,9 @@ pub struct LoggedRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConnectedApp {
     pub grant_id: String,
-    /// The host the app is known by: its client id URL's, or its first
-    /// redirect URI's for a registered client.
+    /// The host the app is known by, as the consent page named it: its
+    /// client id URL's, or for a registered client the host of the redirect
+    /// URI the user allowed.
     pub app_host: String,
     /// The name the app gave itself.
     pub client_name: Option<String>,

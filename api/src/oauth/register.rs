@@ -9,19 +9,19 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-use super::clients::{insert_dcr_in, redirect_uri_allowed, InsertRefusal, NewClient, DCR_CAP};
+use super::clients::{
+    client_metadata, insert_dcr_in, InsertRefusal, MetadataRefusal, NewClient, DCR_CAP,
+};
 use super::secrets::new_secret;
 use super::{has_media_type, now_unix, oauth_error, rate_limited};
 use crate::connection::ConnectionState;
 
 /// Room for 10 redirect URIs of 2,000 characters and the other members a
-/// client sends; a larger body is refused unread.
+/// client sends; reading stops as soon as a body passes it.
 const MAX_BODY_BYTES: usize = 64 * 1024;
-const MAX_REDIRECT_URIS: usize = 10;
-const MAX_REDIRECT_URI_CHARS: usize = 2_000;
-const MAX_CLIENT_NAME_CHARS: usize = 200;
 
 pub(crate) async fn register(
     State(state): State<Arc<ConnectionState>>,
@@ -86,17 +86,35 @@ fn invalid_metadata(description: &str) -> Response {
     )
 }
 
+/// The body, refused as soon as it passes `MAX_BODY_BYTES`, or with the
+/// reason it could not be read.
+async fn read_body(body: Body) -> Result<Vec<u8>, Response> {
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| invalid_metadata(&format!("The registration could not be read: {e}")))?;
+        if bytes.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(invalid_metadata("The registration is larger than 64 KiB"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 /// The client the body registers, or the refusal naming the first member
 /// the rules refuse. Members the rules do not name are ignored.
 async fn read_client(body: Body) -> Result<NewClient, Response> {
-    let not_an_object = || invalid_metadata("The registration must be a JSON object");
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
-        .await
-        .map_err(|_| not_an_object())?;
+    let bytes = read_body(body).await?;
     let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&bytes) else {
-        return Err(not_an_object());
+        return Err(invalid_metadata("The registration must be a JSON object"));
     };
-    let redirect_uris = redirect_uris(doc.get("redirect_uris"))?;
+    let client = client_metadata(&doc).map_err(|refused| match refused {
+        MetadataRefusal::RedirectUris(rule) => {
+            oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", rule)
+        }
+        MetadataRefusal::ClientName(rule) => invalid_metadata(rule),
+    })?;
     if doc
         .get("token_endpoint_auth_method")
         .is_some_and(|m| m != "none")
@@ -122,46 +140,7 @@ async fn read_client(body: Body) -> Result<NewClient, Response> {
             "Soulful supports the response type code only",
         ));
     }
-    let client_name = match doc.get("client_name") {
-        None => None,
-        Some(Value::String(name)) if name.chars().count() <= MAX_CLIENT_NAME_CHARS => {
-            Some(name.clone())
-        }
-        Some(Value::String(_)) => {
-            return Err(invalid_metadata(
-                "client_name must be at most 200 characters",
-            ))
-        }
-        Some(_) => return Err(invalid_metadata("client_name must be a string")),
-    };
-    Ok(NewClient {
-        client_name,
-        redirect_uris,
-    })
-}
-
-/// 1 to 10 strings of at most 2,000 characters, each one
-/// `redirect_uri_allowed` accepts.
-fn redirect_uris(member: Option<&Value>) -> Result<Vec<String>, Response> {
-    let refused = |description: &str| {
-        oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", description)
-    };
-    let uris: Option<Vec<&str>> = member
-        .and_then(Value::as_array)
-        .filter(|uris| (1..=MAX_REDIRECT_URIS).contains(&uris.len()))
-        .and_then(|uris| uris.iter().map(Value::as_str).collect());
-    let Some(uris) = uris.filter(|uris| {
-        uris.iter()
-            .all(|uri| uri.chars().count() <= MAX_REDIRECT_URI_CHARS)
-    }) else {
-        return Err(refused(
-            "Register 1 to 10 redirect URIs of at most 2,000 characters",
-        ));
-    };
-    for uri in &uris {
-        redirect_uri_allowed(uri).map_err(refused)?;
-    }
-    Ok(uris.into_iter().map(str::to_owned).collect())
+    Ok(client)
 }
 
 #[cfg(test)]
@@ -260,7 +239,7 @@ mod tests {
             (
                 json!({"redirect_uris": [CLAUDE_CALLBACK], "logo_uri": "x".repeat(64 * 1024)}),
                 "invalid_client_metadata",
-                "The registration must be a JSON object",
+                "The registration is larger than 64 KiB",
             ),
             (
                 json!(["not", "an", "object"]),
@@ -275,22 +254,22 @@ mod tests {
             (
                 json!({"redirect_uris": []}),
                 "invalid_redirect_uri",
-                "Register 1 to 10 redirect URIs of at most 2,000 characters",
+                "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
             ),
             (
                 json!({"client_name": "Claude"}),
                 "invalid_redirect_uri",
-                "Register 1 to 10 redirect URIs of at most 2,000 characters",
+                "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
             ),
             (
                 json!({"redirect_uris": [long]}),
                 "invalid_redirect_uri",
-                "Register 1 to 10 redirect URIs of at most 2,000 characters",
+                "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
             ),
             (
                 json!({"redirect_uris": [CLAUDE_CALLBACK, 7]}),
                 "invalid_redirect_uri",
-                "Register 1 to 10 redirect URIs of at most 2,000 characters",
+                "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
             ),
         ] {
             let (status, _, doc) = post_json(
@@ -324,15 +303,13 @@ mod tests {
         assert_eq!(count(&db, "oauth_clients").await, 0);
     }
 
-    // Limits gains fields in later tasks; a test sets the one limit it needs
-    // by assignment, so it does not change when they come.
-    #[allow(clippy::field_reassign_with_default)]
     #[tokio::test]
     async fn the_registration_budget_is_shared_by_every_caller() {
-        let mut limits = Limits::default();
-        limits.register = WindowLimiter::new(1, Duration::from_secs(3600));
         let state = ConnectionState {
-            limits: Arc::new(limits),
+            limits: Arc::new(Limits {
+                register: WindowLimiter::new(1, Duration::from_secs(3600)),
+                ..Limits::default()
+            }),
             ..ConnectionState::for_test(test_db::migrated().await)
         };
         let app = router(state);
@@ -353,6 +330,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_budget_is_counted_before_the_registration_is_read() {
+        let state = ConnectionState {
+            limits: Arc::new(Limits {
+                register: WindowLimiter::new(1, Duration::from_secs(3600)),
+                ..Limits::default()
+            }),
+            ..ConnectionState::for_test(test_db::migrated().await)
+        };
+        let app = router(state);
+        // Refused for its content, it still used the one registration.
+        let (first, _, _) =
+            post_json(app.clone(), "/oauth/register", json!({"redirect_uris": []})).await;
+        let (second, _, doc) =
+            post_json(app, "/oauth/register", json!({"redirect_uris": []})).await;
+        assert_eq!(
+            (first, second, doc["error"].as_str()),
+            (
+                StatusCode::BAD_REQUEST,
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("rate_limited")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_that_fails_while_it_is_read_says_so() {
+        let chunks: Vec<Result<&'static str, std::io::Error>> = vec![
+            Ok(r#"{"redirect_uris": "#),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let req = Request::post("/oauth/register")
+            .header("host", HOST)
+            .header("content-type", "application/json")
+            .body(Body::from_stream(futures::stream::iter(chunks)))
+            .unwrap();
+        let (status, _, body) = send(
+            router(ConnectionState::for_test(test_db::migrated().await)),
+            req,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(doc["error"], "invalid_client_metadata");
+        let description = doc["error_description"].as_str().unwrap();
+        assert!(
+            description.starts_with("The registration could not be read: ")
+                && description.contains("connection reset"),
+            "{description}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_full_server_or_an_unavailable_database_refuses_the_registration() {
         let db = test_db::migrated().await;
         sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1', 'bob', 'x')")
@@ -369,9 +398,9 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO oauth_grants (id, user_id, client_id, resource, scope, created_at) \
-             SELECT 'g-' || client_id, 'u1', client_id, 'https://music.example.com/mcp', 'soulful', 0 \
-             FROM oauth_clients",
+            "INSERT INTO oauth_grants (id, user_id, client_id, redirect_uri, resource, scope, created_at) \
+             SELECT 'g-' || client_id, 'u1', client_id, 'https://claude.ai/api/mcp/auth_callback', \
+             'https://music.example.com/mcp', 'soulful', 0 FROM oauth_clients",
         )
         .execute(&db)
         .await

@@ -14,6 +14,8 @@ use reqwest::redirect::Policy;
 use serde_json::Value;
 use url::{Host, Url};
 
+use super::clients::{client_metadata, MetadataRefusal};
+
 /// The largest document Soulful reads.
 pub(crate) const DOCUMENT_MAX_BYTES: usize = 64 * 1024;
 
@@ -24,20 +26,27 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CimdError {
     NotAClientIdUrl(&'static str),
+    /// The request failed, with its causes. The page says only that it
+    /// failed, since the causes would tell a signed-in user whether a name
+    /// resolves to a private address; the log keeps them.
     Fetch(String),
     Status(u16),
     TooLarge,
     NotJson(String),
-    ClientIdMismatch { document: String },
+    ClientIdMismatch {
+        document: String,
+    },
     MissingField(&'static str),
     NotPublic(String),
+    /// A member breaks a rule registration also applies; the rule.
+    Invalid(&'static str),
 }
 
 impl std::fmt::Display for CimdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CimdError::NotAClientIdUrl(m) => write!(f, "{m}"),
-            CimdError::Fetch(e) => write!(f, "{e}"),
+            CimdError::NotAClientIdUrl(m) | CimdError::Invalid(m) => write!(f, "{m}"),
+            CimdError::Fetch(_) => write!(f, "Soulful could not fetch it"),
             CimdError::Status(s) => write!(f, "it answered HTTP {s}"),
             CimdError::TooLarge => write!(f, "it is larger than 64 KiB"),
             CimdError::NotJson(e) => write!(f, "it is not a JSON object ({e})"),
@@ -57,7 +66,7 @@ impl std::fmt::Display for CimdError {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ClientDocument {
     pub client_id: String,
-    pub client_name: String,
+    pub client_name: Option<String>,
     pub redirect_uris: Vec<String>,
 }
 
@@ -148,8 +157,13 @@ const NOT_GLOBAL_V6: &[(Ipv6Addr, u32)] = &[
     (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),
     // Teredo.
     (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32),
-    // Documentation.
+    // Benchmarking.
+    (Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0), 48),
+    // Documentation, the 2001:db8::/32 and 3fff::/20 blocks.
     (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32),
+    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
+    // Segment Routing SIDs.
+    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),
     // 6to4.
     (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
     // Unique-local.
@@ -188,8 +202,9 @@ pub(crate) fn keep_global(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, Str
 }
 
 /// The document `body` read at `url`: a JSON object whose `client_id` is
-/// `url` as written, with a `client_name` and redirect URIs, for a public
-/// client (draft section 4.1).
+/// `url` as written, for a public client (draft section 4.1), whose
+/// `client_name` and redirect URIs follow the rules registration applies
+/// (`client_metadata`). The name is optional, as in RFC 7591.
 pub(crate) fn parse_document(url: &Url, body: &[u8]) -> Result<ClientDocument, CimdError> {
     let doc = match serde_json::from_slice::<Value>(body) {
         Ok(Value::Object(doc)) => doc,
@@ -220,29 +235,15 @@ pub(crate) fn parse_document(url: &Url, body: &[u8]) -> Result<ClientDocument, C
     {
         return Err(CimdError::NotPublic(member.to_string()));
     }
-    let Some(client_name) = doc
-        .get("client_name")
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-    else {
-        return Err(CimdError::MissingField("client_name"));
-    };
-    let Some(redirect_uris) = doc
-        .get("redirect_uris")
-        .and_then(Value::as_array)
-        .filter(|uris| !uris.is_empty())
-        .and_then(|uris| {
-            uris.iter()
-                .map(|uri| uri.as_str().map(str::to_string))
-                .collect::<Option<Vec<String>>>()
-        })
-    else {
-        return Err(CimdError::MissingField("redirect_uris"));
-    };
+    let client = client_metadata(&doc).map_err(|refused| match refused {
+        MetadataRefusal::ClientName(rule) | MetadataRefusal::RedirectUris(rule) => {
+            CimdError::Invalid(rule)
+        }
+    })?;
     Ok(ClientDocument {
         client_id: client_id.to_string(),
-        client_name: client_name.to_string(),
-        redirect_uris,
+        client_name: client.client_name,
+        redirect_uris: client.redirect_uris,
     })
 }
 
@@ -467,6 +468,16 @@ mod tests {
             ("2002:a00:1::1", false),
             ("2001:0:4136:e378:8000:63bf:3fff:fdd2", false),
             ("2001:4860:4860::8888", true),
+            // Benchmarking, documentation (3fff::/20), Segment Routing SIDs.
+            ("2001:2::1", false),
+            ("2001:2:0:ffff::1", false),
+            ("3fff::1", false),
+            ("3fff:fff::1", false),
+            ("5f00::1", false),
+            ("5f00:ffff::1", false),
+            ("2001:3::1", true),
+            ("3fff:1000::1", true),
+            ("5f01::1", true),
         ] {
             assert_eq!(is_global(ip.parse().unwrap()), want, "{ip}");
         }
@@ -490,7 +501,7 @@ mod tests {
             parse_document(&url, CLAUDE_CODE_DOCUMENT.as_bytes()),
             Ok(ClientDocument {
                 client_id: CLAUDE_CODE_ID.into(),
-                client_name: "Claude Code".into(),
+                client_name: Some("Claude Code".into()),
                 redirect_uris: vec![
                     "http://localhost/callback".into(),
                     "http://127.0.0.1/callback".into()
@@ -516,7 +527,9 @@ mod tests {
         );
         assert_eq!(
             parse_document(&url, bare.as_bytes()),
-            Err(CimdError::MissingField("redirect_uris"))
+            Err(CimdError::Invalid(
+                "redirect_uris must list 1 to 10 URIs of at most 2,000 characters"
+            ))
         );
         // Draft section 4.1: client_secret and client_secret_expires_at MUST NOT be used.
         for member in ["client_secret", "client_secret_expires_at"] {
@@ -530,6 +543,60 @@ mod tests {
             parse_document(&url, b"[]"),
             Err(CimdError::NotJson("found an array".into()))
         );
+    }
+
+    /// Claude Code's document with `member` set to `value`.
+    fn with_member(member: &str, value: Value) -> Vec<u8> {
+        let mut doc: serde_json::Map<String, Value> =
+            serde_json::from_str(CLAUDE_CODE_DOCUMENT).unwrap();
+        doc.insert(member.into(), value);
+        serde_json::to_vec(&doc).unwrap()
+    }
+
+    #[test]
+    fn a_document_follows_the_rules_registration_applies() {
+        let url = client_id_url(CLAUDE_CODE_ID).unwrap();
+        let many: Vec<String> = (0..2000).map(|i| format!("https://c.ai/{i}")).collect();
+        for (member, value, rule) in [
+            (
+                "redirect_uris",
+                serde_json::json!(["http://claude.ai/callback"]),
+                "redirect URIs must be https, or http on a loopback address, with no fragment",
+            ),
+            (
+                "redirect_uris",
+                serde_json::json!(["https://claude.ai/callback#x"]),
+                "redirect URIs must be https, or http on a loopback address, with no fragment",
+            ),
+            (
+                "redirect_uris",
+                serde_json::json!(many),
+                "redirect_uris must list 1 to 10 URIs of at most 2,000 characters",
+            ),
+            (
+                "client_name",
+                Value::String("Allow this app. ".repeat(4000)),
+                "client_name must be at most 200 characters",
+            ),
+        ] {
+            let body = with_member(member, value);
+            assert!(body.len() <= DOCUMENT_MAX_BYTES, "{rule}");
+            assert_eq!(
+                parse_document(&url, &body),
+                Err(CimdError::Invalid(rule)),
+                "{rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_document_without_a_client_name_is_used_unnamed() {
+        let url = client_id_url(CLAUDE_CODE_ID).unwrap();
+        let mut doc: serde_json::Map<String, Value> =
+            serde_json::from_str(CLAUDE_CODE_DOCUMENT).unwrap();
+        doc.remove("client_name");
+        let parsed = parse_document(&url, &serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!((parsed.client_name, parsed.redirect_uris.len()), (None, 2));
     }
 
     #[tokio::test]
@@ -598,7 +665,7 @@ mod tests {
         let fetched = fetch_with(&client, &doc).await.unwrap();
         assert_eq!(
             (fetched.client_id, fetched.client_name),
-            (doc.to_string(), "Claude Code".to_string())
+            (doc.to_string(), Some("Claude Code".to_string()))
         );
     }
 
@@ -614,13 +681,10 @@ mod tests {
             "{text}"
         );
         let plain = Url::parse("http://claude.ai/oauth/client").unwrap();
-        assert_eq!(
+        assert!(matches!(
             fetcher.fetch(&plain).await,
-            // reqwest 0.12.28's refusal of a non-https URL under https_only.
-            Err(CimdError::Fetch(
-                "builder error: URL scheme is not allowed".into()
-            ))
-        );
+            Err(CimdError::Fetch(_))
+        ));
     }
 
     #[test]
@@ -638,9 +702,16 @@ mod tests {
                 },
                 "it names another client id: https://claude.ai/oauth/x",
             ),
+            (CimdError::MissingField("client_id"), "it has no client_id"),
             (
-                CimdError::MissingField("client_name"),
-                "it has no client_name",
+                CimdError::Fetch(
+                    "dns error: the name resolves only to private or local addresses".into(),
+                ),
+                "Soulful could not fetch it",
+            ),
+            (
+                CimdError::Invalid("client_name must be at most 200 characters"),
+                "client_name must be at most 200 characters",
             ),
             (
                 CimdError::NotPublic("token_endpoint_auth_method private_key_jwt".into()),

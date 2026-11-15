@@ -7,7 +7,7 @@ use sqlx::sqlite::SqliteArguments;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use url::Url;
 
-use super::clients::{redirect_uris_from_db, ClientKind};
+use super::clients::ClientKind;
 use super::secrets::{hash, new_secret, s256, successor, valid_verifier};
 use super::OFFLINE_ACCESS;
 use crate::auth::UserCtx;
@@ -24,6 +24,9 @@ pub(crate) const REFRESH_LIFETIME: i64 = 60 * 24 * 3600;
 pub(crate) const REFRESH_GRACE: i64 = 60;
 /// A client with no grant is pruned this long after its last use (its registration when never used), D4.
 pub(crate) const UNUSED_CLIENT_LIFETIME: i64 = 90 * 24 * 3600;
+/// Most grants a user holds; a new one ends the least recently used beyond
+/// it, so made-up addresses cannot pile up grants and their tokens.
+pub(crate) const GRANTS_PER_USER: i64 = 20;
 
 /// The answer to a code that cannot be redeemed, and to a code no request
 /// of its client names.
@@ -75,7 +78,8 @@ type CodeRow = (String, String, String, String, String, String);
 /// does not match its client, redirect URI or verifier is used up all the
 /// same; a second use of a redeemed code ends the grant it started
 /// (design 9.2). The grant replaces any earlier one of the same user, client
-/// and resource (D6), and carries a refresh token when its scope has
+/// and resource (D6), then ends the user's least recently used grants beyond
+/// `GRANTS_PER_USER`; it carries a refresh token when its scope has
 /// `offline_access` (D5).
 pub(crate) async fn redeem_code_in(
     db: &SqlitePool,
@@ -83,6 +87,11 @@ pub(crate) async fn redeem_code_in(
     now: i64,
 ) -> Result<Issued, TokenRefusal> {
     let code_hash = hash(r.code);
+    // The first statement writes, so even a plain BEGIN would take the
+    // write lock there and wait for another writer: no test can tell the
+    // two apart. BEGIN IMMEDIATE keeps that true if a read ever comes
+    // first; the read-first transactions (codes.rs, clients.rs) have tests
+    // that fail under a plain BEGIN.
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     let row: Option<CodeRow> = sqlx::query_as(
         "UPDATE oauth_codes SET used_at = ? \
@@ -123,14 +132,25 @@ pub(crate) async fn redeem_code_in(
         .bind(&resource)
         .execute(&mut *tx)
         .await?;
+    // Room for the new grant: the user's newest GRANTS_PER_USER - 1 stay.
+    sqlx::query(
+        "DELETE FROM oauth_grants WHERE id IN ( \
+             SELECT id FROM oauth_grants WHERE user_id = ? \
+             ORDER BY COALESCE(last_used_at, created_at) DESC, id DESC LIMIT -1 OFFSET ?)",
+    )
+    .bind(&user_id)
+    .bind(GRANTS_PER_USER - 1)
+    .execute(&mut *tx)
+    .await?;
     let grant_id = new_secret();
     sqlx::query(
-        "INSERT INTO oauth_grants (id, user_id, client_id, resource, scope, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO oauth_grants (id, user_id, client_id, redirect_uri, resource, scope, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&grant_id)
     .bind(&user_id)
     .bind(&client_id)
+    .bind(&redirect_uri)
     .bind(&resource)
     .bind(&scope)
     .bind(now)
@@ -189,6 +209,11 @@ pub(crate) async fn refresh_in(
 ) -> Result<Issued, TokenRefusal> {
     let refresh_hash = hash(refresh);
     let (access_token, next) = successor(key, refresh);
+    // The first statement writes, so even a plain BEGIN would take the
+    // write lock there and wait for another writer: no test can tell the
+    // two apart. BEGIN IMMEDIATE keeps that true if a read ever comes
+    // first; the read-first transactions (codes.rs, clients.rs) have tests
+    // that fail under a plain BEGIN.
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     let rotated: Option<String> = sqlx::query_scalar(
         "UPDATE oauth_tokens SET rotated_at = ? \
@@ -346,7 +371,7 @@ struct AppRow {
     kind: String,
     client_id: String,
     client_name: Option<String>,
-    redirect_uris: String,
+    redirect_uri: String,
     user_id: String,
     username: String,
     last_used_at: Option<i64>,
@@ -357,7 +382,7 @@ struct AppRow {
 /// latest used first and the never used last.
 pub(crate) async fn apps_in(db: &SqlitePool, ctx: &UserCtx) -> Result<Vec<ConnectedApp>, String> {
     let rows: Vec<AppRow> = sqlx::query_as(
-        "SELECT g.id AS grant_id, c.kind, c.client_id, c.client_name, c.redirect_uris, \
+        "SELECT g.id AS grant_id, c.kind, c.client_id, c.client_name, g.redirect_uri, \
                 g.user_id, u.username, g.last_used_at, g.allow_delete \
          FROM oauth_grants g \
          JOIN oauth_clients c ON c.client_id = g.client_id \
@@ -377,7 +402,7 @@ pub(crate) async fn apps_in(db: &SqlitePool, ctx: &UserCtx) -> Result<Vec<Connec
                 app_host: app_host(
                     ClientKind::from_db(&row.kind)?,
                     &row.client_id,
-                    &row.redirect_uris,
+                    &row.redirect_uri,
                 )?,
                 grant_id: row.grant_id,
                 client_name: row.client_name,
@@ -390,17 +415,15 @@ pub(crate) async fn apps_in(db: &SqlitePool, ctx: &UserCtx) -> Result<Vec<Connec
         .collect()
 }
 
-/// The host an app is known by (D8): its client id URL's for a client with
-/// a metadata document, its first redirect URI's for a registered client.
-fn app_host(kind: ClientKind, client_id: &str, redirect_uris: &str) -> Result<String, String> {
+/// The host an app is known by, as the consent page named it (D8): its
+/// client id URL's for a client with a metadata document, for a registered
+/// client the host of the redirect URI the user allowed.
+fn app_host(kind: ClientKind, client_id: &str, redirect_uri: &str) -> Result<String, String> {
     let named_by = match kind {
-        ClientKind::Cimd => client_id.to_string(),
-        ClientKind::Dcr => redirect_uris_from_db(redirect_uris)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("the registered client {client_id} has no redirect URI"))?,
+        ClientKind::Cimd => client_id,
+        ClientKind::Dcr => redirect_uri,
     };
-    Url::parse(&named_by)
+    Url::parse(named_by)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .ok_or_else(|| format!("{named_by} names no host"))
@@ -441,38 +464,75 @@ pub(crate) async fn revoke_grant_in(
         .map_err(|e| e.to_string())
 }
 
-/// Whether `code` was issued to `client_id`, redeemed or not. A plain read
-/// that keeps junk codes from taking the write lock or the client's budget.
-pub(crate) async fn code_of_client_in(
+/// A code or refresh token a token request names, as a plain read finds it,
+/// so a request that can change nothing takes neither the write lock nor a
+/// budget.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Presented {
+    /// The user it acts for, whose budget a request that issues tokens uses.
+    pub user_id: String,
+    /// A refresh token's grant; None for a code.
+    pub grant_id: Option<String>,
+    /// Redeeming it issues tokens: a live code, a live refresh token or one
+    /// rotated within `REFRESH_GRACE`. Otherwise it is a used code whose
+    /// grant still stands or a refresh token reused after its grace, and
+    /// redeeming it ends that grant, which can happen once.
+    pub issues: bool,
+}
+
+/// `code` of `client_id` when redeeming it issues tokens or ends a grant;
+/// None for anything else: unknown, another client's, expired unused, or
+/// used with no grant left to end.
+pub(crate) async fn presented_code_in(
     db: &SqlitePool,
     code: &str,
     client_id: &str,
-) -> Result<bool, String> {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM oauth_codes WHERE code_hash = ? AND client_id = ?)",
+    now: i64,
+) -> Result<Option<Presented>, String> {
+    let row: Option<(String, bool)> = sqlx::query_as(
+        "SELECT user_id, used_at IS NULL FROM oauth_codes \
+         WHERE code_hash = ? AND client_id = ? \
+           AND ((used_at IS NULL AND expires_at > ?) OR (used_at IS NOT NULL AND grant_id IS NOT NULL))",
     )
     .bind(hash(code))
     .bind(client_id)
-    .fetch_one(db)
+    .bind(now)
+    .fetch_optional(db)
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(row.map(|(user_id, issues)| Presented {
+        user_id,
+        grant_id: None,
+        issues,
+    }))
 }
 
-/// The grant of a refresh token of `client_id`, rotated or not; None for anything else. For the per-grant limit.
-pub(crate) async fn grant_of_refresh_in(
+/// `refresh`, an unexpired refresh token of `client_id`, rotated or not;
+/// None for anything else.
+pub(crate) async fn presented_refresh_in(
     db: &SqlitePool,
     refresh: &str,
     client_id: &str,
-) -> Result<Option<String>, String> {
-    sqlx::query_scalar(
-        "SELECT t.grant_id FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id \
-         WHERE t.token_hash = ? AND t.kind = 'refresh' AND g.client_id = ?",
+    now: i64,
+) -> Result<Option<Presented>, String> {
+    let row: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT g.user_id, t.grant_id, t.rotated_at IS NULL OR ? - t.rotated_at <= ? \
+         FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id \
+         WHERE t.token_hash = ? AND t.kind = 'refresh' AND t.expires_at > ? AND g.client_id = ?",
     )
+    .bind(now)
+    .bind(REFRESH_GRACE)
     .bind(hash(refresh))
+    .bind(now)
     .bind(client_id)
     .fetch_optional(db)
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(row.map(|(user_id, grant_id, issues)| Presented {
+        user_id,
+        grant_id: Some(grant_id),
+        issues,
+    }))
 }
 
 /// Revokes a token of `client_id` (RFC 7009 section 2): a refresh token ends
@@ -601,8 +661,8 @@ mod tests {
     use crate::auth::Role;
     use crate::connection::test_util::*;
     use crate::db::test_db;
-    use crate::oauth::clients::{find_in, upsert_cimd_in};
-    use crate::oauth::codes::{store_request_in, PendingRequest};
+    use crate::oauth::clients::{find_in, insert_dcr_in, upsert_cimd_in, NewClient, DCR_CAP};
+    use crate::oauth::codes::{store_code_in, store_request_in, PendingRequest};
     use crate::oauth::now_unix;
     use crate::oauth::secrets::hash;
     use crate::security::SEEDED_ADMIN_ID;
@@ -1014,7 +1074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refresh_token_names_its_grant_for_its_own_client_only() {
+    async fn a_refresh_token_issues_until_its_grace_ends_for_its_own_client_only() {
         let (db, code) = issue("soulful offline_access").await;
         let issued = redeem_code_in(&db, &good(&code), T).await.unwrap();
         let r = issued.refresh_token.unwrap();
@@ -1022,19 +1082,238 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
+        let presented = |issues| {
+            Ok(Some(Presented {
+                user_id: "u1".into(),
+                grant_id: Some(grant.clone()),
+                issues,
+            }))
+        };
         assert_eq!(
-            grant_of_refresh_in(&db, &r, "dcr_c").await,
-            Ok(Some(grant.clone()))
+            presented_refresh_in(&db, &r, "dcr_c", T + 1).await,
+            presented(true)
         );
-        assert_eq!(grant_of_refresh_in(&db, &r, "dcr_other").await, Ok(None));
         assert_eq!(
-            grant_of_refresh_in(&db, &issued.access_token, "dcr_c").await,
+            presented_refresh_in(&db, &r, "dcr_other", T + 1).await,
+            Ok(None)
+        );
+        assert_eq!(
+            presented_refresh_in(&db, &issued.access_token, "dcr_c", T + 1).await,
             Ok(None)
         );
         refresh_in(&db, test_key(), &r, "dcr_c", RESOURCE, T + 10)
             .await
             .unwrap();
-        assert_eq!(grant_of_refresh_in(&db, &r, "dcr_c").await, Ok(Some(grant)));
+        assert_eq!(
+            presented_refresh_in(&db, &r, "dcr_c", T + 10 + REFRESH_GRACE).await,
+            presented(true)
+        );
+        assert_eq!(
+            presented_refresh_in(&db, &r, "dcr_c", T + 11 + REFRESH_GRACE).await,
+            presented(false)
+        );
+        assert_eq!(
+            presented_refresh_in(&db, &r, "dcr_c", T + REFRESH_LIFETIME).await,
+            Ok(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_issues_while_unused_and_ends_its_grant_once_used() {
+        let (db, code) = issue("soulful offline_access").await;
+        let unused = Ok(Some(Presented {
+            user_id: "u1".into(),
+            grant_id: None,
+            issues: true,
+        }));
+        assert_eq!(presented_code_in(&db, &code, "dcr_c", T + 1).await, unused);
+        assert_eq!(
+            presented_code_in(&db, &code, "dcr_other", T + 1).await,
+            Ok(None)
+        );
+        assert_eq!(
+            presented_code_in(&db, &code, "dcr_c", T + 60).await,
+            Ok(None)
+        );
+        assert_eq!(
+            presented_code_in(&db, "made-up", "dcr_c", T + 1).await,
+            Ok(None)
+        );
+        redeem_code_in(&db, &good(&code), T + 1).await.unwrap();
+        let replayed = Ok(Some(Presented {
+            user_id: "u1".into(),
+            grant_id: None,
+            issues: false,
+        }));
+        // Used, its grant standing, expired or not.
+        assert_eq!(
+            presented_code_in(&db, &code, "dcr_c", T + 2).await,
+            replayed
+        );
+        assert_eq!(
+            presented_code_in(&db, &code, "dcr_c", T + 120).await,
+            replayed
+        );
+        assert_eq!(
+            redeem_code_in(&db, &good(&code), T + 2).await.err(),
+            Some(USED)
+        );
+        assert_eq!(
+            presented_code_in(&db, &code, "dcr_c", T + 3).await,
+            Ok(None)
+        );
+        // A code burnt by a wrong verifier started no grant: nothing to end.
+        let burnt = issue_code(&db, "u1", "soulful", RESOURCE, T).await;
+        let wrong = "a".repeat(43);
+        redeem_code_in(
+            &db,
+            &CodeRedemption {
+                verifier: &wrong,
+                ..good(&burnt)
+            },
+            T + 1,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            presented_code_in(&db, &burnt, "dcr_c", T + 2).await,
+            Ok(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_in_the_grace_window_after_the_successor_rotated_ends_the_grant() {
+        let (db, r) = refreshable().await;
+        let next = refresh_in(&db, test_key(), &r, "dcr_c", RESOURCE, T + 100)
+            .await
+            .unwrap()
+            .refresh_token
+            .unwrap();
+        refresh_in(&db, test_key(), &next, "dcr_c", RESOURCE, T + 110)
+            .await
+            .unwrap();
+        // r's grace runs until T + 160, but its pair is no longer the live one.
+        assert_eq!(
+            refresh_in(&db, test_key(), &r, "dcr_c", RESOURCE, T + 120)
+                .await
+                .err(),
+            Some(ENDED)
+        );
+        assert_eq!(count(&db, "oauth_grants").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_repeat_in_the_grace_window_after_its_access_token_was_revoked_ends_the_grant() {
+        let (db, r) = refreshable().await;
+        let pair = refresh_in(&db, test_key(), &r, "dcr_c", RESOURCE, T + 100)
+            .await
+            .unwrap();
+        revoke_in(&db, &pair.access_token, "dcr_c").await.unwrap();
+        assert_eq!(
+            refresh_in(&db, test_key(), &r, "dcr_c", RESOURCE, T + 110)
+                .await
+                .err(),
+            Some(ENDED)
+        );
+        assert_eq!(count(&db, "oauth_grants").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_user_holds_at_most_20_grants_and_the_least_recently_used_goes() {
+        let db = test_db::migrated().await;
+        add_user(&db, "u1", "alice").await;
+        add_user(&db, "u2", "bob").await;
+        let bobs = issue_code(&db, "u2", "soulful", RESOURCE, T).await;
+        redeem_code_in(&db, &good(&bobs), T).await.unwrap();
+        for i in 0..GRANTS_PER_USER {
+            let resource = format!("https://a{i}.example.com/mcp");
+            let code = issue_code(&db, "u1", "soulful", &resource, T + i).await;
+            redeem_code_in(
+                &db,
+                &CodeRedemption {
+                    resource: &resource,
+                    ..good(&code)
+                },
+                T + i,
+            )
+            .await
+            .unwrap();
+        }
+        // a0 is the oldest, but used since: a1 goes.
+        sqlx::query("UPDATE oauth_grants SET last_used_at = ? WHERE resource = ?")
+            .bind(T + 1000)
+            .bind("https://a0.example.com/mcp")
+            .execute(&db)
+            .await
+            .unwrap();
+        let resource = "https://new.example.com/mcp";
+        let code = issue_code(&db, "u1", "soulful", resource, T + 2000).await;
+        redeem_code_in(
+            &db,
+            &CodeRedemption {
+                resource,
+                ..good(&code)
+            },
+            T + 2000,
+        )
+        .await
+        .unwrap();
+        let resources: Vec<String> = sqlx::query_scalar(
+            "SELECT resource FROM oauth_grants WHERE user_id = 'u1' ORDER BY resource",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(resources.len() as i64, GRANTS_PER_USER);
+        assert!(!resources.contains(&"https://a1.example.com/mcp".to_string()));
+        assert!(resources.contains(&"https://a0.example.com/mcp".to_string()));
+        assert!(resources.contains(&resource.to_string()));
+        assert_eq!(count(&db, "oauth_grants").await, GRANTS_PER_USER + 1);
+    }
+
+    #[tokio::test]
+    async fn a_registered_app_is_named_by_the_redirect_the_user_allowed() {
+        let db = test_db::migrated().await;
+        add_user(&db, "u1", "bob").await;
+        insert_dcr_in(
+            &db,
+            "dcr_two",
+            &NewClient {
+                client_name: Some("Claude".into()),
+                redirect_uris: vec![CLAUDE_CALLBACK.into(), "https://evil.example/cb".into()],
+            },
+            T,
+            DCR_CAP,
+        )
+        .await
+        .unwrap();
+        let code = new_secret();
+        let request = PendingRequest {
+            user_id: "u1".into(),
+            client: find_in(&db, "dcr_two").await.unwrap().unwrap(),
+            redirect_uri: "https://evil.example/cb".into(),
+            state: None,
+            code_challenge: CHALLENGE.into(),
+            scope: "soulful".into(),
+            resource: RESOURCE.into(),
+        };
+        store_code_in(&db, &code, &request, T).await.unwrap();
+        redeem_code_in(
+            &db,
+            &CodeRedemption {
+                client_id: "dcr_two",
+                redirect_uri: "https://evil.example/cb",
+                ..good(&code)
+            },
+            T,
+        )
+        .await
+        .unwrap();
+        let apps = apps_in(&db, &ctx("u1", "bob", Role::User)).await.unwrap();
+        assert_eq!(
+            (apps[0].app_host.as_str(), apps[0].client_name.as_deref()),
+            ("evil.example", Some("Claude"))
+        );
     }
 
     #[tokio::test]
@@ -1115,6 +1394,7 @@ mod tests {
         .unwrap();
         store_request_in(
             &db,
+            &fresh_session(),
             "pending",
             &PendingRequest {
                 user_id: "u1".into(),
@@ -1189,6 +1469,7 @@ mod tests {
         .unwrap();
         store_request_in(
             &db,
+            &fresh_session(),
             "pending",
             &PendingRequest {
                 user_id: "u1".into(),
@@ -1283,8 +1564,8 @@ mod tests {
         add_user(&db, "u1", "bob").await;
         upsert_cimd_in(&db, &claude_code(), T).await.unwrap();
         sqlx::query(
-            "INSERT INTO oauth_grants (id, user_id, client_id, resource, scope, created_at) \
-             VALUES ('g', 'u1', ?, ?, 'soulful', ?)",
+            "INSERT INTO oauth_grants (id, user_id, client_id, redirect_uri, resource, scope, created_at) \
+             VALUES ('g', 'u1', ?, 'http://localhost:3118/callback', ?, 'soulful', ?)",
         )
         .bind(CLAUDE_CODE_ID)
         .bind(RESOURCE)
