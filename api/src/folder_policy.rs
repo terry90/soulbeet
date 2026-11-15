@@ -150,6 +150,8 @@ pub struct PolicyFolder {
     pub user_id: String,
     pub owner_is_admin: bool,
     pub path: Result<PathBuf, String>,
+    /// The path as stored, for a folder whose `path` did not resolve.
+    pub stored_path: PathBuf,
     pub shared: bool,
 }
 
@@ -252,12 +254,40 @@ pub fn check_folder_update(
     check_folder_path(candidate, actor, folders, roots)
 }
 
-/// Whether `actor` owns the deepest stored folder, of any user, that holds
-/// the canonical file `path`. A file that sits in someone else's folder,
-/// nested in or shared over the actor's, is theirs to remove, not the
-/// actor's; when folders of several owners tie, it belongs to none alone.
+/// Whose a file is, for removing it.
 #[cfg(feature = "server")]
-pub fn deepest_folder_is_own(path: &Path, folders: &[PolicyFolder], actor: &str) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FileOwner<'a> {
+    /// The deepest folder that holds the file is the actor's.
+    Actor,
+    /// The deepest folder that holds it is someone else's, folders of several
+    /// owners tie, or no folder holds it.
+    Other,
+    /// Another user's folder, stored as `folder`, cannot be resolved, and
+    /// comparing paths does not show that the file is outside it.
+    Unresolved { folder: &'a Path, error: &'a str },
+}
+
+/// Who owns the canonical file `path`: the owner of the deepest stored
+/// folder, of any user, that holds it. A file that sits in someone else's
+/// folder, nested in or shared over the actor's, is theirs to remove, not
+/// the actor's; when folders of several owners tie, it belongs to none
+/// alone. Another user's folder that cannot be resolved may hold it, so it
+/// is not the actor's unless the stored path shows it is outside that folder.
+#[cfg(feature = "server")]
+pub fn file_owner<'a>(path: &Path, folders: &'a [PolicyFolder], actor: &str) -> FileOwner<'a> {
+    let unresolved = folders.iter().find_map(|f| match &f.path {
+        Err(error) if f.user_id != actor && !lexically_outside(path, &f.stored_path) => {
+            Some(FileOwner::Unresolved {
+                folder: &f.stored_path,
+                error,
+            })
+        }
+        _ => None,
+    });
+    if let Some(owner) = unresolved {
+        return owner;
+    }
     let holding: Vec<(&PolicyFolder, usize)> = folders
         .iter()
         .filter_map(|f| {
@@ -266,12 +296,26 @@ pub fn deepest_folder_is_own(path: &Path, folders: &[PolicyFolder], actor: &str)
         })
         .collect();
     let Some(deepest) = holding.iter().map(|(_, depth)| *depth).max() else {
-        return false;
+        return FileOwner::Other;
     };
-    holding
+    if holding
         .iter()
         .filter(|(_, depth)| *depth == deepest)
         .all(|(f, _)| f.user_id == actor)
+    {
+        FileOwner::Actor
+    } else {
+        FileOwner::Other
+    }
+}
+
+/// Whether the stored folder path `stored` shows, compared as written, that
+/// `file` is not inside it. A relative path or one with `..` shows nothing.
+#[cfg(feature = "server")]
+fn lexically_outside(file: &Path, stored: &Path) -> bool {
+    stored.is_absolute()
+        && !stored.components().any(|c| c == Component::ParentDir)
+        && !file.starts_with(stored)
 }
 
 /// Every stored folder that breaks the rules today, for admins to sort out.
@@ -333,6 +377,7 @@ pub(crate) fn policy_inputs(
         .map(|f| PolicyFolder {
             owner_is_admin: f.owner_role.is_admin(),
             path: canonical_folder_path(Path::new(&f.folder.path)).map_err(|e| e.to_string()),
+            stored_path: PathBuf::from(&f.folder.path),
             user_id: f.folder.user_id.clone(),
             shared: f.folder.shared,
         })
@@ -430,7 +475,16 @@ mod tests {
             user_id: user.to_string(),
             owner_is_admin: admin,
             path: Ok(path.to_path_buf()),
+            stored_path: path.to_path_buf(),
             shared,
+        }
+    }
+
+    /// `pf` for a folder stored as `stored` that does not resolve.
+    fn unresolved(user: &str, stored: &str) -> PolicyFolder {
+        PolicyFolder {
+            path: Err("Too many levels of symbolic links".to_string()),
+            ..pf(user, false, Path::new(stored), false)
         }
     }
 
@@ -671,15 +725,17 @@ mod tests {
         ];
         let bobs_file = tmp.join("music/bob/B/y.flac");
         let alices_file = tmp.join("music/alice/A/x.flac");
-        assert!(!deepest_folder_is_own(&bobs_file, &folders, "alice"));
-        assert!(deepest_folder_is_own(&bobs_file, &folders, "bob"));
-        assert!(deepest_folder_is_own(&alices_file, &folders, "alice"));
-        assert!(!deepest_folder_is_own(&alices_file, &folders, "bob"));
-        assert!(!deepest_folder_is_own(
-            &tmp.join("elsewhere/z.flac"),
-            &folders,
-            "alice"
-        ));
+        assert_eq!(file_owner(&bobs_file, &folders, "alice"), FileOwner::Other);
+        assert_eq!(file_owner(&bobs_file, &folders, "bob"), FileOwner::Actor);
+        assert_eq!(
+            file_owner(&alices_file, &folders, "alice"),
+            FileOwner::Actor
+        );
+        assert_eq!(file_owner(&alices_file, &folders, "bob"), FileOwner::Other);
+        assert_eq!(
+            file_owner(&tmp.join("elsewhere/z.flac"), &folders, "alice"),
+            FileOwner::Other
+        );
     }
 
     #[test]
@@ -690,8 +746,80 @@ mod tests {
             pf("bob", false, &tmp.join("music"), false),
         ];
         let file = tmp.join("music/x.flac");
-        assert!(!deepest_folder_is_own(&file, &folders, "alice"));
-        assert!(!deepest_folder_is_own(&file, &folders, "bob"));
+        assert_eq!(file_owner(&file, &folders, "alice"), FileOwner::Other);
+        assert_eq!(file_owner(&file, &folders, "bob"), FileOwner::Other);
+    }
+
+    #[test]
+    fn another_users_unresolvable_folder_protects_what_it_may_hold() {
+        // Alice has /music; Bob's /music/bob cannot be resolved.
+        let (_dir, tmp) = tmp();
+        let bobs = tmp.join("music/bob");
+        let folders = [
+            pf("alice", false, &tmp.join("music"), false),
+            unresolved("bob", bobs.to_str().unwrap()),
+        ];
+        assert_eq!(
+            file_owner(&bobs.join("B/y.flac"), &folders, "alice"),
+            FileOwner::Unresolved {
+                folder: &bobs,
+                error: "Too many levels of symbolic links",
+            }
+        );
+        // Outside Bob's stored path, as written: still Alice's.
+        assert_eq!(
+            file_owner(&tmp.join("music/alice/A/x.flac"), &folders, "alice"),
+            FileOwner::Actor
+        );
+        // Bob's unresolvable folder is no reason to keep a file from Bob;
+        // this one sits in Alice's folder.
+        assert_eq!(
+            file_owner(&tmp.join("music/bob/B/y.flac"), &folders, "bob"),
+            FileOwner::Other
+        );
+    }
+
+    #[test]
+    fn a_stored_path_that_cannot_be_compared_protects_every_file() {
+        let (_dir, tmp) = tmp();
+        let alices_file = tmp.join("music/alice/A/x.flac");
+        for stored in [
+            "music/bob".to_string(),
+            format!("{}/music/alice/../bob", tmp.display()),
+        ] {
+            let folders = [
+                pf("alice", false, &tmp.join("music"), false),
+                unresolved("bob", &stored),
+            ];
+            assert!(
+                matches!(
+                    file_owner(&alices_file, &folders, "alice"),
+                    FileOwner::Unresolved { .. }
+                ),
+                "{stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_folder_keeps_its_stored_path() {
+        let (_dir, tmp) = tmp();
+        symlink(tmp.join("loop"), tmp.join("loop")).unwrap();
+        let stored = tmp.join("loop/bob");
+        let row = OwnedFolder {
+            folder: Folder {
+                id: "f".to_string(),
+                user_id: "bob".to_string(),
+                name: "Bob".to_string(),
+                path: stored.to_str().unwrap().to_string(),
+                shared: false,
+            },
+            owner: "bob".to_string(),
+            owner_role: Role::User,
+        };
+        let (folders, _) = policy_inputs(&[row], &[]);
+        assert!(folders[0].path.is_err());
+        assert_eq!(folders[0].stored_path, stored);
     }
 
     #[test]

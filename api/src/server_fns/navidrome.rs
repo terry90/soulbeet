@@ -5,7 +5,9 @@ use shared::navidrome::{DeletionReview, LibraryStats, SyncResult};
 use dioxus::logger::tracing::{info, warn};
 
 #[cfg(feature = "server")]
-use crate::folder_policy::{canonical_folder_path, deepest_folder_is_own, PolicyRows};
+use crate::folder_policy::{
+    canonical_folder_path, file_owner, FileOwner, PolicyFolder, PolicyRows,
+};
 #[cfg(feature = "server")]
 use crate::models::deletion_review::DeletionReviewRow;
 #[cfg(feature = "server")]
@@ -109,52 +111,27 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                                         .map(|f| f.to_ascii_lowercase())
                         });
                         if !is_discovery {
-                            match resolve_navidrome_path(
+                            let local = resolve_navidrome_path(
                                 path_str,
                                 &folders,
                                 navidrome_music_path.as_deref(),
-                            ) {
-                                LocalPath::Found { path, .. }
-                                    if !deepest_folder_is_own(
-                                        &path,
-                                        &everyones_folders,
+                            );
+                            match auto_delete_file(local, &everyones_folders, user_id).await {
+                                AutoDelete::Deleted(path) => {
+                                    DeletionReviewRow::upsert(
+                                        &song.id,
+                                        &song.title,
+                                        song.artist.as_deref().unwrap_or("Unknown"),
+                                        song.album.as_deref().unwrap_or("Unknown"),
+                                        Some(&path.to_string_lossy()),
+                                        song.user_rating,
                                         user_id,
-                                    ) =>
-                                {
-                                    info!(
-                                        "Auto-delete skipped (in another user's folder): {}",
-                                        path.display()
-                                    );
+                                    )
+                                    .await?;
+                                    deleted_tracks += 1;
                                 }
-                                LocalPath::Found { path, folder } => {
-                                    if let Err(e) = tokio::fs::remove_file(&path).await {
-                                        warn!("Auto-delete failed for {}: {}", path.display(), e);
-                                    } else {
-                                        info!("Auto-deleted {}", path.display());
-                                        if let Some(parent) = path.parent() {
-                                            let _ = super::cleanup_empty_ancestors(parent, &folder)
-                                                .await;
-                                        }
-                                        DeletionReviewRow::upsert(
-                                            &song.id,
-                                            &song.title,
-                                            song.artist.as_deref().unwrap_or("Unknown"),
-                                            song.album.as_deref().unwrap_or("Unknown"),
-                                            Some(&path.to_string_lossy()),
-                                            song.user_rating,
-                                            user_id,
-                                        )
-                                        .await?;
-                                        deleted_tracks += 1;
-                                    }
-                                }
-                                LocalPath::Ambiguous(_) => {
-                                    info!(
-                                        "Auto-delete skipped (several local files match): {}",
-                                        path_str
-                                    );
-                                }
-                                LocalPath::NotFound => {
+                                AutoDelete::Kept => {}
+                                AutoDelete::NotFound => {
                                     real_path_failures += 1;
                                     skipped_not_found += 1;
                                 }
@@ -279,6 +256,66 @@ pub(crate) enum LocalPath {
     NotFound,
     /// Several distinct files match, so none of them is chosen.
     Ambiguous(Vec<PathBuf>),
+}
+
+/// What auto-delete did with the file behind a 1-star song.
+#[cfg(feature = "server")]
+#[derive(Debug, PartialEq)]
+enum AutoDelete {
+    Deleted(PathBuf),
+    /// Left in place: someone else's, several files match, or removing failed.
+    Kept,
+    NotFound,
+}
+
+/// Removes the local file `local` when the deepest folder holding it, among
+/// `everyones_folders`, is `user_id`'s, then the directories that leaves
+/// empty up to the user's folder.
+#[cfg(feature = "server")]
+async fn auto_delete_file(
+    local: LocalPath,
+    everyones_folders: &[PolicyFolder],
+    user_id: &str,
+) -> AutoDelete {
+    let (path, folder) = match local {
+        LocalPath::Found { path, folder } => (path, folder),
+        LocalPath::Ambiguous(paths) => {
+            let paths: Vec<_> = paths.iter().map(|p| p.display().to_string()).collect();
+            info!(
+                "Auto-delete skipped (several local files match): {}",
+                paths.join(", ")
+            );
+            return AutoDelete::Kept;
+        }
+        LocalPath::NotFound => return AutoDelete::NotFound,
+    };
+    match file_owner(&path, everyones_folders, user_id) {
+        FileOwner::Actor => {}
+        FileOwner::Other => {
+            info!(
+                "Auto-delete skipped (in another user's folder): {}",
+                path.display()
+            );
+            return AutoDelete::Kept;
+        }
+        FileOwner::Unresolved { folder, error } => {
+            info!(
+                "Auto-delete skipped: {} may be inside another user's folder {}, which cannot be resolved ({error})",
+                path.display(),
+                folder.display()
+            );
+            return AutoDelete::Kept;
+        }
+    }
+    if let Err(e) = tokio::fs::remove_file(&path).await {
+        warn!("Auto-delete failed for {}: {}", path.display(), e);
+        return AutoDelete::Kept;
+    }
+    info!("Auto-deleted {}", path.display());
+    if let Some(parent) = path.parent() {
+        let _ = super::cleanup_empty_ancestors(parent, &folder).await;
+    }
+    AutoDelete::Deleted(path)
 }
 
 /// The user's folders through `canonical_folder_path`, leaving out the ones
@@ -710,6 +747,103 @@ mod tests {
                 folder: alice
             }
         );
+    }
+
+    fn owned(user: &str, path: &Path, shared: bool) -> PolicyFolder {
+        PolicyFolder {
+            user_id: user.to_string(),
+            owner_is_admin: false,
+            path: Ok(path.to_path_buf()),
+            stored_path: path.to_path_buf(),
+            shared,
+        }
+    }
+
+    fn write_file(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"audio").unwrap();
+    }
+
+    /// What auto-delete does with the file Navidrome reports at `file`, for
+    /// `user`, whose own folders are `own`.
+    async fn rate_one_star(
+        file: &Path,
+        own: &[PathBuf],
+        everyones: &[PolicyFolder],
+        user: &str,
+    ) -> AutoDelete {
+        let local = resolve_navidrome_path(file.to_str().unwrap(), own, None);
+        auto_delete_file(local, everyones, user).await
+    }
+
+    #[tokio::test]
+    async fn auto_delete_never_removes_another_users_folder_on_the_way_up() {
+        // Alice has /music (shared) and /music/x/a; Bob has /music/x.
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(dir.path()).unwrap();
+        let (music, x, a) = (
+            tmp.join("music"),
+            tmp.join("music/x"),
+            tmp.join("music/x/a"),
+        );
+        let everyones = [
+            owned("alice", &music, true),
+            owned("alice", &a, false),
+            owned("bob", &x, false),
+        ];
+        let own = [music.clone(), a.clone()];
+
+        // The only file in Alice's /music/x/a, two levels down: the walk
+        // stops at her deepest folder, so Bob's /music/x stays.
+        let alices = a.join("Artist/Album/s.flac");
+        write_file(&alices);
+        assert_eq!(
+            rate_one_star(&alices, &own, &everyones, "alice").await,
+            AutoDelete::Deleted(alices.clone())
+        );
+        assert!(!a.join("Artist").exists());
+        assert!(a.is_dir());
+        assert!(x.is_dir());
+
+        // A file in Bob's folder is his, though Alice's shared /music holds it.
+        let bobs = x.join("B/t.flac");
+        write_file(&bobs);
+        assert_eq!(
+            rate_one_star(&bobs, &own, &everyones, "alice").await,
+            AutoDelete::Kept
+        );
+        assert!(bobs.is_file());
+    }
+
+    #[tokio::test]
+    async fn auto_delete_keeps_a_file_an_unresolvable_foreign_folder_may_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(dir.path()).unwrap();
+        let (music, bob) = (tmp.join("music"), tmp.join("music/bob"));
+        let everyones = [
+            owned("alice", &music, false),
+            PolicyFolder {
+                path: Err("Permission denied".to_string()),
+                ..owned("bob", &bob, false)
+            },
+        ];
+        let bobs = bob.join("B/y.flac");
+        write_file(&bobs);
+
+        assert_eq!(
+            rate_one_star(&bobs, std::slice::from_ref(&music), &everyones, "alice").await,
+            AutoDelete::Kept
+        );
+        assert!(bobs.is_file());
+
+        // A file outside Bob's stored path is still Alice's to delete.
+        let alices = music.join("alice/A/x.flac");
+        write_file(&alices);
+        assert_eq!(
+            rate_one_star(&alices, std::slice::from_ref(&music), &everyones, "alice").await,
+            AutoDelete::Deleted(alices)
+        );
+        assert!(bob.is_dir());
     }
 
     #[test]
