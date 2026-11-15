@@ -965,7 +965,10 @@ impl DownloadMonitor {
     }
 
     /// Another peer's live transfer of `slot`'s file that this batch may
-    /// adopt.
+    /// adopt. A record between attempts is not live: no watcher's clock
+    /// bounds a foreign one, and a record cancelled during slskd's retry
+    /// delay stays that way for good. If slskd starts the retry, the record
+    /// reads `Queued, Locally` on the next poll and is adoptable then.
     fn adoptable<'a>(
         &self,
         slot: usize,
@@ -977,6 +980,7 @@ impl DownloadMonitor {
         downloads.iter().find(|dl| {
             dl.source != tracked.source
                 && !is_terminal_state(&dl.state)
+                && dl.pending_retry.is_none()
                 && filenames_match(&dl.item, &tracked.filename)
                 && !self.owns(dl)
                 && registry.may_adopt(
@@ -2344,6 +2348,29 @@ mod tests {
         .await;
 
         assert_eq!(m.tracked_files[0].source, "peer_b");
+    }
+
+    #[tokio::test]
+    async fn another_peers_record_pending_a_retry_is_not_adopted() {
+        // No watcher's clock bounds another peer's record, so one cancelled
+        // during slskd's retry delay would read Queued for good.
+        let (mut m, _rx) = failover_monitor();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[
+                failed_transfer("peer_a", "dirA/aaa.flac"),
+                pending_retry("peer_x", "dirX/aaa.flac"),
+            ],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(m.pool.attempts_used(0), 2);
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+        assert_eq!(m.tracked_files[0].transfer_id, "t-dirB/bbb.flac");
     }
 
     #[tokio::test]
