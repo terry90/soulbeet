@@ -744,6 +744,20 @@ impl SoulseekClient {
         Self::usable_files(files, errors)
     }
 
+    /// `GET transfers/downloads/{username}/{id}` (`TransfersController.cs:549-573`). None for 404 and
+    /// for a removed record. slskd finds the transfer by id alone; the username only builds the path.
+    pub async fn get_download(&self, username: &str, id: &str) -> Result<Option<FileEntry>> {
+        match self
+            .make_request::<FileEntry, ()>(Method::GET, &download_endpoint(username, id)?, None)
+            .await
+        {
+            Ok(entry) if entry.removed => Ok(None),
+            Ok(entry) => Ok(Some(entry)),
+            Err(SoulseekError::Api { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn cancel_download(
         &self,
         username: &str,
@@ -905,11 +919,18 @@ fn user_downloads_endpoint(username: &str) -> Result<String> {
     Ok(format!("transfers/downloads/{}", path_segment(username)?))
 }
 
-fn transfer_endpoint(username: &str, id: &str, remove: bool) -> Result<String> {
+fn download_endpoint(username: &str, id: &str) -> Result<String> {
     Ok(format!(
-        "{}/{}?remove={remove}",
+        "{}/{}",
         user_downloads_endpoint(username)?,
         path_segment(id)?
+    ))
+}
+
+fn transfer_endpoint(username: &str, id: &str, remove: bool) -> Result<String> {
+    Ok(format!(
+        "{}?remove={remove}",
+        download_endpoint(username, id)?
     ))
 }
 
@@ -1213,6 +1234,18 @@ impl crate::DownloadBackend for SoulseekClient {
             .into_iter()
             .map(|e| e.into_progress(limit))
             .collect())
+    }
+
+    async fn get_download(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<Option<shared::download::DownloadProgress>> {
+        let limit = self.retry_limit().await?;
+        Ok(self
+            .get_download(source, id)
+            .await?
+            .map(|e| e.into_progress(limit)))
     }
 
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()> {
@@ -2162,5 +2195,67 @@ mod tests {
             "Not found in slskd after a retried enqueue"
         ));
         assert_eq!(results[1].transfer_id, None);
+    }
+
+    #[tokio::test]
+    async fn one_transfer_is_read_until_slskd_no_longer_has_it() {
+        let options = r#"{"transfers":{"download":{"retry":{"attempts":3}}}}"#;
+        let record = |removed: bool| {
+            serde_json::json!({
+                "id": "890f943c-02e1-4d45-af76-d55e3d855684", "username": "peer", "direction": "Download",
+                "filename": "shared\\Artist\\Album\\01. Track.flac", "size": 1024, "state": "InProgress",
+                "requestedAt": "2026-07-19T05:11:22Z", "enqueuedAt": "2026-07-19T05:11:23Z",
+                "startedAt": "2026-07-19T05:11:24Z", "bytesTransferred": 512, "averageSpeed": 250000.0,
+                "attempts": 1, "removed": removed, "bytesRemaining": 512, "percentComplete": 50.0 })
+            .to_string()
+        };
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: options.into(),
+            },
+            Reply {
+                status: 200,
+                body: record(false),
+            },
+            Reply {
+                status: 404,
+                body: String::new(),
+            },
+            Reply {
+                status: 200,
+                body: record(true),
+            },
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        let id = "890f943c-02e1-4d45-af76-d55e3d855684";
+        let row = crate::DownloadBackend::get_download(&client, "peer", id)
+            .await
+            .unwrap()
+            .expect("listed");
+        assert_eq!(
+            (row.state, row.transferred),
+            (shared::download::DownloadState::InProgress, 512)
+        );
+        assert_eq!(
+            crate::DownloadBackend::get_download(&client, "peer", id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            crate::DownloadBackend::get_download(&client, "peer", id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            seen.lock().unwrap()[1].target,
+            format!("/api/v0/transfers/downloads/peer/{id}")
+        );
     }
 }

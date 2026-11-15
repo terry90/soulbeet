@@ -122,6 +122,11 @@ pub struct FileEntry {
     /// attempt and incremented on each retry (`Transfers/Types/Transfer.cs:155`).
     #[serde(default)]
     pub attempts: u32,
+    /// slskd removed the record from its UI (`Transfers/Types/Transfer.cs:165`, sent since 0.26.0,
+    /// docs/api/slskd.md:241). The single-transfer GET still returns it (`DownloadService.cs:688-704`
+    /// has no `Removed` filter).
+    #[serde(default)]
+    pub removed: bool,
 }
 
 /// Map slskd's TransferStates bitfield to a DownloadState.

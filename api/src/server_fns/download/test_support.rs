@@ -325,6 +325,15 @@ impl DownloadBackend for StubBackend {
     async fn get_downloads(&self) -> SoulResult<Vec<DownloadProgress>> {
         Ok(self.listing.lock().unwrap().clone())
     }
+    async fn get_download(&self, source: &str, id: &str) -> SoulResult<Option<DownloadProgress>> {
+        Ok(self
+            .listing
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.source == source && t.id == id)
+            .cloned())
+    }
     async fn cancel_download(&self, username: &str, id: &str, remove: bool) -> SoulResult<()> {
         self.cancelled.lock().unwrap().push(Cancel {
             peer: username.to_string(),
