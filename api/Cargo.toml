@@ -54,6 +54,12 @@ dotenvy = "0.15.7"
 
 [dev-dependencies]
 async-trait = "0.1"
+rmcp = { version = "=3.10.0", default-features = false, features = [
+  "client",
+  "auth",
+  "transport-streamable-http-client-reqwest",
+] }
+reqwest_013 = { package = "reqwest", version = "0.13.2", default-features = false }
 tempfile = "3"
 tokio = { version = "1.48.0", features = ["test-util"] }
 tower = { version = "0.5.2", features = ["util"] }

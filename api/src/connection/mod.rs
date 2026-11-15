@@ -22,6 +22,8 @@ use crate::oauth::limits::Limits;
 use crate::security::GateReason;
 
 #[cfg(test)]
+mod flow_tests;
+#[cfg(test)]
 pub(crate) mod test_util;
 
 /// What the connection router reads about the instance, a seam for tests.
