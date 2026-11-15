@@ -4,7 +4,7 @@ use super::runner::{run_beet, RunEnd, RunLimits, RunSpec, Stream};
 use super::BeetsSettings;
 use crate::traits::{ForgetOutcome, Relocation};
 use serde::Deserialize;
-use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
+use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -88,7 +88,7 @@ pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> 
     let ls = vec!["ls".into(), "-f".into(), ID_FORMAT.into(), query];
     let ids = match run_library(s, root, None, ls).await {
         Ok(ids) => ids,
-        Err(e) => return ForgetOutcome::Failed(e),
+        Err(e) => return ForgetOutcome::Failed(e.into()),
     };
     let id: u64 = match ids.as_slice() {
         [] => return ForgetOutcome::NotInLibrary,
@@ -106,7 +106,7 @@ pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> 
     let remove = vec!["remove".into(), "-f".into(), format!("id:{id}").into()];
     match run_library(s, root, None, remove).await {
         Ok(_) => ForgetOutcome::Removed,
-        Err(e) => ForgetOutcome::Failed(e),
+        Err(e) => ForgetOutcome::Failed(e.into()),
     }
 }
 
@@ -115,59 +115,63 @@ pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> 
 /// item's file is from beets' own JSON export, so no character of a file name can be taken for
 /// a separator, also when the move failed, since beets may have moved some items before it
 /// did. An item the export of all ids does not give cleanly is read again on its own. A path
-/// inside `root` is given relative to it, any other as beets gives it. The failure, coded
-/// import_beets_failed: beets' own move failure; else an item moved out of `root`; else an item
-/// whose path could not be read, which beets may have moved.
+/// inside `root` is given relative to it, any other as beets gives it. What went wrong, in this
+/// order: beets' own move failure, each item moved out of `root`, each item whose path could
+/// not be read (which beets may have moved); the failure (move_failure) names the first and
+/// lists the others.
 pub(crate) async fn move_items(s: &BeetsSettings, root: &Path, item_ids: &[u64]) -> Relocation {
     // `beet move` with no query moves every item of the library.
     if item_ids.is_empty() {
         return Relocation {
             now: vec![],
-            failure: Some(move_failed(
-                RetryAdvice::NotRetryable,
-                "Could not move the new copy into place: no items to move".into(),
-                None,
-            )),
+            failure: move_failure(vec![Problem {
+                retry: RetryAdvice::NotRetryable,
+                message: "Could not move the new copy into place: no items to move".into(),
+                cause: None,
+            }]),
         };
     }
     let mut command: Vec<OsString> = vec!["move".into()];
     command.extend(ids_query(item_ids));
     let moved = run_library(s, root, None, command).await;
     let (now, unread) = read_paths(s, root, item_ids).await;
-    let outside = now.iter().find(|(_, path)| inside(path, root).is_none());
-    let failure = match (&moved, outside, unread.first()) {
-        (Err(e), _, None) => Some(move_failed(
-            RetryAdvice::SameSourceLater,
-            format!("Could not move the new copy into place: {e}"),
-            Some(e.clone()),
-        )),
-        (Err(e), _, Some((id, read))) => Some(move_failed(
-            RetryAdvice::SameSourceLater,
-            format!(
-                "Could not move the new copy into place: {e}; Soulful could not read where \
-                 beets left item {id}: {read}"
-            ),
-            Some(e.clone()),
-        )),
-        (Ok(_), Some((id, path)), _) => Some(move_failed(
-            RetryAdvice::NotRetryable,
-            format!(
+    let mut problems = Vec::new();
+    if let Err(e) = &moved {
+        problems.push(Problem {
+            retry: RetryAdvice::SameSourceLater,
+            message: format!("Could not move the new copy into place: {}", e.text),
+            cause: e.cause(),
+        });
+    }
+    for (id, path) in now.iter().filter(|(_, path)| inside(path, root).is_none()) {
+        problems.push(Problem {
+            retry: RetryAdvice::NotRetryable,
+            message: format!(
                 "beets moved item {id} to {}, which is not inside {}",
                 path.display(),
                 root.display()
             ),
-            None,
-        )),
-        (Ok(_), None, Some((id, read))) => Some(move_failed(
-            RetryAdvice::SameSourceLater,
-            format!(
-                "beets may have moved the new copy, and Soulful could not read where item {id} \
-                 is: {read}"
+            cause: None,
+        });
+    }
+    for (id, why) in unread {
+        let message = match moved {
+            Err(_) => format!(
+                "Soulful could not read where beets left item {id}: {}",
+                why.text
             ),
-            Some(read.clone()),
-        )),
-        (Ok(_), None, None) => None,
-    };
+            Ok(_) => format!(
+                "beets may have moved the new copy, and Soulful could not read where item {id} \
+                 is: {}",
+                why.text
+            ),
+        };
+        problems.push(Problem {
+            retry: RetryAdvice::SameSourceLater,
+            message,
+            cause: why.cause,
+        });
+    }
     Relocation {
         now: now
             .into_iter()
@@ -176,22 +180,36 @@ pub(crate) async fn move_items(s: &BeetsSettings, root: &Path, item_ids: &[u64])
                 None => (id, path),
             })
             .collect(),
-        failure,
+        failure: move_failure(problems),
     }
 }
 
-/// A move of a new copy that failed, as `message` says; `raw` is beets' own text.
-fn move_failed(retry: RetryAdvice, message: String, raw: Option<String>) -> Failure {
+/// One thing that went wrong in a move of new items: its retry advice, its text and its cause.
+struct Problem {
+    retry: RetryAdvice,
+    message: String,
+    cause: Option<Cause>,
+}
+
+/// The failure of a move that went wrong as `problems` say, None when nothing did: coded
+/// import_beets_failed, it names the first problem, with its retry advice and its own cause.
+/// When there are others, the cause instead lists their texts, one per line, as Soulful's own
+/// (each text holds its own cause), so none is dropped.
+fn move_failure(problems: Vec<Problem>) -> Option<Failure> {
+    let mut problems = problems.into_iter();
+    let first = problems.next()?;
+    let others: Vec<String> = problems.map(|p| p.message).collect();
     let failure = Failure::new(
         FailureCode::ImportBeetsFailed,
         Stage::Import,
-        retry,
-        message,
+        first.retry,
+        first.message,
     );
-    match raw {
-        Some(raw) => failure.with_cause(Service::Beets, None, raw),
-        None => failure,
-    }
+    let cause = match others.is_empty() {
+        true => first.cause,
+        false => Some(Cause::new(Service::Soulful, None, others.join("\n"))),
+    };
+    Some(Failure { cause, ..failure })
 }
 
 /// `id:a , id:b ...`: one beets query of `item_ids`, read as OR.
@@ -214,6 +232,14 @@ fn inside<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
         .filter(|p| p.components().next().is_some())
 }
 
+/// Why Soulful could not read where an item is: its text, and its cause, which is beets' own
+/// output when beets failed, or the lines beets printed that Soulful could not take for the
+/// item, as Soulful's own.
+struct Unread {
+    text: String,
+    cause: Option<Cause>,
+}
+
 /// Where beets has each item of `item_ids`, read from `beet export` of them all, and, for each
 /// that read does not give cleanly (beets failed, a line is not an id and a path, the id is not
 /// one asked for or is given twice), from an export of that item alone. The items read, and
@@ -222,7 +248,7 @@ async fn read_paths(
     s: &BeetsSettings,
     root: &Path,
     item_ids: &[u64],
-) -> (Vec<(u64, PathBuf)>, Vec<(u64, String)>) {
+) -> (Vec<(u64, PathBuf)>, Vec<(u64, Unread)>) {
     let mut wanted = item_ids.to_vec();
     wanted.sort_unstable();
     wanted.dedup();
@@ -248,22 +274,33 @@ async fn read_paths(
         if found.iter().any(|(listed, _)| *listed == id) {
             continue;
         }
+        let lines = |rows: &[String]| {
+            (!rows.is_empty()).then(|| Cause::new(Service::Soulful, None, rows.join("\n")))
+        };
         let alone = match export(s, root, &[id]).await {
             Ok(rows) => match rows.as_slice() {
-                [row] => exported_item(row).and_then(|(listed, path)| match listed == id {
-                    true => Ok(path),
-                    false => Err(format!("beet export gave item {listed} for item {id}")),
+                [row] => exported_item(row)
+                    .and_then(|(listed, path)| match listed == id {
+                        true => Ok(path),
+                        false => Err(format!("beet export gave item {listed} for item {id}")),
+                    })
+                    .map_err(|text| Unread {
+                        text,
+                        cause: lines(&rows),
+                    }),
+                rows => Err(Unread {
+                    text: format!("beet export listed {} items for item {id}", rows.len()),
+                    cause: lines(rows),
                 }),
-                rows => Err(format!(
-                    "beet export listed {} items for item {id}",
-                    rows.len()
-                )),
             },
-            Err(e) => Err(e),
+            Err(e) => Err(Unread {
+                cause: e.cause(),
+                text: e.text,
+            }),
         };
         match alone {
             Ok(path) => found.push((id, path)),
-            Err(e) => unread.push((id, e)),
+            Err(why) => unread.push((id, why)),
         }
     }
     found.sort_by_key(|(id, _)| *id);
@@ -271,7 +308,11 @@ async fn read_paths(
 }
 
 /// `beet -p export export -l -f jsonlines -i id,path` of `item_ids`: one row per item.
-async fn export(s: &BeetsSettings, root: &Path, item_ids: &[u64]) -> Result<Vec<String>, String> {
+async fn export(
+    s: &BeetsSettings,
+    root: &Path,
+    item_ids: &[u64],
+) -> Result<Vec<String>, RunFailure> {
     let mut command: Vec<OsString> = ["export", "-l", "-f", "jsonlines", "-i", "id,path"]
         .map(OsString::from)
         .to_vec();
@@ -291,6 +332,29 @@ fn exported_item(row: &str) -> Result<(u64, PathBuf), String> {
     Ok((id, item.path))
 }
 
+/// Why a beets library command failed: Soulful's text, which holds what beets printed, and
+/// that output alone when beets exited with a failure after printing some.
+#[derive(Debug)]
+struct RunFailure {
+    text: String,
+    output: Option<String>,
+}
+
+impl RunFailure {
+    /// beets' output as the cause, when beets printed any.
+    fn cause(&self) -> Option<Cause> {
+        self.output
+            .as_ref()
+            .map(|output| Cause::new(Service::Beets, None, output.clone()))
+    }
+}
+
+impl From<RunFailure> for String {
+    fn from(e: RunFailure) -> String {
+        e.text
+    }
+}
+
 /// Runs `beet {command}` on the library under `root` and returns its rows: the
 /// text after the row marker of each line that has one, or, with `plugin`,
 /// every line, as `beet -p {plugin}` loads that plugin alone and no other one
@@ -300,7 +364,7 @@ async fn run_library(
     root: &Path,
     plugin: Option<&str>,
     command: Vec<OsString>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, RunFailure> {
     let subcommand = command[0].to_string_lossy().into_owned();
     let mut retried = false;
     loop {
@@ -344,14 +408,15 @@ async fn run_library(
             retried = true;
             continue;
         }
+        let failed = |text: String, output: Option<String>| Err(RunFailure { text, output });
         return match outcome.end {
             RunEnd::Exited(status) if status.success() => Ok(rows),
-            RunEnd::Exited(status) => Err(format!(
-                "beet {subcommand} failed ({status}): {}",
-                outcome.tail
-            )),
-            RunEnd::Idle | RunEnd::Total => Err(format!("beet {subcommand} timed out")),
-            RunEnd::SpawnFailed(e) => Err(format!("Could not start beets: {e}")),
+            RunEnd::Exited(status) => failed(
+                format!("beet {subcommand} failed ({status}): {}", outcome.tail),
+                (!outcome.tail.is_empty()).then_some(outcome.tail),
+            ),
+            RunEnd::Idle | RunEnd::Total => failed(format!("beet {subcommand} timed out"), None),
+            RunEnd::SpawnFailed(e) => failed(format!("Could not start beets: {e}"), None),
         };
     }
 }
@@ -581,6 +646,12 @@ mod tests {
                 "beets may have moved the new copy, and Soulful could not read where item 7 is: {why}"
             );
             assert!(message.starts_with(&prefix), "{message}");
+            // The line beets printed is the cause, as Soulful's own failure to read it.
+            let printed = line.replace("$PWD", &dir.path().display().to_string());
+            assert_eq!(
+                relocation.failure.unwrap().cause,
+                Some(Cause::new(Service::Soulful, None, printed))
+            );
             // Read for all ids, then for item 7 alone.
             let calls = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
             assert_eq!(calls.lines().filter(|c| c.contains(" export ")).count(), 2);
@@ -654,9 +725,114 @@ mod tests {
             message.starts_with("Could not move the new copy into place: beet move failed ("),
             "{message}"
         );
+        // beets' own output is the cause.
         assert_eq!(
-            relocation.failure.unwrap().cause.map(|c| c.service),
-            Some(Service::Beets)
+            relocation.failure.unwrap().cause,
+            Some(Cause::new(Service::Beets, None, "error: permission denied"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_beets_cannot_export_has_beets_output_as_its_cause() {
+        let (dir, settings) = fake_library(&format!(
+            "{LOG}\ncase \"$*\" in *' export '*) echo 'error: no such table: items' >&2; exit 1;; esac"
+        ))
+        .await;
+        let relocation = move_items(&settings, dir.path(), &[7]).await;
+        let message = failure_of(&relocation).2;
+        assert!(
+            message.starts_with(
+                "beets may have moved the new copy, and Soulful could not read where item 7 is: \
+                 beet export failed ("
+            ),
+            "{message}"
+        );
+        assert_eq!(
+            relocation.failure.unwrap().cause,
+            Some(Cause::new(
+                Service::Beets,
+                None,
+                "error: no such table: items"
+            ))
+        );
+    }
+
+    /// A fake `beet` whose export lists item 7 outside the library and prints a line that is
+    /// not an item for item 9, and whose move fails when `move_fails`.
+    async fn moving_out_and_unreadable(move_fails: bool) -> (tempfile::TempDir, BeetsSettings) {
+        let moving = match move_fails {
+            true => "*' move '*) echo 'error: permission denied' >&2; exit 1;;",
+            false => "",
+        };
+        fake_library(&format!(
+            "{LOG}\ncase \"$*\" in\n\
+             {moving}\n\
+             *' export '*' , '*) echo '{{\"id\": \"7\",\"path\": \"/elsewhere/03.flac\"}}'; echo '9|||broken';;\n\
+             *' export '*id:7) echo '{{\"id\": \"7\",\"path\": \"/elsewhere/03.flac\"}}';;\n\
+             *' export '*id:9) echo '9|||broken';;\n\
+             esac"
+        ))
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_problem_of_a_move_is_named_first_or_listed_in_the_cause() {
+        let why_9 = exported_item("9|||broken").unwrap_err();
+        let outside = |dir: &Path| {
+            format!(
+                "beets moved item 7 to /elsewhere/03.flac, which is not inside {}",
+                dir.display()
+            )
+        };
+
+        // beets' move failed, item 7 is outside the library and item 9 cannot be read: the
+        // move failure is the message, and the cause lists the other two in Soulful's words.
+        let (dir, settings) = moving_out_and_unreadable(true).await;
+        let relocation = move_items(&settings, dir.path(), &[7, 9]).await;
+        assert_eq!(relocation.now, vec![(7, "/elsewhere/03.flac".into())]);
+        let (code, retry, message) = failure_of(&relocation);
+        assert_eq!(
+            (code, retry),
+            (FailureCode::ImportBeetsFailed, RetryAdvice::SameSourceLater)
+        );
+        assert!(
+            message.starts_with("Could not move the new copy into place: beet move failed (")
+                && message.ends_with("): error: permission denied"),
+            "{message}"
+        );
+        assert_eq!(
+            relocation.failure.unwrap().cause,
+            Some(Cause::new(
+                Service::Soulful,
+                None,
+                format!(
+                    "{}\nSoulful could not read where beets left item 9: {why_9}",
+                    outside(dir.path())
+                )
+            ))
+        );
+
+        // The move itself went through: the item outside the library is the message.
+        let (dir, settings) = moving_out_and_unreadable(false).await;
+        let relocation = move_items(&settings, dir.path(), &[7, 9]).await;
+        assert_eq!(
+            failure_of(&relocation),
+            (
+                FailureCode::ImportBeetsFailed,
+                RetryAdvice::NotRetryable,
+                outside(dir.path())
+            )
+        );
+        assert_eq!(
+            relocation.failure.unwrap().cause,
+            Some(Cause::new(
+                Service::Soulful,
+                None,
+                format!(
+                    "beets may have moved the new copy, and Soulful could not read where item 9 \
+                     is: {why_9}"
+                )
+            ))
         );
     }
 

@@ -171,6 +171,9 @@ pub enum Service {
     Filesystem,
     /// Soulful's own settings database.
     Database,
+    /// Soulful itself: lines it could not read from a service, or what it found wrong, in its
+    /// own words.
+    Soulful,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
