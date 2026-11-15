@@ -24,13 +24,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "server")]
+use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
+#[cfg(feature = "server")]
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
 #[cfg(feature = "server")]
 use crate::models::folder::Folder;
-#[cfg(feature = "server")]
-use crate::models::user_settings::UserSettings;
-#[cfg(feature = "server")]
-use crate::server_fns::search::{hydrate_album_tracks, TracklistError};
 #[cfg(feature = "server")]
 use crate::services::{
     available_download_backends, download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND,
@@ -238,24 +236,6 @@ async fn usable_backends() -> Result<(Searched, Vec<Searched>), BackendLookupErr
     }
 }
 
-/// The tracklist of the album could not be looked up.
-#[cfg(feature = "server")]
-fn tracklist_failure(e: &TracklistError) -> Failure {
-    e.error.failure(Stage::Metadata, e.to_string())
-}
-
-/// The user's settings could not be read, which the tracklist lookup needs.
-#[cfg(feature = "server")]
-fn settings_unreadable(e: &str) -> Failure {
-    Failure::new(
-        FailureCode::SettingsUnreadable,
-        Stage::Metadata,
-        RetryAdvice::SameSourceLater,
-        "Could not read your settings",
-    )
-    .with_cause(Service::Database, None, e)
-}
-
 #[cfg(feature = "server")]
 fn queue_failed(e: &SoulseekError) -> Failure {
     e.failure(Stage::Enqueue, format!("Download queue failed: {e}"))
@@ -338,7 +318,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
     // This avoids blocking the HTTP response during the search-poll loop (Research Pitfall 4).
     let folder_path = folder.path;
     let mut query = req.query;
-    let auth_user_id = auth.0.user_id.clone();
+    let ctx = auth.0.clone();
 
     tokio::spawn(async move {
         // Send Searching event
@@ -348,26 +328,29 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             backend_count: 1 + rest.len(),
         }));
 
-        let settings = match UserSettings::get(&auth_user_id).await {
-            Ok(settings) => settings,
-            Err(e) => {
+        let key = match lastfm_key(&ctx).await {
+            Ok(key) => key,
+            Err(failure) => {
+                warn!(
+                    "Auto-download: could not read settings for '{query_desc}': {}",
+                    failure.cause.as_ref().map_or("", |c| c.raw.as_str())
+                );
                 let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                     batch_id: batch_id.clone(),
-                    failure: settings_unreadable(&e),
+                    failure,
                 }));
-                warn!("Auto-download: could not read settings for '{query_desc}': {e}");
                 return;
             }
         };
-        if let Err(e) = hydrate_album_tracks(&mut query, settings.lastfm_api_key.as_deref()).await {
-            let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
-                batch_id: batch_id.clone(),
-                failure: tracklist_failure(&e),
-            }));
+        if let Err(failure) = hydrate_album_tracks(&mut query, key.as_deref()).await {
             info!(
                 "Auto-download: no tracklist for '{}': {}",
-                query_desc, e.error
+                query_desc, failure.message
             );
+            let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
+                batch_id: batch_id.clone(),
+                failure,
+            }));
             return;
         }
         let (album, tracks) = (query.album, query.tracks);
@@ -639,7 +622,6 @@ mod tests {
     use shared::download::SearchResult;
     use shared::failure::UserActionCode;
     use soulbeet::error::MissingSetting;
-    use soulbeet::MetadataError;
 
     /// The groups `stub`'s search found and the failure an empty one gives.
     async fn searched(stub: Arc<StubBackend>) -> (Vec<DownloadableGroup>, Failure) {
@@ -894,27 +876,6 @@ mod tests {
         );
         let cause = f.cause.unwrap();
         assert_eq!((cause.status, cause.raw.as_str()), (Some(400), body));
-    }
-
-    #[test]
-    fn a_tracklist_that_cannot_be_read_fails_at_the_metadata_stage() {
-        let e = MetadataError::Unavailable {
-            service: Service::Musicbrainz,
-            status: Some(503),
-            raw: "no answer within 15 s".into(),
-        };
-        let f = tracklist_failure(&TracklistError {
-            album_title: "Winter Songs".into(),
-            error: e,
-        });
-        assert_eq!(
-            (f.code, f.stage),
-            (FailureCode::MetadataUnavailable, Stage::Metadata)
-        );
-        assert_eq!(
-            f.message,
-            "could not resolve tracklist for 'Winter Songs': MusicBrainz is unavailable: no answer within 15 s"
-        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 
 pub mod folders;
 pub mod health;
+pub mod metadata;
 pub mod settings;
 
 /// Soulful's own database failed.
