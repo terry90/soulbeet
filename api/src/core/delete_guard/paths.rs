@@ -88,7 +88,7 @@ pub(super) async fn local_file_in(
 /// file `path`: its library's canonical root joined with `song.path`, or that path resolved.
 /// A song whose path is not inside its library, or whose root is not on this machine, names
 /// no file here.
-pub(super) async fn names_file(
+pub(crate) async fn names_file(
     db: &SqlitePool,
     song: &NativeSong,
     music_path: Option<&Path>,

@@ -11,6 +11,8 @@ use super::failure_error;
 #[cfg(feature = "server")]
 use crate::auth::UserId;
 #[cfg(feature = "server")]
+use crate::core::delete_guard::paths;
+#[cfg(feature = "server")]
 use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
 #[cfg(feature = "server")]
 use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin, Verdict};
@@ -250,7 +252,7 @@ pub(crate) async fn auto_delete_songs(
         }
         let artist = song.artist.as_deref().unwrap_or_default();
         let skipped = |why: &str| info!("Auto-delete skipped {artist} - {}: {why}", song.title);
-        if deleted_before(&deleted, &song.id).await {
+        if deleted_before(guard, actor, &deleted, &song.id).await {
             skipped("deleted earlier, and Navidrome has not noticed yet");
             continue;
         }
@@ -309,14 +311,39 @@ pub(crate) async fn auto_delete_songs(
     run
 }
 
-/// Whether a deletion in `deleted` (song id, path) removed song `song_id`'s file: its path
-/// is no longer there.
+/// Whether a deletion in `deleted` (song id, canonical path) removed the file song `song_id`
+/// has now: `actor`'s native record of it names that path on this machine, found as
+/// local_file_in finds it (paths::names_file), and nothing is there. Navidrome keeps a song's id
+/// and ratings when its scanner matches a missing file to a new one
+/// (scanner/phase_2_missing_tracks.go:275-308, moveMatched), so a song whose file is now
+/// elsewhere is checked as any other. A record that cannot be read is not skipped either: the
+/// guard reads it again and says why it keeps the file.
 #[cfg(feature = "server")]
-async fn deleted_before(deleted: &[(String, String)], song_id: &str) -> bool {
-    for (_, path) in deleted.iter().filter(|(id, _)| id == song_id) {
-        if tokio::fs::symlink_metadata(path)
+async fn deleted_before(
+    guard: &Guard<'_>,
+    actor: &UserId,
+    deleted: &[(String, String)],
+    song_id: &str,
+) -> bool {
+    let recorded: Vec<&Path> = deleted
+        .iter()
+        .filter(|(id, _)| id == song_id)
+        .map(|(_, path)| Path::new(path))
+        .collect();
+    if recorded.is_empty() {
+        return false;
+    }
+    let Ok(Some(song)) = guard.listeners.native_song(actor, song_id).await else {
+        return false;
+    };
+    for path in recorded {
+        let named = paths::names_file(guard.db, &song, guard.music_path, path)
             .await
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            .unwrap_or(false);
+        if named
+            && tokio::fs::symlink_metadata(path)
+                .await
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
         {
             return true;
         }
@@ -606,6 +633,7 @@ mod tests {
     use super::*;
     use crate::core::delete_guard::test_support::Library;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
+    use soulbeet::navidrome::models::NativeSong;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -836,15 +864,37 @@ mod tests {
         let songs = [subsonic("s1", "O Holy Night", Some(1))];
         let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
         assert_eq!((run.deleted, run.kept.len()), (1, 0));
-        // The next sync lists it again: Navidrome has not scanned since.
-        let reads = lib.fake.reads_by("alice");
+        // The next sync lists it again: Navidrome has not scanned since. Only its record is
+        // read: the guard never checks it, so no rating is sent.
         let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
         assert_eq!((run.deleted, run.removed, run.kept.len()), (0, 0, 0));
-        assert_eq!(lib.fake.reads_by("alice"), reads);
+        assert_eq!(lib.fake.ratings_set().len(), 1);
         // A file at that path again (re-imported) is checked as usual.
         lib.write("alice/A/x.flac", b"audio");
         let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
         assert_eq!(run.deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn a_song_navidrome_moved_to_another_file_since_its_deletion_is_checked_again() {
+        let lib = Library::new().await;
+        let queue = ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())));
+        let songs = [subsonic("s1", "O Holy Night", Some(1))];
+        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        assert_eq!(run.deleted, 1);
+        // Re-imported at another path: Navidrome's scanner matched the missing file to the new
+        // one and gave it the song's id and alice's rating of 1 (moveMatched).
+        lib.write("alice/B/x.flac", b"audio");
+        lib.fake.file(
+            NativeSong {
+                path: "alice/B/x.flac".into(),
+                ..lib.record("s1")
+            },
+            "al1",
+        );
+        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        assert_eq!((run.deleted, run.kept.len()), (1, 0));
+        assert!(!lib.root.join("music/alice/B/x.flac").exists());
     }
 
     #[tokio::test]
