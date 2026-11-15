@@ -15,7 +15,9 @@ use tokio::sync::broadcast;
 #[cfg(feature = "server")]
 use crate::{
     base_url::{BaseUrl, BaseUrlError},
-    server_fns::{forbidden_error, import_refusal_error, refusal_error, server_error},
+    server_fns::{
+        failure_error, forbidden_error, import_refusal_error, refusal_error, server_error,
+    },
     AuthSession,
 };
 #[cfg(feature = "server")]
@@ -334,8 +336,8 @@ pub struct DownloadRequest {
 pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, ServerFnError> {
     let user = auth.0.id();
 
-    if let Some(issue) = crate::importer_health::broken_issue().await {
-        return Err(refusal_error(issue.title));
+    if let Some(failure) = crate::importer_health::blocking_failure().await {
+        return Err(failure_error(failure));
     }
     let folder =
         crate::models::folder::Folder::find_for_user_by_path(&auth.0.user_id, &req.target_folder)

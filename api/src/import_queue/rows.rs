@@ -20,7 +20,7 @@ pub fn row_state(outcome: &ImportOutcome) -> DownloadState {
 /// The typed failure for an import outcome that is not a success. Its message
 /// is the result's text, so a row shows what it always showed; its user
 /// action is the importer's.
-fn import_failure(result: &ImportResult) -> Option<Failure> {
+pub(crate) fn import_failure(result: &ImportResult) -> Option<Failure> {
     let (code, retry) = match &result.outcome {
         ImportOutcome::Imported { .. } => return None,
         ImportOutcome::Skipped(SkipReason::AlreadyInLibrary) => (

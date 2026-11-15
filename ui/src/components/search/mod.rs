@@ -388,10 +388,10 @@ pub fn Search() -> Element {
                     batch_to_item.write().insert(batch_id.clone(), item_id);
                     batch_to_name.write().insert(batch_id, display_name);
                 }
-                Ok(api::AutoDownloadResult::Error(e)) => {
+                Ok(api::AutoDownloadResult::Error(failure)) => {
                     download_states
                         .write()
-                        .insert(item_id, DownloadRowState::Failed(e));
+                        .insert(item_id, DownloadRowState::Failed(failure.message));
                 }
                 Err(e) => {
                     download_states

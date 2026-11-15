@@ -488,8 +488,8 @@ pub async fn generate_discovery_playlist_internal(
         .ok_or("Discovery folder not found")?;
 
     // Shown as the run's error, so the user sees why nothing was imported.
-    if let Some(issue) = crate::importer_health::broken_issue().await {
-        return Err(issue.title);
+    if let Some(failure) = crate::importer_health::blocking_failure().await {
+        return Err(failure.message);
     }
 
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
@@ -622,9 +622,9 @@ pub async fn generate_discovery_playlist_internal(
                 }
             }
 
-            if let Some(issue) = crate::importer_health::broken_issue().await {
-                warn!("Discovery for {user_id} skipped: {}", issue.title);
-                importer_issue = Some(issue.title);
+            if let Some(failure) = crate::importer_health::blocking_failure().await {
+                warn!("Discovery for {user_id} skipped: {}", failure.message);
+                importer_issue = Some(failure.message);
                 break;
             }
 

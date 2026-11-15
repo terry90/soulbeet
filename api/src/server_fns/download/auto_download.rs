@@ -6,22 +6,21 @@ use shared::download::DownloadQuery;
 use shared::download::{
     AutoDownloadEvent, DownloadEvent, DownloadProgress, EnqueueStatus, QueuedDownload,
 };
+use shared::failure::Failure;
 #[cfg(feature = "server")]
-use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
+use shared::failure::{FailureCode, RetryAdvice, Service, Stage};
 #[cfg(feature = "server")]
 use soulbeet::error::SoulseekError;
 
 #[cfg(feature = "server")]
-use dioxus::logger::tracing::{info, warn};
+use dioxus::logger::tracing::info;
 
 #[cfg(feature = "server")]
 use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
 #[cfg(feature = "server")]
-use crate::core::{backend_unavailable, sources};
+use crate::core::{backend_unavailable, folders, sources};
 #[cfg(feature = "server")]
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
-#[cfg(feature = "server")]
-use crate::models::folder::Folder;
 #[cfg(feature = "server")]
 use crate::services::download_backend;
 #[cfg(feature = "server")]
@@ -80,28 +79,24 @@ pub enum AutoDownloadResult {
     /// Pipeline spawned, all further results delivered via WebSocket AutoDownloadEvent
     Accepted { batch_id: String },
     /// Error before pipeline could start (no backends, bad input, etc.)
-    Error(String),
+    Error(Failure),
 }
 
 #[post("/api/auto-download", auth: AuthSession)]
 pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResult, ServerFnError> {
     let user = auth.0.id();
 
-    if let Some(issue) = crate::importer_health::broken_issue().await {
-        return Ok(AutoDownloadResult::Error(issue.title));
+    if let Some(failure) = crate::importer_health::blocking_failure().await {
+        return Ok(AutoDownloadResult::Error(failure));
     }
-    let folder = match Folder::get_by_id(&req.folder_id).await {
-        Ok(Some(f))
-            if f.user_id == auth.0.user_id
-                && std::path::Path::new(&req.folder_path) == std::path::Path::new(&f.path) =>
-        {
-            f
-        }
-        Ok(_) => return Ok(AutoDownloadResult::Error("Folder not found".to_string())),
-        Err(e) => {
-            warn!("Folder lookup for auto-download failed: {e}");
-            return Ok(AutoDownloadResult::Error("Folder not found".to_string()));
-        }
+    let folder = match folders::owned(&auth.0, &req.folder_id).await {
+        Ok(f) if std::path::Path::new(&req.folder_path) == std::path::Path::new(&f.path) => f,
+        Ok(_) => return Ok(AutoDownloadResult::Error(folders::folder_not_found())),
+        Err(failure) => return Ok(AutoDownloadResult::Error(failure)),
+    };
+    let key = match lastfm_key(&auth.0).await {
+        Ok(key) => key,
+        Err(failure) => return Ok(AutoDownloadResult::Error(failure)),
     };
 
     let (tx, _) = get_or_create_user_channel(&user).await;
@@ -125,12 +120,11 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         Ok(backends) => backends,
         Err(failure) => {
             let batch_id = uuid::Uuid::new_v4().to_string();
-            let error = failure.message.clone();
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                 batch_id,
-                failure,
+                failure: failure.clone(),
             }));
-            return Ok(AutoDownloadResult::Error(error));
+            return Ok(AutoDownloadResult::Error(failure));
         }
     };
 
@@ -142,7 +136,6 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
     // This avoids blocking the HTTP response during the search-poll loop (Research Pitfall 4).
     let folder_path = folder.path;
     let mut query = req.query;
-    let ctx = auth.0.clone();
 
     tokio::spawn(async move {
         // Send Searching event
@@ -152,20 +145,6 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             backend_count: 1 + rest.len(),
         }));
 
-        let key = match lastfm_key(&ctx).await {
-            Ok(key) => key,
-            Err(failure) => {
-                warn!(
-                    "Auto-download: could not read settings for '{query_desc}': {}",
-                    failure.cause.as_ref().map_or("", |c| c.raw.as_str())
-                );
-                let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
-                    batch_id: batch_id.clone(),
-                    failure,
-                }));
-                return;
-            }
-        };
         if let Err(failure) = hydrate_album_tracks(&mut query, key.as_deref()).await {
             info!(
                 "Auto-download: no tracklist for '{}': {}",

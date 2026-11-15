@@ -9,6 +9,7 @@ mod rows;
 pub(crate) mod test_support;
 
 pub use retry::{forget_retries, import_choices_for, retry_import_for};
+pub(crate) use rows::import_failure;
 
 use crate::auth::UserId;
 use async_trait::async_trait;
