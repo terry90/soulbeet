@@ -53,6 +53,7 @@ fn main() {
             api::importer_health::start_startup_probe();
 
             api::security::check_seeded_admin().await;
+            api::folder_policy::log_folder_conflicts().await;
             for reason in api::security::gate_reasons() {
                 dioxus::logger::tracing::warn!("MCP stays off: {}", reason.message);
             }

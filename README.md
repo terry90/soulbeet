@@ -135,6 +135,8 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 
 **Note**: Local passwords always work. If Navidrome rejects your credentials or can't be reached, Soulbeet checks the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. A Navidrome login only takes over an existing Soulful account that is already linked to Navidrome or whose Soulful password is the same.
 
+**Note**: Users who are not admins can only add library folders under a root an admin approved in Settings > Library. The upgrade approves the parent directory of each existing admin folder. A top-level admin folder such as `/music` approves nothing, because `/` is never a root: add a root in Settings > Library before other users add folders.
+
 **Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. Scrobble credentials (Last.fm API key, ListenBrainz token) are configured per-user in Settings > Library.
 
 ### Beets Configuration

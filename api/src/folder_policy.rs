@@ -2,10 +2,16 @@
 //! and no overlap with another user's folder unless that folder is shared.
 
 use crate::models::folder::Folder;
+#[cfg(feature = "server")]
+use crate::models::folder_root::FolderRoot;
+#[cfg(feature = "server")]
+use crate::models::user::User;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "server")]
 use crate::auth::UserCtx;
+#[cfg(feature = "server")]
+use std::collections::HashSet;
 #[cfg(feature = "server")]
 use std::fmt;
 #[cfg(feature = "server")]
@@ -242,6 +248,59 @@ pub fn folder_conflicts(folders: &[PolicyFolder], roots: &[PathBuf]) -> Vec<Fold
         }
     }
     conflicts
+}
+
+/// Canonicalizes every stored folder and root. A root that does not resolve
+/// is left out, so it approves nothing.
+#[cfg(feature = "server")]
+pub(crate) fn policy_inputs(
+    folders: Vec<Folder>,
+    admin_ids: &HashSet<String>,
+    roots: Vec<FolderRoot>,
+) -> (Vec<PolicyFolder>, Vec<PathBuf>) {
+    let folders = folders
+        .into_iter()
+        .map(|f| PolicyFolder {
+            owner_is_admin: admin_ids.contains(&f.user_id),
+            path: canonical_folder_path(Path::new(&f.path)).map_err(|e| e.to_string()),
+            id: f.id,
+            user_id: f.user_id,
+            shared: f.shared,
+        })
+        .collect();
+    let roots = roots
+        .iter()
+        .filter_map(|r| canonical_folder_path(Path::new(&r.path)).ok())
+        .collect();
+    (folders, roots)
+}
+
+#[cfg(feature = "server")]
+pub async fn load_policy_inputs() -> Result<(Vec<PolicyFolder>, Vec<PathBuf>), String> {
+    let folders = Folder::get_all().await?;
+    let admin_ids = User::get_all()
+        .await?
+        .into_iter()
+        .filter(|u| u.role.is_admin())
+        .map(|u| u.id)
+        .collect();
+    let roots = FolderRoot::get_all().await?;
+    Ok(policy_inputs(folders, &admin_ids, roots))
+}
+
+/// Startup re-validation: SQL cannot canonicalize, so existing rows are
+/// checked here on every start.
+#[cfg(feature = "server")]
+pub async fn log_folder_conflicts() {
+    match load_policy_inputs().await {
+        Ok((folders, roots)) => {
+            let n = folder_conflicts(&folders, &roots).len();
+            if n > 0 {
+                tracing::warn!("{n} folder conflicts found after the upgrade checks; an admin can review them in Settings > Library");
+            }
+        }
+        Err(e) => tracing::warn!("Could not check library folders: {e}"),
+    }
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -541,5 +600,42 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn policy_inputs_mark_admin_folders_and_drop_unresolvable_roots() {
+        let (_dir, tmp) = tmp();
+        std::fs::create_dir(tmp.join("music")).unwrap();
+        symlink(tmp.join("music"), tmp.join("link")).unwrap();
+        let folder = |id: &str, user: &str, path: PathBuf| Folder {
+            id: id.into(),
+            user_id: user.into(),
+            name: id.into(),
+            path: path.to_str().unwrap().into(),
+            shared: false,
+        };
+        let root = |path: &str| FolderRoot {
+            path: path.into(),
+            created_at: String::new(),
+        };
+        let admins = HashSet::from(["admin-id".to_string()]);
+
+        let (folders, roots) = policy_inputs(
+            vec![
+                folder("f1", "admin-id", tmp.join("link")),
+                folder("f2", "u1", tmp.join("missing/x")),
+            ],
+            &admins,
+            vec![
+                root(tmp.join("link").to_str().unwrap()),
+                root("relative/root"),
+            ],
+        );
+
+        assert!(folders[0].owner_is_admin);
+        assert_eq!(folders[0].path, Ok(tmp.join("music")));
+        assert!(!folders[1].owner_is_admin);
+        assert_eq!(folders[1].path, Ok(tmp.join("missing/x")));
+        assert_eq!(roots, vec![tmp.join("music")]);
     }
 }
