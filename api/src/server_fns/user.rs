@@ -1,18 +1,21 @@
 #[cfg(feature = "server")]
 use super::{
     auth::{start_session, SessionCookie},
-    refusal_error, server_error,
+    forbidden_error, refusal_error, server_error, ADMIN_ONLY,
 };
+use crate::auth::Role;
 use crate::models;
 #[cfg(feature = "server")]
-use crate::{config::CONFIG, AdminSession, AuthSession};
+use crate::{
+    auth::UserCtx, config::CONFIG, services::evict_navidrome_client, AdminSession, AuthSession,
+};
 #[cfg(feature = "server")]
 use axum::http::HeaderMap;
 use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use tower_cookies::Cookies;
 
-#[get("/api/users", _: AuthSession)]
+#[get("/api/users", _: AdminSession)]
 pub async fn get_users() -> Result<Vec<models::user::User>, ServerFnError> {
     models::user::User::get_all().await.map_err(server_error)
 }
@@ -56,8 +59,32 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
         .map_err(server_error)
 }
 
+/// Whether `actor` may set the password of `target_user_id`: their own, or any as an admin.
+#[cfg(feature = "server")]
+pub(crate) fn may_set_password(actor: &UserCtx, target_user_id: &str) -> bool {
+    actor.user_id == target_user_id || actor.role.is_admin()
+}
+
+#[post("/api/users/role", _: AdminSession)]
+pub async fn set_user_role(user_id: String, role: Role) -> Result<(), ServerFnError> {
+    use models::user::UserChangeError;
+
+    models::user::User::set_role(&user_id, role)
+        .await
+        .map_err(|e| match e {
+            UserChangeError::Db(_) => server_error(e),
+            _ => refusal_error(e),
+        })
+}
+
 #[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap)]
 pub async fn update_user_password(user_id: String, password: String) -> Result<(), ServerFnError> {
+    if password.is_empty() {
+        return Err(refusal_error("Password cannot be empty"));
+    }
+    if !may_set_password(&auth.0, &user_id) {
+        return Err(forbidden_error(ADMIN_ONLY));
+    }
     // The bump ends every session of this user; the caller's own is renewed.
     let own_session = if user_id == auth.0.user_id {
         Some(SessionCookie::for_request(&headers)?)
@@ -73,9 +100,36 @@ pub async fn update_user_password(user_id: String, password: String) -> Result<(
     Ok(())
 }
 
-#[delete("/api/users/delete", _: AuthSession)]
+#[delete("/api/users/delete", _: AdminSession)]
 pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
+    use models::user::UserChangeError;
+
     models::user::User::delete(&user_id)
         .await
-        .map_err(server_error)
+        .map_err(|e| match e {
+            UserChangeError::Db(_) => server_error(e),
+            _ => refusal_error(e),
+        })?;
+    evict_navidrome_client(&user_id).await;
+    Ok(())
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    fn ctx(id: &str, role: Role) -> UserCtx {
+        UserCtx {
+            user_id: id.into(),
+            username: id.into(),
+            role,
+        }
+    }
+
+    #[test]
+    fn users_set_their_own_password_and_admins_anyone() {
+        assert!(may_set_password(&ctx("a", Role::User), "a"));
+        assert!(!may_set_password(&ctx("a", Role::User), "b"));
+        assert!(may_set_password(&ctx("a", Role::Admin), "b"));
+    }
 }

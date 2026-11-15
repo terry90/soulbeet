@@ -5,7 +5,7 @@ pub use crate::models::user_settings::{UpdateUserSettings, UserSettings};
 #[cfg(feature = "server")]
 use crate::models::app_config::AppConfig;
 #[cfg(feature = "server")]
-use crate::AuthSession;
+use crate::{AdminSession, AuthSession};
 
 #[cfg(feature = "server")]
 use super::server_error;
@@ -164,7 +164,7 @@ pub struct AppConfigValues {
     pub slskd_api_key: Option<String>,
 }
 
-#[get("/api/config", _: AuthSession)]
+#[get("/api/config", _: AdminSession)]
 pub async fn get_app_config() -> Result<AppConfigValues, ServerFnError> {
     use crate::models::app_config::keys;
 
@@ -181,7 +181,7 @@ pub async fn get_app_config() -> Result<AppConfigValues, ServerFnError> {
     })
 }
 
-#[post("/api/config", _: AuthSession)]
+#[post("/api/config", _: AdminSession)]
 pub async fn update_app_config(config: AppConfigValues) -> Result<AppConfigValues, ServerFnError> {
     use crate::models::app_config::keys;
     use crate::services::reload_providers;

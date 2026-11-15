@@ -5,12 +5,14 @@ use shared::system::{AvailableBackends, SystemHealth};
 use shared::system::BackendInfo;
 
 #[cfg(feature = "server")]
+use crate::config::CONFIG;
+#[cfg(feature = "server")]
 use crate::services::{
     available_download_backends, available_importers, available_metadata_providers,
     download_backend, evict_navidrome_client, navidrome_client_for_user,
 };
 #[cfg(feature = "server")]
-use crate::AuthSession;
+use crate::{AdminSession, AuthSession};
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::debug;
 
@@ -83,4 +85,12 @@ pub async fn get_backends() -> Result<AvailableBackends, ServerFnError> {
     }
     #[cfg(not(feature = "server"))]
     Ok(AvailableBackends::default())
+}
+
+#[get("/api/system/security", _: AdminSession)]
+pub async fn get_security_status() -> Result<crate::security::SecurityStatus, ServerFnError> {
+    Ok(crate::security::SecurityStatus {
+        mcp_blocked_by: crate::security::gate_reasons(),
+        registration: CONFIG.registration(),
+    })
 }

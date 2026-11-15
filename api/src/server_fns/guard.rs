@@ -61,9 +61,13 @@ pub(crate) async fn load_session(
         tracing::warn!("Auth failure: invalid token: {}", e);
         (StatusCode::UNAUTHORIZED, format!("Invalid token: {e}"))
     })?;
-    let user = User::find_by_id_in(db, &claims.sub)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let user = User::find_by_id_in(db, &claims.sub).await.map_err(|e| {
+        tracing::error!("Could not load the session's user: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not check the session".to_string(),
+        )
+    })?;
     session_from(&claims, user.as_ref())
 }
 

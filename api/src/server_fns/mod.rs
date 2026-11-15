@@ -55,6 +55,17 @@ pub fn refusal_error_with<E: std::fmt::Display, D: serde::Serialize>(
     }
 }
 
+/// Status of a request refused because of the caller's role.
+pub const FORBIDDEN_CODE: u16 = 403;
+
+pub fn forbidden_error<E: std::fmt::Display>(e: E) -> ServerFnError {
+    ServerFnError::ServerError {
+        message: e.to_string(),
+        code: FORBIDDEN_CODE,
+        details: None,
+    }
+}
+
 pub fn unauthorized_error<E: std::fmt::Display>(e: E) -> ServerFnError {
     ServerFnError::ServerError {
         message: e.to_string(),
