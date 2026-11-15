@@ -7,6 +7,8 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadRequest {
     pub username: String,
@@ -560,7 +562,8 @@ impl From<FileEntry> for crate::download::DownloadProgress {
                 .cloned()
                 .unwrap_or(DownloadState::Unknown("unknown".into()))
         };
-        Self {
+        let (state, failure) = classify_transfer(&state, entry.exception.as_deref());
+        let row = Self {
             id: entry.id,
             source: entry.username,
             item: entry.filename,
@@ -568,10 +571,10 @@ impl From<FileEntry> for crate::download::DownloadProgress {
             // not. A nonsensical negative must not wrap into a huge size.
             size: entry.size.max(0) as u64,
             transferred: entry.bytes_transferred.max(0) as u64,
-            state: state.into(),
+            state,
             percent: entry.percent_complete,
             speed: entry.average_speed,
-            error: entry.exception,
+            error: None,
             backend: Some("slskd".into()),
             batch_id: None,
             batch_label: None,
@@ -581,34 +584,129 @@ impl From<FileEntry> for crate::download::DownloadProgress {
             can_choose_import: false,
             failure: None,
             skip: None,
+        };
+        match failure {
+            Some(failure) => row.with_failure(failure),
+            None => row,
         }
     }
 }
 
-impl From<DownloadState> for crate::download::DownloadState {
-    fn from(state: DownloadState) -> Self {
-        use crate::download::DownloadState as DS;
-        match state {
-            DownloadState::Queued => DS::Queued,
-            DownloadState::Requested => DS::Queued,
-            DownloadState::Initializing => DS::InProgress,
-            DownloadState::InProgress => DS::InProgress,
-            DownloadState::Downloaded => DS::Completed,
-            DownloadState::Importing => DS::Importing,
-            DownloadState::Imported => DS::Imported,
-            DownloadState::ImportSkipped => DS::ImportSkipped,
-            DownloadState::Errored => DS::Failed("Download error".into()),
-            DownloadState::ImportFailed => DS::Failed("Import failed".into()),
-            DownloadState::Aborted => DS::Failed("Aborted".into()),
-            DownloadState::Cancelled => DS::Cancelled,
-            DownloadState::Rejected => DS::Failed("Transfer rejected by peer".into()),
-            DownloadState::TimedOut => DS::Failed("Download timed out".into()),
-            // Unrecognized states must never map to a terminal state: the
-            // monitor treats terminal as finished and cancels the live slskd
-            // transfer (issue #71). Treat as active; the per-track timeout
-            // is the backstop if the state never advances.
-            DownloadState::Unknown(_) => DS::Queued,
+/// The row state for a transfer and, for a failed or cancelled one, its
+/// failure. The message is the exception slskd stored, else the state's own
+/// text. Only failure states read the exception: a record waiting to retry
+/// still carries the failed attempt's text.
+fn classify_transfer(
+    state: &DownloadState,
+    exception: Option<&str>,
+) -> (crate::download::DownloadState, Option<Failure>) {
+    use crate::download::DownloadState as DS;
+    let text = exception.map(str::to_ascii_lowercase).unwrap_or_default();
+    let (stage, code, retry, default) = match state {
+        DownloadState::Queued | DownloadState::Requested => return (DS::Queued, None),
+        DownloadState::Initializing | DownloadState::InProgress => return (DS::InProgress, None),
+        DownloadState::Downloaded => return (DS::Completed, None),
+        DownloadState::Importing => return (DS::Importing, None),
+        DownloadState::Imported => return (DS::Imported, None),
+        DownloadState::ImportSkipped => return (DS::ImportSkipped, None),
+        // Unrecognized states must never map to a terminal state: the
+        // monitor treats terminal as finished and cancels the live slskd
+        // transfer (issue #71). Treat as active; the per-track timeout
+        // is the backstop if the state never advances.
+        DownloadState::Unknown(_) => return (DS::Queued, None),
+        DownloadState::Rejected => {
+            let (code, retry) = rejection(&text);
+            (Stage::Transfer, code, retry, "Transfer rejected by peer")
         }
+        DownloadState::Errored => {
+            let (code, retry) = if text.contains("appears to be offline") {
+                (FailureCode::PeerOffline, RetryAdvice::OtherSource)
+            } else if text == "application shut down" {
+                // slskd restarted mid-transfer; the peer is fine.
+                (
+                    FailureCode::TransferConnectionFailed,
+                    RetryAdvice::SameSourceLater,
+                )
+            } else {
+                (
+                    FailureCode::TransferConnectionFailed,
+                    RetryAdvice::OtherSource,
+                )
+            };
+            (Stage::Transfer, code, retry, "Download error")
+        }
+        DownloadState::TimedOut => (
+            Stage::Transfer,
+            FailureCode::TransferTimedOut,
+            RetryAdvice::OtherSource,
+            "Download timed out",
+        ),
+        // Soulseek.NET aborts a download only when the peer's file size
+        // differs from the one it expected.
+        DownloadState::Aborted => {
+            let code = if text.contains("does not match expected size") {
+                FailureCode::TransferSizeMismatch
+            } else {
+                FailureCode::TransferAborted
+            };
+            (Stage::Transfer, code, RetryAdvice::OtherSource, "Aborted")
+        }
+        DownloadState::Cancelled => (
+            Stage::Transfer,
+            FailureCode::TransferCancelled,
+            RetryAdvice::NotRetryable,
+            "Cancelled",
+        ),
+        DownloadState::ImportFailed => (
+            Stage::Import,
+            FailureCode::ImportBeetsFailed,
+            RetryAdvice::SameSourceLater,
+            "Import failed",
+        ),
+    };
+    let row_state = match state {
+        DownloadState::Cancelled => DS::Cancelled,
+        _ => DS::Failed(default.into()),
+    };
+    let failure = Failure::new(code, stage, retry, exception.unwrap_or(default));
+    let failure = match exception {
+        Some(raw) => failure.with_cause(Service::Slskd, None, raw),
+        None => failure,
+    };
+    (row_state, Some(failure))
+}
+
+/// Code and retry advice for a peer's refusal, from its lowercased text.
+///
+/// Soulseek.NET stores the peer's reason as `Transfer rejected: {reason}`
+/// or bare, and slskd may cut everything up to the first colon. Only the
+/// exact `Too many files` and `Too many megabytes` mean "retry later"
+/// between clients; the `today` and `this week` forms are quotas that last
+/// that long.
+fn rejection(text: &str) -> (FailureCode, RetryAdvice) {
+    let reason = text.strip_prefix("transfer rejected: ").unwrap_or(text);
+    let reason = reason.strip_suffix('.').unwrap_or(reason);
+    match reason {
+        "too many files" | "too many megabytes" | "overwhelmed with requests; try again later" => (
+            FailureCode::TransferRejectedPeerBusy,
+            RetryAdvice::SameSourceLater,
+        ),
+        "too many files today"
+        | "too many megabytes today"
+        | "too many files this week"
+        | "too many megabytes this week" => (
+            FailureCode::TransferRejectedPeerBusy,
+            RetryAdvice::OtherSource,
+        ),
+        "too many failed transfers today" | "too many failed transfers this week" => (
+            FailureCode::TransferRejectedFailureLimit,
+            RetryAdvice::OtherSource,
+        ),
+        r if r.contains("file not shared") => (
+            FailureCode::TransferRejectedNotShared,
+            RetryAdvice::OtherSource,
+        ),
+        _ => (FailureCode::TransferRejectedOther, RetryAdvice::OtherSource),
     }
 }
 
@@ -651,7 +749,16 @@ mod tests {
     /// with the given `state` value (string or numeric bitfield), and return
     /// the DownloadState the monitor would see.
     fn mapped(state: serde_json::Value) -> DS {
-        let entry: FileEntry = serde_json::from_value(json!({
+        converted(state, None).state
+    }
+
+    /// The row the monitor would see for a transfer entry with the given
+    /// `state` and, when given, the `exception` slskd stored on it.
+    fn converted(
+        state: serde_json::Value,
+        exception: Option<&str>,
+    ) -> crate::download::DownloadProgress {
+        let mut entry = json!({
             "id": "890f943c-02e1-4d45-af76-d55e3d855684",
             "username": "peer",
             "direction": "Download",
@@ -662,9 +769,229 @@ mod tests {
             "bytesTransferred": 0,
             "bytesRemaining": 1024,
             "percentComplete": 0.0
-        }))
-        .expect("FileEntry should deserialize");
-        crate::download::DownloadProgress::from(entry).state
+        });
+        if let Some(exception) = exception {
+            entry["exception"] = json!(exception);
+        }
+        let entry: FileEntry = serde_json::from_value(entry).expect("FileEntry should deserialize");
+        crate::download::DownloadProgress::from(entry)
+    }
+
+    /// Reasons a peer gives for refusing an upload, as slskd and other
+    /// clients send them (`slskd-failure-texts.md` sections 2.2 and 2.3).
+    /// Soulseek.NET stores each either as `Transfer rejected: {reason}` or
+    /// bare, so every reason is checked in both forms.
+    #[test]
+    fn rejected_transfers_get_the_code_their_exception_names() {
+        use FailureCode::*;
+        use RetryAdvice::*;
+        for (reason, code, retry) in [
+            ("File not shared.", TransferRejectedNotShared, OtherSource),
+            ("File not shared", TransferRejectedNotShared, OtherSource),
+            ("Too many files", TransferRejectedPeerBusy, SameSourceLater),
+            (
+                "Too many megabytes",
+                TransferRejectedPeerBusy,
+                SameSourceLater,
+            ),
+            (
+                "Overwhelmed with requests; try again later.",
+                TransferRejectedPeerBusy,
+                SameSourceLater,
+            ),
+            (
+                "Too many files today",
+                TransferRejectedPeerBusy,
+                OtherSource,
+            ),
+            (
+                "Too many megabytes today",
+                TransferRejectedPeerBusy,
+                OtherSource,
+            ),
+            (
+                "Too many files this week",
+                TransferRejectedPeerBusy,
+                OtherSource,
+            ),
+            (
+                "Too many megabytes this week",
+                TransferRejectedPeerBusy,
+                OtherSource,
+            ),
+            (
+                "Too many failed transfers today",
+                TransferRejectedFailureLimit,
+                OtherSource,
+            ),
+            (
+                "Too many failed transfers this week",
+                TransferRejectedFailureLimit,
+                OtherSource,
+            ),
+            ("Banned", TransferRejectedOther, OtherSource),
+            ("Banned (no leechers)", TransferRejectedOther, OtherSource),
+            ("Cancelled", TransferRejectedOther, OtherSource),
+            ("Pending shutdown.", TransferRejectedOther, OtherSource),
+            ("File read error.", TransferRejectedOther, OtherSource),
+            (
+                "Enqueue failed due to internal error",
+                TransferRejectedOther,
+                OtherSource,
+            ),
+            ("Disallowed extension", TransferRejectedOther, OtherSource),
+        ] {
+            for exception in [format!("Transfer rejected: {reason}"), reason.to_string()] {
+                let row = converted(json!("Completed, Rejected"), Some(&exception));
+                let f = row.failure.clone().expect("a failure");
+                assert_eq!((f.code, f.retry), (code, retry), "{exception:?}");
+                assert_eq!(f.stage, Stage::Transfer);
+                assert_eq!(row.error.as_deref(), Some(exception.as_str()));
+                assert_eq!(row.state, DS::Failed(exception.clone()));
+                assert_eq!(f.cause.map(|c| c.raw), Some(exception));
+            }
+        }
+
+        let bare = converted(json!(528u64), None);
+        let f = bare.failure.expect("a failure");
+        assert_eq!((f.code, f.retry), (TransferRejectedOther, OtherSource));
+        assert_eq!(f.cause, None);
+        assert_eq!(bare.error.as_deref(), Some("Transfer rejected by peer"));
+        assert_eq!(bare.state, DS::Failed("Transfer rejected by peer".into()));
+    }
+
+    #[test]
+    fn failed_transfers_keep_the_exception_as_their_message_else_the_state_text() {
+        let closed = "Transfer failed: The connection was closed unexpectedly";
+        let dropped = converted(json!("Completed, Errored"), Some(closed));
+        let f = dropped.failure.expect("a failure");
+        assert_eq!(
+            (f.code, f.stage, f.retry),
+            (
+                FailureCode::TransferConnectionFailed,
+                Stage::Transfer,
+                RetryAdvice::OtherSource
+            )
+        );
+        assert_eq!(f.cause.map(|c| c.raw).as_deref(), Some(closed));
+        assert_eq!(dropped.error.as_deref(), Some(closed));
+        assert_eq!(dropped.state, DS::Failed(closed.into()));
+
+        // Was None on origin/master: the visible change decided under table A.
+        let bare = converted(json!("Completed, Errored"), None);
+        assert_eq!(bare.error.as_deref(), Some("Download error"));
+        assert_eq!(bare.state, DS::Failed("Download error".into()));
+        assert_eq!(bare.failure.expect("a failure").cause, None);
+
+        // slskd restarted mid-transfer: the peer itself is fine.
+        let restart = converted(json!("Completed, Errored"), Some("Application shut down"))
+            .failure
+            .expect("a failure");
+        assert_eq!(
+            (restart.code, restart.retry),
+            (
+                FailureCode::TransferConnectionFailed,
+                RetryAdvice::SameSourceLater
+            )
+        );
+
+        let offline = converted(json!(272u64), Some("User peer appears to be offline"))
+            .failure
+            .expect("a failure");
+        assert_eq!(
+            (offline.code, offline.stage, offline.retry),
+            (
+                FailureCode::PeerOffline,
+                Stage::Transfer,
+                RetryAdvice::OtherSource
+            )
+        );
+
+        let mismatch = converted(
+            json!("Completed, Aborted"),
+            Some("Transfer aborted: the remote size of 12 does not match expected size 10"),
+        )
+        .failure
+        .expect("a failure");
+        assert_eq!(
+            (mismatch.code, mismatch.retry),
+            (FailureCode::TransferSizeMismatch, RetryAdvice::OtherSource)
+        );
+        let aborted = converted(json!(1040u64), None);
+        assert_eq!(aborted.error.as_deref(), Some("Aborted"));
+        let f = aborted.failure.expect("a failure");
+        assert_eq!(
+            (f.code, f.retry),
+            (FailureCode::TransferAborted, RetryAdvice::OtherSource)
+        );
+
+        let waited = "The wait timed out after 15000 milliseconds";
+        let timed_out = converted(json!("Completed, TimedOut"), Some(waited));
+        assert_eq!(timed_out.error.as_deref(), Some(waited));
+        let f = timed_out.failure.expect("a failure");
+        assert_eq!(
+            (f.code, f.retry),
+            (FailureCode::TransferTimedOut, RetryAdvice::OtherSource)
+        );
+        assert_eq!(
+            converted(json!(144u64), None).error.as_deref(),
+            Some("Download timed out")
+        );
+
+        let cancelled = converted(
+            json!("Completed, Cancelled"),
+            Some("The operation was canceled."),
+        );
+        assert_eq!(cancelled.state, DS::Cancelled);
+        assert_eq!(
+            cancelled.error.as_deref(),
+            Some("The operation was canceled.")
+        );
+        let f = cancelled.failure.expect("a failure");
+        assert_eq!(
+            (f.code, f.retry),
+            (FailureCode::TransferCancelled, RetryAdvice::NotRetryable)
+        );
+        let bare_cancel = converted(json!(80u64), None);
+        assert_eq!(bare_cancel.state, DS::Cancelled);
+        assert_eq!(bare_cancel.error.as_deref(), Some("Cancelled"));
+
+        // Not a state slskd sends; Soulful's parser accepts it.
+        let import = converted(json!("ImportFailed"), None);
+        assert_eq!(import.error.as_deref(), Some("Import failed"));
+        let f = import.failure.expect("a failure");
+        assert_eq!(
+            (f.code, f.stage, f.retry),
+            (
+                FailureCode::ImportBeetsFailed,
+                Stage::Import,
+                RetryAdvice::SameSourceLater
+            )
+        );
+    }
+
+    #[test]
+    fn a_succeeded_transfer_keeps_no_failure_from_an_earlier_attempt() {
+        let row = converted(
+            json!("Completed, Succeeded"),
+            Some("Transfer failed: The connection was closed unexpectedly"),
+        );
+        assert_eq!(row.state, DS::Completed);
+        assert_eq!(row.failure, None);
+        assert_eq!(row.error, None);
+    }
+
+    /// slskd's retry writes `Queued, Locally` but leaves the failed
+    /// attempt's exception on the record until the next attempt starts.
+    #[test]
+    fn a_transfer_waiting_to_retry_keeps_no_failure_from_the_failed_attempt() {
+        let row = converted(
+            json!("Queued, Locally"),
+            Some("Transfer failed: The connection was closed unexpectedly"),
+        );
+        assert_eq!(row.state, DS::Queued);
+        assert_eq!(row.failure, None);
+        assert_eq!(row.error, None);
     }
 
     /// A verbatim `GET /api/v0/transfers/downloads` payload as slskd 0.26.0
