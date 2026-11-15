@@ -2,7 +2,9 @@
 
 use super::unlink::FileId;
 use super::{not_a_track, path_unresolved};
+use crate::auth::UserId;
 use crate::core::database_failure;
+use crate::folder_policy::PolicyRows;
 use crate::models::navidrome_library::NavidromeLibraryRow;
 use shared::failure::{Failure, Service, Stage};
 use soulbeet::navidrome::models::NativeSong;
@@ -41,6 +43,55 @@ pub(super) async fn local_file_in(
     song: &NativeSong,
     music_path: Option<&Path>,
 ) -> Result<(PathBuf, FileId), Failure> {
+    file_under_root(db, song, music_path).await?
+}
+
+/// local_file_in, and when no file is found under the song's root (none is learned, or the
+/// learned one does not hold it) and that root is not `music_path`'s, learns the root from the
+/// files the folders of `owner` that resolve may hold for the song (learn_from_folders) and
+/// looks again. With no proof the first answer stands.
+pub(super) async fn local_file_learning(
+    db: &SqlitePool,
+    song: &NativeSong,
+    music_path: Option<&Path>,
+    owner: &UserId,
+) -> Result<(PathBuf, FileId), Failure> {
+    let no_file = match file_under_root(db, song, music_path).await? {
+        Ok(found) => return Ok(found),
+        Err(no_file) => no_file,
+    };
+    if music_path.is_some() && song.library_id == DEFAULT_LIBRARY_ID {
+        return Err(no_file);
+    }
+    let (folders, _) = PolicyRows::load_in(db)
+        .await
+        .map_err(|e| database_failure(Stage::Delete, e))?
+        .inputs();
+    let owner = owner.to_string();
+    let owned: Vec<&Path> = folders
+        .iter()
+        .filter(|f| f.user_id == owner)
+        .filter_map(|f| f.path.as_deref().ok())
+        .collect();
+    match learn_from_folders(db, song, &owned).await {
+        Ok(true) => local_file_in(db, song, music_path).await,
+        Ok(false) => Err(no_file),
+        Err(e) => {
+            warn!(
+                "Could not learn where Navidrome library {} ({}) is on this machine from song {}: {e}",
+                song.library_id, song.library_path, song.id
+            );
+            Err(no_file)
+        }
+    }
+}
+
+/// local_file_in's checks: Err for a refusal, Ok(Err) when no file is under the song's root.
+async fn file_under_root(
+    db: &SqlitePool,
+    song: &NativeSong,
+    music_path: Option<&Path>,
+) -> Result<Result<(PathBuf, FileId), Failure>, Failure> {
     if song.missing {
         return Err(path_unresolved(
             "Navidrome lists the file of this song as missing",
@@ -56,17 +107,24 @@ pub(super) async fn local_file_in(
             e.to_string(),
         )
     };
-    let canonical_root = tokio::fs::canonicalize(&root).await.map_err(no_file)?;
-    let canonical = tokio::fs::canonicalize(&local).await.map_err(no_file)?;
+    let canonical_root = match tokio::fs::canonicalize(&root).await {
+        Ok(canonical) => canonical,
+        Err(e) => return Ok(Err(no_file(e))),
+    };
+    let canonical = match tokio::fs::canonicalize(&local).await {
+        Ok(canonical) => canonical,
+        Err(e) => return Ok(Err(no_file(e))),
+    };
     if canonical != canonical_root.join(relative) {
         return Err(path_unresolved(format!(
             "Navidrome's path for this song passes through a symbolic link: {}",
             song.path
         )));
     }
-    let meta = tokio::fs::symlink_metadata(&canonical)
-        .await
-        .map_err(no_file)?;
+    let meta = match tokio::fs::symlink_metadata(&canonical).await {
+        Ok(meta) => meta,
+        Err(e) => return Ok(Err(no_file(e))),
+    };
     if !meta.is_file() {
         return Err(not_a_track(format!(
             "{} is not a regular file",
@@ -81,7 +139,7 @@ pub(super) async fn local_file_in(
             song.size
         )));
     }
-    Ok((canonical, FileId::of(&meta)))
+    Ok(Ok((canonical, FileId::of(&meta))))
 }
 
 /// Whether `song`'s path on this machine, found as local_file_in finds it, is the canonical
@@ -213,49 +271,126 @@ pub(crate) async fn learn_in(
     Ok(learned)
 }
 
-/// Learns `song`'s library root from `local`: when `local` is a regular file of `song.size`
-/// bytes, with the modification time Navidrome read for `song` (`updated_at`), that ends with
-/// `song.path` by whole components, the part before is the root, and the root's canonical path
-/// joined with `song.path` must be the canonical `local` (no link below the root, as
-/// local_file_in refuses one). The modification time tells the imported file from another of
-/// its size whose path ends like it (another user's copy of the release, listed before
-/// Navidrome lists the import), which would give a root one level too deep: a copy is written
-/// at another time. A root already stored for the same Navidrome path
-/// is replaced only when it no longer resolves here; one that resolves to another directory
-/// means one of the two was learned from another file, so both are forgotten and the conflict
-/// is logged. Ok(true) when a root is stored or already known.
+/// Learns `song`'s library root from `local` (proven_root), storing it (store_root). Ok(true)
+/// when a root is stored or already known.
 async fn learn_one(db: &SqlitePool, song: &NativeSong, local: &Path) -> Result<bool, String> {
+    match proven_root(song, local).await? {
+        Some(proven) => store_root(db, song, &proven).await,
+        None => Ok(false),
+    }
+}
+
+/// Learns `song`'s library root from the files `folders` (canonical folders of one user) may
+/// hold for it: each folder joined with `song.path`, and with what follows each leading part
+/// of `song.path` the folder's path ends with (a folder inside Navidrome's library). Those
+/// that are there are taken through proven_root, and only when exactly one root is proven
+/// is it stored (store_root): two files that each prove a root may each be the song's.
+/// Ok(true) when a root is stored or already known.
+async fn learn_from_folders(
+    db: &SqlitePool,
+    song: &NativeSong,
+    folders: &[&Path],
+) -> Result<bool, String> {
     let Some(relative) = inside(&song.path) else {
         return Ok(false);
     };
+    let parts: Vec<Component> = relative.components().collect();
+    let mut proven: Vec<Proven> = Vec::new();
+    for folder in folders {
+        for skipped in 0..parts.len() {
+            let leading: PathBuf = parts[..skipped].iter().collect();
+            if !folder.ends_with(&leading) {
+                continue;
+            }
+            let local = parts[skipped..]
+                .iter()
+                .fold(folder.to_path_buf(), |path, part| path.join(part));
+            match tokio::fs::symlink_metadata(&local).await {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue
+                }
+                _ => {}
+            }
+            if let Some(found) = proven_root(song, &local).await? {
+                if !proven
+                    .iter()
+                    .any(|p| p.canonical_root == found.canonical_root)
+                {
+                    proven.push(found);
+                }
+            }
+        }
+    }
+    match proven.as_slice() {
+        [one] => store_root(db, song, one).await,
+        _ => Ok(false),
+    }
+}
+
+/// A library root a file proves: as `local` is written, and canonical.
+struct Proven {
+    root: PathBuf,
+    canonical_root: PathBuf,
+    local: PathBuf,
+}
+
+/// The root of `song`'s library that `local` proves: when `local` is a regular file of
+/// `song.size` bytes, with the modification time Navidrome read for `song` (`updated_at`), that
+/// ends with `song.path` by whole components, the part before is the root, and the root's
+/// canonical path joined with `song.path` must be the canonical `local` (no link below the
+/// root, as local_file_in refuses one). The modification time tells the imported file from
+/// another of its size whose path ends like it (another user's copy of the release, listed
+/// before Navidrome lists the import), which would give a root one level too deep: a copy is
+/// written at another time.
+async fn proven_root(song: &NativeSong, local: &Path) -> Result<Option<Proven>, String> {
+    let Some(relative) = inside(&song.path) else {
+        return Ok(None);
+    };
     if !local.is_absolute() || !local.ends_with(relative) {
-        return Ok(false);
+        return Ok(None);
     }
     let unreadable = |e: std::io::Error| format!("{}: {e}", local.display());
     let file = tokio::fs::symlink_metadata(local)
         .await
         .map_err(unreadable)?;
     if !file.is_file() || file.len() != song.size {
-        return Ok(false);
+        return Ok(None);
     }
     let modified = file.modified().map_err(unreadable)?;
     if chrono::DateTime::<chrono::Utc>::from(modified) != song.updated_at {
-        return Ok(false);
+        return Ok(None);
     }
     let kept = local.components().count() - relative.components().count();
     let root: PathBuf = local.components().take(kept).collect();
     let canonical = tokio::fs::canonicalize(local).await.map_err(unreadable)?;
     let canonical_root = tokio::fs::canonicalize(&root).await.map_err(unreadable)?;
     if canonical_root.join(relative) != canonical {
-        return Ok(false);
+        return Ok(None);
     }
-    let Some(local_path) = root.to_str() else {
-        return Err(format!("{} is not valid UTF-8", root.display()));
+    Ok(Some(Proven {
+        root,
+        canonical_root,
+        local: local.to_path_buf(),
+    }))
+}
+
+/// Stores `proven` as the root of `song`'s library. A root already stored for the same
+/// Navidrome path is replaced only when it no longer resolves here; one that resolves to
+/// another directory means one of the two was learned from another file, so both are forgotten
+/// and the conflict is logged. Ok(true) when the root is stored or already known.
+async fn store_root(db: &SqlitePool, song: &NativeSong, proven: &Proven) -> Result<bool, String> {
+    let Some(local_path) = proven.root.to_str() else {
+        return Err(format!("{} is not valid UTF-8", proven.root.display()));
     };
     let stored = NavidromeLibraryRow::get_in(db, song.library_id).await?;
     if let Some(row) = stored.filter(|row| row.navidrome_path == song.library_path) {
         match tokio::fs::canonicalize(&row.local_path).await {
-            Ok(known) if known == canonical_root => return Ok(true),
+            Ok(known) if known == proven.canonical_root => return Ok(true),
             Ok(_) => {
                 NavidromeLibraryRow::delete_in(db, song.library_id).await?;
                 warn!(
@@ -265,7 +400,7 @@ async fn learn_one(db: &SqlitePool, song: &NativeSong, local: &Path) -> Result<b
                     song.library_id,
                     song.library_path,
                     row.local_path,
-                    local.display(),
+                    proven.local.display(),
                     local_path
                 );
                 return Ok(false);

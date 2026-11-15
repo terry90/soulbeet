@@ -140,7 +140,7 @@ impl Guard<'_> {
                 rating: song.rating,
             });
         }
-        let (path, id) = paths::local_file_in(self.db, &song, self.music_path).await?;
+        let (path, id) = paths::local_file_learning(self.db, &song, self.music_path, actor).await?;
         for track in pending {
             if tokio::fs::canonicalize(&track.path)
                 .await
@@ -160,10 +160,12 @@ impl Guard<'_> {
     /// Checks the library item beets reported at `library.join(&item.path)`: its song is the
     /// first song of `actor`'s search for the item's tags whose path on this machine names the
     /// canonical file (paths::names_file), and that song's own refusal from local_file_in
-    /// stands. When no song names it, the refusal of a song is_imported_file takes for the item
-    /// but whose file cannot be found here says why, else Navidrome has no song for it. Then
-    /// check_resolved with `exempt_jobs`. A pending discovery track never holds a library item,
-    /// so this is Checked.
+    /// stands. When no song names it, the songs is_imported_file takes for the item teach where
+    /// their libraries are from the item's file, as an import's index lookup does
+    /// (paths::learn_in), and when one is learned the songs are asked again. When still none
+    /// names it, the refusal of a song is_imported_file takes for the item but whose file cannot
+    /// be found here says why, else Navidrome has no song for it. Then check_resolved with
+    /// `exempt_jobs`. A pending discovery track never holds a library item, so this is Checked.
     pub async fn check_file(
         &self,
         actor: &UserId,
@@ -192,26 +194,56 @@ impl Guard<'_> {
                     path.display()
                 ))
             })?;
-        let mut unfound = None;
-        for song in candidates {
-            if paths::names_file(self.db, &song, self.music_path, &path).await? {
-                let (file, id) = paths::local_file_in(self.db, &song, self.music_path).await?;
-                if file != path {
-                    return Err(changed_since_check());
+        let taken: Vec<NativeSong> = candidates
+            .iter()
+            .filter(|song| crate::core::index::is_imported_file(song, &item.path, size))
+            .cloned()
+            .collect();
+        let mut named = self.song_naming(&candidates, &path).await?;
+        if named.is_none() && !taken.is_empty() {
+            match paths::learn_in(self.db, &taken, &reported).await {
+                Ok(learned) if !learned.is_empty() => {
+                    named = self.song_naming(&candidates, &path).await?;
                 }
-                return self
-                    .check_resolved(actor, song, path, id, exempt_jobs)
-                    .await;
-            }
-            if unfound.is_none() && crate::core::index::is_imported_file(&song, &item.path, size) {
-                unfound = paths::local_file_in(self.db, &song, self.music_path)
-                    .await
-                    .err();
+                Ok(_) => {}
+                Err(e) => warn!(
+                    "Could not learn where Navidrome's libraries are on this machine from {}: {e}",
+                    reported.display()
+                ),
             }
         }
-        Err(unfound.unwrap_or_else(|| {
-            path_unresolved(format!("Navidrome has no song for {}", path.display()))
-        }))
+        if let Some(song) = named {
+            let (file, id) = paths::local_file_in(self.db, song, self.music_path).await?;
+            if file != path {
+                return Err(changed_since_check());
+            }
+            return self
+                .check_resolved(actor, song.clone(), path, id, exempt_jobs)
+                .await;
+        }
+        // The first song taken for the item that has no file here says why.
+        for song in &taken {
+            paths::local_file_in(self.db, song, self.music_path).await?;
+        }
+        Err(path_unresolved(format!(
+            "Navidrome has no song for {}",
+            path.display()
+        )))
+    }
+
+    /// The first of `candidates` whose path on this machine names the canonical file `path`
+    /// (paths::names_file).
+    async fn song_naming<'s>(
+        &self,
+        candidates: &'s [NativeSong],
+        path: &Path,
+    ) -> Result<Option<&'s NativeSong>, Failure> {
+        for song in candidates {
+            if paths::names_file(self.db, song, self.music_path, path).await? {
+                return Ok(Some(song));
+            }
+        }
+        Ok(None)
     }
 
     /// Rules 1, 2, 5, the one-song check, 3 and 4, in that order, for `path`, the canonical
@@ -1664,6 +1696,115 @@ mod tests {
         assert_eq!(lib.fake.ratings_set(), vec![]);
     }
 
+    /// Library 1 as Navidrome mounts it, at a path this machine does not have.
+    const NAVIDROME_MOUNT: &str = "/srv/navidrome/music";
+
+    /// Song s1 as Navidrome lists it under NAVIDROME_MOUNT, its file modified at `updated_at`
+    /// by Navidrome's reading.
+    fn mounted_elsewhere(lib: &Library, updated_at: chrono::DateTime<chrono::Utc>) {
+        lib.fake.file(
+            NativeSong {
+                library_path: NAVIDROME_MOUNT.into(),
+                updated_at,
+                ..lib.record("s1")
+            },
+            "al1",
+        );
+    }
+
+    /// The root stored for library 1, if any.
+    async fn learned_root(lib: &Library) -> Option<String> {
+        crate::models::navidrome_library::NavidromeLibraryRow::get_in(&lib.db, 1)
+            .await
+            .unwrap()
+            .map(|row| row.local_path)
+    }
+
+    #[tokio::test]
+    async fn a_root_no_import_taught_is_learned_by_the_check_that_needs_it() {
+        // Navidrome mounts the music elsewhere, and no import has taught where: the check
+        // finds alice's file for s1 in her folder, proves it, learns the root and goes on.
+        let lib = Library::new().await;
+        mounted_elsewhere(&lib, test_support::mtime());
+        lib.fake.rates("alice", "s1", 1);
+        let checked = library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+        assert_eq!(checked.path, canonical(&lib, "music/alice/A/x.flac"));
+        assert_eq!(
+            learned_root(&lib).await,
+            Some(lib.root.join("music").to_string_lossy().into_owned())
+        );
+
+        // A replacement's earlier copy teaches it the same way, from the item's own file.
+        let lib = Library::new().await;
+        mounted_elsewhere(&lib, test_support::mtime());
+        lib.fake.rates("alice", "s1", 1);
+        let item = ImportedItem {
+            path: "A/x.flac".into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+        };
+        let checked = lib
+            .guard()
+            .check_file(&lib.alice(), &item, &lib.root.join("music/alice"), &[])
+            .await
+            .unwrap();
+        assert_eq!(checked.path, canonical(&lib, "music/alice/A/x.flac"));
+        assert_eq!(
+            learned_root(&lib).await,
+            Some(lib.root.join("music").to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_root_the_file_cannot_prove_is_not_learned_and_the_check_refuses() {
+        let no_file = (
+            FailureCode::DeletePathUnresolved,
+            format!("No file at {NAVIDROME_MOUNT}/alice/A/x.flac"),
+        );
+        // Navidrome read an earlier write of the file: another modification time.
+        let earlier: chrono::DateTime<chrono::Utc> =
+            "2026-10-03T21:14:09.583201447Z".parse().unwrap();
+        let lib = Library::new().await;
+        mounted_elsewhere(&lib, earlier);
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
+            no_file
+        );
+        let item = ImportedItem {
+            path: "A/x.flac".into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+        };
+        let f = lib
+            .guard()
+            .check_file(&lib.alice(), &item, &lib.root.join("music/alice"), &[])
+            .await
+            .unwrap_err();
+        assert_eq!((f.code, f.message), no_file);
+        assert_eq!(learned_root(&lib).await, None);
+
+        // Two of alice's folders each hold a file that proves a root (a copy that kept its
+        // times): either may be the song's, so neither is learned.
+        let lib = Library::new().await;
+        mounted_elsewhere(&lib, test_support::mtime());
+        lib.folder("alice", "alice-backup", "backup/alice", false)
+            .await;
+        let copy = lib.root.join("backup/alice/A/x.flac");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::write(&copy, b"audio").unwrap();
+        test_support::set_mtime(&copy, test_support::mtime());
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
+            no_file
+        );
+        assert_eq!(learned_root(&lib).await, None);
+        assert_eq!(lib.fake.ratings_set(), vec![]);
+    }
+
     #[tokio::test]
     async fn another_users_song_that_links_to_the_file_is_the_same_file() {
         // Navidrome follows links and lists bob's link as a song of its own.
@@ -2356,10 +2497,12 @@ mod tests {
                 (FailureCode::DeletePathUnresolved, expected)
             );
         }
-        // A song taken for the item whose library is not on this machine says so.
+        // A song taken for the item whose library is not on this machine, and whose root the
+        // item's file cannot prove (Navidrome read another modification time), says so.
         lib.fake.file(
             NativeSong {
                 library_path: lib.root.join("elsewhere").to_string_lossy().into_owned(),
+                updated_at: "2026-10-03T21:14:09.583201447Z".parse().unwrap(),
                 ..s1
             },
             "al1",
