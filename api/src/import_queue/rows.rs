@@ -76,14 +76,11 @@ fn import_failure(result: &ImportResult) -> Option<Failure> {
     Some(failure)
 }
 
+/// `rows` in a state on the way to an outcome, with no earlier failure,
+/// skip or failure note left on them.
 pub fn rows_with_state(rows: &[DownloadProgress], state: DownloadState) -> Vec<DownloadProgress> {
     rows.iter()
-        .map(|row| DownloadProgress {
-            state: state.clone(),
-            failure: None,
-            skip: None,
-            ..row.clone()
-        })
+        .map(|row| row.clone().without_failure().with_state(state.clone()))
         .collect()
 }
 
@@ -529,6 +526,9 @@ mod tests {
             ..row("a").with_failure(earlier)
         };
         let rows = rows_with_state(&[stale], DownloadState::Importing);
-        assert_eq!((&rows[0].failure, rows[0].skip), (&None, None));
+        assert_eq!(
+            (&rows[0].failure, rows[0].skip, &rows[0].error),
+            (&None, None, &None)
+        );
     }
 }

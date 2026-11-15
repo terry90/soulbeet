@@ -1,6 +1,6 @@
 use dioxus::logger::tracing::{info, warn};
 use shared::download::{DownloadProgress, DownloadState};
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction};
 use soulbeet::{DriverChoice, ImportMode};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -68,15 +68,24 @@ pub async fn resolve_on_disk(
 /// Row text for a finished download whose file was not found on disk.
 const UNRESOLVED: &str = "Could not resolve file path";
 
-/// The Failed row of a finished download whose file was not found.
-pub fn unresolved_row(row: DownloadProgress) -> DownloadProgress {
-    row.with_state(DownloadState::Failed(UNRESOLVED.into()))
-        .with_failure(Failure::new(
-            FailureCode::FileNotFoundAfterDownload,
-            Stage::FileLookup,
-            RetryAdvice::SameSourceLater,
-            UNRESOLVED,
-        ))
+/// The Failed row of a finished download whose file was not found under
+/// `base`, the download folder.
+///
+/// The backend reported the file complete and `resolve_on_disk` already
+/// waited out a slow mount, so the file is not where Soulful looks: the
+/// backend saves somewhere else than `base` shows, or Soulful cannot read
+/// there. Downloading it again ends the same way until a person fixes that.
+pub fn unresolved_row(row: DownloadProgress, base: &Path) -> DownloadProgress {
+    row.with_state(DownloadState::Failed(String::new()))
+        .with_failure(
+            Failure::new(
+                FailureCode::FileNotFoundAfterDownload,
+                Stage::FileLookup,
+                RetryAdvice::NotRetryable,
+                UNRESOLVED,
+            )
+            .with_user_action(UserAction::fix_download_path(base)),
+        )
 }
 
 /// A finished slot whose file was found on disk. `destination` is the batch
@@ -152,10 +161,11 @@ pub fn album_jobs(
 mod tests {
     use super::*;
     use crate::import_queue::test_support::row;
+    use shared::failure::UserActionCode;
 
     #[test]
     fn unresolved_row_fails_with_file_not_found_after_download() {
-        let failed = unresolved_row(row("a"));
+        let failed = unresolved_row(row("a"), Path::new("/downloads"));
 
         assert_eq!(failed.state, DownloadState::Failed(UNRESOLVED.into()));
         assert_eq!(failed.error.as_deref(), Some(UNRESOLVED));
@@ -165,10 +175,13 @@ mod tests {
             (
                 FailureCode::FileNotFoundAfterDownload,
                 Stage::FileLookup,
-                RetryAdvice::SameSourceLater,
+                RetryAdvice::NotRetryable,
                 UNRESOLVED
             )
         );
+        let action = f.user_action.expect("a person fixes the download folder");
+        assert_eq!(action.code, UserActionCode::FixDownloadPath);
+        assert!(action.what.contains("/downloads"), "{}", action.what);
     }
 
     #[test]

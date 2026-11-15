@@ -1252,7 +1252,7 @@ impl DownloadMonitor {
                 }
                 None => {
                     self.settle(slot, SlotPhase::Settled, backend.id());
-                    missing.push(unresolved_row(row));
+                    missing.push(unresolved_row(row, &self.download_base));
                 }
             }
         }
@@ -1337,7 +1337,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
     else {
         send_user_event(
             &h.owner.user_id,
-            DownloadEvent::Progress(vec![unresolved_row(h.row)]),
+            DownloadEvent::Progress(vec![unresolved_row(h.row, &h.download_base)]),
         )
         .await;
         registry.release(&h.key, &h.owner);
