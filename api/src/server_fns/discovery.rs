@@ -416,11 +416,11 @@ async fn settle_poll(
                 let next = qt.pool.enqueue_next(0, backend, &qt.batch).await;
                 for refused in &next.refused {
                     warn!(
-                        "Discovery: '{}' - {} failover source {} refused: {:?}: {}",
+                        "Discovery: '{}' - {} failover source {} refused: {}: {}",
                         qt.artist,
                         qt.track,
                         refused.source,
-                        refused.failure.code,
+                        refused.failure.code.as_str(),
                         refused.failure.message
                     );
                 }

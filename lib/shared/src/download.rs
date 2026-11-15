@@ -227,6 +227,17 @@ impl DownloadProgress {
         self
     }
 
+    /// This row with no failure and no skip, and without the note when
+    /// `with_failure` wrote it. A note with no failure, the one on an
+    /// imported row, stays.
+    pub fn without_failure(mut self) -> Self {
+        if self.failure.take().is_some() {
+            self.error = None;
+        }
+        self.skip = None;
+        self
+    }
+
     pub fn with_backend(mut self, backend: impl Into<String>) -> Self {
         self.backend = Some(backend.into());
         self
@@ -479,18 +490,59 @@ mod tests {
     }
 
     #[test]
-    fn skip_kind_round_trips() {
-        let k = SkipKind::NoMatch {
-            candidates: Some(2),
+    fn without_failure_drops_the_failure_its_note_and_the_skip() {
+        let f = Failure::new(
+            FailureCode::ImportNoMatch,
+            Stage::Import,
+            RetryAdvice::NeedsDecision,
+            "No close match",
+        );
+        let skipped = DownloadProgress {
+            skip: Some(SkipKind::NoMatch { candidates: None }),
+            ..DownloadProgress::queued("1".into(), "p".into(), "a.flac".into(), 1)
+                .with_state(DownloadState::ImportSkipped)
+                .with_failure(f)
         };
+        let cleared = skipped.without_failure();
         assert_eq!(
-            serde_json::to_value(k).unwrap(),
-            serde_json::json!({"no_match": {"candidates": 2}})
+            (&cleared.failure, cleared.skip, &cleared.error),
+            (&None, None, &None)
         );
-        assert_eq!(
-            serde_json::to_value(SkipKind::AlreadyInLibrary).unwrap(),
-            serde_json::json!("already_in_library")
-        );
+
+        let note = "Imported as-is (untagged)";
+        let imported = DownloadProgress {
+            error: Some(note.into()),
+            ..DownloadProgress::queued("1".into(), "p".into(), "a.flac".into(), 1)
+                .with_state(DownloadState::Imported)
+        };
+        assert_eq!(imported.without_failure().error.as_deref(), Some(note));
+    }
+
+    #[test]
+    fn skip_kind_round_trips() {
+        for (kind, wire) in [
+            (
+                SkipKind::NoMatch {
+                    candidates: Some(2),
+                },
+                serde_json::json!({"no_match": {"candidates": 2}}),
+            ),
+            (
+                SkipKind::NoMatch { candidates: None },
+                serde_json::json!({"no_match": {"candidates": null}}),
+            ),
+            (
+                SkipKind::AlreadyInLibrary,
+                serde_json::json!("already_in_library"),
+            ),
+            (
+                SkipKind::NothingToImport,
+                serde_json::json!("nothing_to_import"),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<SkipKind>(wire).unwrap(), kind);
+        }
     }
 
     #[test]

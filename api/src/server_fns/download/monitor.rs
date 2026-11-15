@@ -467,11 +467,11 @@ impl DownloadMonitor {
         let next = pool.enqueue_next(slot, backend, &self.batch).await;
         for refused in &next.refused {
             warn!(
-                "Failover source {} refused {} for {}: {:?}: {}",
+                "Failover source {} refused {} for {}: {}: {}",
                 refused.source,
                 refused.item,
                 self.tracked_files[slot].filename,
-                refused.failure.code,
+                refused.failure.code.as_str(),
                 refused.failure.message
             );
         }
