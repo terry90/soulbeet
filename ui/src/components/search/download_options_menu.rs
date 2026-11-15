@@ -90,7 +90,7 @@ pub fn FolderDropdown(props: FolderDropdownProps) -> Element {
                                     }
                                 }
                             }
-                            span { class: "truncate", "{truncate_name(&folder.name, 20)}" }
+                            span { class: "truncate", title: "{folder.name}", "{truncate_name(&folder.name, 20)}" }
                         }
                     }
                 }
