@@ -10,7 +10,7 @@ use soulbeet::DownloadBackend;
 use std::sync::Arc;
 
 use crate::transfer_registry::{
-    AddedSlot, BatchRef, InboxReservation, RequestClaim, TransferKey, TransferRegistry,
+    AddedSlot, BatchRef, Claim, InboxReservation, RequestClaim, TransferKey, TransferRegistry,
 };
 use tracing::warn;
 
@@ -21,7 +21,8 @@ pub const ALREADY_IN_SLSKD: &str = "already downloading in slskd";
 /// Refusal for a request whose files the same user is already downloading
 /// into another library folder.
 pub const ANOTHER_FOLDER: &str = "already downloading into another folder";
-/// Log text for a file the same user's batch is already downloading.
+/// Reason for a file the same user's batch is already downloading into the
+/// same folder.
 pub const ALREADY_MINE: &str = "already downloading for this user";
 /// Row text for a file that joined a batch whose monitor had stopped.
 pub const MONITOR_STOPPED: &str = "Download monitoring stopped";
@@ -103,6 +104,35 @@ pub fn failed_reason(status: &EnqueueStatus) -> Option<Failure> {
         EnqueueStatus::Failed(reason) => Some(reason.clone()),
         EnqueueStatus::AlreadyInFlight(cause) => Some(already_in_slskd(cause)),
         EnqueueStatus::Enqueued | EnqueueStatus::AlreadyRunning => None,
+    }
+}
+
+/// Why none of `results` was enqueued: the first failed file's failure, else
+/// `nothing enqueued` for a backend that answered nothing for its files.
+pub fn not_enqueued_failure(results: &[QueuedDownload]) -> Failure {
+    results
+        .iter()
+        .find_map(|q| failed_reason(&q.status))
+        .unwrap_or_else(|| {
+            Failure::new(
+                FailureCode::EnqueueFailed,
+                Stage::Enqueue,
+                RetryAdvice::OtherSource,
+                NOTHING_ENQUEUED,
+            )
+        })
+}
+
+/// Why `batch` could not claim its one key, when `claim` found it held:
+/// by another user, by the same user into another folder, or by the same
+/// user into this one.
+pub fn held_failure(claim: &Claim, batch: &BatchRef) -> Failure {
+    if !claim.other_user.is_empty() {
+        other_user()
+    } else if claim.mine[0].1.target != batch.target {
+        another_folder(RetryAdvice::OtherSource)
+    } else {
+        already_running()
     }
 }
 
@@ -385,6 +415,52 @@ mod tests {
             );
         }
         assert_eq!(already_in_slskd(&in_backend).cause, Some(in_backend));
+    }
+
+    #[test]
+    fn a_request_left_unenqueued_names_the_first_files_reason() {
+        let answer = |status| QueuedDownload {
+            id: "01.flac".into(),
+            source: "peer_a".into(),
+            item: "01.flac".into(),
+            size: 0,
+            status,
+        };
+        let offline = Failure::new(
+            FailureCode::PeerOffline,
+            Stage::Enqueue,
+            RetryAdvice::OtherSource,
+            "User 'peer_a' is offline",
+        );
+        assert_eq!(
+            not_enqueued_failure(&[
+                answer(EnqueueStatus::AlreadyRunning),
+                answer(EnqueueStatus::Failed(offline.clone())),
+            ]),
+            offline
+        );
+        let in_flight = Cause::new(Service::Slskd, None, STUB_IN_FLIGHT);
+        assert_eq!(
+            not_enqueued_failure(&[answer(EnqueueStatus::AlreadyInFlight(in_flight.clone()))]),
+            already_in_slskd(&in_flight)
+        );
+
+        let nothing = not_enqueued_failure(&[]);
+        assert_eq!(
+            (
+                nothing.code,
+                nothing.stage,
+                nothing.retry,
+                nothing.message.as_str()
+            ),
+            (
+                FailureCode::EnqueueFailed,
+                Stage::Enqueue,
+                RetryAdvice::OtherSource,
+                NOTHING_ENQUEUED
+            )
+        );
+        assert_eq!(nothing.cause, None);
     }
 
     #[tokio::test]

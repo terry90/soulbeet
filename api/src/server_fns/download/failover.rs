@@ -8,17 +8,14 @@
 //! decide *when* a transfer has definitively failed.
 
 use shared::download::{DownloadableGroup, DownloadableItem, EnqueueStatus, QueuedDownload};
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+use shared::failure::{Failure, Stage};
 use soulbeet::DownloadBackend;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tracing::info;
 
-use super::enqueue::{
-    already_running, another_folder, enqueue_claimed, failed_reason, other_user, transfer_key,
-    NOTHING_ENQUEUED,
-};
-use crate::transfer_registry::{BatchRef, Claim, TransferRegistry};
+use super::enqueue::{enqueue_claimed, held_failure, not_enqueued_failure, transfer_key};
+use crate::transfer_registry::{BatchRef, TransferRegistry};
 
 /// Sources tried per track before it is declared failed: the peer picked at
 /// search time plus three alternates. slskd retries each peer 3 times on its
@@ -40,17 +37,6 @@ pub struct NextSource {
     pub queued: Option<QueuedDownload>,
     /// Every alternate refused before it, in the order tried.
     pub refused: Vec<RefusedAlternate>,
-}
-
-/// Why `batch` could not claim its one key: `claim` found it held.
-fn held_failure(claim: &Claim, batch: &BatchRef) -> Failure {
-    if !claim.other_user.is_empty() {
-        other_user()
-    } else if claim.mine[0].1.target != batch.target {
-        another_folder(RetryAdvice::OtherSource)
-    } else {
-        already_running()
-    }
 }
 
 /// Alternates and attempt budget for one track.
@@ -166,17 +152,7 @@ impl SourcePool {
                                 refused,
                             };
                         }
-                        queued
-                            .iter()
-                            .find_map(|d| failed_reason(&d.status))
-                            .unwrap_or_else(|| {
-                                Failure::new(
-                                    FailureCode::EnqueueFailed,
-                                    Stage::Enqueue,
-                                    RetryAdvice::OtherSource,
-                                    NOTHING_ENQUEUED,
-                                )
-                            })
+                        not_enqueued_failure(&queued)
                     }
                     Err(e) => e.failure(Stage::Enqueue, e.to_string()),
                 }
@@ -226,13 +202,13 @@ pub fn align_pool_tracks(
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use crate::server_fns::download::enqueue::{ALREADY_MINE, ANOTHER_FOLDER};
+    use crate::server_fns::download::enqueue::{ALREADY_MINE, ANOTHER_FOLDER, NOTHING_ENQUEUED};
     use crate::server_fns::download::test_support::{
         batch, group, item, key, same_user_into, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::download::DownloadableItem;
-    use shared::failure::FailureCode;
+    use shared::failure::{FailureCode, RetryAdvice};
     use soulbeet::DownloadBackend;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -752,6 +728,32 @@ mod tests {
                 ("peer_c", FailureCode::AlreadyRunning, ALREADY_MINE)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn an_alternate_the_backend_answers_nothing_for_is_refused_as_nothing_enqueued() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Unanswered]);
+
+        let next = pool.enqueue_next(0, &backend, &batch("X")).await;
+
+        assert!(next.queued.is_none());
+        let f = &next.refused[0].failure;
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::EnqueueFailed,
+                Stage::Enqueue,
+                RetryAdvice::OtherSource,
+                NOTHING_ENQUEUED
+            )
+        );
+        assert!(TransferRegistry::global()
+            .may_adopt(&key(&backend, "peer_b", "b.flac"), &batch("Y").owner));
     }
 
     #[tokio::test]

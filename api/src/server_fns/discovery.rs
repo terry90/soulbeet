@@ -48,7 +48,7 @@ use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
 use crate::server_fns::download::enqueue::{
-    enqueue_claimed, failed_reason, transfer_key, ALREADY_MINE, NOTHING_ENQUEUED, OTHER_USER,
+    enqueue_claimed, held_failure, not_enqueued_failure, transfer_key,
 };
 #[cfg(feature = "server")]
 use crate::server_fns::download::failover::{self, SourcePool};
@@ -758,17 +758,12 @@ pub async fn generate_discovery_playlist_internal(
                     let claim = TransferRegistry::global()
                         .claim(std::slice::from_ref(&transfer), &track_batch);
                     if claim.claimed.is_empty() {
-                        let owner = if claim.other_user.is_empty() {
-                            ALREADY_MINE
-                        } else {
-                            OTHER_USER
-                        };
                         info!(
                             "Download source {} skipped for '{}' - {}: {}",
                             attempt_idx + 1,
                             candidate.artist,
                             candidate.track,
-                            owner
+                            held_failure(&claim, &track_batch).message
                         );
                         stats.downloads_failed += 1;
                         continue;
@@ -828,17 +823,12 @@ pub async fn generate_discovery_playlist_internal(
                     // This source refused the file in its response
                     stats.downloads_failed += 1;
                     if attempt_idx + 1 < ranked_items.len() {
-                        let reason = download_results
-                            .iter()
-                            .find_map(|dl| failed_reason(&dl.status))
-                            .map(|f| f.message)
-                            .unwrap_or_else(|| NOTHING_ENQUEUED.to_string());
                         info!(
                             "Download source {} refused '{}' - {} ({}), trying next",
                             attempt_idx + 1,
                             candidate.artist,
                             candidate.track,
-                            reason
+                            not_enqueued_failure(&download_results).message
                         );
                     }
                 }

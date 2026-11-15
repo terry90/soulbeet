@@ -32,7 +32,8 @@ use crate::AuthSession;
 
 #[cfg(feature = "server")]
 use super::enqueue::{
-    another_folder, deliver, enqueue_request, failed_reason, stopped_rows, RequestEnqueue, Watcher,
+    another_folder, deliver, enqueue_request, failed_reason, not_enqueued_failure, stopped_rows,
+    RequestEnqueue, Watcher,
 };
 #[cfg(feature = "server")]
 use super::failover::{align_pool_tracks, SourcePool};
@@ -96,22 +97,10 @@ fn no_results_failure(stops: &[SearchStop]) -> Failure {
         .unwrap_or_else(empty)
 }
 
-/// Why no file of a request was queued: the first failed file's failure.
+/// Why no file of a request was queued, shown as the request's failure.
 #[cfg(feature = "server")]
 fn queue_failure(results: &[QueuedDownload]) -> Failure {
-    const MESSAGE: &str = "All downloads failed to queue";
-    results
-        .iter()
-        .find_map(|d| failed_reason(&d.status))
-        .map(|f| f.with_message(MESSAGE))
-        .unwrap_or_else(|| {
-            Failure::new(
-                FailureCode::EnqueueFailed,
-                Stage::Enqueue,
-                RetryAdvice::OtherSource,
-                MESSAGE,
-            )
-        })
+    not_enqueued_failure(results).with_message("All downloads failed to queue")
 }
 
 #[cfg(feature = "server")]

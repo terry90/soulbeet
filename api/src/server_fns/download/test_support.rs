@@ -92,11 +92,13 @@ pub const STUB_IN_FLIGHT: &str = "stub is already fetching this file";
 /// What a scripted `download` call does: accept the item (transfer id
 /// `t-{item.id}`), refuse it because the backend is already fetching it
 /// (cause `STUB_IN_FLIGHT`), accept the call but mark the item rejected
-/// (peer offline), or fail the call itself (transport error).
+/// (peer offline), accept the call but answer nothing for the item, or fail
+/// the call itself (transport error).
 pub enum ScriptedOutcome {
     Enqueued,
     AlreadyInFlight,
     Rejected,
+    Unanswered,
     TransportError,
 }
 
@@ -256,6 +258,7 @@ impl DownloadBackend for StubBackend {
                     "peer offline",
                 )),
             ),
+            ScriptedOutcome::Unanswered => Ok(Vec::new()),
             // An unreadable answer stands in for any failure of the call;
             // its meaning doesn't matter here, only that `download` itself
             // errors rather than returning an Ok with a rejected item.
