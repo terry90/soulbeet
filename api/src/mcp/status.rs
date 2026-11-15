@@ -1,12 +1,15 @@
 //! `get_status`: what Soulful can do for the user right now, read at once
 //! (D9).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use futures::future::join_all;
+use futures::future::{join_all, BoxFuture, Shared};
+use futures::FutureExt;
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{Failure, Stage};
@@ -25,6 +28,10 @@ use crate::transfer_registry::{RunningBatch, TransferRegistry};
 
 /// How long a folder's free space is waited for.
 const FREE_SPACE_WAIT: Duration = Duration::from_secs(2);
+
+/// What `FreeSpaceReads::read` answers when the read takes longer than its
+/// wait.
+const NO_ANSWER: &str = "no answer within 2 seconds";
 
 /// What the user's Navidrome account says, each read on its own.
 #[derive(Clone)]
@@ -75,13 +82,16 @@ impl StatusSource for LiveStatus {
             health,
             navidrome,
             folders: folders?,
-            // An empty id is a cleared choice (core::settings::check_folder_choices).
-            default_folder_id: settings?
-                .default_download_folder_id
-                .filter(|id| !id.is_empty()),
+            default_folder_id: chosen_folder(settings?.default_download_folder_id),
             running_batches: TransferRegistry::global().running_batches(&ctx.id()),
         })
     }
+}
+
+/// The folder a settings choice names: an empty id is a cleared choice
+/// (core::settings::check_folder_choices), so no folder.
+fn chosen_folder(id: Option<String>) -> Option<String> {
+    id.filter(|id| !id.is_empty())
 }
 
 async fn navidrome_facts(ctx: &UserCtx) -> Option<NavidromeFacts> {
@@ -97,20 +107,75 @@ async fn navidrome_facts(ctx: &UserCtx) -> Option<NavidromeFacts> {
 async fn folder_facts(ctx: &UserCtx) -> Result<Vec<FolderFacts>, Failure> {
     let folders = folders::list(ctx).await?;
     Ok(join_all(folders.into_iter().map(|folder| async move {
-        let free = bounded_free_space(PathBuf::from(&folder.path)).await;
+        let free = FREE_SPACE.read(PathBuf::from(&folder.path)).await;
         FolderFacts { folder, free }
     }))
     .await)
 }
 
-/// `free_space` off the async threads, given up after `FREE_SPACE_WAIT`: a
-/// hung network mount blocks `statvfs`.
-async fn bounded_free_space(path: PathBuf) -> Result<u64, String> {
-    let read = tokio::task::spawn_blocking(move || free_space(&path));
-    match tokio::time::timeout(FREE_SPACE_WAIT, read).await {
-        Err(_) => Err("no answer within 2 seconds".into()),
-        Ok(Err(join)) => Err(join.to_string()),
-        Ok(Ok(free)) => free,
+/// The running instance's free-space reads.
+static FREE_SPACE: LazyLock<Arc<FreeSpaceReads>> =
+    LazyLock::new(|| FreeSpaceReads::new(free_space, FREE_SPACE_WAIT));
+
+type FreeSpaceRead = Shared<BoxFuture<'static, Result<u64, String>>>;
+
+/// Free-space reads off the async threads, at most one running per path. A
+/// hung network mount blocks `statvfs` for good: a call gives up after its
+/// wait, and a later call for the same path waits on the read still
+/// running instead of starting one more blocking thread, so a hung mount
+/// holds one of tokio's blocking threads, not one per call.
+pub(crate) struct FreeSpaceReads {
+    reader: fn(&Path) -> Result<u64, String>,
+    wait: Duration,
+    running: Mutex<HashMap<PathBuf, FreeSpaceRead>>,
+}
+
+impl FreeSpaceReads {
+    pub(crate) fn new(reader: fn(&Path) -> Result<u64, String>, wait: Duration) -> Arc<Self> {
+        Arc::new(FreeSpaceReads {
+            reader,
+            wait,
+            running: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The free space at `path`, or `NO_ANSWER` when the read, started now
+    /// or by an earlier call, gives none within the wait.
+    pub(crate) async fn read(self: &Arc<Self>, path: PathBuf) -> Result<u64, String> {
+        let read = {
+            let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+            match running.get(&path) {
+                Some(read) => read.clone(),
+                None => {
+                    let read = self.start(path.clone());
+                    running.insert(path, read.clone());
+                    read
+                }
+            }
+        };
+        tokio::time::timeout(self.wait, read)
+            .await
+            .unwrap_or_else(|_| Err(NO_ANSWER.into()))
+    }
+
+    /// A blocking read of `path` that takes itself out of `running` once it
+    /// returns. The caller inserts it while it holds the lock, and the
+    /// read's thread takes the same lock to remove it, so the entry it
+    /// removes is its own.
+    fn start(self: &Arc<Self>, path: PathBuf) -> FreeSpaceRead {
+        let reads = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let free = (reads.reader)(&path);
+            reads
+                .running
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&path);
+            free
+        })
+        .map(|joined| joined.unwrap_or_else(|join| Err(join.to_string())))
+        .boxed()
+        .shared()
     }
 }
 
@@ -232,10 +297,18 @@ fn read<T>(fact: Option<&Result<T, Failure>>, value: impl Fn(&T) -> Value) -> (V
     }
 }
 
+/// Navidrome's `count` is the library's song count when idle and the files
+/// read so far while a scan runs (navidrome scanner/controller.go,
+/// `Status`), so each is its own field, `null` in the other state.
 fn scan_document(scan: &ScanStatus) -> Value {
     let last_scan = (scan.last_scan != go_zero_time()).then(|| scan.last_scan.to_rfc3339());
     let error = (!scan.error.is_empty()).then_some(scan.error.as_str());
-    json!({"scanning": scan.scanning, "count": scan.count, "last_scan": last_scan, "error": error})
+    let (songs, files_scanned) = match scan.scanning {
+        false => (Some(scan.count), None),
+        true => (None, Some(scan.count)),
+    };
+    json!({"scanning": scan.scanning, "songs": songs, "files_scanned": files_scanned,
+        "last_scan": last_scan, "error": error})
 }
 
 /// `0001-01-01T00:00:00Z`, Go's zero time, which Navidrome sends as
@@ -276,7 +349,8 @@ mod tests {
                 "importer": {"level": "degraded", "issues": [{"severity": "degraded", "title": "beets config check timed out",
                              "detail": "A plugin may be waiting on the network or for input."}]},
                 "navidrome": {"connected": true, "failure": null, "admin": false, "admin_failure": null, "can_trigger_scan": false,
-                              "scan": {"scanning": false, "count": 1342, "last_scan": "2026-11-14T21:03:11.519322+00:00", "error": null},
+                              "scan": {"scanning": false, "songs": 1342, "files_scanned": null,
+                                       "last_scan": "2026-11-14T21:03:11.519322+00:00", "error": null},
                               "scan_failure": null},
                 "folders": [{"folder_id": "f1", "name": "Music", "path": "/music/alice", "default": true, "free_bytes": 1000,
                              "free_space_failure": null}],
@@ -364,7 +438,7 @@ mod tests {
         let doc = Value::Object(status_fields(&facts, &alice_caller(false)));
         assert_eq!(
             doc["navidrome"]["scan"],
-            json!({"scanning": false, "count": 0, "last_scan": null, "error": null})
+            json!({"scanning": false, "songs": 0, "files_scanned": null, "last_scan": null, "error": null})
         );
         assert_eq!(
             (
@@ -373,6 +447,75 @@ mod tests {
             ),
             (Some(true), Some(true))
         );
+    }
+
+    #[test]
+    fn a_running_scan_counts_files_scanned_not_songs() {
+        let mut facts = sample_facts();
+        if let Some(NavidromeFacts { scan: Ok(scan), .. }) = facts.navidrome.as_mut() {
+            scan.scanning = true;
+            scan.count = 412;
+        }
+        let doc = Value::Object(status_fields(&facts, &alice_caller(false)));
+        assert_eq!(
+            (
+                &doc["navidrome"]["scan"]["songs"],
+                &doc["navidrome"]["scan"]["files_scanned"]
+            ),
+            (&Value::Null, &json!(412))
+        );
+    }
+
+    #[test]
+    fn an_empty_default_folder_id_is_no_default() {
+        assert_eq!(chosen_folder(Some("f1".into())), Some("f1".to_string()));
+        assert_eq!(chosen_folder(Some(String::new())), None);
+        assert_eq!(chosen_folder(None), None);
+    }
+
+    /// Reads that block until the test lets them return, counting how many
+    /// started.
+    static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static RELEASE: LazyLock<(Mutex<bool>, std::sync::Condvar)> =
+        LazyLock::new(|| (Mutex::new(false), std::sync::Condvar::new()));
+
+    fn hung_read(_: &Path) -> Result<u64, String> {
+        STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (released, wake) = &*RELEASE;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = wake.wait(released).unwrap();
+        }
+        Ok(7)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_read_holds_one_blocking_thread_however_often_it_is_asked() {
+        let reads = FreeSpaceReads::new(hung_read, Duration::from_millis(50));
+        let path = PathBuf::from("/mnt/hung");
+        for _ in 0..5 {
+            assert_eq!(reads.read(path.clone()).await, Err(NO_ANSWER.to_string()));
+        }
+        // Calls at once share the read too.
+        let at_once = join_all((0..5).map(|_| reads.read(path.clone()))).await;
+        assert!(at_once.iter().all(|r| r == &Err(NO_ANSWER.to_string())));
+        assert_eq!(STARTED.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(reads.running.lock().unwrap().len(), 1);
+        {
+            let (released, wake) = &*RELEASE;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        // The read returns and takes itself out; the next call starts anew.
+        for _ in 0..100 {
+            if reads.running.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(reads.running.lock().unwrap().is_empty());
+        assert_eq!(reads.read(path).await, Ok(7));
+        assert_eq!(STARTED.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -4,9 +4,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::future::BoxFuture;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, JsonObject, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, JsonObject,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -20,17 +22,26 @@ use crate::connection::ConnectionState;
 /// What the server tells a client at `initialize`.
 pub(crate) const INSTRUCTIONS: &str = "Soulful finds music, downloads it, imports it into the user's library and manages their Navidrome playlists. Call get_status first: it says what is connected and working. Every tool answers one JSON document; a failure has a stable error.code, error.stage and error.next with the calls that can still be tried.";
 
-/// A tool as `tools/list` declares it.
+/// How a tool answers a call: the state, who calls and the arguments.
+pub(crate) type ToolHandler = for<'a> fn(
+    &'a ConnectionState,
+    &'a McpCaller,
+    Option<JsonObject>,
+) -> BoxFuture<'a, CallToolResult>;
+
+/// A tool as `tools/list` declares it, and its handler.
 pub(crate) struct ToolSpec {
     pub name: &'static str,
     pub title: &'static str,
-    pub description: &'static str,
+    /// The description, given the tool calls an app may make a minute.
+    pub description: fn(u32) -> String,
     /// The JSON Schema of the arguments, as JSON text.
     pub input_schema: &'static str,
     pub read_only: bool,
     pub destructive: bool,
     pub idempotent: bool,
     pub open_world: bool,
+    pub call: ToolHandler,
 }
 
 /// Every tool, in the fixed order `tools/list` answers (MCP 2026-07-28
@@ -38,21 +49,25 @@ pub(crate) struct ToolSpec {
 pub(crate) const TOOLS: &[ToolSpec] = &[ToolSpec {
     name: "get_status",
     title: "Soulful status",
-    description: "Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work and which importer issues stand, the user's Navidrome link (connected, admin or not, scan status, whether this account can start a scan), the user's folders with free space and which one is the default, the batches downloading now, whether this app may delete music, and the address Soulful is reached at. Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than 120 tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.",
+    description: |calls_a_minute| {
+        format!("Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work, and why not when they do not, with the importer issues that stand; the user's Navidrome link (connected, admin or not, whether this account can start a scan, and the scan status: songs is the library's song count while no scan runs, files_scanned the files read so far while one does); the user's folders with free space and which one is the default; the batches downloading now; whether this app may delete music; and the address Soulful is reached at. A folder_id holds until the folder is removed; a batch_id while its batch runs. Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.")
+    },
     // The schema for a tool without arguments (`server/tools.mdx`, "Tool").
     input_schema: r#"{"type": "object", "additionalProperties": false}"#,
     read_only: true,
     destructive: false,
     idempotent: true,
     open_world: false,
+    call: |state, caller, args| Box::pin(status::call(state, caller, args)),
 }];
 
 impl ToolSpec {
-    /// The rmcp tool, every hint set (design 10.3).
-    fn tool(&self) -> Tool {
+    /// The rmcp tool, every hint set (design 10.3), its description naming
+    /// `calls_a_minute`.
+    fn tool(&self, calls_a_minute: u32) -> Tool {
         let schema: JsonObject = serde_json::from_str(self.input_schema)
             .expect("every tool's input schema is a JSON object");
-        Tool::new(self.name, self.description, schema)
+        Tool::new(self.name, (self.description)(calls_a_minute), schema)
             .with_title(self.title)
             .with_annotations(
                 ToolAnnotations::new()
@@ -82,8 +97,9 @@ impl ServerHandler for SoulfulMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let calls_a_minute = self.state.limits.tool_calls.limit();
         Ok(ListToolsResult::with_all_items(
-            TOOLS.iter().map(ToolSpec::tool).collect(),
+            TOOLS.iter().map(|spec| spec.tool(calls_a_minute)).collect(),
         ))
     }
 
@@ -91,7 +107,7 @@ impl ServerHandler for SoulfulMcp {
         TOOLS
             .iter()
             .find(|spec| spec.name == name)
-            .map(ToolSpec::tool)
+            .map(|spec| spec.tool(self.state.limits.tool_calls.limit()))
     }
 
     /// A name that is no tool is a protocol error (MCP 2026-07-28
@@ -117,11 +133,9 @@ impl ServerHandler for SoulfulMcp {
         if let Err(wait) = limit.admit(&caller.grant_id, Instant::now()) {
             return Ok(failed(rate_limited(limit.limit(), wait)).into());
         }
-        let result = match spec.name {
-            "get_status" => status::call(&self.state, caller, request.arguments).await,
-            _ => unreachable!("every tool in TOOLS is dispatched"),
-        };
-        Ok(result.into())
+        Ok((spec.call)(&self.state, caller, request.arguments)
+            .await
+            .into())
     }
 }
 
@@ -206,9 +220,13 @@ mod tests {
             (
                 Some("get_status"),
                 Some("Soulful status"),
-                Some(TOOLS[0].description)
+                Some((TOOLS[0].description)(120).as_str())
             )
         );
+        assert!(t["description"]
+            .as_str()
+            .unwrap()
+            .contains("more than 120 tool calls in a minute"));
         assert_eq!(
             t["annotations"],
             json!({"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false})
@@ -304,6 +322,35 @@ mod tests {
             error["message"],
             format!("Too many tool calls from this app: at most 1 a minute. Try again in {wait} seconds.")
         );
+    }
+
+    #[tokio::test]
+    async fn the_description_names_the_limit_the_server_applies() {
+        let db = test_db::migrated().await;
+        add_user(&db, "u1", "alice").await;
+        let token = access_token(&db, "u1", RESOURCE).await;
+        let app = router(ConnectionState {
+            limits: Arc::new(Limits {
+                tool_calls: WindowLimiter::new(7, Duration::from_secs(60)),
+                ..Limits::default()
+            }),
+            ..ConnectionState::for_test(db)
+        });
+        let bearer = format!("Bearer {token}");
+        let (_, _, body) = post_rpc(
+            app,
+            &[
+                ("host", HOST),
+                ("authorization", &bearer),
+                ("mcp-protocol-version", "2025-11-25"),
+            ],
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        )
+        .await;
+        assert!(body["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("more than 7 tool calls in a minute"));
     }
 
     #[tokio::test]
