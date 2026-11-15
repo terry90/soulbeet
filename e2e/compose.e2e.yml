@@ -16,6 +16,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:/data/soulbeet.db
       - SECRET_KEY=e2e-secret-key
+      - REGISTRATION=open
       - DOWNLOAD_PATH=/downloads
       - BEETS_CONFIG=/app/beets-e2e.yaml
       - MUSICBRAINZ_HOST=stubs:5050
@@ -38,6 +39,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:/data/soulbeet.db
       - SECRET_KEY=e2e-secret-key
+      - REGISTRATION=open
       - DOWNLOAD_PATH=/downloads
       - BEETS_CONFIG=/config/config.yaml
       - MUSICBRAINZ_HOST=stubs:5050

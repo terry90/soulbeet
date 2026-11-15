@@ -38,17 +38,33 @@ export async function loginViaApi(context: BrowserContext, user: TestUser): Prom
   expect(response.ok(), `login ${user.username}: ${response.status()}`).toBeTruthy();
 }
 
-/** Creates a per-test music folder for the user and returns its app-side path. */
+/** Sets a user's password through the API, as the logged-in user in the context. */
+export async function setPassword(
+  context: BrowserContext,
+  userId: string,
+  password: string,
+): Promise<void> {
+  const response = await context.request.post('/api/users/password', {
+    data: { user_id: userId, password },
+  });
+  expect(response.ok(), `set password for ${userId}: ${response.status()}`).toBeTruthy();
+}
+
+/**
+ * Creates a per-test music folder for the user and returns its app-side path.
+ * The name is made unique so retries and reruns never hit another user's folder.
+ */
 export async function createFolder(
   context: BrowserContext,
   name: string,
 ): Promise<{ name: string; path: string }> {
-  const path = `${musicDirForApp}/${name}`;
+  const unique = `${name}-${randomUUID().slice(0, 8)}`;
+  const path = `${musicDirForApp}/${unique}`;
   const response = await context.request.post('/api/folders', {
-    data: { name, path },
+    data: { name: unique, path },
   });
-  expect(response.ok(), `create folder ${name}: ${response.status()}`).toBeTruthy();
-  return { name, path };
+  expect(response.ok(), `create folder ${unique}: ${response.status()}`).toBeTruthy();
+  return { name: unique, path };
 }
 
 export async function loginViaUi(page: Page, user: TestUser): Promise<void> {

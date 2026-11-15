@@ -4,7 +4,7 @@
 
 import { expect, test } from '@playwright/test';
 import { loginViaUi, openSettings } from '../helpers/app.js';
-import { slskdApiKey, slskdUrlForApp } from '../helpers/env.js';
+import { musicDirForApp, slskdApiKey, slskdUrlForApp } from '../helpers/env.js';
 
 test('configure slskd connection', async ({ page }) => {
   // The migration seeds a local admin/admin user.
@@ -18,4 +18,10 @@ test('configure slskd connection', async ({ page }) => {
   await page.getByRole('button', { name: 'Save Configuration' }).click();
 
   await expect(page.getByText('Configuration saved')).toBeVisible();
+
+  // Folders may only be created under a root the admin allows.
+  const roots = await page.request.post('/api/folders/roots', {
+    data: { path: musicDirForApp },
+  });
+  expect(roots.ok(), `allow folder root: ${roots.status()}`).toBeTruthy();
 });

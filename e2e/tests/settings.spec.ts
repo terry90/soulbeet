@@ -1,6 +1,7 @@
 // Settings flows: folder management, user management, search preferences.
 // The Config tab (slskd connection) is covered by the setup project.
 
+import { randomUUID } from 'node:crypto';
 import { expect, test } from '@playwright/test';
 import { loginViaApi, openSettings, registerUser, uniqueUser } from '../helpers/app.js';
 import { musicDirForApp } from '../helpers/env.js';
@@ -18,7 +19,7 @@ test('creates and deletes a music folder', async ({ page }) => {
   await page.getByRole('button', { name: 'Library' }).click();
 
   await page.getByPlaceholder('My Music').fill('Vault');
-  await page.getByPlaceholder('/home/user/Music').fill(`${musicDirForApp}/settings-vault`);
+  await page.getByPlaceholder('/home/user/Music').fill(`${musicDirForApp}/settings-vault-${randomUUID().slice(0, 8)}`);
   await page.getByRole('button', { name: 'Add Folder' }).click();
 
   await expect(page.getByText('Folder added successfully')).toBeVisible();
@@ -29,7 +30,12 @@ test('creates and deletes a music folder', async ({ page }) => {
   await expect(page.getByText('Vault', { exact: true })).not.toBeVisible();
 });
 
-test('creates another user account', async ({ page }) => {
+test('creates another user account', async ({ context, page }) => {
+  // Only an admin may create users.
+  await context.clearCookies();
+  await loginViaApi(context, { username: 'admin', password: 'admin' });
+  await page.reload();
+  await openSettings(page);
   await page.getByRole('button', { name: 'Users' }).click();
 
   const name = `made-in-ui-${Date.now()}`;
@@ -39,6 +45,13 @@ test('creates another user account', async ({ page }) => {
 
   await expect(page.getByText(`User '${name}' created successfully`)).toBeVisible();
   await expect(page.getByText(name, { exact: true })).toBeVisible();
+});
+
+test('a non-admin sees only their own account', async ({ page }) => {
+  await page.getByRole('button', { name: 'Users' }).click();
+
+  await expect(page.getByText('Your Account')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create User' })).toHaveCount(0);
 });
 
 test('persists the default metadata provider', async ({ page }) => {
