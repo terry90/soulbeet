@@ -160,9 +160,18 @@ fn WebNavbar() -> Element {
         },
     );
 
+    // Set while the server could not end the session: the user is still
+    // signed in.
+    let mut logout_error = use_signal(|| None::<String>);
     let logout = move |_| {
         spawn(async move {
-            auth.logout().await;
+            let failed = auth.logout().await.err();
+            logout_error.set(failed.map(|e| {
+                format!(
+                    "Sign-out failed, you are still signed in. {}",
+                    ui::friendly_error(&e)
+                )
+            }));
         });
     };
 
@@ -269,6 +278,15 @@ fn WebNavbar() -> Element {
 
             ImporterBanner {}
             NavidromeBanner {}
+            if let Some(message) = logout_error() {
+                StatusBanner { dot_class: "bg-beet-accent", label: "SIGN-OUT", message,
+                    button {
+                        class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted cursor-pointer",
+                        onclick: logout,
+                        "Try again"
+                    }
+                }
+            }
 
             main { class: "px-4 sm:px-6 lg:px-8 flex-grow flex flex-col relative overflow-y-auto w-full py-8 no-scrollbar",
                 Outlet::<Route> {}

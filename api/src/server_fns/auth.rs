@@ -542,25 +542,35 @@ pub(crate) async fn end_session_in(
         .await
 }
 
-#[post("/api/auth/logout", cookies: Cookies)]
-pub async fn logout() -> Result<(), ServerFnError> {
-    let token = cookies.get(AUTH_COOKIE_NAME).map(|c| c.value().to_string());
-
+/// Ends the session the request's cookie holds, then clears the cookie. The
+/// cookie stays when the token could not be revoked, so a failed sign-out
+/// leaves the browser signed in rather than out while the token still works.
+#[cfg(feature = "server")]
+pub(crate) async fn sign_out_in(
+    cookies: &Cookies,
+    db: &sqlx::SqlitePool,
+    key: &crate::secret_key::SecretKey,
+    now: i64,
+) -> Result<(), String> {
+    if let Some(token) = cookies.get(AUTH_COOKIE_NAME) {
+        end_session_in(db, key, token.value(), now).await?;
+    }
     let mut cookie = Cookie::new(AUTH_COOKIE_NAME, "");
     cookie.set_path("/");
     cookies.remove(cookie);
-
-    if let Some(token) = token {
-        end_session_in(
-            &crate::db::DB,
-            crate::secret_key::current(),
-            &token,
-            chrono::Utc::now().timestamp(),
-        )
-        .await
-        .map_err(server_error)?;
-    }
     Ok(())
+}
+
+#[post("/api/auth/logout", cookies: Cookies)]
+pub async fn logout() -> Result<(), ServerFnError> {
+    sign_out_in(
+        &cookies,
+        &crate::db::DB,
+        crate::secret_key::current(),
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+    .map_err(server_error)
 }
 
 #[get("/api/auth/me", auth: AuthSession)]
@@ -1329,6 +1339,31 @@ mod tests {
                 "{shown}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_that_cannot_revoke_keeps_the_cookie() {
+        use crate::secret_key::SecretKey;
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let key = SecretKey::new("k".repeat(32));
+        let token = auth::create_token(&key, &ann.id, 0).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let cookies = Cookies::default();
+        cookies.add(Cookie::new(AUTH_COOKIE_NAME, token.clone()));
+
+        let closed = test_db::migrated().await;
+        closed.close().await;
+        assert!(sign_out_in(&cookies, &closed, &key, now).await.is_err());
+        assert_eq!(
+            cookies.get(AUTH_COOKIE_NAME).map(|c| c.value().to_string()),
+            Some(token.clone())
+        );
+
+        sign_out_in(&cookies, &db, &key, now).await.unwrap();
+        assert!(cookies.get(AUTH_COOKIE_NAME).is_none());
+        let ended = crate::server_fns::guard::load_session(Some(&token), &db, &key).await;
+        assert_eq!(ended.unwrap_err().0.as_u16(), 401);
     }
 
     #[tokio::test]

@@ -15,9 +15,17 @@ impl Auth {
         self.state.set(Some(response));
     }
 
-    pub async fn logout(&mut self) {
-        let _ = api::logout().await;
+    /// Signs out on the server, then here. When the server could not end
+    /// the session, its token still works, so the user stays signed in here
+    /// too and the error is returned for display.
+    pub async fn logout(&mut self) -> Result<(), ServerFnError> {
+        self.signed_out(api::logout().await)
+    }
+
+    fn signed_out(&mut self, server: Result<(), ServerFnError>) -> Result<(), ServerFnError> {
+        server?;
         self.state.set(None);
+        Ok(())
     }
 
     /// Check if a server error is an authentication error.
@@ -79,4 +87,34 @@ impl Auth {
 
 pub fn use_auth() -> Auth {
     use_context::<Auth>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_sign_out_keeps_the_user_signed_in() {
+        let dom = VirtualDom::new(|| rsx! {});
+        dom.in_scope(ScopeId::ROOT, || {
+            let mut auth = Auth::new(Signal::new(Some(AuthResponse {
+                username: "ann".to_string(),
+                user_id: "u1".to_string(),
+                navidrome_status: Default::default(),
+                role: Default::default(),
+                rename_allowed: false,
+            })));
+
+            let failed = auth.signed_out(Err(ServerFnError::ServerError {
+                message: "database is locked".to_string(),
+                code: 500,
+                details: None,
+            }));
+            assert!(failed.is_err());
+            assert!(auth.is_logged_in());
+
+            auth.signed_out(Ok(())).unwrap();
+            assert!(!auth.is_logged_in());
+        });
+    }
 }
