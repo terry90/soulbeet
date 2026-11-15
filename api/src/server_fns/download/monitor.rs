@@ -40,6 +40,11 @@ const MAX_CONSECUTIVE_EMPTY: usize = 15;
 /// Per-track timeout duration (1 hour).
 const PER_TRACK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// How long a transfer may wait in its source's own queue before the slot
+/// moves to another source. A transfer waiting in slskd's queue is not held
+/// to it: slskd's download slots free up on their own.
+const REMOTE_QUEUE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 /// How long a track may stay absent from slskd's transfer list before it is
 /// marked failed: never appearing at all, or vanishing after being seen.
 /// Without this, one absent track keeps the whole batch unfinished forever.
@@ -70,15 +75,56 @@ const MAX_INVALID_RESPONSES: u32 = 15;
 const BACKEND_STALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long a failed transfer state must persist before it is treated as
-/// final. The backend already reads a failed attempt it knows will be
-/// retried as queued; this window covers a failed sighting the backend
-/// replaces anyway, such as a slskd retry beyond the limit the client read
-/// before slskd's limit was raised. Acting on a single sighting would
-/// abandon that transfer.
+/// final. A failed attempt slskd will retry reads as queued for
+/// `RETRY_PENDING_FOR` (`read_pending_retry`); this window covers a failed
+/// sighting the backend replaces anyway, such as a slskd retry beyond the
+/// limit the client read before slskd's limit was raised. Acting on a single
+/// sighting would abandon that transfer.
 ///
 /// Shared with discovery's poll loop, which waits on the same transfers and
 /// so must judge them by the same rule.
 pub(crate) const FAILED_STATE_CONFIRM: Duration = Duration::from_secs(4);
+
+/// How long a failed attempt slskd says it will retry may keep reading as
+/// queued. slskd writes the retry's `Queued, Locally` in `onRetry`, before
+/// the backoff delay (`Common/Retry.cs:118-119`,
+/// `DownloadService.cs:1426-1428`), so a retry shows the failure only for
+/// the database writes in between. A download cancelled during that delay
+/// keeps the failure for good: `Task.Delay` throws, `Retry.Do` does not
+/// retry a cancel and throws, and `TryFail` finds the record `Queued,
+/// Locally` and writes `Completed, Errored` (`DownloadService.cs:1045-1068`,
+/// called again from the download task's continuation at `:596`), keeping
+/// the earlier attempt's exception, end time and the raised attempt count.
+/// Nothing tells that record from a retry about to start but how long it
+/// stays.
+///
+/// Counted from this watcher's first sighting of the record pending, on
+/// Soulful's monotonic clock: `endedAt` is slskd's host clock, and a
+/// difference between the two hosts would move the bound.
+pub(crate) const RETRY_PENDING_FOR: Duration = Duration::from_secs(30);
+
+/// `dl` as a watcher that has held it pending since `pending_since` reads
+/// it: a pending retry stays queued for `RETRY_PENDING_FOR`, then reads as
+/// the failure its attempt stated. Starts the clock on the first sighting
+/// and clears it for a row that is not pending.
+pub(crate) fn read_pending_retry(
+    dl: &DownloadProgress,
+    pending_since: &mut Option<Instant>,
+) -> DownloadProgress {
+    let Some(failure) = &dl.pending_retry else {
+        *pending_since = None;
+        return dl.clone();
+    };
+    if pending_since.get_or_insert_with(Instant::now).elapsed() < RETRY_PENDING_FOR {
+        return dl.clone();
+    }
+    DownloadProgress {
+        pending_retry: None,
+        ..dl.clone()
+    }
+    .with_state(DownloadState::Failed(String::new()))
+    .with_failure(failure.clone())
+}
 
 fn transfer_failure(code: FailureCode, retry: RetryAdvice, message: &str) -> Failure {
     Failure::new(code, Stage::Transfer, retry, message)
@@ -108,6 +154,19 @@ fn per_track_timeout() -> Failure {
         FailureCode::TransferTimedOut,
         RetryAdvice::OtherSource,
         "Per-track timeout",
+    )
+}
+
+/// A slot that waited past `REMOTE_QUEUE_TIMEOUT` in its source's queue
+/// with no other source left.
+fn stuck_in_remote_queue() -> Failure {
+    transfer_failure(
+        FailureCode::TransferStuckInRemoteQueue,
+        RetryAdvice::OtherSource,
+        &format!(
+            "Waited {} minutes in the source's queue",
+            REMOTE_QUEUE_TIMEOUT.as_secs() / 60
+        ),
     )
 }
 
@@ -155,7 +214,8 @@ enum SlotPhase {
     Watching,
     /// Its file went to the import queue, which shows its row from then on.
     HandedOff,
-    /// It ran past the per-track timeout and its transfer was cancelled.
+    /// It ran past the per-track timeout or the remote queue limit with no
+    /// source left, and its transfer was cancelled.
     TimedOut,
     /// It ended without a file: failed, absent, or not found on disk.
     Settled,
@@ -175,6 +235,12 @@ struct TrackState {
     missing_since: Option<Instant>,
     /// When the track's transfer was first seen in a failed terminal state.
     failing_since: Option<Instant>,
+    /// When the track's transfer was first seen waiting in its source's
+    /// queue, cleared the moment it is seen in any other state.
+    queued_at_source_since: Option<Instant>,
+    /// When the track's transfer was first seen as a failed attempt slskd
+    /// will retry (`read_pending_retry`).
+    retry_pending_since: Option<Instant>,
     phase: SlotPhase,
 }
 
@@ -188,6 +254,8 @@ impl TrackState {
             first_seen: None,
             missing_since: None,
             failing_since: None,
+            queued_at_source_since: None,
+            retry_pending_since: None,
             phase: SlotPhase::Watching,
         }
     }
@@ -340,6 +408,23 @@ impl DownloadMonitor {
                 transfer_by_id(downloads, &tracked.source, &tracked.transfer_id)
                     .is_none_or(|dl| is_failed(&dl.state))
             })
+    }
+
+    /// Read each watched slot's own row in `downloads` as `read_pending_retry`
+    /// does, on that slot's clock.
+    fn read_pending_retries(&mut self, downloads: &mut [DownloadProgress]) {
+        for slot in 0..self.tracked_files.len() {
+            if !self.watching(slot) {
+                continue;
+            }
+            let tracked = &self.tracked_files[slot];
+            if let Some(dl) = downloads
+                .iter_mut()
+                .find(|dl| dl.source == tracked.source && dl.id == tracked.transfer_id)
+            {
+                *dl = read_pending_retry(dl, &mut self.track_states[slot].retry_pending_since);
+            }
+        }
     }
 
     /// Watch the transfers joining requests delivered since the last poll.
@@ -587,13 +672,17 @@ impl DownloadMonitor {
                 Ok(mut downloads) => {
                     invalid_responses = 0;
                     self.last_readable_poll = Instant::now();
+                    self.read_pending_retries(&mut downloads);
 
                     // Widen to every peer only while a slot has nothing
                     // usable, so the unbounded list is read when it can
                     // actually tell us something new rather than every poll.
                     if self.any_slot_unresolved(&downloads) {
                         match backend.get_downloads().await {
-                            Ok(all) => downloads = all,
+                            Ok(mut all) => {
+                                self.read_pending_retries(&mut all);
+                                downloads = all;
+                            }
                             Err(e) => debug!("Could not widen the transfer view: {}", e),
                         }
                     }
@@ -658,7 +747,9 @@ impl DownloadMonitor {
     /// by the handoff or album finish that found its file on disk: removing
     /// it before that can strand the file in slskd's incomplete folder.
     /// Only this batch's ids: another batch's record of the same file is
-    /// that batch's to remove.
+    /// that batch's to remove. A failed attempt slskd says it will retry
+    /// ended without a file too, and with the batch done nobody would import
+    /// what a retry fetched.
     async fn remove_batch_transfers(&mut self, backend: &Arc<dyn DownloadBackend>) {
         let mut peers = self.sources();
         for (peer, _) in &self.abandoned {
@@ -674,10 +765,9 @@ impl DownloadMonitor {
             }
         };
 
-        for entry in downloads
-            .iter()
-            .filter(|entry| is_failed(&entry.state) && self.owns(entry))
-        {
+        for entry in downloads.iter().filter(|entry| {
+            (is_failed(&entry.state) || entry.pending_retry.is_some()) && self.owns(entry)
+        }) {
             if let Err(e) = backend
                 .cancel_download(&entry.source, &entry.id, true)
                 .await
@@ -1015,19 +1105,26 @@ impl DownloadMonitor {
                         first_seen.elapsed().as_secs() / 60,
                         download.item
                     );
-                    if self.try_failover(slot, backend, "Transfer timed out").await {
-                        continue;
-                    }
-                    self.abandon(slot, backend).await;
-                    self.settle(slot, SlotPhase::TimedOut, backend.id());
-                    let timeout_entry = download
-                        .clone()
-                        .with_state(DownloadState::Failed(String::new()))
-                        .with_failure(per_track_timeout());
-                    let entries = self.stamp_batch(vec![timeout_entry]);
-                    let _ = self.tx.send(DownloadEvent::Progress(entries));
+                    self.time_out(slot, download, per_track_timeout(), backend)
+                        .await;
                     continue;
                 }
+            }
+
+            // A peer can hold its queue for hours; another source may send
+            // the file now.
+            if download.queued_at_source {
+                let since = *self.track_states[slot]
+                    .queued_at_source_since
+                    .get_or_insert_with(Instant::now);
+                if since.elapsed() > REMOTE_QUEUE_TIMEOUT {
+                    let failure = stuck_in_remote_queue();
+                    warn!("{}: {}", failure.message, download.item);
+                    self.time_out(slot, download, failure, backend).await;
+                    continue;
+                }
+            } else {
+                self.track_states[slot].queued_at_source_since = None;
             }
 
             // Singleton mode: process completed tracks immediately
@@ -1061,6 +1158,30 @@ impl DownloadMonitor {
                 self.track_states[slot].failing_since = None;
             }
         }
+    }
+
+    /// Fail `slot` over to its next source, or else cancel its transfer,
+    /// settle it TimedOut and show `download` Failed with `failure`.
+    async fn time_out(
+        &mut self,
+        slot: usize,
+        download: &DownloadProgress,
+        failure: Failure,
+        backend: &Arc<dyn DownloadBackend>,
+    ) {
+        if self.try_failover(slot, backend, &failure.message).await {
+            return;
+        }
+        self.abandon(slot, backend).await;
+        self.settle(slot, SlotPhase::TimedOut, backend.id());
+        let row = DownloadProgress {
+            queued_at_source: false,
+            ..download.clone()
+        }
+        .with_state(DownloadState::Failed(String::new()))
+        .with_failure(failure);
+        let entries = self.stamp_batch(vec![row]);
+        let _ = self.tx.send(DownloadEvent::Progress(entries));
     }
 
     /// Hand a singleton slot's finished transfer to the import queue. Its
@@ -1520,6 +1641,28 @@ mod tests {
         transfer(source, filename, &id_of(filename), state)
     }
 
+    /// slskd's record of `filename` from `source`, waiting in the peer's queue.
+    fn at_source(source: &str, filename: &str) -> DownloadProgress {
+        DownloadProgress {
+            queued_at_source: true,
+            ..listed(source, filename, DownloadState::Queued)
+        }
+    }
+
+    /// slskd's record of `filename` from `source`, a failed attempt slskd
+    /// says it will retry.
+    fn pending_retry(source: &str, filename: &str) -> DownloadProgress {
+        DownloadProgress {
+            pending_retry: Some(Failure::new(
+                FailureCode::TransferConnectionFailed,
+                Stage::Transfer,
+                RetryAdvice::OtherSource,
+                "Connection reset by peer",
+            )),
+            ..listed(source, filename, DownloadState::Queued)
+        }
+    }
+
     /// A slskd transfer of `filename` from `source` in a failed terminal state.
     fn failed_transfer(source: &str, filename: &str) -> DownloadProgress {
         listed(
@@ -1581,8 +1724,10 @@ mod tests {
         listing: &[DownloadProgress],
         backend: &Arc<dyn DownloadBackend>,
     ) {
-        m.apply_cancels(listing, backend).await;
-        let matched = m.find_matching_downloads(listing, backend);
+        let mut listing = listing.to_vec();
+        m.read_pending_retries(&mut listing);
+        m.apply_cancels(&listing, backend).await;
+        let matched = m.find_matching_downloads(&listing, backend);
         m.process_tracks(&matched, backend).await;
         m.handle_absent_tracks(&matched, backend).await;
         m.send_status_update(&matched);
@@ -1845,6 +1990,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_removes_this_batchs_transfers_left_pending_a_retry() {
+        // A transfer cancelled during slskd's retry delay keeps reading as a
+        // pending retry for good.
+        let mut m = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].phase = SlotPhase::Settled;
+        stub.set_listing(vec![pending_retry("peer_a", "dirA/aaa.flac")]);
+
+        m.remove_batch_transfers(&backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::removing("peer_a", &id_of("dirA/aaa.flac"))]
+        );
+    }
+
+    #[tokio::test]
     async fn a_timed_out_transfer_that_succeeded_late_keeps_its_record() {
         // slskd finished it between the listing and the cancel. Its file may
         // still be on its way out of the incomplete folder.
@@ -2073,6 +2236,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_slot_waiting_in_the_source_queue_too_long_fails_over() {
+        let (mut m, _rx) = failover_monitor();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].first_seen = Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+        m.track_states[0].queued_at_source_since =
+            Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+
+        poll_tracks(&mut m, &[at_source("peer_a", "dirA/aaa.flac")], &backend).await;
+
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", &id_of("dirA/aaa.flac"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_with_no_source_left_fails_stuck_in_remote_queue() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        m.track_states[0].first_seen = Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+        m.track_states[0].queued_at_source_since =
+            Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+
+        poll_tracks(&mut m, &[at_source("peer_a", "one.flac")], &backend).await;
+
+        let rows = rows_for(&mut rx, "one.flac");
+        assert_failed(
+            &rows[0],
+            FailureCode::TransferStuckInRemoteQueue,
+            "Waited 15 minutes in the source's queue",
+        );
+        assert!(!rows[0].queued_at_source);
+        assert_eq!(phase(&m, 0), SlotPhase::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_slot_queued_locally_is_not_held_to_the_remote_queue_limit() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut m = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].first_seen = Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+        m.track_states[0].queued_at_source_since =
+            Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[listed("peer_a", "one.flac", DownloadState::Queued)],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(m.track_states[0].queued_at_source_since, None);
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
+        assert!(stub.cancelled().is_empty());
+        assert_eq!(states_for(&mut rx, "one.flac"), vec![DownloadState::Queued]);
+    }
+
+    #[tokio::test]
+    async fn the_remote_queue_clock_starts_at_the_first_sighting() {
+        let mut m = monitor(vec!["peer_a"], vec!["one.flac"]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        poll_tracks(&mut m, &[at_source("peer_a", "one.flac")], &backend).await;
+        assert!(m.track_states[0].queued_at_source_since.is_some());
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
+    }
+
+    #[test]
+    fn a_pending_retry_reads_as_its_failure_only_30_seconds_after_it_was_first_seen() {
+        let row = pending_retry("peer_a", "one.flac");
+        let mut since = None;
+
+        let first = read_pending_retry(&row, &mut since);
+        assert_eq!(first, row);
+        assert!(since.is_some());
+
+        since = Some(ago(RETRY_PENDING_FOR));
+        let held = read_pending_retry(&row, &mut since);
+        assert_failed(
+            &held,
+            FailureCode::TransferConnectionFailed,
+            "Connection reset by peer",
+        );
+        assert_eq!(held.pending_retry, None);
+
+        let live = listed("peer_a", "one.flac", DownloadState::Queued);
+        assert_eq!(read_pending_retry(&live, &mut since), live);
+        assert_eq!(since, None);
+    }
+
+    #[tokio::test]
+    async fn a_pending_retry_held_past_its_bound_fails_over() {
+        let (mut m, _rx) = failover_monitor();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        m.track_states[0].retry_pending_since = Some(ago(RETRY_PENDING_FOR));
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[pending_retry("peer_a", "dirA/aaa.flac")],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+    }
+
+    #[tokio::test]
     async fn the_absence_window_restarts_on_every_rebind() {
         // The same guarantee stated directly: a slot that has just been
         // rebound is young, however old the batch is.
@@ -2211,6 +2485,12 @@ mod tests {
                 FailureCode::TransferTimedOut,
                 OtherSource,
                 "Per-track timeout",
+            ),
+            (
+                stuck_in_remote_queue(),
+                FailureCode::TransferStuckInRemoteQueue,
+                OtherSource,
+                "Waited 15 minutes in the source's queue",
             ),
             (
                 stalled(&e),

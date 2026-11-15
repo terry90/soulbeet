@@ -182,6 +182,15 @@ pub struct DownloadProgress {
     /// Which kind of skip an ImportSkipped row is
     #[serde(default)]
     pub skip: Option<SkipKind>,
+    /// The transfer waits in the source's own queue, not in the backend's
+    #[serde(default)]
+    pub queued_at_source: bool,
+    /// A failed attempt slskd says it will retry, which the row reads as
+    /// Queued: the failure that attempt stated. Never sent to the browser. A
+    /// watcher reads the row as this failure once it has held it pending for
+    /// `RETRY_PENDING_FOR`.
+    #[serde(skip)]
+    pub pending_retry: Option<Failure>,
 }
 
 /// Why an import was skipped.
@@ -213,6 +222,8 @@ impl DownloadProgress {
             retryable: false,
             failure: None,
             skip: None,
+            queued_at_source: false,
+            pending_retry: None,
         }
     }
 
@@ -493,6 +504,7 @@ mod tests {
         assert_eq!(row.import_output, None);
         assert_eq!(row.failure, None);
         assert_eq!(row.skip, None);
+        assert!(!row.queued_at_source);
     }
 
     #[test]

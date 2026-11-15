@@ -53,7 +53,9 @@ use crate::server_fns::download::enqueue::{
 #[cfg(feature = "server")]
 use crate::server_fns::download::failover::{self, SourcePool};
 #[cfg(feature = "server")]
-use crate::server_fns::download::monitor::{transfer_by_id, FAILED_STATE_CONFIRM};
+use crate::server_fns::download::monitor::{
+    read_pending_retry, transfer_by_id, FAILED_STATE_CONFIRM,
+};
 #[cfg(feature = "server")]
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
 #[cfg(feature = "server")]
@@ -298,6 +300,9 @@ struct QueuedTrack {
     /// When this track's transfer was first seen failed, cleared the moment
     /// it is seen in any other state.
     failing_since: Option<tokio::time::Instant>,
+    /// When this track's transfer was first seen as a failed attempt slskd
+    /// will retry (`read_pending_retry`).
+    retry_pending_since: Option<tokio::time::Instant>,
     /// Alternate peers for this track, and how many have been tried.
     pool: SourcePool,
 }
@@ -352,6 +357,7 @@ async fn settle_poll(
         let Some(dl) = transfer_by_id(downloads, &qt.key.peer, &qt.transfer_id) else {
             continue;
         };
+        let dl = read_pending_retry(dl, &mut qt.retry_pending_since);
         if !matches!(dl.state, shared::download::DownloadState::Failed(_)) {
             qt.failing_since = None;
         }
@@ -416,6 +422,7 @@ async fn settle_poll(
                         registry.release(&dead, &qt.batch.owner);
                         qt.transfer_id = next.id.clone();
                         qt.failing_since = None;
+                        qt.retry_pending_since = None;
                         pending.insert(next.id);
                     }
                     None => {
@@ -781,6 +788,7 @@ pub async fn generate_discovery_playlist_internal(
                             key: transfer,
                             batch: track_batch.clone(),
                             failing_since: None,
+                            retry_pending_since: None,
                             // Start the pool at the source that actually
                             // enqueued: earlier entries were already tried and
                             // rejected in this loop, and must not be retried.
@@ -1511,11 +1519,13 @@ mod tests {
     use super::{scan_finished, scan_imports, settle_poll, QueuedTrack, FAILED_STATE_CONFIRM};
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
+    use crate::server_fns::download::monitor::RETRY_PENDING_FOR;
     use crate::server_fns::download::test_support::{
         batch, item, transfer, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::download::{DownloadProgress, DownloadState, DownloadableItem};
+    use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
     use soulbeet::DownloadBackend;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -1626,6 +1636,7 @@ mod tests {
             key,
             batch,
             failing_since: None,
+            retry_pending_since: None,
             pool: SourcePool::single(items),
         }
     }
@@ -1923,6 +1934,39 @@ mod tests {
         assert!(queued[0].failing_since.is_none());
         assert_eq!(pending, pending_of(&queued));
         assert!(failed_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pending_retry_held_past_its_bound_moves_to_the_next_peer() {
+        let backend = stub();
+        let mut queued = vec![queued_track(
+            vec![
+                item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+                item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+            ],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+        already_confirmed_failing(&mut queued[0]);
+        queued[0].retry_pending_since = Some(tokio::time::Instant::from_std(
+            std::time::Instant::now()
+                .checked_sub(RETRY_PENDING_FOR)
+                .expect("monotonic clock younger than the retry window"),
+        ));
+        let row = DownloadProgress {
+            pending_retry: Some(Failure::new(
+                FailureCode::TransferConnectionFailed,
+                Stage::Transfer,
+                RetryAdvice::OtherSource,
+                "Connection reset by peer",
+            )),
+            ..live("peer_a", "a/07 - Wake Up.flac")
+        };
+
+        settle_poll(&mut queued, &[row], &mut pending, &mut failed_ids, &backend).await;
+
+        assert_eq!(queued[0].pool.attempts_used(0), 2);
     }
 
     /// A Navidrome whose scan status cannot be read (getLastScanTime's

@@ -3,7 +3,6 @@ use std::path::Path;
 
 use std::fmt;
 
-use chrono::{DateTime, TimeDelta, Utc};
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -44,6 +43,9 @@ pub enum DownloadState {
     Aborted,
     Cancelled,
     Rejected,
+    /// slskd's `Remotely` qualifier: with `Queued`, the peer holds the
+    /// transfer in its own upload queue. Never a row's state on its own.
+    Remotely,
     Unknown(String),
 }
 
@@ -67,6 +69,7 @@ impl From<String> for DownloadState {
             "Imported" => DownloadState::Imported,
             "ImportSkipped" => DownloadState::ImportSkipped,
             "ImportFailed" => DownloadState::ImportFailed,
+            "Remotely" => DownloadState::Remotely,
             _ => DownloadState::Unknown(s),
         }
     }
@@ -543,13 +546,9 @@ impl From<AlbumResult> for crate::download::DownloadableGroup {
 }
 
 impl FileEntry {
-    /// The row for this transfer at `now`, under slskd's `retry_limit` (its
+    /// The row for this transfer under slskd's `retry_limit` (its
     /// `transfers.download.retry.attempts`).
-    pub fn into_progress(
-        self,
-        retry_limit: u32,
-        now: DateTime<Utc>,
-    ) -> crate::download::DownloadProgress {
+    pub fn into_progress(self, retry_limit: u32) -> crate::download::DownloadProgress {
         // Check all state elements, preferring error/rejection states over success.
         // This prevents "Completed, Rejected" from being treated as Downloaded
         // when only the first element is checked.
@@ -571,22 +570,18 @@ impl FileEntry {
                 .cloned()
                 .unwrap_or(DownloadState::Unknown("unknown".into()))
         };
-        // slskd stores `EndedAt` as UTC and reads it back as UTC
-        // (`Transfers/TransfersDbContext.cs:85-86`), so it is sent with `Z`.
-        let ended_ago = self
-            .ended_at
-            .as_deref()
-            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-            .map(|t| now - t.with_timezone(&Utc));
-        let (state, failure) = classify_transfer(
+        let queued_at_source = self.state.contains(&DownloadState::Queued)
+            && self.state.contains(&DownloadState::Remotely);
+        let pending = awaits_retry(
             &state,
             self.exception.as_deref(),
             Attempt {
                 number: self.attempts,
                 limit: retry_limit,
-                ended_ago,
+                ended: self.ended_at.is_some(),
             },
         );
+        let (row_state, failure) = classify_transfer(&state, self.exception.as_deref());
         let row = crate::download::DownloadProgress {
             id: self.id,
             source: self.username,
@@ -595,7 +590,7 @@ impl FileEntry {
             // not. A nonsensical negative must not wrap into a huge size.
             size: self.size.max(0) as u64,
             transferred: self.bytes_transferred.max(0) as u64,
-            state,
+            state: row_state,
             percent: self.percent_complete,
             speed: self.average_speed,
             error: None,
@@ -607,8 +602,15 @@ impl FileEntry {
             retryable: false,
             failure: None,
             skip: None,
+            queued_at_source,
+            pending_retry: None,
         };
         match failure {
+            Some(failure) if pending => crate::download::DownloadProgress {
+                state: crate::download::DownloadState::Queued,
+                pending_retry: Some(failure),
+                ..row
+            },
             Some(failure) => row.with_failure(failure),
             None => row,
         }
@@ -631,44 +633,26 @@ pub const NOT_LOGGED_IN: &str = "must be connected and logged in";
 /// attempt count unchanged (`Application.cs:100,367`). Nothing resumes it.
 const APPLICATION_SHUT_DOWN: &str = "application shut down";
 
-/// How long after a failed attempt ended its record may still show that
-/// failure while slskd is about to retry it. slskd writes the retry's
-/// `Queued, Locally` in `onRetry`, before the backoff delay
-/// (`Common/Retry.cs:118-119`, `DownloadService.cs:1426-1428`), so a retry
-/// shows the failure only for the database writes in between. A download
-/// cancelled during that delay keeps the failure for good: `Task.Delay`
-/// throws, `Retry.Do` does not retry a cancel and throws, and `TryFail`
-/// finds the record `Queued, Locally` and writes `Completed, Errored`
-/// (`DownloadService.cs:1045-1068`, called again from the download task's
-/// continuation at `:596`), keeping the earlier attempt's exception, end
-/// time and the raised attempt count. Nothing tells that record from a
-/// retry about to start but how long it stays.
-const RETRY_PENDING_FOR: TimeDelta = TimeDelta::seconds(30);
-
-/// A transfer's attempt count and slskd's limit on it, and how long ago the
-/// last attempt ended, if slskd recorded that.
+/// A transfer's attempt count and slskd's limit on it, and whether slskd
+/// recorded an end for the last attempt.
 struct Attempt {
     number: u32,
     limit: u32,
-    ended_ago: Option<TimeDelta>,
+    ended: bool,
 }
 
 impl Attempt {
     /// Whether slskd will start another attempt. `number` 0 means slskd
     /// failed the record before its first attempt (`DownloadService.cs:1350`
-    /// sets 1 just before it). A failure older than `RETRY_PENDING_FOR` is
-    /// one slskd will not retry; without an end time there is no sign of a
-    /// retry either, since slskd sets one on every finished attempt.
+    /// sets 1 just before it). Without an end time there is no sign of a
+    /// retry, since slskd sets one on every finished attempt. How long a
+    /// record may wait for the retry is the watcher's to bound.
     fn will_retry(&self) -> bool {
-        (1..self.limit).contains(&self.number)
-            && self.ended_ago.is_some_and(|ago| ago < RETRY_PENDING_FOR)
+        (1..self.limit).contains(&self.number) && self.ended
     }
 }
 
-/// The row state for a transfer and, for a failed or cancelled one, its
-/// failure. The message is the exception slskd stored, else the state's own
-/// text. Only failure states read the exception: a record waiting to retry
-/// still carries the failed attempt's text.
+/// Whether a transfer in `state` is a failed attempt slskd will retry.
 ///
 /// An errored or timed out attempt slskd will retry is queued: slskd copies
 /// the attempt's terminal state over its `Queued, Locally` before the retry
@@ -676,19 +660,22 @@ impl Attempt {
 /// `WithSoulseekTransfer`, which takes `State` from Soulseek.NET's transfer
 /// at `Transfers/Extensions.cs:47`), and retries while the attempt count is
 /// below its limit (`Attempt::will_retry`).
+fn awaits_retry(state: &DownloadState, exception: Option<&str>, attempt: Attempt) -> bool {
+    matches!(state, DownloadState::Errored | DownloadState::TimedOut)
+        && attempt.will_retry()
+        && !exception.is_some_and(|e| e.eq_ignore_ascii_case(APPLICATION_SHUT_DOWN))
+}
+
+/// The row state for a transfer and, for a failed or cancelled one, its
+/// failure. The message is the exception slskd stored, else the state's own
+/// text. Only failure states read the exception: a record waiting to retry
+/// still carries the failed attempt's text.
 fn classify_transfer(
     state: &DownloadState,
     exception: Option<&str>,
-    attempt: Attempt,
 ) -> (crate::download::DownloadState, Option<Failure>) {
     use crate::download::DownloadState as DS;
     let text = exception.map(str::to_ascii_lowercase).unwrap_or_default();
-    if matches!(state, DownloadState::Errored | DownloadState::TimedOut)
-        && attempt.will_retry()
-        && text != APPLICATION_SHUT_DOWN
-    {
-        return (DS::Queued, None);
-    }
     let (stage, code, retry, default) = match state {
         DownloadState::Queued | DownloadState::Requested => return (DS::Queued, None),
         DownloadState::Initializing | DownloadState::InProgress => return (DS::InProgress, None),
@@ -700,7 +687,7 @@ fn classify_transfer(
         // monitor treats terminal as finished and cancels the live slskd
         // transfer (issue #71). Treat as active; the per-track timeout
         // is the backstop if the state never advances.
-        DownloadState::Unknown(_) => return (DS::Queued, None),
+        DownloadState::Remotely | DownloadState::Unknown(_) => return (DS::Queued, None),
         DownloadState::Rejected => {
             let (code, retry) = rejection(&text);
             (Stage::Transfer, code, retry, "Transfer rejected by peer")
@@ -854,35 +841,13 @@ mod tests {
         converted(state, None, 3).state
     }
 
-    /// When the transfers in these tests ended.
-    const ENDED_AT: &str = "2026-07-19T05:11:30.1234567Z";
-
-    /// `seconds` after `ENDED_AT`.
-    fn after_end(seconds: i64) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(ENDED_AT)
-            .unwrap()
-            .with_timezone(&Utc)
-            + TimeDelta::seconds(seconds)
-    }
-
-    /// The row the monitor would see a second after the transfer ended, for
-    /// a transfer entry with the given `state`, its `attempts` and, when
-    /// given, the `exception` slskd stored on it, under slskd's default
-    /// limit of 3 attempts.
+    /// The row the monitor would see for a transfer entry with the given
+    /// `state`, its `attempts` and, when given, the `exception` slskd stored
+    /// on it, under slskd's default limit of 3 attempts.
     fn converted(
         state: serde_json::Value,
         exception: Option<&str>,
         attempts: u32,
-    ) -> crate::download::DownloadProgress {
-        converted_at(state, exception, attempts, after_end(1))
-    }
-
-    /// `converted`, read at `now`.
-    fn converted_at(
-        state: serde_json::Value,
-        exception: Option<&str>,
-        attempts: u32,
-        now: DateTime<Utc>,
     ) -> crate::download::DownloadProgress {
         let mut entry = json!({
             "id": "890f943c-02e1-4d45-af76-d55e3d855684",
@@ -892,7 +857,7 @@ mod tests {
             "size": 1024,
             "state": state,
             "requestedAt": "2026-07-19T05:11:22Z",
-            "endedAt": ENDED_AT,
+            "endedAt": "2026-07-19T05:11:30.1234567Z",
             "bytesTransferred": 0,
             "bytesRemaining": 1024,
             "percentComplete": 0.0,
@@ -902,24 +867,57 @@ mod tests {
             entry["exception"] = json!(exception);
         }
         let entry: FileEntry = serde_json::from_value(entry).expect("FileEntry should deserialize");
-        entry.into_progress(3, now)
+        entry.into_progress(3)
+    }
+
+    #[test]
+    fn a_transfer_the_peer_has_queued_is_queued_at_source() {
+        for (state, attempts, expected) in [
+            (json!("Queued, Remotely"), 1, true),
+            (json!("Queued, Locally"), 1, false),
+            (json!("Requested"), 0, false),
+            (json!("InProgress"), 1, false),
+            // A failed attempt slskd will retry reads as Queued (step 3 D5), but no peer holds it.
+            (json!("Completed, Errored"), 1, false),
+        ] {
+            let row = converted(state.clone(), None, attempts);
+            assert_eq!(row.queued_at_source, expected, "{state}");
+            assert!(matches!(row.state, DS::Queued | DS::InProgress), "{state}");
+            assert_eq!(row.failure, None, "{state}");
+        }
     }
 
     #[test]
     fn a_failed_attempt_slskd_will_retry_reads_as_queued() {
-        for (state, attempts, queued) in [
-            (json!("Completed, Errored"), 1, true),
-            (json!("Completed, TimedOut"), 2, true),
-            (json!("Completed, Errored"), 3, false),
-            (json!("Completed, Errored"), 0, false),
-            (json!("Completed, Rejected"), 1, false),
-            (json!("Completed, Aborted"), 1, false),
-            (json!("Completed, Cancelled"), 1, false),
+        use FailureCode::*;
+        for (state, attempts, queued, pending) in [
+            (
+                json!("Completed, Errored"),
+                1,
+                true,
+                Some(TransferConnectionFailed),
+            ),
+            (
+                json!("Completed, TimedOut"),
+                2,
+                true,
+                Some(TransferTimedOut),
+            ),
+            (json!("Completed, Errored"), 3, false, None),
+            (json!("Completed, Errored"), 0, false, None),
+            (json!("Completed, Rejected"), 1, false, None),
+            (json!("Completed, Aborted"), 1, false, None),
+            (json!("Completed, Cancelled"), 1, false, None),
         ] {
             let row = converted(state.clone(), Some("Connection reset by peer"), attempts);
             assert_eq!(
                 row.state == DS::Queued,
                 queued,
+                "{state} attempts {attempts}"
+            );
+            assert_eq!(
+                row.pending_retry.map(|f| f.code),
+                pending,
                 "{state} attempts {attempts}"
             );
             if queued {
@@ -947,6 +945,7 @@ mod tests {
             "{:?}",
             restarted.state
         );
+        assert_eq!(restarted.pending_retry, None);
         let f = restarted.failure.unwrap();
         assert_eq!(
             (f.code, f.retry),
@@ -957,31 +956,11 @@ mod tests {
         );
     }
 
-    /// A download cancelled during slskd's retry delay keeps `Completed,
-    /// Errored` with the raised attempt count and the earlier attempt's end
-    /// time for good; past `RETRY_PENDING_FOR` it reads as the failure it
-    /// states.
+    /// No end time is no sign of a retry: slskd sets one on every finished
+    /// attempt.
     #[test]
-    fn a_failed_attempt_still_showing_long_after_it_ended_is_a_failure() {
-        let reading = |seconds| {
-            converted_at(
-                json!("Completed, Errored"),
-                Some("Connection reset by peer"),
-                2,
-                after_end(seconds),
-            )
-        };
-        assert_eq!(reading(29).state, DS::Queued);
-        let stale = reading(30);
-        assert!(matches!(stale.state, DS::Failed(_)), "{:?}", stale.state);
-        assert_eq!(
-            stale.failure.unwrap().code,
-            FailureCode::TransferConnectionFailed
-        );
-
-        // No end time is no sign of a retry: slskd sets one on every
-        // finished attempt.
-        let mut entry: FileEntry = serde_json::from_value(json!({
+    fn a_failed_attempt_with_no_end_time_is_not_a_pending_retry() {
+        let entry: FileEntry = serde_json::from_value(json!({
             "id": "890f943c-02e1-4d45-af76-d55e3d855684", "username": "peer",
             "direction": "Download", "filename": "a.flac", "size": 1024,
             "state": "Completed, Errored", "requestedAt": "2026-07-19T05:11:22Z",
@@ -989,15 +968,7 @@ mod tests {
             "exception": "Connection reset by peer"
         }))
         .unwrap();
-        assert!(matches!(
-            entry.clone().into_progress(3, after_end(1)).state,
-            DS::Failed(_)
-        ));
-        entry.ended_at = Some("not a time".into());
-        assert!(matches!(
-            entry.into_progress(3, after_end(1)).state,
-            DS::Failed(_)
-        ));
+        assert!(matches!(entry.into_progress(3).state, DS::Failed(_)));
     }
 
     #[test]
@@ -1310,10 +1281,7 @@ mod tests {
         let files: FlattenedFiles =
             serde_json::from_value(payload).expect("payload should deserialize");
         assert_eq!(files.files.len(), 1, "transfer entry was silently dropped");
-        assert_eq!(
-            files.files[0].clone().into_progress(3, Utc::now()).state,
-            DS::Completed
-        );
+        assert_eq!(files.files[0].clone().into_progress(3).state, DS::Completed);
     }
 
     /// slskd computes `bytesRemaining` as `Size - BytesTransferred` and
@@ -1347,7 +1315,7 @@ mod tests {
             serde_json::from_value(payload).expect("payload should deserialize");
         assert_eq!(files.errors.len(), 0, "overshooting transfer was rejected");
         assert_eq!(files.files.len(), 1, "overshooting transfer was dropped");
-        let progress = files.files[0].clone().into_progress(3, Utc::now());
+        let progress = files.files[0].clone().into_progress(3);
         assert_eq!(progress.transferred, 5120);
         assert_eq!(progress.size, 1024);
     }
