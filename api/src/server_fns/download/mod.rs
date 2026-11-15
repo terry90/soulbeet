@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 
 #[cfg(feature = "server")]
 use crate::{
-    base_url::BaseUrl,
+    base_url::{BaseUrl, BaseUrlError},
     server_fns::{forbidden_error, refusal_error, refusal_error_with, server_error},
     AuthSession,
 };
@@ -97,15 +97,23 @@ fn auto_batch_label(group: &shared::download::DownloadableGroup) -> String {
 #[cfg(feature = "server")]
 const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Whether a socket upgrade may come from the page at `origin`: one on the
-/// host this request was made to. A request with no `Origin` is not from a
-/// browser page, so no other site can be riding on the user's cookie.
+/// Whether a socket upgrade may come from the page its `Origin` names: a
+/// page on the host and port the request was sent to, so a page opened at
+/// any of Soulful's addresses works, whatever `PUBLIC_URL` pins. The scheme
+/// is not compared, since a proxy may end TLS. A request with no `Origin`
+/// is not from a browser page, so no other site can be riding on the user's
+/// cookie.
 #[cfg(feature = "server")]
-pub(crate) fn origin_allowed(origin: Option<&str>, base: &BaseUrl) -> bool {
-    match origin {
-        None => true,
-        Some(origin) => BaseUrl::parse(origin).is_ok_and(|o| o.same_host(base)),
-    }
+pub(crate) fn origin_allowed(headers: &HeaderMap, uri: &Uri) -> Result<bool, BaseUrlError> {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return Ok(true);
+    };
+    let addressed = crate::base_url::addressed_to(headers, uri)?;
+    Ok(origin
+        .to_str()
+        .ok()
+        .and_then(|o| BaseUrl::parse(o).ok())
+        .is_some_and(|o| o.same_host(&addressed)))
 }
 
 /// Whether the socket's token still gives `user` a session: not signed out,
@@ -130,12 +138,9 @@ pub async fn download_updates_ws(
 ) -> Result<Websocket<(), DownloadEvent>, ServerFnError> {
     let user = auth.0.id();
 
-    let base = crate::base_url::request_base(&headers, &uri)
+    let allowed = origin_allowed(&headers, &uri)
         .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
-    let origin = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok());
-    if !origin_allowed(origin, &base) {
+    if !allowed {
         warn!("Refused a download updates socket for user {user} from another origin");
         return Err(forbidden_error(
             "Download updates can only be opened from Soulful's own page",
@@ -566,19 +571,72 @@ mod tests {
     }
 
     #[test]
-    fn only_this_hosts_pages_may_open_the_socket() {
-        let base = BaseUrl::parse("https://music.example.com").unwrap();
-        assert!(origin_allowed(Some("https://music.example.com"), &base));
-        assert!(!origin_allowed(Some("https://evil.example"), &base));
-        assert!(!origin_allowed(
-            Some("https://music.example.com:8443"),
-            &base
-        ));
-        assert!(!origin_allowed(Some("null"), &base));
-        assert!(origin_allowed(None, &base));
-        // http://nas:9765 typed in the browser: the base calls the host https.
-        let lan = BaseUrl::parse("https://nas:9765").unwrap();
-        assert!(origin_allowed(Some("http://nas:9765"), &lan));
+    fn only_pages_on_the_address_the_socket_was_asked_at_may_open_it() {
+        use axum::http::{HeaderName, HeaderValue};
+        let allowed = |pairs: &[(&str, &str)]| {
+            let headers: HeaderMap = pairs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                        HeaderValue::from_str(v).unwrap(),
+                    )
+                })
+                .collect();
+            origin_allowed(&headers, &Uri::from_static("/api/downloads/updates"))
+        };
+        let host = ("host", "music.example.com");
+
+        assert_eq!(
+            allowed(&[host, ("origin", "https://music.example.com")]),
+            Ok(true)
+        );
+        assert_eq!(
+            allowed(&[host, ("origin", "https://evil.example")]),
+            Ok(false)
+        );
+        assert_eq!(
+            allowed(&[host, ("origin", "https://music.example.com:8443")]),
+            Ok(false)
+        );
+        assert_eq!(allowed(&[host, ("origin", "null")]), Ok(false));
+        // Not a browser page: nothing to compare, and no address needed.
+        assert_eq!(allowed(&[]), Ok(true));
+        // A page opened at a LAN address talks to that address; PUBLIC_URL
+        // takes no part.
+        assert_eq!(
+            allowed(&[
+                ("host", "192.168.1.5:9765"),
+                ("origin", "http://192.168.1.5:9765")
+            ]),
+            Ok(true)
+        );
+        // http://nas:9765 typed in the browser: the host derives https.
+        assert_eq!(
+            allowed(&[("host", "nas:9765"), ("origin", "http://nas:9765")]),
+            Ok(true)
+        );
+        // Behind a proxy, the forwarded host is the one the page was on.
+        assert_eq!(
+            allowed(&[
+                ("host", "soulful:9765"),
+                ("x-forwarded-host", "music.example.com"),
+                ("origin", "https://music.example.com"),
+            ]),
+            Ok(true)
+        );
+        assert_eq!(
+            allowed(&[
+                ("host", "soulful:9765"),
+                ("forwarded", "host=music.example.com;proto=https"),
+                ("origin", "http://soulful:9765"),
+            ]),
+            Ok(false)
+        );
+        assert_eq!(
+            allowed(&[("origin", "https://music.example.com")]),
+            Err(BaseUrlError::MissingHost)
+        );
     }
 
     #[tokio::test]

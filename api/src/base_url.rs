@@ -190,17 +190,21 @@ pub fn request_base_with(
     uri: &Uri,
     public_url: Option<&Result<BaseUrl, BaseUrlError>>,
 ) -> Result<BaseUrl, BaseUrlError> {
-    let authority = uri.authority().map(|a| a.as_str());
     match public_url {
-        None => derive_base(headers, authority, None),
-        Some(Ok(pin)) => derive_base(headers, authority, Some(pin)),
+        None => addressed_to(headers, uri),
+        Some(Ok(pin)) => derive_base(headers, authority(uri), Some(pin)),
         Some(Err(e)) => Err(BaseUrlError::InvalidPublicUrl(e.to_string())),
     }
 }
 
-/// `derive_base` for a request, with the configured `PUBLIC_URL`.
-pub fn request_base(headers: &HeaderMap, uri: &Uri) -> Result<BaseUrl, BaseUrlError> {
-    request_base_with(headers, uri, crate::config::CONFIG.public_url())
+/// The address the request itself was sent to, from its headers, whatever
+/// `PUBLIC_URL` pins: a page opened at a LAN address talks to that address.
+pub fn addressed_to(headers: &HeaderMap, uri: &Uri) -> Result<BaseUrl, BaseUrlError> {
+    derive_base(headers, authority(uri), None)
+}
+
+fn authority(uri: &Uri) -> Option<&str> {
+    uri.authority().map(|a| a.as_str())
 }
 
 #[cfg(test)]
