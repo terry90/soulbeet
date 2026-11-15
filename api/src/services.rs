@@ -6,8 +6,11 @@ use std::{
 };
 
 #[cfg(feature = "server")]
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
+#[cfg(feature = "server")]
 use soulbeet::{
     beets::{BeetsImporter, BeetsSettings},
+    error::SoulseekError,
     musicbrainz::MusicBrainzProvider,
     navidrome::NavidromeClientBuilder,
     slskd::{DownloadConfig, SoulseekClientBuilder},
@@ -82,36 +85,82 @@ async fn init_metadata_provider(
     }
 }
 
+/// Why `download_backend` has no backend to give. Its Display is the text
+/// the lookup always showed.
 #[cfg(feature = "server")]
-async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, String> {
+#[derive(Debug)]
+pub enum BackendLookupError {
+    /// The backend's settings could not be read from Soulful's database.
+    Settings(String),
+    /// The backend refused its settings; its own error says what is wrong.
+    Backend(SoulseekError),
+    /// No backend has this id.
+    Unknown(String),
+}
+
+#[cfg(feature = "server")]
+impl std::fmt::Display for BackendLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendLookupError::Settings(e) => f.write_str(e),
+            BackendLookupError::Backend(e) => write!(f, "{e}"),
+            BackendLookupError::Unknown(id) => write!(f, "Unknown download backend: {id}"),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl BackendLookupError {
+    /// This lookup error as the failure of `stage`, shown as `message`. The
+    /// backend gives the code, cause and user action for its own settings.
+    pub fn failure(&self, stage: Stage, message: impl Into<String>) -> Failure {
+        match self {
+            BackendLookupError::Backend(e) => e.failure(stage, message),
+            BackendLookupError::Settings(e) => Failure::new(
+                FailureCode::BackendUnreachable,
+                stage,
+                RetryAdvice::SameSourceLater,
+                message,
+            )
+            .with_cause(Service::Database, None, e.clone()),
+            // The caller named a backend that does not exist, so nothing at
+            // `stage` ran.
+            BackendLookupError::Unknown(_) => Failure::new(
+                FailureCode::InvalidInput,
+                Stage::Input,
+                RetryAdvice::NotRetryable,
+                message,
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
     match id {
         downloaders::SLSKD => {
             let url = AppConfig::get(keys::SLSKD_URL)
-                .await?
-                .ok_or("slskd URL not configured")?;
+                .await
+                .map_err(BackendLookupError::Settings)?;
             let api_key = AppConfig::get(keys::SLSKD_API_KEY)
-                .await?
-                .ok_or("slskd API key not configured")?;
-
-            if url.is_empty() || api_key.is_empty() {
-                return Err("slskd not configured".to_string());
-            }
-
-            let client = SoulseekClientBuilder::new()
-                .base_url(&url)
-                .api_key(&api_key)
-                .download_config(DownloadConfig {
-                    batch_size: 3,
-                    batch_delay_ms: 3000,
-                    max_retries: 3,
-                    retry_base_delay_ms: 1000,
+                .await
+                .map_err(BackendLookupError::Settings)?;
+            let client = SoulseekClientBuilder::from_settings(url, api_key)
+                .and_then(|builder| {
+                    builder
+                        .download_config(DownloadConfig {
+                            batch_size: 3,
+                            batch_delay_ms: 3000,
+                            max_retries: 3,
+                            retry_base_delay_ms: 1000,
+                        })
+                        .build()
                 })
-                .build()
-                .map_err(|e| e.to_string())?;
+                .map_err(BackendLookupError::Backend)?;
 
             Ok(Arc::new(client))
         }
-        _ => Err(format!("Unknown download backend: {}", id)),
+        _ => Err(BackendLookupError::Unknown(id.to_string())),
     }
 }
 
@@ -148,9 +197,15 @@ pub async fn metadata_provider(
     Ok(provider)
 }
 
+/// The backend `download_backend(None)` gives.
 #[cfg(feature = "server")]
-pub async fn download_backend(id: Option<&str>) -> Result<Arc<dyn DownloadBackend>, String> {
-    let requested = id.unwrap_or(downloaders::SLSKD);
+pub const DEFAULT_DOWNLOAD_BACKEND: &str = downloaders::SLSKD;
+
+#[cfg(feature = "server")]
+pub async fn download_backend(
+    id: Option<&str>,
+) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+    let requested = id.unwrap_or(DEFAULT_DOWNLOAD_BACKEND);
 
     if let Some(backend) = DOWNLOAD_BACKENDS.read().await.get(requested) {
         return Ok(backend.clone());

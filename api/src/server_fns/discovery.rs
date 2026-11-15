@@ -495,7 +495,7 @@ pub async fn generate_discovery_playlist_internal(
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
     let track_counts = settings.parse_track_counts();
 
-    let backend = download_backend(None).await?;
+    let backend = download_backend(None).await.map_err(|e| e.to_string())?;
 
     // Create per-profile subdirectories under Discovery/
     for profile in &selected_profiles {

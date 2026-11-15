@@ -116,22 +116,6 @@ impl UserAction {
         }
     }
 
-    pub fn configure_backend() -> Self {
-        Self::new(
-            UserActionCode::ConfigureBackend,
-            "Set the slskd URL and API key",
-            "Settings > Config",
-        )
-    }
-
-    pub fn upgrade_backend() -> Self {
-        Self::new(
-            UserActionCode::UpgradeBackend,
-            "Upgrade slskd to 0.26 or newer",
-            "slskd",
-        )
-    }
-
     pub fn fix_importer(message: &str) -> Self {
         Self::new(
             UserActionCode::FixImporter,

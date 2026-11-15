@@ -8,7 +8,7 @@ use shared::download::{
     QueuedDownload, SearchState,
 };
 #[cfg(feature = "server")]
-use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage, UserAction};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 #[cfg(feature = "server")]
 use shared::metadata::{Album, Track};
 #[cfg(feature = "server")]
@@ -28,7 +28,9 @@ use crate::globals::{get_or_create_user_channel, register_user_task, unregister_
 #[cfg(feature = "server")]
 use crate::models::folder::Folder;
 #[cfg(feature = "server")]
-use crate::services::{available_download_backends, download_backend};
+use crate::services::{
+    available_download_backends, download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND,
+};
 #[cfg(feature = "server")]
 use crate::transfer_registry::{BatchRef, TransferOwner};
 #[cfg(feature = "server")]
@@ -123,37 +125,36 @@ async fn search_backend(
     }
 }
 
-/// Why a search found nothing: an empty search when any backend finished,
-/// else a timeout when any timed out, else the first backend's own failure.
+/// Why a search of `first` and `rest` found nothing: an empty search when
+/// any backend finished, else a timeout when any timed out, else the first
+/// backend's own failure.
 #[cfg(feature = "server")]
-fn no_results_failure(stops: &[SearchStop]) -> Failure {
+fn no_results_failure(first: &SearchStop, rest: &[SearchStop]) -> Failure {
     const MESSAGE: &str = "No results found";
-    let empty = || {
-        Failure::new(
+    let rank = |stop: &SearchStop| match stop {
+        SearchStop::Finished => 2,
+        SearchStop::TimedOut => 1,
+        SearchStop::Failed(_) => 0,
+    };
+    // The earliest of the highest rank.
+    let stop = rest
+        .iter()
+        .fold(first, |best, s| if rank(s) > rank(best) { s } else { best });
+    match stop {
+        SearchStop::Finished => Failure::new(
             FailureCode::SearchNoResults,
             Stage::SourceSearch,
             RetryAdvice::OtherQuery,
             MESSAGE,
-        )
-    };
-    if stops.iter().any(|s| matches!(s, SearchStop::Finished)) {
-        return empty();
-    }
-    if stops.iter().any(|s| matches!(s, SearchStop::TimedOut)) {
-        return Failure::new(
+        ),
+        SearchStop::TimedOut => Failure::new(
             FailureCode::SearchTimeout,
             Stage::SourceSearch,
             RetryAdvice::SameSourceLater,
             MESSAGE,
-        );
+        ),
+        SearchStop::Failed(f) => f.clone().with_message(MESSAGE),
     }
-    stops
-        .iter()
-        .find_map(|s| match s {
-            SearchStop::Failed(f) => Some(f.clone().with_message(MESSAGE)),
-            _ => None,
-        })
-        .unwrap_or_else(empty)
 }
 
 /// Why no file of a request was queued, shown as the request's failure.
@@ -162,15 +163,10 @@ fn queue_failure(results: &[QueuedDownload]) -> Failure {
     not_enqueued_failure(results).with_message("All downloads failed to queue")
 }
 
+/// No backend was available, `e` saying why the default one was not.
 #[cfg(feature = "server")]
-fn no_backends() -> Failure {
-    Failure::new(
-        FailureCode::BackendNotConfigured,
-        Stage::SourceSearch,
-        RetryAdvice::NeedsUser,
-        "No download backends available",
-    )
-    .with_user_action(UserAction::configure_backend())
+fn no_backends(e: &BackendLookupError) -> Failure {
+    e.failure(Stage::SourceSearch, "No download backends available")
 }
 
 #[cfg(feature = "server")]
@@ -185,14 +181,45 @@ fn target_unwritable(e: &std::io::Error) -> Failure {
 }
 
 #[cfg(feature = "server")]
-fn backend_unavailable(e: &str) -> Failure {
-    Failure::new(
-        FailureCode::BackendNotConfigured,
+fn backend_unavailable(e: &BackendLookupError) -> Failure {
+    e.failure(
         Stage::Enqueue,
-        RetryAdvice::NeedsUser,
         format!("Download backend not available: {e}"),
     )
-    .with_user_action(UserAction::configure_backend())
+}
+
+/// A backend an auto-download searches, by its id in the settings.
+#[cfg(feature = "server")]
+type Searched = (String, Arc<dyn DownloadBackend>);
+
+/// The backends to search, the default one first when it is available, or
+/// the default one's lookup error when none is.
+#[cfg(feature = "server")]
+async fn usable_backends() -> Result<(Searched, Vec<Searched>), BackendLookupError> {
+    let mut others = Vec::new();
+    for (id, _) in available_download_backends() {
+        if id == DEFAULT_DOWNLOAD_BACKEND {
+            continue;
+        }
+        match download_backend(Some(id)).await {
+            Ok(b) => others.push((id.to_string(), b)),
+            Err(e) => warn!("Backend {} unavailable for auto-download: {}", id, e),
+        }
+    }
+    match download_backend(None).await {
+        Ok(b) => Ok(((DEFAULT_DOWNLOAD_BACKEND.to_string(), b), others)),
+        Err(e) => {
+            warn!(
+                "Backend {} unavailable for auto-download: {}",
+                DEFAULT_DOWNLOAD_BACKEND, e
+            );
+            let mut others = others.into_iter();
+            match others.next() {
+                Some(first) => Ok((first, others.collect())),
+                None => Err(e),
+            }
+        }
+    }
 }
 
 #[cfg(feature = "server")]
@@ -259,32 +286,20 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                 .unwrap_or_else(|| "Unknown query".to_string())
         });
 
-    // Collect available backends (per D-06: search ALL configured backends)
-    let backend_ids: Vec<String> = available_download_backends()
-        .iter()
-        .map(|(id, _)| id.to_string())
-        .collect();
-
-    let mut backends = Vec::new();
-    for id in &backend_ids {
-        match download_backend(Some(id)).await {
-            Ok(b) => backends.push((id.clone(), b)),
-            Err(e) => {
-                warn!("Backend {} unavailable for auto-download: {}", id, e);
-            }
+    // Search every configured backend (per D-06).
+    let (first, rest) = match usable_backends().await {
+        Ok(backends) => backends,
+        Err(e) => {
+            let batch_id = uuid::Uuid::new_v4().to_string();
+            let failure = no_backends(&e);
+            let error = failure.message.clone();
+            let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
+                batch_id,
+                failure,
+            }));
+            return Ok(AutoDownloadResult::Error(error));
         }
-    }
-
-    if backends.is_empty() {
-        let batch_id = uuid::Uuid::new_v4().to_string();
-        let failure = no_backends();
-        let error = failure.message.clone();
-        let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
-            batch_id,
-            failure,
-        }));
-        return Ok(AutoDownloadResult::Error(error));
-    }
+    };
 
     // Generate batch_id upfront so we can return it immediately (per D-10)
     let batch_id = uuid::Uuid::new_v4().to_string();
@@ -301,31 +316,36 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Searching {
             batch_id: batch_id.clone(),
             query: query_desc.clone(),
-            backend_count: backends.len(),
+            backend_count: 1 + rest.len(),
         }));
 
         info!(
             "Auto-download: searching {} backends for '{}'",
-            backends.len(),
+            1 + rest.len(),
             query_desc
         );
 
         // Search all backends in parallel (per D-06)
-        let results = futures::future::join_all(
-            backends
-                .iter()
-                .map(|(id, backend)| search_backend(id, backend, album.as_ref(), &tracks)),
+        let ((first_groups, first_stop), results) = futures::future::join(
+            search_backend(&first.0, &first.1, album.as_ref(), &tracks),
+            futures::future::join_all(
+                rest.iter()
+                    .map(|(id, backend)| search_backend(id, backend, album.as_ref(), &tracks)),
+            ),
         )
         .await;
 
         // Merge all results into a single list sorted by score (per D-07)
         let (groups, stops): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-        let mut all_groups: Vec<DownloadableGroup> = groups.into_iter().flatten().collect();
+        let mut all_groups: Vec<DownloadableGroup> = first_groups
+            .into_iter()
+            .chain(groups.into_iter().flatten())
+            .collect();
 
         if all_groups.is_empty() {
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                 batch_id: batch_id.clone(),
-                failure: no_results_failure(&stops),
+                failure: no_results_failure(&first_stop, &stops),
             }));
             info!("Auto-download: no results for '{}'", query_desc);
             return;
@@ -564,12 +584,13 @@ mod tests {
     use super::*;
     use crate::server_fns::download::test_support::{group, item, search_result, StubBackend};
     use shared::failure::UserActionCode;
+    use soulbeet::error::MissingSetting;
 
     /// The groups `stub`'s search found and the failure an empty one gives.
     async fn searched(stub: Arc<StubBackend>) -> (Vec<DownloadableGroup>, Failure) {
         let backend: Arc<dyn DownloadBackend> = stub;
         let (groups, stop) = search_backend("stub", &backend, None, &[]).await;
-        (groups, no_results_failure(&[stop]))
+        (groups, no_results_failure(&stop, &[]))
     }
 
     fn advice(f: &Failure) -> (FailureCode, Stage, RetryAdvice, &str) {
@@ -693,25 +714,50 @@ mod tests {
 
     #[test]
     fn no_results_failure_tells_an_empty_search_from_a_dead_backend() {
-        let dead = SoulseekError::Api {
-            status: 503,
-            message: "Connection failed".into(),
-        }
-        .failure(Stage::SourceSearch, "x");
-        let code = |stops: &[SearchStop]| no_results_failure(stops).code;
-        assert_eq!(code(&[SearchStop::Finished]), FailureCode::SearchNoResults);
-        assert_eq!(code(&[SearchStop::TimedOut]), FailureCode::SearchTimeout);
+        let dead = |message: &str| {
+            SearchStop::Failed(
+                SoulseekError::Api {
+                    status: 503,
+                    message: message.into(),
+                }
+                .failure(Stage::SourceSearch, "x"),
+            )
+        };
+        let advice = |first: SearchStop, rest: Vec<SearchStop>| {
+            let f = no_results_failure(&first, &rest);
+            (f.code, f.retry)
+        };
+        use FailureCode::*;
+        use RetryAdvice::*;
         assert_eq!(
-            code(&[SearchStop::Failed(dead.clone())]),
-            FailureCode::BackendUnreachable
+            advice(SearchStop::Finished, vec![]),
+            (SearchNoResults, OtherQuery)
         );
         assert_eq!(
-            code(&[SearchStop::Failed(dead.clone()), SearchStop::Finished]),
-            FailureCode::SearchNoResults
+            advice(SearchStop::TimedOut, vec![]),
+            (SearchTimeout, SameSourceLater)
         );
-        let f = no_results_failure(&[SearchStop::Failed(dead)]);
+        assert_eq!(
+            advice(dead("down"), vec![]),
+            (BackendUnreachable, SameSourceLater)
+        );
+        assert_eq!(
+            advice(dead("down"), vec![SearchStop::Finished]),
+            (SearchNoResults, OtherQuery)
+        );
+        // A timeout says more than a dead backend, an empty search more than both.
+        assert_eq!(
+            advice(dead("down"), vec![SearchStop::TimedOut]),
+            (SearchTimeout, SameSourceLater)
+        );
+        assert_eq!(
+            advice(SearchStop::TimedOut, vec![SearchStop::Finished]),
+            (SearchNoResults, OtherQuery)
+        );
+        let f = no_results_failure(&dead("first"), &[dead("second")]);
         assert_eq!(f.message, "No results found");
-        assert_eq!(f.cause.unwrap().raw, "Connection failed");
+        assert_eq!(f.stage, Stage::SourceSearch);
+        assert_eq!(f.cause.unwrap().raw, "first");
     }
 
     /// slskd lost the search: a 404 on its responses is a failed search to
@@ -790,14 +836,15 @@ mod tests {
             status: 503,
             message: "down".into(),
         };
+        let unset = BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url));
         let (dir, backend, queue) = (
             format!("Failed to create target directory: {io}"),
-            "Download backend not available: not configured".to_string(),
+            "Download backend not available: slskd URL not configured".to_string(),
             format!("Download queue failed: {slskd}"),
         );
         for (f, code, stage, retry, message) in [
             (
-                no_backends(),
+                no_backends(&unset),
                 FailureCode::BackendNotConfigured,
                 Stage::SourceSearch,
                 NeedsUser,
@@ -811,7 +858,7 @@ mod tests {
                 dir.as_str(),
             ),
             (
-                backend_unavailable("not configured"),
+                backend_unavailable(&unset),
                 FailureCode::BackendNotConfigured,
                 Stage::Enqueue,
                 NeedsUser,
@@ -834,9 +881,12 @@ mod tests {
             target_unwritable(&io).cause.unwrap().service,
             Service::Filesystem
         );
-        assert_eq!(
-            no_backends().user_action.unwrap().code,
-            UserActionCode::ConfigureBackend
-        );
+        for f in [no_backends(&unset), backend_unavailable(&unset)] {
+            assert_eq!(
+                f.user_action.unwrap().code,
+                UserActionCode::ConfigureBackend
+            );
+            assert_eq!(f.cause.unwrap().raw, "slskd URL not configured");
+        }
     }
 }

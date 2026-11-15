@@ -9,7 +9,7 @@
 
 use dioxus::logger::tracing::{debug, info, warn};
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, QueuedDownload};
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::SoulseekError;
 use soulbeet::{DownloadBackend, ImportMode};
 use std::collections::HashSet;
@@ -29,7 +29,7 @@ use super::utils::FileId;
 use crate::config::CONFIG;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
-use crate::services::download_backend;
+use crate::services::{download_backend, BackendLookupError};
 use crate::transfer_registry::{AddedSlot, BatchRef, TransferKey, TransferOwner, TransferRegistry};
 
 /// Poll interval for checking download status (2 seconds).
@@ -124,14 +124,10 @@ fn stalled(e: &SoulseekError) -> Failure {
     )
 }
 
-/// No download backend could be reached for `MAX_BACKEND_FAILURES` polls.
-fn backend_unavailable() -> Failure {
-    transfer_failure(
-        FailureCode::BackendNotConfigured,
-        RetryAdvice::NeedsUser,
-        "Download backend unavailable",
-    )
-    .with_user_action(UserAction::configure_backend())
+/// No download backend was available for `MAX_BACKEND_FAILURES` polls, the
+/// last lookup failing with `e`, whose failure this is.
+fn backend_unavailable(e: &BackendLookupError) -> Failure {
+    e.failure(Stage::Transfer, "Download backend unavailable")
 }
 
 /// slskd's downloads list kept failing to parse.
@@ -589,7 +585,7 @@ impl DownloadMonitor {
                         backend_failures, MAX_BACKEND_FAILURES, e
                     );
                     if backend_failures >= MAX_BACKEND_FAILURES {
-                        self.fail_unprocessed_tracks(backend_unavailable());
+                        self.fail_unprocessed_tracks(backend_unavailable(&e));
                         break;
                     }
                     interval.tick().await;
@@ -1453,7 +1449,8 @@ mod tests {
     use crate::server_fns::download::test_support::{
         batch, item, key, transfer, Cancel, ScriptedOutcome, StubBackend,
     };
-    use shared::failure::UserActionCode;
+    use shared::failure::{Service, UserActionCode};
+    use soulbeet::error::MissingSetting;
     use tokio::sync::broadcast;
 
     fn assert_failed(row: &DownloadProgress, code: FailureCode, message: &str) {
@@ -2179,7 +2176,7 @@ mod tests {
                 "slskd's transfer list was unreadable for 10 minutes",
             ),
             (
-                backend_unavailable(),
+                backend_unavailable(&unset_key()),
                 FailureCode::BackendNotConfigured,
                 NeedsUser,
                 "Download backend unavailable",
@@ -2202,10 +2199,42 @@ mod tests {
                 (code, Stage::Transfer, retry, message)
             );
         }
+    }
+
+    fn unset_key() -> BackendLookupError {
+        BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::ApiKey))
+    }
+
+    /// The lookup error is the cause, and the backend says what to set.
+    #[test]
+    fn an_unavailable_backend_keeps_why_it_was_unavailable() {
+        let f = backend_unavailable(&unset_key());
         assert_eq!(
-            backend_unavailable().user_action.unwrap().code,
-            UserActionCode::ConfigureBackend
+            f.user_action.map(|a| a.code),
+            Some(UserActionCode::ConfigureBackend)
         );
+        assert_eq!(
+            f.cause.map(|c| c.raw).as_deref(),
+            Some("slskd API key not configured")
+        );
+
+        let locked = BackendLookupError::Settings("database is locked".into());
+        let f = backend_unavailable(&locked);
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::BackendUnreachable,
+                Stage::Transfer,
+                RetryAdvice::SameSourceLater,
+                "Download backend unavailable"
+            )
+        );
+        let cause = f.cause.unwrap();
+        assert_eq!(
+            (cause.service, cause.raw.as_str()),
+            (Service::Database, "database is locked")
+        );
+        assert_eq!(f.user_action, None);
     }
 
     #[tokio::test]
