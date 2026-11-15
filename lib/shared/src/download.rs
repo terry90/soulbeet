@@ -428,7 +428,7 @@ pub enum AutoDownloadEvent {
         threshold: f64,
     },
     /// Auto-download pipeline failed
-    Failed { batch_id: String, error: String },
+    Failed { batch_id: String, failure: Failure },
 }
 
 #[cfg(test)]

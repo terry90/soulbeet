@@ -220,10 +220,10 @@ pub fn Search() -> Element {
                         fallback_toasts.write().retain(|t| t.id != toast_id);
                     });
                 }
-                AutoDownloadEvent::Failed { error, .. } => {
+                AutoDownloadEvent::Failed { failure, .. } => {
                     download_states
                         .write()
-                        .insert(item_id, DownloadRowState::Failed(error));
+                        .insert(item_id, DownloadRowState::Failed(failure.message));
                 }
             }
         }
@@ -322,10 +322,10 @@ pub fn Search() -> Element {
                         fallback_toasts.write().retain(|t| t.id != toast_id);
                     });
                 }
-                AutoDownloadEvent::Failed { error, .. } => {
+                AutoDownloadEvent::Failed { failure, .. } => {
                     download_states
                         .write()
-                        .insert(item_id, DownloadRowState::Failed(error));
+                        .insert(item_id, DownloadRowState::Failed(failure.message));
                 }
             }
         }

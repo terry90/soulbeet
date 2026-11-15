@@ -7,6 +7,10 @@ use shared::download::{
     AutoDownloadEvent, DownloadEvent, DownloadProgress, DownloadableGroup, EnqueueStatus,
     QueuedDownload, SearchState,
 };
+#[cfg(feature = "server")]
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage, UserAction};
+#[cfg(feature = "server")]
+use soulbeet::error::SoulseekError;
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
@@ -28,7 +32,7 @@ use crate::AuthSession;
 
 #[cfg(feature = "server")]
 use super::enqueue::{
-    deliver, enqueue_request, failed_reason, stopped_rows, RequestEnqueue, Watcher,
+    another_folder, deliver, enqueue_request, failed_reason, stopped_rows, RequestEnqueue, Watcher,
 };
 #[cfg(feature = "server")]
 use super::failover::{align_pool_tracks, SourcePool};
@@ -47,6 +51,106 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Poll interval when waiting for search results.
 #[cfg(feature = "server")]
 const SEARCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How one backend's search ended.
+#[cfg(feature = "server")]
+enum SearchStop {
+    /// The backend finished the search, or no longer knows it.
+    Finished,
+    /// SEARCH_TIMEOUT passed before the backend finished.
+    TimedOut,
+    /// Starting or polling the search failed.
+    Failed(Failure),
+}
+
+/// Why a search found nothing: an empty search when any backend finished,
+/// else a timeout when any timed out, else the first backend's own failure.
+#[cfg(feature = "server")]
+fn no_results_failure(stops: &[SearchStop]) -> Failure {
+    const MESSAGE: &str = "No results found";
+    let empty = || {
+        Failure::new(
+            FailureCode::SearchNoResults,
+            Stage::SourceSearch,
+            RetryAdvice::OtherQuery,
+            MESSAGE,
+        )
+    };
+    if stops.iter().any(|s| matches!(s, SearchStop::Finished)) {
+        return empty();
+    }
+    if stops.iter().any(|s| matches!(s, SearchStop::TimedOut)) {
+        return Failure::new(
+            FailureCode::SearchTimeout,
+            Stage::SourceSearch,
+            RetryAdvice::SameSourceLater,
+            MESSAGE,
+        );
+    }
+    stops
+        .iter()
+        .find_map(|s| match s {
+            SearchStop::Failed(f) => Some(f.clone().with_message(MESSAGE)),
+            _ => None,
+        })
+        .unwrap_or_else(empty)
+}
+
+/// Why no file of a request was queued: the first failed file's failure.
+#[cfg(feature = "server")]
+fn queue_failure(results: &[QueuedDownload]) -> Failure {
+    const MESSAGE: &str = "All downloads failed to queue";
+    results
+        .iter()
+        .find_map(|d| failed_reason(&d.status))
+        .map(|f| f.clone().with_message(MESSAGE))
+        .unwrap_or_else(|| {
+            Failure::new(
+                FailureCode::EnqueueFailed,
+                Stage::Enqueue,
+                RetryAdvice::OtherSource,
+                MESSAGE,
+            )
+        })
+}
+
+#[cfg(feature = "server")]
+fn no_backends() -> Failure {
+    Failure::new(
+        FailureCode::BackendNotConfigured,
+        Stage::SourceSearch,
+        RetryAdvice::NeedsUser,
+        "No download backends available",
+    )
+    .with_user_action(UserAction::configure_backend())
+}
+
+#[cfg(feature = "server")]
+fn target_unwritable(e: &std::io::Error) -> Failure {
+    Failure::new(
+        FailureCode::ImportTargetUnwritable,
+        Stage::Import,
+        RetryAdvice::NotRetryable,
+        format!("Failed to create target directory: {e}"),
+    )
+    .with_cause(Service::Filesystem, None, e.to_string())
+}
+
+#[cfg(feature = "server")]
+fn backend_unavailable(e: &str) -> Failure {
+    Failure::new(
+        FailureCode::BackendNotConfigured,
+        Stage::Enqueue,
+        RetryAdvice::NeedsUser,
+        format!("Download backend not available: {e}"),
+    )
+    .with_user_action(UserAction::configure_backend())
+}
+
+#[cfg(feature = "server")]
+fn queue_failed(e: &SoulseekError) -> Failure {
+    e.failure(Stage::Enqueue, format!("Download queue failed: {e}"))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoDownloadRequest {
@@ -125,13 +229,13 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
 
     if backends.is_empty() {
         let batch_id = uuid::Uuid::new_v4().to_string();
+        let failure = no_backends();
+        let error = failure.message.clone();
         let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
             batch_id,
-            error: "No download backends available".to_string(),
+            failure,
         }));
-        return Ok(AutoDownloadResult::Error(
-            "No download backends available".to_string(),
-        ));
+        return Ok(AutoDownloadResult::Error(error));
     }
 
     // Generate batch_id upfront so we can return it immediately (per D-10)
@@ -172,7 +276,9 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                         Ok(sid) => sid,
                         Err(e) => {
                             warn!("Backend {} search start failed: {}", id, e);
-                            return (id, Vec::<DownloadableGroup>::new());
+                            let stop =
+                                SearchStop::Failed(e.failure(Stage::SourceSearch, e.to_string()));
+                            return (id, Vec::<DownloadableGroup>::new(), stop);
                         }
                     };
 
@@ -196,10 +302,10 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                                     if !result.groups.is_empty() {
                                         latest_groups = result.groups;
                                     }
-                                    return (id, latest_groups);
+                                    return (id, latest_groups, SearchStop::Finished);
                                 }
                                 SearchState::NotFound => {
-                                    return (id, latest_groups);
+                                    return (id, latest_groups, SearchStop::Finished);
                                 }
                                 SearchState::InProgress => {
                                     if !result.groups.is_empty() {
@@ -209,11 +315,14 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
                             },
                             Err(e) => {
                                 warn!("Backend {} poll error: {}", id, e);
-                                return (id, latest_groups);
+                                let stop = SearchStop::Failed(
+                                    e.failure(Stage::SourceSearch, e.to_string()),
+                                );
+                                return (id, latest_groups, stop);
                             }
                         }
                     }
-                    (id, latest_groups)
+                    (id, latest_groups, SearchStop::TimedOut)
                 }
             })
             .collect();
@@ -221,15 +330,16 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         let results = futures::future::join_all(search_futures).await;
 
         // Merge all results into a single list sorted by score (per D-07)
-        let mut all_groups: Vec<DownloadableGroup> = results
+        let (groups, stops): (Vec<_>, Vec<_>) = results
             .into_iter()
-            .flat_map(|(_backend_id, groups)| groups)
-            .collect();
+            .map(|(_backend_id, groups, stop)| (groups, stop))
+            .unzip();
+        let mut all_groups: Vec<DownloadableGroup> = groups.into_iter().flatten().collect();
 
         if all_groups.is_empty() {
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                 batch_id: batch_id.clone(),
-                error: "No results found".to_string(),
+                failure: no_results_failure(&stops),
             }));
             info!("Auto-download: no results for '{}'", query_desc);
             return;
@@ -305,7 +415,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         if let Err(e) = tokio::fs::create_dir_all(&target_path_buf).await {
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                 batch_id: batch_id.clone(),
-                error: format!("Failed to create target directory: {}", e),
+                failure: target_unwritable(&e),
             }));
             return;
         }
@@ -317,7 +427,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             Err(e) => {
                 let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                     batch_id: batch_id.clone(),
-                    error: format!("Download backend not available: {}", e),
+                    failure: backend_unavailable(&e),
                 }));
                 return;
             }
@@ -332,7 +442,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             target_path_buf,
         );
         let enq = enqueue_request(&backend, items, fresh).await;
-        let refusal = enq.refusal();
+        let refused = enq.refusal().is_some();
         let RequestEnqueue {
             batch,
             results,
@@ -372,17 +482,17 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         if let Some(e) = error {
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                 batch_id: batch_id.clone(),
-                error: format!("Download queue failed: {}", e),
+                failure: queue_failed(&e),
             }));
-        } else if let Some(reason) = refusal {
+        } else if refused {
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                 batch_id: batch_id.clone(),
-                error: reason.to_string(),
+                failure: another_folder(RetryAdvice::NotRetryable),
             }));
         } else if successful.is_empty() && !already_downloading {
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                 batch_id: batch_id.clone(),
-                error: "All downloads failed to queue".to_string(),
+                failure: queue_failure(&results),
             }));
         } else {
             // Send Downloading event
@@ -461,4 +571,113 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
     Ok(AutoDownloadResult::Accepted {
         batch_id: batch_id_for_response,
     })
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use shared::failure::UserActionCode;
+
+    #[test]
+    fn no_results_failure_tells_an_empty_search_from_a_dead_backend() {
+        let dead = SoulseekError::Api {
+            status: 503,
+            message: "Connection failed".into(),
+        }
+        .failure(Stage::SourceSearch, "x");
+        let code = |stops: &[SearchStop]| no_results_failure(stops).code;
+        assert_eq!(code(&[SearchStop::Finished]), FailureCode::SearchNoResults);
+        assert_eq!(code(&[SearchStop::TimedOut]), FailureCode::SearchTimeout);
+        assert_eq!(
+            code(&[SearchStop::Failed(dead.clone())]),
+            FailureCode::BackendUnreachable
+        );
+        assert_eq!(
+            code(&[SearchStop::Failed(dead.clone()), SearchStop::Finished]),
+            FailureCode::SearchNoResults
+        );
+        let f = no_results_failure(&[SearchStop::Failed(dead)]);
+        assert_eq!(f.message, "No results found");
+        assert_eq!(f.cause.unwrap().raw, "Connection failed");
+    }
+
+    #[test]
+    fn queue_failure_names_why_the_files_failed() {
+        let failed = |code| QueuedDownload {
+            id: "1".into(),
+            source: "p".into(),
+            item: "a".into(),
+            size: 0,
+            status: EnqueueStatus::Failed(Failure::new(
+                code,
+                Stage::Enqueue,
+                RetryAdvice::OtherSource,
+                "peer offline",
+            )),
+        };
+        let f = queue_failure(&[failed(FailureCode::PeerOffline)]);
+        assert_eq!(
+            (f.code, f.message.as_str()),
+            (FailureCode::PeerOffline, "All downloads failed to queue")
+        );
+        assert_eq!(queue_failure(&[]).code, FailureCode::EnqueueFailed);
+    }
+
+    #[test]
+    fn pipeline_failures_keep_their_text() {
+        use RetryAdvice::*;
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let slskd = SoulseekError::Api {
+            status: 503,
+            message: "down".into(),
+        };
+        let (dir, backend, queue) = (
+            format!("Failed to create target directory: {io}"),
+            "Download backend not available: not configured".to_string(),
+            format!("Download queue failed: {slskd}"),
+        );
+        for (f, code, stage, retry, message) in [
+            (
+                no_backends(),
+                FailureCode::BackendNotConfigured,
+                Stage::SourceSearch,
+                NeedsUser,
+                "No download backends available",
+            ),
+            (
+                target_unwritable(&io),
+                FailureCode::ImportTargetUnwritable,
+                Stage::Import,
+                NotRetryable,
+                dir.as_str(),
+            ),
+            (
+                backend_unavailable("not configured"),
+                FailureCode::BackendNotConfigured,
+                Stage::Enqueue,
+                NeedsUser,
+                backend.as_str(),
+            ),
+            (
+                queue_failed(&slskd),
+                FailureCode::BackendUnreachable,
+                Stage::Enqueue,
+                SameSourceLater,
+                queue.as_str(),
+            ),
+        ] {
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message.as_str()),
+                (code, stage, retry, message)
+            );
+        }
+        assert_eq!(
+            target_unwritable(&io).cause.unwrap().service,
+            Service::Filesystem
+        );
+        assert_eq!(
+            no_backends().user_action.unwrap().code,
+            UserActionCode::ConfigureBackend
+        );
+    }
 }
