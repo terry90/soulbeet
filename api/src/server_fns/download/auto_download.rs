@@ -28,6 +28,8 @@ use crate::globals::{get_or_create_user_channel, register_user_task, unregister_
 #[cfg(feature = "server")]
 use crate::models::folder::Folder;
 #[cfg(feature = "server")]
+use crate::models::user_settings::UserSettings;
+#[cfg(feature = "server")]
 use crate::server_fns::search::{hydrate_album_tracks, tracklist_message};
 #[cfg(feature = "server")]
 use crate::services::{
@@ -242,6 +244,18 @@ fn tracklist_failure(album_title: &str, e: &MetadataError) -> Failure {
     e.failure(Stage::Metadata, tracklist_message(album_title, e))
 }
 
+/// The user's settings could not be read, which the tracklist lookup needs.
+#[cfg(feature = "server")]
+fn settings_unreadable(e: &str) -> Failure {
+    Failure::new(
+        FailureCode::SettingsUnreadable,
+        Stage::Metadata,
+        RetryAdvice::SameSourceLater,
+        "Could not read your settings",
+    )
+    .with_cause(Service::Database, None, e)
+}
+
 #[cfg(feature = "server")]
 fn queue_failed(e: &SoulseekError) -> Failure {
     e.failure(Stage::Enqueue, format!("Download queue failed: {e}"))
@@ -324,6 +338,7 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
     // This avoids blocking the HTTP response during the search-poll loop (Research Pitfall 4).
     let folder_path = folder.path;
     let mut query = req.query;
+    let auth_user_id = auth.0.user_id.clone();
 
     tokio::spawn(async move {
         // Send Searching event
@@ -333,7 +348,18 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             backend_count: 1 + rest.len(),
         }));
 
-        if let Err(e) = hydrate_album_tracks(&mut query).await {
+        let settings = match UserSettings::get(&auth_user_id).await {
+            Ok(settings) => settings,
+            Err(e) => {
+                let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
+                    batch_id: batch_id.clone(),
+                    failure: settings_unreadable(&e),
+                }));
+                warn!("Auto-download: could not read settings for '{query_desc}': {e}");
+                return;
+            }
+        };
+        if let Err(e) = hydrate_album_tracks(&mut query, settings.lastfm_api_key.as_deref()).await {
             // Only an album query looks its tracklist up.
             let album = query.album.as_ref().map_or("", |a| a.title.as_str());
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {

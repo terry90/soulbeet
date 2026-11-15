@@ -6,7 +6,7 @@ use shared::recommendation::{
     ArtistPopularity, Listen, RankedArtist, RankedTrack, SimilarArtist, SimilarTrack, TimePeriod,
     WeightedTag,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::{Result, SoulseekError};
 use crate::http::SendError;
@@ -400,17 +400,12 @@ impl LastFmProvider {
 
     async fn get_album_info(
         &self,
-        artist: &str,
-        album: &str,
+        id: &str,
     ) -> std::result::Result<LastFmAlbumInfo, LastFmFailure> {
-        info!("Fetching album info from Last.fm: {} - {}", artist, album);
-        let data: AlbumInfoResponse = self
-            .api_request(&[
-                ("method", "album.getInfo"),
-                ("artist", artist),
-                ("album", album),
-            ])
-            .await?;
+        info!("Fetching album info from Last.fm: {}", id);
+        let params = album_info_params(id);
+        let params: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let data: AlbumInfoResponse = self.api_request(&params).await?;
         Ok(data.album)
     }
 
@@ -829,6 +824,20 @@ fn format_duration(seconds: Option<u32>) -> Option<String> {
     })
 }
 
+/// The `album.getInfo` parameters for an album id from `search_albums`: a
+/// `lastfm:{artist}:{album}` id names the album, any other id is its MBID.
+fn album_info_params(id: &str) -> Vec<(&'static str, String)> {
+    let mut params = vec![("method", "album.getInfo".to_string())];
+    match id.strip_prefix("lastfm:").and_then(|r| r.split_once(':')) {
+        Some((artist, album)) => {
+            params.push(("artist", artist.to_string()));
+            params.push(("album", album.to_string()));
+        }
+        None => params.push(("mbid", id.to_string())),
+    }
+    params
+}
+
 fn generate_lastfm_id(artist: &str, name: &str) -> String {
     format!("lastfm:{}:{}", artist.to_lowercase(), name.to_lowercase())
 }
@@ -925,62 +934,48 @@ impl crate::MetadataProvider for LastFmProvider {
     }
 
     async fn get_album(&self, id: &str) -> std::result::Result<AlbumWithTracks, MetadataError> {
-        if let Some(rest) = id.strip_prefix("lastfm:") {
-            if let Some((artist, album)) = rest.split_once(':') {
-                let info = self.get_album_info(artist, album).await?;
+        let info = self.get_album_info(id).await?;
 
-                let album_mbid = nonempty_mbid(info.mbid.clone());
-                let cover_url = LastFmImage::get_largest(&info.image);
+        let album_mbid = nonempty_mbid(info.mbid.clone());
+        let cover_url = LastFmImage::get_largest(&info.image);
 
-                let tracks = info
-                    .tracks
-                    .map(|t| {
-                        t.track
-                            .into_vec()
-                            .into_iter()
-                            .map(|track| {
-                                let track_mbid = nonempty_mbid(track.mbid);
-                                Track {
-                                    id: generate_lastfm_id(&info.artist, &track.name),
-                                    title: track.name,
-                                    artist: track
-                                        .artist
-                                        .map(|a| a.name)
-                                        .unwrap_or_else(|| info.artist.clone()),
-                                    album_id: Some(id.to_string()),
-                                    album_title: Some(info.name.clone()),
-                                    release_date: info
-                                        .wiki
-                                        .as_ref()
-                                        .and_then(|w| w.published.clone()),
-                                    duration: format_duration(track.duration),
-                                    mbid: track_mbid,
-                                    release_mbid: album_mbid.clone(),
-                                }
-                            })
-                            .collect()
+        let tracks = info
+            .tracks
+            .map(|t| {
+                t.track
+                    .into_vec()
+                    .into_iter()
+                    .map(|track| {
+                        let track_mbid = nonempty_mbid(track.mbid);
+                        Track {
+                            id: generate_lastfm_id(&info.artist, &track.name),
+                            title: track.name,
+                            artist: track
+                                .artist
+                                .map(|a| a.name)
+                                .unwrap_or_else(|| info.artist.clone()),
+                            album_id: Some(id.to_string()),
+                            album_title: Some(info.name.clone()),
+                            release_date: info.wiki.as_ref().and_then(|w| w.published.clone()),
+                            duration: format_duration(track.duration),
+                            mbid: track_mbid,
+                            release_mbid: album_mbid.clone(),
+                        }
                     })
-                    .unwrap_or_default();
+                    .collect()
+            })
+            .unwrap_or_default();
 
-                return Ok(AlbumWithTracks {
-                    album: Album {
-                        id: id.to_string(),
-                        title: info.name,
-                        artist: info.artist,
-                        release_date: info.wiki.and_then(|w| w.published),
-                        mbid: album_mbid,
-                        cover_url,
-                    },
-                    tracks,
-                });
-            }
-        }
-
-        warn!("Cannot fetch album by MBID from Last.fm: {}", id);
-        Err(MetadataError::Rejected {
-            service: Service::Lastfm,
-            status: Some(400),
-            raw: "Last.fm requires artist:album format, not MBID".to_string(),
+        Ok(AlbumWithTracks {
+            album: Album {
+                id: id.to_string(),
+                title: info.name,
+                artist: info.artist,
+                release_date: info.wiki.and_then(|w| w.published),
+                mbid: album_mbid,
+                cover_url,
+            },
+            tracks,
         })
     }
 }
@@ -1167,6 +1162,26 @@ impl crate::ScrobbleProvider for LastFmProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_album_is_looked_up_by_the_id_search_gave() {
+        let p = |id| album_info_params(id);
+        assert_eq!(
+            p("lastfm:marrow choir:winter songs"),
+            vec![
+                ("method", "album.getInfo".to_string()),
+                ("artist", "marrow choir".to_string()),
+                ("album", "winter songs".to_string())
+            ]
+        );
+        assert_eq!(
+            p("8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f"),
+            vec![
+                ("method", "album.getInfo".to_string()),
+                ("mbid", "8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f".to_string())
+            ]
+        );
+    }
 
     fn kind(e: MetadataError) -> &'static str {
         match e {

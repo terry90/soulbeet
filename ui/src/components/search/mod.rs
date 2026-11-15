@@ -22,7 +22,7 @@ use shared::download::{
     AutoDownloadEvent, DownloadQuery, DownloadableGroup, DownloadableItem,
     SearchState as DownloadSearchState,
 };
-use shared::metadata::{AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
+use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
 use std::collections::{HashMap, HashSet};
 
 use track::TrackResult;
@@ -39,6 +39,13 @@ use toast::{FallbackToast, FallbackToastData};
 
 mod search_type_toggle;
 use search_type_toggle::{SearchType, SearchTypeToggle};
+
+/// A download query for `album`, whose id comes from `provider`.
+fn album_query(album: &Album, provider: Provider) -> DownloadQuery {
+    DownloadQuery::new(vec![])
+        .album(album.clone())
+        .metadata_provider(provider)
+}
 
 #[component]
 pub fn Search() -> Element {
@@ -825,14 +832,7 @@ pub fn Search() -> Element {
                                       on_search_sources: {
                                           let album_for_search = album.clone();
                                           move || {
-                                              let query = DownloadQuery::new(vec![]).album(shared::metadata::Album {
-                                                  id: album_for_search.id.clone(),
-                                                  title: album_for_search.title.clone(),
-                                                  artist: album_for_search.artist.clone(),
-                                                  release_date: album_for_search.release_date.clone(),
-                                                  mbid: album_for_search.mbid.clone(),
-                                                  cover_url: album_for_search.cover_url.clone(),
-                                              });
+                                              let query = album_query(&album_for_search, provider);
                                               spawn(download(query));
                                           }
                                       },
@@ -842,25 +842,11 @@ pub fn Search() -> Element {
                                       selected_folder_id: current_folder_id.clone(),
                                       active_menu,
                                       on_download: move |_| {
-                                          let query = DownloadQuery::new(vec![]).album(shared::metadata::Album {
-                                              id: album_for_dl.id.clone(),
-                                              title: album_for_dl.title.clone(),
-                                              artist: album_for_dl.artist.clone(),
-                                              release_date: album_for_dl.release_date.clone(),
-                                              mbid: album_for_dl.mbid.clone(),
-                                              cover_url: album_for_dl.cover_url.clone(),
-                                          });
+                                          let query = album_query(&album_for_dl, provider);
                                           handle_auto_download(album_for_dl.id.clone(), query);
                                       },
                                       on_override_download: move |folder: Folder| {
-                                          let query = DownloadQuery::new(vec![]).album(shared::metadata::Album {
-                                              id: album_for_override.id.clone(),
-                                              title: album_for_override.title.clone(),
-                                              artist: album_for_override.artist.clone(),
-                                              release_date: album_for_override.release_date.clone(),
-                                              mbid: album_for_override.mbid.clone(),
-                                              cover_url: album_for_override.cover_url.clone(),
-                                          });
+                                          let query = album_query(&album_for_override, provider);
                                           handle_override_download(album_for_override.id.clone(), query, folder);
                                       },
                                       tracks: tracks_for_panel,
@@ -906,5 +892,26 @@ pub fn Search() -> Element {
           }
         }
       }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_album_query_carries_the_album_and_its_provider() {
+        let album = Album {
+            id: "lastfm:marrow choir:winter songs".to_string(),
+            title: "Winter Songs".to_string(),
+            artist: "Marrow Choir".to_string(),
+            release_date: None,
+            mbid: None,
+            cover_url: None,
+        };
+        let query = album_query(&album, Provider::LastFm);
+        assert!(query.tracks.is_empty());
+        assert_eq!(query.album, Some(album));
+        assert_eq!(query.metadata_provider, Some(Provider::LastFm));
     }
 }

@@ -110,7 +110,10 @@ pub async fn find_album(input: AlbumQuery) -> Result<AlbumWithTracks, ServerFnEr
 /// album's tracklist through the metadata provider before searching. Fails
 /// only for an album query.
 #[cfg(feature = "server")]
-pub(crate) async fn hydrate_album_tracks(query: &mut DownloadQuery) -> Result<(), MetadataError> {
+pub(crate) async fn hydrate_album_tracks(
+    query: &mut DownloadQuery,
+    lastfm_api_key: Option<&str>,
+) -> Result<(), MetadataError> {
     if !query.tracks.is_empty() {
         return Ok(());
     }
@@ -118,7 +121,10 @@ pub(crate) async fn hydrate_album_tracks(query: &mut DownloadQuery) -> Result<()
         return Ok(());
     };
 
-    let album_with_tracks = metadata_provider(None, None).get_album(&album.id).await?;
+    let provider = query.metadata_provider.map(|p| p.to_string());
+    let album_with_tracks = metadata_provider(provider.as_deref(), lastfm_api_key)
+        .get_album(&album.id)
+        .await?;
     query.tracks = album_with_tracks.tracks;
     Ok(())
 }
@@ -175,8 +181,11 @@ static SEARCH_OWNERS: LazyLock<SearchOwners> = LazyLock::new(SearchOwners::defau
 
 #[post("/api/download/search/start", auth: AuthSession)]
 pub async fn start_download_search(data: DownloadQuery) -> Result<String, ServerFnError> {
+    let user_settings = UserSettings::get(&auth.0.user_id)
+        .await
+        .map_err(server_error)?;
     let mut data = data;
-    if let Err(e) = hydrate_album_tracks(&mut data).await {
+    if let Err(e) = hydrate_album_tracks(&mut data, user_settings.lastfm_api_key.as_deref()).await {
         // Only an album query looks its tracklist up.
         let album = data.album.as_ref().map_or("", |a| a.title.as_str());
         return Err(server_error(tracklist_message(album, &e)));
