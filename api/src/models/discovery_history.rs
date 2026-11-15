@@ -42,11 +42,21 @@ impl DiscoveryHistoryRow {
         track: &str,
         outcome: &str,
     ) -> Result<(), String> {
+        Self::update_outcome_in(&DB, user_id, artist, track, outcome).await
+    }
+
+    pub(crate) async fn update_outcome_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        artist: &str,
+        track: &str,
+        outcome: &str,
+    ) -> Result<(), String> {
         sqlx::query(
             "UPDATE discovery_history SET outcome = ? WHERE user_id = ? AND lower(artist) = lower(?) AND lower(track) = lower(?)"
         )
         .bind(outcome).bind(user_id).bind(artist).bind(track)
-        .execute(&*DB).await.map_err(|e| e.to_string())?;
+        .execute(db).await.map_err(|e| e.to_string())?;
         Ok(())
     }
 

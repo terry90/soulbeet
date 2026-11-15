@@ -18,6 +18,7 @@ use unlink::UnlinkError;
 mod listeners;
 pub mod paths;
 mod rules;
+pub(crate) mod staging;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod unlink;
@@ -1133,9 +1134,22 @@ mod tests {
         let lib = Library::new().await;
         lib.fake
             .version_unreadable(|| NavidromeLookupError::Client(NavidromeError::CircuitOpen));
+        let f = lib
+            .guard()
+            .check_song(&lib.alice(), "s1")
+            .await
+            .unwrap_err();
         assert_eq!(
-            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
-            (FailureCode::DeleteVetoUnknown, VETO.into())
+            (f.code, f.message.as_str(), f.cause),
+            (
+                FailureCode::NavidromeCircuitOpen,
+                "Soulful could not read your Navidrome server's version, which this deletion check needs",
+                Some(Cause::new(
+                    Service::Navidrome,
+                    None,
+                    NavidromeError::CircuitOpen.to_string()
+                ))
+            )
         );
         assert_eq!(lib.fake.ratings_set(), vec![]);
     }

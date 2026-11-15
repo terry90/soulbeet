@@ -154,10 +154,18 @@ impl DiscoveryTrackRow {
     }
 
     pub async fn update_status(id: &str, status: &DiscoveryStatus) -> Result<(), String> {
+        Self::update_status_in(&DB, id, status).await
+    }
+
+    pub(crate) async fn update_status_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+        status: &DiscoveryStatus,
+    ) -> Result<(), String> {
         sqlx::query("UPDATE discovery_tracks SET status = ? WHERE id = ?")
             .bind(status.to_string())
             .bind(id)
-            .execute(&*DB)
+            .execute(db)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())

@@ -255,70 +255,6 @@ pub fn check_folder_update(
     check_folder_path(candidate, actor, folders, roots)
 }
 
-/// Whose a file is, for removing it.
-#[cfg(feature = "server")]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum FileOwner<'a> {
-    /// The deepest folder that holds the file is the actor's.
-    Actor,
-    /// The deepest folder that holds it is someone else's, folders of several
-    /// owners tie, or no folder holds it.
-    Other,
-    /// Another user's folder, stored as `folder`, cannot be resolved, and
-    /// comparing paths does not show that the file is outside it.
-    Unresolved { folder: &'a Path, error: &'a str },
-}
-
-/// Who owns the canonical file `path`: the owner of the deepest stored
-/// folder, of any user, that holds it. A file that sits in someone else's
-/// folder, nested in or shared over the actor's, is theirs to remove, not
-/// the actor's; when folders of several owners tie, it belongs to none
-/// alone. Another user's folder that cannot be resolved may hold it, so it
-/// is not the actor's unless the stored path shows it is outside that folder.
-#[cfg(feature = "server")]
-pub fn file_owner<'a>(path: &Path, folders: &'a [PolicyFolder], actor: &str) -> FileOwner<'a> {
-    let unresolved = folders.iter().find_map(|f| match &f.path {
-        Err(error) if f.user_id != actor && !lexically_outside(path, &f.stored_path) => {
-            Some(FileOwner::Unresolved {
-                folder: &f.stored_path,
-                error,
-            })
-        }
-        _ => None,
-    });
-    if let Some(owner) = unresolved {
-        return owner;
-    }
-    let holding: Vec<(&PolicyFolder, usize)> = folders
-        .iter()
-        .filter_map(|f| {
-            let folder = f.path.as_ref().ok()?;
-            (path != folder && path.starts_with(folder)).then(|| (f, folder.components().count()))
-        })
-        .collect();
-    let Some(deepest) = holding.iter().map(|(_, depth)| *depth).max() else {
-        return FileOwner::Other;
-    };
-    if holding
-        .iter()
-        .filter(|(_, depth)| *depth == deepest)
-        .all(|(f, _)| f.user_id == actor)
-    {
-        FileOwner::Actor
-    } else {
-        FileOwner::Other
-    }
-}
-
-/// Whether the stored folder path `stored` shows, compared as written, that
-/// `file` is not inside it. A relative path or one with `..` shows nothing.
-#[cfg(feature = "server")]
-fn lexically_outside(file: &Path, stored: &Path) -> bool {
-    stored.is_absolute()
-        && !stored.components().any(|c| c == Component::ParentDir)
-        && !file.starts_with(stored)
-}
-
 /// Every stored folder that breaks the rules today, for admins to sort out.
 /// Folders are named by their index in `folders`.
 #[cfg(feature = "server")]
@@ -480,14 +416,6 @@ mod tests {
             path: Ok(path.to_path_buf()),
             stored_path: path.to_path_buf(),
             shared,
-        }
-    }
-
-    /// `pf` for a folder stored as `stored` that does not resolve.
-    fn unresolved(user: &str, stored: &str) -> PolicyFolder {
-        PolicyFolder {
-            path: Err("Too many levels of symbolic links".to_string()),
-            ..pf(user, false, Path::new(stored), false)
         }
     }
 
@@ -716,92 +644,6 @@ mod tests {
             check_folder_path(&candidate, &actor("a", Role::User), &folders, &roots),
             Err(FolderRefusal::Overlaps(Overlap::Equal))
         );
-    }
-
-    #[test]
-    fn a_file_in_another_users_nested_folder_is_not_the_actors() {
-        // Alice shared /music; Bob has /music/bob inside it.
-        let (_dir, tmp) = tmp();
-        let folders = [
-            pf("alice", false, &tmp.join("music"), true),
-            pf("bob", false, &tmp.join("music/bob"), false),
-        ];
-        let bobs_file = tmp.join("music/bob/B/y.flac");
-        let alices_file = tmp.join("music/alice/A/x.flac");
-        assert_eq!(file_owner(&bobs_file, &folders, "alice"), FileOwner::Other);
-        assert_eq!(file_owner(&bobs_file, &folders, "bob"), FileOwner::Actor);
-        assert_eq!(
-            file_owner(&alices_file, &folders, "alice"),
-            FileOwner::Actor
-        );
-        assert_eq!(file_owner(&alices_file, &folders, "bob"), FileOwner::Other);
-        assert_eq!(
-            file_owner(&tmp.join("elsewhere/z.flac"), &folders, "alice"),
-            FileOwner::Other
-        );
-    }
-
-    #[test]
-    fn a_file_in_a_folder_two_users_share_is_neither_ones_alone() {
-        let (_dir, tmp) = tmp();
-        let folders = [
-            pf("alice", false, &tmp.join("music"), true),
-            pf("bob", false, &tmp.join("music"), false),
-        ];
-        let file = tmp.join("music/x.flac");
-        assert_eq!(file_owner(&file, &folders, "alice"), FileOwner::Other);
-        assert_eq!(file_owner(&file, &folders, "bob"), FileOwner::Other);
-    }
-
-    #[test]
-    fn another_users_unresolvable_folder_protects_what_it_may_hold() {
-        // Alice has /music; Bob's /music/bob cannot be resolved.
-        let (_dir, tmp) = tmp();
-        let bobs = tmp.join("music/bob");
-        let folders = [
-            pf("alice", false, &tmp.join("music"), false),
-            unresolved("bob", bobs.to_str().unwrap()),
-        ];
-        assert_eq!(
-            file_owner(&bobs.join("B/y.flac"), &folders, "alice"),
-            FileOwner::Unresolved {
-                folder: &bobs,
-                error: "Too many levels of symbolic links",
-            }
-        );
-        // Outside Bob's stored path, as written: still Alice's.
-        assert_eq!(
-            file_owner(&tmp.join("music/alice/A/x.flac"), &folders, "alice"),
-            FileOwner::Actor
-        );
-        // Bob's unresolvable folder is no reason to keep a file from Bob;
-        // this one sits in Alice's folder.
-        assert_eq!(
-            file_owner(&tmp.join("music/bob/B/y.flac"), &folders, "bob"),
-            FileOwner::Other
-        );
-    }
-
-    #[test]
-    fn a_stored_path_that_cannot_be_compared_protects_every_file() {
-        let (_dir, tmp) = tmp();
-        let alices_file = tmp.join("music/alice/A/x.flac");
-        for stored in [
-            "music/bob".to_string(),
-            format!("{}/music/alice/../bob", tmp.display()),
-        ] {
-            let folders = [
-                pf("alice", false, &tmp.join("music"), false),
-                unresolved("bob", &stored),
-            ];
-            assert!(
-                matches!(
-                    file_owner(&alices_file, &folders, "alice"),
-                    FileOwner::Unresolved { .. }
-                ),
-                "{stored}"
-            );
-        }
     }
 
     #[test]

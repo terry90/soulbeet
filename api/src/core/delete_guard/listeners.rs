@@ -256,8 +256,9 @@ impl Guard<'_> {
     /// Rule 4: reads `actor`'s record of `song` again (N1), re-sends N1's rating so Navidrome
     /// recomputes the average, reads it again (N2), and compares N2's average with the mean of
     /// N1's rating (when above 0) and `others`: a difference beyond Navidrome's rounding is
-    /// blocked_by_other_user. Navidrome before 0.60.0, an unknown version or one that cannot be
-    /// read keeps no average to compare, so every file is veto_unknown. An absent average means
+    /// blocked_by_other_user. Navidrome before 0.60.0 or an unknown version keeps no average to
+    /// compare, so every file is veto_unknown; a version the actor's own Navidrome does not
+    /// answer is that read's own failure, with its error as the cause. An absent average means
     /// nobody rated the song (`omitempty`), which cannot be so while the actor rated it: that is
     /// veto_unknown too. N2 comes back for the caller to act on.
     pub(super) async fn no_unknown_rater(
@@ -268,8 +269,10 @@ impl Guard<'_> {
     ) -> Result<NativeSong, Failure> {
         let own = |e: NavidromeLookupError| e.failure(Stage::Delete, e.to_string());
         let version = self.listeners.server_version(actor).await.map_err(|e| {
-            warn!("Could not read Navidrome's version for a deletion check: {e}");
-            veto_unknown()
+            e.failure(
+                Stage::Delete,
+                "Soulful could not read your Navidrome server's version, which this deletion check needs",
+            )
         })?;
         if !version.as_deref().is_some_and(keeps_song_averages) {
             return Err(navidrome_too_old(version.as_deref()));

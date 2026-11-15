@@ -335,9 +335,9 @@ async fn run_automation() {
         info!("Automation: syncing ratings for user {}...", user.username);
         match crate::server_fns::navidrome::sync_ratings_internal(&user.id).await {
             Ok(result) => info!(
-                "Automation: sync complete for {} - {} scanned, {} deletions, {} promoted, {} removed",
+                "Automation: sync complete for {} - {} scanned, {} deletions, {} promoted, {} removed, {} kept",
                 user.username, result.total_songs_scanned, result.deleted_tracks,
-                result.promoted_tracks, result.removed_tracks
+                result.promoted_tracks, result.removed_tracks, result.kept_tracks
             ),
             Err(e) => info!("Automation: sync failed for {}: {}", user.username, e),
         }
@@ -380,67 +380,73 @@ async fn run_automation() {
         };
         let lifetime_map = settings.parse_lifetime_days();
         let now = chrono::Utc::now();
-        let folder = crate::models::folder::Folder::get_by_id(folder_id)
-            .await
-            .ok()
-            .flatten();
+        let folder = match crate::models::folder::Folder::get_by_id(folder_id).await {
+            Ok(Some(folder)) => Some(folder),
+            Ok(None) => {
+                warn!(
+                    "Automation: discovery folder {folder_id} of user {} is gone, so no track expires",
+                    user.username
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "Automation: discovery folder {folder_id} of user {} cannot be read, so no track expires: {e}",
+                    user.username
+                );
+                None
+            }
+        };
 
-        // Check each profile's pending tracks and expire those past their lifetime
-        let pending =
-            match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(
-                folder_id,
-            )
-            .await
-            {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-        let mut expired_count = 0u32;
-        for track in &pending {
-            let lifetime_days = lifetime_map.get(&track.profile).copied().unwrap_or(7) as i64;
-            let created =
-                match chrono::DateTime::parse_from_rfc3339(&track.created_at).or_else(|_| {
-                    chrono::NaiveDateTime::parse_from_str(&track.created_at, "%Y-%m-%d %H:%M:%S")
-                        .map(|naive| naive.and_utc().fixed_offset())
-                }) {
-                    Ok(dt) => dt,
+        if let Some(folder) = folder {
+            // Check each profile's pending tracks and expire those past their lifetime
+            let pending =
+                match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(
+                    folder_id,
+                )
+                .await
+                {
+                    Ok(p) => p,
                     Err(_) => continue,
                 };
-            if now.signed_duration_since(created).num_days() < lifetime_days {
-                continue;
-            }
-            // This track has expired
-            let path = std::path::Path::new(&track.path);
-            if path.exists() {
-                let _ = tokio::fs::remove_file(path).await;
-                if let (Some(parent), Some(folder)) = (path.parent(), &folder) {
-                    let profile_root = folder.discovery_profile_path(&track.profile);
-                    let _ = crate::server_fns::cleanup_empty_ancestors(
-                        parent,
-                        std::path::Path::new(&profile_root),
-                    )
-                    .await;
+            let mut expired_count = 0u32;
+            for track in &pending {
+                let lifetime_days = lifetime_map.get(&track.profile).copied().unwrap_or(7) as i64;
+                let created =
+                    match chrono::DateTime::parse_from_rfc3339(&track.created_at).or_else(|_| {
+                        chrono::NaiveDateTime::parse_from_str(
+                            &track.created_at,
+                            "%Y-%m-%d %H:%M:%S",
+                        )
+                        .map(|naive| naive.and_utc().fixed_offset())
+                    }) {
+                        Ok(dt) => dt,
+                        Err(_) => continue,
+                    };
+                if now.signed_duration_since(created).num_days() < lifetime_days {
+                    continue;
+                }
+                match crate::core::delete_guard::staging::remove_staged_in(
+                    &crate::db::DB,
+                    track,
+                    &folder,
+                    crate::core::delete_guard::staging::StagedOutcome::Expired,
+                )
+                .await
+                {
+                    Ok(()) => expired_count += 1,
+                    Err(f) => warn!(
+                        "Automation: could not expire {} for user {}: {}",
+                        track.title, user.username, f.message
+                    ),
                 }
             }
-            let _ = crate::models::discovery_playlist::DiscoveryTrackRow::update_status(
-                &track.id,
-                &shared::navidrome::DiscoveryStatus::Removed,
-            )
-            .await;
-            let _ = crate::models::discovery_history::DiscoveryHistoryRow::update_outcome(
-                user_id,
-                &track.artist,
-                &track.title,
-                "expired",
-            )
-            .await;
-            expired_count += 1;
-        }
-        if expired_count > 0 {
-            info!(
-                "Automation: expired {} tracks for user {}",
-                expired_count, user.username
-            );
+            if expired_count > 0 {
+                info!(
+                    "Automation: expired {} tracks for user {}",
+                    expired_count, user.username
+                );
+            }
         }
 
         // Refill any gaps (generate_discovery_playlist_internal accounts for existing tracks)

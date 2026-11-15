@@ -5,21 +5,21 @@ use shared::navidrome::{DeletionReview, LibraryStats, SyncResult};
 use dioxus::logger::tracing::{info, warn};
 
 #[cfg(feature = "server")]
+use crate::auth::UserId;
+#[cfg(feature = "server")]
 use crate::core::database_failure;
 #[cfg(feature = "server")]
-use crate::core::delete_guard::Origin;
+use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
+#[cfg(feature = "server")]
+use crate::core::delete_guard::{ForgetVia, Guard, Origin, Verdict};
 #[cfg(feature = "server")]
 use crate::core::folders::folder_not_found;
 #[cfg(feature = "server")]
-use crate::folder_policy::{
-    canonical_folder_path, file_owner, FileOwner, PolicyFolder, PolicyRows,
-};
-#[cfg(feature = "server")]
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
 #[cfg(feature = "server")]
-use crate::models::deletion_review::{DeletionRecord, DeletionReviewRow};
+use crate::models::deletion_block::DeletionBlockRow;
 #[cfg(feature = "server")]
-use crate::models::discovery_history::DiscoveryHistoryRow;
+use crate::models::deletion_review::DeletionReviewRow;
 #[cfg(feature = "server")]
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 #[cfg(feature = "server")]
@@ -35,9 +35,9 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 #[cfg(feature = "server")]
 use shared::navidrome::{DeletionReason, DiscoveryStatus, DiscoveryTrack};
 #[cfg(feature = "server")]
-use soulbeet::ForgetOutcome;
+use soulbeet::navidrome::models::SubsonicSong;
 #[cfg(feature = "server")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[cfg(feature = "server")]
 use super::server_error;
@@ -61,194 +61,55 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
 
     let user_settings = UserSettings::get(user_id).await?;
     let promote_threshold = user_settings.discovery_promote_threshold;
-    let auto_delete = user_settings.auto_delete_enabled;
 
-    let folders = local_folders(&Folder::get_all_by_user(user_id).await.unwrap_or_default());
-    // Every user's folders, so a file in someone else's folder that overlaps
-    // one of the user's is left to its owner.
-    let everyones_folders = if auto_delete {
-        PolicyRows::load().await?.inputs().0
-    } else {
-        Vec::new()
-    };
-    let navidrome_music_path = std::env::var("NAVIDROME_MUSIC_PATH").ok();
-
-    let mut real_path_failures = 0u32;
-    let mut deleted_tracks = 0u32;
-    let mut promoted_tracks = 0u32;
-    let mut removed_tracks = 0u32;
-    let mut skipped_veto = 0u32;
-    let mut skipped_not_found = 0u32;
-
-    let pending_discovery_tracks = if let Some(ref fid) = user_settings.discovery_folder_id {
+    let pending = if let Some(ref fid) = user_settings.discovery_folder_id {
         DiscoveryTrackRow::get_pending_by_folder(fid).await?
     } else {
         vec![]
     };
 
+    let mut removed_tracks =
+        remove_disliked_pending_in(&crate::db::DB, &songs, &pending, promote_threshold).await;
+    let mut promoted_tracks = 0u32;
     for song in &songs {
-        // Auto-delete 1-star tracks (when enabled)
-        if auto_delete && song.user_rating == Some(1) {
-            let artist = song.artist.as_deref().unwrap_or("?");
-            match shared_veto(song.average_rating) {
-                Veto::OtherRaters(avg) => {
-                    info!(
-                        "Auto-delete skipped (shared veto, avg={:.1}): {} - {}",
-                        avg, artist, song.title
-                    );
-                    skipped_veto += 1;
-                }
-                Veto::AverageUnknown => {
-                    info!(
-                        "Auto-delete skipped (average rating unknown): {} - {}",
-                        artist, song.title
-                    );
-                    skipped_veto += 1;
-                }
-                Veto::Allowed => {
-                    if let Some(ref path_str) = song.path {
-                        // A pending discovery track is deleted by the
-                        // discovery branch below instead, which also marks
-                        // its row Removed and records the outcome. Skip only
-                        // the library delete: `continue`ing the whole song
-                        // here jumped over that branch, so a 1-star pending
-                        // track was never removed at all (#77).
-                        let is_discovery = pending_discovery_tracks.iter().any(|dt| {
-                            dt.song_id.as_deref() == Some(&song.id)
-                                || std::path::Path::new(&dt.path)
-                                    .file_name()
-                                    .map(|f| f.to_ascii_lowercase())
-                                    == std::path::Path::new(path_str)
-                                        .file_name()
-                                        .map(|f| f.to_ascii_lowercase())
-                        });
-                        if !is_discovery {
-                            let local = resolve_navidrome_path(
-                                path_str,
-                                &folders,
-                                navidrome_music_path.as_deref(),
-                            );
-                            match auto_delete_file(local, &everyones_folders, user_id).await {
-                                AutoDelete::Deleted { path, folder } => {
-                                    // The file is gone whatever the library
-                                    // says, so the delete counts. The forget
-                                    // may wait behind a long import on that
-                                    // library, so it runs in its own task,
-                                    // started before anything is awaited:
-                                    // the review row is written without
-                                    // waiting for beets, and a dropped
-                                    // request cannot cancel the forget.
-                                    tokio::spawn(clean_up_after_delete(
-                                        &IMPORT_QUEUE,
-                                        folder,
-                                        path.clone(),
-                                    ));
-                                    let mut tx =
-                                        crate::db::DB.begin().await.map_err(|e| e.to_string())?;
-                                    DeletionReviewRow::insert_in(
-                                        &mut tx,
-                                        &DeletionRecord {
-                                            user_id,
-                                            song_id: &song.id,
-                                            title: &song.title,
-                                            artist: song.artist.as_deref().unwrap_or("Unknown"),
-                                            album: song.album.as_deref().unwrap_or("Unknown"),
-                                            path: &path.to_string_lossy(),
-                                            rating: song.user_rating,
-                                            origin: Origin::Auto.as_str(),
-                                            reason: DeletionReason::Disliked,
-                                        },
-                                    )
-                                    .await?;
-                                    tx.commit().await.map_err(|e| e.to_string())?;
-                                    deleted_tracks += 1;
-                                }
-                                AutoDelete::Kept => {}
-                                AutoDelete::NotFound => {
-                                    real_path_failures += 1;
-                                    skipped_not_found += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check discovery track promotion/removal
-        if let Some(user_rating) = song.user_rating {
-            // Match by song_id first (exact), then by filename (fuzzy).
-            // song_id is authoritative when set by reconciliation.
-            let matching_track = pending_discovery_tracks.iter().find(|dt| {
-                if let Some(ref dt_song_id) = dt.song_id {
-                    return dt_song_id == &song.id;
-                }
-                // Fallback: match by filename when song_id isn't set yet
-                if let Some(ref song_path) = song.path {
-                    let song_fn = std::path::Path::new(song_path)
-                        .file_name()
-                        .map(|f| f.to_ascii_lowercase());
-                    let dt_fn = std::path::Path::new(&dt.path)
-                        .file_name()
-                        .map(|f| f.to_ascii_lowercase());
-                    return song_fn.is_some() && song_fn == dt_fn;
-                }
-                false
-            });
-
-            if let Some(track) = matching_track {
-                if user_rating >= promote_threshold {
-                    if let Err(e) = promote_discovery_track_internal(&track.id, user_id).await {
-                        warn!("Failed to promote track {}: {}", track.title, e.message);
-                    } else {
-                        promoted_tracks += 1;
-                    }
-                } else if user_rating == 1 {
-                    if let Err(e) = remove_discovery_track_internal(&track.id).await {
-                        warn!("Failed to remove track {}: {}", track.title, e);
-                    } else {
-                        info!(
-                            "Removed discovery track: {} - {} (rating 1)",
-                            track.artist, track.title
-                        );
-                        if let Err(e) = DiscoveryHistoryRow::update_outcome(
-                            user_id,
-                            &track.artist,
-                            &track.title,
-                            "removed",
-                        )
-                        .await
-                        {
-                            warn!(
-                                "Failed to update history for removed track '{}': {}",
-                                track.title, e
-                            );
-                        }
-                        removed_tracks += 1;
-                    }
-                }
+        if let Some(PendingAction::Promote(track)) =
+            pending_action(song, &pending, promote_threshold)
+        {
+            if let Err(e) = promote_discovery_track_internal(&track.id, user_id).await {
+                warn!("Failed to promote track {}: {}", track.title, e.message);
+            } else {
+                promoted_tracks += 1;
             }
         }
     }
 
-    if !auto_delete {
-        info!("Auto-delete is disabled for this user");
-    } else if skipped_veto > 0 || skipped_not_found > 0 {
-        info!(
-            "Auto-delete: {} skipped (shared veto), {} skipped (file not found)",
-            skipped_veto, skipped_not_found
-        );
-        if real_path_failures > 0 {
-            warn!(
-                "Auto-delete: {} tracks could not be resolved to a local file. \
-                 Ensure your folder paths in Soulbeet match the Navidrome library root.",
-                real_path_failures
-            );
+    let (mut deleted_tracks, mut kept_tracks) = (0u32, 0u32);
+    if user_settings.auto_delete_enabled {
+        let run = auto_delete_songs(
+            &Guard::live(),
+            &UserId::new(user_id),
+            &songs,
+            &pending,
+            &IMPORT_QUEUE,
+        )
+        .await;
+        let mut by_code = std::collections::BTreeMap::<&str, u32>::new();
+        for kept in &run.kept {
+            *by_code.entry(kept.failure.code.as_str()).or_default() += 1;
         }
+        for (code, n) in by_code {
+            info!("Auto-delete kept {n}: {code}");
+        }
+        DeletionBlockRow::replace_in(&crate::db::DB, user_id, &run.kept).await?;
+        deleted_tracks = run.deleted;
+        removed_tracks += run.removed;
+        kept_tracks = run.kept.len() as u32;
+    } else {
+        info!("Auto-delete is disabled for this user");
     }
     info!(
-        "Ratings sync complete: {} songs scanned, {} deleted, {} promoted, {} removed",
-        total_songs_scanned, deleted_tracks, promoted_tracks, removed_tracks
+        "Ratings sync complete: {} songs scanned, {} deleted, {} promoted, {} removed, {} kept",
+        total_songs_scanned, deleted_tracks, promoted_tracks, removed_tracks, kept_tracks
     );
 
     Ok(SyncResult {
@@ -256,7 +117,174 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
         promoted_tracks,
         removed_tracks,
         total_songs_scanned,
+        kept_tracks,
     })
+}
+
+/// The pending discovery track `song` is: the track's song id when it has one, else the file
+/// name of the song's Subsonic path, ignoring ASCII case.
+#[cfg(feature = "server")]
+pub(crate) fn pending_track_for<'a>(
+    song: &SubsonicSong,
+    pending: &'a [DiscoveryTrack],
+) -> Option<&'a DiscoveryTrack> {
+    let file_name = |path: &str| Path::new(path).file_name().map(|f| f.to_ascii_lowercase());
+    pending.iter().find(|track| match &track.song_id {
+        Some(song_id) => *song_id == song.id,
+        None => song
+            .path
+            .as_deref()
+            .and_then(file_name)
+            .is_some_and(|name| Some(name) == file_name(&track.path)),
+    })
+}
+
+/// What the rating sync does with a pending discovery track the user rated.
+#[cfg(feature = "server")]
+pub(crate) enum PendingAction<'a> {
+    Promote(&'a DiscoveryTrack),
+    Remove(&'a DiscoveryTrack),
+}
+
+/// Promote the pending track of `song` at `promote_threshold` or above, else remove it at
+/// rating 1.
+#[cfg(feature = "server")]
+pub(crate) fn pending_action<'a>(
+    song: &SubsonicSong,
+    pending: &'a [DiscoveryTrack],
+    promote_threshold: u8,
+) -> Option<PendingAction<'a>> {
+    let rating = song.user_rating?;
+    let track = pending_track_for(song, pending)?;
+    if rating >= promote_threshold {
+        Some(PendingAction::Promote(track))
+    } else if rating == 1 {
+        Some(PendingAction::Remove(track))
+    } else {
+        None
+    }
+}
+
+/// Discovery's own cleanup (D12): removes the pending track of each song of `songs` that
+/// pending_action removes, through remove_staged_in with its folder, with no Navidrome call.
+/// The count removed.
+#[cfg(feature = "server")]
+pub(crate) async fn remove_disliked_pending_in(
+    db: &sqlx::SqlitePool,
+    songs: &[SubsonicSong],
+    pending: &[DiscoveryTrack],
+    promote_threshold: u8,
+) -> u32 {
+    let mut removed = 0;
+    for song in songs {
+        let Some(PendingAction::Remove(track)) = pending_action(song, pending, promote_threshold)
+        else {
+            continue;
+        };
+        let result = match Folder::get_by_id_in(db, &track.folder_id).await {
+            Ok(Some(folder)) => remove_staged_in(db, track, &folder, StagedOutcome::Removed).await,
+            Ok(None) => Err(folder_not_found()),
+            Err(e) => Err(database_failure(Stage::Delete, e)),
+        };
+        match result {
+            Ok(()) => removed += 1,
+            Err(f) => warn!("Failed to remove track {}: {}", track.title, f.message),
+        }
+    }
+    removed
+}
+
+/// A 1-star song auto-delete kept, and the refusal that kept it.
+#[cfg(feature = "server")]
+pub(crate) struct KeptTrack {
+    pub song_id: String,
+    pub title: String,
+    pub artist: String,
+    pub failure: Failure,
+}
+
+/// What one auto-delete run did.
+#[cfg(feature = "server")]
+pub(crate) struct AutoDeleteRun {
+    /// Library files deleted.
+    pub deleted: u32,
+    /// Pending discovery tracks the guard found and removed.
+    pub removed: u32,
+    pub kept: Vec<KeptTrack>,
+}
+
+/// Deletes through the guard every song of `songs` that `actor` rated 1 and pending_track_for
+/// does not match in `pending`: a library file is carried out, a pending discovery track the
+/// guard finds is removed as a staged track. Only a song the fresh record still shows at 1
+/// star is removed; one rated otherwise since `songs` was listed is skipped. A failure of any
+/// step is kept with its song.
+#[cfg(feature = "server")]
+pub(crate) async fn auto_delete_songs(
+    guard: &Guard<'_>,
+    actor: &UserId,
+    songs: &[SubsonicSong],
+    pending: &[DiscoveryTrack],
+    queue: &ImportQueue,
+) -> AutoDeleteRun {
+    let mut run = AutoDeleteRun {
+        deleted: 0,
+        removed: 0,
+        kept: Vec::new(),
+    };
+    for song in songs {
+        if song.user_rating != Some(1) || pending_track_for(song, pending).is_some() {
+            continue;
+        }
+        let artist = song.artist.as_deref().unwrap_or_default();
+        let outcome = match guard.check_song(actor, &song.id).await {
+            Ok(Verdict::Library(checked)) if checked.song.rating == 1 => {
+                let forget = ForgetVia::Queue(queue.clone());
+                guard
+                    .carry_out(
+                        actor,
+                        checked,
+                        DeletionReason::Disliked,
+                        Origin::Auto,
+                        forget,
+                    )
+                    .await
+                    .map(|warnings| {
+                        for warning in warnings {
+                            warn!("{warning}");
+                        }
+                        run.deleted += 1;
+                    })
+            }
+            Ok(Verdict::Discovery { track, rating: 1 }) => {
+                match Folder::get_by_id_in(guard.db, &track.folder_id).await {
+                    Ok(Some(folder)) => {
+                        remove_staged_in(guard.db, &track, &folder, StagedOutcome::Removed)
+                            .await
+                            .map(|()| run.removed += 1)
+                    }
+                    Ok(None) => Err(folder_not_found()),
+                    Err(e) => Err(database_failure(Stage::Delete, e)),
+                }
+            }
+            Ok(_) => {
+                info!(
+                    "Auto-delete skipped {artist} - {}: no longer rated 1",
+                    song.title
+                );
+                Ok(())
+            }
+            Err(f) => Err(f),
+        };
+        if let Err(failure) = outcome {
+            run.kept.push(KeptTrack {
+                song_id: song.id.clone(),
+                title: song.title.clone(),
+                artist: artist.to_string(),
+                failure,
+            });
+        }
+    }
+    run
 }
 
 #[get("/api/navidrome/deletion-history", auth: AuthSession)]
@@ -274,194 +302,6 @@ pub async fn check_report_real_path(user_id: &str) -> Result<Option<bool>, Strin
     let players = client.get_players().await.map_err(|e| e.to_string())?;
     let soulbeet = players.iter().find(|p| p.client == "Soulbeet");
     Ok(soulbeet.map(|p| p.report_real_path))
-}
-
-/// Where a track Navidrome reports lives on this machine.
-#[cfg(feature = "server")]
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum LocalPath {
-    /// A regular file strictly inside `folder`, the deepest of the user's
-    /// folders that holds it.
-    Found {
-        path: PathBuf,
-        folder: PathBuf,
-    },
-    NotFound,
-    /// Several distinct files match, so none of them is chosen.
-    Ambiguous(Vec<PathBuf>),
-}
-
-/// What auto-delete did with the file behind a 1-star song.
-#[cfg(feature = "server")]
-#[derive(Debug, PartialEq)]
-enum AutoDelete {
-    /// Removed from disk; `folder` is the user's folder that held it.
-    Deleted {
-        path: PathBuf,
-        folder: PathBuf,
-    },
-    /// Left in place: someone else's, several files match, or removing failed.
-    Kept,
-    NotFound,
-}
-
-/// Removes the local file `local` when the deepest folder holding it, among
-/// `everyones_folders`, is `user_id`'s.
-#[cfg(feature = "server")]
-async fn auto_delete_file(
-    local: LocalPath,
-    everyones_folders: &[PolicyFolder],
-    user_id: &str,
-) -> AutoDelete {
-    let (path, folder) = match local {
-        LocalPath::Found { path, folder } => (path, folder),
-        LocalPath::Ambiguous(paths) => {
-            let paths: Vec<_> = paths.iter().map(|p| p.display().to_string()).collect();
-            info!(
-                "Auto-delete skipped (several local files match): {}",
-                paths.join(", ")
-            );
-            return AutoDelete::Kept;
-        }
-        LocalPath::NotFound => return AutoDelete::NotFound,
-    };
-    match file_owner(&path, everyones_folders, user_id) {
-        FileOwner::Actor => {}
-        FileOwner::Other => {
-            info!(
-                "Auto-delete skipped (in another user's folder): {}",
-                path.display()
-            );
-            return AutoDelete::Kept;
-        }
-        FileOwner::Unresolved { folder, error } => {
-            info!(
-                "Auto-delete skipped: {} may be inside another user's folder {}, which cannot be resolved ({error})",
-                path.display(),
-                folder.display()
-            );
-            return AutoDelete::Kept;
-        }
-    }
-    if let Err(e) = tokio::fs::remove_file(&path).await {
-        warn!("Auto-delete failed for {}: {}", path.display(), e);
-        return AutoDelete::Kept;
-    }
-    info!("Auto-deleted {}", path.display());
-    AutoDelete::Deleted { path, folder }
-}
-
-/// Drops the auto-deleted `path` from the library of `folder` through
-/// `queue`, logging the outcome, and removes the directories it left empty
-/// up to `folder`.
-#[cfg(feature = "server")]
-async fn clean_up_after_delete(queue: &ImportQueue, folder: PathBuf, path: PathBuf) {
-    match queue.forget(&folder, &path).await {
-        ForgetOutcome::Removed => info!(
-            "Removed {} from the library of {}",
-            path.display(),
-            folder.display()
-        ),
-        ForgetOutcome::NotInLibrary => warn!(
-            "{} was not in the library of {}",
-            path.display(),
-            folder.display()
-        ),
-        ForgetOutcome::Several(n) => warn!(
-            "Left {} in the library of {}: {n} items have that path",
-            path.display(),
-            folder.display()
-        ),
-        ForgetOutcome::Failed(e) => warn!(
-            "Could not remove {} from the library of {}: {e}",
-            path.display(),
-            folder.display()
-        ),
-    }
-    if let Some(parent) = path.parent() {
-        let _ = super::cleanup_empty_ancestors(parent, &folder).await;
-    }
-}
-
-/// The user's folders through `canonical_folder_path`, leaving out the ones
-/// that cannot be resolved.
-#[cfg(feature = "server")]
-fn local_folders(folders: &[Folder]) -> Vec<PathBuf> {
-    folders
-        .iter()
-        .filter_map(|f| canonical_folder_path(Path::new(&f.path)).ok())
-        .collect()
-}
-
-/// Finds the local file behind a path Navidrome reports, only ever inside
-/// one of `folders` (canonical, from `local_folders`).
-///
-/// An absolute path is tried as given, a relative one (Navidrome's library
-/// root) under each folder. When Navidrome mounts the music elsewhere,
-/// `navidrome_music_path` is its root: the part of the path below it is
-/// tried under each folder and each of the folder's ancestors.
-#[cfg(feature = "server")]
-pub(crate) fn resolve_navidrome_path(
-    navidrome_path: &str,
-    folders: &[PathBuf],
-    navidrome_music_path: Option<&str>,
-) -> LocalPath {
-    let reported = Path::new(navidrome_path);
-    let mut candidates = Vec::new();
-    if reported.is_absolute() {
-        candidates.push(reported.to_path_buf());
-    } else {
-        candidates.extend(folders.iter().map(|f| f.join(reported)));
-    }
-    if let Some(rest) = navidrome_music_path.and_then(|root| reported.strip_prefix(root).ok()) {
-        for folder in folders {
-            candidates.extend(folder.ancestors().map(|dir| dir.join(rest)));
-        }
-    }
-
-    let mut found = std::collections::BTreeMap::new();
-    for candidate in candidates {
-        let Ok(path) = std::fs::canonicalize(&candidate) else {
-            continue;
-        };
-        if !std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
-            continue;
-        }
-        let deepest = folders
-            .iter()
-            .filter(|f| path.starts_with(f) && path != **f)
-            .max_by_key(|f| f.components().count());
-        if let Some(folder) = deepest {
-            found.insert(path, folder.clone());
-        }
-    }
-
-    if found.len() > 1 {
-        return LocalPath::Ambiguous(found.into_keys().collect());
-    }
-    match found.pop_first() {
-        Some((path, folder)) => LocalPath::Found { path, folder },
-        None => LocalPath::NotFound,
-    }
-}
-
-/// Whether other listeners' ratings block an auto-delete.
-#[cfg(feature = "server")]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Veto {
-    Allowed,
-    OtherRaters(f64),
-    /// Navidrome leaves the average out when average ratings are off.
-    AverageUnknown,
-}
-
-#[cfg(feature = "server")]
-pub(crate) fn shared_veto(average_rating: Option<f64>) -> Veto {
-    match average_rating {
-        None => Veto::AverageUnknown,
-        Some(avg) if avg > 1.0 => Veto::OtherRaters(avg),
-        Some(_) => Veto::Allowed,
-    }
 }
 
 #[get("/api/navidrome/library-stats", auth: AuthSession)]
@@ -695,53 +535,12 @@ async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), Failure> 
     Ok(())
 }
 
-#[cfg(feature = "server")]
-async fn remove_discovery_track_internal(track_id: &str) -> Result<(), String> {
-    let track = DiscoveryTrackRow::get_by_id(track_id)
-        .await?
-        .ok_or("Discovery track not found")?;
-
-    let path = std::path::Path::new(&track.path);
-    if path.exists() {
-        tokio::fs::remove_file(path)
-            .await
-            .map_err(|e| format!("Failed to delete file: {}", e))?;
-        let folder = Folder::get_by_id(&track.folder_id).await;
-        if let (Some(parent), Ok(Some(folder))) = (path.parent(), folder) {
-            let profile_root = folder.discovery_profile_path(&track.profile);
-            let _ =
-                super::cleanup_empty_ancestors(parent, std::path::Path::new(&profile_root)).await;
-        }
-    }
-
-    DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Removed).await?;
-
-    info!("Removed discovery track: {}", track.title);
-    Ok(())
-}
-
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::core::delete_guard::test_support::Library;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
-    use std::os::unix::fs::symlink;
     use std::sync::Arc;
-
-    /// `tmp/music/alice/A/x.flac`, `tmp/music/bob/B/y.flac`, `tmp/outside/z.flac`.
-    fn library() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = std::fs::canonicalize(dir.path()).unwrap();
-        for file in [
-            "music/alice/A/x.flac",
-            "music/bob/B/y.flac",
-            "outside/z.flac",
-        ] {
-            let path = tmp.join(file);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, b"audio").unwrap();
-        }
-        (dir, tmp)
-    }
 
     #[tokio::test]
     async fn another_users_track_is_refused_before_it_is_claimed() {
@@ -845,277 +644,204 @@ mod tests {
         assert_eq!(f.message, format!("Promote stopped: {e}"));
     }
 
-    fn folder(path: &Path) -> Folder {
-        Folder {
-            id: "f1".to_string(),
-            user_id: "alice".to_string(),
-            name: "Music".to_string(),
-            path: path.to_str().unwrap().to_string(),
-            shared: false,
+    /// The song search3 lists for alice: by "Marrow Choir", no path.
+    fn subsonic(id: &str, title: &str, rating: Option<u8>) -> SubsonicSong {
+        SubsonicSong {
+            id: id.into(),
+            title: title.into(),
+            artist: Some("Marrow Choir".into()),
+            album: Some("Winter Songs".into()),
+            album_id: Some("al1".into()),
+            genre: None,
+            duration: None,
+            path: None,
+            user_rating: rating,
+            average_rating: None,
+            play_count: None,
+            starred: None,
         }
     }
 
-    #[test]
-    fn absolute_path_inside_a_folder_is_found() {
-        let (_dir, tmp) = library();
-        let alice = tmp.join("music/alice");
-        let track = alice.join("A/x.flac");
-        assert_eq!(
-            resolve_navidrome_path(track.to_str().unwrap(), std::slice::from_ref(&alice), None),
-            LocalPath::Found {
-                path: track,
-                folder: alice
-            }
-        );
-    }
-
-    #[test]
-    fn absolute_path_outside_every_folder_is_not_found() {
-        let (_dir, tmp) = library();
-        let outside = tmp.join("outside/z.flac");
-        assert_eq!(
-            resolve_navidrome_path(outside.to_str().unwrap(), &[tmp.join("music/alice")], None),
-            LocalPath::NotFound
-        );
-    }
-
-    #[test]
-    fn parent_components_cannot_escape_a_folder() {
-        let (_dir, tmp) = library();
-        assert_eq!(
-            resolve_navidrome_path("../bob/B/y.flac", &[tmp.join("music/alice")], None),
-            LocalPath::NotFound
-        );
-    }
-
-    #[test]
-    fn a_symlink_inside_a_folder_pointing_outside_is_not_found() {
-        let (_dir, tmp) = library();
-        let link = tmp.join("music/alice/link.flac");
-        symlink(tmp.join("outside/z.flac"), &link).unwrap();
-        assert_eq!(
-            resolve_navidrome_path(link.to_str().unwrap(), &[tmp.join("music/alice")], None),
-            LocalPath::NotFound
-        );
-        assert_eq!(
-            resolve_navidrome_path("link.flac", &[tmp.join("music/alice")], None),
-            LocalPath::NotFound
-        );
-    }
-
-    #[test]
-    fn folder_reached_through_a_symlink_still_matches() {
-        let (_dir, tmp) = library();
-        symlink(tmp.join("music"), tmp.join("lib")).unwrap();
-        let folders = local_folders(&[folder(&tmp.join("lib/alice"))]);
-        let track = tmp.join("music/alice/A/x.flac");
-        assert_eq!(
-            resolve_navidrome_path(track.to_str().unwrap(), &folders, None),
-            LocalPath::Found {
-                path: track,
-                folder: tmp.join("music/alice")
-            }
-        );
-    }
-
-    #[test]
-    fn navidrome_music_path_maps_onto_the_folder_that_holds_the_file() {
-        let (_dir, tmp) = library();
-        let alice = tmp.join("music/alice");
-        assert_eq!(
-            resolve_navidrome_path(
-                "/navi/alice/A/x.flac",
-                std::slice::from_ref(&alice),
-                Some("/navi")
-            ),
-            LocalPath::Found {
-                path: alice.join("A/x.flac"),
-                folder: alice
-            }
-        );
-    }
-
-    #[test]
-    fn navidrome_music_path_never_reaches_a_sibling_folder() {
-        let (_dir, tmp) = library();
-        assert_eq!(
-            resolve_navidrome_path(
-                "/navi/bob/B/y.flac",
-                &[tmp.join("music/alice")],
-                Some("/navi")
-            ),
-            LocalPath::NotFound
-        );
-    }
-
-    #[test]
-    fn a_directory_is_never_a_track() {
-        let (_dir, tmp) = library();
-        let album = tmp.join("music/alice/A");
-        assert_eq!(
-            resolve_navidrome_path(album.to_str().unwrap(), &[tmp.join("music/alice")], None),
-            LocalPath::NotFound
-        );
-    }
-
-    #[test]
-    fn several_matching_files_are_ambiguous() {
-        let (_dir, tmp) = library();
-        let (alice, bob) = (tmp.join("music/alice"), tmp.join("music/bob"));
-        std::fs::create_dir_all(bob.join("A")).unwrap();
-        std::fs::write(bob.join("A/x.flac"), b"audio").unwrap();
-        assert_eq!(
-            resolve_navidrome_path("A/x.flac", &[alice.clone(), bob.clone()], None),
-            LocalPath::Ambiguous(vec![alice.join("A/x.flac"), bob.join("A/x.flac")])
-        );
-    }
-
-    #[test]
-    fn the_deepest_folder_holding_the_file_is_the_cleanup_root() {
-        let (_dir, tmp) = library();
-        let (music, alice) = (tmp.join("music"), tmp.join("music/alice"));
-        let track = alice.join("A/x.flac");
-        assert_eq!(
-            resolve_navidrome_path(track.to_str().unwrap(), &[music, alice.clone()], None),
-            LocalPath::Found {
-                path: track,
-                folder: alice
-            }
-        );
-    }
-
-    fn owned(user: &str, path: &Path, shared: bool) -> PolicyFolder {
-        PolicyFolder {
-            id: format!("{user}:{}", path.display()),
-            user_id: user.to_string(),
-            owner_is_admin: false,
-            path: Ok(path.to_path_buf()),
-            stored_path: path.to_path_buf(),
-            shared,
-        }
-    }
-
-    fn write_file(path: &Path) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, b"audio").unwrap();
-    }
-
-    /// A queue whose importer records what it is asked to forget.
-    fn import_queue() -> (ImportQueue, Arc<StubImporter>) {
+    #[tokio::test]
+    async fn one_star_songs_are_deleted_through_the_guard_and_the_kept_ones_say_why() {
+        let lib = Library::new().await;
+        lib.song("s2", "alice/A/y.flac", b"audio");
+        lib.fake.rates("alice", "s2", 1);
+        lib.fake.rates("bob", "s2", 4);
         let stub = Arc::new(StubImporter::new());
-        (ImportQueue::new(RecordingDeps::new(stub.clone())), stub)
+        let queue = ImportQueue::new(RecordingDeps::new(stub.clone()));
+        let songs = vec![
+            subsonic("s1", "O Holy Night", Some(1)),
+            subsonic("s2", "Silent Night", Some(1)),
+            subsonic("s3", "Away in a Manger", Some(5)),
+        ];
+        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        assert_eq!((run.deleted, run.removed), (1, 0));
+        assert_eq!(
+            run.kept
+                .iter()
+                .map(|k| (k.song_id.as_str(), k.failure.code))
+                .collect::<Vec<_>>(),
+            vec![("s2", FailureCode::DeleteBlockedByOtherUser)]
+        );
+        assert!(
+            !lib.root.join("music/alice/A/x.flac").exists()
+                && lib.root.join("music/alice/A/y.flac").exists()
+        );
+        DeletionBlockRow::replace_in(&lib.db, "alice", &run.kept)
+            .await
+            .unwrap();
+        let listed = DeletionBlockRow::for_user_in(&lib.db, "alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            (listed[0].title.as_str(), listed[0].message.as_str()),
+            (
+                "Silent Night",
+                "Another listener rated or starred this track"
+            )
+        );
+        DeletionBlockRow::replace_in(&lib.db, "alice", &[])
+            .await
+            .unwrap();
+        assert!(DeletionBlockRow::for_user_in(&lib.db, "alice")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
-    /// What auto-delete does with the file Navidrome reports at `file`, for
-    /// `user`, whose own folders are `own`.
-    async fn rate_one_star(
-        file: &Path,
-        own: &[PathBuf],
-        everyones: &[PolicyFolder],
-        user: &str,
-    ) -> AutoDelete {
-        let local = resolve_navidrome_path(file.to_str().unwrap(), own, None);
-        auto_delete_file(local, everyones, user).await
+    #[tokio::test]
+    async fn a_song_no_longer_rated_one_star_is_neither_deleted_nor_kept() {
+        // search3 listed s1 at 1 star; alice has rated it 4 since.
+        let lib = Library::new().await;
+        lib.fake.rates("alice", "s1", 4);
+        let queue = ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())));
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &[subsonic("s1", "O Holy Night", Some(1))],
+            &[],
+            &queue,
+        )
+        .await;
+        assert_eq!((run.deleted, run.removed, run.kept.len()), (0, 0, 0));
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
     }
 
-    /// Runs the cleanup sync_ratings starts for a deleted file.
-    async fn clean_up(queue: &ImportQueue, deleted: AutoDelete) {
-        let AutoDelete::Deleted { path, folder } = deleted else {
-            panic!("not deleted: {deleted:?}");
+    #[tokio::test]
+    async fn a_pending_track_the_guard_finds_on_its_own_is_removed_as_a_staged_track() {
+        // Not among the discovery folder's tracks the sync loaded (`pending` is empty), as for a
+        // track left in an earlier discovery folder of the user.
+        let lib = Library::new().await;
+        let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
+        lib.song("s5", "alice/Discovery/Explore/03.flac", b"audio");
+        lib.fake.rates("alice", "s5", 1);
+        lib.pending_track("t1", "alice-music", "Explore", &staged, None)
+            .await;
+        let queue = ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())));
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &[subsonic("s5", "03", Some(1))],
+            &[],
+            &queue,
+        )
+        .await;
+        assert_eq!((run.deleted, run.removed, run.kept.len()), (0, 1, 0));
+        assert_eq!(
+            (
+                lib.track_status("t1").await,
+                lib.history_outcome("t1").await
+            ),
+            ("Removed".into(), "removed".into())
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deletion_reviews")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_one_star_discovery_track_is_removed_without_navidrome_placing_its_file() {
+        // Navidrome has no record of s9 for anyone, and the track has no song id yet: today's file
+        // name match on the Subsonic path still finds it, and the guard is never asked.
+        let lib = Library::new().await;
+        let staged = lib
+            .root
+            .join("music/alice/Discovery/Explore/Marrow Choir/03 - O Holy Night.flac");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"audio").unwrap();
+        let track = lib
+            .pending_track("t1", "alice-music", "Explore", &staged, None)
+            .await;
+        let song = SubsonicSong {
+            path: Some("Marrow Choir/Explore/03 - O HOLY NIGHT.flac".into()),
+            ..subsonic("s9", "O Holy Night", Some(1))
         };
-        clean_up_after_delete(queue, folder, path).await;
-    }
-
-    #[tokio::test]
-    async fn auto_delete_never_removes_another_users_folder_on_the_way_up() {
-        // Alice has /music (shared) and /music/x/a; Bob has /music/x.
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = std::fs::canonicalize(dir.path()).unwrap();
-        let (music, x, a) = (
-            tmp.join("music"),
-            tmp.join("music/x"),
-            tmp.join("music/x/a"),
+        let pending = vec![track];
+        assert!(
+            matches!(pending_action(&song, &pending, 1), Some(PendingAction::Promote(t)) if t.id == "t1")
         );
-        let everyones = [
-            owned("alice", &music, true),
-            owned("alice", &a, false),
-            owned("bob", &x, false),
-        ];
-        let own = [music.clone(), a.clone()];
-        let (queue, stub) = import_queue();
-
-        // The only file in Alice's /music/x/a, two levels down: the walk
-        // stops at her deepest folder, so Bob's /music/x stays.
-        let alices = a.join("Artist/Album/s.flac");
-        write_file(&alices);
-        let deleted = rate_one_star(&alices, &own, &everyones, "alice").await;
         assert_eq!(
-            deleted,
-            AutoDelete::Deleted {
-                path: alices.clone(),
-                folder: a.clone()
-            }
+            remove_disliked_pending_in(&lib.db, std::slice::from_ref(&song), &pending, 1).await,
+            0
         );
-        assert!(!alices.exists());
-        clean_up(&queue, deleted).await;
-        assert!(!a.join("Artist").exists());
-        assert!(a.is_dir());
-        assert!(x.is_dir());
-
-        // A file in Bob's folder is his, though Alice's shared /music holds it.
-        let bobs = x.join("B/t.flac");
-        write_file(&bobs);
+        assert!(staged.exists());
+        let queue = ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())));
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            std::slice::from_ref(&song),
+            &pending,
+            &queue,
+        )
+        .await;
+        assert_eq!((run.deleted, run.removed, run.kept.len()), (0, 0, 0));
         assert_eq!(
-            rate_one_star(&bobs, &own, &everyones, "alice").await,
-            AutoDelete::Kept
+            remove_disliked_pending_in(&lib.db, &[song], &pending, 3).await,
+            1
         );
-        assert!(bobs.is_file());
-        assert_eq!(stub.forgets(), vec![(a, alices)]);
-    }
-
-    #[tokio::test]
-    async fn auto_delete_keeps_a_file_an_unresolvable_foreign_folder_may_hold() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = std::fs::canonicalize(dir.path()).unwrap();
-        let (music, bob) = (tmp.join("music"), tmp.join("music/bob"));
-        let everyones = [
-            owned("alice", &music, false),
-            PolicyFolder {
-                path: Err("Permission denied".to_string()),
-                ..owned("bob", &bob, false)
-            },
-        ];
-        let bobs = bob.join("B/y.flac");
-        write_file(&bobs);
-        let (queue, stub) = import_queue();
-
+        assert!(!staged.exists());
         assert_eq!(
-            rate_one_star(&bobs, std::slice::from_ref(&music), &everyones, "alice").await,
-            AutoDelete::Kept
+            (
+                lib.track_status("t1").await,
+                lib.history_outcome("t1").await
+            ),
+            ("Removed".into(), "removed".into())
         );
-        assert!(bobs.is_file());
-
-        // A file outside Bob's stored path is still Alice's to delete.
-        let alices = music.join("alice/A/x.flac");
-        write_file(&alices);
-        let deleted =
-            rate_one_star(&alices, std::slice::from_ref(&music), &everyones, "alice").await;
         assert_eq!(
-            deleted,
-            AutoDelete::Deleted {
-                path: alices.clone(),
-                folder: music.clone()
-            }
+            (lib.fake.reads_by("alice"), lib.fake.reads_by("bob")),
+            (0, 0)
         );
-        clean_up(&queue, deleted).await;
-        assert!(bob.is_dir());
-        assert_eq!(stub.forgets(), vec![(music, alices)]);
     }
 
     #[test]
-    fn the_veto_fails_closed() {
-        assert_eq!(shared_veto(None), Veto::AverageUnknown);
-        assert_eq!(shared_veto(Some(2.5)), Veto::OtherRaters(2.5));
-        assert_eq!(shared_veto(Some(1.0)), Veto::Allowed);
+    fn a_track_with_a_song_id_matches_only_that_song() {
+        let track = DiscoveryTrack {
+            id: "t1".into(),
+            song_id: Some("s5".into()),
+            title: "O Holy Night".into(),
+            artist: "Marrow Choir".into(),
+            album: "Winter Songs".into(),
+            path: "/music/alice/Discovery/Explore/03.flac".into(),
+            folder_id: "alice-music".into(),
+            profile: "Explore".into(),
+            rating: None,
+            status: DiscoveryStatus::Pending,
+            created_at: "2026-11-15 20:00:00".into(),
+        };
+        let same_name = SubsonicSong {
+            path: Some("Marrow Choir/Explore/03.flac".into()),
+            ..subsonic("s6", "O Holy Night", Some(1))
+        };
+        assert!(pending_track_for(&same_name, std::slice::from_ref(&track)).is_none());
+        assert!(pending_track_for(
+            &subsonic("s5", "O Holy Night", Some(1)),
+            std::slice::from_ref(&track)
+        )
+        .is_some());
     }
 }

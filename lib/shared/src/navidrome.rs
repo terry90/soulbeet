@@ -155,12 +155,24 @@ pub struct UnreadableListener {
     pub since: String,
 }
 
+/// A track auto-delete kept at the user's last rating sync, and why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BlockedDeletion {
+    pub title: String,
+    pub artist: String,
+    /// The guard's refusal.
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncResult {
     pub deleted_tracks: u32,
     pub promoted_tracks: u32,
     pub removed_tracks: u32,
     pub total_songs_scanned: u32,
+    /// The 1-star tracks auto-delete kept.
+    #[serde(default)]
+    pub kept_tracks: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

@@ -2,9 +2,6 @@ use dioxus::prelude::*;
 use shared::navidrome::{DiscoveryConfig, DiscoveryTrack};
 
 #[cfg(feature = "server")]
-use shared::navidrome::DiscoveryStatus;
-
-#[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
 
 #[cfg(feature = "server")]
@@ -201,43 +198,15 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
 
 #[post("/api/discovery/remove", auth: AuthSession)]
 pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    #[cfg(feature = "server")]
-    use crate::models::discovery_history::DiscoveryHistoryRow;
+    use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
 
     let (track, folder) =
         super::navidrome::owned_discovery_track(&req.track_id, &auth.0.user_id, Stage::Delete)
             .await
             .map_err(failure_error)?;
-
-    let path = std::path::Path::new(&track.path);
-    if path.exists() {
-        tokio::fs::remove_file(path)
-            .await
-            .map_err(|e| server_error(format!("Failed to delete: {}", e)))?;
-        // Clean up empty Artist/Album/ dirs left by beets
-        if let Some(parent) = path.parent() {
-            let profile_root = folder.discovery_profile_path(&track.profile);
-            let _ =
-                super::cleanup_empty_ancestors(parent, std::path::Path::new(&profile_root)).await;
-        }
-    }
-
-    DiscoveryTrackRow::update_status(&req.track_id, &DiscoveryStatus::Removed)
+    remove_staged_in(&crate::db::DB, &track, &folder, StagedOutcome::Removed)
         .await
-        .map_err(server_error)?;
-
-    if let Err(e) =
-        DiscoveryHistoryRow::update_outcome(&auth.0.user_id, &track.artist, &track.title, "removed")
-            .await
-    {
-        warn!(
-            "Failed to update history for removed track '{}': {}",
-            track.title, e
-        );
-    }
-
-    info!("Removed discovery track: {}", track.title);
-    Ok(())
+        .map_err(failure_error)
 }
 
 #[post("/api/discovery/start-generation", auth: AuthSession)]
