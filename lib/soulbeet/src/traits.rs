@@ -74,7 +74,9 @@ pub trait DownloadBackend: Send + Sync {
     /// The transfer `source` holds under `id`, as `get_downloads_for` reads it; None when the backend no longer has it.
     async fn get_download(&self, source: &str, id: &str) -> Result<Option<DownloadProgress>>;
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()>;
-    async fn health_check(&self) -> bool;
+    /// Ok when the backend can take work now; else why not, as a failure
+    /// with the backend's own answer as its cause.
+    async fn health_check(&self) -> std::result::Result<(), Failure>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

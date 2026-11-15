@@ -13,7 +13,9 @@ use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
     download::EnqueueStatus,
-    failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage},
+    failure::{
+        Cause, Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
+    },
     metadata::{Album, Track},
     slskd::{AlbumResult, DownloadResponse, FileEntry, FlattenedFiles, SearchState, TrackResult},
 };
@@ -788,17 +790,18 @@ impl SoulseekClient {
         }
     }
 
-    /// Check both slskd connectivity and Soulseek network connection.
-    ///
-    /// Returns Ok(()) if slskd is reachable and connected to Soulseek.
-    /// Returns Err with a descriptive message if either check fails.
-    pub async fn check_connection(&self) -> std::result::Result<(), String> {
+    /// Checks that slskd answers and is connected and logged in to the
+    /// Soulseek network; else the failure that says which, with slskd's own
+    /// answer as its cause: a rejected API key is `backend_not_configured`,
+    /// no answer `backend_unreachable`, and so is a slskd that is not
+    /// connected or not logged in.
+    pub async fn check_connection(&self) -> std::result::Result<(), Failure> {
         // First verify slskd is reachable (session endpoint)
         if let Err(e) = self
             .make_request::<serde_json::Value, ()>(Method::GET, "session", None)
             .await
         {
-            return Err(match e {
+            let message = match &e {
                 SoulseekError::Api {
                     status: status @ (401 | 403),
                     ..
@@ -807,42 +810,16 @@ impl SoulseekClient {
                      and any CIDR restriction in slskd's web.authentication.api_keys config."
                 ),
                 other => format!("Cannot reach slskd (session endpoint failed: {other})"),
-            });
+            };
+            return Err(e.failure(Stage::SourceSearch, message));
         }
 
         // Then verify Soulseek network connection via application state
-        #[derive(Deserialize)]
-        struct ServerState {
-            #[serde(rename = "isConnected")]
-            is_connected: bool,
-            #[serde(rename = "isLoggedIn")]
-            is_logged_in: bool,
-        }
-
-        #[derive(Deserialize)]
-        struct AppState {
-            server: ServerState,
-        }
-
         match self
-            .make_request::<AppState, ()>(Method::GET, "application", None)
+            .make_request::<serde_json::Value, ()>(Method::GET, "application", None)
             .await
         {
-            Ok(app_state) => {
-                if !app_state.server.is_connected {
-                    return Err(
-                        "slskd is running but not connected to the Soulseek network. \
-                         Check slskd's connection settings or restart slskd."
-                            .to_string(),
-                    );
-                }
-                if !app_state.server.is_logged_in {
-                    return Err("slskd is connected to Soulseek but not logged in. \
-                         Check slskd's Soulseek username and password."
-                        .to_string());
-                }
-                Ok(())
-            }
+            Ok(state) => server_state_failure(&state["server"]).map_or(Ok(()), Err),
             Err(e) => {
                 warn!("Failed to check slskd application state: {}", e);
                 // If we can reach the session endpoint but not the application endpoint,
@@ -852,6 +829,46 @@ impl SoulseekClient {
             }
         }
     }
+}
+
+/// Why `server`, the `server` member of slskd's `GET application`
+/// (`isConnected`, `isLoggedIn`), keeps slskd from searching; None when it
+/// is connected and logged in, or when the member cannot be read (older
+/// slskd versions are given the benefit of the doubt).
+fn server_state_failure(server: &serde_json::Value) -> Option<Failure> {
+    let flag = |name: &str| server.get(name).and_then(serde_json::Value::as_bool);
+    let (connected, logged_in) = (flag("isConnected")?, flag("isLoggedIn")?);
+    let failure = |retry, message: &str| {
+        Failure::new(
+            FailureCode::BackendUnreachable,
+            Stage::SourceSearch,
+            retry,
+            message,
+        )
+        .with_cause(Service::Slskd, Some(200), server.to_string())
+    };
+    if !connected {
+        return Some(failure(
+            RetryAdvice::SameSourceLater,
+            "slskd is running but not connected to the Soulseek network. \
+             Check slskd's connection settings or restart slskd.",
+        ));
+    }
+    if !logged_in {
+        return Some(
+            failure(
+                RetryAdvice::NeedsUser,
+                "slskd is connected to Soulseek but not logged in. \
+                 Check slskd's Soulseek username and password.",
+            )
+            .with_user_action(UserAction::new(
+                UserActionCode::ConfigureBackend,
+                "Check the Soulseek username and password slskd signs in with",
+                "slskd",
+            )),
+        );
+    }
+    None
 }
 
 /// Everything but unreserved characters, `.` included. Soulseek usernames
@@ -1263,14 +1280,10 @@ impl crate::DownloadBackend for SoulseekClient {
         self.cancel_download(username, download_id, remove).await
     }
 
-    async fn health_check(&self) -> bool {
-        match self.check_connection().await {
-            Ok(()) => true,
-            Err(msg) => {
-                warn!("Health check failed: {}", msg);
-                false
-            }
-        }
+    async fn health_check(&self) -> std::result::Result<(), Failure> {
+        self.check_connection().await.inspect_err(|failure| {
+            warn!("Health check failed: {}", failure.message);
+        })
     }
 }
 
@@ -1344,6 +1357,102 @@ mod tests {
             mbid: None,
             cover_url: None,
         }
+    }
+
+    /// slskd's `GET application` with its server in `state` (a
+    /// `SoulseekClientStates` flags value, `Core/API/DTO/ServerState.cs`).
+    fn application(state: &str, connected: bool, logged_in: bool) -> String {
+        format!(
+            r#"{{"server":{{"address":"vps.slsknet.org:2271","ipEndPoint":null,"state":"{state}","username":"marrow","isConnected":{connected},"isLoggedIn":{logged_in},"isTransitioning":false}}}}"#
+        )
+    }
+
+    async fn checked(replies: Vec<Reply>) -> std::result::Result<(), Failure> {
+        let (url, _) = serve(replies);
+        SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap()
+            .check_connection()
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_health_check_says_why_slskd_cannot_take_work() {
+        assert_eq!(
+            checked(vec![
+                ok(""),
+                ok(&application("Connected, LoggedIn", true, true))
+            ])
+            .await,
+            Ok(())
+        );
+
+        let rejected = checked(vec![Reply {
+            status: 401,
+            body: String::new(),
+        }])
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (
+                rejected.code,
+                rejected.retry,
+                rejected.cause.as_ref().map(|c| c.status)
+            ),
+            (
+                FailureCode::BackendNotConfigured,
+                RetryAdvice::NeedsUser,
+                Some(Some(401))
+            )
+        );
+        assert!(rejected
+            .message
+            .starts_with("slskd rejected the API key (HTTP 401)."));
+        assert!(rejected.user_action.is_some());
+
+        let down = checked(vec![Reply {
+            status: 503,
+            body: "Service Unavailable".into(),
+        }])
+        .await
+        .unwrap_err();
+        assert_eq!(down.code, FailureCode::BackendUnreachable);
+        assert!(down
+            .message
+            .starts_with("Cannot reach slskd (session endpoint failed: "));
+        assert_eq!(down.cause.unwrap().raw, "Service Unavailable");
+
+        let offline = application("Disconnected", false, false);
+        let not_connected = checked(vec![ok(""), ok(&offline)]).await.unwrap_err();
+        assert_eq!(
+            (not_connected.code, not_connected.retry),
+            (
+                FailureCode::BackendUnreachable,
+                RetryAdvice::SameSourceLater
+            )
+        );
+        assert!(not_connected
+            .message
+            .starts_with("slskd is running but not connected"));
+        let raw = not_connected.cause.unwrap().raw;
+        assert!(raw.contains(r#""isConnected":false"#), "{raw}");
+
+        let not_logged_in = checked(vec![ok(""), ok(&application("Connected", true, false))])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (not_logged_in.code, not_logged_in.retry),
+            (FailureCode::BackendUnreachable, RetryAdvice::NeedsUser)
+        );
+        assert!(not_logged_in
+            .message
+            .starts_with("slskd is connected to Soulseek but not logged in."));
+        assert_eq!(
+            not_logged_in.user_action.map(|a| a.code),
+            Some(UserActionCode::ConfigureBackend)
+        );
     }
 
     #[test]

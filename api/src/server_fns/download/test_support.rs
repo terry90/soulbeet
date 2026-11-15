@@ -363,7 +363,7 @@ impl DownloadBackend for StubBackend {
         });
         Ok(())
     }
-    async fn health_check(&self) -> bool {
-        true
+    async fn health_check(&self) -> Result<(), Failure> {
+        Ok(())
     }
 }
