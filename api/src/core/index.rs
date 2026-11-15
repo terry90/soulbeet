@@ -13,7 +13,7 @@ use shared::failure::{
 use soulbeet::navidrome::error::NOT_AUTHORIZED;
 use soulbeet::navidrome::models::NativeSong;
 use soulbeet::navidrome::{NavidromeClient, ScanStatus};
-use soulbeet::NavidromeError;
+use soulbeet::{ImportedItem, NavidromeError};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -40,8 +40,9 @@ fn given_up(since: i64, now: i64) -> bool {
 /// What to do with an import, given the scan status just read, whether its items were found and
 /// whether the wait gave up (D8): scanning: Wait unchanged; found: Listed; no baseline: StartScan
 /// with the baseline set from status (last_scan, last_start); ended_after(baseline.last_scan):
-/// Fail(not_found_after_scan); last_start later than baseline.started and error set:
-/// Fail(scan_failed(&error)); gave up: Fail(no_scan_possible); else Wait unchanged.
+/// Fail(not_found_after_scan); last_start later than baseline.started, and error set or
+/// last_start later than last_scan: Fail(scan_failed(&error)); gave up: Fail(no_scan_possible);
+/// else Wait unchanged.
 pub(crate) fn next_step(wait: &IndexWait, status: &ScanStatus, found: bool, gave_up: bool) -> Step {
     // None while Navidrome scans: a scan already running may have walked past the file.
     let Some(started) = status.last_start() else {
@@ -61,9 +62,17 @@ pub(crate) fn next_step(wait: &IndexWait, status: &ScanStatus, found: bool, gave
         Some(baseline) if status.ended_after(baseline.last_scan) => {
             Step::Fail(not_found_after_scan())
         }
-        // A failed scan stores its error and leaves lastScan as it was; an error from before
-        // the baseline, with no scan begun since, is stale.
-        Some(baseline) if started > baseline.started && !status.error.is_empty() => {
+        // A scan begun after the baseline, Navidrome idle and lastScan unchanged, failed. A
+        // failed phase stores its error and leaves lastScan as it was; failing to prepare the
+        // libraries stores no error (scanner/scanner.go:130-135), and then the start is later
+        // than lastScan: a completed scan sets lastScan after its start (scanner/scanner.go:
+        // 292-326, persistence/library_repository.go:169-174), and a status read while one
+        // completes still counts elapsedTime from its start (scanner/controller.go:126-147).
+        // An error from before the baseline, with no scan begun since, is stale.
+        Some(baseline)
+            if started > baseline.started
+                && (!status.error.is_empty() || started > status.last_scan) =>
+        {
             Step::Fail(scan_failed(&status.error))
         }
         _ if gave_up => Step::Fail(no_scan_possible()),
@@ -83,11 +92,32 @@ pub(crate) fn is_imported_file(song: &NativeSong, item: &Path, size: u64) -> boo
         && (listed.ends_with(item) || item.ends_with(listed))
 }
 
+/// The words Navidrome's full-text filter finds `item` by: its artist and title, the title being
+/// the file name without its extension when beets has none, as Navidrome names a song without a
+/// title tag (model/metadata/persistent_ids.go:94-99, utils/files.go:16-19). Navidrome's
+/// full_text holds the title it shows (persistence/mediafile_repository.go:58-62).
+fn lookup_text(item: &ImportedItem) -> String {
+    let title = if item.title.trim().is_empty() {
+        let name = item
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match name.rfind('.') {
+            Some(dot) => name[..dot].to_string(),
+            None => name,
+        }
+    } else {
+        item.title.clone()
+    };
+    format!("{} {title}", item.artist).trim().to_string()
+}
+
 /// Whether every item of `wait` is listed: each looked up by its recording MBID, then by
-/// "{artist} {title}" (D7), paging LOOKUP_PAGE at a time until a short page or a match, each
-/// candidate checked with is_imported_file against the size of wait.library.join(item.path) on
-/// disk. An item whose file cannot be read is not listed. A text with no letter or digit is not
-/// looked up: Navidrome drops a filter that sanitizes to nothing and lists every song
+/// lookup_text (D7), paging LOOKUP_PAGE at a time until a short page or a match, each candidate
+/// checked with is_imported_file against the size of wait.library.join(item.path) on disk. An
+/// item whose file cannot be read is not listed. A text with no letter or digit is not looked up:
+/// Navidrome drops a filter that sanitizes to nothing and lists every song
 /// (persistence/sql_search.go:62-66, sql_restful.go:31-35).
 pub(crate) async fn listed(
     navi: &NavidromeClient,
@@ -101,7 +131,7 @@ pub(crate) async fn listed(
             .recording_mbid
             .iter()
             .cloned()
-            .chain([format!("{} {}", item.artist, item.title)])
+            .chain([lookup_text(item)])
             .filter(|text| text.chars().any(char::is_alphanumeric));
         let mut found = false;
         for text in texts {
@@ -160,7 +190,16 @@ pub(crate) fn no_scan_possible() -> Failure {
     ))
 }
 
+/// Navidrome's last scan failed with `error`, empty when Navidrome stored none.
 pub(crate) fn scan_failed(error: &str) -> Failure {
+    if error.is_empty() {
+        return Failure::new(
+            FailureCode::ScanFailed,
+            Stage::Index,
+            RetryAdvice::SameSourceLater,
+            "Navidrome's scan failed without giving a reason",
+        );
+    }
     Failure::new(
         FailureCode::ScanFailed,
         Stage::Index,
@@ -699,6 +738,47 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_that_fails_without_an_error_fails_the_wait_and_one_that_completes_does_not() {
+        let Step::StartScan(started) = next_step(
+            &waiting(1_000),
+            &status(false, "2026-11-15T10:02:00Z", 4, ""),
+            false,
+            given_up(1_000, 1_005),
+        ) else {
+            panic!()
+        };
+        // Read while the scan begun at 10:02:30 completed: lastScan not yet moved, elapsedTime
+        // counted from that start.
+        assert!(matches!(
+            next_step(
+                &started,
+                &status(false, "2026-11-15T10:02:00Z", 1, ""),
+                false,
+                given_up(1_000, 1_010)
+            ),
+            Step::Wait(_)
+        ));
+        // The scan begun at 10:02:30 failed preparing the libraries: no error stored.
+        let Step::Fail(f) = next_step(
+            &started,
+            &status(false, "2026-11-15T10:02:00Z", -30, ""),
+            false,
+            given_up(1_000, 1_015),
+        ) else {
+            panic!("a scan that began after the import failed")
+        };
+        assert_eq!(
+            (f.code, f.retry, f.message.as_str(), f.cause),
+            (
+                FailureCode::ScanFailed,
+                RetryAdvice::SameSourceLater,
+                "Navidrome's scan failed without giving a reason",
+                None
+            )
+        );
+    }
+
+    #[test]
     fn the_wait_ends_listed_or_given_up() {
         let started = IndexWait {
             baseline: Some(ScanBaseline {
@@ -1133,22 +1213,68 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn an_item_without_a_tag_is_not_looked_up_by_text() {
-        let library = tempfile::tempdir().unwrap();
-        let mut wait = imported_in(library.path());
-        // Imported as-is from an untagged file: no MBID, artist or title.
+    /// `wait` with its one item imported as-is from an untagged file: no MBID, artist or title.
+    fn untagged(mut wait: IndexWait) -> IndexWait {
         wait.items[0] = ImportedItem {
             recording_mbid: None,
             artist: String::new(),
             title: String::new(),
             ..wait.items[0].clone()
         };
+        wait
+    }
+
+    #[tokio::test]
+    async fn an_item_without_tags_is_found_by_its_file_name_and_its_wait_ends_listed() {
+        let library = tempfile::tempdir().unwrap();
+        let (ledger, db, mut rx, _) = indexing(untagged(imported_in(library.path()))).await;
         let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        // Navidrome titles a song without a title tag by its file name.
         navi.answer(
             "/api/song",
-            &[&song_json("Zzqx Artist/Qzz Album/01 Song Number 1.mp3", 4)],
+            &[&song_json(
+                "alice/Zzqx Artist/Qzz Album/01 Song Number 1.mp3",
+                4,
+            )],
         );
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Ok(navi.client())),
+            &mut IndexRunner::default(),
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Done));
+        assert_eq!(
+            indexes(&mut rx),
+            vec![Some(IndexState::Waiting), Some(IndexState::Listed)]
+        );
+        let lookups: Vec<String> = navi
+            .asked_with_queries()
+            .into_iter()
+            .filter(|target| target.starts_with("/api/song?"))
+            .collect();
+        assert_eq!(lookups.len(), 1);
+        assert!(
+            lookups[0].contains("&title=01+Song+Number+1&"),
+            "{}",
+            lookups[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_whose_name_has_no_letter_or_digit_is_not_looked_up() {
+        let library = tempfile::tempdir().unwrap();
+        let mut wait = untagged(imported_in(library.path()));
+        let path = Path::new("_/_/_.mp3");
+        std::fs::create_dir_all(library.path().join("_/_")).unwrap();
+        std::fs::write(library.path().join(path), b"mp3!").unwrap();
+        wait.items[0].path = path.into();
+        let navi = NavidromeStub::start();
+        navi.answer("/api/song", &[&song_json("_/_/_.mp3", 4)]);
         assert!(!listed(&navi.client(), &wait).await.unwrap());
         assert!(!navi.asked().contains(&"/api/song".to_string()));
     }

@@ -13,7 +13,7 @@ type Answers = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
 
 /// A Navidrome stand-in on 127.0.0.1: answers each endpoint path from the bodies set for it, in
 /// order, the last one repeating; an endpoint with none answers `{"subsonic-response":{"status":"ok","version":"1.16.1"}}`.
-/// `/auth/login` answers `{"token":"jwt"}` unless set. Records each request's path.
+/// `/auth/login` answers `{"token":"jwt"}` unless set. Records each request's path and query.
 pub(crate) struct NavidromeStub {
     pub url: String,
     answers: Answers,
@@ -50,7 +50,18 @@ impl NavidromeStub {
         );
     }
 
+    /// The path of each request, in order.
     pub fn asked(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|target| target.split('?').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The path and query of each request, in order.
+    pub fn asked_with_queries(&self) -> Vec<String> {
         self.asked.lock().unwrap().clone()
     }
 
@@ -94,7 +105,7 @@ fn serve(stream: TcpStream, answers: &Answers, asked: &Mutex<Vec<String>>) -> st
         None => None,
     }
     .unwrap_or_else(|| OK.to_string());
-    asked.lock().unwrap().push(endpoint);
+    asked.lock().unwrap().push(target.to_string());
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
