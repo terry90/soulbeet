@@ -36,6 +36,23 @@ pub(crate) fn parse_registration(
     }
 }
 
+/// Reads `MCP`: `on` or `off` in any case. Unset is on; an unknown value is
+/// off, as an unknown `REGISTRATION` closes registration.
+#[cfg(feature = "server")]
+pub(crate) fn parse_mcp_switch(value: Option<&str>) -> bool {
+    match value.map(str::to_lowercase).as_deref() {
+        None | Some("on") => true,
+        Some("off") => false,
+        Some(other) => {
+            tracing::warn!(
+                "Invalid MCP value '{}' (expected on or off), using off",
+                other
+            );
+            false
+        }
+    }
+}
+
 /// Why `PUBLIC_URL` stops every sign-in, when it is set and cannot be used.
 #[cfg(feature = "server")]
 pub(crate) fn public_url_problem(
@@ -98,6 +115,8 @@ pub struct AppConfig {
     navidrome_music_path: Option<PathBuf>,
     /// Who can create accounts (`REGISTRATION`)
     registration: RegistrationMode,
+    /// Whether Claude (MCP) access is switched on (`MCP`)
+    mcp_enabled: bool,
     /// HTTP server port (default: 9765)
     pub port: u16,
     /// HTTP server bind address (default: "0.0.0.0")
@@ -155,6 +174,13 @@ impl AppConfig {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             registration,
+            mcp_enabled: parse_mcp_switch(
+                std::env::var("MCP")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty()),
+            ),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
@@ -213,6 +239,11 @@ impl AppConfig {
         self.registration
     }
 
+    /// Whether Claude (MCP) access is switched on.
+    pub fn mcp_enabled(&self) -> bool {
+        self.mcp_enabled
+    }
+
     /// The mode every batch of this run imports in.
     pub fn import_mode(&self) -> ImportMode {
         match self.beets_album_mode {
@@ -247,6 +278,20 @@ mod tests {
         assert_eq!(public_url_problem(None), None);
         let good = BaseUrl::parse("https://music.example.com");
         assert_eq!(public_url_problem(Some(&good)), None);
+    }
+
+    #[test]
+    fn mcp_is_on_unless_switched_off() {
+        for (value, want) in [
+            (None, true),
+            (Some("on"), true),
+            (Some("ON"), true),
+            (Some("off"), false),
+            (Some("Off"), false),
+            (Some("disabled"), false),
+        ] {
+            assert_eq!(parse_mcp_switch(value), want, "{value:?}");
+        }
     }
 
     #[test]

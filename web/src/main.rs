@@ -68,7 +68,11 @@ fn main() {
                 dioxus::logger::tracing::warn!("MCP stays off: {}", reason.message);
             }
 
-            Ok(dioxus::server::router(App).layer(CookieManagerLayer::new()))
+            Ok(dioxus::server::router(App)
+                .merge(api::connection::router(
+                    api::connection::ConnectionState::live(),
+                ))
+                .layer(CookieManagerLayer::new()))
         });
     }
 

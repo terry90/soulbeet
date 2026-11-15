@@ -28,7 +28,7 @@ pub fn SecurityStatusPanel() -> Element {
 
 #[component]
 fn SecurityChecks(status: SecurityStatus) -> Element {
-    if status.sign_in_problem.is_none() && status.mcp_blocked_by.is_empty() {
+    if status.mcp_enabled && status.sign_in_problem.is_none() && status.mcp_blocked_by.is_empty() {
         return rsx! {
             p { class: "text-sm font-mono text-gray-300", "All security checks pass." }
         };
@@ -36,6 +36,11 @@ fn SecurityChecks(status: SecurityStatus) -> Element {
     rsx! {
         if let Some(problem) = status.sign_in_problem {
             p { class: "text-sm font-mono text-red-400 mb-3", "{problem}" }
+        }
+        if !status.mcp_enabled {
+            p { class: "text-sm font-mono text-gray-300 mb-3",
+                "Claude (MCP) access is turned off: MCP=off is set."
+            }
         }
         if !status.mcp_blocked_by.is_empty() {
             p { class: "text-sm font-mono text-gray-300 mb-3",
@@ -68,7 +73,19 @@ mod tests {
         SecurityStatus {
             mcp_blocked_by,
             sign_in_problem: sign_in_problem.map(Into::into),
+            mcp_enabled: true,
         }
+    }
+
+    #[test]
+    fn checks_say_when_mcp_is_switched_off() {
+        let html = render(SecurityStatus {
+            mcp_blocked_by: vec![],
+            sign_in_problem: None,
+            mcp_enabled: false,
+        });
+        assert!(html.contains("Claude (MCP) access is turned off: MCP=off is set."));
+        assert!(!html.contains("All security checks pass."));
     }
 
     #[test]

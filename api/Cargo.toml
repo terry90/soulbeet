@@ -49,6 +49,7 @@ dotenvy = "0.15.7"
 async-trait = "0.1"
 tempfile = "3"
 tokio = { version = "1.48.0", features = ["test-util"] }
+tower = { version = "0.5.2", features = ["util"] }
 
 [features]
 default = []

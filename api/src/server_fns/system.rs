@@ -55,5 +55,6 @@ pub async fn get_security_status() -> Result<crate::security::SecurityStatus, Se
     Ok(crate::security::SecurityStatus {
         mcp_blocked_by: crate::security::gate_reasons(),
         sign_in_problem: CONFIG.public_url_problem(),
+        mcp_enabled: CONFIG.mcp_enabled(),
     })
 }
