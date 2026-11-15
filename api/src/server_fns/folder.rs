@@ -106,19 +106,16 @@ pub async fn update_folder(
         },
     )
     .await?;
-    models::folder::Folder::update(&folder_id, &name, path_str(&canonical))
+    crate::core::folders::update(&folder, &name, path_str(&canonical))
         .await
-        .map_err(server_error)
+        .map_err(failure_error)
 }
 
 #[delete("/api/folders/delete", auth: AuthSession)]
 pub async fn delete_folder(folder_id: String) -> Result<(), ServerFnError> {
-    crate::core::folders::owned(&auth.0, &folder_id)
+    crate::core::folders::delete(&auth.0, &folder_id)
         .await
-        .map_err(failure_error)?;
-    models::folder::Folder::delete(&folder_id)
-        .await
-        .map_err(server_error)
+        .map_err(failure_error)
 }
 
 #[get("/api/folders/admin", _: AdminSession)]

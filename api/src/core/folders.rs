@@ -46,6 +46,36 @@ pub(crate) async fn owned_in(
     ensure_owner(folder, ctx)
 }
 
+/// Stores a new name and path for `folder`, one `owned` gave and whose path
+/// the folder rules allowed.
+pub async fn update(folder: &Folder, name: &str, path: &str) -> Result<(), Failure> {
+    update_in(&DB, folder, name, path).await
+}
+
+async fn update_in(
+    db: &SqlitePool,
+    folder: &Folder,
+    name: &str,
+    path: &str,
+) -> Result<(), Failure> {
+    Folder::update_in(db, &folder.id, name, path)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))
+}
+
+/// Deletes `ctx`'s folder `folder_id`. Only the entry goes; its files stay
+/// on disk.
+pub async fn delete(ctx: &UserCtx, folder_id: &str) -> Result<(), Failure> {
+    delete_in(&DB, ctx, folder_id).await
+}
+
+async fn delete_in(db: &SqlitePool, ctx: &UserCtx, folder_id: &str) -> Result<(), Failure> {
+    owned_in(db, ctx, folder_id).await?;
+    Folder::delete_in(db, folder_id)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))
+}
+
 /// `ctx`'s own folder at `path`.
 pub async fn owned_at(ctx: &UserCtx, path: &str) -> Result<Folder, Failure> {
     Folder::find_for_user_by_path(&ctx.user_id, path)
@@ -108,5 +138,39 @@ mod tests {
             owned_in(&db, &bob, &bob_folder).await.map(|f| f.id),
             Ok(bob_folder.clone())
         );
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_deletes_a_folder() {
+        let db = crate::db::test_db::migrated().await;
+        let alice_folder = crate::core::folder_of(&db, "alice").await;
+        let alice = test_ctx("alice");
+        assert_eq!(
+            delete_in(&db, &test_ctx("bob"), &alice_folder).await,
+            Err(folder_not_found())
+        );
+        assert!(owned_in(&db, &alice, &alice_folder).await.is_ok());
+        assert_eq!(delete_in(&db, &alice, &alice_folder).await, Ok(()));
+        assert_eq!(
+            owned_in(&db, &alice, &alice_folder).await,
+            Err(folder_not_found())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_write_the_database_refuses_is_a_database_failure() {
+        let db = crate::db::test_db::migrated().await;
+        let id = crate::core::folder_of(&db, "alice").await;
+        let alice = test_ctx("alice");
+        let folder = owned_in(&db, &alice, &id).await.unwrap();
+        db.close().await;
+        let closed = sqlx::Error::PoolClosed.to_string();
+
+        let renamed = update_in(&db, &folder, "Music", "/music/alice")
+            .await
+            .unwrap_err();
+        assert_eq!(renamed, database_failure(Stage::Input, &closed));
+        let deleted = delete_in(&db, &alice, &id).await.unwrap_err();
+        assert_eq!(deleted, database_failure(Stage::Input, &closed));
     }
 }

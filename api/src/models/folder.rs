@@ -68,12 +68,17 @@ impl Folder {
             .map_err(|e| e.to_string())
     }
 
-    pub async fn update(id: &str, name: &str, path: &str) -> Result<(), String> {
+    pub(crate) async fn update_in(
+        db: &SqlitePool,
+        id: &str,
+        name: &str,
+        path: &str,
+    ) -> Result<(), String> {
         sqlx::query("UPDATE folders SET name = ?, path = ? WHERE id = ?")
             .bind(name)
             .bind(path)
             .bind(id)
-            .execute(&*DB)
+            .execute(db)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -90,9 +95,13 @@ impl Folder {
     }
 
     pub async fn delete(id: &str) -> Result<(), String> {
+        Self::delete_in(&DB, id).await
+    }
+
+    pub(crate) async fn delete_in(db: &SqlitePool, id: &str) -> Result<(), String> {
         sqlx::query("DELETE FROM folders WHERE id = ?")
             .bind(id)
-            .execute(&*DB)
+            .execute(db)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
