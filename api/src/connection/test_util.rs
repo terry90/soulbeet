@@ -1,20 +1,28 @@
 //! Shared helpers for the connection router's tests.
 
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::Router;
 use sqlx::SqlitePool;
 use tower::ServiceExt;
+use url::Url;
 
 use super::ConnectionState;
+use crate::oauth::cimd::{
+    client_id_url, parse_document, CimdError, ClientDocument, ClientDocuments,
+};
 use crate::oauth::limits::Limits;
 use crate::secret_key::SecretKey;
 
 impl ConnectionState {
-    /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits, `test_key()`.
+    /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits,
+    /// `test_key()`, and no client metadata documents.
     pub(crate) fn for_test(db: SqlitePool) -> ConnectionState {
         ConnectionState {
             mcp_enabled: true,
@@ -23,6 +31,7 @@ impl ConnectionState {
             db,
             limits: Arc::new(Limits::default()),
             key: test_key(),
+            documents: FixedDocuments::new(vec![]),
         }
     }
 }
@@ -32,6 +41,72 @@ pub(crate) const HOST: &str = "music.example.com";
 
 /// Claude's redirect URI (claude.com `connectors/building/authentication.md:211`).
 pub(crate) const CLAUDE_CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
+
+// The document Claude Code serves, fetched 2026-11-15 from its client_id URL
+// (cited by claude.com connectors/building/authentication.md:220).
+pub(crate) const CLAUDE_CODE_DOCUMENT: &str = r#"{"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"Claude Code","client_uri":"https://claude.ai","redirect_uris":["http://localhost/callback","http://127.0.0.1/callback"],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"}"#;
+pub(crate) const CLAUDE_CODE_ID: &str = "https://claude.ai/oauth/claude-code-client-metadata";
+
+/// Claude Code's document as `parse_document` reads it at its URL.
+pub(crate) fn claude_code() -> ClientDocument {
+    let url = client_id_url(CLAUDE_CODE_ID).expect("Claude Code's client id is a client id URL");
+    parse_document(&url, CLAUDE_CODE_DOCUMENT.as_bytes()).expect("Claude Code's document parses")
+}
+
+/// Answers each URL's document from a fixed list and counts the fetches.
+pub(crate) struct FixedDocuments {
+    docs: Vec<(String, Result<ClientDocument, CimdError>)>,
+    calls: AtomicUsize,
+}
+
+impl FixedDocuments {
+    pub(crate) fn new(docs: Vec<(&str, Result<ClientDocument, CimdError>)>) -> Arc<FixedDocuments> {
+        Arc::new(FixedDocuments {
+            docs: docs
+                .into_iter()
+                .map(|(url, doc)| (url.to_string(), doc))
+                .collect(),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    /// How many fetches were asked for.
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ClientDocuments for FixedDocuments {
+    async fn fetch(&self, url: &Url) -> Result<ClientDocument, CimdError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.docs
+            .iter()
+            .find(|(known, _)| known == url.as_str())
+            .map(|(_, doc)| doc.clone())
+            .unwrap_or_else(|| {
+                Err(CimdError::Fetch(format!(
+                    "no document for {url} in this test"
+                )))
+            })
+    }
+}
+
+/// Serves `app` over TCP on a free loopback port.
+pub(crate) async fn serve_on_loopback(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port is free");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener has an address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("the test server runs");
+    });
+    (addr, server)
+}
 
 /// The S256 code challenge of RFC 7636 appendix B.
 pub(crate) const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";

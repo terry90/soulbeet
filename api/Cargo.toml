@@ -31,6 +31,7 @@ tokio = { version = "1.48.0", features = [
   "sync",
   "macros",
   "time",
+  "net",
 ], optional = true }
 tracing = "0.1.41"
 axum = { version = "0.8.7", optional = true }
@@ -40,6 +41,7 @@ base64 = { version = "0.22", optional = true }
 futures = { version = "0.3", optional = true }
 async-trait = { version = "0.1", optional = true }
 url = { version = "2.5.8", optional = true }
+reqwest = { version = "0.12.25", features = ["json"], optional = true }
 rustix = { version = "1.1.2", features = ["fs"], optional = true }
 
 [build-dependencies]
@@ -69,5 +71,6 @@ server = [
   "dep:futures",
   "dep:async-trait",
   "dep:url",
+  "dep:reqwest",
   "dep:rustix",
 ]

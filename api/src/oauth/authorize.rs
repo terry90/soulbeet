@@ -7,9 +7,11 @@
 //! a bad request would make Soulful an open redirector (RFC 9700 4.11.2).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::header::RETRY_AFTER;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Extension;
@@ -17,9 +19,13 @@ use shared::oauth::AUTHORIZE_PATH;
 use tower_cookies::Cookies;
 use url::Url;
 
-use super::clients::{find_in, is_loopback_uri, redirect_matches};
+use super::cimd::{client_id_url, CimdError, ClientDocument};
+use super::clients::{
+    find_in, is_loopback_uri, redirect_matches, upsert_cimd_in, ClientKind, KnownClient,
+};
 use super::codes::{store_code_in, store_request_in, take_request_in, PendingRequest};
 use super::consent::{consent_page, error_page, ConsentView};
+use super::limits::retry_after_seconds;
 use super::metadata::mcp_url;
 use super::secrets::new_secret;
 use super::{now_unix, resource_matches, OFFLINE_ACCESS, SCOPE};
@@ -116,18 +122,25 @@ pub(crate) async fn show(
         let back: String = url::form_urlencoded::byte_serialize(back.as_bytes()).collect();
         return Redirect::to(&format!("/login?return_to={back}")).into_response();
     };
-    let client = match params.get("client_id") {
-        None => None,
-        Some(client_id) => match find_in(&state.db, client_id).await {
-            Ok(client) => client,
+    let Some(client_id) = params.get("client_id") else {
+        return error_page(StatusCode::BAD_REQUEST, UNKNOWN_APP);
+    };
+    // A CIMD client is known by its URL's host, a registered one by its
+    // redirect's host (D8).
+    let (client, client_id_host) = if client_id.starts_with("https://") {
+        match document_client(&state, &user, client_id).await {
+            Ok((client, host)) => (client, Some(host)),
+            Err(refused) => return refused,
+        }
+    } else {
+        match find_in(&state.db, client_id).await {
+            Ok(Some(client)) => (client, None),
+            Ok(None) => return error_page(StatusCode::BAD_REQUEST, UNKNOWN_APP),
             Err(e) => {
                 tracing::error!("Could not read an OAuth client: {e}");
                 return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
             }
-        },
-    };
-    let Some(client) = client else {
-        return error_page(StatusCode::BAD_REQUEST, UNKNOWN_APP);
+        }
     };
     let redirect = params
         .get("redirect_uri")
@@ -168,7 +181,7 @@ pub(crate) async fn show(
         return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
     }
     consent_page(&ConsentView {
-        app_host: &redirect_host,
+        app_host: client_id_host.as_deref().unwrap_or(&redirect_host),
         client_name: pending.client.client_name.as_deref(),
         redirect_host: &redirect_host,
         loopback_only: pending
@@ -179,6 +192,40 @@ pub(crate) async fn show(
         username: &user.username,
         request_id: &request_id,
     })
+}
+
+/// The client a client id URL names, from its document fetched now, and the
+/// URL's host; or the page that says why it cannot be used.
+async fn document_client(
+    state: &ConnectionState,
+    user: &UserCtx,
+    client_id: &str,
+) -> Result<(KnownClient, String), Response> {
+    let unusable = |e: CimdError| {
+        error_page(
+            StatusCode::BAD_REQUEST,
+            &format!("Soulful could not use this app's client metadata at {client_id}: {e}"),
+        )
+    };
+    let url = client_id_url(client_id).map_err(unusable)?;
+    if let Err(wait) = state.limits.cimd_fetch.admit(&user.user_id, Instant::now()) {
+        let seconds = retry_after_seconds(wait);
+        let mut refused = error_page(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!("Too many app sign-ins in a minute. Try again in {seconds} seconds."),
+        );
+        refused.headers_mut().insert(RETRY_AFTER, seconds.into());
+        return Err(refused);
+    }
+    let doc = state.documents.fetch(&url).await.map_err(unusable)?;
+    let host = url.host_str().expect("an https URL has a host").to_string();
+    let client = KnownClient {
+        client_id: doc.client_id,
+        kind: ClientKind::Cimd,
+        client_name: Some(doc.client_name),
+        redirect_uris: doc.redirect_uris,
+    };
+    Ok((client, host))
 }
 
 /// The granted scope and the code challenge, or the OAuth error code and
@@ -272,6 +319,22 @@ pub(crate) async fn answer(
             ],
         );
     }
+    // The code's client must exist: a CIMD client is stored once allowed.
+    if pending.client.kind == ClientKind::Cimd {
+        let Some(client_name) = pending.client.client_name.clone() else {
+            tracing::error!("A stored CIMD authorize request has no client name");
+            return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
+        };
+        let doc = ClientDocument {
+            client_id: pending.client.client_id.clone(),
+            client_name,
+            redirect_uris: pending.client.redirect_uris.clone(),
+        };
+        if let Err(e) = upsert_cimd_in(&state.db, &doc, now).await {
+            tracing::error!("Could not store an OAuth client: {e}");
+            return error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE);
+        }
+    }
     let code = new_secret();
     if let Err(e) = store_code_in(&state.db, &code, &pending, now).await {
         tracing::error!("Could not store an OAuth authorization code: {e}");
@@ -300,6 +363,9 @@ fn back_to_app(pending: &PendingRequest, base: &BaseUrl, first: &[(&str, &str)])
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use axum::http::{HeaderMap, StatusCode};
     use axum::Router;
     use sqlx::SqlitePool;
@@ -309,7 +375,9 @@ mod tests {
     use crate::connection::test_util::*;
     use crate::connection::{router, ConnectionState};
     use crate::db::test_db;
+    use crate::oauth::cimd::{CimdError, ClientDocument};
     use crate::oauth::clients::{insert_dcr_in, NewClient, DCR_CAP};
+    use crate::oauth::limits::{Limits, WindowLimiter};
     use crate::oauth::now_unix;
     use crate::oauth::secrets::hash;
 
@@ -775,6 +843,205 @@ mod tests {
             "This app runs on a computer (it returns to 127.0.0.1). Allow it only if you started it yourself."
         ));
         assert!(!page.contains("It calls itself"));
+    }
+
+    /// A database, the documents the router fetches (Claude Code's id answers
+    /// `doc`), and the router with the cookie layer.
+    async fn cimd_app(
+        doc: Result<ClientDocument, CimdError>,
+    ) -> (SqlitePool, Arc<FixedDocuments>, Router) {
+        let db = test_db::migrated().await;
+        let docs = FixedDocuments::new(vec![(CLAUDE_CODE_ID, doc)]);
+        let state = ConnectionState {
+            documents: docs.clone(),
+            ..ConnectionState::for_test(db.clone())
+        };
+        (db, docs, router(state).layer(CookieManagerLayer::new()))
+    }
+
+    fn claude_code_query(redirect: &'static str) -> String {
+        query_with(&[
+            ("client_id", Some(CLAUDE_CODE_ID)),
+            ("redirect_uri", Some(redirect)),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_metadata_document_app_is_shown_by_its_url_host() {
+        let (db, docs, app) = cimd_app(Ok(claude_code())).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let q = claude_code_query("http://localhost:3118/callback");
+        let (status, _, page) =
+            get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        for text in [
+            "Connect claude.ai to Soulful",
+            "It calls itself \"Claude Code\".",
+            "This app runs on a computer (it returns to localhost). Allow it only if you started it yourself.",
+        ] {
+            assert!(page.contains(text), "{text}");
+        }
+        assert_eq!(count(&db, "oauth_clients").await, 0);
+        let (status, headers, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &request_id_of(&page)), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(headers["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("http://localhost:3118/callback?code="));
+        let row: (String, Option<String>, String) = sqlx::query_as(
+            "SELECT kind, client_name, redirect_uris FROM oauth_clients WHERE client_id = ?",
+        )
+        .bind(CLAUDE_CODE_ID)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                "cimd".into(),
+                Some("Claude Code".into()),
+                r#"["http://localhost/callback","http://127.0.0.1/callback"]"#.into()
+            )
+        );
+        assert_eq!(docs.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_authorization_updates_the_stored_document() {
+        let db = test_db::migrated().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let renamed = ClientDocument {
+            client_name: "Claude Code 2".into(),
+            ..claude_code()
+        };
+        for doc in [claude_code(), renamed] {
+            let docs = FixedDocuments::new(vec![(CLAUDE_CODE_ID, Ok(doc))]);
+            let app = router(ConnectionState {
+                documents: docs,
+                ..ConnectionState::for_test(db.clone())
+            })
+            .layer(CookieManagerLayer::new());
+            let q = claude_code_query("http://localhost:3118/callback");
+            let (_, _, page) =
+                get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+            let (status, _, _) = post_form(
+                app,
+                "/oauth/authorize",
+                Some(&cookie),
+                &[("request", &request_id_of(&page)), ("decision", "allow")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::SEE_OTHER);
+        }
+        let names: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT client_name FROM oauth_clients")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(names, [Some("Claude Code 2".to_string())]);
+        assert_eq!(count(&db, "oauth_codes").await, 2);
+    }
+
+    #[tokio::test]
+    async fn the_document_is_fetched_only_after_sign_in() {
+        let (_, docs, app) = cimd_app(Ok(claude_code())).await;
+        let (status, headers, _) = get(
+            app,
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("http://localhost:3118/callback")
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(headers["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("/login?return_to="));
+        assert_eq!(docs.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_document_is_named_on_the_page() {
+        let (db, _, app) = cimd_app(Err(CimdError::Status(404))).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (status, headers, page) = get(
+            app,
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("http://localhost:3118/callback")
+            ),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(headers.get("location").is_none());
+        assert!(page.contains("Soulful could not use this app&#39;s client metadata at https://claude.ai/oauth/claude-code-client-metadata: it answered HTTP 404"), "{page}");
+
+        let (db, docs, app) = cimd_app(Ok(claude_code())).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (status, _, page) = get(
+            app.clone(),
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("https://evil.example/cb")
+            ),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains("This app asked to return to an address it did not register."));
+        let q = query_with(&[("client_id", Some("https://claude.ai/"))]);
+        let (status, _, page) = get(app, &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page
+            .contains("client metadata at https://claude.ai/: a client id URL must have a path"));
+        assert_eq!(docs.calls(), 1);
+        assert_eq!(count(&db, "oauth_requests").await, 0);
+    }
+
+    // Limits gains fields in later tasks; a test sets the one limit it needs
+    // by assignment, so it does not change when they come.
+    #[allow(clippy::field_reassign_with_default)]
+    #[tokio::test]
+    async fn metadata_fetches_per_user_are_limited() {
+        let db = test_db::migrated().await;
+        let mut limits = Limits::default();
+        limits.cimd_fetch = WindowLimiter::new(1, Duration::from_secs(60));
+        let docs = FixedDocuments::new(vec![(CLAUDE_CODE_ID, Ok(claude_code()))]);
+        let app = router(ConnectionState {
+            documents: docs.clone(),
+            limits: Arc::new(limits),
+            ..ConnectionState::for_test(db.clone())
+        })
+        .layer(CookieManagerLayer::new());
+        let alice = signed_in(&db, "u1", "alice").await;
+        let bob = signed_in(&db, "u2", "bob").await;
+        let path = format!(
+            "/oauth/authorize?{}",
+            claude_code_query("http://localhost:3118/callback")
+        );
+        let (first, _, _) = get(app.clone(), &path, Some(&alice)).await;
+        let (second, headers, page) = get(app.clone(), &path, Some(&alice)).await;
+        assert_eq!(
+            (first, second),
+            (StatusCode::OK, StatusCode::TOO_MANY_REQUESTS)
+        );
+        let wait: u64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((59..=60).contains(&wait), "{wait}");
+        assert!(page.contains(&format!(
+            "Too many app sign-ins in a minute. Try again in {wait} seconds."
+        )));
+        assert_eq!(docs.calls(), 1);
+        let (other_user, _, _) = get(app, &path, Some(&bob)).await;
+        assert_eq!(other_user, StatusCode::OK);
     }
 
     #[tokio::test]

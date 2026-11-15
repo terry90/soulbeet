@@ -70,12 +70,15 @@ impl WindowLimiter {
 pub(crate) struct Limits {
     /// App registrations, one budget for the whole server.
     pub(crate) register: WindowLimiter,
+    /// Client metadata document fetches, per signed-in user id.
+    pub(crate) cimd_fetch: WindowLimiter,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
         Limits {
             register: WindowLimiter::new(30, Duration::from_secs(3600)),
+            cimd_fetch: WindowLimiter::new(10, Duration::from_secs(60)),
         }
     }
 }

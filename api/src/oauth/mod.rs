@@ -13,6 +13,7 @@ use crate::base_url::BaseUrl;
 use crate::connection::{ConnectionState, RequestBase};
 
 pub(crate) mod authorize;
+pub(crate) mod cimd;
 pub(crate) mod clients;
 pub(crate) mod codes;
 pub(crate) mod consent;

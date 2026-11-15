@@ -16,6 +16,7 @@ use serde_json::json;
 
 use crate::base_url::{explain_request, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
+use crate::oauth::cimd::{CimdFetcher, ClientDocuments, UnbuiltFetcher};
 use crate::oauth::limits::Limits;
 use crate::security::GateReason;
 
@@ -31,6 +32,8 @@ pub struct ConnectionState {
     pub(crate) limits: Arc<Limits>,
     /// The key session cookies are signed with.
     pub(crate) key: &'static crate::secret_key::SecretKey,
+    /// Where apps' client metadata documents are fetched from.
+    pub(crate) documents: Arc<dyn ClientDocuments>,
 }
 
 impl ConnectionState {
@@ -43,6 +46,13 @@ impl ConnectionState {
             db: (*crate::db::DB).clone(),
             limits: Arc::new(Limits::default()),
             key: crate::secret_key::current(),
+            documents: match CimdFetcher::new() {
+                Ok(fetcher) => Arc::new(fetcher),
+                Err(e) => {
+                    tracing::error!("Could not build the client metadata fetcher: {e}");
+                    Arc::new(UnbuiltFetcher(e))
+                }
+            },
         }
     }
 }

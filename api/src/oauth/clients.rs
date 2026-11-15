@@ -3,6 +3,7 @@
 use sqlx::SqlitePool;
 use url::Url;
 
+use super::cimd::ClientDocument;
 use crate::base_url::is_loopback_host;
 
 /// Most clients registered through `POST /oauth/register` (D4).
@@ -199,6 +200,32 @@ pub(crate) async fn insert_dcr_in(
     .await
     .map_err(database)?;
     tx.commit().await.map_err(database)
+}
+
+/// Stores a CIMD client as its document reads now: inserted at its first
+/// allowed authorization, its name and redirect URIs replaced at each later
+/// one.
+pub(crate) async fn upsert_cimd_in(
+    db: &SqlitePool,
+    doc: &ClientDocument,
+    now: i64,
+) -> Result<(), String> {
+    let redirect_uris =
+        serde_json::to_string(&doc.redirect_uris).expect("a list of strings serializes");
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, kind, client_name, redirect_uris, created_at) \
+         VALUES (?, 'cimd', ?, ?, ?) \
+         ON CONFLICT (client_id) DO UPDATE SET client_name = excluded.client_name, \
+         redirect_uris = excluded.redirect_uris",
+    )
+    .bind(&doc.client_id)
+    .bind(&doc.client_name)
+    .bind(redirect_uris)
+    .bind(now)
+    .execute(db)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
