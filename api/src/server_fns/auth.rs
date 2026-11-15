@@ -160,21 +160,23 @@ enum Credentials {
 
 /// Decides a sign-in. The limiter is checked before Navidrome is asked, every
 /// failed local verification is recorded, and a success clears the account.
+/// The clock is read when each decision is made, so a slow Navidrome call
+/// does not backdate a recorded failure.
 #[cfg(feature = "server")]
 async fn authenticate_in(
     db: &sqlx::SqlitePool,
     limiter: &LoginLimiter,
     username: &str,
     password: &str,
-    now: std::time::Instant,
+    clock: impl Fn() -> std::time::Instant,
     navidrome: impl std::future::Future<Output = NavidromeAuthResult>,
 ) -> Result<Credentials, ServerFnError> {
     use shared::system::NavidromeStatus;
 
-    limiter.check(username, now).map_err(rate_limited_error)?;
+    limiter.check(username, clock()).map_err(rate_limited_error)?;
 
     let rejected = || {
-        limiter.record_failure(username, now);
+        limiter.record_failure(username, clock());
         unauthorized_error("Invalid username or password")
     };
 
@@ -216,7 +218,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
         &LOGIN_LIMITER,
         &username,
         &password,
-        Instant::now(),
+        Instant::now,
         try_navidrome_auth(&username, &password),
     )
     .await?;
@@ -385,7 +387,7 @@ mod tests {
         now: Instant,
         result: NavidromeAuthResult,
     ) -> Result<Credentials, ServerFnError> {
-        authenticate_in(db, limiter, name, password, now, async { result }).await
+        authenticate_in(db, limiter, name, password, || now, async { result }).await
     }
 
     #[tokio::test]
@@ -449,7 +451,7 @@ mod tests {
             limiter.record_failure("ann", now);
         }
         let asked = std::cell::Cell::new(false);
-        let err = authenticate_in(&db, &limiter, "ann", "right", now, async {
+        let err = authenticate_in(&db, &limiter, "ann", "right", || now, async {
             asked.set(true);
             NavidromeAuthResult::NotConfigured
         })
@@ -512,5 +514,37 @@ mod tests {
         assert!(matches!(ok, Credentials::Navidrome));
         limiter.record_failure("ann", now);
         assert_eq!(limiter.check("ann", now), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_stamped_after_navidrome_answers() {
+        let db = test_db::migrated().await;
+        let limiter = LoginLimiter::new();
+        let start = Instant::now();
+        let later = start + std::time::Duration::from_secs(30);
+        for _ in 0..FREE_FAILURES {
+            limiter.record_failure("ghost", start);
+        }
+        let calls = std::cell::Cell::new(0);
+        let clock = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                start
+            } else {
+                later
+            }
+        };
+        let err = authenticate_in(&db, &limiter, "ghost", "pw", clock, async {
+            NavidromeAuthResult::AuthFailed
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(code(&err), 401);
+        // The failure sits at `later`, so the wait runs from there.
+        assert!(matches!(
+            limiter.check("ghost", later),
+            Err(LoginBlock::Account { .. })
+        ));
     }
 }
