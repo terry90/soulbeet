@@ -258,7 +258,9 @@ impl Guard<'_> {
     /// while the transaction is open, so the row is built before it begins. The unlink, the
     /// commit, its warning, the info line and the spawn of a queued forget run in one spawned
     /// task, which a dropped caller does not cancel. A removal that stops without saying whether
-    /// it unlinked is settled by lost_removal.
+    /// it unlinked is settled by lost_removal: when the file is gone the removal is done and goes
+    /// on to its forget and pruning; when it is still there it is Kept; when it cannot be looked
+    /// at it is Unconfirmed.
     pub async fn carry_out(
         &self,
         actor: &UserId,
@@ -266,7 +268,7 @@ impl Guard<'_> {
         reason: DeletionReason,
         origin: Origin,
         forget: ForgetVia<'_>,
-    ) -> Result<Vec<String>, Failure> {
+    ) -> Result<Vec<String>, NotRemoved> {
         let Checked {
             song,
             path,
@@ -278,14 +280,16 @@ impl Guard<'_> {
             .db
             .begin()
             .await
-            .map_err(|e| database_failure(Stage::Delete, e))?;
+            .map_err(|e| NotRemoved::Kept(database_failure(Stage::Delete, e)))?;
         DeletionReviewRow::insert_in(&mut tx, &record)
             .await
-            .map_err(|e| database_failure(Stage::Delete, e))?;
+            .map_err(|e| NotRemoved::Kept(database_failure(Stage::Delete, e)))?;
         let (queued, in_worker) = match forget {
             ForgetVia::Queue(queue) => (Some(queue), None),
             ForgetVia::Worker { importer, library } => (None, Some((importer, library))),
         };
+        // For a task that stops: the caller then queues the forget itself.
+        let requeue = queued.clone();
         let (db, target, root, kept) = (
             self.db.clone(),
             path.clone(),
@@ -297,21 +301,26 @@ impl Guard<'_> {
         // A refusal drops the transaction, which rolls the row back.
         let removal = tokio::spawn(async move {
             let unlinking = target.clone();
-            match tokio::task::spawn_blocking(move || unlink::unlink_if_same(&unlinking, id)).await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(UnlinkError::Changed)) => return Err(changed_since_check()),
-                Ok(Err(UnlinkError::Io(e))) => return Err(delete_failed(&target, &e)),
-                Err(e) => {
-                    drop(tx);
-                    return Err(lost_removal(&db, &kept, &target, id, &e.to_string()).await);
-                }
-            }
-            let unrecorded = tx.commit().await.err().map(|e| {
-                let warning = not_recorded(&target, &e.to_string());
-                warn!("{warning}");
-                warning
-            });
+            let unrecorded =
+                match tokio::task::spawn_blocking(move || unlink::unlink_if_same(&unlinking, id))
+                    .await
+                {
+                    Ok(Ok(())) => tx.commit().await.err().map(|e| {
+                        let warning = not_recorded(&target, &e.to_string());
+                        warn!("{warning}");
+                        warning
+                    }),
+                    Ok(Err(UnlinkError::Changed)) => {
+                        return Err(NotRemoved::Kept(changed_since_check()))
+                    }
+                    Ok(Err(UnlinkError::Io(e))) => {
+                        return Err(NotRemoved::Kept(delete_failed(&target, &e)))
+                    }
+                    Err(e) => {
+                        drop(tx);
+                        lost_removal(&db, &kept, &target, id, &e.to_string()).await?
+                    }
+                };
             info!(
                 "Deleted {} ({}, {})",
                 target.display(),
@@ -319,13 +328,7 @@ impl Guard<'_> {
                 origin.as_str()
             );
             if let Some(queue) = queued {
-                tokio::spawn(async move {
-                    let outcome = queue.forget(&root, &target).await;
-                    if let Some(note) = forget_note(&outcome, &target, &root) {
-                        warn!("{note}");
-                    }
-                    prune(&target, &root).await;
-                });
+                tokio::spawn(forget_queued(queue, target, root));
             }
             Ok(unrecorded)
         });
@@ -333,7 +336,12 @@ impl Guard<'_> {
         match removal.await {
             Ok(Ok(unrecorded)) => warnings.extend(unrecorded),
             Ok(Err(f)) => return Err(f),
-            Err(e) => return Err(lost_removal(self.db, &record, &path, id, &e.to_string()).await),
+            Err(e) => {
+                warnings.extend(lost_removal(self.db, &record, &path, id, &e.to_string()).await?);
+                if let Some(queue) = requeue {
+                    tokio::spawn(forget_queued(queue, path.clone(), folder.clone()));
+                }
+            }
         }
         if let Some((importer, library)) = in_worker {
             let outcome = importer.forget(library, &path).await;
@@ -428,36 +436,72 @@ fn not_recorded(path: &Path, error: &str) -> String {
     )
 }
 
+/// Why carry_out did not remove a file.
+#[derive(Debug)]
+pub enum NotRemoved {
+    /// The file stays where it was checked: refused, failed, or a stopped removal that left it.
+    Kept(Failure),
+    /// A removal that stopped before it reported, and its file could not be looked at: it may be
+    /// gone.
+    Unconfirmed(Failure),
+}
+
+impl NotRemoved {
+    pub fn into_failure(self) -> Failure {
+        match self {
+            NotRemoved::Kept(f) | NotRemoved::Unconfirmed(f) => f,
+        }
+    }
+}
+
 /// Settles a removal of the checked file `path` (identity `id`) that stopped (`error`) without
-/// saying whether its unlink ran, and makes the audit match the file: when the checked file is
-/// still there nothing was removed, no row stays, and the removal failed; when it is gone the
-/// row is recorded once (`record` keeps its id) and the failure says the file may have been
-/// deleted; when that cannot be read nothing is recorded and the failure says the same.
+/// saying whether its unlink ran, and makes the audit match the file (unlink::look): when the
+/// file is still there nothing was removed, no row stays, and it is Kept with delete_failed;
+/// when it is gone the removal is done and its row is recorded once (`record` keeps its id), and
+/// Ok holds the warning when that row could not be stored (logged here); when the path cannot
+/// be read nothing is recorded and it is Unconfirmed: the file may have been deleted.
 async fn lost_removal(
     db: &SqlitePool,
     record: &DeletionRecord,
     path: &Path,
     id: unlink::FileId,
     error: &str,
-) -> Failure {
-    match unlink::still_there(path, id) {
-        Ok(true) => return delete_failed(path, &std::io::Error::other(error)),
-        Ok(false) => {
-            let recorded = match db.acquire().await {
-                Ok(mut conn) => DeletionReviewRow::insert_in(&mut conn, record).await,
-                Err(e) => Err(e.to_string()),
-            };
-            if let Err(e) = recorded {
-                warn!("{}", not_recorded(path, &e));
-            }
-        }
-        Err(_) => {}
-    }
+) -> Result<Option<String>, NotRemoved> {
     warn!(
         "The removal of {} stopped before it reported: {error}",
         path.display()
     );
-    removal_unconfirmed(path, error)
+    match unlink::look(path, id) {
+        unlink::Look::There => Err(NotRemoved::Kept(delete_failed(
+            path,
+            &std::io::Error::other(error),
+        ))),
+        unlink::Look::Gone => {
+            let recorded = match db.acquire().await {
+                Ok(mut conn) => DeletionReviewRow::insert_in(&mut conn, record).await,
+                Err(e) => Err(e.to_string()),
+            };
+            Ok(recorded.err().map(|e| {
+                let warning = not_recorded(path, &e);
+                warn!("{warning}");
+                warning
+            }))
+        }
+        unlink::Look::Unreadable(e) => {
+            warn!("Could not look at {} after that: {e}", path.display());
+            Err(NotRemoved::Unconfirmed(removal_unconfirmed(path, error)))
+        }
+    }
+}
+
+/// Queues the forget of the removed `path` on the worker of `folder`'s library, logs a forget
+/// that did not remove one item, and prunes the empty parents up to `folder`.
+async fn forget_queued(queue: ImportQueue, path: PathBuf, folder: PathBuf) {
+    let outcome = queue.forget(&folder, &path).await;
+    if let Some(note) = forget_note(&outcome, &path, &folder) {
+        warn!("{note}");
+    }
+    prune(&path, &folder).await;
 }
 
 /// Removes the directories the removal of `path` left empty, up to (not including) `folder`.
@@ -1786,7 +1830,8 @@ mod tests {
                 },
             )
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .into_failure();
         assert_eq!(
             (f.code, f.message.as_str()),
             (
@@ -1829,7 +1874,8 @@ mod tests {
                 },
             )
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .into_failure();
         assert_eq!(f.code, FailureCode::DeleteChangedSincePreview);
         assert_eq!(std::fs::read(&path).unwrap(), b"other audio");
     }
@@ -1855,7 +1901,8 @@ mod tests {
                 },
             )
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .into_failure();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let os = std::io::Error::from_raw_os_error(13); // EACCES, "Permission denied (os error 13)"
         assert_eq!(
@@ -1885,21 +1932,28 @@ mod tests {
                 .await
                 .unwrap()
         };
-        let f = lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await;
-        assert_eq!(
-            (f.code, f.message),
-            (
-                FailureCode::DeleteFailed,
-                format!("Could not delete {}: task 7 panicked", path.display())
-            )
-        );
+        // Still there, rewritten in place since: it was kept, and nothing is recorded.
+        std::fs::write(&path, b"other audio").unwrap();
+        match lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await {
+            Err(NotRemoved::Kept(f)) => assert_eq!(
+                (f.code, f.message),
+                (
+                    FailureCode::DeleteFailed,
+                    format!("Could not delete {}: task 7 panicked", path.display())
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(rows().await, 0);
         assert!(path.exists());
-        std::fs::remove_file(&path).unwrap();
-        // The task and its caller may both settle it: the row is recorded once.
-        for _ in 0..2 {
-            let f = lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await;
-            assert_eq!(
+
+        // Its folder now a link: it cannot be looked at without following one.
+        let album = path.parent().unwrap().to_path_buf();
+        let moved = album.with_file_name("A.moved");
+        std::fs::rename(&album, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &album).unwrap();
+        match lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await {
+            Err(NotRemoved::Unconfirmed(f)) => assert_eq!(
                 (f.code, f.message),
                 (
                     FailureCode::DeleteFailed,
@@ -1908,7 +1962,20 @@ mod tests {
                         path.display()
                     )
                 )
-            );
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rows().await, 0);
+
+        // Gone: the removal is done. The task and its caller may both settle it: the row is
+        // recorded once.
+        std::fs::remove_file(&album).unwrap();
+        std::fs::remove_dir_all(&moved).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await,
+                Ok(None)
+            ));
         }
         assert_eq!(rows().await, 1);
     }

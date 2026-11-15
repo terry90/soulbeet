@@ -13,7 +13,7 @@ use crate::auth::UserId;
 #[cfg(feature = "server")]
 use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
 #[cfg(feature = "server")]
-use crate::core::delete_guard::{ForgetVia, Guard, Origin, Verdict};
+use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin, Verdict};
 #[cfg(feature = "server")]
 use crate::core::folders::folder_not_found;
 #[cfg(feature = "server")]
@@ -268,6 +268,7 @@ pub(crate) async fn auto_delete_songs(
                     .await
                     // Its only warning, an unrecorded deletion, is logged where it happens.
                     .map(|_| run.deleted += 1)
+                    .map_err(NotRemoved::into_failure)
             }
             Ok(Verdict::Library(_)) => {
                 skipped("no longer rated 1");

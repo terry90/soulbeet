@@ -73,26 +73,67 @@ pub(super) fn unlink_if_same(path: &Path, expected: FileId) -> Result<(), Unlink
     Ok(())
 }
 
-/// Whether the file that was checked is still at `path`, read as unlink_if_same reads it:
-/// false when the path leads nowhere, through a link, or to a file of another identity.
-pub(super) fn still_there(path: &Path, expected: FileId) -> Result<bool, UnlinkError> {
+/// What a look at the path of a file that was checked finds.
+#[derive(Debug)]
+pub(super) enum Look {
+    /// The checked file (its device and inode), whether it changed since or not.
+    There,
+    /// Nothing is at the path, or another file is.
+    Gone,
+    /// The path cannot be read without following a link (ELOOP, ENOTDIR), or reading it failed.
+    Unreadable(std::io::Error),
+}
+
+/// Looks at `path`, read as unlink_if_same reads it, for the file whose identity was `expected`.
+pub(super) fn look(path: &Path, expected: FileId) -> Look {
     match located(path) {
-        Ok((_, _, found)) => Ok(found == expected),
-        Err(UnlinkError::Changed) => Ok(false),
-        Err(e) => Err(e),
+        Ok((_, _, found)) if (found.dev, found.ino) == (expected.dev, expected.ino) => Look::There,
+        Ok(_) | Err(Located::Errno(Errno::NOENT)) => Look::Gone,
+        Err(e) => Look::Unreadable(e.into()),
+    }
+}
+
+/// Why located found nothing.
+enum Located {
+    Errno(Errno),
+    /// The path is not canonical.
+    NotCanonical(std::io::Error),
+}
+
+impl From<Errno> for Located {
+    fn from(e: Errno) -> Located {
+        Located::Errno(e)
+    }
+}
+
+impl From<Located> for std::io::Error {
+    fn from(e: Located) -> std::io::Error {
+        match e {
+            Located::Errno(e) => e.into(),
+            Located::NotCanonical(e) => e,
+        }
+    }
+}
+
+impl From<Located> for UnlinkError {
+    fn from(e: Located) -> UnlinkError {
+        match e {
+            Located::Errno(e) => e.into(),
+            Located::NotCanonical(e) => UnlinkError::Io(e),
+        }
     }
 }
 
 /// The directory of the canonical `path`, opened from "/" without following a link, the name
 /// of `path` in it, and the identity of what that name holds.
-fn located(path: &Path) -> Result<(OwnedFd, &OsStr, FileId), UnlinkError> {
+fn located(path: &Path) -> Result<(OwnedFd, &OsStr, FileId), Located> {
     let canonical = path.is_absolute()
         && path
             .components()
             .skip(1)
             .all(|c| matches!(c, Component::Normal(_)));
     let (true, Some(parent), Some(name)) = (canonical, path.parent(), path.file_name()) else {
-        return Err(UnlinkError::Io(std::io::Error::new(
+        return Err(Located::NotCanonical(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{} is not a canonical path to a file", path.display()),
         )));

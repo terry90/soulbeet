@@ -1,7 +1,7 @@
 //! The library's earlier copy of an import, replaced only through the delete guard (D2).
 
 use crate::auth::UserId;
-use crate::core::delete_guard::{ForgetVia, Guard, Origin};
+use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin};
 use crate::core::logged;
 use shared::navidrome::DeletionReason;
 use soulbeet::{
@@ -157,26 +157,18 @@ impl Run<'_> {
                     self.taken.insert(removal.existing[deleted].path.clone());
                     warnings.extend(done);
                 }
-                Err(f) => {
+                Err(stop) => {
+                    let (what, f) = match &stop {
+                        NotRemoved::Kept(f) => ("Kept", f),
+                        NotRemoved::Unconfirmed(f) => ("May have removed", f),
+                    };
                     warn!(
-                        "Kept the earlier copy {} of an import into {}: {}",
+                        "{what} the earlier copy {} of an import into {}: {}",
                         earlier[deleted].display(),
                         target.display(),
-                        logged(&f)
+                        logged(f)
                     );
-                    let mut notes = Vec::new();
-                    if deleted > 0 {
-                        notes.push(duplicate_note(
-                            &earlier[..deleted],
-                            target,
-                            DuplicateNote::Removed,
-                        ));
-                    }
-                    notes.push(duplicate_note(
-                        &earlier[deleted..],
-                        target,
-                        DuplicateNote::Blocked(&f.message),
-                    ));
+                    let mut notes = stopped_notes(&earlier, deleted, target, &stop);
                     notes.extend(warnings);
                     return notes;
                 }
@@ -198,6 +190,37 @@ impl Run<'_> {
         notes.extend(warnings);
         notes
     }
+}
+
+/// The notes of a removal whose deletions stopped at `earlier[deleted]`: the files deleted before
+/// it, removed; that file and the rest, kept with its reason when `stop` kept it; when its
+/// removal is unconfirmed, its own message, which says it may have been deleted, and the rest
+/// kept with that reason.
+fn stopped_notes(
+    earlier: &[PathBuf],
+    deleted: usize,
+    target: &Path,
+    stop: &NotRemoved,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if deleted > 0 {
+        notes.push(duplicate_note(
+            &earlier[..deleted],
+            target,
+            DuplicateNote::Removed,
+        ));
+    }
+    let (kept, reason) = match stop {
+        NotRemoved::Kept(f) => (&earlier[deleted..], &f.message),
+        NotRemoved::Unconfirmed(f) => {
+            notes.push(f.message.clone());
+            (&earlier[deleted + 1..], &f.message)
+        }
+    };
+    if !kept.is_empty() {
+        notes.push(duplicate_note(kept, target, DuplicateNote::Blocked(reason)));
+    }
+    notes
 }
 
 /// Gives each of `items` that is an item of `imported` the path `moved` gives its id, both
@@ -469,6 +492,59 @@ mod tests {
             ]
         );
         assert_eq!(item_paths(&done), vec![new_copy(7, 3).1]);
+    }
+
+    #[test]
+    fn a_removal_that_stopped_says_which_file_may_be_gone_without_calling_it_kept() {
+        let target = Path::new("/music/alice");
+        let earlier: Vec<PathBuf> = ["A/x.flac", "A/y.flac", "A/z.flac"]
+            .iter()
+            .map(|rel| target.join(rel))
+            .collect();
+        // As lost_removal words them for /music/alice/A/y.flac.
+        let failed = |message: &str| {
+            shared::failure::Failure::new(
+                shared::failure::FailureCode::DeleteFailed,
+                shared::failure::Stage::Delete,
+                shared::failure::RetryAdvice::SameSourceLater,
+                message,
+            )
+        };
+        let unconfirmed = "/music/alice/A/y.flac may have been deleted: the removal stopped before it reported (task 7 panicked)";
+        assert_eq!(
+            stopped_notes(
+                &earlier,
+                1,
+                target,
+                &NotRemoved::Unconfirmed(failed(unconfirmed))
+            ),
+            vec![
+                "removed the library's earlier copy A/x.flac".to_string(),
+                unconfirmed.to_string(),
+                format!("kept the library's earlier copy A/z.flac: {unconfirmed}"),
+            ]
+        );
+        assert_eq!(
+            stopped_notes(
+                &earlier[..2],
+                1,
+                target,
+                &NotRemoved::Unconfirmed(failed(unconfirmed))
+            ),
+            vec![
+                "removed the library's earlier copy A/x.flac".to_string(),
+                unconfirmed.to_string(),
+            ]
+        );
+        // A stopped removal that left its file keeps it, as a refusal does.
+        let kept = "Could not delete /music/alice/A/y.flac: task 7 panicked";
+        assert_eq!(
+            stopped_notes(&earlier, 1, target, &NotRemoved::Kept(failed(kept))),
+            vec![
+                "removed the library's earlier copy A/x.flac".to_string(),
+                format!("kept the library's earlier copy A/y.flac, A/z.flac: {kept}"),
+            ]
+        );
     }
 
     #[test]
