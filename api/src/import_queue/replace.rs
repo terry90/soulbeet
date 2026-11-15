@@ -8,13 +8,19 @@ use soulbeet::{
     duplicate_note, DuplicateNote, ImportOutcome, ImportResult, ImportedItem, MusicImporter,
     WantedRemoval,
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-/// Settles each removal beets wanted in `result`, an import into `target` (the canonical
-/// library folder beets ran on), and appends what became of each earlier copy to the outcome's
-/// warnings. Only an Imported outcome is settled: any other is returned unchanged, so a run the
-/// row reports as failed deletes nothing.
+/// Why a removal of a run is not made: an earlier removal of the same run deleted one of its
+/// files or moved a new file there, or one of its files is a file this run imported.
+const OVERLAPS: &str = "this import already replaced or added one of these files";
+
+/// Settles the removals beets wanted in `result`, an import into `target` (the canonical
+/// library folder beets ran on), as one run, and appends what became of each earlier copy to
+/// the outcome's warnings. The removals are taken out of `result`, which keeps none. Only an
+/// Imported outcome is settled: any other is returned with nothing removed, so a run the row
+/// reports as failed deletes nothing.
 pub(super) async fn settle_removals(
     guard: &Guard<'_>,
     importer: &dyn MusicImporter,
@@ -24,22 +30,34 @@ pub(super) async fn settle_removals(
     target: &Path,
     mut result: ImportResult,
 ) -> ImportResult {
+    let removals = std::mem::take(&mut result.removals);
     let ImportOutcome::Imported {
         warnings, items, ..
     } = &mut result.outcome
     else {
         return result;
     };
-    let replace = Replacement {
-        guard,
-        importer,
-        actor,
-        origin,
-        exempt_jobs,
-        target,
+    let mut run = Run {
+        replace: Replacement {
+            guard,
+            importer,
+            actor,
+            origin,
+            exempt_jobs,
+            target,
+        },
+        taken: items
+            .iter()
+            .map(|item| item.path.clone())
+            .chain(
+                removals
+                    .iter()
+                    .flat_map(|r| r.imported.iter().map(|(_, p)| p.clone())),
+            )
+            .collect(),
     };
-    for removal in &result.removals {
-        warnings.extend(replace.settle(removal, items).await);
+    for removal in &removals {
+        warnings.extend(run.settle(removal, items).await);
     }
     result
 }
@@ -53,26 +71,53 @@ struct Replacement<'a> {
     target: &'a Path,
 }
 
-impl Replacement<'_> {
+/// One run's removals, settled in turn.
+struct Run<'a> {
+    replace: Replacement<'a>,
+    /// Paths, relative to the target as beets names items, that a removal of this run must not
+    /// touch: every file the run imported, and each file an earlier removal deleted or moved a
+    /// new file to.
+    taken: HashSet<PathBuf>,
+}
+
+impl Run<'_> {
     /// The notes of one removal. One whose task imported nothing is skipped: its new items never
-    /// reached the library (D2). Every earlier item is checked before any is deleted; the new
-    /// items are moved into place only once all are deleted and forgotten cleanly, and `items`
-    /// then names them where they are.
-    async fn settle(&self, removal: &WantedRemoval, items: &mut [ImportedItem]) -> Vec<String> {
-        if removal.imported.is_empty() {
+    /// reached the library (D2). One that names no earlier item is skipped too: there is
+    /// nothing it may replace. One that names a path `taken` holds is refused (OVERLAPS). Every
+    /// earlier item is checked before any is deleted; the new items are moved into place only
+    /// once all are deleted and forgotten cleanly, and `items` then names them where they are.
+    async fn settle(&mut self, removal: &WantedRemoval, items: &mut [ImportedItem]) -> Vec<String> {
+        if removal.imported.is_empty() || removal.existing.is_empty() {
             return vec![];
         }
-        let target = self.target;
+        let replace = &self.replace;
+        let target = replace.target;
         let earlier: Vec<PathBuf> = removal
             .existing
             .iter()
             .map(|item| target.join(&item.path))
             .collect();
+        if removal
+            .existing
+            .iter()
+            .any(|item| self.taken.contains(&item.path))
+        {
+            warn!(
+                "Kept the earlier copy {} of an import into {}: {OVERLAPS}",
+                earlier[0].display(),
+                target.display()
+            );
+            return vec![duplicate_note(
+                &earlier,
+                target,
+                DuplicateNote::Blocked(OVERLAPS),
+            )];
+        }
         let mut checked = Vec::with_capacity(removal.existing.len());
         for (item, file) in removal.existing.iter().zip(&earlier) {
-            match self
+            match replace
                 .guard
-                .check_file(self.actor, item, target, self.exempt_jobs)
+                .check_file(replace.actor, item, target, replace.exempt_jobs)
                 .await
             {
                 Ok(c) => checked.push(c),
@@ -94,15 +139,24 @@ impl Replacement<'_> {
         let mut warnings = Vec::new();
         for (deleted, c) in checked.into_iter().enumerate() {
             let forget = ForgetVia::Worker {
-                importer: self.importer,
+                importer: replace.importer,
                 library: target,
             };
-            match self
+            let outcome = replace
                 .guard
-                .carry_out(self.actor, c, DeletionReason::Replaced, self.origin, forget)
-                .await
-            {
-                Ok(done) => warnings.extend(done),
+                .carry_out(
+                    replace.actor,
+                    c,
+                    DeletionReason::Replaced,
+                    replace.origin,
+                    forget,
+                )
+                .await;
+            match outcome {
+                Ok(done) => {
+                    self.taken.insert(removal.existing[deleted].path.clone());
+                    warnings.extend(done);
+                }
                 Err(f) => {
                     warn!(
                         "Kept the earlier copy {} of an import into {}: {}",
@@ -133,8 +187,11 @@ impl Replacement<'_> {
         // items stay where beets put them.
         if warnings.is_empty() {
             let ids: Vec<u64> = removal.imported.iter().map(|(id, _)| *id).collect();
-            match self.importer.relocate(target, &ids).await {
-                Ok(moved) => renamed(items, &removal.imported, &moved, target),
+            match replace.importer.relocate(target, &ids).await {
+                Ok(moved) => {
+                    self.taken.extend(moved.iter().map(|(_, now)| now.clone()));
+                    renamed(items, &removal.imported, &moved);
+                }
                 Err(e) => notes.push(format!("Could not move the new copy into place: {e}")),
             }
         }
@@ -143,20 +200,16 @@ impl Replacement<'_> {
     }
 }
 
-/// Gives each of `items` that is an item of `imported` the path `moved` gives its id, relative
-/// to `target` as beets reports items. Each item is matched by the path it had before the move.
-fn renamed(
-    items: &mut [ImportedItem],
-    imported: &[(u64, PathBuf)],
-    moved: &[(u64, PathBuf)],
-    target: &Path,
-) {
+/// Gives each of `items` that is an item of `imported` the path `moved` gives its id, both
+/// relative to the target as beets reports items. Each item is matched by the path it had
+/// before the move.
+fn renamed(items: &mut [ImportedItem], imported: &[(u64, PathBuf)], moved: &[(u64, PathBuf)]) {
     for item in items.iter_mut() {
         let Some((id, _)) = imported.iter().find(|(_, was)| *was == item.path) else {
             continue;
         };
         if let Some((_, now)) = moved.iter().find(|(moved_id, _)| moved_id == id) {
-            item.path = now.strip_prefix(target).unwrap_or(now).to_path_buf();
+            item.path = now.clone();
         }
     }
 }
@@ -254,10 +307,7 @@ mod tests {
         let lib = Library::new().await;
         let stub = StubImporter::new();
         let target = lib.root.join("music/alice");
-        stub.script_relocate(Ok(vec![(
-            7,
-            target.join("Marrow Choir/Winter Songs/03.flac"),
-        )]));
+        stub.script_relocate(Ok(vec![(7, "Marrow Choir/Winter Songs/03.flac".into())]));
         let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
         let done = settle(&lib, &stub, &[], &target, result).await;
         assert_eq!(
@@ -316,7 +366,13 @@ mod tests {
             ..ImportResult::failed(FailKind::Beets, "beets exited with code 1".into())
         };
         let done = settle(&lib, &stub, &[], &target, failed.clone()).await;
-        assert_eq!(done, failed);
+        assert_eq!(
+            done,
+            ImportResult {
+                removals: vec![],
+                ..failed
+            }
+        );
         assert!(target.join("A/x.flac").exists());
         assert_eq!(lib.fake.ratings_set(), vec![]);
         assert!(stub.forgets().is_empty() && stub.relocations().is_empty());
@@ -417,7 +473,6 @@ mod tests {
 
     #[test]
     fn each_new_item_takes_the_path_its_own_id_was_moved_to() {
-        let target = Path::new("/music/alice");
         let mut items = vec![
             ImportedItem {
                 path: new_copy(7, 3).1,
@@ -430,15 +485,10 @@ mod tests {
         ];
         // Item 7 moves to the path item 8 had, which moves on.
         let moved = vec![
-            (7, target.join(new_copy(8, 4).1)),
-            (8, target.join("Marrow Choir/Winter Songs/04.flac")),
+            (7, new_copy(8, 4).1),
+            (8, "Marrow Choir/Winter Songs/04.flac".into()),
         ];
-        renamed(
-            &mut items,
-            &[new_copy(7, 3), new_copy(8, 4)],
-            &moved,
-            target,
-        );
+        renamed(&mut items, &[new_copy(7, 3), new_copy(8, 4)], &moved);
         assert_eq!(
             items.iter().map(|i| i.path.clone()).collect::<Vec<_>>(),
             vec![
@@ -446,6 +496,71 @@ mod tests {
                 PathBuf::from("Marrow Choir/Winter Songs/04.flac")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_removal_that_names_no_earlier_item_is_skipped() {
+        let lib = Library::new().await;
+        let stub = StubImporter::new();
+        let target = lib.root.join("music/alice");
+        let none = WantedRemoval {
+            existing: vec![],
+            imported: vec![new_copy(7, 3)],
+        };
+        let done = settle(&lib, &stub, &[], &target, imported_with(vec![none])).await;
+        assert!(notes(&done).is_empty());
+        assert!(stub.relocations().is_empty() && stub.forgets().is_empty());
+        assert_eq!(item_paths(&done), vec![new_copy(7, 3).1]);
+        assert_eq!(lib.fake.ratings_set(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_later_removal_of_the_run_never_touches_what_an_earlier_one_replaced_or_added() {
+        // Two beets tasks of one album download (the main tracks and a Bonus folder with the
+        // same tags) both want the same earlier item removed; removal 1 moves its new copy to
+        // the earlier item's path.
+        let lib = Library::new().await;
+        let stub = StubImporter::new();
+        let target = lib.root.join("music/alice");
+        stub.script_relocate(Ok(vec![(7, "A/x.flac".into())]));
+        let result = imported_with(vec![
+            removal("A/x.flac", vec![new_copy(7, 3)]),
+            removal("A/x.flac", vec![new_copy(8, 4)]),
+        ]);
+        let done = settle(&lib, &stub, &[], &target, result).await;
+        assert_eq!(
+            notes(&done),
+            vec![
+                "replaced the library's earlier copy A/x.flac".to_string(),
+                format!("kept the library's earlier copy A/x.flac: {OVERLAPS}"),
+            ]
+        );
+        assert_eq!(stub.relocations(), vec![(target.clone(), vec![7])]);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deletion_reviews")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap(),
+            1
+        );
+        // A removal naming a file the run itself imported is refused before any check.
+        let lib = Library::new().await;
+        let stub = StubImporter::new();
+        let target = lib.root.join("music/alice");
+        let mut own = removal("A/x.flac", vec![new_copy(8, 4)]);
+        own.existing
+            .push(earlier(new_copy(7, 3).1.to_str().unwrap(), "O Holy Night"));
+        let result = imported_with(vec![removal("B/z.flac", vec![new_copy(7, 3)]), own]);
+        let done = settle(&lib, &stub, &[], &target, result).await;
+        assert_eq!(
+            notes(&done)[1],
+            format!(
+                "kept the library's earlier copy A/x.flac, {}: {OVERLAPS}",
+                new_copy(7, 3).1.display()
+            )
+        );
+        assert!(target.join("A/x.flac").exists());
+        assert_eq!(lib.fake.ratings_set(), vec![]);
     }
 
     #[tokio::test]
@@ -461,6 +576,13 @@ mod tests {
         let stub = StubImporter::new();
         let target = lib.root.join("music/alice");
         let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
+        // Without the exemption the same job keeps the earlier copy.
+        let kept = settle(&lib, &stub, &[], &target, result.clone()).await;
+        assert_eq!(
+            notes(&kept),
+            vec!["kept the library's earlier copy A/x.flac: A download or import that is not finished wants this track".to_string()]
+        );
+        assert!(target.join("A/x.flac").exists());
         let done = settle(&lib, &stub, &["j1".to_string()], &target, result).await;
         assert_eq!(
             notes(&done),
