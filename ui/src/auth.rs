@@ -53,6 +53,17 @@ impl Auth {
         self.state.read().as_ref().map(|a| a.username.clone())
     }
 
+    pub fn is_admin(&self) -> bool {
+        self.state
+            .read()
+            .as_ref()
+            .is_some_and(|a| a.role.is_admin())
+    }
+
+    pub fn rename_allowed(&self) -> bool {
+        self.state.read().as_ref().is_some_and(|a| a.rename_allowed)
+    }
+
     pub fn is_logged_in(&self) -> bool {
         self.state.read().is_some()
     }

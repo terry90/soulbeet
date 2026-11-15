@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
-use ui::settings::{AppConfigManager, FolderManager, PreferencesManager, UserManager};
+use ui::settings::{
+    AccountPanel, AppConfigManager, FolderManager, PreferencesManager, UserManager,
+};
 
 #[derive(PartialEq, Clone, Copy, Default)]
 pub(crate) enum SettingsTab {
@@ -18,6 +20,7 @@ pub(crate) struct SettingsTabRequest(pub Signal<Option<SettingsTab>>);
 #[component]
 pub fn SettingsPage() -> Element {
     let mut active_tab = use_signal(SettingsTab::default);
+    let auth = crate::auth::use_auth();
     let SettingsTabRequest(mut requested_tab) = use_context();
 
     use_effect(move || {
@@ -71,7 +74,14 @@ pub fn SettingsPage() -> Element {
                 match active_tab() {
                     SettingsTab::Search => rsx! { PreferencesManager {} },
                     SettingsTab::Library => rsx! { FolderManager {} },
-                    SettingsTab::Users => rsx! { UserManager {} },
+                    SettingsTab::Users => rsx! {
+                        div { class: "space-y-8",
+                            AccountPanel {}
+                            if auth.is_admin() {
+                                UserManager {}
+                            }
+                        }
+                    },
                     SettingsTab::Config => rsx! { AppConfigManager {} },
                 }
             }

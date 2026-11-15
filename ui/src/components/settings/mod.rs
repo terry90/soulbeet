@@ -7,4 +7,4 @@ mod user_manager;
 pub use app_config::AppConfigManager;
 pub use folder_manager::FolderManager;
 pub use preferences::PreferencesManager;
-pub use user_manager::UserManager;
+pub use user_manager::{AccountPanel, UserManager};

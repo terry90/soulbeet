@@ -24,7 +24,7 @@ pub fn friendly_error(error: &ServerFnError) -> String {
             }
         }
         ServerFnError::ServerError {
-            code: api::REFUSAL_CODE,
+            code: api::REFUSAL_CODE | api::FORBIDDEN_CODE,
             message,
             ..
         } => message.clone(),
@@ -82,6 +82,14 @@ mod tests {
         assert_eq!(friendly_error(&e), "Folder not found");
         assert!(is_refusal(&e));
         assert!(!is_refusal(&server_error(500, "Nothing to retry")));
+    }
+
+    #[test]
+    fn forbidden_shows_its_message() {
+        assert_eq!(
+            friendly_error(&server_error(403, "Only an admin can do this")),
+            "Only an admin can do this"
+        );
     }
 
     #[test]
