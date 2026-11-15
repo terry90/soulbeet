@@ -254,29 +254,107 @@ pub async fn music_importer(id: Option<&str>) -> Result<Arc<dyn MusicImporter>, 
     Ok(importer)
 }
 
+/// Why no Navidrome client could be made for a user.
 #[cfg(feature = "server")]
-pub async fn navidrome_client_for_user(user_id: &str) -> Result<Arc<NavidromeClient>, String> {
+#[derive(Debug)]
+pub enum NavidromeLookupError {
+    /// Soulful's database could not be read.
+    Database(String),
+    /// The user row is gone.
+    UserNotFound,
+    /// No Navidrome password is stored for this user.
+    NotLinked,
+    /// The stored password cannot be decrypted (SECRET_KEY changed).
+    PasswordUnreadable,
+    /// NAVIDROME_URL is not set.
+    NoServer,
+    Client(soulbeet::NavidromeError),
+}
+
+#[cfg(feature = "server")]
+impl std::fmt::Display for NavidromeLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NavidromeLookupError::Database(e) => f.write_str(e),
+            NavidromeLookupError::UserNotFound => f.write_str("User not found"),
+            NavidromeLookupError::NotLinked => f.write_str("Navidrome not configured for user"),
+            NavidromeLookupError::PasswordUnreadable => f.write_str(STORED_PASSWORD_UNREADABLE),
+            NavidromeLookupError::NoServer => {
+                f.write_str("NAVIDROME_URL environment variable not set")
+            }
+            NavidromeLookupError::Client(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl From<NavidromeLookupError> for String {
+    fn from(e: NavidromeLookupError) -> String {
+        e.to_string()
+    }
+}
+
+#[cfg(feature = "server")]
+impl NavidromeLookupError {
+    /// This lookup error as the failure of `stage`, shown as `message`.
+    pub fn failure(&self, stage: Stage, message: impl Into<String>) -> Failure {
+        let not_linked = |message: String, action| {
+            Failure::new(
+                FailureCode::NavidromeNotLinked,
+                stage,
+                RetryAdvice::NeedsUser,
+                message,
+            )
+            .with_user_action(action)
+        };
+        let message = message.into();
+        match self {
+            NavidromeLookupError::Database(e) => Failure::new(
+                FailureCode::SettingsUnreadable,
+                stage,
+                RetryAdvice::SameSourceLater,
+                message,
+            )
+            .with_cause(Service::Database, None, e.clone()),
+            NavidromeLookupError::UserNotFound
+            | NavidromeLookupError::NotLinked
+            | NavidromeLookupError::PasswordUnreadable => {
+                not_linked(message, soulbeet::navidrome::relink_navidrome())
+            }
+            NavidromeLookupError::NoServer => {
+                not_linked(message, soulbeet::navidrome::configure_navidrome())
+            }
+            NavidromeLookupError::Client(e) => e.failure(stage, message),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+pub async fn navidrome_client_for_user(
+    user_id: &str,
+) -> Result<Arc<NavidromeClient>, NavidromeLookupError> {
     // Check cache first
     if let Some(client) = NAVIDROME_CLIENTS.read().await.get(user_id) {
         return Ok(client.clone());
     }
 
     let user = crate::models::user::User::find_by_id(user_id)
-        .await?
-        .ok_or("User not found")?;
+        .await
+        .map_err(NavidromeLookupError::Database)?
+        .ok_or(NavidromeLookupError::UserNotFound)?;
 
     let password = stored_password_in(&crate::db::DB, crate::secret_key::current(), &user).await?;
 
     let url = crate::config::CONFIG
         .navidrome_url()
-        .ok_or("NAVIDROME_URL environment variable not set")?;
+        .ok_or(NavidromeLookupError::NoServer)?;
 
     let client = NavidromeClientBuilder::new()
         .base_url(url)
         .username(&user.username)
         .password(&password)
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(NavidromeLookupError::Client)?;
 
     let client = Arc::new(client);
     NAVIDROME_CLIENTS
@@ -297,11 +375,11 @@ pub(crate) async fn stored_password_in(
     db: &sqlx::SqlitePool,
     key: &crate::secret_key::SecretKey,
     user: &crate::models::user::User,
-) -> Result<String, String> {
+) -> Result<String, NavidromeLookupError> {
     let encrypted = user
         .navidrome_token
         .as_deref()
-        .ok_or("Navidrome not configured for user")?;
+        .ok_or(NavidromeLookupError::NotLinked)?;
     if let Ok(password) = crate::crypto::decrypt(key, encrypted) {
         return Ok(password);
     }
@@ -314,7 +392,7 @@ pub(crate) async fn stored_password_in(
             tracing::warn!("Could not mark user {} for a new sign-in: {e}", user.id);
         }
     }
-    Err(STORED_PASSWORD_UNREADABLE.to_string())
+    Err(NavidromeLookupError::PasswordUnreadable)
 }
 
 /// Keeps the undecryptable token and asks the user to sign in again.
@@ -438,10 +516,10 @@ mod tests {
             stored_password_in(&db, &old, &user().await).await.unwrap(),
             "navidrome-pw"
         );
-        assert_eq!(
+        assert!(matches!(
             stored_password_in(&db, &generated, &user().await).await,
-            Err(STORED_PASSWORD_UNREADABLE.to_string())
-        );
+            Err(NavidromeLookupError::PasswordUnreadable)
+        ));
         assert_eq!(user().await.navidrome_status, "invalid_credentials");
 
         // Already marked: the banner the user dismissed since stays dismissed.
@@ -461,6 +539,78 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dismissed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_user_without_a_stored_token_is_not_linked() {
+        use crate::models::user::User;
+
+        let db = test_db::migrated().await;
+        sqlx::query("UPDATE users SET navidrome_token = NULL WHERE id = ?")
+            .bind(SEEDED_ADMIN_ID)
+            .execute(&db)
+            .await
+            .unwrap();
+        let user = User::find_by_id_in(&db, SEEDED_ADMIN_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = crate::secret_key::SecretKey::new("secret".into());
+
+        assert!(matches!(
+            stored_password_in(&db, &key, &user).await,
+            Err(NavidromeLookupError::NotLinked)
+        ));
+    }
+
+    #[test]
+    fn a_navidrome_lookup_error_names_what_to_fix() {
+        use shared::failure::UserActionCode;
+
+        let cases = [
+            (
+                NavidromeLookupError::Database("database is locked".into()),
+                "database is locked",
+                FailureCode::SettingsUnreadable,
+                None,
+            ),
+            (
+                NavidromeLookupError::UserNotFound,
+                "User not found",
+                FailureCode::NavidromeNotLinked,
+                Some(UserActionCode::RelinkNavidrome),
+            ),
+            (
+                NavidromeLookupError::NotLinked,
+                "Navidrome not configured for user",
+                FailureCode::NavidromeNotLinked,
+                Some(UserActionCode::RelinkNavidrome),
+            ),
+            (
+                NavidromeLookupError::PasswordUnreadable,
+                STORED_PASSWORD_UNREADABLE,
+                FailureCode::NavidromeNotLinked,
+                Some(UserActionCode::RelinkNavidrome),
+            ),
+            (
+                NavidromeLookupError::NoServer,
+                "NAVIDROME_URL environment variable not set",
+                FailureCode::NavidromeNotLinked,
+                Some(UserActionCode::ConfigureNavidrome),
+            ),
+            (
+                NavidromeLookupError::Client(soulbeet::NavidromeError::CircuitOpen),
+                "Navidrome appears unavailable (circuit breaker open)",
+                FailureCode::NavidromeCircuitOpen,
+                None,
+            ),
+        ];
+        for (e, text, code, action) in cases {
+            assert_eq!(e.to_string(), text);
+            let f = e.failure(Stage::LibraryCheck, "m");
+            assert_eq!(f.code, code, "{e:?}");
+            assert_eq!(f.user_action.map(|a| a.code), action, "{e:?}");
+        }
     }
 
     /// Each lookup error fails at the caller's stage: an unreadable settings

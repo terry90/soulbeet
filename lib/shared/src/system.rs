@@ -1,3 +1,4 @@
+use crate::failure::Failure;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -71,6 +72,9 @@ pub struct SystemHealth {
     #[serde(default)]
     pub importer: ImporterHealth,
     pub navidrome_online: bool,
+    /// Why Navidrome is offline, when it is.
+    #[serde(default)]
+    pub navidrome_failure: Option<Failure>,
 }
 
 /// How well the importer can do its job; later variants are worse.
@@ -160,5 +164,6 @@ mod tests {
         let v = serde_json::json!({"downloader_online":true,"navidrome_online":false});
         let h: SystemHealth = serde_json::from_value(v).unwrap();
         assert_eq!(h.importer.level, HealthLevel::Checking);
+        assert_eq!(h.navidrome_failure, None);
     }
 }

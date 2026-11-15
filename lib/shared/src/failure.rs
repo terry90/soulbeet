@@ -184,6 +184,7 @@ pub enum UserActionCode {
     FixDownloadPath,
     FreeDiskSpace,
     RelinkNavidrome,
+    ConfigureNavidrome,
     EnableDeletion,
     EnableIndexing,
     AddFolder,
@@ -231,6 +232,8 @@ failure_codes! {
     NavidromeAuthFailed => "navidrome_auth_failed",
     NavidromeNotLinked => "navidrome_not_linked",
     NavidromeCircuitOpen => "navidrome_circuit_open",
+    /// Navidrome answered with a Subsonic error other than a refused login.
+    NavidromeRefused => "navidrome_refused",
     BackendNotConfigured => "backend_not_configured",
     BackendUnreachable => "backend_unreachable",
     /// Soulful could not read its own settings database to find the backend.
@@ -314,7 +317,7 @@ mod tests {
     /// `search_already_running`, `search_lost` and `import_disk_full`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 76] = [
+    const NAMES: [&str; 77] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -330,6 +333,7 @@ mod tests {
         "navidrome_auth_failed",
         "navidrome_not_linked",
         "navidrome_circuit_open",
+        "navidrome_refused",
         "backend_not_configured",
         "backend_unreachable",
         "settings_unreadable",

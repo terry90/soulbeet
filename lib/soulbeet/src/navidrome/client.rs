@@ -309,6 +309,9 @@ impl NavidromeClient {
             .await
             .map_err(transport)?;
 
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(NavidromeError::NativeLoginRefused);
+        }
         if !resp.status().is_success() {
             return Err(NavidromeError::Http {
                 action: "Navidrome native login",

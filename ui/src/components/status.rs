@@ -12,14 +12,27 @@ pub fn importer_chip(level: HealthLevel) -> (&'static str, &'static str) {
     (dot, level.chip())
 }
 
+/// The Navidrome chip's hint: why Navidrome is offline when the health check
+/// says so, else what the user's link status says.
+pub fn navidrome_hint(health: &SystemHealth, status: NavidromeStatus) -> Option<String> {
+    if !health.navidrome_online {
+        if let Some(failure) = &health.navidrome_failure {
+            return Some(failure.message.clone());
+        }
+    }
+    match status {
+        NavidromeStatus::Connected | NavidromeStatus::MissingReportRealPath => None,
+        NavidromeStatus::InvalidCredentials => {
+            Some("Your username was not found in Navidrome".to_string())
+        }
+        NavidromeStatus::Unknown => Some("Navidrome credentials not configured".to_string()),
+        NavidromeStatus::Offline => None,
+    }
+}
+
 #[component]
 pub fn SystemStatus(health: SystemHealth, navidrome_status: NavidromeStatus) -> Element {
-    let nav_hint = match navidrome_status {
-        NavidromeStatus::Connected | NavidromeStatus::MissingReportRealPath => None,
-        NavidromeStatus::InvalidCredentials => Some("Your username was not found in Navidrome"),
-        NavidromeStatus::Unknown => Some("Navidrome credentials not configured"),
-        NavidromeStatus::Offline => None,
-    };
+    let nav_hint = navidrome_hint(&health, navidrome_status);
 
     let (beets_dot, beets_chip) = importer_chip(health.importer.level);
     let beets_hint = health
@@ -92,6 +105,38 @@ mod tests {
         assert_eq!(
             importer_chip(HealthLevel::Checking),
             ("bg-gray-500 animate-pulse", "CHECKING")
+        );
+    }
+
+    #[test]
+    fn the_navidrome_hint_says_why_it_is_offline() {
+        use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+
+        let message = "Navidrome appears unavailable (circuit breaker open)";
+        let offline = SystemHealth {
+            navidrome_failure: Some(Failure::new(
+                FailureCode::NavidromeCircuitOpen,
+                Stage::LibraryCheck,
+                RetryAdvice::SameSourceLater,
+                message,
+            )),
+            ..SystemHealth::default()
+        };
+        assert_eq!(
+            navidrome_hint(&offline, NavidromeStatus::Connected).as_deref(),
+            Some(message)
+        );
+
+        let online = SystemHealth {
+            navidrome_online: true,
+            ..offline.clone()
+        };
+        assert_eq!(navidrome_hint(&online, NavidromeStatus::Connected), None);
+
+        let unexplained = SystemHealth::default();
+        assert_eq!(
+            navidrome_hint(&unexplained, NavidromeStatus::Unknown).as_deref(),
+            Some("Navidrome credentials not configured")
         );
     }
 }

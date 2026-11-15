@@ -15,6 +15,8 @@ use crate::services::{
 use crate::{AdminSession, AuthSession};
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::debug;
+#[cfg(feature = "server")]
+use shared::failure::Stage;
 
 #[get("/api/system/health", auth: AuthSession)]
 pub async fn get_system_health() -> Result<SystemHealth, ServerFnError> {
@@ -27,26 +29,28 @@ pub async fn get_system_health() -> Result<SystemHealth, ServerFnError> {
 
         let importer = crate::importer_health::snapshot().await;
 
-        let navidrome_online = match navidrome_client_for_user(&auth.0.user_id).await {
+        let navidrome_failure = match navidrome_client_for_user(&auth.0.user_id).await {
             Ok(client) => match client.ping().await {
-                Ok(()) => true,
-                Err(soulbeet::NavidromeError::CircuitOpen) => {
-                    debug!(
-                        "Evicted stale Navidrome client for user {} after circuit-breaker-open ping",
-                        auth.0.user_id
-                    );
-                    evict_navidrome_client(&auth.0.user_id).await;
-                    false
+                Ok(()) => None,
+                Err(e) => {
+                    if matches!(e, soulbeet::NavidromeError::CircuitOpen) {
+                        debug!(
+                            "Evicted stale Navidrome client for user {} after circuit-breaker-open ping",
+                            auth.0.user_id
+                        );
+                        evict_navidrome_client(&auth.0.user_id).await;
+                    }
+                    Some(e.failure(Stage::LibraryCheck, e.to_string()))
                 }
-                Err(_) => false,
             },
-            Err(_) => false,
+            Err(e) => Some(e.failure(Stage::LibraryCheck, e.to_string())),
         };
 
         Ok(SystemHealth {
             downloader_online,
             importer,
-            navidrome_online,
+            navidrome_online: navidrome_failure.is_none(),
+            navidrome_failure,
         })
     }
     #[cfg(not(feature = "server"))]
