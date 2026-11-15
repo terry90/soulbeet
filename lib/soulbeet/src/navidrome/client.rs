@@ -109,13 +109,7 @@ impl NavidromeClient {
         endpoint: &str,
         extra_params: &[(&str, &str)],
     ) -> Result<T> {
-        if self.circuit_breaker.is_open().await {
-            warn!("Circuit breaker open, rejecting request to {}", endpoint);
-            return Err(NavidromeError::CircuitOpen);
-        }
-
         let mut url = self.base_url.join(&format!("rest/{}", endpoint))?;
-
         {
             let mut query = url.query_pairs_mut();
             for (k, v) in self.auth_params() {
@@ -125,12 +119,39 @@ impl NavidromeClient {
                 query.append_pair(k, v);
             }
         }
+        self.subsonic(endpoint, self.client.get(url)).await
+    }
 
-        debug!("Navidrome GET {}", endpoint);
+    /// A Subsonic write as a form body. Navidrome copies the form into the
+    /// query before every handler (server/subsonic/middlewares.go
+    /// `fromFormToQuery`, applied to all routes at server/subsonic/api.go).
+    async fn post_form<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        extra_params: &[(&str, &str)],
+    ) -> Result<T> {
+        let url = self.base_url.join(&format!("rest/{}", endpoint))?;
+        let mut form = self.auth_params();
+        form.extend(extra_params.iter().map(|(k, v)| (*k, v.to_string())));
+        self.subsonic(endpoint, self.client.post(url).form(&form))
+            .await
+    }
 
-        // The URL's query carries the Subsonic token and salt, a working
+    async fn subsonic<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T> {
+        if self.circuit_breaker.is_open().await {
+            warn!("Circuit breaker open, rejecting request to {}", endpoint);
+            return Err(NavidromeError::CircuitOpen);
+        }
+
+        debug!("Navidrome request {}", endpoint);
+
+        // The request carries the Subsonic token and salt, a working
         // credential, so no error built here may include it.
-        let response = match self.client.get(url).send().await {
+        let response = match request.send().await {
             Ok(resp) => resp,
             Err(e) => {
                 self.circuit_breaker.record_failure().await;
@@ -170,22 +191,13 @@ impl NavidromeClient {
     }
 
     pub async fn start_scan(&self) -> Result<()> {
-        let _: PingBody = self.get("startScan", &[]).await?;
+        let _: PingBody = self.post_form("startScan", &[]).await?;
         Ok(())
     }
 
-    pub async fn get_scan_status(&self) -> Result<bool> {
-        #[derive(serde::Deserialize)]
-        struct ScanStatusBody {
-            #[serde(rename = "scanStatus")]
-            scan_status: Option<ScanStatus>,
-        }
-        #[derive(serde::Deserialize)]
-        struct ScanStatus {
-            scanning: bool,
-        }
+    pub async fn get_scan_status(&self) -> Result<ScanStatus> {
         let body: ScanStatusBody = self.get("getScanStatus", &[]).await?;
-        Ok(body.scan_status.map(|s| s.scanning).unwrap_or(false))
+        Ok(body.scan_status)
     }
 
     pub async fn get_all_albums(&self) -> Result<Vec<SubsonicAlbum>> {
@@ -222,81 +234,8 @@ impl NavidromeClient {
         Ok(all_albums)
     }
 
-    pub async fn get_album(&self, id: &str) -> Result<SubsonicAlbumDetail> {
-        let body: AlbumBody = self.get("getAlbum", &[("id", id)]).await?;
-        body.album
-            .ok_or_else(|| NavidromeError::Missing(format!("Album {} not found", id)))
-    }
-
     pub async fn get_all_songs_with_ratings(&self) -> Result<Vec<SubsonicSong>> {
         self.search_all_songs().await
-    }
-
-    pub async fn set_rating(&self, id: &str, rating: u8) -> Result<()> {
-        let rating_str = rating.to_string();
-        let _: PingBody = self
-            .get("setRating", &[("id", id), ("rating", &rating_str)])
-            .await?;
-        Ok(())
-    }
-
-    pub async fn get_playlists(&self) -> Result<Vec<SubsonicPlaylist>> {
-        let body: PlaylistsBody = self.get("getPlaylists", &[]).await?;
-        Ok(body.playlists.map(|p| p.playlist).unwrap_or_default())
-    }
-
-    pub async fn create_playlist(
-        &self,
-        name: &str,
-        song_ids: &[String],
-    ) -> Result<SubsonicPlaylistDetail> {
-        let mut params: Vec<(&str, &str)> = vec![("name", name)];
-        for id in song_ids {
-            params.push(("songId", id));
-        }
-        let body: PlaylistBody = self.get("createPlaylist", &params).await?;
-        body.playlist.ok_or_else(|| {
-            NavidromeError::Missing("No playlist returned after creation".to_string())
-        })
-    }
-
-    pub async fn delete_playlist(&self, id: &str) -> Result<()> {
-        let _: PingBody = self.get("deletePlaylist", &[("id", id)]).await?;
-        Ok(())
-    }
-
-    pub async fn update_playlist_songs(
-        &self,
-        playlist_id: &str,
-        song_ids_to_add: &[String],
-    ) -> Result<()> {
-        let mut params: Vec<(&str, &str)> = vec![("playlistId", playlist_id)];
-        for id in song_ids_to_add {
-            params.push(("songIdToAdd", id));
-        }
-        let _: PingBody = self.get("updatePlaylist", &params).await?;
-        Ok(())
-    }
-
-    pub async fn get_starred(&self) -> Result<StarredContent> {
-        let body: StarredBody = self.get("getStarred2", &[]).await?;
-        Ok(body.starred.unwrap_or(StarredContent {
-            song: vec![],
-            album: vec![],
-        }))
-    }
-
-    pub async fn search(&self, query: &str) -> Result<SearchResult3> {
-        let body: SearchResult3Body = self
-            .get(
-                "search3",
-                &[("query", query), ("songCount", "50"), ("albumCount", "20")],
-            )
-            .await?;
-        Ok(body.search_result.unwrap_or(SearchResult3 {
-            song: vec![],
-            album: vec![],
-        }))
     }
 
     /// Fetch all songs from Navidrome using paginated search3 requests.
@@ -535,7 +474,7 @@ fn parse(e: reqwest::Error) -> NavidromeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use crate::test_http::{serve, Reply};
 
     fn client(base_url: &str) -> NavidromeClient {
         NavidromeClientBuilder::new()
@@ -544,24 +483,6 @@ mod tests {
             .password("secret-password")
             .build()
             .unwrap()
-    }
-
-    /// A local address that answers one request with `status` and `body`.
-    fn serve_once(status: &'static str, body: &'static str) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 8192];
-            let _ = stream.read(&mut request);
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        url
     }
 
     /// Navidrome's answer to a Subsonic request it refuses with `code`
@@ -578,9 +499,55 @@ mod tests {
         }
     }
 
+    const SCAN_STATUS: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"scanStatus":{"scanning":true,"count":1342,"folderCount":120,"lastScan":"2026-11-14T21:03:11.519322Z","scanType":"quick"}}}"#;
+
+    #[tokio::test]
+    async fn a_scan_is_started_with_a_form_post() {
+        let (url, seen) = serve(vec![Reply {
+            status: 200,
+            body: SCAN_STATUS.into(),
+        }]);
+        client(&url).start_scan().await.unwrap();
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            (sent.method.as_str(), sent.target.as_str()),
+            ("POST", "/rest/startScan")
+        );
+        assert_eq!(
+            sent.content_type.as_deref(),
+            Some("application/x-www-form-urlencoded")
+        );
+        for part in ["u=alice", "v=1.16.1", "c=Soulbeet", "f=json"] {
+            assert!(
+                sent.body.split('&').any(|p| p == part),
+                "{part} in {}",
+                sent.body
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_scan_status_has_its_count_time_and_error() {
+        let (url, _) = serve(vec![Reply {
+            status: 200,
+            body: SCAN_STATUS.into(),
+        }]);
+        let status = client(&url).get_scan_status().await.unwrap();
+        assert!(status.scanning);
+        assert_eq!(status.count, 1342);
+        assert_eq!(
+            status.last_scan.to_rfc3339(),
+            "2026-11-14T21:03:11.519322+00:00"
+        );
+        assert_eq!(status.error, "");
+    }
+
     #[tokio::test]
     async fn a_refused_login_is_subsonic_error_40() {
-        let url = serve_once("200 OK", subsonic_failure(40));
+        let (url, _) = serve(vec![Reply {
+            status: 200,
+            body: subsonic_failure(40).into(),
+        }]);
         let err = client(&url).ping().await.unwrap_err();
         assert!(
             matches!(err, NavidromeError::Subsonic { code: 40, .. }),
@@ -591,7 +558,10 @@ mod tests {
 
     #[tokio::test]
     async fn another_subsonic_error_keeps_its_code_and_is_not_a_refusal() {
-        let url = serve_once("200 OK", subsonic_failure(10));
+        let (url, _) = serve(vec![Reply {
+            status: 200,
+            body: subsonic_failure(10).into(),
+        }]);
         let err = client(&url).ping().await.unwrap_err();
         assert!(
             matches!(err, NavidromeError::Subsonic { code: 10, .. }),
@@ -602,7 +572,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_proxy_error_is_an_http_status() {
-        let url = serve_once("502 Bad Gateway", "<html>Bad Gateway</html>");
+        let (url, _) = serve(vec![Reply {
+            status: 502,
+            body: "<html>Bad Gateway</html>".into(),
+        }]);
         let err = client(&url).ping().await.unwrap_err();
         assert!(
             matches!(err, NavidromeError::Http { status: 502, .. }),
@@ -613,7 +586,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_that_is_not_subsonic_is_a_parse_error() {
-        let url = serve_once("200 OK", "<html>a login page</html>");
+        let (url, _) = serve(vec![Reply {
+            status: 200,
+            body: "<html>a login page</html>".into(),
+        }]);
         let err = client(&url).ping().await.unwrap_err();
         assert!(matches!(err, NavidromeError::Parse(_)), "{err:?}");
         assert!(!err.is_wrong_credentials());

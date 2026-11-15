@@ -28,6 +28,25 @@ pub struct SubsonicError {
 pub struct PingBody {}
 
 #[derive(Debug, Deserialize)]
+pub struct ScanStatusBody {
+    #[serde(rename = "scanStatus")]
+    pub scan_status: ScanStatus,
+}
+
+/// Navidrome's scan status (server/subsonic/responses/responses.go
+/// `ScanStatus`). `lastScan` is always sent and is `0001-01-01T00:00:00Z`
+/// before the first scan.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanStatus {
+    pub scanning: bool,
+    pub count: i64,
+    pub last_scan: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub error: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AlbumList2Body {
     #[serde(rename = "albumList2")]
     pub album_list: Option<AlbumList2>,
@@ -35,41 +54,6 @@ pub struct AlbumList2Body {
 
 #[derive(Debug, Deserialize)]
 pub struct AlbumList2 {
-    #[serde(default)]
-    pub album: Vec<SubsonicAlbum>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AlbumBody {
-    pub album: Option<SubsonicAlbumDetail>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PlaylistsBody {
-    pub playlists: Option<PlaylistsWrapper>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PlaylistsWrapper {
-    #[serde(default)]
-    pub playlist: Vec<SubsonicPlaylist>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PlaylistBody {
-    pub playlist: Option<SubsonicPlaylistDetail>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StarredBody {
-    #[serde(rename = "starred2")]
-    pub starred: Option<StarredContent>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StarredContent {
-    #[serde(default)]
-    pub song: Vec<SubsonicSong>,
     #[serde(default)]
     pub album: Vec<SubsonicAlbum>,
 }
@@ -84,8 +68,6 @@ pub struct SearchResult3Body {
 pub struct SearchResult3 {
     #[serde(default)]
     pub song: Vec<SubsonicSong>,
-    #[serde(default)]
-    pub album: Vec<SubsonicAlbum>,
 }
 
 // Core data types
@@ -144,42 +126,6 @@ impl SubsonicAlbum {
             .or(self.title.as_deref())
             .unwrap_or("Unknown Album")
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SubsonicAlbumDetail {
-    pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub artist: Option<String>,
-    #[serde(default)]
-    pub song_count: Option<u32>,
-    #[serde(default)]
-    pub song: Vec<SubsonicSong>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SubsonicPlaylist {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub song_count: Option<u32>,
-    #[serde(default)]
-    pub duration: Option<u32>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SubsonicPlaylistDetail {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub song_count: Option<u32>,
-    #[serde(default)]
-    pub entry: Vec<SubsonicSong>,
 }
 
 /// A player registered with Navidrome (native API: GET /api/player).

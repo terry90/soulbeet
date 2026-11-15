@@ -39,10 +39,6 @@ pub enum NavidromeError {
     /// The answer could not be read.
     #[error("Unreadable Navidrome response: {0}")]
     Parse(String),
-
-    /// The answer lacked what the request asked for.
-    #[error("{0}")]
-    Missing(String),
 }
 
 impl NavidromeError {

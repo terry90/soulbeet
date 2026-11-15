@@ -1075,25 +1075,43 @@ pub async fn generate_discovery_playlist_internal(
     // Trigger a Navidrome scan then wait for it to finish so playlists can be created.
     if total_downloads > 0 {
         if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
-            if let Err(e) = navi.start_scan().await {
-                warn!("Failed to trigger Navidrome scan: {}", e);
-            } else {
-                info!(
-                    "Triggered Navidrome library scan after {} discovery imports",
-                    total_downloads
-                );
-                // Wait for scan to complete (poll every 3s, max 2 min)
-                for _ in 0..40u32 {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                    match navi.get_scan_status().await {
-                        Ok(false) => break,
-                        Ok(true) => continue,
-                        Err(_) => break,
-                    }
+            // The scan runs in a goroutine and startScan answers at once, so
+            // "not scanning" alone can be read before it begins: wait for a
+            // scan that ended after the one recorded here.
+            let before = match navi.get_scan_status().await {
+                Ok(status) => Some(status.last_scan),
+                Err(e) => {
+                    warn!("Failed to read Navidrome scan status: {}", e);
+                    None
                 }
-                // Create/update smart playlists now that tracks are indexed
-                if let Err(e) = reconcile_discovery_playlists(user_id).await {
-                    warn!("Playlist reconciliation after generation failed: {}", e);
+            };
+            if let Some(before) = before {
+                if let Err(e) = navi.start_scan().await {
+                    warn!("Failed to trigger Navidrome scan: {}", e);
+                } else {
+                    info!(
+                        "Triggered Navidrome library scan after {} discovery imports",
+                        total_downloads
+                    );
+                    // Poll every 3s, at most 2 min
+                    for _ in 0..40u32 {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        match navi.get_scan_status().await {
+                            Ok(status) if scan_finished(&status, before) => {
+                                if !status.error.is_empty() {
+                                    warn!("Navidrome scan reported an error: {}", status.error);
+                                }
+                                info!("Navidrome scan ended after {} items", status.count);
+                                break;
+                            }
+                            Ok(_) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    // Create/update smart playlists now that tracks are indexed
+                    if let Err(e) = reconcile_discovery_playlists(user_id).await {
+                        warn!("Playlist reconciliation after generation failed: {}", e);
+                    }
                 }
             }
         }
@@ -1106,6 +1124,16 @@ pub async fn generate_discovery_playlist_internal(
         total_imported: total_downloads,
         profiles: all_profile_stats,
     })
+}
+
+/// A scan has ended once Navidrome is idle and its last scan is later than
+/// the one recorded before this generation started its own.
+#[cfg(feature = "server")]
+fn scan_finished(
+    status: &soulbeet::navidrome::ScanStatus,
+    before: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    !status.scanning && status.last_scan > before
 }
 
 /// Create or update smart playlists in Navidrome for each discovery profile.
@@ -1492,7 +1520,7 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use super::{settle_poll, QueuedTrack, FAILED_STATE_CONFIRM};
+    use super::{scan_finished, settle_poll, QueuedTrack, FAILED_STATE_CONFIRM};
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
     use crate::server_fns::download::test_support::{
@@ -1503,6 +1531,36 @@ mod tests {
     use soulbeet::DownloadBackend;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    #[test]
+    fn a_scan_is_finished_once_a_later_one_ended() {
+        use chrono::{DateTime, Utc};
+        use soulbeet::navidrome::ScanStatus;
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let status = |scanning, last: &str| ScanStatus {
+            scanning,
+            count: 0,
+            last_scan: at(last),
+            error: String::new(),
+        };
+        let before = at("2026-11-15T10:00:00Z");
+        assert!(!scan_finished(
+            &status(false, "2026-11-15T10:00:00Z"),
+            before
+        ));
+        assert!(!scan_finished(
+            &status(true, "2026-11-15T10:00:05Z"),
+            before
+        ));
+        assert!(scan_finished(
+            &status(false, "2026-11-15T10:00:05Z"),
+            before
+        ));
+        assert!(scan_finished(
+            &status(false, "2026-11-15T10:00:05Z"),
+            at("0001-01-01T00:00:00Z")
+        ));
+    }
 
     #[test]
     fn classify_discovery_keeps_config_failures_out_of_history() {
