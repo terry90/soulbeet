@@ -1,12 +1,14 @@
 //! Getting files: batches, enqueueing a request's files and watching them,
-//! and the manual download.
+//! the manual download and the auto-download pipeline.
 
 use crate::auth::UserCtx;
-use crate::core::{backend_unavailable, target_unwritable};
+use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
+use crate::core::{backend_unavailable, sources, target_unwritable};
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{
-    another_folder, deliver, enqueue_request, failed_reason, stopped_rows, RequestEnqueue, Watcher,
+    another_folder, deliver, enqueue_request, failed_reason, not_enqueued_failure, stopped_rows,
+    RequestEnqueue, Watcher,
 };
 use crate::server_fns::download::failover::{align_pool_tracks, SourcePool};
 use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
@@ -14,8 +16,8 @@ use crate::services::download_backend;
 use crate::transfer_registry::{BatchRef, TransferOwner};
 use dioxus::logger::tracing::info;
 use shared::download::{
-    DownloadEvent, DownloadProgress, DownloadableGroup, DownloadableItem, EnqueueStatus,
-    QueuedDownload,
+    AutoDownloadEvent, DownloadEvent, DownloadProgress, DownloadQuery, DownloadableGroup,
+    DownloadableItem, EnqueueStatus, QueuedDownload,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::SoulseekError;
@@ -40,7 +42,7 @@ fn manual_batch_label(items: &[DownloadableItem]) -> String {
 /// Name for an auto download's batch: the picked group's title, which a
 /// track search leaves empty since no album was searched for, else the same
 /// name a manual download of its items gets.
-pub(crate) fn auto_batch_label(group: &DownloadableGroup) -> String {
+fn auto_batch_label(group: &DownloadableGroup) -> String {
     if group.title.trim().is_empty() {
         manual_batch_label(&group.items)
     } else {
@@ -49,7 +51,7 @@ pub(crate) fn auto_batch_label(group: &DownloadableGroup) -> String {
 }
 
 /// The backend call that enqueues a request's files failed.
-pub(crate) fn queue_failed(e: &SoulseekError) -> Failure {
+fn queue_failed(e: &SoulseekError) -> Failure {
     e.failure(Stage::Enqueue, format!("Download queue failed: {e}"))
 }
 
@@ -65,7 +67,7 @@ fn request_stopped(e: &tokio::task::JoinError) -> Failure {
 
 /// A new batch of `ctx`'s user, downloading into `batch_folder(label,
 /// batch_id)` and importing into `target`.
-pub fn fresh_batch(ctx: &UserCtx, batch_id: String, label: String, target: PathBuf) -> BatchRef {
+fn fresh_batch(ctx: &UserCtx, batch_id: String, label: String, target: PathBuf) -> BatchRef {
     BatchRef::new(
         TransferOwner {
             user_id: ctx.id(),
@@ -77,7 +79,7 @@ pub fn fresh_batch(ctx: &UserCtx, batch_id: String, label: String, target: PathB
 }
 
 /// Creates `folder`'s directory, and returns its path as the import target.
-pub async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> {
+async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> {
     let target = PathBuf::from(&folder.path);
     tokio::fs::create_dir_all(&target)
         .await
@@ -248,10 +250,218 @@ pub async fn download(
     enqueue_and_watch(ctx, backend, items, fresh, Vec::new()).await
 }
 
+/// Score threshold for automatic source selection (per D-04).
+/// Below this, the client gets FallbackToManual with results attached.
+const AUTO_SELECT_SCORE_THRESHOLD: f64 = 0.7;
+
+/// Why no file of a request was queued, shown as the request's failure.
+fn queue_failure(results: &[QueuedDownload]) -> Failure {
+    not_enqueued_failure(results).with_message("All downloads failed to queue")
+}
+
+/// What an auto download's enqueue means for its search row: Downloading
+/// when a file was enqueued or is already running into this folder, else
+/// the failure of the request or of its files.
+fn enqueue_outcome(
+    batch_id: String,
+    outcome: &Result<Vec<QueuedDownload>, Failure>,
+) -> AutoDownloadEvent {
+    let on_its_way = |d: &QueuedDownload| {
+        matches!(
+            d.status,
+            EnqueueStatus::Enqueued | EnqueueStatus::AlreadyRunning
+        )
+    };
+    match outcome {
+        Ok(results) if results.iter().any(on_its_way) => {
+            AutoDownloadEvent::Downloading { batch_id }
+        }
+        Ok(results) => AutoDownloadEvent::Failed {
+            batch_id,
+            failure: queue_failure(results),
+        },
+        Err(failure) => AutoDownloadEvent::Failed {
+            batch_id,
+            failure: failure.clone(),
+        },
+    }
+}
+
+/// Searches every backend for `query`, picks the best source when it scores
+/// well enough, and downloads it into `folder`, the other sources standing by
+/// as alternates. Everything after the backend lookup runs in the background
+/// and reports on the user's channel; the batch id is returned at once.
+pub async fn auto_download(
+    ctx: &UserCtx,
+    folder: Folder,
+    mut query: DownloadQuery,
+) -> Result<String, Failure> {
+    if let Some(failure) = crate::importer_health::blocking_failure().await {
+        return Err(failure);
+    }
+    let key = lastfm_key(ctx).await?;
+
+    let (tx, _) = get_or_create_user_channel(&ctx.id()).await;
+    let send = move |event| {
+        let _ = tx.send(DownloadEvent::AutoDownload(event));
+    };
+
+    // Build search description for logging and events
+    let query_desc = query
+        .album
+        .as_ref()
+        .map(|a| format!("{} - {}", a.artist, a.title))
+        .unwrap_or_else(|| {
+            query
+                .tracks
+                .first()
+                .map(|t| format!("{} - {}", t.artist, t.title))
+                .unwrap_or_else(|| "Unknown query".to_string())
+        });
+
+    // Search every configured backend (per D-06).
+    let (first, rest) = match sources::usable_backends().await {
+        Ok(backends) => backends,
+        Err(failure) => {
+            send(AutoDownloadEvent::Failed {
+                batch_id: uuid::Uuid::new_v4().to_string(),
+                failure: failure.clone(),
+            });
+            return Err(failure);
+        }
+    };
+
+    // Generate batch_id upfront so we can return it immediately (per D-10)
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let batch_id_for_response = batch_id.clone();
+
+    // Spawn the entire search-score-pick-download pipeline onto a background task.
+    // This avoids blocking the HTTP response during the search-poll loop (Research Pitfall 4).
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        send(AutoDownloadEvent::Searching {
+            batch_id: batch_id.clone(),
+            query: query_desc.clone(),
+            backend_count: 1 + rest.len(),
+        });
+
+        if let Err(failure) = hydrate_album_tracks(&mut query, key.as_deref()).await {
+            info!(
+                "Auto-download: no tracklist for '{}': {}",
+                query_desc, failure.message
+            );
+            send(AutoDownloadEvent::Failed {
+                batch_id: batch_id.clone(),
+                failure,
+            });
+            return;
+        }
+        let (album, tracks) = (query.album, query.tracks);
+
+        info!(
+            "Auto-download: searching {} backends for '{}'",
+            1 + rest.len(),
+            query_desc
+        );
+
+        // Search all backends in parallel (per D-06), best score first (per D-07)
+        let mut all_groups =
+            match sources::search_ranked(&first, &rest, album.as_ref(), &tracks).await {
+                Ok(groups) => groups,
+                Err(failure) => {
+                    send(AutoDownloadEvent::Failed {
+                        batch_id: batch_id.clone(),
+                        failure,
+                    });
+                    info!("Auto-download: no results for '{}'", query_desc);
+                    return;
+                }
+            };
+
+        let best_score = all_groups[0].score;
+
+        send(AutoDownloadEvent::ScoringResults {
+            batch_id: batch_id.clone(),
+            result_count: all_groups.len(),
+            best_score,
+        });
+
+        info!(
+            "Auto-download: {} results, best score {:.2} for '{}'",
+            all_groups.len(),
+            best_score,
+            query_desc
+        );
+
+        // Decide: auto-pick or fallback (per D-04)
+        if best_score < AUTO_SELECT_SCORE_THRESHOLD {
+            send(AutoDownloadEvent::FallbackToManual {
+                batch_id: batch_id.clone(),
+                results: all_groups,
+                best_score,
+                threshold: AUTO_SELECT_SCORE_THRESHOLD,
+            });
+            info!(
+                "Auto-download: score {:.2} < threshold {:.1}, falling back to manual for '{}'",
+                best_score, AUTO_SELECT_SCORE_THRESHOLD, query_desc
+            );
+            return;
+        }
+
+        // Pick the best source
+        let picked = all_groups.remove(0);
+
+        send(AutoDownloadEvent::PickedSource {
+            batch_id: batch_id.clone(),
+            source: picked.source.clone(),
+            score: picked.score,
+            quality: picked.quality.clone(),
+            track_count: picked.items.len(),
+        });
+
+        info!(
+            "Auto-download: picked source '{}' (score {:.2}, {} tracks) for '{}'",
+            picked.source,
+            picked.score,
+            picked.items.len(),
+            query_desc
+        );
+
+        let target = match prepare_target(&folder).await {
+            Ok(target) => target,
+            Err(failure) => {
+                send(AutoDownloadEvent::Failed {
+                    batch_id: batch_id.clone(),
+                    failure,
+                });
+                return;
+            }
+        };
+
+        let backend = match download_backend(None).await {
+            Ok(b) => b,
+            Err(e) => {
+                send(AutoDownloadEvent::Failed {
+                    batch_id: batch_id.clone(),
+                    failure: backend_unavailable(Stage::Enqueue, &e),
+                });
+                return;
+            }
+        };
+
+        let fresh = fresh_batch(&ctx, batch_id.clone(), auto_batch_label(&picked), target);
+        let outcome = enqueue_and_watch(&ctx, backend, picked.items, fresh, all_groups).await;
+        send(enqueue_outcome(batch_id, &outcome));
+    });
+
+    Ok(batch_id_for_response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::test_ctx;
+    use crate::server_fns::download::enqueue::other_user;
     use crate::server_fns::download::test_support::{
         batch, item, key, same_user_into, ScriptedOutcome, StubBackend,
     };
@@ -298,6 +508,65 @@ mod tests {
         group.title = String::new();
         group.items[0].album = String::new();
         assert_eq!(auto_batch_label(&group), "Northern Line");
+    }
+
+    #[test]
+    fn queue_failure_names_why_the_files_failed() {
+        let failed = |code| QueuedDownload {
+            id: "1".into(),
+            source: "p".into(),
+            item: "a".into(),
+            size: 0,
+            status: EnqueueStatus::Failed(Failure::new(
+                code,
+                Stage::Enqueue,
+                RetryAdvice::OtherSource,
+                "peer offline",
+            )),
+        };
+        let f = queue_failure(&[failed(FailureCode::PeerOffline)]);
+        assert_eq!(
+            (f.code, f.message.as_str()),
+            (FailureCode::PeerOffline, "All downloads failed to queue")
+        );
+        assert_eq!(queue_failure(&[]).code, FailureCode::EnqueueFailed);
+    }
+
+    #[test]
+    fn the_pipeline_says_downloading_only_when_a_file_is_on_its_way() {
+        let q = |status| QueuedDownload {
+            id: "t-01.flac".into(),
+            source: "peer_a".into(),
+            item: "01.flac".into(),
+            size: 27_213_250,
+            status,
+        };
+        let downloading = |e: AutoDownloadEvent| matches!(e, AutoDownloadEvent::Downloading { batch_id } if batch_id == "b1");
+        let failed = |e: AutoDownloadEvent| match e {
+            AutoDownloadEvent::Failed { failure, .. } => failure,
+            other => panic!("{other:?}"),
+        };
+        assert!(downloading(enqueue_outcome(
+            "b1".into(),
+            &Ok(vec![q(EnqueueStatus::Enqueued)])
+        )));
+        assert!(downloading(enqueue_outcome(
+            "b1".into(),
+            &Ok(vec![q(EnqueueStatus::AlreadyRunning)])
+        )));
+        let held = failed(enqueue_outcome(
+            "b1".into(),
+            &Ok(vec![q(EnqueueStatus::Failed(other_user()))]),
+        ));
+        assert_eq!(
+            (held.code, held.message.as_str()),
+            (other_user().code, "All downloads failed to queue")
+        );
+        let refused = failed(enqueue_outcome(
+            "b1".into(),
+            &Err(another_folder(RetryAdvice::NotRetryable)),
+        ));
+        assert_eq!(refused, another_folder(RetryAdvice::NotRetryable));
     }
 
     #[tokio::test]
