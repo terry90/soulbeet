@@ -172,8 +172,7 @@ impl NavidromeClient {
         self.circuit_breaker.record_success().await;
 
         let bytes = response.bytes().await.map_err(parse)?;
-        let answer: SubsonicAnswer =
-            serde_json::from_slice(&bytes).map_err(|e| NavidromeError::Parse(e.to_string()))?;
+        let answer: SubsonicAnswer = serde_json::from_slice(&bytes).map_err(undecodable)?;
 
         if answer.response.status != "ok" {
             return Err(match answer.response.error {
@@ -185,8 +184,7 @@ impl NavidromeClient {
             });
         }
 
-        let envelope: SubsonicEnvelope<T> =
-            serde_json::from_slice(&bytes).map_err(|e| NavidromeError::Parse(e.to_string()))?;
+        let envelope: SubsonicEnvelope<T> = serde_json::from_slice(&bytes).map_err(undecodable)?;
 
         Ok(envelope.response.body)
     }
@@ -508,6 +506,16 @@ fn parse(e: reqwest::Error) -> NavidromeError {
     NavidromeError::Parse(e.without_url().to_string())
 }
 
+/// What a Subsonic answer that is not the JSON asked for reads as: the text of reqwest's decode
+/// error, which read these answers before Subsonic errors were read first.
+const UNDECODABLE: &str = "error decoding response body";
+
+/// A Subsonic answer serde could not read, as UNDECODABLE; serde's reason is logged.
+fn undecodable(e: serde_json::Error) -> NavidromeError {
+    debug!("Undecodable Navidrome answer: {e}");
+    NavidromeError::Parse(UNDECODABLE.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +545,20 @@ mod tests {
     }
 
     const SCAN_STATUS: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"scanStatus":{"scanning":true,"count":1342,"folderCount":120,"lastScan":"2026-11-14T21:03:11.519322Z","scanType":"quick"}}}"#;
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_subsonic_json_reads_as_it_always_did() {
+        // A proxy's login page in front of Navidrome answers 200 with HTML.
+        let (url, _) = serve(vec![Reply {
+            status: 200,
+            body: "<!doctype html><title>Sign in</title>".into(),
+        }]);
+        let e = client(&url).get_scan_status().await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "Unreadable Navidrome response: error decoding response body"
+        );
+    }
 
     #[tokio::test]
     async fn a_scan_is_started_with_a_form_post() {
@@ -680,16 +702,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_request_does_not_reveal_the_subsonic_token() {
-        // A port nothing listens on: the connection is refused.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let err = client(&format!("http://127.0.0.1:{port}"))
-            .ping()
-            .await
-            .unwrap_err();
+        // A server that hangs up on every request. A port left free instead
+        // could be taken by another test's server meanwhile.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let err = client(&url).ping().await.unwrap_err();
         assert!(matches!(err, NavidromeError::Transport(_)), "{err:?}");
 
         let message = err.to_string();
