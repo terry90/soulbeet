@@ -46,8 +46,19 @@ interface SearchRecord {
   startedAt: Date;
   /** epoch ms after which the search reports complete */
   completeAtMs: number;
+  /** set by slskd's cancel call while the search ran */
+  cancelled: boolean;
   responses: SearchResponseJson[];
 }
+
+/**
+ * How long after a search completes its responses stay unreadable. slskd
+ * saves the Completed state from the stateChanged callback with no
+ * responses (Search/Extensions.cs:135-149) and writes them in a second
+ * update once the search task returns (Search/SearchService.cs:357-361),
+ * so a reader that polls in between sees isComplete and an empty list.
+ */
+const RESPONSES_LAG_MS = 700;
 
 interface TransferStep {
   afterMs: number;
@@ -288,6 +299,7 @@ export class SlskdState {
       token: this.nextToken++,
       startedAt: new Date(),
       completeAtMs: Date.now() + this.searchCompleteAfterMs,
+      cancelled: false,
       responses: this.buildResponses(searchText),
     };
     this.searches.set(record.id, record);
@@ -305,13 +317,39 @@ export class SlskdState {
     return this.searches.delete(id);
   }
 
+  /**
+   * SearchesController.Cancel: false (404) for a search slskd does not hold,
+   * else true (200) whether or not it still ran. A running search ends as
+   * Completed, Cancelled, its responses written as for any other end.
+   */
+  cancelSearch(id: string): boolean {
+    const record = this.searches.get(id);
+    if (!record) {
+      return false;
+    }
+    const now = Date.now();
+    if (now < record.completeAtMs) {
+      record.completeAtMs = now;
+      record.cancelled = true;
+    }
+    return true;
+  }
+
+  /** The responses slskd serves for the search: none until it wrote them. */
+  searchResponses(record: SearchRecord): SearchResponseJson[] {
+    return Date.now() >= record.completeAtMs + RESPONSES_LAG_MS ? record.responses : [];
+  }
+
   searchJson(record: SearchRecord): Record<string, unknown> {
     const isComplete = Date.now() >= record.completeAtMs;
+    // A search left to run ends when no response came for searchTimeout
+    // (Soulseek.NET SearchStates: Completed | TimedOut).
+    const ended = record.cancelled ? 'Completed, Cancelled' : 'Completed, TimedOut';
     return {
       id: record.id,
       searchText: record.searchText,
       token: record.token,
-      state: isComplete ? 'Completed, Succeeded' : 'InProgress',
+      state: isComplete ? ended : 'InProgress',
       isComplete,
       startedAt: record.startedAt.toISOString(),
       endedAt: isComplete ? new Date(record.completeAtMs).toISOString() : null,

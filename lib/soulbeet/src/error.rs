@@ -46,9 +46,10 @@ pub enum SoulseekError {
     #[error("API error: 400 - {body}")]
     SearchAlreadyRunning { body: String },
 
-    /// slskd answered 404 to a poll: it has no search with that id any more
-    /// (`SearchesController.GetResponsesById`), for example because it was
-    /// deleted from slskd.
+    /// slskd answered 404 to a poll, reading the search's status or responses
+    /// or cancelling it: it has no search with that id any more
+    /// (`SearchesController.GetById`, `GetResponsesById`, `Cancel`), for
+    /// example because it was deleted from slskd.
     #[error("API error: 404 - {body}")]
     SearchGone { body: String },
 

@@ -100,7 +100,14 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
             sendEmpty(res, 404);
             return;
           }
-          sendJson(res, 200, record.responses);
+          sendJson(res, 200, state.searchResponses(record));
+        },
+      },
+      {
+        method: 'PUT',
+        pattern: '/api/v0/searches/:id',
+        handler: ({ res, params }) => {
+          sendEmpty(res, state.cancelSearch(params.id as string) ? 200 : 404);
         },
       },
       {
