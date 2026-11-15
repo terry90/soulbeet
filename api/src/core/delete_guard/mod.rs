@@ -176,8 +176,9 @@ impl Guard<'_> {
     /// the empty parents up to checked.folder. Ok holds the deletion's warnings: a commit that
     /// failed, and with `ForgetVia::Worker` a forget that did not remove one item (with
     /// `ForgetVia::Queue` that one is logged). Nothing may use `self.db` while the transaction
-    /// is open, so the row is built before it begins. The unlink and the commit run in one
-    /// spawned task, which a dropped caller does not cancel.
+    /// is open, so the row is built before it begins. The unlink, the commit, the info line and
+    /// the spawn of a queued forget run in one spawned task, which a dropped caller does not
+    /// cancel.
     pub async fn carry_out(
         &self,
         actor: &UserId,
@@ -213,15 +214,40 @@ impl Guard<'_> {
         DeletionReviewRow::insert_in(&mut tx, &record)
             .await
             .map_err(|e| database_failure(Stage::Delete, e))?;
-        let target = path.clone();
-        // One task unlinks and then commits, so a dropped caller cannot delete the file and
-        // roll its row back. A refusal drops the transaction, which rolls the row back.
+        let (queued, in_worker) = match forget {
+            ForgetVia::Queue(queue) => (Some(queue), None),
+            ForgetVia::Worker { importer, library } => (None, Some((importer, library))),
+        };
+        let (target, removed, root) = (path.clone(), path.clone(), folder.clone());
+        // One task unlinks, commits and, for a queued forget, spawns it, so a dropped caller can
+        // neither delete the file and roll its row back nor leave the file in beets' library.
+        // A refusal drops the transaction, which rolls the row back.
         let removal = tokio::spawn(async move {
-            match tokio::task::spawn_blocking(move || unlink::unlink_if_same(&target, id)).await {
-                Ok(Ok(())) => Ok(tx.commit().await.err()),
-                Ok(Err(e)) => Err(e),
-                Err(e) => Err(UnlinkError::Io(std::io::Error::other(e))),
+            let committed = match tokio::task::spawn_blocking(move || {
+                unlink::unlink_if_same(&target, id)
+            })
+            .await
+            {
+                Ok(Ok(())) => tx.commit().await.err(),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(UnlinkError::Io(std::io::Error::other(e))),
+            };
+            info!(
+                "Deleted {} ({}, {})",
+                removed.display(),
+                reason.as_str(),
+                origin.as_str()
+            );
+            if let Some(queue) = queued {
+                tokio::spawn(async move {
+                    let outcome = queue.forget(&root, &removed).await;
+                    if let Some(note) = forget_note(&outcome, &removed, &root) {
+                        warn!("{note}");
+                    }
+                    prune(&removed, &root).await;
+                });
             }
+            Ok(committed)
         });
         let mut warnings = Vec::new();
         match removal.await {
@@ -234,27 +260,10 @@ impl Guard<'_> {
             Ok(Err(UnlinkError::Io(e))) => return Err(delete_failed(&path, &e)),
             Err(e) => return Err(delete_failed(&path, &std::io::Error::other(e))),
         }
-        info!(
-            "Deleted {} ({}, {})",
-            path.display(),
-            reason.as_str(),
-            origin.as_str()
-        );
-        match forget {
-            ForgetVia::Queue(queue) => {
-                tokio::spawn(async move {
-                    let outcome = queue.forget(&folder, &path).await;
-                    if let Some(note) = forget_note(&outcome, &path, &folder) {
-                        warn!("{note}");
-                    }
-                    prune(&path, &folder).await;
-                });
-            }
-            ForgetVia::Worker { importer, library } => {
-                let outcome = importer.forget(library, &path).await;
-                warnings.extend(forget_note(&outcome, &path, library));
-                prune(&path, &folder).await;
-            }
+        if let Some((importer, library)) = in_worker {
+            let outcome = importer.forget(library, &path).await;
+            warnings.extend(forget_note(&outcome, &path, library));
+            prune(&path, &folder).await;
         }
         Ok(warnings)
     }
@@ -1267,6 +1276,52 @@ mod tests {
         .await
         .expect("the queued forget never ran");
         assert_eq!(stub.forgets(), vec![(folder.clone(), path.clone())]);
+    }
+
+    #[tokio::test]
+    async fn a_request_dropped_after_the_unlink_still_forgets_and_prunes() {
+        let lib = Library::new().await;
+        let stub = Arc::new(StubImporter::new());
+        let queue = ImportQueue::new(RecordingDeps::new(stub.clone()));
+        let checked = checked(&lib).await;
+        let (path, folder) = (checked.path.clone(), checked.folder.clone());
+        let guard = lib.guard();
+        let alice = lib.alice();
+        let mut request = Box::pin(guard.carry_out(
+            &alice,
+            checked,
+            DeletionReason::Disliked,
+            Origin::Auto,
+            ForgetVia::Queue(queue),
+        ));
+        // The test runtime has one thread: the removal task only runs while this task sleeps,
+        // so the request is never polled again once the file is gone, and is dropped there.
+        while path.exists() {
+            let poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(request.as_mut(), cx))
+            });
+            assert!(
+                poll.await.is_pending(),
+                "carry_out finished before the unlink"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(request);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stub.forgets().is_empty() || folder.join("A").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the forget of a dropped request never ran");
+        assert_eq!(stub.forgets(), vec![(folder.clone(), path.clone())]);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deletion_reviews")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
