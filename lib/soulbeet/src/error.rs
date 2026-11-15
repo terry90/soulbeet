@@ -1,4 +1,5 @@
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage, UserAction};
+use shared::slskd::NOT_LOGGED_IN;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -84,7 +85,13 @@ impl SoulseekError {
             SoulseekError::Api { status: 400, .. } if stage == Stage::SourceSearch => {
                 (BackendUnreachable, OtherQuery)
             }
-            // slskd could not reach the peer, or is not logged in to Soulseek.
+            // slskd is not logged in to Soulseek: every peer fails the same
+            // way until it logs back in.
+            SoulseekError::Api {
+                status: 500,
+                message,
+            } if message.contains(NOT_LOGGED_IN) => (BackendUnreachable, SameSourceLater),
+            // slskd could not reach the peer.
             SoulseekError::Api { status: 500, .. } if stage == Stage::Enqueue => {
                 (EnqueueFailed, OtherSource)
             }
@@ -213,6 +220,15 @@ mod tests {
                 Stage::Enqueue,
                 FailureCode::EnqueueFailed,
                 RetryAdvice::OtherSource,
+            ),
+            (
+                api(
+                    500,
+                    "The server connection must be connected and logged in to fetch user endpoint (currently: Disconnected)",
+                ),
+                Stage::Enqueue,
+                FailureCode::BackendUnreachable,
+                RetryAdvice::SameSourceLater,
             ),
             (
                 api(

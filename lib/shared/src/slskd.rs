@@ -592,6 +592,14 @@ impl From<FileEntry> for crate::download::DownloadProgress {
     }
 }
 
+/// What Soulseek.NET says, in lowercase, when slskd is not logged in to the
+/// Soulseek server: `The server connection must be connected and logged in
+/// to {download files|fetch user endpoint|...} (currently: {state})`. slskd
+/// has no typed signal for it, so the text is all there is. When `TryFail`
+/// stores the text of a single attempt, the cut at the first colon leaves
+/// only `{state})`, which says nothing.
+pub const NOT_LOGGED_IN: &str = "must be connected and logged in";
+
 /// The row state for a transfer and, for a failed or cancelled one, its
 /// failure. The message is the exception slskd stored, else the state's own
 /// text. Only failure states read the exception: a record waiting to retry
@@ -619,7 +627,13 @@ fn classify_transfer(
             (Stage::Transfer, code, retry, "Transfer rejected by peer")
         }
         DownloadState::Errored => {
-            let (code, retry) = if text.contains("appears to be offline") {
+            let (code, retry) = if text.contains(NOT_LOGGED_IN) {
+                // Every peer fails the same way until slskd logs back in.
+                (
+                    FailureCode::BackendUnreachable,
+                    RetryAdvice::SameSourceLater,
+                )
+            } else if text.contains("appears to be offline") {
                 (FailureCode::PeerOffline, RetryAdvice::OtherSource)
             } else if text == "application shut down" {
                 // slskd restarted mid-transfer; the peer is fine.
@@ -968,6 +982,32 @@ mod tests {
                 RetryAdvice::SameSourceLater
             )
         );
+    }
+
+    /// slskd logged out of Soulseek: every peer fails the same way until it
+    /// logs back in. Soulseek.NET throws before the transfer starts, so slskd
+    /// stores the text through `TryFail`, which drops everything up to the
+    /// first colon of the `AggregateException` its retries end in
+    /// (`DownloadService.cs:1059`, `Common/Retry.cs:149`).
+    #[test]
+    fn a_transfer_slskd_could_not_start_while_logged_out_waits_for_slskd() {
+        let refused = "The server connection must be connected and logged in to download files (currently: Disconnected)";
+        let after_retries = format!("Disconnected)) ({refused}) ({refused})");
+        for exception in [refused.to_string(), after_retries] {
+            let row = converted(json!("Completed, Errored"), Some(&exception));
+            let f = row.failure.expect("a failure");
+            assert_eq!(
+                (f.code, f.stage, f.retry),
+                (
+                    FailureCode::BackendUnreachable,
+                    Stage::Transfer,
+                    RetryAdvice::SameSourceLater
+                ),
+                "{exception:?}"
+            );
+            assert_eq!(row.error.as_deref(), Some(exception.as_str()));
+            assert_eq!(f.cause.map(|c| c.raw), Some(exception));
+        }
     }
 
     #[test]
