@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use shared::navidrome::LibraryStats;
+use shared::navidrome::{DeletionReason, LibraryStats};
 
 #[derive(PartialEq, Clone, Copy, Default)]
 pub enum DashboardTab {
@@ -142,7 +142,13 @@ pub fn DeletionHistoryTab() -> Element {
                                 span { class: "text-gray-400 mx-2", "-" }
                                 span { class: "text-gray-400 truncate", "{item.artist}" }
                             }
-                            span { class: "text-xs font-mono ml-2 text-red-400", "Deleted" }
+                            span { class: "text-xs font-mono ml-2 text-red-400",
+                                if item.reason == DeletionReason::Replaced {
+                                    "Replaced"
+                                } else {
+                                    "Deleted"
+                                }
+                            }
                         }
                     }
                 }

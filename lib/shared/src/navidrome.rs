@@ -24,7 +24,27 @@ pub struct DeletionReview {
     pub album: String,
     pub path: Option<String>,
     pub rating: Option<u8>,
+    pub reason: DeletionReason,
     pub created_at: String,
+}
+
+/// Why a file was deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionReason {
+    /// Its listener rated it down.
+    Disliked,
+    /// A new copy of it was imported.
+    Replaced,
+}
+
+impl DeletionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeletionReason::Disliked => "disliked",
+            DeletionReason::Replaced => "replaced",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

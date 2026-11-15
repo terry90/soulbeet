@@ -610,18 +610,11 @@ pub async fn generate_discovery_playlist_internal(
     seen.extend(history_keys);
 
     // Past deletions (user doesn't want these back)
-    let deletions = DeletionReviewRow::get_history(user_id, 1000)
+    let disliked = DeletionReviewRow::disliked_keys(user_id)
         .await
         .map_err(|e| run_database_failure(Stage::Input, e))?;
-    let deletion_count = deletions.len();
-    for d in &deletions {
-        seen.insert(format!(
-            "{}:{}",
-            d.artist.to_lowercase(),
-            d.title.to_lowercase()
-        ));
-    }
-    info!("Added {} deleted tracks to exclusion set", deletion_count);
+    info!("Added {} deleted tracks to exclusion set", disliked.len());
+    seen.extend(disliked);
 
     let mut total_downloads = 0u32;
     let mut all_profile_stats: Vec<ProfileGenerationStats> = Vec::new();

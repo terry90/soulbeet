@@ -49,6 +49,7 @@ pub(crate) mod test_db {
     pub const HARDENING: i64 = 20261114000000;
     pub const USERNAME_CASE: i64 = 20261115000001;
     pub const FOREIGN_FOLDER_CHOICES: i64 = 20261115000002;
+    pub const DELETION_AUDIT: i64 = 20261116000004;
 
     async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()

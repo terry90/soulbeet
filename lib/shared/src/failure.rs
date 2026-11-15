@@ -306,6 +306,8 @@ failure_codes! {
     DeleteVetoUnknown => "delete_veto_unknown",
     DeleteInUse => "delete_in_use",
     DeleteChangedSincePreview => "delete_changed_since_preview",
+    /// The OS refused to remove a file every rule allowed removing.
+    DeleteFailed => "delete_failed",
     DeleteDailyLimit => "delete_daily_limit",
     ServerRestarted => "server_restarted",
 }
@@ -316,10 +318,11 @@ mod tests {
 
     /// Design section 7 and 13 codes, by stage, with `settings_unreadable`,
     /// `backend_response_unreadable`, `search_query_rejected`,
-    /// `search_already_running`, `search_lost` and `import_disk_full`, and
+    /// `search_already_running`, `search_lost`, `import_disk_full` and
+    /// `delete_failed`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 77] = [
+    const NAMES: [&str; 78] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -395,6 +398,7 @@ mod tests {
         "delete_veto_unknown",
         "delete_in_use",
         "delete_changed_since_preview",
+        "delete_failed",
         "delete_daily_limit",
         "server_restarted",
     ];

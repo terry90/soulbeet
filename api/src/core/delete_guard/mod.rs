@@ -3,12 +3,17 @@
 use crate::auth::UserId;
 use crate::core::database_failure;
 use crate::folder_policy::PolicyRows;
+use crate::import_queue::ImportQueue;
+use crate::models::deletion_review::{DeletionRecord, DeletionReviewRow};
 use crate::models::discovery_playlist::DiscoveryTrackRow;
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use shared::navidrome::DiscoveryTrack;
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
+use shared::navidrome::{DeletionReason, DiscoveryTrack};
 use soulbeet::navidrome::models::NativeSong;
+use soulbeet::{ForgetOutcome, MusicImporter};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
+use unlink::UnlinkError;
 
 mod listeners;
 pub mod paths;
@@ -59,6 +64,37 @@ pub struct Checked {
     pub folder: PathBuf,
     /// The file's identity when it was checked, compared when it is removed (rule 6).
     id: unlink::FileId,
+}
+
+/// What started a removal, as the audit records it (D13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Someone in the web UI.
+    Ui,
+    /// Soulful on its own, from a rating sync.
+    Auto,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Ui => "ui",
+            Origin::Auto => "auto",
+        }
+    }
+}
+
+/// How a removed file leaves the library of its folder.
+pub enum ForgetVia<'a> {
+    /// Queue the forget on the folder's worker in a spawned task that owns this handle, and do
+    /// not wait (auto-delete: the audit row never waits on beets, step 3 final ruling; a dropped
+    /// request cannot cancel the forget). The task prunes the parents after the forget.
+    Queue(ImportQueue),
+    /// Forget now, from inside the worker that owns `library`.
+    Worker {
+        importer: &'a dyn MusicImporter,
+        library: &'a Path,
+    },
 }
 
 impl Guard<'_> {
@@ -134,6 +170,95 @@ impl Guard<'_> {
         })
     }
 
+    /// Rule 6 and the removal: the audit row (actor, song, title, artist, album, path, the
+    /// caller's rating, origin, reason) in a transaction; unlink_if_same(checked.path, checked.id);
+    /// commit; one info line "Deleted {path} ({reason}, {origin})"; then the forget and pruning
+    /// the empty parents up to checked.folder. Ok holds the deletion's warnings: a commit that
+    /// failed, and with `ForgetVia::Worker` a forget that did not remove one item (with
+    /// `ForgetVia::Queue` that one is logged). Nothing may use `self.db` while the transaction
+    /// is open, so the row is built before it begins. The unlink and the commit run in one
+    /// spawned task, which a dropped caller does not cancel.
+    pub async fn carry_out(
+        &self,
+        actor: &UserId,
+        checked: Checked,
+        reason: DeletionReason,
+        origin: Origin,
+        forget: ForgetVia<'_>,
+    ) -> Result<Vec<String>, Failure> {
+        let Checked {
+            song,
+            path,
+            folder,
+            id,
+        } = checked;
+        let user_id = actor.to_string();
+        let path_text = path.to_string_lossy();
+        let record = DeletionRecord {
+            user_id: &user_id,
+            song_id: &song.id,
+            title: &song.title,
+            artist: &song.artist,
+            album: &song.album,
+            path: &path_text,
+            rating: (song.rating > 0).then_some(song.rating),
+            origin: origin.as_str(),
+            reason,
+        };
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| database_failure(Stage::Delete, e))?;
+        DeletionReviewRow::insert_in(&mut tx, &record)
+            .await
+            .map_err(|e| database_failure(Stage::Delete, e))?;
+        let target = path.clone();
+        // One task unlinks and then commits, so a dropped caller cannot delete the file and
+        // roll its row back. A refusal drops the transaction, which rolls the row back.
+        let removal = tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || unlink::unlink_if_same(&target, id)).await {
+                Ok(Ok(())) => Ok(tx.commit().await.err()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(UnlinkError::Io(std::io::Error::other(e))),
+            }
+        });
+        let mut warnings = Vec::new();
+        match removal.await {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(e))) => warnings.push(format!(
+                "The deletion of {} was not recorded: {e}",
+                path.display()
+            )),
+            Ok(Err(UnlinkError::Changed)) => return Err(changed_since_check()),
+            Ok(Err(UnlinkError::Io(e))) => return Err(delete_failed(&path, &e)),
+            Err(e) => return Err(delete_failed(&path, &std::io::Error::other(e))),
+        }
+        info!(
+            "Deleted {} ({}, {})",
+            path.display(),
+            reason.as_str(),
+            origin.as_str()
+        );
+        match forget {
+            ForgetVia::Queue(queue) => {
+                tokio::spawn(async move {
+                    let outcome = queue.forget(&folder, &path).await;
+                    if let Some(note) = forget_note(&outcome, &path, &folder) {
+                        warn!("{note}");
+                    }
+                    prune(&path, &folder).await;
+                });
+            }
+            ForgetVia::Worker { importer, library } => {
+                let outcome = importer.forget(library, &path).await;
+                warnings.extend(forget_note(&outcome, &path, library));
+                prune(&path, &folder).await;
+            }
+        }
+        Ok(warnings)
+    }
+
     /// Navidrome lists the canonical file `path` as `song` only, in `actor`'s view: their
     /// search for its tags finds `song` and no other song that is the same file.
     async fn one_song(
@@ -192,6 +317,29 @@ impl Guard<'_> {
             }
         }
         Ok(false)
+    }
+}
+
+/// Removes the directories the removal of `path` left empty, up to (not including) `folder`.
+/// A directory that cannot be removed is left, as an empty one is harmless.
+async fn prune(path: &Path, folder: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = crate::server_fns::cleanup_empty_ancestors(parent, folder).await;
+    }
+}
+
+/// The warning for a forget that did not remove exactly one item, None for Removed.
+pub(crate) fn forget_note(outcome: &ForgetOutcome, path: &Path, library: &Path) -> Option<String> {
+    let (path, library) = (path.display(), library.display());
+    match outcome {
+        ForgetOutcome::Removed => None,
+        ForgetOutcome::NotInLibrary => Some(format!("{path} was not in the library of {library}")),
+        ForgetOutcome::Several(n) => Some(format!(
+            "Left {path} in the library of {library}: {n} items have that path"
+        )),
+        ForgetOutcome::Failed(e) => Some(format!(
+            "Could not remove {path} from the library of {library}: {e}"
+        )),
     }
 }
 
@@ -265,15 +413,40 @@ pub(crate) fn in_use() -> Failure {
     )
 }
 
+/// The file is not the one that was checked any more (rule 6).
+pub(crate) fn changed_since_check() -> Failure {
+    Failure::new(
+        FailureCode::DeleteChangedSincePreview,
+        Stage::Delete,
+        RetryAdvice::SameSourceLater,
+        "The file changed after it was checked",
+    )
+}
+
+/// The OS refused to remove `path`.
+pub(crate) fn delete_failed(path: &Path, e: &std::io::Error) -> Failure {
+    Failure::new(
+        FailureCode::DeleteFailed,
+        Stage::Delete,
+        RetryAdvice::SameSourceLater,
+        format!("Could not delete {}: {e}", path.display()),
+    )
+    .with_cause(Service::Filesystem, None, e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_support::{wanted, FakeNavidrome, Library};
     use super::*;
+    use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use crate::models::navidrome_read_failure::NavidromeReadFailureRow;
     use crate::services::NavidromeLookupError;
     use shared::download::DownloadQuery;
+    use shared::failure::Cause;
     use shared::metadata::Album;
     use soulbeet::NavidromeError;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn library_verdict(v: Result<Verdict, Failure>) -> Checked {
         match v {
@@ -281,6 +454,10 @@ mod tests {
             Ok(Verdict::Discovery { track, .. }) => panic!("discovery {track:?}"),
             Err(f) => panic!("{f:?}"),
         }
+    }
+
+    async fn checked(lib: &Library) -> Checked {
+        library_verdict(lib.guard().check_song(&lib.alice(), "s1").await)
     }
 
     fn refusal(v: Result<Verdict, Failure>) -> (FailureCode, String) {
@@ -1019,6 +1196,210 @@ mod tests {
         assert_eq!(
             refusal(lib.guard().check_song(&lib.alice(), "s1").await).0,
             FailureCode::DeleteBlockedByOtherUser
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checked_file_is_deleted_recorded_forgotten_and_its_empty_folders_pruned() {
+        let lib = Library::new().await;
+        let stub = StubImporter::new();
+        let checked = checked(&lib).await;
+        let (path, folder) = (checked.path.clone(), checked.folder.clone());
+        let warnings = lib
+            .guard()
+            .carry_out(
+                &lib.alice(),
+                checked,
+                DeletionReason::Disliked,
+                Origin::Auto,
+                ForgetVia::Worker {
+                    importer: &stub,
+                    library: &folder,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
+        assert!(!path.exists() && !folder.join("A").exists() && folder.is_dir());
+        assert_eq!(stub.forgets(), vec![(folder.clone(), path.clone())]);
+        let rows: Vec<(String, String, String, String, String)> =
+            sqlx::query_as("SELECT user_id, song_id, path, origin, reason FROM deletion_reviews")
+                .fetch_all(&lib.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "alice".into(),
+                "s1".into(),
+                path.to_string_lossy().into_owned(),
+                "auto".into(),
+                "disliked".into()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forget_queued_on_the_folders_worker_runs_after_the_request_and_prunes() {
+        let lib = Library::new().await;
+        let stub = Arc::new(StubImporter::new());
+        let queue = ImportQueue::new(RecordingDeps::new(stub.clone()));
+        let checked = checked(&lib).await;
+        let (path, folder) = (checked.path.clone(), checked.folder.clone());
+        let warnings = lib
+            .guard()
+            .carry_out(
+                &lib.alice(),
+                checked,
+                DeletionReason::Disliked,
+                Origin::Auto,
+                ForgetVia::Queue(queue.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(warnings.is_empty() && !path.exists());
+        drop(queue); // the spawned task holds its own handle
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stub.forgets().is_empty() || folder.join("A").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the queued forget never ran");
+        assert_eq!(stub.forgets(), vec![(folder.clone(), path.clone())]);
+    }
+
+    #[tokio::test]
+    async fn a_path_component_swapped_for_a_symlink_is_not_followed() {
+        let lib = Library::new().await;
+        let checked = checked(&lib).await;
+        let album = lib.root.join("music/alice/A");
+        std::fs::rename(&album, lib.root.join("music/alice/A.moved")).unwrap();
+        std::fs::create_dir_all(lib.root.join("elsewhere")).unwrap();
+        // The same inode, so the identity matches through the link: only a no-follow open refuses.
+        std::fs::hard_link(
+            lib.root.join("music/alice/A.moved/x.flac"),
+            lib.root.join("elsewhere/x.flac"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(lib.root.join("elsewhere"), &album).unwrap();
+        let stub = StubImporter::new();
+        let f = lib
+            .guard()
+            .carry_out(
+                &lib.alice(),
+                checked,
+                DeletionReason::Disliked,
+                Origin::Auto,
+                ForgetVia::Worker {
+                    importer: &stub,
+                    library: &lib.root.join("music/alice"),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.message.as_str()),
+            (
+                FailureCode::DeleteChangedSincePreview,
+                "The file changed after it was checked"
+            )
+        );
+        assert!(
+            lib.root.join("elsewhere/x.flac").exists()
+                && lib.root.join("music/alice/A.moved/x.flac").exists()
+        );
+        assert!(stub.forgets().is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deletion_reviews")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_rewritten_since_the_check_is_left() {
+        let lib = Library::new().await;
+        let checked = checked(&lib).await;
+        let path = checked.path.clone();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"other audio").unwrap();
+        let stub = StubImporter::new();
+        let f = lib
+            .guard()
+            .carry_out(
+                &lib.alice(),
+                checked,
+                DeletionReason::Disliked,
+                Origin::Auto,
+                ForgetVia::Worker {
+                    importer: &stub,
+                    library: &lib.root.join("music/alice"),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(f.code, FailureCode::DeleteChangedSincePreview);
+        assert_eq!(std::fs::read(&path).unwrap(), b"other audio");
+    }
+
+    #[tokio::test]
+    async fn an_unlink_the_os_refuses_is_a_failure_with_its_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let lib = Library::new().await;
+        let checked = checked(&lib).await;
+        let dir = checked.path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let stub = StubImporter::new();
+        let f = lib
+            .guard()
+            .carry_out(
+                &lib.alice(),
+                checked,
+                DeletionReason::Disliked,
+                Origin::Auto,
+                ForgetVia::Worker {
+                    importer: &stub,
+                    library: &lib.root.join("music/alice"),
+                },
+            )
+            .await
+            .unwrap_err();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let os = std::io::Error::from_raw_os_error(13); // EACCES, "Permission denied (os error 13)"
+        assert_eq!(
+            (f.code, f.retry),
+            (FailureCode::DeleteFailed, RetryAdvice::SameSourceLater)
+        );
+        assert_eq!(
+            f.cause,
+            Some(Cause::new(Service::Filesystem, None, os.to_string()))
+        );
+    }
+
+    #[test]
+    fn a_forget_that_did_not_remove_one_item_is_a_warning() {
+        let (p, l) = (
+            Path::new("/music/alice/A/x.flac"),
+            Path::new("/music/alice"),
+        );
+        assert_eq!(forget_note(&ForgetOutcome::Removed, p, l), None);
+        assert_eq!(
+            forget_note(&ForgetOutcome::NotInLibrary, p, l).as_deref(),
+            Some("/music/alice/A/x.flac was not in the library of /music/alice")
+        );
+        assert_eq!(
+            forget_note(&ForgetOutcome::Several(2), p, l).as_deref(),
+            Some(
+                "Left /music/alice/A/x.flac in the library of /music/alice: 2 items have that path"
+            )
+        );
+        // import_queue/mod.rs:33 WORKER_STOPPED, what ImportQueue::forget reports for a worker that went away.
+        assert_eq!(
+            forget_note(&ForgetOutcome::Failed("import worker stopped".into()), p, l).as_deref(),
+            Some("Could not remove /music/alice/A/x.flac from the library of /music/alice: import worker stopped")
         );
     }
 

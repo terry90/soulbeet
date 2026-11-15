@@ -7,6 +7,8 @@ use dioxus::logger::tracing::{info, warn};
 #[cfg(feature = "server")]
 use crate::core::database_failure;
 #[cfg(feature = "server")]
+use crate::core::delete_guard::Origin;
+#[cfg(feature = "server")]
 use crate::core::folders::folder_not_found;
 #[cfg(feature = "server")]
 use crate::folder_policy::{
@@ -15,7 +17,7 @@ use crate::folder_policy::{
 #[cfg(feature = "server")]
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
 #[cfg(feature = "server")]
-use crate::models::deletion_review::DeletionReviewRow;
+use crate::models::deletion_review::{DeletionRecord, DeletionReviewRow};
 #[cfg(feature = "server")]
 use crate::models::discovery_history::DiscoveryHistoryRow;
 #[cfg(feature = "server")]
@@ -31,7 +33,7 @@ use crate::AuthSession;
 #[cfg(feature = "server")]
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 #[cfg(feature = "server")]
-use shared::navidrome::{DiscoveryStatus, DiscoveryTrack};
+use shared::navidrome::{DeletionReason, DiscoveryStatus, DiscoveryTrack};
 #[cfg(feature = "server")]
 use soulbeet::ForgetOutcome;
 #[cfg(feature = "server")]
@@ -141,16 +143,24 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
                                         folder,
                                         path.clone(),
                                     ));
-                                    DeletionReviewRow::upsert(
-                                        &song.id,
-                                        &song.title,
-                                        song.artist.as_deref().unwrap_or("Unknown"),
-                                        song.album.as_deref().unwrap_or("Unknown"),
-                                        Some(&path.to_string_lossy()),
-                                        song.user_rating,
-                                        user_id,
+                                    let mut tx =
+                                        crate::db::DB.begin().await.map_err(|e| e.to_string())?;
+                                    DeletionReviewRow::insert_in(
+                                        &mut tx,
+                                        &DeletionRecord {
+                                            user_id,
+                                            song_id: &song.id,
+                                            title: &song.title,
+                                            artist: song.artist.as_deref().unwrap_or("Unknown"),
+                                            album: song.album.as_deref().unwrap_or("Unknown"),
+                                            path: &path.to_string_lossy(),
+                                            rating: song.user_rating,
+                                            origin: Origin::Auto.as_str(),
+                                            reason: DeletionReason::Disliked,
+                                        },
                                     )
                                     .await?;
+                                    tx.commit().await.map_err(|e| e.to_string())?;
                                     deleted_tracks += 1;
                                 }
                                 AutoDelete::Kept => {}
@@ -251,7 +261,7 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
 
 #[get("/api/navidrome/deletion-history", auth: AuthSession)]
 pub async fn get_deletion_history() -> Result<Vec<DeletionReview>, ServerFnError> {
-    DeletionReviewRow::get_history(&auth.0.user_id, 50)
+    DeletionReviewRow::history(&auth.0.user_id, 50)
         .await
         .map_err(server_error)
 }

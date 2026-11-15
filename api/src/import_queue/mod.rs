@@ -214,6 +214,8 @@ struct Shared {
     retries: RetryStore,
 }
 
+/// A handle on the queue; clones share it.
+#[derive(Clone)]
 pub struct ImportQueue {
     shared: Arc<Shared>,
 }

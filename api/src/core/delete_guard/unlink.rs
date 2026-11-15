@@ -1,6 +1,10 @@
 //! A file's identity, taken when it is checked and compared when it is removed.
 
+use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::io::Errno;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path};
 
 /// What makes a file the one that was checked: the same inode, size and modification time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,4 +27,63 @@ impl FileId {
             mtime_nsec: meta.mtime_nsec(),
         }
     }
+
+    /// The identity in `stat`, cast as std casts the same fields (std::os::linux::fs::MetadataExt).
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "the widths of struct stat's fields differ between targets"
+    )]
+    fn of_stat(stat: &rustix::fs::Stat) -> FileId {
+        FileId {
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+            size: stat.st_size as u64,
+            mtime: stat.st_mtime as i64,
+            mtime_nsec: stat.st_mtime_nsec as i64,
+        }
+    }
+}
+
+/// Why a file was not removed.
+pub(super) enum UnlinkError {
+    /// The path no longer leads, without a symbolic link, to the file that was checked.
+    Changed,
+    Io(std::io::Error),
+}
+
+impl From<Errno> for UnlinkError {
+    fn from(e: Errno) -> UnlinkError {
+        match e {
+            Errno::LOOP | Errno::NOTDIR | Errno::NOENT => UnlinkError::Changed,
+            e => UnlinkError::Io(e.into()),
+        }
+    }
+}
+
+/// Opens every directory of `path` from "/" with O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC, stats the last
+/// component with AT_SYMLINK_NOFOLLOW, and unlinks it only when its identity is `expected`.
+/// A symlinked component (ELOOP, ENOTDIR), a missing one (ENOENT) or another identity is Changed.
+pub(super) fn unlink_if_same(path: &Path, expected: FileId) -> Result<(), UnlinkError> {
+    let canonical = path.is_absolute()
+        && path
+            .components()
+            .skip(1)
+            .all(|c| matches!(c, Component::Normal(_)));
+    let (true, Some(parent), Some(name)) = (canonical, path.parent(), path.file_name()) else {
+        return Err(UnlinkError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a canonical path to a file", path.display()),
+        )));
+    };
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir: OwnedFd = rustix::fs::open("/", flags, Mode::empty())?;
+    for child in parent.iter().skip(1) {
+        dir = rustix::fs::openat(&dir, child, flags, Mode::empty())?;
+    }
+    let stat = rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileId::of_stat(&stat) != expected {
+        return Err(UnlinkError::Changed);
+    }
+    rustix::fs::unlinkat(&dir, name, AtFlags::empty())?;
+    Ok(())
 }
