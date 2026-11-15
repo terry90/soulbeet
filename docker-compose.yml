@@ -9,8 +9,12 @@ services:
       - DATABASE_URL=sqlite:/data/soulbeet.db
       # This path must match the volume mapping for downloads inside the container
       - DOWNLOAD_PATH=/downloads
-      # Required. Put it in a .env file next to this one: echo "SECRET_KEY=$(openssl rand -hex 32)" > .env
-      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY to at least 32 random bytes, for example openssl rand -hex 32}
+      # Optional. Unset, a key is generated on the first start and stored in
+      # /data/secret.key next to the database: back it up with the database.
+      # To set your own, put SECRET_KEY in a .env file next to this one
+      # (at least 32 random bytes, for example openssl rand -hex 32).
+      # Passed on only when it is set.
+      - SECRET_KEY
       - NAVIDROME_URL=http://localhost:4533 # Your Navidrome server URL
       # - BEETS_CONFIG=/config/config.yaml # Needs the ./beets:/config volume below
     volumes:

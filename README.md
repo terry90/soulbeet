@@ -53,7 +53,8 @@ services:
     environment:
       - DATABASE_URL=sqlite:/data/soulbeet.db
       - DOWNLOAD_PATH=/downloads
-      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env, see step 2}
+      # Optional, see step 2. Passed on only when it is set.
+      - SECRET_KEY
       - NAVIDROME_URL=http://navidrome:4533
       # Optional
       - BEETS_CONFIG=/config/config.yaml
@@ -87,10 +88,10 @@ services:
       - "5030:5030"
 ```
 
-2.  Generate the secret key that signs sessions. It goes in a `.env` file next to `docker-compose.yml`, and Compose refuses to start without it. Keep this value: changing it later signs everyone out and makes the stored Navidrome passwords unreadable until each user signs in again.
+2.  The secret key that signs sessions and encrypts stored Navidrome passwords is optional. Without `SECRET_KEY`, Soulbeet generates one on the first start and stores it in `secret.key` next to the database (in the `./data` volume above). Back up that file together with the database: losing or changing the key signs everyone out and makes the stored Navidrome passwords unreadable until each user signs in again. To set your own key instead, put a random value of at least 32 bytes in a `.env` file next to `docker-compose.yml` (a shorter key works, but Settings > Config lists it under Security Checks). Skip this if your `.env` already sets `SECRET_KEY`; the command adds a line and keeps whatever the file already holds:
 
 ```bash
-echo "SECRET_KEY=$(openssl rand -hex 32)" > .env
+echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env
 ```
 
 3.  Seed the beets config. `BEETS_CONFIG` replaces the config shipped in the image, so start from a copy of it. Use the same tag as the `image:` line above, since the shipped `plugins:` line depends on the tier (see [Image Tiers](#image-tiers)), and copy it again after you change tier:
@@ -113,7 +114,7 @@ docker-compose up -d
 
 ### Initial Setup
 
-A fresh install has one account, `admin` with the password `admin`. It is the only admin: Settings > Users, Settings > Config and the folder administration in Settings > Library are shown to admins only.
+A fresh install has one account, `admin` with the password `admin`. It is the only admin. Everyone sees the Settings tabs, but only admins see user management in Settings > Users, the slskd settings and Security Checks in Settings > Config, and the folder administration in Settings > Library.
 
 1.  Open `http://localhost:9765` and sign in as `admin` / `admin`, with or without Navidrome.
 2.  In **Settings > Users**, change the admin password. Until you do, Settings > Config lists it under Security Checks.
@@ -122,7 +123,7 @@ A fresh install has one account, `admin` with the password `admin`. It is the on
 5.  Let the other users in:
     - **With Navidrome** (`NAVIDROME_URL` set): everyone signs in with their **Navidrome credentials**, and their Soulbeet account is created on the first sign-in. To make your own Navidrome account an admin, sign in with it once, then sign in as `admin` and click **Make admin** next to it in Settings > Users.
     - **Without Navidrome**: create the accounts in Settings > Users.
-6.  Users who are not admins can only add folders inside a folder root an admin approved. Add one under **Approved Folder Roots** in Settings > Library, for example `/music`, so a user can add `/music/alice`. The root itself cannot be anyone's folder. If one of your own folders is that root (an admin folder at `/music`), tick **Shared** next to it, or every folder inside it is refused as being inside another user's folder.
+6.  Users who are not admins can only add folders inside a folder root an admin approved. Add one under **Approved Folder Roots** in Settings > Library, for example `/music`, so a user can add `/music/alice`. The root itself cannot be the folder of a user who is not an admin. If one of your own folders is that root (an admin folder at `/music`), tick **Shared** next to it, or every folder inside it is refused as being inside another user's folder.
 7.  That's it. Search for something and download it.
 
 For discovery (optional): add your Last.fm API key and/or ListenBrainz token in Settings > Library, enable discovery on a folder, pick your profiles, and hit Generate.
@@ -135,7 +136,7 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 |----------|-------------|---------|
 | `DATABASE_URL` | Connection string for SQLite | `sqlite:soulbeet.db` |
 | `DOWNLOAD_PATH` | Path where slskd saves downloads | `/downloads` |
-| `SECRET_KEY` | Signs sessions and encrypts stored Navidrome passwords. Use at least 32 random bytes (`openssl rand -hex 32`). Changing it makes stored Navidrome passwords unreadable until each user signs in again | |
+| `SECRET_KEY` | Signs sessions and encrypts stored Navidrome passwords. Optional: when unset, a key is generated on the first start and stored in `secret.key` next to the database, where it is read on later starts. A key you set wins over that file; use at least 32 random bytes (`openssl rand -hex 32`), since Security Checks lists a shorter one. Changing the key signs everyone out and makes stored Navidrome passwords unreadable until each user signs in again | generated |
 | `NAVIDROME_URL` | Your Navidrome server URL. Optional: without it you log in with local accounts, and discovery playlists, rating sync and auto-delete are unavailable | |
 | `REGISTRATION` | Who can create accounts: `navidrome` (accounts appear when a Navidrome user signs in), `admin` (only an admin creates accounts), `open` (anyone can register) | `navidrome` with `NAVIDROME_URL`, else `admin` |
 | `BEETS_CONFIG` | Path to your beets config file. Replaces the shipped `/app/beets_config.yaml` (beets defaults still apply underneath) | `beets_config.yaml` |
@@ -144,7 +145,9 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
-**Note**: Local passwords always work. If Navidrome rejects your credentials or can't be reached, Soulbeet checks the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. A Navidrome login only takes over an existing Soulful account that is already linked to Navidrome or whose Soulful password is the same.
+**Note**: For an account linked to Navidrome, Navidrome decides: if it rejects your credentials, the sign-in is refused. Only while Navidrome cannot be reached (or `NAVIDROME_URL` is not set) does Soulbeet check the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. Accounts not linked to Navidrome sign in with their Soulbeet password. A Navidrome login only takes over an existing Soulful account that is already linked to Navidrome or whose Soulful password is the same.
+
+**Note**: Usernames are unique without regard to letter case, so `Bob` and `bob` are the same name.
 
 **Note**: Users who are not admins can only add library folders inside a root an admin approved in Settings > Library, never at the root itself.
 
@@ -155,7 +158,10 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 The release that adds admin roles changes a few things on the first start:
 
 -   **Everyone is signed out once.** Sessions from earlier versions are no longer accepted. Sign in again.
--   **The seeded `admin` account is the only admin.** If it was deleted, the oldest account becomes admin instead. Every other account, Navidrome accounts included, becomes a plain user and no longer sees Settings > Users, Settings > Config or the folder administration. Sign in as `admin` and click **Make admin** next to your own account in Settings > Users. If you no longer know the admin password and no other admin exists, nothing in the app gives the role back: stop Soulbeet and run `sqlite3 soulbeet.db "UPDATE users SET role = 'admin' WHERE username = 'yourname'"` on the database file (in the `./data` volume of the Quick Start).
+-   **The seeded `admin` account is the only admin.** If it was deleted, the oldest account becomes admin instead. Every other account, Navidrome accounts included, becomes a plain user and no longer sees user management, the slskd settings, Security Checks or the folder administration. Sign in as `admin` and click **Make admin** next to your own account in Settings > Users. If you no longer know the admin password and no other admin exists, nothing in the app gives the role back: stop Soulbeet and run `sqlite3 soulbeet.db "UPDATE users SET role = 'admin' WHERE username = 'yourname'"` on the database file (in the `./data` volume of the Quick Start).
+-   **A generated secret key replaces the built-in one.** An install that ran without `SECRET_KEY` used a key built into Soulbeet. That key is gone: on the first start Soulbeet generates a key and stores it in `secret.key` next to the database. Everyone is signed out, and stored Navidrome passwords cannot be read any more, so each user is asked to sign in again once. Back up `secret.key` with the database from now on. An install that sets `SECRET_KEY` keeps it.
+-   **Usernames ignore letter case.** Accounts whose names differ only in letter case (`bob` and `Bob`) cannot sign in. The startup log lists them; an admin deletes the ones that are not used in Settings > Users.
+-   **Signing out ends the session on the server**, so a copied cookie stops working too. Your other devices stay signed in.
 -   **Registration is closed.** `REGISTRATION` now defaults to `navidrome` with `NAVIDROME_URL` set and to `admin` without it. Set `REGISTRATION=open` to keep the old behaviour.
 -   **Folder roots.** The upgrade approves the parent directory of each existing admin folder, so an admin folder at `/music/main` approves `/music`. It never approves `/`, so a top-level admin folder such as `/music` approves nothing: add `/music` as a root and tick **Shared** on that folder before other users add folders inside it.
 -   **Folder conflicts.** Existing folders that are outside every root, or that equal, contain or sit inside another user's folder, are listed under Folder Conflicts in Settings > Library. They keep working and can still be renamed in place, but a move to another path has to pass the folder rules. To solve one, tick **Shared** on one of the folders, or delete a folder entry there (its files stay on disk).
