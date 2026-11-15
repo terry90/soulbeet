@@ -8,10 +8,25 @@ use super::panel::{
     ListRow, LoadError, Loading, Messages, Panel, SectionTitle, REMOVE_BUTTON_CLASS,
 };
 use crate::auth::use_auth;
-use crate::{friendly_error, FieldLook, TextInput};
+use crate::{friendly_error, ConfirmModal, FieldLook, TextInput};
 
 fn folder_label(label: &FolderLabel) -> String {
     format!("{}'s folder {}", label.owner, label.name)
+}
+
+/// What the Delete button asks before it removes another user's folder entry.
+fn delete_prompt(label: &FolderLabel) -> String {
+    format!(
+        "Delete {}? This removes only the folder entry, not its files.",
+        folder_label(label)
+    )
+}
+
+/// A folder the admin asked to delete, waiting for confirmation.
+#[derive(Clone, PartialEq)]
+struct PendingDelete {
+    id: String,
+    label: FolderLabel,
 }
 
 /// One line describing a conflict, naming the folders and their owners.
@@ -35,6 +50,7 @@ pub fn FolderAdminPanel() -> Element {
     let mut view = use_resource(move || async move { auth.call(get_folder_admin()).await });
     let mut new_root = use_signal(String::new);
     let mut error = use_signal(String::new);
+    let mut pending_delete = use_signal(|| None::<PendingDelete>);
 
     // Every change reloads the view, so the lists and conflicts stay current.
     let mut finish = move |result: Result<(), ServerFnError>| {
@@ -132,11 +148,14 @@ pub fn FolderAdminPanel() -> Element {
                                             button {
                                                 class: REMOVE_BUTTON_CLASS,
                                                 onclick: {
-                                                    let id = entry.folder.id.clone();
-                                                    move |_| {
-                                                        let id = id.clone();
-                                                        async move { finish(auth.call(delete_any_folder(id)).await) }
-                                                    }
+                                                    let pending = PendingDelete {
+                                                        id: entry.folder.id.clone(),
+                                                        label: FolderLabel {
+                                                            owner: entry.owner.clone(),
+                                                            name: entry.folder.name.clone(),
+                                                        },
+                                                    };
+                                                    move |_| pending_delete.set(Some(pending.clone()))
                                                 },
                                                 "Delete"
                                             }
@@ -161,6 +180,19 @@ pub fn FolderAdminPanel() -> Element {
                         }
                     }
                 },
+            }
+        }
+        if let Some(pending) = pending_delete() {
+            ConfirmModal {
+                message: delete_prompt(&pending.label),
+                confirm_label: "Delete",
+                danger: true,
+                on_confirm: move |_| {
+                    let id = pending.id.clone();
+                    pending_delete.set(None);
+                    spawn(async move { finish(auth.call(delete_any_folder(id)).await) });
+                },
+                on_cancel: move |_| pending_delete.set(None),
             }
         }
     }
@@ -190,6 +222,14 @@ mod tests {
         assert_eq!(
             conflict_text(&c),
             "bob's folder Bob is inside alice's folder Main"
+        );
+    }
+
+    #[test]
+    fn deleting_a_folder_asks_first_and_says_the_files_stay() {
+        assert_eq!(
+            delete_prompt(&label("bob", "Bob")),
+            "Delete bob's folder Bob? This removes only the folder entry, not its files."
         );
     }
 

@@ -70,23 +70,25 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
     };
 
     let mut downloads_signal = props.downloads;
-    let cancel_download = move |file: DownloadProgress| {
-        let req = CancelDownloadRequest {
-            id: file.id.clone(),
-            source: file.source.clone(),
-            item: file.item.clone(),
-            backend: file.backend.clone(),
-        };
-        let item_key = file.item.clone();
-        spawn(async move {
-            if api::cancel_download(req).await.is_ok() {
-                let mut map = downloads_signal.write();
-                if let Some(entry) = map.get_mut(&item_key) {
+    let cancel_download = use_callback(
+        move |file: DownloadProgress| -> Pin<Box<dyn Future<Output = Result<(), String>>>> {
+            let req = CancelDownloadRequest {
+                id: file.id.clone(),
+                source: file.source.clone(),
+                item: file.item.clone(),
+                backend: file.backend.clone(),
+            };
+            Box::pin(async move {
+                api::cancel_download(req)
+                    .await
+                    .map_err(|e| friendly_error(&e))?;
+                if let Some(entry) = downloads_signal.write().get_mut(&file.item) {
                     entry.state = DownloadState::Cancelled;
                 }
-            }
-        });
-    };
+                Ok(())
+            })
+        },
+    );
 
     let mut fail =
         move |item: &str, error: &ServerFnError, from_picker: bool| match downloads_signal

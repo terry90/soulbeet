@@ -93,6 +93,18 @@ fn reason(row: &DownloadProgress) -> Option<(&'static str, &str)> {
     row.error.as_deref().map(|note| (class, note))
 }
 
+/// The row's note line: its reason, else why the last cancel was refused.
+fn note<'a>(
+    row: &'a DownloadProgress,
+    cancel_refusal: Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
+    reason(row).or_else(|| cancel_refusal.map(|refusal| ("text-red-400", refusal)))
+}
+
+/// Cancels the row's transfer. Resolves to why the server refused, if it did.
+pub type CancelHandler =
+    Callback<DownloadProgress, Pin<Box<dyn Future<Output = Result<(), String>>>>>;
+
 /// Imports the row's item again the way the choice says. Resolves to Ok once
 /// the server accepted it.
 pub type ImportHandler =
@@ -120,7 +132,7 @@ fn shows_choices(row: &DownloadProgress) -> bool {
 #[component]
 pub fn DownloadItem(
     file: DownloadProgress,
-    on_cancel: EventHandler<DownloadProgress>,
+    on_cancel: CancelHandler,
     on_import: ImportHandler,
     on_load_choices: ChoicesLoader,
 ) -> Element {
@@ -129,9 +141,12 @@ pub fn DownloadItem(
     let mut busy = use_signal(|| false);
     // Why the picker's last load or pick failed, shown in the picker.
     let mut picker_notice = use_signal(|| None::<String>);
+    // Why the last cancel was refused, on the note line.
+    let mut cancel_refusal = use_signal(|| None::<String>);
     use_effect(use_reactive(&file.state, move |_| {
         busy.set(false);
         picker_notice.set(None);
+        cancel_refusal.set(None);
     }));
     let item = file.item.clone();
     let import = use_callback(move |choice: ImportChoice| {
@@ -152,7 +167,8 @@ pub fn DownloadItem(
     });
 
     let state = &file.state;
-    let note = reason(&file);
+    let refusal = cancel_refusal();
+    let note = note(&file, refusal.as_deref());
     let is_cancellable = matches!(state, DownloadState::Queued | DownloadState::InProgress);
     let Badge {
         title: status_text,
@@ -198,7 +214,10 @@ pub fn DownloadItem(
                   title: "Cancel download",
                   onclick: move |evt: Event<MouseData>| {
                       evt.stop_propagation();
-                      on_cancel.call(file_clone.clone());
+                      let file = file_clone.clone();
+                      spawn(async move {
+                          cancel_refusal.set(on_cancel.call(file).await.err());
+                      });
                   },
                   "\u{00d7}"
                 }
@@ -355,6 +374,24 @@ mod tests {
         assert_eq!(
             reason(&with_error(DownloadState::InProgress, Some("stale"))),
             None
+        );
+    }
+
+    #[test]
+    fn a_refused_cancel_shows_on_the_note_line() {
+        let running = row(DownloadState::InProgress, None);
+        assert_eq!(
+            note(&running, Some("Download not found")),
+            Some(("text-red-400", "Download not found"))
+        );
+        assert_eq!(note(&running, None), None);
+        let failed = DownloadProgress {
+            error: Some("beets exited with code 1".into()),
+            ..row(DownloadState::Failed("x".into()), None)
+        };
+        assert_eq!(
+            note(&failed, Some("Download not found")),
+            Some(("text-red-400", "beets exited with code 1"))
         );
     }
 
