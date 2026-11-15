@@ -30,7 +30,7 @@ use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
 use retry::{keeps_retry, RetryStore};
-use rows::{rows_for_done, rows_with_state};
+use rows::{row_with_state, rows_for_done, rows_with_state};
 
 const WORKER_STOPPED: &str = "import worker stopped";
 
@@ -68,6 +68,7 @@ impl ImportJob {
             album: matches!(self.mode, ImportMode::Album),
             cleanup_root: self.cleanup_root.clone(),
             choices: self.choices.as_deref().cloned(),
+            choice: self.choice.clone(),
             // The writer ignores a row without a job, so none is stored.
             rows: owner
                 .rows
@@ -77,7 +78,7 @@ impl ImportJob {
         })
     }
 
-    /// The job `stored` describes, choice Auto, reporting to `user` through its rows (jobs set).
+    /// The job `stored` describes, reporting to `user` through its rows (jobs set).
     pub fn from_stored(stored: StoredImport, user: UserId) -> ImportJob {
         ImportJob {
             sources: stored.sources,
@@ -96,13 +97,13 @@ impl ImportJob {
             }),
             snapshot_target: false,
             cleanup_root: stored.cleanup_root,
-            choice: DriverChoice::Auto,
+            choice: stored.choice,
             choices: stored.choices.map(Arc::new),
         }
     }
 
     /// Whether the job's sources still hold an audio file to import.
-    async fn holds_audio(&self) -> bool {
+    pub(crate) async fn holds_audio(&self) -> bool {
         let sources: Vec<&Path> = self.sources.iter().map(PathBuf::as_path).collect();
         count_audio_files(&sources).await > 0
     }
@@ -312,10 +313,7 @@ impl ImportQueue {
                 // the worker records for this job.
                 if let Some(mut import) = waiting.job.stored() {
                     for (_, row) in &mut import.rows {
-                        *row = row
-                            .clone()
-                            .without_failure()
-                            .with_state(DownloadState::ImportQueued(position));
+                        *row = row_with_state(row.clone(), DownloadState::ImportQueued(position));
                     }
                     self.shared
                         .deps
@@ -1152,19 +1150,26 @@ mod tests {
             &["a", "b"],
         );
         original.mode = ImportMode::Album;
+        // A retry the user chose a match for.
+        original.choice = DriverChoice::Pick {
+            data_source: "MusicBrainz".into(),
+            id: "c2b1f1c4-6c7f-4a77-8a44-4c3e0b8a9b11".into(),
+        };
         let rebuilt = ImportJob::from_stored(original.stored().unwrap(), alice());
         assert_eq!(
             (
                 &rebuilt.sources,
                 &rebuilt.target,
                 rebuilt.mode,
-                &rebuilt.cleanup_root
+                &rebuilt.cleanup_root,
+                &rebuilt.choice
             ),
             (
                 &original.sources,
                 &original.target,
                 original.mode,
-                &original.cleanup_root
+                &original.cleanup_root,
+                &original.choice
             )
         );
         let rows = |j: ImportJob| {

@@ -93,12 +93,14 @@ pub fn key(backend: &Arc<dyn DownloadBackend>, peer: &str, filename: &str) -> Tr
 pub const STUB_IN_FLIGHT: &str = "stub is already fetching this file";
 
 /// What a scripted `download` call does: accept the item (transfer id
-/// `t-{item.id}`), refuse it because the backend is already fetching it
+/// `t-{item.id}`), accept another file of the item's peer instead (transfer
+/// id `t-{file}`), refuse it because the backend is already fetching it
 /// (cause `STUB_IN_FLIGHT`), accept the call but mark the item rejected
 /// (peer offline), accept the call but answer nothing for the item, or fail
 /// the call itself (transport error).
 pub enum ScriptedOutcome {
     Enqueued,
+    EnqueuedAs(&'static str),
     AlreadyInFlight,
     Rejected,
     Unanswered,
@@ -289,6 +291,13 @@ impl DownloadBackend for StubBackend {
         };
         match outcome {
             ScriptedOutcome::Enqueued => answer(format!("t-{}", item.id), EnqueueStatus::Enqueued),
+            ScriptedOutcome::EnqueuedAs(file) => Ok(vec![QueuedDownload {
+                id: format!("t-{file}"),
+                source: item.source.clone(),
+                item: file.to_string(),
+                size: item.size.unwrap_or(0),
+                status: EnqueueStatus::Enqueued,
+            }]),
             ScriptedOutcome::AlreadyInFlight => answer(
                 item.id.clone(),
                 EnqueueStatus::AlreadyInFlight(Cause::new(Service::Slskd, None, STUB_IN_FLIGHT)),

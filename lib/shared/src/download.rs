@@ -252,7 +252,12 @@ impl DownloadProgress {
     }
 
     pub fn failed(id: String, source: String, item: String, failure: Failure) -> Self {
-        Self::queued(id, source, item, 0)
+        Self::queued(id, source, item, 0).failed_with(failure)
+    }
+
+    /// This row Failed with `failure`, any earlier failure or skip dropped.
+    pub fn failed_with(self, failure: Failure) -> Self {
+        self.without_failure()
             .with_state(DownloadState::Failed(String::new()))
             .with_failure(failure)
     }
@@ -510,6 +515,38 @@ mod tests {
     use super::*;
     use crate::failure::{FailureCode, RetryAdvice, Stage};
     use crate::metadata::Provider;
+
+    #[test]
+    fn a_row_failed_with_a_failure_keeps_no_earlier_one() {
+        let earlier = Failure::new(
+            FailureCode::ImportNoMatch,
+            Stage::Import,
+            RetryAdvice::NeedsDecision,
+            "beets found no matches.",
+        );
+        let now = Failure::new(
+            FailureCode::ImportFilesGone,
+            Stage::Import,
+            RetryAdvice::NotRetryable,
+            "The kept files are gone",
+        );
+        let kept = DownloadProgress {
+            skip: Some(SkipKind::NoMatch { candidates: None }),
+            ..DownloadProgress::queued("t-1".into(), "p".into(), "1.flac".into(), 4)
+                .with_state(DownloadState::ImportSkipped)
+                .with_failure(earlier)
+        };
+        let failed = kept.failed_with(now.clone());
+        assert_eq!(
+            (failed.state, failed.error, failed.failure, failed.skip),
+            (
+                DownloadState::Failed("The kept files are gone".into()),
+                Some("The kept files are gone".into()),
+                Some(now),
+                None
+            )
+        );
+    }
 
     #[test]
     fn an_album_query_names_the_provider_of_its_id() {

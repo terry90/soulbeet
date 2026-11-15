@@ -142,6 +142,18 @@ impl SourcePool {
         backend: &Arc<dyn DownloadBackend>,
         batch: &BatchRef,
     ) -> NextSource {
+        self.enqueue_next_noting(slot, backend, batch, |_| {}).await
+    }
+
+    /// `enqueue_next`, calling `sending` with each alternate just before it
+    /// is sent to the backend.
+    pub async fn enqueue_next_noting(
+        &mut self,
+        slot: usize,
+        backend: &Arc<dyn DownloadBackend>,
+        batch: &BatchRef,
+        mut sending: impl FnMut(&DownloadableItem),
+    ) -> NextSource {
         let mut refused = Vec::new();
         while let Some(item) = self.take_next(slot) {
             let (source, id) = (item.source.clone(), item.id.clone());
@@ -150,6 +162,7 @@ impl SourcePool {
             let failure = if claim.claimed.is_empty() {
                 held_failure(&claim, batch)
             } else {
+                sending(&item);
                 match enqueue_claimed(backend, vec![item.clone()], batch).await {
                     Ok(queued) => {
                         if let Some(ok) =

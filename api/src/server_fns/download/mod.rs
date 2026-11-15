@@ -133,8 +133,10 @@ pub async fn download_updates_ws(
         }
     };
 
-    // Read after subscribing, so no row sent meanwhile is lost; a row sent both ways is the same
-    // row twice, which the panel's map keeps once.
+    // Read after subscribing, so a row sent from here on arrives live; one sent both ways is the
+    // same row twice, which the panel's map keeps once. The ledger is written behind the sends,
+    // so a change sent just before the subscribe can be missing from this read too: the panel
+    // then shows the slot's stored row until its next one.
     let rows = match crate::ledger::store::open_rows(&crate::db::DB, &user).await {
         Ok(rows) => rows,
         Err(e) => {

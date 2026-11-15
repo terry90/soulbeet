@@ -15,7 +15,7 @@ use soulbeet::navidrome::models::NativeSong;
 use soulbeet::navidrome::{NavidromeClient, ScanStatus};
 use soulbeet::NavidromeError;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,12 +32,17 @@ pub(crate) enum Step {
     Fail(Failure),
 }
 
-/// What to do with an import, given the scan status just read and whether its items were found (D8):
-/// scanning: Wait unchanged; found: Listed; no baseline: StartScan with the baseline set from
-/// status (last_scan, last_start); ended_after(baseline.last_scan): Fail(not_found_after_scan);
-/// last_start later than baseline.started and error set: Fail(scan_failed(&error));
-/// INDEX_GIVE_UP_SECS since `since`: Fail(no_scan_possible); else Wait unchanged.
-pub(crate) fn next_step(wait: &IndexWait, status: &ScanStatus, found: bool, now: i64) -> Step {
+/// Whether a wait held since `since` gave up at `now`.
+fn given_up(since: i64, now: i64) -> bool {
+    now - since >= INDEX_GIVE_UP_SECS
+}
+
+/// What to do with an import, given the scan status just read, whether its items were found and
+/// whether the wait gave up (D8): scanning: Wait unchanged; found: Listed; no baseline: StartScan
+/// with the baseline set from status (last_scan, last_start); ended_after(baseline.last_scan):
+/// Fail(not_found_after_scan); last_start later than baseline.started and error set:
+/// Fail(scan_failed(&error)); gave up: Fail(no_scan_possible); else Wait unchanged.
+pub(crate) fn next_step(wait: &IndexWait, status: &ScanStatus, found: bool, gave_up: bool) -> Step {
     // None while Navidrome scans: a scan already running may have walked past the file.
     let Some(started) = status.last_start() else {
         return Step::Wait(wait.clone());
@@ -61,7 +66,7 @@ pub(crate) fn next_step(wait: &IndexWait, status: &ScanStatus, found: bool, now:
         Some(baseline) if started > baseline.started && !status.error.is_empty() => {
             Step::Fail(scan_failed(&status.error))
         }
-        _ if now - wait.since >= INDEX_GIVE_UP_SECS => Step::Fail(no_scan_possible()),
+        _ if gave_up => Step::Fail(no_scan_possible()),
         _ => Step::Wait(wait.clone()),
     }
 }
@@ -70,13 +75,20 @@ pub(crate) fn next_step(wait: &IndexWait, status: &ScanStatus, found: bool, now:
 /// the shorter of the two paths, by components, ends the longer, and the sizes are equal.
 pub(crate) fn is_imported_file(song: &NativeSong, item: &Path, size: u64) -> bool {
     let listed = Path::new(&song.path);
-    song.size == size && (listed.ends_with(item) || item.ends_with(listed))
+    // Every path ends with the empty one.
+    let named = |path: &Path| path.components().next().is_some();
+    named(listed)
+        && named(item)
+        && song.size == size
+        && (listed.ends_with(item) || item.ends_with(listed))
 }
 
 /// Whether every item of `wait` is listed: each looked up by its recording MBID, then by
 /// "{artist} {title}" (D7), paging LOOKUP_PAGE at a time until a short page or a match, each
 /// candidate checked with is_imported_file against the size of wait.library.join(item.path) on
-/// disk. An item whose file cannot be read is not listed.
+/// disk. An item whose file cannot be read is not listed. A text with no letter or digit is not
+/// looked up: Navidrome drops a filter that sanitizes to nothing and lists every song
+/// (persistence/sql_search.go:62-66, sql_restful.go:31-35).
 pub(crate) async fn listed(
     navi: &NavidromeClient,
     wait: &IndexWait,
@@ -89,7 +101,8 @@ pub(crate) async fn listed(
             .recording_mbid
             .iter()
             .cloned()
-            .chain([format!("{} {}", item.artist, item.title)]);
+            .chain([format!("{} {}", item.artist, item.title)])
+            .filter(|text| text.chars().any(char::is_alphanumeric));
         let mut found = false;
         for text in texts {
             if lists(navi, &text, &item.path, file.len()).await? {
@@ -180,16 +193,23 @@ impl NavidromeOf for ServerNavidrome {
 
 /// What a runner holds between rounds, by slot: the wait as it last persisted it, or None once
 /// the slot ended (Done or Failed), so a round never acts on an older copy its own write has not
-/// replaced in the database yet. A round drops the slots indexing_slots no longer returns.
+/// replaced in the database yet; when the runner first held it; and whether a failed scan request
+/// for it was logged. A round drops the slots indexing_slots no longer returns.
 #[derive(Default)]
 pub(crate) struct IndexRunner {
     waits: HashMap<JobSlot, Option<IndexWait>>,
+    /// On Soulful's clock. A wait a restart interrupted gets its give-up time from here.
+    held_since: HashMap<JobSlot, i64>,
+    scan_warned: HashSet<JobSlot>,
 }
 
 /// The slots of one import, waiting together, and the wait as the runner knows it.
 struct Import {
     wait: IndexWait,
     rows: Vec<DownloadProgress>,
+    /// The later of when the import ended and when the runner first held it: a downtime does not
+    /// count against the wait.
+    since: i64,
 }
 
 impl Import {
@@ -198,18 +218,26 @@ impl Import {
     }
 }
 
-/// One round at `now`: reads indexing_slots, groups them by user and import, and for each user asks
-/// `navidrome` for a client and reads the scan status once.
-/// NotLinked/NoServer: the slots are Done, rows unchanged (D9).
-/// Another lookup or status error: Wait, and Fail with e.failure(Stage::Index, e.to_string())
-/// once INDEX_GIVE_UP_SECS have passed.
-/// A slot the runner holds no wait for gets its row sent and recorded (Slots { Indexing }) with
-/// index Waiting. listed() runs when Navidrome is idle and its lastScan differs from `checked`
-/// (which it then becomes). StartScan calls start_scan; a refusal (Subsonic 50, `StartScan`'s
-/// ErrorAuthorizationFail, server/subsonic/library_scanning.go:43-44) leaves the wait to the watcher
-/// or a schedule. Another start_scan error keeps the wait without the new baseline, so the next
-/// idle round asks again, and fails it as a status error does once given up. Listed: rows with index Listed, Slots { Done }. Fail(f): rows with index
-/// Failed(f), Slots { Failed }. A changed wait: Indexing. Rows go out with send_user_event.
+/// One round at `now`: reads indexing_slots, groups them by user and import, and for each user
+/// asks `navidrome` for a client and reads the scan status once.
+///
+/// - A slot whose row or wait cannot be read ends failed (Unreadable), logged once.
+/// - NotLinked/NoServer: the slots are Done, rows unchanged (D9).
+/// - Another lookup or status error: Wait, and Fail with e.failure(Stage::Index, e.to_string())
+///   once INDEX_GIVE_UP_SECS have passed since the import's `since`, counted from no earlier
+///   than when the runner first held it.
+/// - A slot the runner holds no wait for gets its row sent and recorded (Slots { Indexing })
+///   with index Waiting.
+/// - listed() runs when Navidrome is idle and its lastScan differs from `checked` (which it
+///   then becomes).
+/// - StartScan: start_scan is called once for every import of the user that asks for it. A
+///   refusal (Subsonic 50, `StartScan`'s ErrorAuthorizationFail,
+///   server/subsonic/library_scanning.go:43-44) leaves the wait to the watcher or a schedule.
+///   Another start_scan error keeps the wait without the new baseline, so the next idle round
+///   asks again, and fails it as a status error does once given up; it is logged at warn once
+///   per wait, then at debug.
+/// - Listed: rows with index Listed, Slots { Done }. Fail(f): rows with index Failed(f),
+///   Slots { Failed }. A changed wait: Indexing. Rows go out with send_user_event.
 pub(crate) async fn index_round(
     db: &SqlitePool,
     ledger: &Ledger,
@@ -217,16 +245,28 @@ pub(crate) async fn index_round(
     runner: &mut IndexRunner,
     now: i64,
 ) {
-    let slots = match store::indexing_slots(db).await {
-        Ok(slots) => slots,
+    let store::Indexing { slots, unreadable } = match store::indexing_slots(db).await {
+        Ok(indexing) => indexing,
         Err(e) => {
             warn!("Could not read the imports waiting for Navidrome: {e}");
             return;
         }
     };
-    runner
-        .waits
-        .retain(|held, _| slots.iter().any(|s| &s.slot == held));
+    if !unreadable.is_empty() {
+        for (slot, e) in &unreadable {
+            warn!("Ending the wait for Navidrome of {slot:?}, which cannot be read: {e}");
+        }
+        ledger.record(JobEvent::Unreadable(
+            unreadable.into_iter().map(|(slot, _)| slot).collect(),
+        ));
+    }
+    let present = |held: &JobSlot| slots.iter().any(|s| &s.slot == held);
+    runner.waits.retain(|held, _| present(held));
+    runner.held_since.retain(|held, _| present(held));
+    runner.scan_warned.retain(present);
+    for slot in &slots {
+        runner.held_since.entry(slot.slot.clone()).or_insert(now);
+    }
     for (user, imports, new) in group(runner, slots) {
         let navi = match navidrome.navidrome_of(&user).await {
             Err(NavidromeLookupError::NotLinked | NavidromeLookupError::NoServer) => {
@@ -265,8 +305,15 @@ pub(crate) async fn index_round(
         };
         match read {
             Ok((navi, status)) => {
+                let mut scan = Vec::new();
                 for import in imports {
-                    advance(ledger, runner, &user, &navi, &status, import, now).await;
+                    let next = advance(ledger, runner, &user, &navi, &status, import, now).await;
+                    if let Some(asks) = next {
+                        scan.push(asks);
+                    }
+                }
+                if !scan.is_empty() {
+                    start_scan(ledger, runner, &user, &navi, scan, now).await;
                 }
             }
             Err(failure) => {
@@ -298,6 +345,9 @@ fn group(
             Some(Some(held)) => held.clone(),
             None => wait,
         };
+        let since = wait
+            .since
+            .max(runner.held_since.get(&slot).copied().unwrap_or(wait.since));
         let at = match users.iter().position(|(u, ..)| *u == user) {
             Some(at) => at,
             None => {
@@ -310,17 +360,30 @@ fn group(
             new.push(row.clone());
         }
         match imports.iter_mut().find(|i| i.wait.import == wait.import) {
-            Some(import) => import.rows.push(row),
+            Some(import) => {
+                import.since = import.since.max(since);
+                import.rows.push(row);
+            }
             None => imports.push(Import {
                 wait,
                 rows: vec![row],
+                since,
             }),
         }
     }
     users
 }
 
-/// Looks the import up when Navidrome scanned since it last did, and takes the next step.
+/// An import that asks for a scan: the wait it keeps once the scan is asked for, and the one it
+/// keeps when asking fails.
+struct ScanAsk {
+    import: Import,
+    started: IndexWait,
+    unasked: IndexWait,
+}
+
+/// Looks the import up when Navidrome scanned since it last did, and takes the next step. An
+/// import that asks for a scan is given back for start_scan.
 async fn advance(
     ledger: &Ledger,
     runner: &mut IndexRunner,
@@ -329,7 +392,7 @@ async fn advance(
     status: &ScanStatus,
     import: Import,
     now: i64,
-) {
+) -> Option<ScanAsk> {
     let mut wait = import.wait.clone();
     let mut found = false;
     if !status.scanning && wait.checked != Some(status.last_scan) {
@@ -341,53 +404,74 @@ async fn advance(
             Err(e) => {
                 let failure = e.failure(Stage::Index, e.to_string());
                 let held = import.wait.clone();
-                return give_up_after(ledger, runner, user, import, held, &failure, now).await;
+                give_up_after(ledger, runner, user, import, held, &failure, now).await;
+                return None;
             }
         }
     }
-    match next_step(&wait, status, found, now) {
+    match next_step(&wait, status, found, given_up(import.since, now)) {
         Step::Listed => {
-            end(
-                ledger,
-                runner,
-                user,
-                import,
-                JobState::Done,
-                Some(IndexState::Listed),
-            )
-            .await
+            let listed = Some(IndexState::Listed);
+            end(ledger, runner, user, import, JobState::Done, listed).await;
         }
         Step::Fail(f) => {
-            end(
-                ledger,
-                runner,
-                user,
-                import,
-                JobState::Failed,
-                Some(IndexState::Failed(f)),
-            )
-            .await
+            let failed = Some(IndexState::Failed(f));
+            end(ledger, runner, user, import, JobState::Failed, failed).await;
         }
-        Step::StartScan(started) => match navi.start_scan().await {
-            // A non-admin account is refused (Subsonic 50, server/subsonic/library_scanning.go:43-44):
-            // Navidrome's watcher or its schedule may still scan.
-            Ok(()) => keep(ledger, runner, import, started),
-            Err(NavidromeError::Subsonic {
-                code: NOT_AUTHORIZED,
-                ..
-            }) => {
-                debug!("Navidrome does not let {user} start a scan");
-                keep(ledger, runner, import, started);
-            }
-            // Any other error says nothing of the account: without the baseline the next idle
-            // round asks again.
-            Err(e) => {
-                warn!("Could not ask Navidrome to scan for {user}: {e}");
-                let failure = e.failure(Stage::Index, e.to_string());
-                give_up_after(ledger, runner, user, import, wait, &failure, now).await;
-            }
-        },
+        Step::StartScan(started) => {
+            return Some(ScanAsk {
+                import,
+                started,
+                unasked: wait,
+            })
+        }
         Step::Wait(wait) => keep(ledger, runner, import, wait),
+    }
+    None
+}
+
+/// Asks Navidrome for one scan for every import of `user` in `asks`, and keeps or gives up each
+/// wait by the answer.
+async fn start_scan(
+    ledger: &Ledger,
+    runner: &mut IndexRunner,
+    user: &UserId,
+    navi: &NavidromeClient,
+    asks: Vec<ScanAsk>,
+    now: i64,
+) {
+    match navi.start_scan().await {
+        Ok(()) => {
+            for ask in asks {
+                keep(ledger, runner, ask.import, ask.started);
+            }
+        }
+        // A non-admin account is refused (Subsonic 50, server/subsonic/library_scanning.go:43-44):
+        // Navidrome's watcher or its schedule may still scan.
+        Err(NavidromeError::Subsonic {
+            code: NOT_AUTHORIZED,
+            ..
+        }) => {
+            debug!("Navidrome does not let {user} start a scan");
+            for ask in asks {
+                keep(ledger, runner, ask.import, ask.started);
+            }
+        }
+        // Any other error says nothing of the account: without the baseline the next idle round
+        // asks again.
+        Err(e) => {
+            let slots: Vec<JobSlot> = asks.iter().flat_map(|ask| ask.import.slots()).collect();
+            if slots.iter().any(|slot| !runner.scan_warned.contains(slot)) {
+                warn!("Could not ask Navidrome to scan for {user}: {e}");
+            } else {
+                debug!("Could not ask Navidrome to scan for {user}: {e}");
+            }
+            runner.scan_warned.extend(slots);
+            let failure = e.failure(Stage::Index, e.to_string());
+            for ask in asks {
+                give_up_after(ledger, runner, user, ask.import, ask.unasked, &failure, now).await;
+            }
+        }
     }
 }
 
@@ -401,7 +485,7 @@ async fn give_up_after(
     failure: &Failure,
     now: i64,
 ) {
-    if now - import.wait.since >= INDEX_GIVE_UP_SECS {
+    if given_up(import.since, now) {
         let index = Some(IndexState::Failed(failure.clone()));
         end(ledger, runner, user, import, JobState::Failed, index).await;
     } else {
@@ -461,6 +545,7 @@ pub fn start() {
     tokio::spawn(async move {
         let mut runner = IndexRunner::default();
         let mut every = tokio::time::interval(INDEX_POLL);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             every.tick().await;
             index_round(
@@ -534,13 +619,13 @@ mod tests {
     fn a_scan_already_running_at_the_first_look_is_waited_out_and_not_believed() {
         let first = waiting(1_000);
         assert!(
-            matches!(next_step(&first, &status(true, "2026-11-15T10:00:00Z", 9, ""), false, 1_005), Step::Wait(w) if w == first)
+            matches!(next_step(&first, &status(true, "2026-11-15T10:00:00Z", 9, ""), false, given_up(1_000, 1_005)), Step::Wait(w) if w == first)
         );
         let Step::StartScan(started) = next_step(
             &first,
             &status(false, "2026-11-15T10:02:00Z", 4, ""),
             false,
-            1_010,
+            given_up(1_000, 1_010),
         ) else {
             panic!("the first idle look starts a scan")
         };
@@ -556,7 +641,7 @@ mod tests {
                 &started,
                 &status(false, "2026-11-15T10:02:00Z", 4, ""),
                 false,
-                1_015
+                given_up(1_000, 1_015)
             ),
             Step::Wait(_)
         ));
@@ -565,7 +650,7 @@ mod tests {
                 &started,
                 &status(false, "2026-11-15T10:03:00Z", 3, ""),
                 false,
-                1_080
+                given_up(1_000, 1_080)
             ) {
                 Step::Fail(f) => f,
                 _ => panic!("a later scan without the file"),
@@ -581,7 +666,7 @@ mod tests {
             &waiting(1_000),
             &status(false, "2026-11-15T10:02:00Z", -20, LOCKED),
             false,
-            1_005,
+            given_up(1_000, 1_005),
         ) else {
             panic!()
         };
@@ -590,7 +675,7 @@ mod tests {
                 &started,
                 &status(false, "2026-11-15T10:02:00Z", -20, LOCKED),
                 false,
-                1_010
+                given_up(1_000, 1_010)
             ),
             Step::Wait(_)
         ));
@@ -599,7 +684,7 @@ mod tests {
             &started,
             &status(false, "2026-11-15T10:02:00Z", -30, LOCKED),
             false,
-            1_015,
+            given_up(1_000, 1_015),
         ) else {
             panic!("a scan that began after the import failed")
         };
@@ -627,7 +712,7 @@ mod tests {
                 &started,
                 &status(false, "2026-11-15T10:02:00Z", 4, ""),
                 true,
-                1_010
+                given_up(1_000, 1_010)
             ),
             Step::Listed
         ));
@@ -636,7 +721,7 @@ mod tests {
                 &started,
                 &status(false, "2026-11-15T10:02:00Z", 4, ""),
                 false,
-                1_000 + INDEX_GIVE_UP_SECS - 1
+                given_up(1_000, 1_000 + INDEX_GIVE_UP_SECS - 1)
             ),
             Step::Wait(_)
         ));
@@ -644,7 +729,7 @@ mod tests {
             &started,
             &status(false, "2026-11-15T10:02:00Z", 4, ""),
             false,
-            1_000 + INDEX_GIVE_UP_SECS,
+            given_up(1_000, 1_000 + INDEX_GIVE_UP_SECS),
         ) else {
             panic!()
         };
@@ -787,6 +872,7 @@ mod tests {
                     import_mode: ImportMode::Singleton,
                     state: JobState::Queued,
                     search_id: None,
+                    picked: vec![],
                 },
                 None,
             )
@@ -872,7 +958,7 @@ mod tests {
         ledger.settled().await;
         assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Indexing));
         assert!(navi.asked().contains(&"/rest/startScan".to_string()));
-        let [slot] = &store::indexing_slots(&db).await.unwrap()[..] else {
+        let [slot] = &store::indexing_slots(&db).await.unwrap().slots[..] else {
             panic!()
         };
         assert_eq!(
@@ -914,7 +1000,7 @@ mod tests {
             ledger.settled().await;
         }
         assert_eq!(scans_asked(&navi), 1);
-        let [slot] = &store::indexing_slots(&db).await.unwrap()[..] else {
+        let [slot] = &store::indexing_slots(&db).await.unwrap().slots[..] else {
             panic!()
         };
         assert!(slot.wait.baseline.is_some());
@@ -942,7 +1028,7 @@ mod tests {
         )
         .await;
         ledger.settled().await;
-        let [slot] = &store::indexing_slots(&db).await.unwrap()[..] else {
+        let [slot] = &store::indexing_slots(&db).await.unwrap().slots[..] else {
             panic!()
         };
         assert_eq!(
@@ -965,7 +1051,7 @@ mod tests {
             &ledger,
             &Navidrome(Ok(navi.client())),
             &mut runner,
-            1_000 + INDEX_GIVE_UP_SECS,
+            1_005 + INDEX_GIVE_UP_SECS,
         )
         .await;
         ledger.settled().await;
@@ -1018,7 +1104,7 @@ mod tests {
             &ledger,
             &Navidrome(Ok(navi.client())),
             &mut runner,
-            1_000 + INDEX_GIVE_UP_SECS,
+            1_005 + INDEX_GIVE_UP_SECS,
         )
         .await;
         ledger.settled().await;
@@ -1028,5 +1114,156 @@ mod tests {
             matches!(failed, Some(IndexState::Failed(ref f)) if f.stage == Stage::Index && f.message.contains("Internal Error")),
             "{failed:?}"
         );
+    }
+
+    #[test]
+    fn an_empty_path_is_never_the_imported_file() {
+        let song = |path: &str| NativeSong {
+            id: "f2c4d1a8b0e94c37a6d5e8b1c2a3f405".into(),
+            path: path.into(),
+            title: "Song Number 1".into(),
+            size: 4,
+        };
+        let item = Path::new("Zzqx Artist/Qzz Album/01 Song Number 1.mp3");
+        assert!(!is_imported_file(&song(""), item, 4));
+        assert!(!is_imported_file(
+            &song("Zzqx Artist/Qzz Album/01 Song Number 1.mp3"),
+            Path::new(""),
+            4
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_item_without_a_tag_is_not_looked_up_by_text() {
+        let library = tempfile::tempdir().unwrap();
+        let mut wait = imported_in(library.path());
+        // Imported as-is from an untagged file: no MBID, artist or title.
+        wait.items[0] = ImportedItem {
+            recording_mbid: None,
+            artist: String::new(),
+            title: String::new(),
+            ..wait.items[0].clone()
+        };
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/api/song",
+            &[&song_json("Zzqx Artist/Qzz Album/01 Song Number 1.mp3", 4)],
+        );
+        assert!(!listed(&navi.client(), &wait).await.unwrap());
+        assert!(!navi.asked().contains(&"/api/song".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_wait_a_restart_interrupted_has_its_whole_time_again() {
+        let library = tempfile::tempdir().unwrap();
+        // The import ended long before this process started.
+        let (ledger, db, _rx, _) = indexing(IndexWait {
+            since: 0,
+            ..imported_in(library.path())
+        })
+        .await;
+        let navi = NavidromeStub::start();
+        let unreadable = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Internal Error"}}}"#;
+        navi.answer("/rest/getScanStatus", &[unreadable]);
+        let mut runner = IndexRunner::default();
+        for now in [50_000, 50_000 + INDEX_GIVE_UP_SECS - 1] {
+            index_round(
+                &db,
+                &ledger,
+                &Navidrome(Ok(navi.client())),
+                &mut runner,
+                now,
+            )
+            .await;
+            ledger.settled().await;
+            assert_eq!(
+                store::job_state(&db, "j1").await,
+                Some(JobState::Indexing),
+                "{now}"
+            );
+        }
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Ok(navi.client())),
+            &mut runner,
+            50_000 + INDEX_GIVE_UP_SECS,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
+    }
+
+    #[tokio::test]
+    async fn one_scan_is_asked_for_every_import_of_a_user() {
+        let library = tempfile::tempdir().unwrap();
+        let (ledger, db, _rx, _) = indexing(imported_in(library.path())).await;
+        // A second import of the same job's user, waiting on its own.
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 1,
+        };
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![(1, item("peer_a", "Song Number 2", "02.mp3"))],
+        });
+        ledger.record(JobEvent::Slots {
+            state: JobState::Indexing,
+            rows: vec![DownloadProgress::queued(
+                "t-02".into(),
+                "peer_a".into(),
+                "02.mp3".into(),
+                4,
+            )
+            .with_state(DownloadState::Imported)
+            .with_job(slot.clone())],
+        });
+        ledger.record(JobEvent::Indexing {
+            slots: vec![slot],
+            wait: Box::new(IndexWait {
+                import: "/downloads/Come Over [1f2e3d4c]/02.flac".into(),
+                ..imported_in(library.path())
+            }),
+        });
+        ledger.settled().await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        navi.answer("/api/song", &["[]"]);
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Ok(navi.client())),
+            &mut IndexRunner::default(),
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(scans_asked(&navi), 1);
+        let waits = store::indexing_slots(&db).await.unwrap().slots;
+        assert_eq!(waits.len(), 2);
+        assert!(waits.iter().all(|s| s.wait.baseline.is_some()));
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_cannot_be_read_ends_and_the_others_go_on() {
+        let library = tempfile::tempdir().unwrap();
+        let (ledger, db, _rx, _) = indexing(imported_in(library.path())).await;
+        sqlx::query("UPDATE job_tracks SET index_wait = '{' WHERE job_id = 'j1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let indexing = store::indexing_slots(&db).await.unwrap();
+        assert!(indexing.slots.is_empty());
+        assert_eq!(indexing.unreadable.len(), 1);
+        index_round(
+            &db,
+            &ledger,
+            &Navidrome(Err(|| NavidromeLookupError::NotLinked)),
+            &mut IndexRunner::default(),
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
     }
 }

@@ -1,5 +1,5 @@
 use dioxus::logger::tracing::{info, warn};
-use shared::download::{DownloadProgress, DownloadState};
+use shared::download::DownloadProgress;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction};
 use soulbeet::{DriverChoice, ImportMode};
 use std::collections::HashSet;
@@ -98,8 +98,7 @@ pub fn unresolved_row(row: DownloadProgress, base: &Path, why: Unresolved) -> Do
         Unresolved::NotOnDisk => failure.with_user_action(UserAction::fix_download_path(base)),
         Unresolved::Claimed => failure,
     };
-    row.with_state(DownloadState::Failed(String::new()))
-        .with_failure(failure)
+    row.failed_with(failure)
 }
 
 /// A finished slot whose file was found on disk. `destination` is the batch
@@ -175,6 +174,7 @@ pub fn album_jobs(
 mod tests {
     use super::*;
     use crate::import_queue::test_support::row;
+    use shared::download::DownloadState;
     use shared::failure::UserActionCode;
 
     #[test]

@@ -3,10 +3,12 @@
 
 use super::{
     job_state, ClaimedJob, ImportDone, JobEvent, JobState, LedgerError, NewJob, NewSearch, Pruned,
-    JOB_KEPT_SECS, SEARCH_KEPT_SECS, TERMINAL,
+    JOB_KEPT_SECS, SEARCH_KEPT_SECS, TERMINAL_SQL,
 };
 use crate::auth::UserId;
-use shared::download::{DownloadProgress, DownloadState, DownloadableGroup, IndexState, JobSlot};
+use shared::download::{
+    DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, IndexState, JobSlot,
+};
 use shared::failure::FailureCode;
 use soulbeet::ImportMode;
 use sqlx::{Sqlite, SqliteConnection, SqlitePool};
@@ -36,6 +38,7 @@ pub(super) enum Write {
         user: UserId,
         search_id: String,
         folder_id: String,
+        picked: Vec<(u32, DownloadableItem)>,
         reply: Reply<Option<ClaimedJob>>,
     },
     Prune {
@@ -73,13 +76,17 @@ pub(super) fn spawn(db: SqlitePool, mut inbox: mpsc::UnboundedReceiver<Write>) {
     });
 }
 
-/// What a slot's stored row is, as far as a new row of it is compared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a slot's stored row is, as far as a new row of it is compared. A row
+/// of another transfer is always stored: a failover or an adoption rebinds
+/// the slot, and a restart must find the transfer it rebound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RowKey {
     state: JobState,
     row: Discriminant<DownloadState>,
     failure: Option<FailureCode>,
     index: Option<Discriminant<IndexState>>,
+    /// The transfer's source and id.
+    transfer: (String, String),
 }
 
 impl RowKey {
@@ -89,8 +96,32 @@ impl RowKey {
             row: std::mem::discriminant(&row.state),
             failure: row.failure.as_ref().map(|f| f.code),
             index: row.index.as_ref().map(std::mem::discriminant),
+            transfer: (row.source.clone(), row.id.clone()),
         }
     }
+}
+
+/// Stores `items` as `job`'s slots, each queued with its candidate as its first attempt.
+async fn insert_slots(
+    tx: &mut SqliteConnection,
+    job: &str,
+    items: &[(u32, DownloadableItem)],
+) -> Result<(), LedgerError> {
+    for (slot, candidate) in items {
+        sqlx::query("INSERT INTO job_tracks (job_id, slot, state) VALUES (?, ?, ?)")
+            .bind(job)
+            .bind(slot)
+            .bind(JobState::Queued.as_str())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO job_attempts (job_id, slot, n, candidate) VALUES (?, ?, 1, ?)")
+            .bind(job)
+            .bind(slot)
+            .bind(serde_json::to_string(candidate)?)
+            .execute(&mut *tx)
+            .await?;
+    }
+    Ok(())
 }
 
 struct Writer {
@@ -125,11 +156,12 @@ impl Writer {
                 user,
                 search_id,
                 folder_id,
+                picked,
                 reply,
             } => answer(
                 reply,
                 "claim a job waiting for a source",
-                claim_source_choice(db, &user, &search_id, &folder_id).await,
+                claim_source_choice(db, &user, &search_id, &folder_id, &picked).await,
             ),
             Write::Prune { now, reply } => {
                 answer(reply, "remove expired rows", prune(db, now).await)
@@ -170,22 +202,7 @@ impl Writer {
                     .await?;
             }
             JobEvent::Picked { job, items } => {
-                for (slot, candidate) in items {
-                    sqlx::query("INSERT INTO job_tracks (job_id, slot, state) VALUES (?, ?, ?)")
-                        .bind(&job)
-                        .bind(slot)
-                        .bind(JobState::Queued.as_str())
-                        .execute(&mut *tx)
-                        .await?;
-                    sqlx::query(
-                        "INSERT INTO job_attempts (job_id, slot, n, candidate) VALUES (?, ?, 1, ?)",
-                    )
-                    .bind(&job)
-                    .bind(slot)
-                    .bind(serde_json::to_string(&candidate)?)
-                    .execute(&mut *tx)
-                    .await?;
-                }
+                insert_slots(&mut tx, &job, &items).await?;
                 jobs.insert(job);
             }
             JobEvent::Enqueued {
@@ -228,9 +245,10 @@ impl Writer {
                 for (slot, row) in &import.rows {
                     self.store_row(&mut tx, slot, JobState::Importing, row)
                         .await?;
-                    sqlx::query(
-                        "UPDATE job_tracks SET import_job = ? WHERE job_id = ? AND slot = ?",
-                    )
+                    sqlx::query(&format!(
+                        "UPDATE job_tracks SET import_job = ? \
+                         WHERE job_id = ? AND slot = ? AND state NOT IN {TERMINAL_SQL}"
+                    ))
                     .bind(&stored)
                     .bind(&slot.job)
                     .bind(slot.slot)
@@ -252,10 +270,10 @@ impl Writer {
                 let wait = index.map(|wait| serde_json::to_string(&wait)).transpose()?;
                 for (slot, _) in &import.rows {
                     self.set_slot(&mut tx, slot, next).await?;
-                    sqlx::query(
+                    sqlx::query(&format!(
                         "UPDATE job_tracks SET import_job = ?, index_wait = ? \
-                         WHERE job_id = ? AND slot = ?",
-                    )
+                         WHERE job_id = ? AND slot = ? AND state NOT IN {TERMINAL_SQL}"
+                    ))
                     .bind(&kept)
                     .bind(&wait)
                     .bind(&slot.job)
@@ -276,9 +294,10 @@ impl Writer {
                 let wait = serde_json::to_string(&*wait)?;
                 for slot in &slots {
                     self.set_slot(&mut tx, slot, JobState::Indexing).await?;
-                    sqlx::query(
-                        "UPDATE job_tracks SET index_wait = ? WHERE job_id = ? AND slot = ?",
-                    )
+                    sqlx::query(&format!(
+                        "UPDATE job_tracks SET index_wait = ? \
+                         WHERE job_id = ? AND slot = ? AND state NOT IN {TERMINAL_SQL}"
+                    ))
                     .bind(&wait)
                     .bind(&slot.job)
                     .bind(slot.slot)
@@ -293,20 +312,21 @@ impl Writer {
                     jobs.insert(slot.job.clone());
                 }
             }
+            JobEvent::Unreadable(slots) => {
+                for slot in &slots {
+                    self.set_slot(&mut tx, slot, JobState::Failed).await?;
+                    jobs.insert(slot.job.clone());
+                }
+            }
             JobEvent::Ended { job, state } => {
-                let terminal = vec!["?"; TERMINAL.len()].join(", ");
-                let end = format!(
-                    "UPDATE job_tracks SET state = ? WHERE job_id = ? AND state NOT IN ({terminal}) \
+                let ended: Vec<u32> = sqlx::query_scalar(&format!(
+                    "UPDATE job_tracks SET state = ? WHERE job_id = ? AND state NOT IN {TERMINAL_SQL} \
                      RETURNING slot"
-                );
-                let ended: Vec<u32> = TERMINAL
-                    .iter()
-                    .fold(
-                        sqlx::query_scalar(&end).bind(state.as_str()).bind(&job),
-                        |query, s| query.bind(s.as_str()),
-                    )
-                    .fetch_all(&mut *tx)
-                    .await?;
+                ))
+                .bind(state.as_str())
+                .bind(&job)
+                .fetch_all(&mut *tx)
+                .await?;
                 for slot in ended {
                     self.restate(
                         &JobSlot {
@@ -347,7 +367,8 @@ impl Writer {
     }
 
     /// Puts `slot` in `state` with `row` as its last row, unless that row
-    /// changes nothing the ledger keeps. Whether it changed the slot.
+    /// changes nothing the ledger keeps or the slot already ended: a slot in a
+    /// terminal state never moves again. Whether it changed the slot.
     async fn store_row(
         &mut self,
         tx: &mut SqliteConnection,
@@ -358,9 +379,10 @@ impl Writer {
         if !self.changes(slot, state, row) {
             return Ok(false);
         }
-        let stored = sqlx::query(
-            "UPDATE job_tracks SET state = ?, last_row = ? WHERE job_id = ? AND slot = ?",
-        )
+        let stored = sqlx::query(&format!(
+            "UPDATE job_tracks SET state = ?, last_row = ? \
+             WHERE job_id = ? AND slot = ? AND state NOT IN {TERMINAL_SQL}"
+        ))
         .bind(state.as_str())
         .bind(serde_json::to_string(row)?)
         .bind(&slot.job)
@@ -374,20 +396,26 @@ impl Writer {
         Ok(stored > 0)
     }
 
-    /// Puts `slot` in `state`, keeping its last row.
+    /// Puts `slot` in `state`, keeping its last row, unless it already ended.
     async fn set_slot(
         &mut self,
         tx: &mut SqliteConnection,
         slot: &JobSlot,
         state: JobState,
     ) -> Result<(), LedgerError> {
-        sqlx::query("UPDATE job_tracks SET state = ? WHERE job_id = ? AND slot = ?")
-            .bind(state.as_str())
-            .bind(&slot.job)
-            .bind(slot.slot)
-            .execute(&mut *tx)
-            .await?;
-        self.restate(slot, state);
+        let moved = sqlx::query(&format!(
+            "UPDATE job_tracks SET state = ? \
+             WHERE job_id = ? AND slot = ? AND state NOT IN {TERMINAL_SQL}"
+        ))
+        .bind(state.as_str())
+        .bind(&slot.job)
+        .bind(slot.slot)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if moved > 0 {
+            self.restate(slot, state);
+        }
         Ok(())
     }
 
@@ -465,6 +493,7 @@ async fn insert_search(
     Ok(())
 }
 
+/// Records `job` with its picked slots, and first `search` when given.
 async fn create(
     db: &SqlitePool,
     job: NewJob,
@@ -479,7 +508,7 @@ async fn create(
         "INSERT INTO jobs (id, user_id, folder_id, created_at, updated_at, wanted, import_mode, \
          state, search_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(job.id)
+    .bind(&job.id)
     .bind(job.user.to_string())
     .bind(job.folder_id)
     .bind(at)
@@ -490,6 +519,7 @@ async fn create(
     .bind(job.search_id)
     .execute(&mut *tx)
     .await?;
+    insert_slots(&mut tx, &job.id, &job.picked).await?;
     Ok(tx.commit().await?)
 }
 
@@ -511,11 +541,15 @@ async fn claim_source_choice(
     user: &UserId,
     search_id: &str,
     folder_id: &str,
+    picked: &[(u32, DownloadableItem)],
 ) -> Result<Option<ClaimedJob>, LedgerError> {
+    let mut tx = db.begin().await?;
+    // created_at has one-second resolution: insertion order breaks its ties.
     let claimed: Option<(String, String)> = sqlx::query_as(
         "UPDATE jobs SET state = ?, updated_at = ? WHERE id = (\
              SELECT id FROM jobs \
-             WHERE user_id = ? AND search_id = ? AND folder_id = ? AND state = ? LIMIT 1\
+             WHERE user_id = ? AND search_id = ? AND folder_id = ? AND state = ? \
+             ORDER BY created_at, rowid LIMIT 1\
          ) RETURNING id, import_mode",
     )
     .bind(JobState::Queued.as_str())
@@ -524,16 +558,15 @@ async fn claim_source_choice(
     .bind(search_id)
     .bind(folder_id)
     .bind(JobState::NeedsSourceChoice.as_str())
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?;
-    claimed
-        .map(|(id, mode)| {
-            Ok(ClaimedJob {
-                id,
-                import_mode: import_mode_named(&mode)?,
-            })
-        })
-        .transpose()
+    let Some((id, mode)) = claimed else {
+        return Ok(None);
+    };
+    insert_slots(&mut tx, &id, picked).await?;
+    let import_mode = import_mode_named(&mode)?;
+    tx.commit().await?;
+    Ok(Some(ClaimedJob { id, import_mode }))
 }
 
 async fn prune(db: &SqlitePool, now: i64) -> Result<Pruned, LedgerError> {
@@ -555,19 +588,69 @@ async fn prune(db: &SqlitePool, now: i64) -> Result<Pruned, LedgerError> {
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    let terminal = vec!["?"; TERMINAL.len()].join(", ");
-    let old = format!("DELETE FROM jobs WHERE state IN ({terminal}) AND updated_at < ?");
-    let jobs = TERMINAL
-        .iter()
-        .fold(sqlx::query(&old), |query, state| query.bind(state.as_str()))
-        .bind(now - JOB_KEPT_SECS)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let jobs = sqlx::query(&format!(
+        "DELETE FROM jobs WHERE state IN {TERMINAL_SQL} AND updated_at < ?"
+    ))
+    .bind(now - JOB_KEPT_SECS)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     tx.commit().await?;
     Ok(Pruned {
         searches,
         dismissed,
         jobs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{store, JobState, Ledger, NewJob, NewSearch};
+    use crate::auth::UserId;
+    use shared::download::DownloadQuery;
+    use soulbeet::ImportMode;
+
+    #[tokio::test]
+    async fn a_claim_continues_the_job_waiting_longest_for_the_source() {
+        let db = crate::db::test_db::migrated().await;
+        let folder = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        for id in ["first", "second"] {
+            ledger
+                .create(
+                    NewJob {
+                        id: id.into(),
+                        user: UserId::new("alice"),
+                        folder_id: folder.clone(),
+                        wanted: DownloadQuery::new(vec![]),
+                        import_mode: ImportMode::Singleton,
+                        state: JobState::NeedsSourceChoice,
+                        search_id: Some("s1".into()),
+                        picked: vec![],
+                    },
+                    Some(NewSearch {
+                        id: "s1".into(),
+                        user: UserId::new("alice"),
+                        backend: None,
+                        query: DownloadQuery::new(vec![]),
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        // Stored second, but made first.
+        sqlx::query("UPDATE jobs SET created_at = created_at - 10 WHERE id = 'second'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let claimed = ledger
+            .claim_source_choice(&UserId::new("alice"), "s1", &folder, vec![])
+            .await
+            .unwrap();
+        assert_eq!(claimed.map(|c| c.id), Some("second".to_string()));
+        assert_eq!(
+            store::job_state(&db, "first").await,
+            Some(JobState::NeedsSourceChoice)
+        );
+    }
 }

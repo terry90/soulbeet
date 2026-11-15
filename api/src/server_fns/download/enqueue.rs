@@ -143,7 +143,9 @@ pub fn held_failure(claim: &Claim, batch: &BatchRef) -> Failure {
 }
 
 /// Enqueues files `batch` has claimed into its folder. Every key whose file
-/// was not enqueued is released.
+/// was not enqueued is released. An answer for a file not asked for is left
+/// out, and a transfer it enqueued is cancelled: no batch owns it, so it
+/// would download with nobody to import it.
 pub async fn enqueue_claimed(
     backend: &Arc<dyn DownloadBackend>,
     items: Vec<DownloadableItem>,
@@ -151,7 +153,7 @@ pub async fn enqueue_claimed(
 ) -> SoulResult<Vec<QueuedDownload>> {
     let registry = TransferRegistry::global();
     let keys: Vec<TransferKey> = items.iter().map(|i| item_key(backend.id(), i)).collect();
-    let queued = match backend.download(items, &batch.destination).await {
+    let answered = match backend.download(items, &batch.destination).await {
         Ok(queued) => queued,
         Err(e) => {
             for key in &keys {
@@ -160,6 +162,23 @@ pub async fn enqueue_claimed(
             return Err(e);
         }
     };
+    let (queued, stray): (Vec<_>, Vec<_>) = answered.into_iter().partition(|q| {
+        keys.iter()
+            .any(|k| k.peer == q.source && k.filename == q.item)
+    });
+    for q in stray {
+        warn!(
+            "{} answered for {} from {}, which was not asked for",
+            backend.name(),
+            q.item,
+            q.source
+        );
+        if q.status == EnqueueStatus::Enqueued {
+            if let Err(e) = backend.cancel_download(&q.source, &q.id, false).await {
+                warn!("Failed to cancel unasked transfer {} in slskd: {}", q.id, e);
+            }
+        }
+    }
     // Includes files the backend dropped without answering for them.
     for key in &keys {
         let enqueued = queued.iter().any(|q| {
@@ -209,19 +228,65 @@ impl RequestEnqueue {
     }
 }
 
-/// Claims a request's files and enqueues the free ones. When the user is
-/// already downloading some of them into the same folder, the rest join that
-/// batch, so its monitor imports them together, unless it has finished.
-/// Otherwise they go to `fresh`.
+/// A request's files as `claim_request` left them, nothing sent yet.
+pub struct ClaimedRequest {
+    batch: BatchRef,
+    to_enqueue: Vec<DownloadableItem>,
+    results: Vec<QueuedDownload>,
+    watcher: Watcher,
+    elsewhere: Vec<TransferKey>,
+}
+
+impl ClaimedRequest {
+    /// The batch the request's free files go into.
+    pub fn batch(&self) -> &BatchRef {
+        &self.batch
+    }
+
+    /// Whether the request sends the backend any file.
+    pub fn sends(&self) -> bool {
+        !self.to_enqueue.is_empty()
+    }
+
+    /// Enqueues the claimed files.
+    pub async fn enqueue(self, backend: &Arc<dyn DownloadBackend>) -> RequestEnqueue {
+        let ClaimedRequest {
+            batch,
+            to_enqueue,
+            mut results,
+            watcher,
+            elsewhere,
+        } = self;
+        let mut error = None;
+        if !to_enqueue.is_empty() {
+            match enqueue_claimed(backend, to_enqueue, &batch).await {
+                Ok(queued) => results.extend(queued),
+                Err(e) => error = Some(e),
+            }
+        }
+        RequestEnqueue {
+            batch,
+            results,
+            watcher,
+            error,
+            elsewhere,
+        }
+    }
+}
+
+/// Claims a request's files; `ClaimedRequest::enqueue` then enqueues the
+/// free ones. When the user is already downloading some of them into the
+/// same folder, the rest join that batch, so its monitor imports them
+/// together, unless it has finished. Otherwise they go to `fresh`.
 ///
 /// A request left with its own batch and nothing enqueued still owes that
 /// batch a monitor when `batch.inbox.close_if_idle()` fails: another request
 /// saw its claims and joined it meanwhile.
-pub async fn enqueue_request(
+pub fn claim_request(
     backend: &Arc<dyn DownloadBackend>,
     items: Vec<DownloadableItem>,
     fresh: BatchRef,
-) -> RequestEnqueue {
+) -> ClaimedRequest {
     let keys: Vec<TransferKey> = items.iter().map(|i| item_key(backend.id(), i)).collect();
     let RequestClaim {
         claim,
@@ -252,7 +317,7 @@ pub async fn enqueue_request(
         .mine
         .iter()
         .partition(|(_, running)| running.target == fresh.target);
-    let mut results: Vec<QueuedDownload> = here
+    let results: Vec<QueuedDownload> = here
         .iter()
         .map(|(key, _)| not_enqueued(key, EnqueueStatus::AlreadyRunning))
         .chain(
@@ -268,18 +333,11 @@ pub async fn enqueue_request(
     };
 
     let to_enqueue: Vec<DownloadableItem> = claim.claimed.iter().map(item_of).collect();
-    let mut error = None;
-    if !to_enqueue.is_empty() {
-        match enqueue_claimed(backend, to_enqueue, &batch).await {
-            Ok(queued) => results.extend(queued),
-            Err(e) => error = Some(e),
-        }
-    }
-    RequestEnqueue {
+    ClaimedRequest {
         batch,
+        to_enqueue,
         results,
         watcher,
-        error,
         elsewhere: elsewhere.into_iter().map(|(key, _)| key.clone()).collect(),
     }
 }
@@ -371,6 +429,15 @@ mod tests {
     /// Another batch of `running`'s user, importing into the same folder.
     fn same_user(running: &BatchRef) -> BatchRef {
         same_user_into(running, running.target.clone())
+    }
+
+    /// Claims a request's files and enqueues the free ones.
+    async fn enqueue_request(
+        backend: &Arc<dyn DownloadBackend>,
+        items: Vec<DownloadableItem>,
+        fresh: BatchRef,
+    ) -> RequestEnqueue {
+        claim_request(backend, items, fresh).enqueue(backend).await
     }
 
     /// An `EnqueueStatus` with a failure reduced to its code.
@@ -800,6 +867,23 @@ mod tests {
             failure.cause,
             Some(Cause::new(Service::Slskd, None, STUB_IN_FLIGHT)),
             "the cause is the backend's own answer"
+        );
+        assert!(TransferRegistry::global()
+            .may_adopt(&key(&backend, "peer_a", "01.flac"), &batch("Other").owner));
+    }
+
+    #[tokio::test]
+    async fn an_answer_for_a_file_not_asked_for_is_left_out_and_cancelled() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::EnqueuedAs("other.flac")]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+
+        let enq =
+            enqueue_request(&backend, vec![item("peer_a", "One", "01.flac")], batch("X")).await;
+
+        assert!(enq.results.is_empty(), "{:?}", statuses(&enq.results));
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-other.flac")]
         );
         assert!(TransferRegistry::global()
             .may_adopt(&key(&backend, "peer_a", "01.flac"), &batch("Other").owner));

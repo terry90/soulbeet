@@ -77,8 +77,10 @@ pub enum ImportMode {
     Singleton,
 }
 
-/// How the importer decides on a match.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How the importer decides on a match. Kept with an import the ledger stores, so a restart
+/// runs it as the user chose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DriverChoice {
     /// As a quiet import does: apply a strong match, skip the rest.
     Auto,

@@ -3,13 +3,10 @@
 //! after a restart the ledger's kept imports are restored.
 
 use super::choice::{files_gone, nothing_to_retry, resolve};
-use super::rows::rows_with_state;
 use super::{ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
 use crate::ledger::{self, JobEvent};
-use shared::download::{
-    DownloadState, ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind,
-};
+use shared::download::{ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind};
 use soulbeet::{ImportMode, ImportOutcome, SkipReason};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -188,9 +185,10 @@ impl ImportQueue {
             let refusal = files_gone();
             // The job is no longer kept, so its slots end as a restart would end them.
             if let Some(owner) = &job.owner {
-                let rows = rows_with_state(&owner.rows, DownloadState::Failed(String::new()))
-                    .into_iter()
-                    .map(|row| row.with_failure(refusal.failure.clone()))
+                let rows = owner
+                    .rows
+                    .iter()
+                    .map(|row| row.clone().failed_with(refusal.failure.clone()))
                     .collect();
                 self.shared.deps.record(JobEvent::Slots {
                     state: ledger::JobState::Failed,

@@ -77,11 +77,16 @@ pub(crate) fn import_failure(result: &ImportResult) -> Option<Failure> {
     Some(failure)
 }
 
-/// `rows` in a state on the way to an outcome, with no earlier failure,
-/// skip or failure note left on them.
+/// `row` in a state on the way to an outcome, with no earlier failure, skip
+/// or failure note left on it.
+pub fn row_with_state(row: DownloadProgress, state: DownloadState) -> DownloadProgress {
+    row.without_failure().with_state(state)
+}
+
+/// `rows`, each as `row_with_state` makes it.
 pub fn rows_with_state(rows: &[DownloadProgress], state: DownloadState) -> Vec<DownloadProgress> {
     rows.iter()
-        .map(|row| row.clone().without_failure().with_state(state.clone()))
+        .map(|row| row_with_state(row.clone(), state.clone()))
         .collect()
 }
 

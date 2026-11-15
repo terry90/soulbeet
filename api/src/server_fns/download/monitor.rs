@@ -335,8 +335,9 @@ pub struct DownloadMonitor {
     /// deadline is evaluated from a readable list, so this one bounds the
     /// case where no list is readable at all.
     last_readable_poll: Instant,
-    /// `(peer, transfer id)` of every transfer seen Completed, so only its
-    /// first sighting counts as its peer sending this slskd a file.
+    /// `(peer, transfer id)` of every transfer the last listing showed
+    /// Completed, so only its first sighting counts as its peer sending this
+    /// slskd a file.
     completed_seen: HashSet<(String, String)>,
     /// Where every row the monitor sends is recorded with its slot's state.
     ledger: Ledger,
@@ -602,7 +603,19 @@ impl DownloadMonitor {
         backend: &Arc<dyn DownloadBackend>,
         reason: &str,
     ) -> bool {
-        let next = self.pool.enqueue_next(slot, backend, &self.batch).await;
+        // Each source is recorded before it is sent, so a restart knows
+        // which peer may hold the slot's transfer.
+        let (ledger, job) = (self.ledger.clone(), self.tracked_files[slot].job.clone());
+        let record = |item: &DownloadableItem| {
+            ledger.record(JobEvent::Attempt {
+                slot: job.clone(),
+                candidate: Some(item.clone()),
+            })
+        };
+        let next = self
+            .pool
+            .enqueue_next_noting(slot, backend, &self.batch, record)
+            .await;
         for refused in &next.refused {
             warn!(
                 "Failover source {} refused {} for {}: {}: {}",
@@ -613,7 +626,7 @@ impl DownloadMonitor {
                 refused.failure.message
             );
         }
-        let Some((candidate, queued)) = next.queued else {
+        let Some((_, queued)) = next.queued else {
             return false;
         };
 
@@ -650,18 +663,16 @@ impl DownloadMonitor {
         .filename;
         self.track_states[slot] = TrackState::bound_now();
 
-        self.record_attempt(slot, Some(candidate));
         let entry = DownloadProgress::queued(queued.id, queued.source, queued.item, queued.size);
         self.replace_row(previous_item, self.stamp(slot, entry));
         true
     }
 
-    /// Records that `slot` now downloads from `candidate`, or from a
-    /// transfer it adopted when `None`.
-    fn record_attempt(&self, slot: usize, candidate: Option<DownloadableItem>) {
+    /// Records that `slot` now downloads a transfer it adopted.
+    fn record_adoption(&self, slot: usize) {
         self.ledger.record(JobEvent::Attempt {
             slot: self.tracked_files[slot].job.clone(),
-            candidate,
+            candidate: None,
         });
     }
 
@@ -915,7 +926,6 @@ impl DownloadMonitor {
         }
 
         let matched = self.find_matching_downloads(&downloads, backend);
-        let sending = self.peers_sending(&downloads);
 
         let watched = (0..self.tracked_files.len())
             .filter(|slot| self.watching(*slot))
@@ -977,6 +987,7 @@ impl DownloadMonitor {
         }
 
         // Process individual tracks
+        let sending = self.peers_sending(&downloads);
         self.process_tracks(&matched, &sending, backend).await;
 
         // Fail tracks that never appeared or vanished from slskd's list,
@@ -1098,7 +1109,7 @@ impl DownloadMonitor {
         .filename;
         // Reset state so the retried transfer is monitored and imported
         self.track_states[slot] = TrackState::bound_now();
-        self.record_attempt(slot, None);
+        self.record_adoption(slot);
         if previous_item != retry.item {
             self.replace_row(previous_item, self.stamp(slot, retry.clone()));
         }
@@ -1161,15 +1172,11 @@ impl DownloadMonitor {
         }
     }
 
-    /// Sends `rows` to the UI as one Progress event.
+    /// Sends `rows` to the UI as one Progress event. A broadcast send fails
+    /// only when no tab is open to receive it, which is no failure: the rows
+    /// are recorded, and a tab opened later reads them.
     fn send_rows(&self, rows: Vec<DownloadProgress>) {
-        if let Err(e) = self.tx.send(DownloadEvent::Progress(rows)) {
-            if self.tx.receiver_count() == 0 {
-                info!("No receivers for download updates, but continuing monitoring");
-            } else {
-                warn!("Failed to send download status update: {:?}", e);
-            }
-        }
+        let _ = self.tx.send(DownloadEvent::Progress(rows));
     }
 
     /// `entry` stamped with the batch and with `slot`'s job. Every row the
@@ -1187,17 +1194,23 @@ impl DownloadMonitor {
     /// `Queued` and sends one file per downloading user at a time
     /// (`MaximumConcurrentUploadsPerUser` is 1), so every other file from it
     /// waits in its queue meanwhile.
+    /// Only the transfers `downloads` shows Completed stay remembered, so the
+    /// set never outgrows one listing.
     fn peers_sending(&mut self, downloads: &[DownloadProgress]) -> HashSet<String> {
         let mut sending = HashSet::new();
+        let mut completed = HashSet::new();
         for dl in downloads {
-            let first_completion = is_completed(&dl.state)
-                && self
-                    .completed_seen
-                    .insert((dl.source.clone(), dl.id.clone()));
+            let first_completion = is_completed(&dl.state) && {
+                let transfer = (dl.source.clone(), dl.id.clone());
+                let first = !self.completed_seen.contains(&transfer);
+                completed.insert(transfer);
+                first
+            };
             if dl.state == DownloadState::InProgress || first_completion {
                 sending.insert(dl.source.clone());
             }
         }
+        self.completed_seen = completed;
         sending
     }
 
@@ -1306,8 +1319,7 @@ impl DownloadMonitor {
             queued_at_source: false,
             ..download.clone()
         }
-        .with_state(DownloadState::Failed(String::new()))
-        .with_failure(failure);
+        .failed_with(failure);
         let row = self.write_off(slot, SlotPhase::TimedOut, backend.id(), row);
         self.report_settled(vec![self.stamp(slot, row)]);
     }
@@ -2400,7 +2412,7 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_listing_fails_the_batch_after_its_fuse() {
         let (tx, mut rx) = broadcast::channel(16);
-        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
+        let (mut m, mut recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
         let drift =
             || SoulseekError::InvalidResponse("JSON parse error: missing field `id`".into());
         let mut invalid = 0;
@@ -2426,6 +2438,13 @@ mod tests {
         assert_eq!(
             f.cause.as_ref().map(|c| c.raw.as_str()),
             Some("Unparseable slskd response: JSON parse error: missing field `id`")
+        );
+        assert_eq!(
+            slots_recorded(&mut recorded),
+            vec![(
+                JobState::Failed,
+                vec![("a.flac".into(), Some(slot_of_j1(0)))]
+            )]
         );
     }
 
@@ -2459,7 +2478,7 @@ mod tests {
     async fn a_timed_out_slot_is_cancelled_and_not_resent() {
         for album_mode in [false, true] {
             let (tx, mut rx) = broadcast::channel(64);
-            let (mut m, _recorded) =
+            let (mut m, mut recorded) =
                 monitor_on(tx, vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
             m.batch.import_mode = match album_mode {
                 true => ImportMode::Album,
@@ -2497,6 +2516,15 @@ mod tests {
                 .contains(&Cancel::only("peer_a", &id_of("one.flac"))));
             assert_eq!(phase(&m, 0), SlotPhase::TimedOut);
             assert!(TransferRegistry::global().may_adopt(&held, &batch("Y").owner));
+            let one: Vec<JobState> = slots_recorded(&mut recorded)
+                .into_iter()
+                .filter(|(_, rows)| rows.iter().any(|(item, _)| item == "one.flac"))
+                .map(|(state, rows)| {
+                    assert_eq!(rows, vec![("one.flac".into(), Some(slot_of_j1(0)))]);
+                    state
+                })
+                .collect();
+            assert_eq!(one, vec![JobState::Failed], "album_mode={album_mode}");
         }
     }
 
@@ -2805,7 +2833,7 @@ mod tests {
     async fn a_never_appeared_batch_with_no_peers_left_is_still_written_off() {
         // The fallback has to stay reachable, or an absent batch with a dry
         // pool would poll forever.
-        let (mut m, mut rx, _recorded) = failover_monitor();
+        let (mut m, mut rx, mut recorded) = failover_monitor();
         // Every alternate is refused, so the pool yields nothing.
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let mut consecutive_empty = MAX_CONSECUTIVE_EMPTY - 1;
@@ -2825,6 +2853,13 @@ mod tests {
             &rows[0],
             FailureCode::TransferNeverAppeared,
             "Download never appeared in slskd",
+        );
+        assert_eq!(
+            slots_recorded(&mut recorded),
+            vec![(
+                JobState::Failed,
+                vec![("dirA/aaa.flac".into(), Some(slot_of_j1(0)))]
+            )]
         );
     }
 
@@ -3403,7 +3438,7 @@ mod tests {
     // real time.
     #[tokio::test(start_paused = true)]
     async fn an_album_file_that_never_appears_keeps_its_completed_record() {
-        let (mut m, _base, mut imports, _recorded) =
+        let (mut m, _base, mut imports, mut recorded) =
             disk_monitor(&UserId::new("monitor-album-missing"), &["01.flac"], &[]).await;
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
@@ -3433,6 +3468,56 @@ mod tests {
             "Could not resolve file path",
         );
         assert!(TransferRegistry::global().may_adopt(&held, &batch("Y").owner));
+        let one = vec![("01.flac".to_string(), Some(slot_of_j1(0)))];
+        assert_eq!(
+            slots_recorded(&mut recorded),
+            vec![
+                (JobState::Downloading, one.clone()),
+                (JobState::Failed, one)
+            ]
+        );
+    }
+
+    // Paused: resolve_on_disk backs off with tokio::time::sleep.
+    #[tokio::test(start_paused = true)]
+    async fn a_handoff_whose_file_is_never_found_records_its_slot_failed() {
+        let (mut m, _base, _imports, mut recorded) = disk_monitor(
+            &UserId::new("monitor-singleton-missing"),
+            &["one.flac"],
+            &[],
+        )
+        .await;
+        m.batch.import_mode = ImportMode::Singleton;
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let mut empty = 0;
+        m.process_poll_result(
+            vec![listed("peer_a", "one.flac", DownloadState::Completed)],
+            &mut empty,
+            1,
+            &backend,
+        )
+        .await;
+        m.join_handoffs().await;
+        let one = vec![("one.flac".to_string(), Some(slot_of_j1(0)))];
+        assert_eq!(
+            slots_recorded(&mut recorded),
+            vec![
+                (JobState::Downloading, one.clone()),
+                (JobState::Failed, one)
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_transfers_the_last_listing_shows_completed_are_remembered() {
+        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["one.flac"]);
+        let done = listed("peer_a", "one.flac", DownloadState::Completed);
+        assert!(m
+            .peers_sending(std::slice::from_ref(&done))
+            .contains("peer_a"));
+        assert!(m.peers_sending(std::slice::from_ref(&done)).is_empty());
+        assert!(m.peers_sending(&[]).is_empty());
+        assert!(m.completed_seen.is_empty());
     }
 
     #[tokio::test]
@@ -3617,7 +3702,7 @@ mod tests {
     #[tokio::test]
     async fn slots_written_off_at_the_end_of_a_run_are_cancelled() {
         let (tx, mut rx) = broadcast::channel(16);
-        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
+        let (mut m, mut recorded) = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         m.batch
@@ -3642,6 +3727,13 @@ mod tests {
         assert_eq!(stub.cancelled(), vec![Cancel::only("peer_b", "t-02")]);
         let record = transfer("peer_b", "02.flac", "t-02", DownloadState::Cancelled);
         assert!(m.owns(&record), "its record is removed at cleanup");
+        assert_eq!(
+            slots_recorded(&mut recorded),
+            vec![(
+                JobState::Failed,
+                vec![("02.flac".into(), Some(slot_of_j1(1)))]
+            )]
+        );
     }
 
     #[tokio::test]
