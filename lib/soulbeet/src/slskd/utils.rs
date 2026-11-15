@@ -160,29 +160,52 @@ fn score_artist(
     folder_candidate
 }
 
-fn score_track(stem: &CleanedText, expected_tracks: &[CleanedText]) -> (f64, CleanedText) {
-    if expected_tracks.is_empty() {
-        return (1.0, CleanedText::new(&extract_track_title(&stem.original)));
-    }
-
+/// The best score among `expected_tracks` (not empty) and the index of that track.
+fn score_track(stem: &CleanedText, expected_tracks: &[CleanedText]) -> (f64, usize) {
     let track_title_from_stem = CleanedText::new(&extract_track_title(&stem.original));
 
     expected_tracks
         .iter()
-        .map(|expected| {
+        .enumerate()
+        .map(|(i, expected)| {
             let score = (dice_sim(&track_title_from_stem, expected) * 0.6)
                 + (containment_sim(&track_title_from_stem, expected) * 0.4);
-            (score, expected.clone())
+            (score, i)
         })
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or((0.0, CleanedText::new("")))
+        .unwrap_or((0.0, 0))
+}
+
+/// A track the search is for, with its length when the metadata provider knows it.
+#[derive(Debug, Clone)]
+pub struct WantedTrack {
+    pub title: String,
+    pub duration_s: Option<u32>,
+}
+
+pub const DURATION_WEIGHT: f64 = 0.3;
+
+/// Full credit up to this many seconds of difference, none from `DURATION_NONE_S` on.
+const DURATION_FULL_S: u32 = 3;
+const DURATION_NONE_S: u32 = 30;
+
+fn duration_score(wanted_s: u32, file_s: u32) -> f64 {
+    let diff = wanted_s.abs_diff(file_s);
+    if diff <= DURATION_FULL_S {
+        1.0
+    } else if diff >= DURATION_NONE_S {
+        0.0
+    } else {
+        1.0 - f64::from(diff - DURATION_FULL_S) / f64::from(DURATION_NONE_S - DURATION_FULL_S)
+    }
 }
 
 pub fn rank_match(
     filename: &str,
     searched_artist: Option<&str>,
     searched_album: Option<&str>,
-    expected_tracks: &[&str],
+    expected_tracks: &[WantedTrack],
+    file_length_s: Option<i32>,
 ) -> MatchResult {
     const ALBUM_WEIGHT: f64 = 0.4;
     const TRACK_WEIGHT: f64 = 0.4;
@@ -213,16 +236,22 @@ pub fn rank_match(
         (0.0, CleanedText::new(""))
     };
 
-    let (track_score, best_track_match) = if !expected_tracks.is_empty() {
+    let (track_score, best_track_match, matched_duration_s) = if !expected_tracks.is_empty() {
         let expected_tracks_c: Vec<_> = expected_tracks
             .iter()
-            .map(|t| CleanedText::new(t))
+            .map(|t| CleanedText::new(&t.title))
             .collect();
-        score_track(&stem_c, &expected_tracks_c)
+        let (score, i) = score_track(&stem_c, &expected_tracks_c);
+        (
+            score,
+            expected_tracks_c[i].clone(),
+            expected_tracks[i].duration_s,
+        )
     } else {
         (
             0.0,
             CleanedText::new(&extract_track_title(&stem_c.original)),
+            None,
         )
     };
 
@@ -237,6 +266,14 @@ pub fn rank_match(
     if !expected_tracks.is_empty() {
         weighted_sum += track_score * TRACK_WEIGHT;
         total_weight += TRACK_WEIGHT;
+    }
+
+    if let (Some(wanted_s), Some(file_s)) = (
+        matched_duration_s,
+        file_length_s.and_then(|l| u32::try_from(l).ok()),
+    ) {
+        weighted_sum += duration_score(wanted_s, file_s) * DURATION_WEIGHT;
+        total_weight += DURATION_WEIGHT;
     }
 
     if searched_album.is_some() {
@@ -260,5 +297,64 @@ pub fn rank_match(
         album_score,
         track_score,
         total_score,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE: &str = "Marrow Choir\\Winter Songs\\03 - O Holy Night.flac";
+
+    fn night(duration_s: Option<u32>) -> Vec<WantedTrack> {
+        vec![WantedTrack {
+            title: "O Holy Night".into(),
+            duration_s,
+        }]
+    }
+
+    #[test]
+    fn a_file_of_the_wanted_length_keeps_its_score() {
+        let score = |wanted, length| {
+            rank_match(FILE, Some("Marrow Choir"), None, &night(wanted), length).total_score
+        };
+        assert!((score(Some(263), Some(263)) - 1.0).abs() < 1e-9);
+        assert!((score(Some(263), Some(266)) - 1.0).abs() < 1e-9);
+        assert!((score(None, Some(323)) - 1.0).abs() < 1e-9);
+        assert!((score(Some(263), None) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn another_length_lowers_the_match_score() {
+        let score = |length| {
+            rank_match(
+                FILE,
+                Some("Marrow Choir"),
+                None,
+                &night(Some(263)),
+                Some(length),
+            )
+            .total_score
+        };
+        assert!((score(273) - (0.6 + 0.3 * 20.0 / 27.0) / 0.9).abs() < 1e-9);
+        assert!((score(323) - 2.0 / 3.0).abs() < 1e-9);
+        assert!((score(203) - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    /// The path names the searched album, so the album term (0.4) counts too.
+    #[test]
+    fn with_the_album_in_the_path_another_length_scores_ten_thirteenths() {
+        let score = |length| {
+            rank_match(
+                FILE,
+                Some("Marrow Choir"),
+                Some("Winter Songs"),
+                &night(Some(263)),
+                Some(length),
+            )
+            .total_score
+        };
+        assert!((score(263) - 1.0).abs() < 1e-9);
+        assert!((score(323) - 10.0 / 13.0).abs() < 1e-9);
     }
 }

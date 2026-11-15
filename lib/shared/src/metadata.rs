@@ -70,6 +70,19 @@ pub struct Track {
     pub release_mbid: Option<String>,
 }
 
+impl Track {
+    /// `duration` in seconds. Both providers write `{minutes}:{SS}`, with any
+    /// number of minute digits and two second digits; anything else is `None`.
+    pub fn duration_secs(&self) -> Option<u32> {
+        let (minutes, seconds) = self.duration.as_deref()?.split_once(':')?;
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !digits(minutes) || seconds.len() != 2 || !digits(seconds) {
+            return None;
+        }
+        Some(minutes.parse::<u32>().ok()? * 60 + seconds.parse::<u32>().ok()?)
+    }
+}
+
 /// An album from a metadata provider.
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Album {
@@ -94,4 +107,36 @@ pub struct Album {
 pub struct AlbumWithTracks {
     pub album: Album,
     pub tracks: Vec<Track>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_track() -> Track {
+        Track {
+            id: "t1".into(),
+            title: "O Holy Night".into(),
+            artist: "Marrow Choir".into(),
+            album_id: None,
+            album_title: None,
+            release_date: None,
+            duration: None,
+            mbid: None,
+            release_mbid: None,
+        }
+    }
+
+    #[test]
+    fn track_durations_read_as_seconds() {
+        let with = |d: Option<&str>| Track {
+            duration: d.map(str::to_string),
+            ..sample_track()
+        };
+        assert_eq!(with(Some("04:23")).duration_secs(), Some(263));
+        assert_eq!(with(Some("75:03")).duration_secs(), Some(4503));
+        assert_eq!(with(Some("4:7")).duration_secs(), None);
+        assert_eq!(with(Some("")).duration_secs(), None);
+        assert_eq!(with(None).duration_secs(), None);
+    }
 }

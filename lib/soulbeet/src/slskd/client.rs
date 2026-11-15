@@ -1,4 +1,4 @@
-use super::processing;
+use super::{processing, utils::WantedTrack};
 use crate::{
     error::{MissingSetting, Result, SoulseekError},
     http::{resolve_docker_url, CircuitBreaker},
@@ -55,7 +55,7 @@ impl Default for DownloadConfig {
 struct SearchContext {
     artist: String,
     album: Option<String>,
-    track_titles: Vec<String>,
+    tracks: Vec<WantedTrack>,
     start_time: DateTime<Utc>,
     timeout: Duration,
     /// slskd was told to stop the search at the deadline.
@@ -367,7 +367,13 @@ impl SoulseekClient {
         let query = search_text(album.as_ref(), &tracks)?;
         self.wait_for_rate_limit().await?;
 
-        let track_titles: Vec<String> = tracks.iter().map(|t| t.title.clone()).collect();
+        let wanted: Vec<WantedTrack> = tracks
+            .iter()
+            .map(|t| WantedTrack {
+                title: t.title.clone(),
+                duration_s: t.duration_secs(),
+            })
+            .collect();
 
         info!(
             "Starting search for: '{}' with timeout {}ms",
@@ -401,7 +407,7 @@ impl SoulseekClient {
                     .as_ref()
                     .map(|a| a.artist.clone())
                     .unwrap_or_else(|| tracks[0].artist.clone()),
-                track_titles,
+                tracks: wanted,
                 start_time: Utc::now(),
                 timeout,
                 cancelled: false,
@@ -517,12 +523,11 @@ impl SoulseekClient {
             tokio::time::sleep(RESPONSES_REREAD_DELAY).await;
         };
 
-        let track_titles: Vec<&str> = context.track_titles.iter().map(|s| s.as_str()).collect();
         let mut albums = processing::process_search_responses(
             &responses,
             &context.artist,
             context.album.as_deref(),
-            &track_titles,
+            &context.tracks,
         );
         albums.sort_by(|a, b| {
             b.score
@@ -1727,6 +1732,30 @@ mod tests {
                            "sampleRate": 44100, "size": 28734112}]}])
             .to_string(),
         }
+    }
+
+    #[test]
+    fn the_source_with_the_wanted_length_scores_higher() {
+        let mut responses: Vec<SearchResponse> =
+            serde_json::from_str(&one_response().body).unwrap();
+        let other = one_response()
+            .body
+            .replace("carol_shares", "dave_shares")
+            .replace(r#""length":263"#, r#""length":323"#);
+        assert!(other.contains(r#""length":323"#));
+        responses.extend(serde_json::from_str::<Vec<SearchResponse>>(&other).unwrap());
+        let albums = processing::process_search_responses(
+            &responses,
+            "Marrow Choir",
+            Some("Winter Songs"),
+            &[WantedTrack {
+                title: "O Holy Night".into(),
+                duration_s: Some(263),
+            }],
+        );
+        let score = |user: &str| albums.iter().find(|a| a.username == user).unwrap().score;
+        assert!((score("carol_shares") - score("dave_shares") - 0.3 * 3.0 / 13.0).abs() < 1e-9);
+        assert!(score("dave_shares") > 0.7);
     }
 
     fn empty() -> Reply {

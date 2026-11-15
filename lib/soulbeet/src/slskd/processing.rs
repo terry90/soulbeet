@@ -1,4 +1,4 @@
-use super::utils;
+use super::utils::{self, WantedTrack};
 use crate::audio::is_audio_path;
 use crate::slskd::models::SearchResponse;
 use itertools::Itertools;
@@ -10,7 +10,7 @@ pub fn process_search_responses(
     responses: &[SearchResponse],
     searched_artist: &str,
     searched_album: Option<&str>,
-    expected_tracks: &[&str],
+    expected_tracks: &[WantedTrack],
 ) -> Vec<AlbumResult> {
     const MIN_SCORE_THRESHOLD: f64 = 0.6;
     let scored_files: Vec<(MatchResult, SearchResult)> = responses
@@ -27,6 +27,7 @@ pub fn process_search_responses(
                     Some(searched_artist),
                     searched_album,
                     expected_tracks,
+                    file.length,
                 );
 
                 if rank_result.total_score < MIN_SCORE_THRESHOLD {
@@ -55,7 +56,7 @@ pub fn process_search_responses(
 
 fn find_best_albums(
     scored_files: &[(MatchResult, SearchResult)],
-    expected_tracks: &[&str],
+    expected_tracks: &[WantedTrack],
 ) -> Vec<AlbumResult> {
     if expected_tracks.is_empty() {
         return vec![];
@@ -75,11 +76,12 @@ fn find_best_albums(
             // Specific search: find the single best file for each expected track.
             let mut best_files_for_album = HashMap::new();
 
-            for expected_track_title in expected_tracks {
+            for expected in expected_tracks {
+                let expected_track_title = expected.title.as_str();
                 if let Some(best_file_for_track) = files_in_group
                     .iter()
                     // Find all files that matched this specific track
-                    .filter(|(rank, _)| &rank.matched_track == expected_track_title)
+                    .filter(|(rank, _)| rank.matched_track == expected_track_title)
                     // Find the best one among them
                     .max_by(|(r1, s1), (r2, s2)| {
                         r1.total_score
@@ -90,13 +92,13 @@ fn find_best_albums(
                             })
                     })
                 {
-                    best_files_for_album.insert(*expected_track_title, best_file_for_track);
+                    best_files_for_album.insert(expected_track_title, best_file_for_track);
                 }
             }
 
             let final_tracks: Vec<_> = expected_tracks
                 .iter()
-                .filter_map(|t| best_files_for_album.get(*t))
+                .filter_map(|t| best_files_for_album.get(t.title.as_str()))
                 .map(|(mr, sr)| TrackResult::new(sr.clone(), mr.clone()))
                 .collect();
 
