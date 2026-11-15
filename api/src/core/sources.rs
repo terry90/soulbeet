@@ -1,8 +1,11 @@
 //! Download source search: one backend's search started and polled for a
 //! user, and the every-backend ranked search an auto-download runs.
 
-use crate::auth::{UserCtx, UserId};
-use crate::core::{backend_unavailable, metadata};
+use crate::auth::UserCtx;
+use crate::core::{backend_unavailable, database_failure, metadata};
+use crate::db::DB;
+use crate::ledger::store::{self, StoredSearch};
+use crate::ledger::{NewSearch, LEDGER};
 use crate::services::{
     available_download_backends, download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND,
 };
@@ -11,12 +14,9 @@ use shared::download::{DownloadQuery, DownloadableGroup, SearchResult, SearchSta
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
 use soulbeet::DownloadBackend;
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
-
-/// How long a started search stays readable by the user who started it.
-const SEARCH_OWNER_TTL: Duration = Duration::from_secs(3600);
+use sqlx::SqlitePool;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Maximum time to wait for search results from a single backend. A safety
 /// net above the slskd client's own deadline, which cancels a search at 120
@@ -29,44 +29,7 @@ const SEARCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// A backend an auto-download searches, by its id in the settings.
 pub type Searched = (String, Arc<dyn DownloadBackend>);
 
-/// Who started each download search, by backend and search id, so only
-/// they can read its results.
-#[derive(Default)]
-struct SearchOwners {
-    started: Mutex<HashMap<(String, String), (UserId, Instant)>>,
-}
-
-impl SearchOwners {
-    fn started(&self) -> MutexGuard<'_, HashMap<(String, String), (UserId, Instant)>> {
-        self.started.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn expired(at: Instant, now: Instant) -> bool {
-        now.saturating_duration_since(at) > SEARCH_OWNER_TTL
-    }
-
-    /// Records `user` as the starter of the search, and forgets searches
-    /// older than `SEARCH_OWNER_TTL`.
-    fn record(&self, backend: &str, search_id: &str, user: &UserId, now: Instant) {
-        let mut started = self.started();
-        started.retain(|_, (_, at)| !Self::expired(*at, now));
-        started.insert(
-            (backend.to_string(), search_id.to_string()),
-            (user.clone(), now),
-        );
-    }
-
-    /// Whether `user` started the search and it has not expired.
-    fn owns(&self, backend: &str, search_id: &str, user: &UserId, now: Instant) -> bool {
-        self.started()
-            .get(&(backend.to_string(), search_id.to_string()))
-            .is_some_and(|(owner, at)| owner == user && !Self::expired(*at, now))
-    }
-}
-
-static SEARCH_OWNERS: LazyLock<SearchOwners> = LazyLock::new(SearchOwners::default);
-
-/// The search does not exist, is another user's, or has expired.
+/// The search does not exist or is another user's.
 pub fn search_not_found() -> Failure {
     Failure::new(
         FailureCode::UnknownHandle,
@@ -76,14 +39,51 @@ pub fn search_not_found() -> Failure {
     )
 }
 
+/// The search was found, and is older than SEARCH_KEPT_SECS.
+pub fn search_expired() -> Failure {
+    Failure::new(
+        FailureCode::ExpiredHandle,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "Search expired",
+    )
+}
+
+/// `stored` when it exists and has not expired at `now`.
+pub(crate) fn live_search(stored: Option<StoredSearch>, now: i64) -> Result<StoredSearch, Failure> {
+    let stored = stored.ok_or_else(search_not_found)?;
+    if stored.expires_at <= now {
+        return Err(search_expired());
+    }
+    Ok(stored)
+}
+
+/// `ctx`'s search `id`, while it has not expired. Another user's search
+/// reads like a missing one.
+pub(crate) async fn owned_search(
+    db: &SqlitePool,
+    ctx: &UserCtx,
+    id: &str,
+) -> Result<StoredSearch, Failure> {
+    let stored = store::search_of(db, id, &ctx.id())
+        .await
+        .map_err(|e| database_failure(Stage::SourceSearch, e))?;
+    live_search(stored, chrono::Utc::now().timestamp())
+}
+
 /// Starts a search on the named backend, or the default one, for `query`
-/// with its album's tracklist, and records `ctx` as its owner.
+/// with its album's tracklist, and records it in the ledger as `ctx`'s.
 pub async fn start(ctx: &UserCtx, query: DownloadQuery) -> Result<String, Failure> {
     let key = metadata::lastfm_key(ctx).await?;
     let mut query = query;
     metadata::hydrate_album_tracks(&mut query, key.as_deref()).await?;
 
-    let backend = download_backend(query.backend.as_deref())
+    // Stored by the id the backend is looked up by, so a poll finds it again.
+    let backend_id = query
+        .backend
+        .clone()
+        .unwrap_or_else(|| DEFAULT_DOWNLOAD_BACKEND.to_string());
+    let backend = download_backend(Some(&backend_id))
         .await
         .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))?;
 
@@ -91,29 +91,37 @@ pub async fn start(ctx: &UserCtx, query: DownloadQuery) -> Result<String, Failur
         .start_search(query.album.as_ref(), &query.tracks)
         .await
         .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))?;
-    SEARCH_OWNERS.record(backend.id(), &search_id, &ctx.id(), Instant::now());
+    LEDGER
+        .record_search(NewSearch {
+            id: search_id.clone(),
+            user: ctx.id(),
+            backend: Some(backend_id),
+            query,
+        })
+        .await
+        .map_err(|e| database_failure(Stage::SourceSearch, e))?;
     Ok(search_id)
 }
 
-/// The state and groups of a search `ctx` started on the named backend, or
-/// the default one.
-pub async fn poll(
-    ctx: &UserCtx,
-    search_id: &str,
-    backend: Option<&str>,
-) -> Result<SearchResult, Failure> {
-    let backend = download_backend(backend)
+/// The state and groups of `ctx`'s search `search_id`, on the backend it
+/// was started on. A search that ended stores its groups as its candidates.
+pub async fn poll(ctx: &UserCtx, search_id: &str) -> Result<SearchResult, Failure> {
+    let stored = owned_search(&DB, ctx, search_id).await?;
+    let backend = download_backend(stored.backend.as_deref())
         .await
         .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))?;
 
-    if !SEARCH_OWNERS.owns(backend.id(), search_id, &ctx.id(), Instant::now()) {
-        return Err(search_not_found());
-    }
-
-    backend
+    let result = backend
         .poll_search(search_id)
         .await
-        .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))
+        .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))?;
+    if result.state != SearchState::InProgress {
+        LEDGER
+            .store_candidates(search_id, result.groups.clone())
+            .await
+            .map_err(|e| database_failure(Stage::SourceSearch, e))?;
+    }
+    Ok(result)
 }
 
 /// How one backend's search ended.
@@ -291,6 +299,9 @@ pub async fn search_ranked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::UserId;
+    use crate::core::test_ctx;
+    use crate::ledger::{Ledger, NewSearch};
     use crate::server_fns::download::test_support::{group, item, search_result, StubBackend};
     use shared::failure::UserActionCode;
     use soulbeet::error::{MissingSetting, SoulseekError};
@@ -551,21 +562,62 @@ mod tests {
     }
 
     #[test]
-    fn a_search_answers_only_its_owner() {
-        let owners = SearchOwners::default();
-        let t0 = Instant::now();
-        let (a, b) = (UserId::new("user-a"), UserId::new("user-b"));
-        owners.record("slskd", "s1", &a, t0);
+    fn a_search_is_readable_until_it_expires() {
+        let stored = |expires_at| {
+            Some(StoredSearch {
+                id: "s1".into(),
+                backend: Some("slskd".into()),
+                query: DownloadQuery::new(vec![]),
+                candidates: None,
+                expires_at,
+            })
+        };
+        assert_eq!(live_search(None, 1_000).unwrap_err(), search_not_found());
+        assert_eq!(
+            live_search(stored(1_000), 1_000).unwrap_err(),
+            search_expired()
+        );
+        assert_eq!(
+            live_search(stored(1_001), 1_000).map(|s| s.expires_at),
+            Ok(1_001)
+        );
+        let f = search_expired();
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::ExpiredHandle,
+                Stage::Input,
+                RetryAdvice::NotRetryable,
+                "Search expired"
+            )
+        );
+    }
 
-        assert!(owners.owns("slskd", "s1", &a, t0));
-        assert!(!owners.owns("slskd", "s1", &b, t0));
-        assert!(!owners.owns("slskd", "s2", &a, t0));
-        assert!(!owners.owns(
-            "slskd",
-            "s1",
-            &a,
-            t0 + SEARCH_OWNER_TTL + Duration::from_secs(1)
-        ));
+    #[tokio::test]
+    async fn another_users_search_reads_like_a_missing_one() {
+        let db = crate::db::test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        crate::core::folder_of(&db, "bob").await;
+        let ledger = Ledger::start(db.clone());
+        ledger
+            .record_search(NewSearch {
+                id: "s1".into(),
+                user: UserId::new("alice"),
+                backend: Some("slskd".into()),
+                query: DownloadQuery::new(vec![]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            owned_search(&db, &test_ctx("bob"), "s1").await.unwrap_err(),
+            search_not_found()
+        );
+        assert_eq!(
+            owned_search(&db, &test_ctx("alice"), "s1")
+                .await
+                .map(|s| s.backend),
+            Ok(Some("slskd".into()))
+        );
     }
 
     // Paused: every poll waits SEARCH_POLL_INTERVAL first.

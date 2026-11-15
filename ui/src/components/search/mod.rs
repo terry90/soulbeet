@@ -453,7 +453,6 @@ pub fn Search() -> Element {
             match auth
                 .call(api::poll_download_search(api::PollQuery {
                     search_id: search_id.clone(),
-                    backend: None,
                 }))
                 .await
             {

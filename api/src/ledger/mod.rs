@@ -458,7 +458,7 @@ mod tests {
         NewSearch {
             id: id.into(),
             user: UserId::new(user),
-            backend: Some("soulseek".into()),
+            backend: Some("slskd".into()),
             query: DownloadQuery::new(vec![]),
         }
     }

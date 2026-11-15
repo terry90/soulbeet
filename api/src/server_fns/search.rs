@@ -30,8 +30,6 @@ pub struct AlbumQuery {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PollQuery {
     pub search_id: String,
-    #[serde(default)]
-    pub backend: Option<String>,
 }
 
 #[post("/api/metadata/search/album", auth: AuthSession)]
@@ -74,7 +72,7 @@ pub async fn start_download_search(data: DownloadQuery) -> Result<String, Server
 
 #[post("/api/download/search/poll", auth: AuthSession)]
 pub async fn poll_download_search(input: PollQuery) -> Result<DownloadSearchResult, ServerFnError> {
-    sources::poll(&auth.0, &input.search_id, input.backend.as_deref())
+    sources::poll(&auth.0, &input.search_id)
         .await
         .map_err(failure_error)
 }
