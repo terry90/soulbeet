@@ -357,9 +357,13 @@ mod tests {
 
         let db = test_db::migrated().await;
         let old = SecretKey::new("secret".into());
-        let generated = crate::secret_key::resolve(None, tempfile::tempdir().unwrap().path())
-            .unwrap()
-            .0;
+        let generated = crate::secret_key::resolve(
+            None,
+            tempfile::tempdir().unwrap().path(),
+            "sqlite:soulbeet.db",
+        )
+        .unwrap()
+        .0;
         let cipher = crate::crypto::encrypt(&old, "navidrome-pw").unwrap();
         sqlx::query(
             "UPDATE users SET navidrome_token = ?, navidrome_status = 'connected' WHERE id = ?",

@@ -316,9 +316,13 @@ mod tests {
         // a generated key, so its cookies no longer verify.
         let db = db_with_user().await;
         let old = create_token_with(&SecretKey::new("secret".into()), "u1", 0).unwrap();
-        let generated = crate::secret_key::resolve(None, tempfile::tempdir().unwrap().path())
-            .unwrap()
-            .0;
+        let generated = crate::secret_key::resolve(
+            None,
+            tempfile::tempdir().unwrap().path(),
+            "sqlite:soulbeet.db",
+        )
+        .unwrap()
+        .0;
         let err = load_session(Some(&old), &db, &generated).await.unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
