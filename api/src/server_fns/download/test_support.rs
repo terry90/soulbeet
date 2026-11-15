@@ -1,19 +1,20 @@
 //! Shared fixtures for the download module's unit tests: builders for the
 //! search types the failover path consumes, and a `DownloadBackend` whose
-//! every enqueue answer is scripted. Lives outside the test modules so
-//! `failover` and `monitor` drive the same stub instead of keeping two
-//! copies of it in step.
+//! every enqueue and search answer is scripted. Lives outside the test
+//! modules so `failover`, `monitor` and `auto_download` drive the same stub
+//! instead of keeping copies of it in step.
 
 use crate::auth::UserId;
 use async_trait::async_trait;
 use shared::download::{
     DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, EnqueueStatus,
-    QueuedDownload, SearchResult,
+    QueuedDownload, SearchResult, SearchState,
 };
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::metadata::{Album, Track};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::DownloadBackend;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -103,12 +104,16 @@ pub enum ScriptedOutcome {
 }
 
 /// Answers each enqueue from a scripted list, then rejects everything after
-/// the script runs out. Records every destination and cancellation, and
-/// lists whatever transfers the test sets. Each stub has its own backend id,
-/// so the registry keys of concurrent tests never collide.
+/// the script runs out. Starts every search unless told to fail it, and
+/// answers its polls from a scripted list, then as still running with
+/// nothing found. Records every destination and cancellation, and lists
+/// whatever transfers the test sets. Each stub has its own backend id, so
+/// the registry keys of concurrent tests never collide.
 pub struct StubBackend {
     id: &'static str,
     script: Mutex<Vec<ScriptedOutcome>>,
+    search_start: Mutex<Option<SoulseekError>>,
+    polls: Mutex<VecDeque<SoulResult<SearchResult>>>,
     cancelled: Mutex<Vec<Cancel>>,
     destinations: Mutex<Vec<String>>,
     listing: Mutex<Vec<DownloadProgress>>,
@@ -129,6 +134,8 @@ impl StubBackend {
         Arc::new(Self {
             id: Box::leak(id.into_boxed_str()),
             script: Mutex::new(script),
+            search_start: Mutex::new(None),
+            polls: Mutex::new(VecDeque::new()),
             cancelled: Mutex::new(Vec::new()),
             destinations: Mutex::new(Vec::new()),
             listing: Mutex::new(Vec::new()),
@@ -155,6 +162,16 @@ impl StubBackend {
         };
         *self.hold.lock().unwrap() = Some(hold.clone());
         (hold.reached, hold.release)
+    }
+
+    /// Makes `start_search` fail with `e`.
+    pub fn fail_search_start(&self, e: SoulseekError) {
+        *self.search_start.lock().unwrap() = Some(e);
+    }
+
+    /// What `poll_search` answers, in order.
+    pub fn script_polls(&self, polls: Vec<SoulResult<SearchResult>>) {
+        *self.polls.lock().unwrap() = polls.into();
     }
 
     /// What `get_downloads_for` (filtered by peer) and `get_downloads` return.
@@ -191,6 +208,20 @@ impl Cancel {
     }
 }
 
+/// A search poll's answer.
+pub fn search_result(
+    search_id: &str,
+    state: SearchState,
+    groups: Vec<DownloadableGroup>,
+) -> SearchResult {
+    SearchResult {
+        search_id: search_id.to_string(),
+        groups,
+        has_more: state == SearchState::InProgress,
+        state,
+    }
+}
+
 /// A transfer as the backend lists it.
 pub fn transfer(source: &str, filename: &str, id: &str, state: DownloadState) -> DownloadProgress {
     DownloadProgress::queued(id.to_string(), source.to_string(), filename.to_string(), 0)
@@ -206,10 +237,20 @@ impl DownloadBackend for StubBackend {
         "Stub"
     }
     async fn start_search(&self, _album: Option<&Album>, _tracks: &[Track]) -> SoulResult<String> {
-        Ok("search".to_string())
+        match self.search_start.lock().unwrap().take() {
+            Some(e) => Err(e),
+            None => Ok("search".to_string()),
+        }
     }
-    async fn poll_search(&self, _search_id: &str) -> SoulResult<SearchResult> {
-        unreachable!("failover never searches")
+    async fn poll_search(&self, search_id: &str) -> SoulResult<SearchResult> {
+        let next = self.polls.lock().unwrap().pop_front();
+        next.unwrap_or_else(|| {
+            Ok(search_result(
+                search_id,
+                SearchState::InProgress,
+                Vec::new(),
+            ))
+        })
     }
     async fn download(
         &self,

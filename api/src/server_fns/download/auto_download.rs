@@ -10,7 +10,11 @@ use shared::download::{
 #[cfg(feature = "server")]
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage, UserAction};
 #[cfg(feature = "server")]
+use shared::metadata::{Album, Track};
+#[cfg(feature = "server")]
 use soulbeet::error::SoulseekError;
+#[cfg(feature = "server")]
+use soulbeet::DownloadBackend;
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
@@ -62,6 +66,62 @@ enum SearchStop {
     TimedOut,
     /// Starting or polling the search failed.
     Failed(Failure),
+}
+
+/// One backend's search, `id` naming it in the logs: the groups it found and
+/// how it ended.
+#[cfg(feature = "server")]
+async fn search_backend(
+    id: &str,
+    backend: &Arc<dyn DownloadBackend>,
+    album: Option<&Album>,
+    tracks: &[Track],
+) -> (Vec<DownloadableGroup>, SearchStop) {
+    let search_id = match backend.start_search(album, tracks).await {
+        Ok(sid) => sid,
+        Err(e) => {
+            warn!("Backend {} search start failed: {}", id, e);
+            let stop = SearchStop::Failed(e.failure(Stage::SourceSearch, e.to_string()));
+            return (Vec::new(), stop);
+        }
+    };
+
+    // Poll until results are ready or timeout. Polls that report
+    // InProgress carry the groups processed so far (the backend
+    // rescores the full response set each time), so keep the
+    // latest non-empty batch: the final Completed poll is empty
+    // when the search ends by timeout instead of result volume.
+    let deadline = tokio::time::Instant::now() + SEARCH_TIMEOUT;
+    let mut latest_groups = Vec::<DownloadableGroup>::new();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            warn!("Backend {} search timed out", id);
+            return (latest_groups, SearchStop::TimedOut);
+        }
+        tokio::time::sleep(SEARCH_POLL_INTERVAL).await;
+
+        match backend.poll_search(&search_id).await {
+            Ok(result) => match result.state {
+                SearchState::Completed | SearchState::TimedOut => {
+                    if !result.groups.is_empty() {
+                        latest_groups = result.groups;
+                    }
+                    return (latest_groups, SearchStop::Finished);
+                }
+                SearchState::NotFound => return (latest_groups, SearchStop::Finished),
+                SearchState::InProgress => {
+                    if !result.groups.is_empty() {
+                        latest_groups = result.groups;
+                    }
+                }
+            },
+            Err(e) => {
+                warn!("Backend {} poll error: {}", id, e);
+                let stop = SearchStop::Failed(e.failure(Stage::SourceSearch, e.to_string()));
+                return (latest_groups, stop);
+            }
+        }
+    }
 }
 
 /// Why a search found nothing: an empty search when any backend finished,
@@ -252,77 +312,15 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
         );
 
         // Search all backends in parallel (per D-06)
-        let search_futures: Vec<_> = backends
-            .iter()
-            .map(|(id, backend)| {
-                let id = id.clone();
-                let backend = Arc::clone(backend);
-                let album = album.clone();
-                let tracks = tracks.clone();
-                async move {
-                    // Start search
-                    let search_id = match backend.start_search(album.as_ref(), &tracks).await {
-                        Ok(sid) => sid,
-                        Err(e) => {
-                            warn!("Backend {} search start failed: {}", id, e);
-                            let stop =
-                                SearchStop::Failed(e.failure(Stage::SourceSearch, e.to_string()));
-                            return (id, Vec::<DownloadableGroup>::new(), stop);
-                        }
-                    };
-
-                    // Poll until results are ready or timeout. Polls that report
-                    // InProgress carry the groups processed so far (the backend
-                    // rescores the full response set each time), so keep the
-                    // latest non-empty batch: the final Completed poll is empty
-                    // when the search ends by timeout instead of result volume.
-                    let deadline = tokio::time::Instant::now() + SEARCH_TIMEOUT;
-                    let mut latest_groups = Vec::<DownloadableGroup>::new();
-                    loop {
-                        if tokio::time::Instant::now() >= deadline {
-                            warn!("Backend {} search timed out", id);
-                            break;
-                        }
-                        tokio::time::sleep(SEARCH_POLL_INTERVAL).await;
-
-                        match backend.poll_search(&search_id).await {
-                            Ok(result) => match result.state {
-                                SearchState::Completed | SearchState::TimedOut => {
-                                    if !result.groups.is_empty() {
-                                        latest_groups = result.groups;
-                                    }
-                                    return (id, latest_groups, SearchStop::Finished);
-                                }
-                                SearchState::NotFound => {
-                                    return (id, latest_groups, SearchStop::Finished);
-                                }
-                                SearchState::InProgress => {
-                                    if !result.groups.is_empty() {
-                                        latest_groups = result.groups;
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Backend {} poll error: {}", id, e);
-                                let stop = SearchStop::Failed(
-                                    e.failure(Stage::SourceSearch, e.to_string()),
-                                );
-                                return (id, latest_groups, stop);
-                            }
-                        }
-                    }
-                    (id, latest_groups, SearchStop::TimedOut)
-                }
-            })
-            .collect();
-
-        let results = futures::future::join_all(search_futures).await;
+        let results = futures::future::join_all(
+            backends
+                .iter()
+                .map(|(id, backend)| search_backend(id, backend, album.as_ref(), &tracks)),
+        )
+        .await;
 
         // Merge all results into a single list sorted by score (per D-07)
-        let (groups, stops): (Vec<_>, Vec<_>) = results
-            .into_iter()
-            .map(|(_backend_id, groups, stop)| (groups, stop))
-            .unzip();
+        let (groups, stops): (Vec<_>, Vec<_>) = results.into_iter().unzip();
         let mut all_groups: Vec<DownloadableGroup> = groups.into_iter().flatten().collect();
 
         if all_groups.is_empty() {
@@ -565,7 +563,134 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::server_fns::download::test_support::{group, item, search_result, StubBackend};
     use shared::failure::UserActionCode;
+
+    /// The groups `stub`'s search found and the failure an empty one gives.
+    async fn searched(stub: Arc<StubBackend>) -> (Vec<DownloadableGroup>, Failure) {
+        let backend: Arc<dyn DownloadBackend> = stub;
+        let (groups, stop) = search_backend("stub", &backend, None, &[]).await;
+        (groups, no_results_failure(&[stop]))
+    }
+
+    fn advice(f: &Failure) -> (FailureCode, Stage, RetryAdvice, &str) {
+        (f.code, f.stage, f.retry, f.message.as_str())
+    }
+
+    // Paused: every poll waits SEARCH_POLL_INTERVAL first.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_slskd_refuses_to_start_is_not_an_empty_search() {
+        let stub = StubBackend::new(vec![]);
+        let refused = "The server connection must be connected and logged in to perform a search (currently: Disconnected)";
+        stub.fail_search_start(SoulseekError::Api {
+            status: 409,
+            message: refused.into(),
+        });
+
+        let (groups, f) = searched(stub).await;
+
+        assert!(groups.is_empty());
+        assert_eq!(
+            advice(&f),
+            (
+                FailureCode::BackendUnreachable,
+                Stage::SourceSearch,
+                RetryAdvice::SameSourceLater,
+                "No results found"
+            )
+        );
+        let cause = f.cause.expect("slskd's answer");
+        assert_eq!((cause.status, cause.raw.as_str()), (Some(409), refused));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_whose_poll_fails_is_not_an_empty_search() {
+        let stub = StubBackend::new(vec![]);
+        stub.script_polls(vec![Err(SoulseekError::Api {
+            status: 503,
+            message: "Circuit breaker is open - slskd appears to be unavailable".into(),
+        })]);
+
+        let (_, f) = searched(stub).await;
+
+        assert_eq!(
+            advice(&f),
+            (
+                FailureCode::BackendUnreachable,
+                Stage::SourceSearch,
+                RetryAdvice::SameSourceLater,
+                "No results found"
+            )
+        );
+        assert_eq!(f.cause.and_then(|c| c.status), Some(503));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_that_finishes_empty_asks_for_another_query() {
+        let stub = StubBackend::new(vec![]);
+        stub.script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            Vec::new(),
+        ))]);
+
+        let (groups, f) = searched(stub).await;
+
+        assert!(groups.is_empty());
+        assert_eq!(
+            advice(&f),
+            (
+                FailureCode::SearchNoResults,
+                Stage::SourceSearch,
+                RetryAdvice::OtherQuery,
+                "No results found"
+            )
+        );
+        assert_eq!(f.cause, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_still_running_at_the_deadline_is_a_timeout() {
+        let stub = StubBackend::new(vec![]);
+
+        let (_, f) = searched(stub).await;
+
+        assert_eq!(
+            advice(&f),
+            (
+                FailureCode::SearchTimeout,
+                Stage::SourceSearch,
+                RetryAdvice::SameSourceLater,
+                "No results found"
+            )
+        );
+    }
+
+    /// The last poll of a search that ends by time is empty: the groups an
+    /// earlier poll found are the result.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_keeps_the_groups_found_before_it_completed() {
+        let stub = StubBackend::new(vec![]);
+        let found = vec![group(
+            "peer_a",
+            vec![item("peer_a", "Wake Up", "a.flac")],
+            0.9,
+        )];
+        stub.script_polls(vec![
+            Ok(search_result(
+                "search",
+                SearchState::InProgress,
+                found.clone(),
+            )),
+            Ok(search_result("search", SearchState::Completed, Vec::new())),
+        ]);
+        let backend: Arc<dyn DownloadBackend> = stub;
+
+        let (groups, stop) = search_backend("stub", &backend, None, &[]).await;
+
+        assert_eq!(groups, found);
+        assert!(matches!(stop, SearchStop::Finished));
+    }
 
     #[test]
     fn no_results_failure_tells_an_empty_search_from_a_dead_backend() {
