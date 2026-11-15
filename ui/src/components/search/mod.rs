@@ -40,7 +40,7 @@ use toast::{FallbackToast, FallbackToastData};
 mod search_type_toggle;
 use search_type_toggle::{SearchType, SearchTypeToggle};
 
-/// A download query for `album`, whose id comes from `provider`.
+/// A download query for `album`, which a search by `provider` gave.
 fn album_query(album: &Album, provider: Provider) -> DownloadQuery {
     DownloadQuery::new(vec![])
         .album(album.clone())

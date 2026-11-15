@@ -14,7 +14,7 @@ use shared::metadata::{Album, Track};
 #[cfg(feature = "server")]
 use soulbeet::error::SoulseekError;
 #[cfg(feature = "server")]
-use soulbeet::{DownloadBackend, MetadataError};
+use soulbeet::DownloadBackend;
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
@@ -30,7 +30,7 @@ use crate::models::folder::Folder;
 #[cfg(feature = "server")]
 use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
-use crate::server_fns::search::{hydrate_album_tracks, tracklist_message};
+use crate::server_fns::search::{hydrate_album_tracks, TracklistError};
 #[cfg(feature = "server")]
 use crate::services::{
     available_download_backends, download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND,
@@ -238,10 +238,10 @@ async fn usable_backends() -> Result<(Searched, Vec<Searched>), BackendLookupErr
     }
 }
 
-/// The tracklist of the album `album_title` could not be looked up.
+/// The tracklist of the album could not be looked up.
 #[cfg(feature = "server")]
-fn tracklist_failure(album_title: &str, e: &MetadataError) -> Failure {
-    e.failure(Stage::Metadata, tracklist_message(album_title, e))
+fn tracklist_failure(e: &TracklistError) -> Failure {
+    e.error.failure(Stage::Metadata, e.to_string())
 }
 
 /// The user's settings could not be read, which the tracklist lookup needs.
@@ -360,13 +360,14 @@ pub async fn auto_download(req: AutoDownloadRequest) -> Result<AutoDownloadResul
             }
         };
         if let Err(e) = hydrate_album_tracks(&mut query, settings.lastfm_api_key.as_deref()).await {
-            // Only an album query looks its tracklist up.
-            let album = query.album.as_ref().map_or("", |a| a.title.as_str());
             let _ = tx.send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
                 batch_id: batch_id.clone(),
-                failure: tracklist_failure(album, &e),
+                failure: tracklist_failure(&e),
             }));
-            info!("Auto-download: no tracklist for '{}': {}", query_desc, e);
+            info!(
+                "Auto-download: no tracklist for '{}': {}",
+                query_desc, e.error
+            );
             return;
         }
         let (album, tracks) = (query.album, query.tracks);
@@ -638,6 +639,7 @@ mod tests {
     use shared::download::SearchResult;
     use shared::failure::UserActionCode;
     use soulbeet::error::MissingSetting;
+    use soulbeet::MetadataError;
 
     /// The groups `stub`'s search found and the failure an empty one gives.
     async fn searched(stub: Arc<StubBackend>) -> (Vec<DownloadableGroup>, Failure) {
@@ -901,7 +903,10 @@ mod tests {
             status: Some(503),
             raw: "no answer within 15 s".into(),
         };
-        let f = tracklist_failure("Winter Songs", &e);
+        let f = tracklist_failure(&TracklistError {
+            album_title: "Winter Songs".into(),
+            error: e,
+        });
         assert_eq!(
             (f.code, f.stage),
             (FailureCode::MetadataUnavailable, Stage::Metadata)

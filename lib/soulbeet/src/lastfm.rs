@@ -32,7 +32,7 @@ enum LastFmFailure {
     /// No successful HTTP answer, and none with Last.fm's error body.
     Send(SendError),
     /// Last.fm's own error body, `{"error": code, "message": ...}`.
-    Api { code: u32, message: String },
+    Api { code: u16, message: String },
     /// A successful answer that does not parse.
     Parse(String),
 }
@@ -40,7 +40,7 @@ enum LastFmFailure {
 /// The body Last.fm answers an API error with.
 #[derive(Deserialize)]
 struct LastFmErrorBody {
-    error: u32,
+    error: u16,
     #[serde(default)]
     message: String,
 }
@@ -83,28 +83,49 @@ impl From<LastFmFailure> for SoulseekError {
 /// page lists them): 4 authentication failed, 10 invalid API key, 26
 /// suspended API key; 29 rate limit exceeded; 8 operation failed, 11 service
 /// offline, 16 temporary error; 6 invalid parameters, which `album.getInfo`
-/// answers for an album it does not have.
+/// answers for an album it does not have. The code is the error's status,
+/// as a Subsonic code is for Navidrome, since it is what Last.fm says went
+/// wrong; the HTTP status does not decide it.
 impl From<LastFmFailure> for MetadataError {
     fn from(f: LastFmFailure) -> Self {
         let service = Service::Lastfm;
         match f {
-            LastFmFailure::Api { code, message: raw } => match code {
-                4 | 10 | 26 => MetadataError::NotConfigured { service, raw },
-                29 => MetadataError::RateLimited { service, raw },
-                8 | 11 | 16 => MetadataError::Unavailable {
-                    service,
-                    status: None,
-                    raw,
-                },
-                6 => MetadataError::NotFound { service, raw },
-                _ => MetadataError::Rejected {
-                    service,
-                    status: None,
-                    raw,
-                },
-            },
+            LastFmFailure::Api { code, message: raw } => {
+                let status = Some(code);
+                match code {
+                    4 | 10 | 26 => MetadataError::NotConfigured {
+                        service,
+                        status,
+                        raw,
+                    },
+                    29 => MetadataError::RateLimited {
+                        service,
+                        status,
+                        raw,
+                    },
+                    8 | 11 | 16 => MetadataError::Unavailable {
+                        service,
+                        status,
+                        raw,
+                    },
+                    6 => MetadataError::NotFound {
+                        service,
+                        status,
+                        raw,
+                    },
+                    _ => MetadataError::Rejected {
+                        service,
+                        status,
+                        raw,
+                    },
+                }
+            }
             LastFmFailure::Send(SendError { status, body, .. }) => match status {
-                Some(429) => MetadataError::RateLimited { service, raw: body },
+                Some(429) => MetadataError::RateLimited {
+                    service,
+                    status,
+                    raw: body,
+                },
                 None | Some(500..=599) => MetadataError::Unavailable {
                     service,
                     status,
@@ -116,7 +137,11 @@ impl From<LastFmFailure> for MetadataError {
                     raw: body,
                 },
             },
-            LastFmFailure::Parse(raw) => MetadataError::Unreadable { service, raw },
+            LastFmFailure::Parse(raw) => MetadataError::Unreadable {
+                service,
+                status: None,
+                raw,
+            },
         }
     }
 }
@@ -401,10 +426,14 @@ impl LastFmProvider {
     async fn get_album_info(
         &self,
         id: &str,
+        (artist, album): (&str, &str),
     ) -> std::result::Result<LastFmAlbumInfo, LastFmFailure> {
         info!("Fetching album info from Last.fm: {}", id);
-        let params = album_info_params(id);
-        let params: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let params = [
+            ("method", "album.getInfo"),
+            ("artist", artist),
+            ("album", album),
+        ];
         let data: AlbumInfoResponse = self.api_request(&params).await?;
         Ok(data.album)
     }
@@ -824,22 +853,28 @@ fn format_duration(seconds: Option<u32>) -> Option<String> {
     })
 }
 
-/// The `album.getInfo` parameters for an album id from `search_albums`: a
-/// `lastfm:{artist}:{album}` id names the album, any other id is its MBID.
-fn album_info_params(id: &str) -> Vec<(&'static str, String)> {
-    let mut params = vec![("method", "album.getInfo".to_string())];
-    match id.strip_prefix("lastfm:").and_then(|r| r.split_once(':')) {
-        Some((artist, album)) => {
-            params.push(("artist", artist.to_string()));
-            params.push(("album", album.to_string()));
-        }
-        None => params.push(("mbid", id.to_string())),
-    }
-    params
+/// The artist and album a `lastfm:{artist}:{album}` id from `search_albums`
+/// names. A search gives an album Last.fm has an MBID for that MBID as its
+/// id instead: that id is MusicBrainz's, and MusicBrainz looks it up.
+fn album_name(id: &str) -> Option<(&str, &str)> {
+    id.strip_prefix(ID_PREFIX)?.split_once(':')
 }
 
+/// Whether `id` is an album id of Last.fm's own, which only Last.fm can look
+/// up.
+pub fn is_album_id(id: &str) -> bool {
+    album_name(id).is_some()
+}
+
+/// What starts the ids Last.fm results get when Last.fm has no MBID for them.
+const ID_PREFIX: &str = "lastfm:";
+
 fn generate_lastfm_id(artist: &str, name: &str) -> String {
-    format!("lastfm:{}:{}", artist.to_lowercase(), name.to_lowercase())
+    format!(
+        "{ID_PREFIX}{}:{}",
+        artist.to_lowercase(),
+        name.to_lowercase()
+    )
 }
 
 fn time_period_to_lastfm(period: TimePeriod) -> &'static str {
@@ -934,7 +969,12 @@ impl crate::MetadataProvider for LastFmProvider {
     }
 
     async fn get_album(&self, id: &str) -> std::result::Result<AlbumWithTracks, MetadataError> {
-        let info = self.get_album_info(id).await?;
+        let name = album_name(id).ok_or_else(|| MetadataError::Rejected {
+            service: Service::Lastfm,
+            status: None,
+            raw: format!("{id} is not a Last.fm album id"),
+        })?;
+        let info = self.get_album_info(id, name).await?;
 
         let album_mbid = nonempty_mbid(info.mbid.clone());
         let cover_url = LastFmImage::get_largest(&info.image);
@@ -1162,24 +1202,37 @@ impl crate::ScrobbleProvider for LastFmProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MetadataProvider;
+    use shared::failure::{FailureCode, Stage};
 
     #[test]
-    fn an_album_is_looked_up_by_the_id_search_gave() {
-        let p = |id| album_info_params(id);
+    fn only_lastfms_own_album_ids_name_an_album() {
         assert_eq!(
-            p("lastfm:marrow choir:winter songs"),
-            vec![
-                ("method", "album.getInfo".to_string()),
-                ("artist", "marrow choir".to_string()),
-                ("album", "winter songs".to_string())
-            ]
+            album_name("lastfm:marrow choir:winter songs"),
+            Some(("marrow choir", "winter songs"))
         );
-        assert_eq!(
-            p("8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f"),
-            vec![
-                ("method", "album.getInfo".to_string()),
-                ("mbid", "8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f".to_string())
-            ]
+        assert!(is_album_id(&generate_lastfm_id(
+            "Marrow Choir",
+            "Winter Songs"
+        )));
+        assert!(!is_album_id("8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f"));
+    }
+
+    #[tokio::test]
+    async fn an_mbid_is_not_looked_up_on_lastfm() {
+        let e = LastFmProvider::new("key")
+            .get_album("8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                e,
+                MetadataError::Rejected {
+                    service: Service::Lastfm,
+                    ..
+                }
+            ),
+            "{e:?}"
         );
     }
 
@@ -1196,7 +1249,7 @@ mod tests {
 
     #[test]
     fn lastfm_errors_come_from_its_error_code() {
-        let api = |code: u32, message: &str| LastFmFailure::Api {
+        let api = |code: u16, message: &str| LastFmFailure::Api {
             code,
             message: message.into(),
         };
@@ -1245,6 +1298,34 @@ mod tests {
         assert!(
             matches!(refused_key, LastFmFailure::Api { code: 10, .. }),
             "{refused_key:?}"
+        );
+
+        // The failure names the code that chose it, and keeps Last.fm's text.
+        let unmapped = MetadataError::from(api(13, "Invalid method signature supplied"))
+            .failure(Stage::Metadata, "m");
+        let cause = unmapped.cause.unwrap();
+        assert_eq!(
+            (
+                unmapped.code,
+                cause.service,
+                cause.status,
+                cause.raw.as_str()
+            ),
+            (
+                FailureCode::InvalidInput,
+                Service::Lastfm,
+                Some(13),
+                "Invalid method signature supplied"
+            )
+        );
+        let key = MetadataError::from(refused_key).failure(Stage::Metadata, "m");
+        let cause = key.cause.unwrap();
+        assert_eq!(
+            (cause.status, cause.raw.as_str()),
+            (
+                Some(10),
+                "Invalid API key - You must be granted a valid key by last.fm"
+            )
         );
     }
 }

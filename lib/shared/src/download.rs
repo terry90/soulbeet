@@ -9,7 +9,7 @@ pub struct DownloadQuery {
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub backend: Option<String>,
-    /// The metadata provider whose id `album` carries.
+    /// The metadata provider whose search gave `album`.
     #[serde(default)]
     pub metadata_provider: Option<Provider>,
 }

@@ -80,6 +80,7 @@ impl From<musicbrainz_rs::Error> for MetadataError {
         match e {
             Error::NotFound(_) => MetadataError::NotFound {
                 service,
+                status: None,
                 raw: e.to_string(),
             },
             // MusicBrainz's own `{error, help}` body, other than "Not Found"
@@ -96,6 +97,7 @@ impl From<musicbrainz_rs::Error> for MetadataError {
             // (`src/config.rs:9`, `src/fetching.rs:33-59`) until it gives up.
             Error::MaxRetriesExceeded => MetadataError::RateLimited {
                 service,
+                status: None,
                 raw: e.to_string(),
             },
             Error::ReqwestError(e) => MetadataError::Unavailable {
@@ -105,6 +107,7 @@ impl From<musicbrainz_rs::Error> for MetadataError {
             },
             Error::SerdeJsonError(e) => MetadataError::Unreadable {
                 service,
+                status: None,
                 raw: e.to_string(),
             },
             Error::MissingRetryToken | Error::InvalidUserAgent(_) => unreachable!(
@@ -417,20 +420,22 @@ mod tests {
         let mb_error: musicbrainz_rs::entity::api::MusicbrainzError =
             serde_json::from_value(serde_json::json!({"error": "Invalid mbid.", "help": "For usage, please see: https://musicbrainz.org/development/mmd"})).unwrap();
         let parse = serde_json::from_str::<u8>("x").unwrap_err();
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let refused = reqwest::get(format!("http://127.0.0.1:{port}"))
-            .await
-            .unwrap_err();
+        // A server that closes every connection unanswered: the port stays
+        // bound for the test, so nothing else can take it and answer.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                drop(connection);
+            }
+        });
+        let dropped = reqwest::get(format!("http://{addr}")).await.unwrap_err();
         let kinds: Vec<&str> = [
             musicbrainz_rs::Error::NotFound("q".into()),
             musicbrainz_rs::Error::MusicbrainzError("q".into(), mb_error),
             musicbrainz_rs::Error::MaxRetriesExceeded,
             musicbrainz_rs::Error::SerdeJsonError(parse),
-            musicbrainz_rs::Error::ReqwestError(refused),
+            musicbrainz_rs::Error::ReqwestError(dropped),
         ]
         .into_iter()
         .map(|e| match MetadataError::from(e) {
