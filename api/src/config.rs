@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "server")]
 use crate::auth::RegistrationMode;
+#[cfg(feature = "server")]
 use crate::base_url::{BaseUrl, BaseUrlError};
 #[cfg(feature = "server")]
 use soulbeet::ImportMode;
