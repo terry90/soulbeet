@@ -122,9 +122,12 @@ pub(super) enum Other {
 
 /// What `other`, a song other than `song`, is to `path`, the canonical file local_file_in gave
 /// for `song`: Same when Navidrome names the same path (its library path joined with its path)
-/// or its path on this machine (local_file_in's root) resolves to `path`; Unknown when its path
-/// is not inside its library, or does not resolve here while its size is the file's (a library
-/// Soulful does not see, or a root it learned wrong); else Different.
+/// or its path on this machine (local_file_in's root) resolves to `path`. When its path is not
+/// inside its library it is Unknown. When its path does not resolve here and its size is the
+/// file's it is Unknown if its library's root is not on this machine either (a library Soulful
+/// does not see), or if one of the two songs' paths ends with the other's (the sign of a root
+/// learned from another file: under it, the file's own song points one folder level too deep).
+/// Anything else is Different.
 pub(super) async fn other_in(
     db: &SqlitePool,
     music_path: Option<&Path>,
@@ -139,13 +142,21 @@ pub(super) async fn other_in(
     if Path::new(&other.library_path).join(relative) == listed {
         return Ok(Other::Same);
     }
-    let local = root_in(db, other, music_path).await?.join(relative);
-    Ok(match tokio::fs::canonicalize(&local).await {
-        Ok(resolved) if resolved == path => Other::Same,
-        Ok(_) => Other::Different,
-        Err(_) if other.size == song.size => Other::Unknown,
-        Err(_) => Other::Different,
-    })
+    let root = root_in(db, other, music_path).await?;
+    match tokio::fs::canonicalize(root.join(relative)).await {
+        Ok(resolved) if resolved == path => return Ok(Other::Same),
+        Ok(_) => return Ok(Other::Different),
+        Err(_) if other.size != song.size => return Ok(Other::Different),
+        Err(_) => {}
+    }
+    let mine = Path::new(&song.path);
+    let unseen_root = tokio::fs::canonicalize(&root).await.is_err();
+    Ok(
+        match unseen_root || relative.ends_with(mine) || mine.ends_with(relative) {
+            true => Other::Unknown,
+            false => Other::Different,
+        },
+    )
 }
 
 /// `song.path` when it is relative without `..`.
