@@ -9,8 +9,6 @@ use crate::{use_auth, use_system_health, TextInput};
 #[component]
 pub fn AppConfigManager() -> Element {
     let mut settings = use_settings();
-    let auth = use_auth();
-    let health = use_system_health();
     let mut config_resource = use_resource(|| async { api::get_app_config().await });
 
     let config = match &*config_resource.read() {
@@ -103,7 +101,28 @@ pub fn AppConfigManager() -> Element {
                         }
                     }
                 }
+            }
 
+            button {
+                class: "retro-btn rounded",
+                disabled: saving(),
+                onclick: handle_save,
+                if saving() { "Saving..." } else { "Save Configuration" }
+            }
+        }
+    }
+}
+
+/// Navidrome and Beets status, shown to every user.
+#[component]
+pub fn ConnectionStatusPanel() -> Element {
+    let auth = use_auth();
+    let health = use_system_health();
+
+    rsx! {
+        div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
+            h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Status" }
+            div { class: "space-y-6",
                 {
                     let (dot_class, summary) = match auth.navidrome_status() {
                         NavidromeStatus::Connected => ("bg-blue-400", "Connected"),
@@ -135,13 +154,6 @@ pub fn AppConfigManager() -> Element {
                         }
                     }
                 }
-            }
-
-            button {
-                class: "retro-btn rounded",
-                disabled: saving(),
-                onclick: handle_save,
-                if saving() { "Saving..." } else { "Save Configuration" }
             }
         }
     }
