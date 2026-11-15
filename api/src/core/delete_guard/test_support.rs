@@ -262,7 +262,6 @@ impl Listeners for FakeNavidrome {
                 duration: None,
                 path: None,
                 user_rating: (song.rating > 0).then_some(song.rating),
-                average_rating: song.average_rating,
                 play_count: None,
                 starred: s
                     .stars
@@ -294,7 +293,6 @@ impl Listeners for FakeNavidrome {
                 genre: None,
                 user_rating: (!s.legacy.contains(&user))
                     .then(|| s.album_ratings.get(&pair).copied().unwrap_or(0)),
-                average_rating: None,
                 starred: s
                     .album_stars
                     .contains(&pair)

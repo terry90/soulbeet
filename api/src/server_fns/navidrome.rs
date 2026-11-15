@@ -721,7 +721,6 @@ mod tests {
             duration: None,
             path: None,
             user_rating: rating,
-            average_rating: None,
             play_count: None,
             starred: None,
         }

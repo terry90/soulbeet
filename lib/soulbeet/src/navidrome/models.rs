@@ -167,8 +167,6 @@ pub struct SubsonicSong {
     #[serde(default)]
     pub user_rating: Option<u8>,
     #[serde(default)]
-    pub average_rating: Option<f64>,
-    #[serde(default)]
     pub play_count: Option<u32>,
     /// When this user starred the song; absent when not starred.
     #[serde(default)]
@@ -193,8 +191,6 @@ pub struct SubsonicAlbum {
     pub genre: Option<String>,
     #[serde(default)]
     pub user_rating: Option<u8>,
-    #[serde(default)]
-    pub average_rating: Option<f64>,
     /// When this user starred the album; absent when not starred.
     #[serde(default)]
     pub starred: Option<String>,
