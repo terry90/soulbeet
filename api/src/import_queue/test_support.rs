@@ -2,6 +2,7 @@
 
 use super::QueueDeps;
 use crate::auth::UserId;
+use crate::ledger::JobEvent;
 use async_trait::async_trait;
 use shared::download::{
     DownloadEvent, DownloadProgress, DownloadState, MatchCandidate, MatchChoices, MatchKind,
@@ -9,8 +10,8 @@ use shared::download::{
 use shared::library::DuplicateReport;
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::{
-    DriverChoice, ForgetOutcome, ImportMode, ImportOutcome, ImportResult, MusicImporter,
-    SkipReason, TaskCount,
+    DriverChoice, ForgetOutcome, ImportMode, ImportOutcome, ImportResult, ImportedItem,
+    MusicImporter, SkipReason, TaskCount,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -18,12 +19,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// One file imported, as beets reports it.
 pub fn imported() -> ImportResult {
     ImportResult {
         outcome: ImportOutcome::Imported {
             untagged: false,
             warnings: vec![],
-            items: vec![],
+            items: vec![ImportedItem {
+                path: "Zzqx Artist/a.flac".into(),
+                recording_mbid: None,
+                artist: "Zzqx Artist".into(),
+                title: "a".into(),
+            }],
         },
         output_tail: "imported tail".into(),
         tasks: TaskCount {
@@ -306,10 +313,11 @@ impl MusicImporter for StubImporter {
     }
 }
 
-/// Hands out one importer and records every event per user id.
+/// Hands out one importer, records every event per user id and every ledger event.
 pub struct RecordingDeps {
     importer: Arc<StubImporter>,
     events: Mutex<Vec<(UserId, DownloadEvent)>>,
+    ledger: Mutex<Vec<JobEvent>>,
 }
 
 impl RecordingDeps {
@@ -317,7 +325,13 @@ impl RecordingDeps {
         Arc::new(RecordingDeps {
             importer,
             events: Mutex::new(vec![]),
+            ledger: Mutex::new(vec![]),
         })
+    }
+
+    /// What the queue recorded in the ledger, in order.
+    pub fn ledger_events(&self) -> Vec<JobEvent> {
+        self.ledger.lock().unwrap().clone()
     }
 
     /// Each Progress event sent to `user`, as (item, state) pairs.
@@ -350,6 +364,10 @@ impl QueueDeps for RecordingDeps {
 
     async fn emit(&self, user: &UserId, event: DownloadEvent) {
         self.events.lock().unwrap().push((user.clone(), event));
+    }
+
+    fn record(&self, event: JobEvent) {
+        self.ledger.lock().unwrap().push(event);
     }
 }
 

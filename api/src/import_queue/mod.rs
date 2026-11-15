@@ -12,9 +12,10 @@ pub use retry::{forget_retries, import_choices_for, retry_import_for};
 pub(crate) use rows::import_failure;
 
 use crate::auth::UserId;
+use crate::ledger::{self, ImportDone, IndexWait, JobEvent, StoredImport};
 use async_trait::async_trait;
 use futures::FutureExt;
-use shared::download::{DownloadEvent, DownloadProgress, DownloadState, MatchChoices};
+use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, MatchChoices};
 use shared::failure::Failure;
 use soulbeet::audio::{count_audio_files, is_audio_path};
 use soulbeet::{
@@ -28,7 +29,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
-use retry::RetryStore;
+use retry::{keeps_retry, RetryStore};
 use rows::{rows_for_done, rows_with_state};
 
 const WORKER_STOPPED: &str = "import worker stopped";
@@ -55,6 +56,56 @@ pub struct ImportJob {
     pub choice: DriverChoice,
     /// What the last automatic run of these files left to pick from.
     pub choices: Option<Arc<MatchChoices>>,
+}
+
+impl ImportJob {
+    /// None for a job without an owner (discovery, promote): the ledger keeps only owned jobs.
+    pub fn stored(&self) -> Option<StoredImport> {
+        let owner = self.owner.as_ref()?;
+        Some(StoredImport {
+            sources: self.sources.clone(),
+            target: self.target.clone(),
+            album: matches!(self.mode, ImportMode::Album),
+            cleanup_root: self.cleanup_root.clone(),
+            choices: self.choices.as_deref().cloned(),
+            // The writer ignores a row without a job, so none is stored.
+            rows: owner
+                .rows
+                .iter()
+                .filter_map(|row| Some((row.job.clone()?, row.clone())))
+                .collect(),
+        })
+    }
+
+    /// The job `stored` describes, choice Auto, reporting to `user` through its rows (jobs set).
+    pub fn from_stored(stored: StoredImport, user: UserId) -> ImportJob {
+        ImportJob {
+            sources: stored.sources,
+            target: stored.target,
+            mode: match stored.album {
+                true => ImportMode::Album,
+                false => ImportMode::Singleton,
+            },
+            owner: Some(JobOwner {
+                user_id: user,
+                rows: stored
+                    .rows
+                    .into_iter()
+                    .map(|(slot, row)| row.with_job(slot))
+                    .collect(),
+            }),
+            snapshot_target: false,
+            cleanup_root: stored.cleanup_root,
+            choice: DriverChoice::Auto,
+            choices: stored.choices.map(Arc::new),
+        }
+    }
+
+    /// Whether the job's sources still hold an audio file to import.
+    async fn holds_audio(&self) -> bool {
+        let sources: Vec<&Path> = self.sources.iter().map(PathBuf::as_path).collect();
+        count_audio_files(&sources).await > 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +163,8 @@ impl ImportHandle {
 pub trait QueueDeps: Send + Sync {
     async fn importer(&self) -> Result<Arc<dyn MusicImporter>, String>;
     async fn emit(&self, user: &UserId, event: DownloadEvent);
+    /// Records `event` in the job ledger.
+    fn record(&self, event: JobEvent);
 }
 
 struct Waiting {
@@ -186,8 +239,9 @@ impl ImportQueue {
                     format!("Could not create {}: {e}", job.target.display()),
                 );
                 let (state, rx) = watch::channel(JobState::Running);
+                // A failure, so no index wait reads the library.
                 self.shared
-                    .finish(&job, JobOutcome::of(result), &state)
+                    .finish(&job.target, &job, JobOutcome::of(result), &state)
                     .await;
                 return ImportHandle { rx };
             }
@@ -254,6 +308,19 @@ impl ImportQueue {
             if let Work::Import(waiting) = &item {
                 let position = u32::from(entry.running) + entry.queue.len() as u32;
                 waiting.state.send_replace(JobState::Queued { position });
+                // Under the targets lock, so it reaches the ledger before anything
+                // the worker records for this job.
+                if let Some(mut import) = waiting.job.stored() {
+                    for (_, row) in &mut import.rows {
+                        *row = row
+                            .clone()
+                            .without_failure()
+                            .with_state(DownloadState::ImportQueued(position));
+                    }
+                    self.shared
+                        .deps
+                        .record(JobEvent::ImportQueued(Box::new(import)));
+                }
             }
             entry.queue.push_back(item);
             spawn.then_some(entry.generation)
@@ -296,8 +363,12 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                 let rows = rows_with_state(&owner.rows, DownloadState::Importing);
                 shared
                     .deps
-                    .emit(&owner.user_id, DownloadEvent::Progress(rows))
+                    .emit(&owner.user_id, DownloadEvent::Progress(rows.clone()))
                     .await;
+                shared.deps.record(JobEvent::Slots {
+                    state: ledger::JobState::Importing,
+                    rows,
+                });
             }
             for (user, rows) in moved {
                 shared.deps.emit(&user, DownloadEvent::Progress(rows)).await;
@@ -312,7 +383,7 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                         warn!("Import into {} panicked", key.display());
                         JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
                     });
-                shared.finish(&job, outcome, &state).await;
+                shared.finish(&key, &job, outcome, &state).await;
             }
             Work::Forget { file, done } => {
                 let outcome = AssertUnwindSafe(shared.forget(&key, &file))
@@ -379,10 +450,10 @@ impl Shared {
     }
 
     async fn execute(&self, target: &Path, job: &ImportJob) -> JobOutcome {
-        let sources: Vec<&Path> = job.sources.iter().map(PathBuf::as_path).collect();
-        if count_audio_files(&sources).await == 0 {
+        if !job.holds_audio().await {
             return JobOutcome::of(ImportResult::nothing_to_import());
         }
+        let sources: Vec<&Path> = job.sources.iter().map(PathBuf::as_path).collect();
         let importer = match self.deps.importer().await {
             Ok(importer) => importer,
             Err(e) => return JobOutcome::of(ImportResult::failed(FailKind::Setup, e)),
@@ -416,7 +487,23 @@ impl Shared {
         }
     }
 
-    async fn finish(&self, job: &ImportJob, outcome: JobOutcome, state: &watch::Sender<JobState>) {
+    /// Records the dropped slots of kept imports as dismissed.
+    fn dismiss(&self, slots: Vec<JobSlot>) {
+        if !slots.is_empty() {
+            self.deps.record(JobEvent::Dismiss(slots));
+        }
+    }
+
+    /// Ends `job`, imported into `library` (its canonical target): cleans up,
+    /// keeps it for a retry when its outcome says so, and sends and records
+    /// its rows.
+    async fn finish(
+        &self,
+        library: &Path,
+        job: &ImportJob,
+        outcome: JobOutcome,
+        state: &watch::Sender<JobState>,
+    ) {
         match &outcome.result.outcome {
             ImportOutcome::Imported { .. } => {
                 info!(
@@ -457,15 +544,54 @@ impl Shared {
             ..job.clone()
         });
         // Stored before the rows go out, so their Retry button always finds it.
-        self.retries.record(&job, &outcome.result);
+        let keep = keeps_retry(&outcome.result.outcome);
+        let dropped = self.retries.record(&job, keep);
         let _emit = self.emit_lock.lock().await;
         if let Some(owner) = &job.owner {
             let rows = rows_for_done(&owner.rows, &job, &outcome);
+            if let Some(import) = job.stored() {
+                let (next, index) = ledger_end(library, &job, &outcome.result.outcome, keep);
+                self.deps.record(JobEvent::ImportDone(Box::new(ImportDone {
+                    import,
+                    rows: rows.clone(),
+                    next,
+                    index,
+                })));
+            }
             self.deps
                 .emit(&owner.user_id, DownloadEvent::Progress(rows))
                 .await;
         }
+        self.dismiss(dropped);
         state.send_replace(JobState::Done(Box::new(outcome)));
+    }
+}
+
+/// The ledger state the slots of `job` go to after `outcome`, kept for a
+/// retry when `keep`, and the index wait of an import into `library`.
+fn ledger_end(
+    library: &Path,
+    job: &ImportJob,
+    outcome: &ImportOutcome,
+    keep: bool,
+) -> (ledger::JobState, Option<IndexWait>) {
+    match (outcome, job.sources.first()) {
+        // An import that ran had a source.
+        (ImportOutcome::Imported { items, .. }, Some(first)) if !items.is_empty() => (
+            ledger::JobState::Indexing,
+            Some(IndexWait {
+                import: first.display().to_string(),
+                library: library.to_path_buf(),
+                items: items.clone(),
+                since: chrono::Utc::now().timestamp(),
+                baseline: None,
+                checked: None,
+            }),
+        ),
+        // beets left no report of what it imported (D14).
+        (ImportOutcome::Imported { .. }, _) => (ledger::JobState::Done, None),
+        _ if keep => (ledger::JobState::NeedsDecision, None),
+        _ => (ledger::JobState::Failed, None),
     }
 }
 
@@ -529,6 +655,10 @@ impl QueueDeps for LiveDeps {
     async fn emit(&self, user: &UserId, event: DownloadEvent) {
         crate::globals::send_user_event(user, event).await;
     }
+
+    fn record(&self, event: JobEvent) {
+        ledger::LEDGER.record(event);
+    }
 }
 
 pub static IMPORT_QUEUE: LazyLock<ImportQueue> =
@@ -536,9 +666,12 @@ pub static IMPORT_QUEUE: LazyLock<ImportQueue> =
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{alice, broken, row, RecordingDeps, StubImporter};
+    use super::choice::{files_gone, nothing_to_retry};
+    use super::test_support::{
+        alice, broken, imported, no_match, row, RecordingDeps, StubImporter,
+    };
     use super::*;
-    use shared::download::DownloadState;
+    use shared::download::{DownloadState, ImportChoice, JobSlot};
     use soulbeet::{ForgetOutcome, ImportOutcome, SkipReason};
     use std::time::Duration;
 
@@ -571,10 +704,20 @@ mod tests {
         }
     }
 
+    /// `job` reporting to `user` through a row per item, row `i` in slot `i` of job "j1".
     pub(super) fn owned(mut job: ImportJob, user: &UserId, items: &[&str]) -> ImportJob {
         job.owner = Some(JobOwner {
             user_id: user.clone(),
-            rows: items.iter().map(|i| row(i)).collect(),
+            rows: items
+                .iter()
+                .zip(0..)
+                .map(|(item, slot)| {
+                    row(item).with_job(JobSlot {
+                        job: "j1".into(),
+                        slot,
+                    })
+                })
+                .collect(),
         });
         job
     }
@@ -870,6 +1013,177 @@ mod tests {
         ));
         assert!(!lib.exists());
         assert!(stub.forgets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_owned_import_tells_the_ledger_it_queued_and_how_it_ended() {
+        use crate::ledger::JobState as LedgerState;
+        let tmp = tempfile::tempdir().unwrap();
+        let no_items = ImportResult {
+            outcome: ImportOutcome::Imported {
+                untagged: false,
+                warnings: vec![],
+                items: vec![],
+            },
+            ..imported()
+        };
+        for (scripted, next) in [
+            (imported(), LedgerState::Indexing),
+            (no_items, LedgerState::Done),
+            (no_match(2), LedgerState::NeedsDecision),
+            (ImportResult::nothing_to_import(), LedgerState::Failed),
+        ] {
+            let (queue, stub, deps) = queue(StubImporter::new());
+            stub.script(scripted);
+            let lib = tmp.path().join(format!("lib-{}", next.as_str()));
+            finish(
+                queue
+                    .submit(owned(
+                        job(file(tmp.path(), "dl/a.flac"), &lib),
+                        &alice(),
+                        &["a"],
+                    ))
+                    .await,
+            )
+            .await;
+            let events = deps.ledger_events();
+            let slot = JobSlot {
+                job: "j1".into(),
+                slot: 0,
+            };
+            assert!(
+                matches!(&events[0], JobEvent::ImportQueued(import) if import.rows[0].0 == slot),
+                "{events:?}"
+            );
+            assert!(
+                matches!(&events[1], JobEvent::Slots { state: LedgerState::Importing, rows }
+                    if rows[0].job.as_ref() == Some(&slot) && rows[0].state == DownloadState::Importing),
+                "{events:?}"
+            );
+            let JobEvent::ImportDone(done) = &events[2] else {
+                panic!("{events:?}")
+            };
+            assert_eq!(done.next, next);
+            assert_eq!(
+                done.index
+                    .as_ref()
+                    .map(|w| (w.library.clone(), w.items.len())),
+                (next == LedgerState::Indexing).then(|| (std::fs::canonicalize(&lib).unwrap(), 1))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kept_import_restored_after_a_restart_can_be_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let kept = owned(
+            job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        let stored = kept.stored().expect("an owned job is stored");
+        assert_eq!(
+            queue.restore(ImportJob::from_stored(stored, alice())).await,
+            Ok(())
+        );
+        assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stub.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await
+            }
+        })
+        .await
+        .expect("the restored import ran");
+    }
+
+    #[tokio::test]
+    async fn a_kept_import_whose_files_are_gone_is_not_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, _, _) = queue(StubImporter::new());
+        let gone = owned(
+            job(tmp.path().join("dl/a.flac"), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        let refused = queue
+            .restore(ImportJob::from_stored(gone.stored().unwrap(), alice()))
+            .await
+            .unwrap_err();
+        assert_eq!(refused, files_gone());
+        assert_eq!(
+            queue.import_choices(&alice(), "a").unwrap_err(),
+            nothing_to_retry()
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_kept_row_dismisses_its_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(no_match(1));
+        finish(
+            queue
+                .submit(owned(
+                    job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
+                    &alice(),
+                    &["a"],
+                ))
+                .await,
+        )
+        .await;
+        queue.forget_retries(&alice(), &["a".to_string()]);
+        assert_eq!(
+            deps.ledger_events().last(),
+            Some(&JobEvent::Dismiss(vec![JobSlot {
+                job: "j1".into(),
+                slot: 0
+            }]))
+        );
+    }
+
+    #[test]
+    fn a_stored_import_rebuilds_the_same_job() {
+        let mut original = owned(
+            job(PathBuf::from("/dl/X [1f2e3d4c]"), Path::new("/music")),
+            &alice(),
+            &["a", "b"],
+        );
+        original.mode = ImportMode::Album;
+        let rebuilt = ImportJob::from_stored(original.stored().unwrap(), alice());
+        assert_eq!(
+            (
+                &rebuilt.sources,
+                &rebuilt.target,
+                rebuilt.mode,
+                &rebuilt.cleanup_root
+            ),
+            (
+                &original.sources,
+                &original.target,
+                original.mode,
+                &original.cleanup_root
+            )
+        );
+        let rows = |j: ImportJob| {
+            j.owner
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|r| (r.item, r.job))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(rebuilt), rows(original));
+        assert!(owned(
+            job(PathBuf::from("/dl/a.flac"), Path::new("/music")),
+            &alice(),
+            &[]
+        )
+        .stored()
+        .is_some());
+        assert!(job(PathBuf::from("/dl/a.flac"), Path::new("/music"))
+            .stored()
+            .is_none());
     }
 
     #[tokio::test]
