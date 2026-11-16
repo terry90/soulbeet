@@ -67,3 +67,19 @@ export async function stubState(): Promise<StubState> {
   }
   return (await response.json()) as StubState;
 }
+
+/** Takes the stubs' Navidrome proxy down (connections refused) or brings it back. */
+export async function setNavidromeDown(down: boolean): Promise<void> {
+  await post('/_control/navidrome', { down });
+}
+
+/** Has the slskd stub remove a delivered batch destination directory (it wrote it, as root). */
+export async function removeStubDownloads(destination: string): Promise<void> {
+  const response = await fetch(
+    `${slskdControlUrl}/_control/downloads/${encodeURIComponent(destination)}`,
+    { method: 'DELETE' },
+  );
+  if (!response.ok) {
+    throw new Error(`control downloads failed: ${response.status} ${await response.text()}`);
+  }
+}

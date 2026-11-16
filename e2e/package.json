@@ -8,6 +8,7 @@
 		"fixtures": "tsx fixtures/generate.ts",
 		"stubs": "tsx stubs/src/main.ts",
 		"test": "playwright test",
+		"test:mcp": "playwright test -c playwright.mcp.config.ts",
 		"test:headed": "playwright test --headed",
 		"report": "playwright show-report"
 	},

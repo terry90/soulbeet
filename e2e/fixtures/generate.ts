@@ -10,7 +10,7 @@ import { copyFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse, stringify } from 'yaml';
-import { allAudioFiles, audioFileName, findRecording } from './dataset.js';
+import { allAudioFiles, audioFileName, taggedRecording } from './dataset.js';
 import { user90BrokenConfig } from '../helpers/env.js';
 
 const e2eRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -30,7 +30,7 @@ function generateAudio(): void {
       continue;
     }
 
-    const hit = findRecording(share.recordingMbid);
+    const hit = taggedRecording(share.recordingMbid);
     if (!hit) {
       throw new Error(`share references unknown recording ${share.recordingMbid}`);
     }

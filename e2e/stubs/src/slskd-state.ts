@@ -3,7 +3,7 @@
 // flag strings) as implemented in the slskd C# source.
 
 import { randomUUID } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { extname, join } from 'node:path';
 import {
@@ -137,6 +137,31 @@ const HAPPY_STEPS: TransferStep[] = [
   { afterMs: 7300, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
 ];
 
+// A transfer connection that closes mid-file: Soulseek.NET 10.0.2 Connection.cs:651,686 and
+// SoulseekClient.cs:3396, stored in Completed, Errored (SoulseekClient.cs:3519-3527).
+const DROPPED_CONNECTION = 'Transfer failed: Read error: Remote connection closed';
+
+/**
+ * A refused request: Soulseek.NET stores "Transfer rejected: {reason}" in Completed, Rejected
+ * (SoulseekClient.cs#L3308-L3310, #L3481-L3484); slskd never retries a rejection
+ * (DownloadService.cs:1394-1398).
+ */
+function rejectedSteps(reason: string): TransferStep[] {
+  return [
+    { afterMs: 0, state: 'Queued, Locally', percent: 0 },
+    { afterMs: 100, state: 'Requested', percent: 0, attempts: 1 },
+    {
+      afterMs: 2600,
+      state: 'Completed, Rejected',
+      percent: 0,
+      exception: `Transfer rejected: ${reason}`,
+    },
+  ];
+}
+
+/** slskd's queue-full reason (Application.cs:763-766). */
+const QUEUE_FULL = rejectedSteps('Too many files');
+
 /** Behaviors whose enqueue is accepted and whose transfers follow a plan. */
 type EnqueueableBehavior = Exclude<PeerBehavior, 'offline' | 'enqueueoffline'>;
 
@@ -154,7 +179,7 @@ const BEHAVIOR_PLANS: Record<EnqueueableBehavior, TransferStep[]> = {
       afterMs: 4000,
       state: 'Completed, Errored',
       percent: 31,
-      exception: 'Connection reset by peer',
+      exception: DROPPED_CONNECTION,
       attempts: 3,
     },
   ],
@@ -175,12 +200,25 @@ const BEHAVIOR_PLANS: Record<EnqueueableBehavior, TransferStep[]> = {
       afterMs: 5300,
       state: 'Completed, Errored',
       percent: 40,
-      exception: 'Connection reset by peer',
+      exception: DROPPED_CONNECTION,
       attempts: 3,
     },
     { afterMs: 7300, state: 'Queued, Locally', percent: 40, attempts: 4 },
     { afterMs: 9000, state: 'InProgress', percent: 80 },
     { afterMs: 10500, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
+  ],
+  rejects: rejectedSteps('File not shared.'),
+  // The first transfer of a peer is refused by createBatch (QUEUE_FULL); the later ones follow this plan.
+  busyonce: HAPPY_STEPS,
+  // Holds a transfer in progress long enough for the suite to restart Soulful.
+  slow: [
+    { afterMs: 0, state: 'Queued, Locally', percent: 0 },
+    { afterMs: 100, state: 'Requested', percent: 0 },
+    { afterMs: 2600, state: 'Queued, Remotely', percent: 0 },
+    { afterMs: 3400, state: 'Initializing', percent: 0 },
+    { afterMs: 5900, state: 'InProgress', percent: 24 },
+    { afterMs: 90000, state: 'InProgress', percent: 71 },
+    { afterMs: 91000, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
   ],
   stall: [
     { afterMs: 0, state: 'Queued, Locally', percent: 0 },
@@ -246,7 +284,7 @@ export class SlskdState {
   private behaviors = new Map<string, PeerBehavior>();
   private fileSizes = new Map<string, number>();
   private nextToken = 1000;
-  /** peers whose one-off partialenqueue rejection already fired */
+  /** peers whose one-off rejection (partialenqueue, busyonce) already fired */
   private rejectedOnce = new Set<string>();
   private batchIds = new Set<string>();
   private enqueuesInFlight = 0;
@@ -514,7 +552,6 @@ export class SlskdState {
     }
     this.batchIds.add(id);
 
-    const plan = BEHAVIOR_PLANS[behavior];
     const now = Date.now();
     const enqueued: Array<Record<string, unknown>> = [];
     const failures: Array<{ filename: string; message: string }> = [];
@@ -538,6 +575,11 @@ export class SlskdState {
         this.rejectedOnce.add(username);
         failures.push({ filename, message: 'Error: Enqueue rejected by peer' });
         continue;
+      }
+      let plan = BEHAVIOR_PLANS[behavior];
+      if (behavior === 'busyonce' && !this.rejectedOnce.has(username)) {
+        this.rejectedOnce.add(username);
+        plan = QUEUE_FULL;
       }
       // Real slskd creates the record in "Queued, Locally"
       // (DownloadService.EnqueueAsync), then the download task overwrites the
@@ -862,13 +904,22 @@ export class SlskdState {
    * GET /api/v0/users/{username}/status (UsersController.cs:253-278): an
    * offline peer, and a user the dataset does not know, read Offline.
    */
-  userStatusJson(username: string): Record<string, unknown> {
+  userStatusJson(username: string): { isPrivileged: false; presence: 'Online' | 'Offline' } {
     const behavior = this.behaviorOf(username);
     const offline =
       !peers.some((p) => p.username === username) ||
       behavior === 'offline' ||
       behavior === 'enqueueoffline';
     return { isPrivileged: false, presence: offline ? 'Offline' : 'Online' };
+  }
+
+  /** Removes a batch destination directory the stub delivered into; false for anything but one directory name. */
+  removeDestination(name: string): boolean {
+    if (name === '' || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
+      return false;
+    }
+    rmSync(join(this.downloadsDir, name), { recursive: true, force: true });
+    return true;
   }
 
   /** Debug/control snapshot for specs. */

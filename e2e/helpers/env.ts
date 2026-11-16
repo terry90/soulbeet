@@ -9,6 +9,12 @@ export const e2eRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 /** Where the browser reaches the app. */
 export const baseUrl = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:9765';
 
+/** The app instance with MCP on (compose.mcp.yml), as the suite reaches it. */
+export const mcpBaseUrl = process.env.E2E_MCP_BASE_URL ?? 'http://127.0.0.1:9767';
+
+/** The stubs' Navidrome proxy as the host reaches it; the app dials it inside compose. */
+export const navidromeProxyUrl = process.env.E2E_NAVIDROME_PROXY_URL ?? 'http://127.0.0.1:4534';
+
 /** A second app instance whose beets config is the one from issue #90. */
 export const user90BaseUrl = process.env.E2E_USER90_BASE_URL ?? 'http://127.0.0.1:9766';
 

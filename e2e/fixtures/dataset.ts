@@ -47,7 +47,10 @@ export type PeerBehavior =
   | 'stall'
   | 'offline'
   | 'enqueueoffline'
-  | 'partialenqueue';
+  | 'partialenqueue'
+  | 'rejects'
+  | 'busyonce'
+  | 'slow';
 
 export interface Peer {
   username: string;
@@ -449,6 +452,85 @@ export const bellwether: FixtureRelease = {
   ],
 };
 
+// Releases the MCP acceptance suite downloads: no other spec touches them.
+
+export const fenwickCarols: FixtureRelease = {
+  releaseMbid: 'd776ca5d-3ad7-4a56-8fa5-253c88fe7677',
+  releaseGroupMbid: '859137ac-42d1-4444-a0db-64cdc25ef999',
+  title: 'Carols at Fenwick',
+  artist: 'Fenwick Carol Singers',
+  artistMbid: 'a77a15cb-f05f-41cc-9dcf-da78c518b3b4',
+  date: '2025-12-05',
+  primaryType: 'Album',
+  rating: 70,
+  tracks: [
+    {
+      mbid: '262c9272-daeb-4dbf-8a0a-780598777ca7',
+      title: 'Silent Night',
+      position: 1,
+      lengthMs: 30000,
+    },
+    {
+      mbid: 'c1e197e3-921d-49bf-83bf-3ebf2e49d7f7',
+      title: 'O Holy Night',
+      position: 2,
+      lengthMs: 30000,
+    },
+    {
+      mbid: 'af06e47b-77be-4109-a2f3-e34fa947d67f',
+      title: 'Hark the Herald Angels Sing',
+      position: 3,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '066f44e6-56c2-4eb0-9c5e-f231e1df996a',
+      title: 'Coventry Carol',
+      position: 4,
+      lengthMs: 30000,
+    },
+    {
+      mbid: 'ba64f619-93e6-486f-bcc2-978b64ef5955',
+      title: 'Good King Wenceslas',
+      position: 5,
+      lengthMs: 30000,
+    },
+    {
+      mbid: 'ad423f2f-c53c-4b88-97ba-2595a344ff97',
+      title: 'In the Bleak Midwinter',
+      position: 6,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '611961eb-db5c-42f9-a963-af5b4777b0d0',
+      title: 'Deck the Halls',
+      position: 7,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const wytheChapelCarols: FixtureRelease = {
+  releaseMbid: '2722af51-0666-487e-951f-ad4bbc81d073',
+  releaseGroupMbid: '86ff828f-7243-4340-911f-c6d18fdcd52c',
+  title: 'Wythe Chapel Carols',
+  artist: 'Wythe Chapel Choir',
+  artistMbid: '16910708-a305-4cb6-883b-c05be367a483',
+  date: '2024-12-13',
+  primaryType: 'Single',
+  rating: 60,
+  tracks: [
+    {
+      mbid: 'b18dc001-1434-4e54-80f1-ee075ca66507',
+      title: 'The Holly and the Ivy',
+      position: 1,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+/** Releases peers share but the MusicBrainz stub does not know: beets finds no candidate for their files. */
+export const releasesMusicBrainzLacks: FixtureRelease[] = [wytheChapelCarols];
+
 export const releases: FixtureRelease[] = [
   glassAtlas,
   driftwoodCodes,
@@ -458,6 +540,7 @@ export const releases: FixtureRelease[] = [
   ...importReleases,
   cinderPsalmChoir,
   bellwether,
+  fenwickCarols,
 ];
 
 export function findRelease(releaseMbid: string): FixtureRelease | undefined {
@@ -468,6 +551,19 @@ export function findRecording(
   recordingMbid: string,
 ): { release: FixtureRelease; track: FixtureTrack } | undefined {
   for (const release of releases) {
+    const track = release.tracks.find((t) => t.mbid === recordingMbid);
+    if (track) {
+      return { release, track };
+    }
+  }
+  return undefined;
+}
+
+/** findRecording over `releases` and `releasesMusicBrainzLacks`: the tags a generated file carries. */
+export function taggedRecording(
+  recordingMbid: string,
+): { release: FixtureRelease; track: FixtureTrack } | undefined {
+  for (const release of [...releases, ...releasesMusicBrainzLacks]) {
     const track = release.tracks.find((t) => t.mbid === recordingMbid);
     if (track) {
       return { release, track };
@@ -497,6 +593,21 @@ function albumShares(
     sampleRate,
     bitDepth,
   }));
+}
+
+/** The shares of a release's tracks at the given positions. */
+function carolShares(
+  root: string,
+  release: FixtureRelease,
+  positions: number[],
+  format: AudioFormat,
+  bitRate: number | null,
+  sampleRate: number | null,
+  bitDepth: number | null,
+): PeerShare[] {
+  return albumShares(root, release, format, bitRate, sampleRate, bitDepth).filter((_, i) =>
+    positions.includes(i + 1),
+  );
 }
 
 // collector_01 is the canonical best source: complete FLAC rips, fast, free
@@ -546,6 +657,64 @@ export const peers: Peer[] = [
       sampleRate: 44100,
       bitDepth: null,
     })),
+  },
+  // The MCP acceptance suite's Christmas peers (see e2e/acceptance). The failing
+  // ones score above carol_backup, so the automatic pick takes them first.
+  {
+    username: 'carol_happy',
+    uploadSpeed: 8000,
+    queueLength: 0,
+    hasFreeUploadSlot: true,
+    defaultBehavior: 'happy',
+    shares: carolShares('Music\\FLAC', fenwickCarols, [1, 2, 4], 'flac', null, 44100, 16),
+  },
+  {
+    username: 'carol_slow',
+    uploadSpeed: 8000,
+    queueLength: 0,
+    hasFreeUploadSlot: true,
+    defaultBehavior: 'slow',
+    shares: albumShares('Music\\FLAC', wytheChapelCarols, 'flac', null, 44100, 16),
+  },
+  {
+    username: 'carol_rejects',
+    uploadSpeed: 8000,
+    queueLength: 0,
+    hasFreeUploadSlot: true,
+    defaultBehavior: 'rejects',
+    shares: carolShares('Music\\FLAC', fenwickCarols, [3], 'flac', null, 44100, 16),
+  },
+  {
+    username: 'carol_drops',
+    uploadSpeed: 8000,
+    queueLength: 0,
+    hasFreeUploadSlot: true,
+    defaultBehavior: 'flaky',
+    shares: carolShares('Music\\FLAC', fenwickCarols, [5], 'flac', null, 44100, 16),
+  },
+  {
+    username: 'carol_busy',
+    uploadSpeed: 8000,
+    queueLength: 0,
+    hasFreeUploadSlot: true,
+    defaultBehavior: 'busyonce',
+    shares: carolShares('Music\\FLAC', fenwickCarols, [6], 'flac', null, 44100, 16),
+  },
+  {
+    username: 'carol_backup',
+    uploadSpeed: 900,
+    queueLength: 14,
+    hasFreeUploadSlot: false,
+    defaultBehavior: 'happy',
+    shares: carolShares('Music\\FLAC', fenwickCarols, [3, 5], 'flac', null, 44100, 16),
+  },
+  {
+    username: 'carol_mp3',
+    uploadSpeed: 2500,
+    queueLength: 1,
+    hasFreeUploadSlot: true,
+    defaultBehavior: 'happy',
+    shares: carolShares('Music\\mp3', fenwickCarols, [7], 'mp3', 320, 44100, null),
   },
 ];
 

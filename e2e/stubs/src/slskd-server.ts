@@ -4,6 +4,7 @@
 import type { Server } from 'node:http';
 import type { PeerBehavior } from '../../fixtures/dataset.js';
 import { createStubServer, sendEmpty, sendJson, sendText } from './router.js';
+import type { TcpProxy } from './tcp-proxy.js';
 import { parseGuid, type BatchEnqueueBody, type SlskdState } from './slskd-state.js';
 
 const VALID_BEHAVIORS: PeerBehavior[] = [
@@ -15,9 +16,16 @@ const VALID_BEHAVIORS: PeerBehavior[] = [
   'offline',
   'enqueueoffline',
   'partialenqueue',
+  'rejects',
+  'busyonce',
+  'slow',
 ];
 
-export function createSlskdServer(state: SlskdState, apiKey: string): Server {
+export function createSlskdServer(
+  state: SlskdState,
+  apiKey: string,
+  navidrome: TcpProxy | null,
+): Server {
   return createStubServer({
     name: 'slskd',
     intercept: ({ req, res, url }) => {
@@ -244,6 +252,32 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
         handler: ({ res, body }) => {
           state.outage = (body as { down?: boolean })?.down === true;
           sendJson(res, 200, { ok: true, outage: state.outage });
+        },
+      },
+      {
+        method: 'POST',
+        pattern: '/_control/navidrome',
+        handler: async ({ res, body }) => {
+          if (navidrome === null) {
+            sendJson(res, 404, {
+              error: 'no Navidrome proxy runs in this stub (NAVIDROME_PROXY_PORT is unset)',
+            });
+            return;
+          }
+          const down = (body as { down?: boolean })?.down === true;
+          await navidrome.setDown(down);
+          sendJson(res, 200, { ok: true, down });
+        },
+      },
+      {
+        method: 'DELETE',
+        pattern: '/_control/downloads/:destination',
+        handler: ({ res, params }) => {
+          if (!state.removeDestination(params.destination as string)) {
+            sendJson(res, 400, { error: 'destination must be one directory name' });
+            return;
+          }
+          sendJson(res, 200, { ok: true });
         },
       },
       {
