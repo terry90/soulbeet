@@ -525,6 +525,7 @@ async fn resume_search(
                 user: job.ctx.id(),
                 backend: None,
                 query: job.wanted.clone(),
+                spec: None,
             })
             .await;
         if let Err(e) = renewed {
@@ -1409,6 +1410,7 @@ mod tests {
             user: UserId::new("alice"),
             backend: None,
             query: DownloadQuery::new(vec![]),
+            spec: None,
         }
     }
 

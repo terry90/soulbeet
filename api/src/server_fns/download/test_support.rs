@@ -112,9 +112,10 @@ pub enum ScriptedOutcome {
 /// Answers each enqueue from a scripted list, then rejects everything after
 /// the script runs out. Starts every search unless told to fail it, and
 /// answers its polls from a scripted list, then as still running with
-/// nothing found. Records every destination, request and cancellation, and lists
-/// whatever transfers the test sets. Each stub has its own backend id, so
-/// the registry keys of concurrent tests never collide.
+/// nothing found. Records every search spec and stop, destination, request
+/// and cancellation, and lists whatever transfers the test sets. Each stub
+/// has its own backend id, so the registry keys of concurrent tests never
+/// collide.
 pub struct StubBackend {
     id: &'static str,
     script: Mutex<Vec<ScriptedOutcome>>,
@@ -125,9 +126,12 @@ pub struct StubBackend {
     requests: Mutex<Vec<String>>,
     listing: Mutex<Vec<DownloadProgress>>,
     hold: Mutex<Option<Hold>>,
+    specs: Mutex<Vec<SearchSpec>>,
+    search_hold: Mutex<Option<Hold>>,
+    stopped_searches: Mutex<Vec<String>>,
 }
 
-/// Holds every `download` call until released, after announcing it.
+/// Holds every `download` (or `start_search`) call until released, after announcing it.
 #[derive(Clone)]
 struct Hold {
     reached: Arc<Notify>,
@@ -148,6 +152,9 @@ impl StubBackend {
             requests: Mutex::new(Vec::new()),
             listing: Mutex::new(Vec::new()),
             hold: Mutex::new(None),
+            specs: Mutex::new(Vec::new()),
+            search_hold: Mutex::new(None),
+            stopped_searches: Mutex::new(Vec::new()),
         })
     }
 
@@ -175,6 +182,27 @@ impl StubBackend {
         };
         *self.hold.lock().unwrap() = Some(hold.clone());
         (hold.reached, hold.release)
+    }
+
+    /// Makes each `start_search` call wait, as `hold_downloads` does for `download`. A
+    /// `stop_search` releases a held search too, as slskd ends a search it is told to stop.
+    pub fn hold_searches(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let hold = Hold {
+            reached: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self.search_hold.lock().unwrap() = Some(hold.clone());
+        (hold.reached, hold.release)
+    }
+
+    /// The spec of every `start_search` call, in order, from when it arrives.
+    pub fn specs(&self) -> Vec<SearchSpec> {
+        self.specs.lock().unwrap().clone()
+    }
+
+    /// The search id of every `stop_search` call, in order.
+    pub fn stopped_searches(&self) -> Vec<String> {
+        self.stopped_searches.lock().unwrap().clone()
     }
 
     /// Makes `start_search` fail with `e`.
@@ -250,7 +278,13 @@ impl DownloadBackend for StubBackend {
     fn name(&self) -> &'static str {
         "Stub"
     }
-    async fn start_search(&self, _spec: &SearchSpec) -> SoulResult<String> {
+    async fn start_search(&self, spec: &SearchSpec) -> SoulResult<String> {
+        self.specs.lock().unwrap().push(spec.clone());
+        let hold = self.search_hold.lock().unwrap().clone();
+        if let Some(hold) = hold {
+            hold.reached.notify_one();
+            hold.release.notified().await;
+        }
         match self.search_start.lock().unwrap().take() {
             Some(e) => Err(e),
             None => Ok("search".to_string()),
@@ -371,7 +405,14 @@ impl DownloadBackend for StubBackend {
     async fn source_status(&self, _source: &str) -> SoulResult<SourcePresence> {
         Ok(SourcePresence::Online)
     }
-    async fn stop_search(&self, _search_id: &str) -> SoulResult<()> {
+    async fn stop_search(&self, search_id: &str) -> SoulResult<()> {
+        self.stopped_searches
+            .lock()
+            .unwrap()
+            .push(search_id.to_string());
+        if let Some(hold) = self.search_hold.lock().unwrap().as_ref() {
+            hold.release.notify_one();
+        }
         Ok(())
     }
     async fn health_check(&self) -> Result<(), Failure> {

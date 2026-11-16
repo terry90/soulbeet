@@ -4,8 +4,8 @@
 use super::{
     job_state, recording_keys, Admitted, BatchOrigin, ClaimedJob, ImportDone, IndexWait, JobEvent,
     JobState, LedgerError, LiveRows, NewJob, NewJobBatch, NewSearch, Pruned, RecordingKeys,
-    SlotResult, Transition, Transitioned, JOB_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER,
-    SEARCH_KEPT_SECS, TERMINAL_SQL,
+    SearchOutcome, SlotResult, Transition, Transitioned, JOB_KEPT_SECS,
+    MCP_UNFINISHED_JOBS_PER_USER, SEARCH_KEPT_SECS, TERMINAL_SQL,
 };
 use crate::auth::UserId;
 use crate::transfer_registry::TransferRegistry;
@@ -60,6 +60,11 @@ pub(super) enum Write {
     StoreCandidates {
         search_id: String,
         groups: Vec<DownloadableGroup>,
+        reply: Reply<()>,
+    },
+    SearchEnded {
+        id: String,
+        outcome: SearchOutcome,
         reply: Reply<()>,
     },
     ClaimSourceChoice {
@@ -305,6 +310,10 @@ impl Writer {
             } => {
                 let stored = store_candidates(&self.db, &search_id, &groups).await;
                 self.finish(reply, "store a search's candidates", stored)
+            }
+            Write::SearchEnded { id, outcome, reply } => {
+                let ended = self.search_ended(&id, outcome).await;
+                self.finish(reply, "store how a search ended", ended)
             }
             Write::ClaimSourceChoice {
                 user,
@@ -903,7 +912,7 @@ impl Writer {
         state: Option<JobState>,
         at: i64,
     ) -> Result<i64, LedgerError> {
-        let seq = *self.pending.seq.get_or_insert(self.seq + 1);
+        let seq = self.next_seq();
         let state = state.map(JobState::as_str);
         sqlx::query(
             "UPDATE jobs SET state = COALESCE(?, state), changed_seq = ?, updated_at = ?, \
@@ -919,6 +928,32 @@ impl Writer {
         .execute(&mut *tx)
         .await?;
         Ok(seq)
+    }
+
+    /// The change number of the write being made, taken by its first change.
+    fn next_seq(&mut self) -> i64 {
+        *self.pending.seq.get_or_insert(self.seq + 1)
+    }
+
+    /// Stores how search `id` ended: its candidates and stats, or its failure and the stats it
+    /// has, in one statement. A search that was stored moves the change number on.
+    async fn search_ended(&mut self, id: &str, outcome: SearchOutcome) -> Result<(), LedgerError> {
+        let (candidates, stats, failure) = match outcome {
+            Ok((groups, stats)) => (Some(groups), Some(stats), None),
+            Err((failure, stats)) => (None, stats, Some(failure)),
+        };
+        let ended =
+            sqlx::query("UPDATE searches SET candidates = ?, stats = ?, failure = ? WHERE id = ?")
+                .bind(candidates.map(|c| serde_json::to_string(&c)).transpose()?)
+                .bind(stats.map(|s| serde_json::to_string(&s)).transpose()?)
+                .bind(failure.map(|f| serde_json::to_string(&f)).transpose()?)
+                .bind(id)
+                .execute(&self.db)
+                .await?;
+        if ended.rows_affected() > 0 {
+            self.next_seq();
+        }
+        Ok(())
     }
 
     /// Puts `job` in `state` now. The change number.
@@ -1558,20 +1593,23 @@ async fn claim_download(db: &SqlitePool, job: &str, limit: u32) -> Result<bool, 
 }
 
 /// Records `search`, renewing a search of the same id: it expires a day from
-/// now and has no candidates until it ends again.
+/// now and has no candidates, stats or failure until it ends again.
 async fn insert_search(
     db: impl sqlx::Executor<'_, Database = Sqlite>,
     search: NewSearch,
 ) -> Result<(), LedgerError> {
     sqlx::query(
-        "INSERT INTO searches (id, user_id, backend, expires_at, query) VALUES (?, ?, ?, ?, ?) \
-         ON CONFLICT (id) DO UPDATE SET expires_at = excluded.expires_at, candidates = NULL",
+        "INSERT INTO searches (id, user_id, backend, expires_at, query, spec) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (id) DO UPDATE SET expires_at = excluded.expires_at, candidates = NULL, \
+         stats = NULL, failure = NULL",
     )
     .bind(search.id)
     .bind(search.user.to_string())
     .bind(search.backend)
     .bind(now() + SEARCH_KEPT_SECS)
     .bind(serde_json::to_string(&search.query)?)
+    .bind(search.spec.map(|s| serde_json::to_string(&s)).transpose()?)
     .execute(db)
     .await?;
     Ok(())
@@ -1622,6 +1660,7 @@ mod tests {
                         user: UserId::new("alice"),
                         backend: None,
                         query: DownloadQuery::new(vec![]),
+                        spec: None,
                     }),
                 )
                 .await

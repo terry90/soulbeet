@@ -203,6 +203,9 @@ mod tests {
             query: DownloadQuery::new(vec![]),
             candidates: None,
             expires_at: i64::MAX,
+            spec: None,
+            stats: None,
+            failure: None,
         };
         let ledger = Ledger::recording().0;
 
@@ -329,6 +332,7 @@ mod tests {
                     user: UserId::new("alice"),
                     backend: None,
                     query: DownloadQuery::new(vec![]),
+                    spec: None,
                 }),
             )
             .await
@@ -398,6 +402,7 @@ mod tests {
                 user: UserId::new("alice"),
                 backend: None,
                 query: DownloadQuery::new(vec![]),
+                spec: None,
             })
             .await
             .unwrap();

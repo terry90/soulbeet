@@ -1,24 +1,30 @@
 //! Download source search: one backend's search started and polled for a
-//! user, and the every-backend ranked search an auto-download runs.
+//! user, the every-backend ranked search an auto-download runs, and the MCP
+//! searches, stored in the ledger, run one at a time and read as candidates.
 
-use crate::auth::UserCtx;
+use crate::auth::{UserCtx, UserId};
 use crate::core::{backend_unavailable, database_failure, metadata};
 use crate::db::DB;
 use crate::ledger::store::{self, StoredSearch};
-use crate::ledger::{NewSearch, LEDGER};
+use crate::ledger::{Ledger, NewSearch, SearchOutcome, SourceFilters, StoredSpec, LEDGER};
 use crate::services::{
     available_download_backends, download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND,
 };
 use dioxus::logger::tracing::warn;
+use serde::Serialize;
 use shared::download::{
-    DownloadQuery, DownloadableGroup, SearchResult, SearchSpec, SearchState, SearchStats,
+    DownloadQuery, DownloadableGroup, DownloadableItem, FileFacts, SearchResult, SearchSpec,
+    SearchState, SearchStats,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
 use soulbeet::DownloadBackend;
 use sqlx::SqlitePool;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 /// Maximum time to wait for search results from a single backend. A safety
 /// net above the slskd client's own deadline, which cancels a search at 120
@@ -99,6 +105,7 @@ pub async fn start(ctx: &UserCtx, query: DownloadQuery) -> Result<String, Failur
             user: ctx.id(),
             backend: Some(backend_id),
             query,
+            spec: None,
         })
         .await
         .map_err(|e| database_failure(Stage::SourceSearch, e))?;
@@ -143,15 +150,32 @@ async fn search_backend(
     backend: &Arc<dyn DownloadBackend>,
     spec: &SearchSpec,
 ) -> (Vec<DownloadableGroup>, SearchStop) {
-    let search_id = match backend.start_search(spec).await {
-        Ok(sid) => sid,
-        Err(e) => {
-            warn!("Backend {} search start failed: {}", id, e);
-            let stop = SearchStop::Failed(e.failure(Stage::SourceSearch, e.to_string()));
-            return (Vec::new(), stop);
-        }
-    };
+    match start_backend_search(id, backend, spec).await {
+        Ok(search_id) => poll_backend_search(id, backend, &search_id).await,
+        Err(stop) => (Vec::new(), stop),
+    }
+}
 
+/// Starts one backend's search for `spec`: the backend's id of it, or how it
+/// ended when the backend refused it.
+async fn start_backend_search(
+    id: &str,
+    backend: &Arc<dyn DownloadBackend>,
+    spec: &SearchSpec,
+) -> Result<String, SearchStop> {
+    backend.start_search(spec).await.map_err(|e| {
+        warn!("Backend {} search start failed: {}", id, e);
+        SearchStop::Failed(e.failure(Stage::SourceSearch, e.to_string()))
+    })
+}
+
+/// Polls the backend's search `search_id` until it ends: the groups it found
+/// and how it ended.
+async fn poll_backend_search(
+    id: &str,
+    backend: &Arc<dyn DownloadBackend>,
+    search_id: &str,
+) -> (Vec<DownloadableGroup>, SearchStop) {
     // Poll until results are ready or timeout. A backend may send
     // groups while the search is in progress, so keep the latest
     // non-empty batch. slskd sends its groups only in the completing
@@ -165,7 +189,7 @@ async fn search_backend(
         }
         tokio::time::sleep(SEARCH_POLL_INTERVAL).await;
 
-        match backend.poll_search(&search_id).await {
+        match backend.poll_search(search_id).await {
             Ok(result) => match result.state {
                 SearchState::Completed | SearchState::TimedOut => {
                     if !result.groups.is_empty() {
@@ -295,12 +319,390 @@ pub async fn search_ranked(
     if all_groups.is_empty() {
         return Err(no_results_failure(&first_stop, &stops));
     }
-    all_groups.sort_by(|a, b| {
+    best_first(&mut all_groups);
+    Ok(all_groups)
+}
+
+/// Sorts `groups` by score, best first, keeping the order of equal ones.
+fn best_first(groups: &mut [DownloadableGroup]) {
+    groups.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(all_groups)
+}
+
+/// D5: a source whose transfers failed this many times in the last 24 hours is flagged.
+pub const FLAGGED_FAILURES: u32 = 3;
+
+/// Where a stored search is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SearchProgress {
+    Running,
+    /// Its groups, best first, and what it read.
+    Done(Vec<DownloadableGroup>, SearchStats),
+    /// Why it found nothing, and what it read when the backend finished it.
+    Failed(Failure, Option<SearchStats>),
+}
+
+impl SearchProgress {
+    /// A stored search with neither candidates nor a failure is running. A web UI search stores
+    /// its candidates without stats, which read as all zero.
+    pub fn of(stored: &StoredSearch) -> SearchProgress {
+        match (&stored.candidates, &stored.failure) {
+            (Some(groups), _) => {
+                SearchProgress::Done(groups.clone(), stored.stats.clone().unwrap_or_default())
+            }
+            (None, Some(failure)) => SearchProgress::Failed(failure.clone(), stored.stats.clone()),
+            (None, None) => SearchProgress::Running,
+        }
+    }
+
+    fn of_outcome(outcome: &SearchOutcome) -> SearchProgress {
+        match outcome {
+            Ok((groups, stats)) => SearchProgress::Done(groups.clone(), stats.clone()),
+            Err((failure, stats)) => SearchProgress::Failed(failure.clone(), stats.clone()),
+        }
+    }
+}
+
+/// Who a stored search runs for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchFor {
+    /// A `find_sources` call.
+    Find,
+    /// An MCP job's runner.
+    Job,
+}
+
+/// A stored search a task of this process runs.
+struct Run {
+    id: String,
+    user: UserId,
+    purpose: SearchFor,
+    holds_turn: bool,
+    /// The backend's id of the search, once the task started it.
+    backend_search: Option<String>,
+}
+
+/// The MCP searches: one at a time, every MCP search holding the turn while it runs (design
+/// 11.5). The server has one, in `Acquire`; each test makes its own. Web UI searches do not wait
+/// for it.
+#[derive(Default)]
+pub struct Searches {
+    /// In arrival order: the first holds the turn once its task took it, the rest wait.
+    runs: Mutex<Vec<Run>>,
+    /// Notified when a search leaves, so the next one takes the turn.
+    left: Notify,
+}
+
+impl Searches {
+    /// Whether a task of this process runs stored search `id` now (start_stored registers it for
+    /// the task's life). A stored search that reads Running and is not running here was cut off
+    /// by a restart.
+    pub fn runs(&self, id: &str) -> bool {
+        self.runs.lock().unwrap().iter().any(|run| run.id == id)
+    }
+
+    /// The searches holding or waiting for the turn before search `id`; None once it holds the
+    /// turn, and for a search no task runs.
+    pub fn ahead_of(&self, id: &str) -> Option<usize> {
+        let runs = self.runs.lock().unwrap();
+        let place = runs.iter().position(|run| run.id == id)?;
+        (!runs[place].holds_turn).then_some(place)
+    }
+
+    /// The ids of `user`'s `find_sources` searches waiting for the turn, in arrival order.
+    pub fn waiting_finds(&self, user: &UserId) -> Vec<String> {
+        self.runs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|run| &run.user == user && run.purpose == SearchFor::Find && !run.holds_turn)
+            .map(|run| run.id.clone())
+            .collect()
+    }
+
+    /// The backend's id of stored search `id`, once its task started it at the backend.
+    pub fn backend_search(&self, id: &str) -> Option<String> {
+        let runs = self.runs.lock().unwrap();
+        runs.iter()
+            .find(|run| run.id == id)
+            .and_then(|run| run.backend_search.clone())
+    }
+
+    /// Puts search `id` in line; it leaves when the returned place is dropped.
+    fn enter(self: &Arc<Self>, id: &str, user: UserId, purpose: SearchFor) -> Place {
+        self.runs.lock().unwrap().push(Run {
+            id: id.to_string(),
+            user,
+            purpose,
+            holds_turn: false,
+            backend_search: None,
+        });
+        Place {
+            searches: self.clone(),
+            id: id.to_string(),
+        }
+    }
+
+    /// Waits until search `id` is first in line, and takes the turn.
+    async fn take_turn(&self, id: &str) {
+        loop {
+            let left = self.left.notified();
+            tokio::pin!(left);
+            // Registered before the look, so a search leaving after it still wakes this one.
+            left.as_mut().enable();
+            if let Some(first) = self.runs.lock().unwrap().first_mut() {
+                if first.id == id {
+                    first.holds_turn = true;
+                    return;
+                }
+            }
+            left.await;
+        }
+    }
+
+    fn started(&self, id: &str, backend_search: &str) {
+        let mut runs = self.runs.lock().unwrap();
+        if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
+            run.backend_search = Some(backend_search.to_string());
+        }
+    }
+}
+
+/// A search's place in `Searches`, given up when dropped (its task ended, however it ended).
+struct Place {
+    searches: Arc<Searches>,
+    id: String,
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let mut runs = self.searches.runs.lock().unwrap();
+        if let Some(place) = runs.iter().position(|run| run.id == self.id) {
+            runs.remove(place);
+        }
+        drop(runs);
+        self.searches.left.notify_waiters();
+    }
+}
+
+/// A stored search for `start_stored` to run.
+pub struct SearchRun {
+    pub id: String,
+    /// The album and tracks searched for and scored against.
+    pub query: DownloadQuery,
+    pub spec: StoredSpec,
+    pub purpose: SearchFor,
+}
+
+/// Records search `run.id` for `ctx` on the default backend and runs it in its own task once it
+/// holds the turn, storing how it ended. The task's answer is how it ended.
+///
+/// Called only for a new id, or for a search stored Running that no task runs (a restart cut it
+/// off), which runs again under its id. Recording a search again drops what it found, so the
+/// candidate ids handed out from it would name other groups: a search that ended is read as
+/// stored and never started again.
+pub async fn start_stored(
+    searches: &Arc<Searches>,
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    backend: Arc<dyn DownloadBackend>,
+    run: SearchRun,
+) -> Result<JoinHandle<SearchProgress>, Failure> {
+    let SearchRun {
+        id,
+        query,
+        spec,
+        purpose,
+    } = run;
+    // In line before it is recorded, so a stored Running search is never read as cut off.
+    let place = searches.enter(&id, ctx.id(), purpose);
+    ledger
+        .record_search(NewSearch {
+            id: id.clone(),
+            user: ctx.id(),
+            backend: Some(DEFAULT_DOWNLOAD_BACKEND.into()),
+            query: query.clone(),
+            spec: Some(spec.clone()),
+        })
+        .await
+        .map_err(|e| database_failure(Stage::SourceSearch, e))?;
+    let (searches, ledger) = (searches.clone(), ledger.clone());
+    Ok(tokio::spawn(async move {
+        let _place = place;
+        searches.take_turn(&id).await;
+        let search = SearchSpec {
+            album: query.album,
+            tracks: query.tracks,
+            text: spec.text,
+            keep_below_floor: spec.keep_below_floor,
+        };
+        let name = DEFAULT_DOWNLOAD_BACKEND;
+        let (mut groups, stop) = match start_backend_search(name, &backend, &search).await {
+            Ok(backend_search) => {
+                searches.started(&id, &backend_search);
+                poll_backend_search(name, &backend, &backend_search).await
+            }
+            Err(stop) => (Vec::new(), stop),
+        };
+        let stats = match &stop {
+            SearchStop::Finished { stats } => Some(stats.clone()),
+            SearchStop::TimedOut | SearchStop::Failed(_) => None,
+        };
+        let outcome = if groups.is_empty() {
+            Err((no_results_failure(&stop, &[]), stats))
+        } else {
+            // Groups found before a timeout or a failed poll come with no stats: the backend
+            // reported none.
+            best_first(&mut groups);
+            Ok((groups, stats.unwrap_or_default()))
+        };
+        let progress = SearchProgress::of_outcome(&outcome);
+        // The writer logs a write the database refused.
+        let _ = ledger.search_ended(&id, outcome).await;
+        progress
+    }))
+}
+
+/// A stored group offered as a source, with its source's recent failed transfers (D5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidate {
+    /// `{search_id}:{index}` (D3).
+    pub id: String,
+    /// Only its files that passed the filters.
+    pub group: DownloadableGroup,
+    pub recent_failures: u32,
+}
+
+impl Candidate {
+    /// D5: never picked automatically.
+    pub fn flagged(&self) -> bool {
+        self.recent_failures >= FLAGGED_FAILURES
+    }
+}
+
+/// Files the filters dropped, each under the first filter it failed (D6), and groups of an
+/// excluded source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DroppedByFilter {
+    pub format: u32,
+    pub bitrate: u32,
+    pub not_lossless: u32,
+    pub queue_length: u32,
+    /// Groups of a source the job excludes (a rejected result).
+    pub excluded: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateView {
+    pub candidates: Vec<Candidate>,
+    pub dropped_by_filter: DroppedByFilter,
+}
+
+/// D6: extensions that are always lossless. `m4a` holds AAC or ALAC alike, so it is not one.
+const LOSSLESS: [&str; 6] = ["flac", "wav", "aiff", "aif", "ape", "wv"];
+
+/// Whether a file with `facts` passes `filters`; one that does not is counted in `dropped`
+/// under the first filter it fails. What the source did not report fails the filter that asks
+/// for it.
+fn passes(facts: &FileFacts, filters: &SourceFilters, dropped: &mut DroppedByFilter) -> bool {
+    let extension = facts.extension.as_deref();
+    let failed = if !filters.formats.is_empty()
+        && !extension.is_some_and(|e| filters.formats.iter().any(|f| f == e))
+    {
+        &mut dropped.format
+    } else if filters
+        .min_bitrate_kbps
+        .is_some_and(|min| !facts.bitrate_kbps.is_some_and(|kbps| kbps >= min))
+    {
+        &mut dropped.bitrate
+    } else if filters.lossless_only && !extension.is_some_and(|e| LOSSLESS.contains(&e)) {
+        &mut dropped.not_lossless
+    } else if filters
+        .max_queue_length
+        .is_some_and(|max| !facts.source_queue_length.is_some_and(|queue| queue <= max))
+    {
+        &mut dropped.queue_length
+    } else {
+        return true;
+    };
+    *failed += 1;
+    false
+}
+
+/// The stored groups of search `search_id` that pass `filters` (D6) and whose source is not in
+/// `excluded`, each keeping only the files that pass and its stored index in its id (D3), in
+/// stored order, empty groups dropped. `failures` holds each source's recent failures.
+pub fn view(
+    search_id: &str,
+    groups: &[DownloadableGroup],
+    filters: &SourceFilters,
+    failures: &HashMap<String, u32>,
+    excluded: &[String],
+) -> CandidateView {
+    let mut dropped = DroppedByFilter::default();
+    let mut candidates = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        if excluded.contains(&group.source) {
+            dropped.excluded += 1;
+            continue;
+        }
+        let items: Vec<DownloadableItem> = group
+            .items
+            .iter()
+            .filter(|item| passes(&item.facts, filters, &mut dropped))
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        let group = if items.len() == group.items.len() {
+            group.clone()
+        } else {
+            DownloadableGroup {
+                item_count: items.len(),
+                total_size: items.iter().filter_map(|item| item.size).sum(),
+                items,
+                ..group.clone()
+            }
+        };
+        candidates.push(Candidate {
+            id: candidate_id(search_id, index),
+            recent_failures: failures.get(&group.source).copied().unwrap_or(0),
+            group,
+        });
+    }
+    CandidateView {
+        candidates,
+        dropped_by_filter: dropped,
+    }
+}
+
+/// D3: the id of the group at `index` of search `search_id`'s stored ranking.
+pub fn candidate_id(search_id: &str, index: usize) -> String {
+    format!("{search_id}:{index}")
+}
+
+/// The search id and index a candidate id names, split at its last ':'; None for text that is
+/// not one.
+pub fn parse_candidate_id(text: &str) -> Option<(String, usize)> {
+    let (search_id, index) = text.rsplit_once(':')?;
+    if search_id.is_empty() {
+        return None;
+    }
+    Some((search_id.to_string(), index.parse().ok()?))
+}
+
+/// The candidate does not exist, or its search is another user's.
+pub fn candidate_not_found() -> Failure {
+    Failure::new(
+        FailureCode::UnknownHandle,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "Candidate not found",
+    )
 }
 
 #[cfg(test)]
@@ -310,6 +712,7 @@ mod tests {
     use crate::core::test_ctx;
     use crate::ledger::{Ledger, NewSearch};
     use crate::server_fns::download::test_support::{group, item, search_result, StubBackend};
+    use shared::download::{DownloadableItem, FileFacts};
     use shared::failure::UserActionCode;
     use soulbeet::error::{MissingSetting, SoulseekError};
 
@@ -594,6 +997,9 @@ mod tests {
                 query: DownloadQuery::new(vec![]),
                 candidates: None,
                 expires_at,
+                spec: None,
+                stats: None,
+                failure: None,
             })
         };
         assert_eq!(live_search(None, 1_000).unwrap_err(), search_not_found());
@@ -629,6 +1035,7 @@ mod tests {
                 user: UserId::new("alice"),
                 backend: Some("slskd".into()),
                 query: DownloadQuery::new(vec![]),
+                spec: None,
             })
             .await
             .unwrap();
@@ -698,6 +1105,413 @@ mod tests {
                 "Search not found"
             )
         );
+    }
+
+    fn facts(ext: &str, kbps: Option<u32>, queue: u64) -> FileFacts {
+        FileFacts {
+            extension: Some(ext.into()),
+            bitrate_kbps: kbps,
+            source_queue_length: Some(queue),
+            ..FileFacts::default()
+        }
+    }
+
+    fn file(source: &str, id: &str, facts: FileFacts) -> DownloadableItem {
+        DownloadableItem {
+            facts,
+            ..item(source, "One", id)
+        }
+    }
+
+    fn run(id: &str, spec: StoredSpec, purpose: SearchFor) -> SearchRun {
+        SearchRun {
+            id: id.into(),
+            query: DownloadQuery::new(vec![]),
+            spec,
+            purpose,
+        }
+    }
+
+    fn ids(view: &CandidateView) -> Vec<&str> {
+        view.candidates.iter().map(|c| c.id.as_str()).collect()
+    }
+
+    #[test]
+    fn filters_drop_files_by_the_first_rule_they_fail_and_ids_keep_their_place() {
+        let groups = vec![
+            group(
+                "peer_a",
+                vec![file("peer_a", "a/01.flac", facts("flac", None, 0))],
+                0.9,
+            ),
+            group(
+                "peer_b",
+                vec![file("peer_b", "b/01.mp3", facts("mp3", Some(320), 0))],
+                0.8,
+            ),
+            group(
+                "peer_c",
+                vec![file("peer_c", "c/01.flac", facts("flac", Some(900), 40))],
+                0.7,
+            ),
+        ];
+        let lossless = SourceFilters {
+            lossless_only: true,
+            max_queue_length: Some(10),
+            ..Default::default()
+        };
+        let shown = view("s1", &groups, &lossless, &HashMap::new(), &[]);
+        assert_eq!(ids(&shown), vec!["s1:0"]);
+        assert_eq!(
+            shown.dropped_by_filter,
+            DroppedByFilter {
+                not_lossless: 1,
+                queue_length: 1,
+                ..Default::default()
+            }
+        );
+        let bitrate = SourceFilters {
+            min_bitrate_kbps: Some(256),
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(&view("s1", &groups, &bitrate, &HashMap::new(), &[])),
+            vec!["s1:1", "s1:2"],
+            "a file with no bitrate fails a bitrate filter"
+        );
+        let without_a = view(
+            "s1",
+            &groups,
+            &SourceFilters::default(),
+            &HashMap::new(),
+            &["peer_a".to_string()],
+        );
+        assert_eq!(
+            (
+                without_a.candidates[0].id.as_str(),
+                without_a.dropped_by_filter.excluded
+            ),
+            ("s1:1", 1)
+        );
+        assert_eq!(parse_candidate_id("s1:2"), Some(("s1".into(), 2)));
+        assert_eq!(parse_candidate_id("s1"), None);
+    }
+
+    #[test]
+    fn a_group_keeps_only_its_files_that_pass_and_a_format_filter_comes_first() {
+        let groups = vec![group(
+            "peer_a",
+            vec![
+                file("peer_a", "a/01.flac", facts("flac", Some(900), 0)),
+                file("peer_a", "a/02.mp3", facts("mp3", Some(128), 0)),
+                file("peer_a", "a/cover.m4a", facts("m4a", Some(256), 0)),
+            ],
+            0.9,
+        )];
+        let filters = SourceFilters {
+            formats: vec!["flac".into(), "mp3".into()],
+            min_bitrate_kbps: Some(192),
+            lossless_only: true,
+            max_queue_length: None,
+        };
+        let shown = view("s1", &groups, &filters, &HashMap::new(), &[]);
+        let kept = &shown.candidates[0].group;
+        assert_eq!(
+            (kept.items.len(), kept.item_count, kept.total_size),
+            (1, 1, 27_213_250)
+        );
+        assert_eq!(kept.items[0].id, "a/01.flac");
+        assert_eq!(
+            shown.dropped_by_filter,
+            DroppedByFilter {
+                format: 1,
+                bitrate: 1,
+                ..Default::default()
+            }
+        );
+        let wav_only = SourceFilters {
+            formats: vec!["wav".into()],
+            ..Default::default()
+        };
+        let none = view("s1", &groups, &wav_only, &HashMap::new(), &[]);
+        assert!(
+            none.candidates.is_empty(),
+            "a group left with no file is dropped"
+        );
+        assert_eq!(none.dropped_by_filter.format, 3);
+    }
+
+    #[test]
+    fn candidates_show_recent_failures_and_flag_a_failing_source() {
+        let groups = vec![
+            group("peer_a", vec![item("peer_a", "One", "a/01.flac")], 0.9),
+            group("peer_b", vec![item("peer_b", "One", "b/01.flac")], 0.8),
+        ];
+        let shown = view(
+            "s1",
+            &groups,
+            &SourceFilters::default(),
+            &HashMap::from([("peer_a".to_string(), 3)]),
+            &[],
+        );
+        assert_eq!(
+            shown
+                .candidates
+                .iter()
+                .map(|c| (c.recent_failures, c.flagged()))
+                .collect::<Vec<_>>(),
+            vec![(3, true), (0, false)]
+        );
+    }
+
+    #[test]
+    fn a_candidate_id_names_its_search_and_place() {
+        assert_eq!(candidate_id("s1", 4), "s1:4");
+        assert_eq!(parse_candidate_id("a:b:7"), Some(("a:b".into(), 7)));
+        assert_eq!(parse_candidate_id("s1:x"), None);
+        assert_eq!(parse_candidate_id(":3"), None);
+        let f = candidate_not_found();
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::UnknownHandle,
+                Stage::Input,
+                RetryAdvice::NotRetryable,
+                "Candidate not found"
+            )
+        );
+    }
+
+    // Real time, in the tests of stored searches: the in-memory database answers from its own
+    // thread, and a paused clock runs the pool's acquire timeout out while it waits. Each search
+    // here polls once, SEARCH_POLL_INTERVAL after it starts.
+    #[tokio::test]
+    async fn a_stored_search_waits_for_the_one_before_it_and_keeps_its_outcome() {
+        let db = crate::db::test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let stub = StubBackend::new(vec![]);
+        let found = vec![group(
+            "peer_a",
+            vec![item("peer_a", "One", "a/01.flac")],
+            0.9,
+        )];
+        stub.script_polls(vec![
+            Ok(SearchResult {
+                stats: SearchStats {
+                    query_text: "Kowloon One".into(),
+                    response_count: 1,
+                    file_count: 1,
+                    ..Default::default()
+                },
+                ..search_result("search", SearchState::Completed, found.clone())
+            }),
+            Ok(SearchResult {
+                stats: SearchStats {
+                    query_text: "Kowloon Two".into(),
+                    response_count: 2,
+                    file_count: 7,
+                    below_floor: 7,
+                    ..Default::default()
+                },
+                ..search_result("search", SearchState::Completed, vec![])
+            }),
+        ]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let ctx = test_ctx("alice");
+        let searches: Arc<Searches> = Arc::default();
+        let spec = StoredSpec {
+            text: Some("Kowloon One".into()),
+            ..Default::default()
+        };
+        let first = start_stored(
+            &searches,
+            &ledger,
+            &ctx,
+            backend.clone(),
+            run("s1", spec.clone(), SearchFor::Find),
+        )
+        .await
+        .unwrap();
+        let second = start_stored(
+            &searches,
+            &ledger,
+            &ctx,
+            backend,
+            run("s2", StoredSpec::default(), SearchFor::Job),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first.await.unwrap(), SearchProgress::Done(g, _) if g == found));
+        let SearchProgress::Failed(f, Some(stats)) = second.await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            (f.code, stats.below_floor),
+            (FailureCode::SearchAllFiltered, 7)
+        );
+        assert_eq!(
+            stub.specs()
+                .iter()
+                .map(|s| s.text.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("Kowloon One".into()), None]
+        );
+        let stored = store::search_of(&db, "s2", &ctx.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            SearchProgress::of(&stored),
+            SearchProgress::Failed(..)
+        ));
+        let done = store::search_of(&db, "s1", &ctx.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (done.spec.clone(), SearchProgress::of(&done)),
+            (
+                Some(spec),
+                SearchProgress::Done(
+                    found,
+                    SearchStats {
+                        query_text: "Kowloon One".into(),
+                        response_count: 1,
+                        file_count: 1,
+                        ..Default::default()
+                    }
+                )
+            )
+        );
+        assert!(!searches.runs("s1") && !searches.runs("s2"));
+    }
+
+    #[tokio::test]
+    async fn the_second_stored_search_starts_after_the_first_ended() {
+        let db = crate::db::test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let stub = StubBackend::new(vec![]);
+        let (reached, release) = stub.hold_searches();
+        let found = vec![group(
+            "peer_a",
+            vec![item("peer_a", "One", "a/01.flac")],
+            0.9,
+        )];
+        stub.script_polls(vec![
+            Ok(search_result(
+                "search",
+                SearchState::Completed,
+                found.clone(),
+            )),
+            Ok(search_result("search", SearchState::Completed, found)),
+        ]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let ctx = test_ctx("alice");
+        let searches: Arc<Searches> = Arc::default();
+        let text = |text: &str| StoredSpec {
+            text: Some(text.into()),
+            ..Default::default()
+        };
+        let texts = || {
+            stub.specs()
+                .into_iter()
+                .map(|s| s.text.unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        let first = start_stored(
+            &searches,
+            &ledger,
+            &ctx,
+            backend.clone(),
+            run("s1", text("One"), SearchFor::Job),
+        )
+        .await
+        .unwrap();
+        let second = start_stored(
+            &searches,
+            &ledger,
+            &ctx,
+            backend.clone(),
+            run("s2", text("Two"), SearchFor::Find),
+        )
+        .await
+        .unwrap();
+
+        reached.notified().await;
+        assert_eq!(texts(), vec!["One"]);
+        assert_eq!(
+            (searches.ahead_of("s1"), searches.ahead_of("s2")),
+            (None, Some(1))
+        );
+        assert_eq!(searches.waiting_finds(&ctx.id()), vec!["s2".to_string()]);
+        let waiting = store::search_of(&db, "s2", &ctx.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(SearchProgress::of(&waiting), SearchProgress::Running);
+
+        release.notify_one();
+        reached.notified().await;
+        assert_eq!(texts(), vec!["One", "Two"]);
+        let ended = store::search_of(&db, "s1", &ctx.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            SearchProgress::of(&ended),
+            SearchProgress::Done(..)
+        ));
+        assert!(!searches.runs("s1"));
+        assert_eq!(searches.ahead_of("s2"), None);
+        assert!(searches.waiting_finds(&ctx.id()).is_empty());
+
+        // slskd ends a search it was told to stop.
+        backend.stop_search("search").await.unwrap();
+        assert_eq!(stub.stopped_searches(), vec!["search".to_string()]);
+        assert!(matches!(first.await.unwrap(), SearchProgress::Done(..)));
+        assert!(matches!(second.await.unwrap(), SearchProgress::Done(..)));
+        assert!(!searches.runs("s2"));
+    }
+
+    // Paused: a search waiting for the turn is seen not to get it.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_takes_the_turn_when_every_one_before_it_left() {
+        let searches: Arc<Searches> = Arc::default();
+        let alice = UserId::new("alice");
+        let first = searches.enter("s1", alice.clone(), SearchFor::Job);
+        let second = searches.enter("s2", alice.clone(), SearchFor::Find);
+        let third = searches.enter("s3", UserId::new("bob"), SearchFor::Find);
+        let ahead = || ["s1", "s2", "s3"].map(|id| searches.ahead_of(id));
+        assert_eq!(ahead(), [Some(0), Some(1), Some(2)]);
+
+        searches.take_turn("s1").await;
+        searches.started("s1", "backend-1");
+        assert_eq!(ahead(), [None, Some(1), Some(2)]);
+        assert_eq!(
+            (searches.backend_search("s1"), searches.backend_search("s2")),
+            (Some("backend-1".to_string()), None)
+        );
+        assert_eq!(searches.waiting_finds(&alice), vec!["s2".to_string()]);
+        let turn = tokio::time::timeout(Duration::from_secs(60), searches.take_turn("s3"));
+        assert!(turn.await.is_err(), "s3 waits behind s1 and s2");
+
+        // A search that leaves while it waits gives up its place.
+        drop(second);
+        assert_eq!(ahead(), [None, None, Some(1)]);
+        let waiting = tokio::spawn({
+            let searches = searches.clone();
+            async move { searches.take_turn("s3").await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!waiting.is_finished());
+        drop(first);
+        waiting.await.unwrap();
+        assert_eq!(ahead(), [None, None, None]);
+        assert!(!searches.runs("s1") && !searches.runs("s2") && searches.runs("s3"));
+        drop(third);
+        assert!(!searches.runs("s3"));
     }
 
     #[test]

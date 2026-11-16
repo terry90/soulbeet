@@ -148,6 +148,7 @@ pub async fn auto_download(
                     user,
                     backend: None,
                     query: query.clone(),
+                    spec: None,
                 }),
             )
             .await

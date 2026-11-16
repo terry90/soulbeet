@@ -1,11 +1,11 @@
 //! Reads of the ledger, straight from the pool.
 
 use super::writer::import_mode_named;
-use super::{IndexWait, JobState, SlotResult, StoredImport, TERMINAL_SQL};
+use super::{IndexWait, JobState, SlotResult, StoredImport, StoredSpec, TERMINAL_SQL};
 use crate::auth::{Role, UserCtx, UserId};
 use crate::models::folder::Folder;
 use shared::download::{
-    DownloadProgress, DownloadQuery, DownloadableGroup, DownloadableItem, JobSlot,
+    DownloadProgress, DownloadQuery, DownloadableGroup, DownloadableItem, JobSlot, SearchStats,
 };
 use shared::failure::{Failure, Stage};
 use soulbeet::ImportMode;
@@ -22,6 +22,12 @@ pub struct StoredSearch {
     /// None until the search ended.
     pub candidates: Option<Vec<DownloadableGroup>>,
     pub expires_at: i64,
+    /// What an MCP search was asked for; None for a web UI search.
+    pub spec: Option<StoredSpec>,
+    /// What an MCP search read, once it ended; None when it failed before the backend finished.
+    pub stats: Option<SearchStats>,
+    /// Why an MCP search found nothing.
+    pub failure: Option<Failure>,
 }
 
 fn json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, sqlx::Error> {
@@ -34,22 +40,37 @@ pub async fn search_of(
     id: &str,
     user: &UserId,
 ) -> Result<Option<StoredSearch>, sqlx::Error> {
-    let row: Option<(Option<String>, String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT backend, query, candidates, expires_at FROM searches WHERE id = ? AND user_id = ?",
+    type Row = (
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT backend, query, candidates, expires_at, spec, stats, failure FROM searches \
+         WHERE id = ? AND user_id = ?",
     )
     .bind(id)
     .bind(user.to_string())
     .fetch_optional(db)
     .await?;
-    row.map(|(backend, query, candidates, expires_at)| {
-        Ok(StoredSearch {
-            id: id.to_string(),
-            backend,
-            query: json(&query)?,
-            candidates: candidates.as_deref().map(json).transpose()?,
-            expires_at,
-        })
-    })
+    row.map(
+        |(backend, query, candidates, expires_at, spec, stats, failure)| {
+            Ok(StoredSearch {
+                id: id.to_string(),
+                backend,
+                query: json(&query)?,
+                candidates: candidates.as_deref().map(json).transpose()?,
+                expires_at,
+                spec: spec.as_deref().map(json).transpose()?,
+                stats: stats.as_deref().map(json).transpose()?,
+                failure: failure.as_deref().map(json).transpose()?,
+            })
+        },
+    )
     .transpose()
 }
 

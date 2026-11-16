@@ -9,6 +9,7 @@ use crate::transfer_registry::TransferRegistry;
 use serde::{Deserialize, Serialize};
 use shared::download::{
     DownloadProgress, DownloadQuery, DownloadableGroup, DownloadableItem, JobSlot, MatchChoices,
+    SearchStats,
 };
 use shared::failure::Failure;
 use shared::recommendation::normalize_for_matching;
@@ -321,6 +322,18 @@ pub struct SourceFilters {
     pub max_queue_length: Option<u64>,
 }
 
+/// What an MCP search was asked for, stored with it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StoredSpec {
+    /// Sent in place of the text the backend builds from the query.
+    pub text: Option<String>,
+    pub keep_below_floor: bool,
+    pub filters: SourceFilters,
+    /// The reference as the caller sent it (D1's fields in their fixed order, null for a field
+    /// not given), so a call made again names the same one.
+    pub reference: serde_json::Value,
+}
+
 /// How an MCP job picks and keeps sources (design 11.5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobOptions {
@@ -488,7 +501,14 @@ pub struct NewSearch {
     pub user: UserId,
     pub backend: Option<String>,
     pub query: DownloadQuery,
+    /// None for a web UI search.
+    pub spec: Option<StoredSpec>,
 }
+
+/// How a search ended: its groups, best first, and what it read; or its failure and what it
+/// read when it finished.
+pub type SearchOutcome =
+    Result<(Vec<DownloadableGroup>, SearchStats), (Failure, Option<SearchStats>)>;
 
 /// What one prune removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -559,9 +579,9 @@ impl Ledger {
     }
 
     /// A ledger with no writer whose events a test reads. Requests that wait for a reply
-    /// (create, record_search, store_candidates, claim_source_choice, prune, settled) are
-    /// answered at once with Ok and the empty answer (no claimed job, nothing pruned) and
-    /// are not recorded.
+    /// (create, record_search, search_ended, store_candidates, claim_source_choice, prune,
+    /// settled) are answered at once with Ok and the empty answer (no claimed job, nothing
+    /// pruned) and are not recorded.
     #[cfg(test)]
     pub fn recording() -> (Ledger, Recorded) {
         let (ledger, inbox) = Ledger::channel();
@@ -690,6 +710,14 @@ impl Ledger {
             reply,
         })
         .await
+    }
+
+    /// The search ended as `outcome` says. Moves the change number on, as a job change does,
+    /// so a reader waiting on `changes` wakes.
+    pub async fn search_ended(&self, id: &str, outcome: SearchOutcome) -> Result<(), LedgerError> {
+        let id = id.to_string();
+        self.write(|reply| Write::SearchEnded { id, outcome, reply })
+            .await
     }
 
     pub async fn store_candidates(
@@ -844,6 +872,7 @@ mod tests {
             user: UserId::new(user),
             backend: Some("slskd".into()),
             query: DownloadQuery::new(vec![]),
+            spec: None,
         }
     }
 
@@ -878,6 +907,79 @@ mod tests {
                 .unwrap()
                 .candidates,
             Some(groups)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_that_ended_keeps_its_spec_stats_and_failure_and_wakes_readers() {
+        let (ledger, db, _, _) = ledger().await;
+        let spec = StoredSpec {
+            text: Some("Kowloon One".into()),
+            keep_below_floor: true,
+            filters: SourceFilters {
+                lossless_only: true,
+                ..Default::default()
+            },
+            reference: serde_json::json!({"artist": "Kowloon", "title": "One"}),
+        };
+        ledger
+            .record_search(NewSearch {
+                spec: Some(spec.clone()),
+                ..search("s1", "alice")
+            })
+            .await
+            .unwrap();
+        let read = || async {
+            store::search_of(&db, "s1", &UserId::new("alice"))
+                .await
+                .unwrap()
+                .expect("alice's")
+        };
+        let mut changes = ledger.changes();
+        changes.mark_unchanged();
+        let stats = SearchStats {
+            query_text: "Kowloon One".into(),
+            file_count: 7,
+            below_floor: 7,
+            ..Default::default()
+        };
+        let failure = Failure::new(
+            FailureCode::SearchAllFiltered,
+            Stage::SourceSearch,
+            RetryAdvice::OtherQuery,
+            "No results found",
+        );
+        ledger
+            .search_ended("s1", Err((failure.clone(), Some(stats.clone()))))
+            .await
+            .unwrap();
+        assert!(changes.has_changed().unwrap(), "a waiting reader wakes");
+        let ended = read().await;
+        assert_eq!(
+            (ended.spec, ended.stats, ended.failure, ended.candidates),
+            (Some(spec.clone()), Some(stats.clone()), Some(failure), None)
+        );
+
+        // Run again under its id after a restart cut it off: it ends anew.
+        ledger.record_search(search("s1", "alice")).await.unwrap();
+        let renewed = read().await;
+        assert_eq!(
+            (renewed.spec, renewed.stats, renewed.failure),
+            (Some(spec), None, None)
+        );
+        let groups = vec![group(
+            "peer_a",
+            vec![item("peer_a", "One", "a/01.flac")],
+            0.9,
+        )];
+        ledger
+            .search_ended("s1", Ok((groups.clone(), stats.clone())))
+            .await
+            .unwrap();
+        let found = read().await;
+        assert_eq!(
+            (found.candidates, found.stats, found.failure),
+            (Some(groups), Some(stats), None)
         );
     }
 
