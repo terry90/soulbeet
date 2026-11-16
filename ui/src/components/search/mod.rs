@@ -937,6 +937,7 @@ mod tests {
             release_date: None,
             mbid: None,
             cover_url: None,
+            release_types: None,
         };
         let query = album_query(&album, Provider::LastFm);
         assert!(query.tracks.is_empty());

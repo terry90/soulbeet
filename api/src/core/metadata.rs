@@ -3,11 +3,13 @@
 use crate::auth::UserCtx;
 use crate::core::database_failure;
 use crate::models::user_settings::UserSettings;
-use crate::services::metadata_provider;
+use crate::services::{metadata_provider, providers, usable_lastfm_key};
 use shared::download::DownloadQuery;
-use shared::failure::{Failure, Stage};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResults};
+use soulbeet::musicbrainz::{self, ArtistMatch, RecordingReleases};
 use soulbeet::{MetadataError, MetadataProvider};
+use std::sync::Arc;
 
 /// Which provider search runs: search_albums or search_tracks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,8 +18,8 @@ pub enum SearchKind {
     Tracks,
 }
 
-/// Results asked for per search.
-const SEARCH_LIMIT: usize = 25;
+/// Results the web UI's searches ask for.
+pub(crate) const SEARCH_LIMIT: usize = 25;
 
 /// The user's Last.fm key, which picks and authenticates Last.fm.
 pub(crate) async fn lastfm_key(ctx: &UserCtx) -> Result<Option<String>, Failure> {
@@ -32,17 +34,19 @@ fn settings_unreadable(e: impl std::fmt::Display) -> Failure {
     database_failure(Stage::Metadata, e).with_message("Could not read your settings")
 }
 
-/// Searches `provider`, or MusicBrainz when it is unset or cannot be used.
+/// Searches `provider`, or MusicBrainz when it is unset or cannot be used,
+/// asking it for `limit` results.
 pub async fn search(
     ctx: &UserCtx,
     kind: SearchKind,
     artist: Option<&str>,
     query: &str,
     provider: Option<&str>,
+    limit: usize,
 ) -> Result<SearchResults, Failure> {
     let key = lastfm_key(ctx).await?;
     let provider = metadata_provider(provider, key.as_deref());
-    search_in(&*provider, kind, artist, query).await
+    search_in(&*provider, kind, artist, query, limit).await
 }
 
 /// The search on `provider`, the results named by its id.
@@ -51,10 +55,11 @@ async fn search_in(
     kind: SearchKind,
     artist: Option<&str>,
     query: &str,
+    limit: usize,
 ) -> Result<SearchResults, Failure> {
     let results = match kind {
-        SearchKind::Albums => provider.search_albums(artist, query, SEARCH_LIMIT).await,
-        SearchKind::Tracks => provider.search_tracks(artist, query, SEARCH_LIMIT).await,
+        SearchKind::Albums => provider.search_albums(artist, query, limit).await,
+        SearchKind::Tracks => provider.search_tracks(artist, query, limit).await,
     }
     .map_err(|e| provider_failure(&e))?;
     Ok(SearchResults {
@@ -93,8 +98,64 @@ fn album_lookup_provider(searched: Option<Provider>, id: &str) -> Option<Provide
     }
 }
 
-fn provider_failure(e: &MetadataError) -> Failure {
+pub(crate) fn provider_failure(e: &MetadataError) -> Failure {
     e.failure(Stage::Metadata, e.to_string())
+}
+
+/// The release `id` (an MBID, or a `lastfm:` id) with its tracks and the
+/// provider that answered (D6).
+pub async fn release(ctx: &UserCtx, id: &str) -> Result<(AlbumWithTracks, Provider), Failure> {
+    let key = lastfm_key(ctx).await?;
+    let provider = release_provider(id, key.as_deref())?;
+    release_in(&*provider, id).await
+}
+
+/// Last.fm for a `lastfm:` id, which needs a saved Last.fm key, else
+/// MusicBrainz. `metadata_provider` would give MusicBrainz for a `lastfm:` id
+/// when no key is saved, and MusicBrainz cannot look such an id up.
+fn release_provider(
+    id: &str,
+    lastfm_key: Option<&str>,
+) -> Result<Arc<dyn MetadataProvider>, Failure> {
+    let lastfm = soulbeet::lastfm::is_album_id(id);
+    if lastfm && usable_lastfm_key(lastfm_key).is_none() {
+        return Err(Failure::new(
+            FailureCode::ProviderNotConfigured,
+            Stage::Metadata,
+            RetryAdvice::NeedsUser,
+            "A lastfm: release id needs a Last.fm API key saved in Soulful's settings",
+        )
+        .with_user_action(soulbeet::lastfm::configure_lastfm()));
+    }
+    Ok(metadata_provider(
+        lastfm.then_some(providers::LASTFM),
+        lastfm_key,
+    ))
+}
+
+async fn release_in(
+    provider: &dyn MetadataProvider,
+    id: &str,
+) -> Result<(AlbumWithTracks, Provider), Failure> {
+    album_in(provider, id).await.map(|a| (a, provider.id()))
+}
+
+/// Artists MusicBrainz finds by name.
+pub async fn artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, Failure> {
+    musicbrainz::search_artists(query, limit)
+        .await
+        .map_err(|e| provider_failure(&e))
+}
+
+/// The recording `mbid` on MusicBrainz and a page of the releases it is on.
+pub async fn recording_releases(
+    mbid: &str,
+    offset: u16,
+    limit: u8,
+) -> Result<RecordingReleases, Failure> {
+    musicbrainz::recording_releases(mbid, offset, limit)
+        .await
+        .map_err(|e| provider_failure(&e))
 }
 
 /// Album queries arrive from the UI with an empty track list; source matching
@@ -145,7 +206,7 @@ fn tracklist_failure(album_title: &str, e: &MetadataError) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::failure::{FailureCode, RetryAdvice, Service};
+    use shared::failure::Service;
     use shared::metadata::SearchResult as MetadataSearchResult;
 
     /// Fails every call the way step 3's with_retry does when MusicBrainz gives no answer.
@@ -220,12 +281,99 @@ mod tests {
         }
     }
 
+    /// Records the limit a search asks for, and finds nothing.
+    struct AskedFor(std::sync::Mutex<Option<usize>>);
+
+    #[async_trait::async_trait]
+    impl MetadataProvider for AskedFor {
+        fn id(&self) -> Provider {
+            Provider::MusicBrainz
+        }
+        fn name(&self) -> &'static str {
+            "MusicBrainz"
+        }
+        async fn search_albums(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            limit: usize,
+        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+            *self.0.lock().unwrap() = Some(limit);
+            Ok(vec![])
+        }
+        async fn search_tracks(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            limit: usize,
+        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+            *self.0.lock().unwrap() = Some(limit);
+            Ok(vec![])
+        }
+        async fn get_album(&self, _: &str) -> Result<AlbumWithTracks, MetadataError> {
+            Err(unanswered())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_search_asks_the_provider_for_the_limit_given() {
+        for kind in [SearchKind::Albums, SearchKind::Tracks] {
+            let p = AskedFor(Default::default());
+            search_in(&p, kind, None, "Silent Night", 10).await.unwrap();
+            assert_eq!(*p.0.lock().unwrap(), Some(10), "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_release_the_provider_cannot_answer_fails_with_its_failure() {
+        let f = release_in(&Unanswered, "317d1e85-3f9e-463e-939b-bebf47aa2178")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.stage, f.message.as_str()),
+            (
+                FailureCode::MetadataUnavailable,
+                Stage::Metadata,
+                "MusicBrainz is unavailable: no answer within 15 s"
+            )
+        );
+    }
+
+    #[test]
+    fn a_release_id_is_looked_up_by_the_provider_it_belongs_to() {
+        let mbid = "317d1e85-3f9e-463e-939b-bebf47aa2178";
+        let lastfm = "lastfm:bing crosby:white christmas";
+        let provider = |id, key| release_provider(id, key).map(|p| p.id());
+        assert_eq!(provider(mbid, None).unwrap(), Provider::MusicBrainz);
+        assert_eq!(provider(mbid, Some("a1b2")).unwrap(), Provider::MusicBrainz);
+        assert_eq!(provider(lastfm, Some("a1b2")).unwrap(), Provider::LastFm);
+        for key in [None, Some("")] {
+            let f = provider(lastfm, key).unwrap_err();
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message.as_str()),
+                (
+                    FailureCode::ProviderNotConfigured,
+                    Stage::Metadata,
+                    RetryAdvice::NeedsUser,
+                    "A lastfm: release id needs a Last.fm API key saved in Soulful's settings"
+                )
+            );
+            assert_eq!(f.user_action, Some(soulbeet::lastfm::configure_lastfm()));
+        }
+    }
+
     #[tokio::test]
     async fn search_results_name_the_provider_that_answered() {
         for provider in [Provider::LastFm, Provider::MusicBrainz] {
-            let found = search_in(&Empty(provider), SearchKind::Albums, None, "Winter Songs")
-                .await
-                .unwrap();
+            let found = search_in(
+                &Empty(provider),
+                SearchKind::Albums,
+                None,
+                "Winter Songs",
+                SEARCH_LIMIT,
+            )
+            .await
+            .unwrap();
             assert_eq!(found.provider, provider);
         }
     }
@@ -239,9 +387,15 @@ mod tests {
             "MusicBrainz is unavailable: no answer within 15 s",
         );
         for kind in [SearchKind::Albums, SearchKind::Tracks] {
-            let f = search_in(&Unanswered, kind, Some("Marrow Choir"), "Winter Songs")
-                .await
-                .unwrap_err();
+            let f = search_in(
+                &Unanswered,
+                kind,
+                Some("Marrow Choir"),
+                "Winter Songs",
+                SEARCH_LIMIT,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(
                 (f.code, f.stage, f.retry, f.message.as_str()),
                 expected,
@@ -263,6 +417,7 @@ mod tests {
             release_date: None,
             mbid: None,
             cover_url: None,
+            release_types: None,
         };
         let mut query = DownloadQuery::new(vec![]).album(album);
         let f = hydrate_in(&Unanswered, &mut query).await.unwrap_err();

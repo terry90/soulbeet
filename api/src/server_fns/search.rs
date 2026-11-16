@@ -40,6 +40,7 @@ pub async fn search_album(input: SearchQuery) -> Result<SearchResults, ServerFnE
         input.artist.as_deref(),
         &input.query,
         input.provider.as_deref(),
+        metadata::SEARCH_LIMIT,
     )
     .await
     .map_err(failure_error)
@@ -53,6 +54,7 @@ pub async fn search_track(input: SearchQuery) -> Result<SearchResults, ServerFnE
         input.artist.as_deref(),
         &input.query,
         input.provider.as_deref(),
+        metadata::SEARCH_LIMIT,
     )
     .await
     .map_err(failure_error)

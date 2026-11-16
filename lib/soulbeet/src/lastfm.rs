@@ -17,8 +17,9 @@ const LASTFM_API_BASE: &str = "https://ws.audioscrobbler.com/2.0/";
 /// The `resilient_send` context of every Last.fm request.
 const LASTFM_CONTEXT: &str = "Last.fm API";
 
-/// Last.fm refused the API key Soulful sent.
-pub(crate) fn configure_lastfm() -> UserAction {
+/// What the user does when Last.fm refused the API key Soulful sent, or no
+/// key is saved.
+pub fn configure_lastfm() -> UserAction {
     UserAction::new(
         UserActionCode::ConfigureProvider,
         "Set a valid Last.fm API key",
@@ -933,6 +934,7 @@ impl crate::MetadataProvider for LastFmProvider {
                     release_date: None,
                     mbid,
                     cover_url,
+                    release_types: None,
                 })
             })
             .collect())
@@ -1014,6 +1016,7 @@ impl crate::MetadataProvider for LastFmProvider {
                 release_date: info.wiki.and_then(|w| w.published),
                 mbid: album_mbid,
                 cover_url,
+                release_types: None,
             },
             tracks,
         })
