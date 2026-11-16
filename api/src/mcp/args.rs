@@ -282,7 +282,7 @@ impl Args {
         }
     }
 
-    /// A list of distinct names among `choices`, as written there.
+    /// A list of one or more distinct names among `choices`, as written there.
     pub(crate) fn opt_choices(
         &self,
         name: &str,
@@ -302,6 +302,9 @@ impl Args {
                 return Err(refused());
             }
             chosen.push(choice);
+        }
+        if chosen.is_empty() {
+            return Err(refused());
         }
         Ok(Some(chosen))
     }

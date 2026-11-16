@@ -106,10 +106,6 @@ impl UserSettings {
         }
     }
 
-    pub async fn upsert(user_id: &str, update: UpdateUserSettings) -> Result<UserSettings, String> {
-        Self::upsert_in(&DB, user_id, update).await
-    }
-
     /// Stores the fields of `update` that are set, in one statement that writes no other
     /// column, so two writes at once both stay; a new row takes `defaults` for the rest.
     /// Switching auto-delete off drops the tracks its last run kept, in the same transaction,

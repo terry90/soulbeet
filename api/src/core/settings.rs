@@ -45,11 +45,13 @@ fn unknown_profile(profile: &str) -> Failure {
 /// Each map must name all three profiles.
 pub(crate) fn validate(update: &UpdateUserSettings) -> Result<(), Failure> {
     if let Some(profiles) = &update.discovery_profiles {
-        let unknown = profiles
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .find(|p| !PROFILES.contains(p));
+        let names = || profiles.split(',').map(str::trim).filter(|p| !p.is_empty());
+        if names().next().is_none() {
+            return Err(refused(
+                "At least one discovery profile must be selected".into(),
+            ));
+        }
+        let unknown = names().find(|p| !PROFILES.contains(p));
         if let Some(profile) = unknown {
             return Err(unknown_profile(profile));
         }
@@ -298,6 +300,10 @@ mod tests {
             (
                 UpdateUserSettings { discovery_promote_threshold: Some(0), ..Default::default() },
                 "The discovery promote threshold must be 1 to 5, not 0",
+            ),
+            (
+                UpdateUserSettings { discovery_profiles: Some(String::new()), ..Default::default() },
+                "At least one discovery profile must be selected",
             ),
             (
                 UpdateUserSettings { discovery_profiles: Some("Conservative,Wild".into()), ..Default::default() },
