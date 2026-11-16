@@ -334,15 +334,16 @@ async fn delete_tracks(
         state.acquire.queue.clone(),
     );
     let app = app_of(caller);
+    let tool = DELETE_TRACKS.name;
     let work = async move {
         let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
         match deletion::confirm(&guard, &queue, &app, &secret, now_unix()).await {
             Ok(done) => Keyed::Kept(confirmed_answer(done)),
             // A refused take changed nothing: the token is as it was.
-            Err(r) => Keyed::Released(failed(token_refused(r))),
+            Err(r) => Keyed::Released(failed(token_refused(tool, r))),
         }
     };
-    keyed(&state.acquire, caller, DELETE_TRACKS.name, key, &call, work).await
+    keyed(&state.acquire, caller, tool, key, &call, work).await
 }
 
 /// The confirm as `items`: one entry per previewed file, deleted or the failure that kept it,
@@ -416,16 +417,20 @@ fn confirmed_answer(done: Confirmed) -> CallToolResult {
     items(answered)
 }
 
-/// A DeleteTokenRefusal as a tool error: the token's songs and reason as facts when the token is
-/// the caller's, and the call that can still help: get_deletion_history for a used token, a new
-/// preview of the same songs for an expired one or one the day's room cannot hold yet (after
+/// A DeleteTokenRefusal of `tool`'s call as a tool error: the token's songs and reason as facts
+/// when the token is the caller's, and the call that can still help: get_deletion_history when
+/// delete_tracks finds the token used (nothing when ensure_in_library does), a new preview of the
+/// same songs for an expired one or one the day's room cannot hold yet (after
 /// retry_after_seconds); nothing else, and never this call again.
-pub(crate) fn token_refused(r: DeleteTokenRefusal) -> ToolError {
+pub(crate) fn token_refused(tool: &str, r: DeleteTokenRefusal) -> ToolError {
     let known = r
         .reason
         .map(|reason| json!({"song_ids": r.song_ids, "reason": reason.as_str()}));
     let next = match r.kind {
-        TokenRefusalKind::Used => vec![NextCall::new("get_deletion_history", json!({}))],
+        TokenRefusalKind::Used if tool == DELETE_TRACKS.name => {
+            vec![NextCall::new(GET_DELETION_HISTORY.name, json!({}))]
+        }
+        TokenRefusalKind::Used => vec![],
         TokenRefusalKind::Expired | TokenRefusalKind::Room => (known.clone())
             .map(|args| NextCall::new("preview_delete_tracks", args))
             .into_iter()
@@ -833,21 +838,55 @@ mod tests {
             reason: Some(DeletionReason::Cleanup),
         };
         let preview = json!([{"tool": "preview_delete_tracks", "args": {"song_ids": ["s1"], "reason": "cleanup"}}]);
-        for (r, next) in [
+        for (tool, r, next) in [
             (
+                "delete_tracks",
                 known(Used, token_used()),
                 json!([{"tool": "get_deletion_history", "args": {}}]),
             ),
+            ("ensure_in_library", known(Used, token_used()), json!([])),
             (
+                "delete_tracks",
                 known(Expired, token_expired(1_800_000_000)),
                 preview.clone(),
             ),
             (
+                "ensure_in_library",
+                known(Expired, token_expired(1_800_000_000)),
+                preview.clone(),
+            ),
+            (
+                "delete_tracks",
+                known(Room, daily_limit(100, 1, 1_800_000_400, 1_800_000_000)),
+                preview.clone(),
+            ),
+            (
+                "ensure_in_library",
                 known(Room, daily_limit(100, 1, 1_800_000_400, 1_800_000_000)),
                 preview,
             ),
-            (known(Permission, permission_not_granted()), json!([])),
             (
+                "delete_tracks",
+                known(Permission, permission_not_granted()),
+                json!([]),
+            ),
+            (
+                "ensure_in_library",
+                known(Permission, permission_not_granted()),
+                json!([]),
+            ),
+            (
+                "delete_tracks",
+                DeleteTokenRefusal {
+                    kind: NotFound,
+                    failure: token_not_found(),
+                    song_ids: vec![],
+                    reason: None,
+                },
+                json!([]),
+            ),
+            (
+                "ensure_in_library",
                 DeleteTokenRefusal {
                     kind: NotFound,
                     failure: token_not_found(),
@@ -858,16 +897,20 @@ mod tests {
             ),
         ] {
             let kind = r.kind;
-            let e = token_refused(r);
-            assert_eq!(serde_json::to_value(&e.next).unwrap(), next, "{kind:?}");
+            let e = token_refused(tool, r);
+            assert_eq!(
+                serde_json::to_value(&e.next).unwrap(),
+                next,
+                "{tool} {kind:?}"
+            );
             assert_eq!(
                 e.facts.contains_key("song_ids"),
                 kind != NotFound,
-                "{kind:?}"
+                "{tool} {kind:?}"
             );
             assert!(
-                e.next.iter().all(|call| call.tool != "delete_tracks"),
-                "{kind:?}"
+                e.next.iter().all(|call| call.tool != tool),
+                "{tool} {kind:?}"
             );
         }
     }
