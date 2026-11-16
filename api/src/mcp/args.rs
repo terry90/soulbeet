@@ -102,6 +102,20 @@ impl Args {
         Ok((!text.is_empty()).then(|| text.to_string()))
     }
 
+    /// An optional text, trimmed, of at most `max` characters; an empty one is kept, so it can
+    /// clear what it sets.
+    pub(crate) fn opt_text(&self, name: &str, max: usize) -> Result<Option<String>, ToolError> {
+        let Some(value) = self.given(name) else {
+            return Ok(None);
+        };
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| text.chars().count() <= max)
+            .map(|text| Some(text.to_string()))
+            .ok_or_else(|| self.refuse(name, &format!("a text of at most {max} characters")))
+    }
+
     /// A MusicBrainz id in its 36-character hyphenated form, lowercase.
     pub(crate) fn mbid(&self, name: &str) -> Result<String, ToolError> {
         self.opt_mbid(name)?
@@ -280,6 +294,16 @@ impl Args {
     /// This call again (D13), unless it is too large to repeat.
     pub(crate) fn same_call(&self) -> Option<NextCall> {
         repeatable(self.tool, self.as_value())
+    }
+
+    /// This call with the arguments of `changes` replaced or added, unless it is too large to
+    /// repeat.
+    pub(crate) fn call_with(&self, changes: Value) -> Option<NextCall> {
+        let mut args = self.as_value();
+        for (name, value) in changes.as_object().expect("changes are named arguments") {
+            args[name] = value.clone();
+        }
+        repeatable(self.tool, args)
     }
 
     /// Whether `name` was given a value other than `null`.
@@ -554,6 +578,58 @@ pub(crate) mod tests {
                 "find_sources",
                 json!({"query_text": "wake up"})
             )]
+        );
+    }
+
+    #[test]
+    fn texts_keep_an_empty_value_and_are_bounded() {
+        let a = Args::new(
+            "create_playlist",
+            obj(json!({"comment": "  ", "public": "yes", "number": 7})),
+            &["comment", "public", "number"],
+        );
+        assert_eq!(a.opt_text("comment", 2000).unwrap(), Some(String::new()));
+        assert_eq!(a.opt_text("missing", 2000).unwrap(), None);
+        assert_eq!(
+            a.opt_text("number", 2000).unwrap_err().failure.message,
+            "create_playlist: number must be a text of at most 2000 characters"
+        );
+        assert_eq!(
+            a.opt_bool("public").unwrap_err().failure.message,
+            "create_playlist: public must be true or false"
+        );
+        let long = Args::new(
+            "create_playlist",
+            obj(json!({"comment": format!(" {} ", "é".repeat(2000)), "longer": "x".repeat(2001)})),
+            &["comment", "longer"],
+        );
+        assert_eq!(
+            long.opt_text("comment", 2000).unwrap(),
+            Some("é".repeat(2000))
+        );
+        assert_eq!(
+            long.opt_text("longer", 2000).unwrap_err().failure.message,
+            "create_playlist: longer must be a text of at most 2000 characters"
+        );
+    }
+
+    #[test]
+    fn a_call_offered_with_changes_never_carries_the_request_key() {
+        let a = Args::new(
+            "create_playlist",
+            obj(json!({"name": "Advent", "song_ids": ["s1", "s2"], "request_key": "advent-1"})),
+            &["name", "song_ids", "request_key"],
+        );
+        assert_eq!(
+            a.call_with(json!({"allow_duplicate_name": true, "song_ids": ["s1"]})),
+            Some(NextCall::new(
+                "create_playlist",
+                json!({"name": "Advent", "song_ids": ["s1"], "allow_duplicate_name": true})
+            ))
+        );
+        assert_eq!(
+            large_call(json!({})).call_with(json!({"cursor": "c"})),
+            None
         );
     }
 

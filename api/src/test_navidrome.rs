@@ -14,7 +14,13 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 /// What an endpoint with no answer set says (a Subsonic `ok` with no body).
-const OK: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+pub(crate) const OK: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+
+/// A playlist id as Navidrome makes one, and three songs (id, title) of the tests' library.
+pub(crate) const ADVENT: &str = "6vN2bQ8rT4yH1kL9mX3zPa";
+pub(crate) const HOLY: (&str, &str) = ("3sG8kPq0WmZ1xYbN4vTcDe", "O Holy Night");
+pub(crate) const SILENT: (&str, &str) = ("0bF4hJ7kL2zX9cV5nM1qWe", "Silent Night");
+pub(crate) const AWAY: (&str, &str) = ("9pL1kJ3hG5fD7sA2qW4eRt", "Away in a Manger");
 
 type Answers = Arc<Mutex<Book>>;
 
@@ -244,6 +250,103 @@ pub(crate) fn playlist_row(
     row["mediaFileId"] = json!(song_id);
     row["missing"] = json!(missing);
     row.to_string()
+}
+
+/// The `/api/playlist/{id}/tracks` answer of `playlist_row`s, each (place, song id, title, missing)
+/// by "Marrow Choir".
+pub(crate) fn playlist_rows(rows: &[(u32, &str, &str, bool)]) -> String {
+    let rows: Vec<String> = rows
+        .iter()
+        .map(|(place, id, title, missing)| {
+            playlist_row(*place, id, "Marrow Choir", title, *missing)
+        })
+        .collect();
+    format!("[{}]", rows.join(","))
+}
+
+/// The `GET /api/song` answer of `native_song(id, "Marrow Choir", id, 263.4, None)` records, each
+/// with `missing` as given.
+pub(crate) fn native_songs(songs: &[(&str, bool)]) -> String {
+    let songs: Vec<serde_json::Value> = songs
+        .iter()
+        .map(|(id, missing)| {
+            let mut song: serde_json::Value =
+                serde_json::from_str(&native_song(id, "Marrow Choir", id, 263.4, None))
+                    .expect("native_song writes JSON");
+            song["missing"] = json!(missing);
+            song
+        })
+        .collect();
+    json!(songs).to_string()
+}
+
+/// A playlist as getPlaylists lists it and getPlaylist answers it, in responses.Playlist's key
+/// order (server/subsonic/responses/responses.go:305-327): `comment` and `public` left out when
+/// empty or false, 263 seconds a song.
+fn playlist_json(
+    id: &str,
+    name: &str,
+    owner: &str,
+    public: bool,
+    comment: &str,
+    songs: usize,
+) -> String {
+    let mut p = format!(r#""id":{},"name":{}"#, json!(id), json!(name));
+    if !comment.is_empty() {
+        p.push_str(&format!(r#","comment":{}"#, json!(comment)));
+    }
+    p.push_str(&format!(
+        r#","songCount":{songs},"duration":{}"#,
+        songs * 263
+    ));
+    if public {
+        p.push_str(r#","public":true"#);
+    }
+    p.push_str(&format!(
+        r#","owner":{},"created":"2026-11-15T09:00:00.123456Z","changed":"2026-11-15T09:00:04.5Z","readonly":false"#,
+        json!(owner)
+    ));
+    p
+}
+
+/// getPlaylist's or createPlaylist's answer (server/subsonic/playlists.go:42-75): the playlist
+/// with one `child(id, "Marrow Choir", title)` entry per song, `entry` left out when there is
+/// none (responses.go:333-336).
+pub(crate) fn playlist_body(
+    id: &str,
+    name: &str,
+    owner: &str,
+    public: bool,
+    comment: &str,
+    songs: &[(&str, &str)],
+) -> String {
+    let mut p = playlist_json(id, name, owner, public, comment, songs.len());
+    if !songs.is_empty() {
+        let entries: Vec<String> = songs
+            .iter()
+            .map(|(id, title)| child(id, "Marrow Choir", title))
+            .collect();
+        p.push_str(&format!(r#","entry":[{}]"#, entries.join(",")));
+    }
+    subsonic_ok(&format!(r#""playlist":{{{p}}}"#))
+}
+
+/// getPlaylists' answer of (id, name, owner, public) playlists, each with no song; an empty list
+/// is left out (responses.go:329-331).
+pub(crate) fn playlists_body(list: &[(&str, &str, &str, bool)]) -> String {
+    if list.is_empty() {
+        return subsonic_ok(r#""playlists":{}"#);
+    }
+    let playlists: Vec<String> = list
+        .iter()
+        .map(|(id, name, owner, public)| {
+            format!("{{{}}}", playlist_json(id, name, owner, *public, "", 0))
+        })
+        .collect();
+    subsonic_ok(&format!(
+        r#""playlists":{{"playlist":[{}]}}"#,
+        playlists.join(",")
+    ))
 }
 
 /// A Subsonic song child (the SONG shape of the soulbeet client tests) with these values: track 3

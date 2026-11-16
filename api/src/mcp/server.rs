@@ -257,6 +257,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ensure::DOWNLOAD_SOURCE_TOOL,
     imports::GET_IMPORT_CHOICES,
     imports::RESOLVE_IMPORT,
+    playlists::CREATE_PLAYLIST,
+    playlists::UPDATE_PLAYLIST,
+    playlists::DELETE_PLAYLIST,
 ];
 
 impl ToolSpec {
@@ -502,6 +505,9 @@ mod tests {
             "resolve_import" => {
                 json!({"job_id": "5b0e3c2a-7d41-4f6e-9a18-c3d2e1f0a9b8", "choice": "retry"})
             }
+            "create_playlist" => json!({"name": "Advent"}),
+            "update_playlist" => json!({"playlist_id": "6vN2bQ8rT4yH1kL9mX3zPa", "name": "Advent"}),
+            "delete_playlist" => json!({"playlist_id": "6vN2bQ8rT4yH1kL9mX3zPa"}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -570,6 +576,9 @@ mod tests {
         ("download_source", false, false, false, true),
         ("get_import_choices", true, false, true, false),
         ("resolve_import", false, false, false, false),
+        ("create_playlist", false, false, false, false),
+        ("update_playlist", false, false, true, false),
+        ("delete_playlist", false, true, true, false),
     ];
 
     #[test]
@@ -680,6 +689,9 @@ mod tests {
             "list_starred",
             "list_playlists",
             "get_playlist",
+            "create_playlist",
+            "update_playlist",
+            "delete_playlist",
         ] {
             let result = call_tool(app.clone(), &token, name, valid_args(name)).await;
             within_cap(&result, name);

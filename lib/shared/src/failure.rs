@@ -400,6 +400,8 @@ failure_codes! {
     PlaylistNotOwner => "playlist_not_owner",
     PlaylistNameTaken => "playlist_name_taken",
     PlaylistTracksNotWritten => "playlist_tracks_not_written",
+    /// Navidrome answered a playlist change it does not show: a name, comment, public flag or delete.
+    PlaylistNotWritten => "playlist_not_written",
     DeletePathUnresolved => "delete_path_unresolved",
     DeleteOutsideLibrary => "delete_outside_library",
     DeleteNotATrack => "delete_not_a_track",
@@ -434,7 +436,7 @@ mod tests {
     /// `sources_exhausted`, `result_rejected` and `search_stopped`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 83] = [
+    const NAMES: [&str; 84] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -503,6 +505,7 @@ mod tests {
         "playlist_not_owner",
         "playlist_name_taken",
         "playlist_tracks_not_written",
+        "playlist_not_written",
         "delete_path_unresolved",
         "delete_outside_library",
         "delete_not_a_track",
