@@ -19,7 +19,7 @@ use crate::ledger::store::{self, SlotRecord, StoredSearch, Unfinished, Unfinishe
 use crate::ledger::{JobEvent, JobState, Ledger, NewSearch, StoredImport, LEDGER};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{held_failure, transfer_key};
-use crate::server_fns::download::failover::{alternates_for, SourcePool};
+use crate::server_fns::download::failover::{alternates_for, SourcePool, MAX_SOURCES_PER_TRACK};
 use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
 use crate::server_fns::download::process::{
     find_on_disk, import_job, resolve_on_disk, unresolved_row, ResolvedSlot,
@@ -395,7 +395,7 @@ struct Downloads {
     /// backend does not hold, by job: each is looked for in the batch folder,
     /// and the others are sent again into this batch.
     queued: Vec<Queued>,
-    pools: HashMap<JobSlot, (Vec<DownloadableItem>, usize)>,
+    pools: HashMap<JobSlot, (Vec<DownloadableItem>, usize, usize)>,
 }
 
 impl Downloads {
@@ -407,8 +407,10 @@ impl Downloads {
             Some(Some(first)) => alternates_for(first, &alternates_from(candidates, &tried)),
             _ => Vec::new(),
         };
-        self.pools
-            .insert(slot.clone(), (alternates, record.attempts.len()));
+        self.pools.insert(
+            slot.clone(),
+            (alternates, record.attempts.len(), MAX_SOURCES_PER_TRACK),
+        );
         self.slots.push((slot, record));
     }
 }
@@ -927,7 +929,11 @@ async fn resume_batch(
     let pool = SourcePool::resumed(
         watched
             .iter()
-            .map(|w| pools.remove(&w.job).unwrap_or_default())
+            .map(|w| {
+                pools
+                    .remove(&w.job)
+                    .unwrap_or_else(|| (Vec::new(), 0, MAX_SOURCES_PER_TRACK))
+            })
             .collect(),
     );
     resume
@@ -963,6 +969,7 @@ impl Queued {
             job: job.id.clone(),
             alternates: alternates_from(&candidates, &picked),
             items,
+            max_sources: MAX_SOURCES_PER_TRACK,
         };
         (job, acquisition)
     }

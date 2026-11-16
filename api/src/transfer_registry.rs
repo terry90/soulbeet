@@ -319,6 +319,8 @@ pub struct AddedSlot {
     /// Other sources for the same track, best first; empty when the request
     /// had none.
     pub alternates: Vec<DownloadableItem>,
+    /// The most sources the slot may use, the transfer being its first.
+    pub max_sources: usize,
     /// The job slot the transfer downloads for.
     pub job: JobSlot,
 }
@@ -418,6 +420,7 @@ impl Drop for InboxReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 
     fn batch(user_id: &str, batch_id: &str, import_mode: ImportMode) -> BatchRef {
         BatchRef::new(
@@ -484,6 +487,7 @@ mod tests {
             filename: filename.to_string(),
             transfer_id: format!("t-{filename}"),
             alternates: vec![],
+            max_sources: MAX_SOURCES_PER_TRACK,
             job: JobSlot {
                 job: "j1".to_string(),
                 slot: 0,

@@ -10,6 +10,7 @@ use crate::globals::get_or_create_user_channel;
 use crate::ledger::{JobEvent, JobState, Ledger, NewJob, NewSearch, LEDGER};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::not_enqueued_failure;
+use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 use crate::services::download_backend;
 use dioxus::logger::tracing::info;
 use shared::download::{
@@ -327,6 +328,7 @@ pub(crate) async fn run_search(
         job: run.job.clone(),
         items,
         alternates: all_groups,
+        max_sources: MAX_SOURCES_PER_TRACK,
     };
     let outcome = enqueue_and_watch(&ledger, &ctx, backend, fresh, acquisition).await;
     match enqueue_outcome(run.batch_id.clone(), &outcome) {

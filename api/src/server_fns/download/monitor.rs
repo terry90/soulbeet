@@ -374,7 +374,8 @@ impl DownloadMonitor {
         let track_states = (0..tracked_files.len())
             .map(|_| TrackState::bound_now())
             .collect();
-        let pool = SourcePool::from_tracks(&vec![None; tracked_files.len()], &[]);
+        let pool =
+            SourcePool::from_tracks(&vec![None; tracked_files.len()], &[], MAX_SOURCES_PER_TRACK);
 
         Self {
             tracked_files,
@@ -526,7 +527,7 @@ impl DownloadMonitor {
                 job: slot.job,
             });
             self.track_states.push(TrackState::bound_now());
-            self.pool.push_slot(slot.alternates);
+            self.pool.push_slot(slot.alternates, slot.max_sources);
         }
         any
     }
@@ -670,7 +671,7 @@ impl DownloadMonitor {
             self.tracked_files[slot].source,
             queued.source,
             attempt,
-            MAX_SOURCES_PER_TRACK
+            self.pool.max_sources(slot)
         );
 
         self.abandon(slot, backend).await;
@@ -3797,6 +3798,7 @@ mod tests {
                 job: "j1".into(),
                 items: vec![(1, item("peer_b", "Two", "q\\02.flac"))],
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
             },
         )
         .await
@@ -4062,6 +4064,7 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: id_of("02.flac"),
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
                 job: slot_of_j1(1),
             }])
             .expect("delivered");
@@ -4101,6 +4104,7 @@ mod tests {
                 filename: "dirA/two.flac".into(),
                 transfer_id: id_of("dirA/two.flac"),
                 alternates: vec![item("peer_b", "Two", "dirB/two.flac")],
+                max_sources: MAX_SOURCES_PER_TRACK,
                 job: slot_of_j1(1),
             }])
             .expect("delivered");
@@ -4126,6 +4130,64 @@ mod tests {
         );
         assert_eq!((m.pool.attempts_used(0), m.pool.attempts_used(1)), (1, 2));
         assert_eq!(m.tracked_files[0].source, "peer_a");
+    }
+
+    #[tokio::test]
+    async fn a_joined_slot_fails_over_within_its_own_cap() {
+        let (tx, _rx) = broadcast::channel(16);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        assert_eq!(m.pool.max_sources(0), MAX_SOURCES_PER_TRACK);
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued, ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.batch
+            .inbox
+            .reserve()
+            .expect("open inbox")
+            .deliver(vec![AddedSlot {
+                source: "peer_a".into(),
+                filename: "dirA/two.flac".into(),
+                transfer_id: id_of("dirA/two.flac"),
+                alternates: vec![
+                    item("peer_b", "Two", "dirB/two.flac"),
+                    item("peer_c", "Two", "dirC/two.flac"),
+                ],
+                max_sources: 2,
+                job: slot_of_j1(1),
+            }])
+            .expect("delivered");
+        assert!(m.drain_inbox());
+        assert_eq!(m.pool.max_sources(1), 2);
+        m.track_states[1].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[
+                listed("peer_a", "dirA/aaa.flac", DownloadState::InProgress),
+                failed_transfer("peer_a", "dirA/two.flac"),
+            ],
+            &backend,
+        )
+        .await;
+        assert_eq!(m.tracked_files[1].source, "peer_b");
+
+        m.track_states[1].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+        poll_tracks(
+            &mut m,
+            &[
+                listed("peer_a", "dirA/aaa.flac", DownloadState::InProgress),
+                failed_transfer("peer_b", "dirB/two.flac"),
+            ],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(
+            m.tracked_files[1].source, "peer_b",
+            "peer_c is over the cap"
+        );
+        assert_eq!(m.pool.attempts_used(1), 2);
+        assert_eq!(phase(&m, 1), SlotPhase::Settled);
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
     }
 
     #[tokio::test]
@@ -4170,6 +4232,7 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02".to_string(),
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
                 job: slot_of_j1(1),
             }])
             .expect("delivered");
@@ -4209,6 +4272,7 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02".to_string(),
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
                 job: slot_of_j1(1),
             }])
             .expect("delivered");

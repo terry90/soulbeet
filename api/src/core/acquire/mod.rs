@@ -113,6 +113,9 @@ pub struct Acquisition {
     pub job: String,
     pub items: Vec<(u32, DownloadableItem)>,
     pub alternates: Vec<DownloadableGroup>,
+    /// The most sources each of the job's files may use, the first being the
+    /// one enqueued.
+    pub max_sources: usize,
 }
 
 /// `items` as the slots 0..n of a job.
@@ -181,7 +184,8 @@ pub(super) async fn queue_and_watch(
         job,
         items: picked,
         alternates,
-    } = acquisition;
+        max_sources,
+    } = &acquisition;
     let items: Vec<DownloadableItem> = picked.iter().map(|(_, item)| item.clone()).collect();
     let claimed = match batch {
         RequestBatch::New(fresh) => claim_request(&backend, items.clone(), fresh.owned_by(&ctx)),
@@ -318,16 +322,7 @@ pub(super) async fn queue_and_watch(
                 enqueued.len(),
                 batch.owner.batch_id
             );
-            let lost = deliver(
-                reservation,
-                &enqueued,
-                &picked,
-                &alternates,
-                &backend,
-                &batch,
-                &job,
-            )
-            .await;
+            let lost = deliver(reservation, &enqueued, &acquisition, &backend, &batch).await;
             if !lost.is_empty() {
                 let rows = stopped_rows(&lost, &batch);
                 let _ = tx.send(DownloadEvent::Progress(rows.clone()));
@@ -352,7 +347,11 @@ pub(super) async fn queue_and_watch(
                 .collect();
             // Pool slots must line up with the monitor's slots, which follow
             // `enqueued`, not `items`.
-            let pool = SourcePool::from_tracks(&align_pool_tracks(&enqueued, &items), &alternates);
+            let pool = SourcePool::from_tracks(
+                &align_pool_tracks(&enqueued, &items),
+                alternates,
+                *max_sources,
+            );
             let target = batch.target.clone();
             spawn_monitor(
                 &ctx,
@@ -420,6 +419,7 @@ mod tests {
     use super::*;
     use crate::auth::UserId;
     use crate::ledger::NewJob;
+    use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
     use crate::server_fns::download::test_support::{
         batch, group, item, key, ScriptedOutcome, StubBackend,
     };
@@ -446,6 +446,7 @@ mod tests {
             job: "j1".into(),
             items: numbered(items),
             alternates,
+            max_sources: MAX_SOURCES_PER_TRACK,
         }
     }
 
@@ -690,6 +691,7 @@ mod tests {
                 job: "j1".into(),
                 items: vec![(0, item("peer_a", "One", "01.flac"))],
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
             },
         )
         .await
@@ -727,6 +729,7 @@ mod tests {
                     (1, item("peer_a", "Two", "02.flac")),
                 ],
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
             },
         )
         .await
@@ -761,6 +764,7 @@ mod tests {
                 job: "j2".into(),
                 items: vec![(0, item("peer_a", "One", "01.flac"))],
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
             },
         )
         .await
@@ -822,6 +826,7 @@ mod tests {
                 job: "j1".into(),
                 items,
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
             },
         )
         .await
@@ -854,6 +859,7 @@ mod tests {
                     (1, item("peer_a", "Two", "02.flac")),
                 ],
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
             },
         )
         .await
@@ -992,6 +998,7 @@ mod tests {
                 job: "j1".into(),
                 items: picked,
                 alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
             },
         )
         .await

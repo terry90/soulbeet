@@ -44,6 +44,7 @@ pub struct NextSource {
 struct Slot {
     alternates: VecDeque<DownloadableItem>,
     used: usize,
+    max: usize,
 }
 
 /// Ranked alternate sources for every track in a batch, indexed by slot.
@@ -62,35 +63,42 @@ impl SourcePool {
     ///
     /// `rest` must already be in descending score order, which is how
     /// `auto_download` sorts it.
-    pub fn from_tracks(tracks: &[Option<DownloadableItem>], rest: &[DownloadableGroup]) -> Self {
+    pub fn from_tracks(
+        tracks: &[Option<DownloadableItem>],
+        rest: &[DownloadableGroup],
+        max_sources: usize,
+    ) -> Self {
         let mut pool = Self { slots: Vec::new() };
         for track in tracks {
             let alternates = match track {
                 Some(track) => alternates_for(track, rest),
                 None => Vec::new(),
             };
-            pool.push_slot(alternates);
+            pool.push_slot(alternates, max_sources);
         }
         pool
     }
 
-    /// Adds a slot after the last; its transfer counts as its first source.
-    pub fn push_slot(&mut self, alternates: Vec<DownloadableItem>) {
+    /// Adds a slot after the last; its transfer counts as its first of
+    /// `max_sources` sources.
+    pub fn push_slot(&mut self, alternates: Vec<DownloadableItem>, max_sources: usize) {
         self.slots.push(Slot {
             alternates: alternates.into(),
             used: 1,
+            max: max_sources,
         });
     }
 
-    /// A pool resumed after a restart: per slot its untried alternates and
-    /// the sources it used.
-    pub fn resumed(slots: Vec<(Vec<DownloadableItem>, usize)>) -> Self {
+    /// A pool resumed after a restart: per slot its untried alternates, the
+    /// sources it used and its own cap.
+    pub fn resumed(slots: Vec<(Vec<DownloadableItem>, usize, usize)>) -> Self {
         Self {
             slots: slots
                 .into_iter()
-                .map(|(alternates, used)| Slot {
+                .map(|(alternates, used, max)| Slot {
                     alternates: alternates.into(),
                     used,
+                    max,
                 })
                 .collect(),
         }
@@ -104,6 +112,7 @@ impl SourcePool {
             slots: vec![Slot {
                 alternates,
                 used: 1,
+                max: MAX_SOURCES_PER_TRACK,
             }],
         }
     }
@@ -118,11 +127,19 @@ impl SourcePool {
         self.slots.get(slot).map(|s| s.used).unwrap_or(0)
     }
 
+    /// The most sources this slot may use, or the default cap for a slot that
+    /// does not exist.
+    pub fn max_sources(&self, slot: usize) -> usize {
+        self.slots
+            .get(slot)
+            .map_or(MAX_SOURCES_PER_TRACK, |s| s.max)
+    }
+
     /// Next alternate for this slot, or `None` once the budget is spent, the
     /// alternates run out, or the slot does not exist.
     pub fn take_next(&mut self, slot: usize) -> Option<DownloadableItem> {
         let slot = self.slots.get_mut(slot)?;
-        if slot.used >= MAX_SOURCES_PER_TRACK {
+        if slot.used >= slot.max {
             return None;
         }
         let item = slot.alternates.pop_front()?;
@@ -321,7 +338,7 @@ mod tests {
             0.9,
         )];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         let next = pool.take_next(0).expect("alternate for slot 0");
         assert_eq!(next.source, "Cornflake9026");
     }
@@ -335,7 +352,7 @@ mod tests {
             group("peer_d", vec![item("peer_d", "Wake Up", "d.flac")], 0.7),
         ];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_b".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_c".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_d".into()));
@@ -351,6 +368,7 @@ mod tests {
                 item("peer_d", "One", "d/01.flac"),
             ],
             3,
+            MAX_SOURCES_PER_TRACK,
         )]);
         assert_eq!(pool.take_next(0).map(|i| i.id), Some("c/01.flac".into()));
         assert!(pool.take_next(0).is_none());
@@ -468,7 +486,7 @@ mod tests {
             Some(item("peer_a", "Come Over", "a-come-over.flac")),
         ];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert_eq!(
             pool.take_next(0).map(|i| i.id),
             Some("b-wake-up.flac".to_string())
@@ -498,7 +516,7 @@ mod tests {
             Some(item("peer_a", "Come Over", "a-come-over.flac")),
         ];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert_eq!(
             pool.take_next(0).map(|i| i.id),
             Some("b-wake-up.flac".to_string())
@@ -519,7 +537,7 @@ mod tests {
             0.9,
         )];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert!(pool.take_next(0).is_none());
     }
 
@@ -546,6 +564,32 @@ mod tests {
     }
 
     #[test]
+    fn each_slot_keeps_its_own_cap() {
+        let rest = vec![
+            group("peer_b", vec![item("peer_b", "One", "b/01.flac")], 0.9),
+            group("peer_c", vec![item("peer_c", "One", "c/01.flac")], 0.8),
+        ];
+        let mut pool =
+            SourcePool::from_tracks(&[Some(item("peer_a", "One", "a/01.flac"))], &rest, 1);
+        assert_eq!(
+            pool.take_next(0),
+            None,
+            "a slot with one source has no failover"
+        );
+        pool.push_slot(
+            vec![
+                item("peer_b", "One", "b/01.flac"),
+                item("peer_c", "One", "c/01.flac"),
+            ],
+            2,
+        );
+        assert_eq!(pool.max_sources(0), 1);
+        assert_eq!(pool.max_sources(1), 2);
+        assert_eq!(pool.take_next(1).map(|i| i.source), Some("peer_b".into()));
+        assert_eq!(pool.take_next(1), None);
+    }
+
+    #[test]
     fn a_pushed_slot_offers_its_own_alternates() {
         let mut pool = SourcePool::from_tracks(
             &[Some(item("peer_a", "One", "a/01.flac"))],
@@ -554,8 +598,12 @@ mod tests {
                 vec![item("peer_b", "One", "b/01.flac")],
                 0.9,
             )],
+            MAX_SOURCES_PER_TRACK,
         );
-        pool.push_slot(vec![item("peer_c", "Two", "c/02.flac")]);
+        pool.push_slot(
+            vec![item("peer_c", "Two", "c/02.flac")],
+            MAX_SOURCES_PER_TRACK,
+        );
         assert_eq!(pool.attempts_used(1), 1);
         assert_eq!(
             pool.take_next(1).map(|i| i.id),

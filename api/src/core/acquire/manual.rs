@@ -7,6 +7,7 @@ use crate::core::{backend_unavailable, database_failure};
 use crate::ledger::store::StoredSearch;
 use crate::ledger::{JobState, Ledger, NewJob, LEDGER};
 use crate::models::folder::Folder;
+use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 use crate::services::{download_backend, BackendLookupError};
 use shared::download::{DownloadableItem, QueuedDownload};
 use shared::failure::{Failure, Stage};
@@ -145,6 +146,7 @@ async fn start_manual(
         job,
         items: picked,
         alternates,
+        max_sources: MAX_SOURCES_PER_TRACK,
     };
     queue_and_watch(ledger, ctx, backend, fresh.into(), acquisition).await
 }

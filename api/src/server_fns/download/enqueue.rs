@@ -4,7 +4,7 @@
 //! anything, and releases each key whose file was not enqueued.
 
 use shared::download::{
-    DownloadProgress, DownloadableGroup, DownloadableItem, EnqueueStatus, JobSlot, QueuedDownload,
+    DownloadProgress, DownloadableItem, EnqueueStatus, JobSlot, QueuedDownload,
 };
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
@@ -12,6 +12,7 @@ use soulbeet::DownloadBackend;
 use std::sync::Arc;
 
 use super::failover::{alternates_for, item_index};
+use crate::core::acquire::Acquisition;
 use crate::transfer_registry::{
     AddedSlot, BatchRef, Claim, InboxReservation, RequestClaim, TransferKey, TransferRegistry,
 };
@@ -395,8 +396,8 @@ fn sort_claim(
 }
 
 /// Hands a joining request's enqueued transfers to `batch`'s monitor, each
-/// as the slot of `job` its file has among `picked`, with the alternates
-/// `rest` holds for that file. A transfer no picked file lines up with is no
+/// as the slot of the job its file has among `acquisition`'s items, with the
+/// alternates and source cap `acquisition` gives it. A transfer no picked file lines up with is no
 /// slot of the job and is not handed over.
 /// Returns the ones nobody will watch because that monitor stopped first,
 /// with their keys released and their transfers cancelled, since they would
@@ -404,12 +405,16 @@ fn sort_claim(
 pub async fn deliver(
     reservation: InboxReservation,
     enqueued: &[QueuedDownload],
-    picked: &[(u32, DownloadableItem)],
-    rest: &[DownloadableGroup],
+    acquisition: &Acquisition,
     backend: &Arc<dyn DownloadBackend>,
     batch: &BatchRef,
-    job: &str,
 ) -> Vec<AddedSlot> {
+    let Acquisition {
+        job,
+        items: picked,
+        alternates: rest,
+        max_sources,
+    } = acquisition;
     let slots = enqueued
         .iter()
         .filter_map(|q| {
@@ -419,8 +424,9 @@ pub async fn deliver(
                 filename: q.item.clone(),
                 transfer_id: q.id.clone(),
                 alternates: alternates_for(item, rest),
+                max_sources: *max_sources,
                 job: JobSlot {
-                    job: job.to_string(),
+                    job: job.clone(),
                     slot: *slot,
                 },
             })
@@ -469,6 +475,7 @@ pub fn stopped_rows(lost: &[AddedSlot], batch: &BatchRef) -> Vec<DownloadProgres
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
     use crate::server_fns::download::test_support::{
         batch, group, item, key, same_user_into, Cancel, ScriptedOutcome, StubBackend,
         STUB_IN_FLIGHT,
@@ -699,11 +706,14 @@ mod tests {
         assert!(deliver(
             reservation,
             &enqueued,
-            &picked,
-            &rest,
+            &Acquisition {
+                job: "j1".into(),
+                items: picked.clone(),
+                alternates: rest.clone(),
+                max_sources: MAX_SOURCES_PER_TRACK,
+            },
             &backend,
             &running,
-            "j1"
         )
         .await
         .is_empty());
@@ -714,6 +724,7 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02.flac".to_string(),
                 alternates: vec![item("peer_b", "Two", "b/02.flac")],
+                max_sources: MAX_SOURCES_PER_TRACK,
                 job: JobSlot {
                     job: "j1".to_string(),
                     slot: 1,
@@ -744,11 +755,14 @@ mod tests {
         let lost = deliver(
             reservation,
             &enqueued,
-            &[(0, item("peer_a", "One", "01.flac"))],
-            &rest,
+            &Acquisition {
+                job: "j1".into(),
+                items: vec![(0, item("peer_a", "One", "01.flac"))],
+                alternates: rest.clone(),
+                max_sources: MAX_SOURCES_PER_TRACK,
+            },
             &backend,
             &running,
-            "j1",
         )
         .await;
 
@@ -993,11 +1007,14 @@ mod tests {
         let lost = deliver(
             reservation,
             &enqueued,
-            &[(0, item("peer_a", "One", "01.flac"))],
-            &[],
+            &Acquisition {
+                job: "j1".into(),
+                items: vec![(0, item("peer_a", "One", "01.flac"))],
+                alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
+            },
             &backend,
             &running,
-            "j1",
         )
         .await;
 
