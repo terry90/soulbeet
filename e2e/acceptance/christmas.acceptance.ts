@@ -129,6 +129,15 @@ interface Batch {
   playlist: { playlist_id: string; settled: number; waiting: number; failure: unknown; hidden_entries_dropped: number };
   [field: string]: unknown;
 }
+/**
+ * What a job needs action for: its failure, or, for a job waiting for an import decision, the
+ * warning its slot carries (the slot did not fail, so the job's failure is null).
+ */
+function actionFor(job: JobDoc): ErrorObject | null {
+  if (job.state !== 'needs_decision') return job.failure;
+  expect(job.failure, JSON.stringify(job)).toBeNull();
+  return (job.slots as { warning: ErrorObject | null }[]).find((slot) => slot.warning !== null)?.warning ?? null;
+}
 const matched = (e: Entry) => (e.matches as { song_id: string; match: { kind: string } }[] | undefined)?.[0];
 
 test('the Christmas playlist is filled through every injected failure by following each error', async ({ browser }) => {
@@ -349,32 +358,33 @@ test('the Christmas playlist is filled through every injected failure by followi
       cursor = b.cursor;
       if (b.needs_action.length === 0 && b.all_terminal) break;
       for (const job of b.needs_action) {
-        const code = job.failure?.code ?? job.state;
+        const failure = actionFor(job);
+        const code = failure?.code ?? job.state;
         const before = acted.get(job.job_id) ?? [];
         expect(before, `acted twice on ${code}: ${JSON.stringify(job)}`).not.toContain(code);
         if (!seen.has(job.wanted.title)) {
           seen.add(job.wanted.title);
           const want = EXPECTED[job.wanted.title];
           if (want === undefined) throw new Error(`no failure was injected for ${JSON.stringify(job)}`);
-          expect({ state: job.state, code, stage: job.failure?.stage, retry: job.failure?.retry }).toEqual({
+          expect({ state: job.state, code, stage: failure?.stage, retry: failure?.retry }).toEqual({
             state: want.state,
             code: want.code,
             stage: want.stage,
             retry: want.retry,
           });
-          if (want.raw) expect(job.failure?.cause?.raw).toBe(want.raw);
-          if (want.source) expect(job.failure?.facts.source).toBe(want.source);
+          if (want.raw) expect(failure?.cause?.raw).toBe(want.raw);
+          if (want.source) expect(failure?.facts.source).toBe(want.source);
           expect(
             job.next.some(
               (n) => n.tool === want.offers.tool && (want.offers.mode === undefined || n.args.mode === want.offers.mode),
             ),
           ).toBe(true);
           if (job.wanted.title === 'Deck the Halls') {
-            expect(job.failure?.facts.dropped_by_filter).toMatchObject({ not_lossless: expect.any(Number) });
-            expect((job.failure?.facts.dropped_by_filter as { not_lossless: number }).not_lossless).toBeGreaterThanOrEqual(
+            expect(failure?.facts.dropped_by_filter).toMatchObject({ not_lossless: expect.any(Number) });
+            expect((failure?.facts.dropped_by_filter as { not_lossless: number }).not_lossless).toBeGreaterThanOrEqual(
               1,
             );
-            expect(job.failure?.facts.query_text_sent).toEqual(expect.stringMatching(/\S/));
+            expect(failure?.facts.query_text_sent).toEqual(expect.stringMatching(/\S/));
           }
         }
         const step = nextStep(followerView(job));
