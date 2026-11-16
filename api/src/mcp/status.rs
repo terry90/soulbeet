@@ -21,6 +21,7 @@ use super::contract::{failed, success, ToolError};
 use super::McpCaller;
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
+use crate::core::library::{library_roots_in, listing, navidrome_failure};
 use crate::core::{folders, health::system_health, settings};
 use crate::models::folder::Folder;
 use crate::oauth::metadata::mcp_url;
@@ -55,6 +56,9 @@ pub(crate) struct StatusFacts {
     /// None when the user has no Navidrome client (`health.navidrome_failure` says why).
     pub navidrome: Option<NavidromeFacts>,
     pub folders: Vec<FolderFacts>,
+    /// Where Navidrome's libraries are on this machine, as far as Soulful
+    /// knows (library_roots_in).
+    pub library_roots: Vec<PathBuf>,
     pub default_folder_id: Option<String>,
     pub running_batches: Vec<RunningBatch>,
 }
@@ -70,19 +74,21 @@ pub(crate) struct LiveStatus;
 
 #[async_trait]
 impl StatusSource for LiveStatus {
-    /// Reads every fact at once; fails only when the folders or settings
-    /// cannot be read.
+    /// Reads every fact at once; fails only when the folders, the library
+    /// roots or the settings cannot be read.
     async fn gather(&self, ctx: &UserCtx) -> Result<StatusFacts, Failure> {
-        let (health, navidrome, folders, settings) = tokio::join!(
+        let (health, navidrome, folders, library_roots, settings) = tokio::join!(
             system_health(ctx),
             navidrome_facts(ctx),
             async { Ok::<_, Failure>(with_free_space(folders::list(ctx).await?).await) },
+            library_roots_in(&crate::db::DB, crate::config::CONFIG.navidrome_music_path()),
             settings::get(ctx),
         );
         Ok(StatusFacts {
             health,
             navidrome,
             folders: folders?,
+            library_roots: library_roots?,
             default_folder_id: chosen_folder(settings?.default_download_folder_id),
             running_batches: TransferRegistry::global().running_batches(&ctx.id()),
         })
@@ -98,7 +104,7 @@ pub(crate) fn chosen_folder(id: Option<String>) -> Option<String> {
 async fn navidrome_facts(ctx: &UserCtx) -> Option<NavidromeFacts> {
     let client = navidrome_client_for_user(&ctx.user_id).await.ok()?;
     let (user, scan) = tokio::join!(client.get_own_user(), client.get_scan_status());
-    let failure = |e: soulbeet::NavidromeError| e.failure(Stage::LibraryCheck, e.to_string());
+    let failure = |e: soulbeet::NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
     Some(NavidromeFacts {
         admin: user.map(|u| u.admin_role).map_err(failure),
         scan: scan.map_err(failure),
@@ -248,7 +254,12 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
     let folders: Vec<Value> = facts
         .folders
         .iter()
-        .map(|f| folder_fields(f, default))
+        .map(|f| {
+            let mut fields = folder_fields(f, default);
+            let listed = listing(Path::new(&f.folder.path), &facts.library_roots);
+            fields["in_navidrome"] = json!(listed);
+            fields
+        })
         .collect();
     let running_batches: Vec<Value> = facts
         .running_batches
@@ -351,7 +362,7 @@ mod tests {
                                        "last_scan": "2026-11-14T21:03:11.519322+00:00", "error": null},
                               "scan_failure": null},
                 "folders": [{"folder_id": "f1", "name": "Music", "path": "/music/alice", "shared": false, "default": true, "free_bytes": 1000,
-                             "free_space_failure": null}],
+                             "free_space_failure": null, "in_navidrome": "listed"}],
                 "default_folder_id": "f1",
                 "running_batches": [{"batch_id": "b1", "label": "Come Over", "transfers": 2}],
                 "deletion_enabled": false
@@ -418,6 +429,19 @@ mod tests {
         ] {
             assert_eq!(doc["navidrome"][key], Value::Null, "{key}");
         }
+    }
+
+    #[test]
+    fn a_folder_no_known_library_root_holds_is_unknown_in_navidrome() {
+        let mut facts = sample_facts();
+        let in_navidrome = |facts: &StatusFacts| {
+            status_fields(facts, &alice_caller(false))["folders"][0]["in_navidrome"].clone()
+        };
+        assert_eq!(in_navidrome(&facts), "listed");
+        facts.library_roots = vec![PathBuf::from("/music/bob")];
+        assert_eq!(in_navidrome(&facts), "unknown");
+        facts.library_roots.clear();
+        assert_eq!(in_navidrome(&facts), "unknown");
     }
 
     #[test]

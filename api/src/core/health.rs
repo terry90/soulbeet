@@ -1,6 +1,7 @@
 //! What the user's backends report about their health.
 
 use crate::auth::UserCtx;
+use crate::core::library::navidrome_failure;
 use crate::services::{download_backend, evict_navidrome_client, navidrome_client_for_user};
 use dioxus::logger::tracing::debug;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
@@ -74,7 +75,7 @@ async fn navidrome_health(ctx: &UserCtx) -> Option<Failure> {
                     );
                     evict_navidrome_client(&ctx.user_id).await;
                 }
-                Some(e.failure(Stage::LibraryCheck, e.to_string()))
+                Some(navidrome_failure(Stage::LibraryCheck, &e))
             }
         },
         Err(e) => Some(e.failure(Stage::LibraryCheck, e.to_string())),

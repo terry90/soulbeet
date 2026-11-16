@@ -22,6 +22,7 @@ use super::log::RequestLog;
 use super::{router, ConnectionState};
 use crate::auth::{Role, UserCtx};
 use crate::base_url::BaseUrl;
+use crate::core::index::NavidromeOf;
 use crate::db::test_db;
 use crate::mcp::status::{FolderFacts, NavidromeFacts, StatusFacts, StatusSource};
 use crate::mcp::McpCaller;
@@ -36,11 +37,14 @@ use crate::oauth::limits::Limits;
 use crate::oauth::now_unix;
 use crate::oauth::secrets::new_secret;
 use crate::secret_key::SecretKey;
+use crate::services::NavidromeLookupError;
+use crate::test_navidrome::NavidromeFor;
 use crate::transfer_registry::RunningBatch;
 
 impl ConnectionState {
     /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits,
-    /// `test_key()`, no client metadata documents, and `sample_facts()`.
+    /// `test_key()`, no client metadata documents, `sample_facts()`, and no
+    /// user linked to Navidrome.
     pub(crate) fn for_test(db: SqlitePool) -> ConnectionState {
         ConnectionState {
             mcp_off: None,
@@ -51,6 +55,7 @@ impl ConnectionState {
             key: test_key(),
             documents: FixedDocuments::new(vec![]),
             status: Arc::new(FixedStatus(Ok(sample_facts()))),
+            navidrome: Arc::new(NavidromeFor(Err(|| NavidromeLookupError::NotLinked))),
             log: Arc::new(RequestLog::default()),
         }
     }
@@ -396,10 +401,24 @@ pub(crate) async fn access_token(db: &SqlitePool, user_id: &str, resource: &str)
 
 /// A router on a database where u1 (alice) exists, and u1's access token for music.example.com.
 pub(crate) async fn mcp_app() -> (SqlitePool, Router, String) {
-    let db = test_db::migrated().await;
+    alice_app(ConnectionState::for_test(test_db::migrated().await)).await
+}
+
+/// `mcp_app` with tools getting the caller's Navidrome from `navidrome`.
+pub(crate) async fn mcp_app_with(navidrome: Arc<dyn NavidromeOf>) -> (SqlitePool, Router, String) {
+    alice_app(ConnectionState {
+        navidrome,
+        ..ConnectionState::for_test(test_db::migrated().await)
+    })
+    .await
+}
+
+/// A router on `state`, whose database gains u1 (alice), and u1's access token for music.example.com.
+async fn alice_app(state: ConnectionState) -> (SqlitePool, Router, String) {
+    let db = state.db.clone();
     add_user(&db, "u1", "alice").await;
     let token = access_token(&db, "u1", RESOURCE).await;
-    (db.clone(), router(ConnectionState::for_test(db)), token)
+    (db, router(state), token)
 }
 
 /// A `POST` of the JSON-RPC message `body` to `/mcp` with `headers`. The
@@ -489,8 +508,8 @@ impl StatusSource for FixedStatus {
 }
 
 /// A status where everything answers: slskd online, beets degraded by Soulful's
-/// own probe issue, alice not a Navidrome admin, one default folder, one
-/// running batch.
+/// own probe issue, alice not a Navidrome admin, one default folder inside the
+/// one known library root, one running batch.
 pub(crate) fn sample_facts() -> StatusFacts {
     StatusFacts {
         health: SystemHealth {
@@ -531,6 +550,7 @@ pub(crate) fn sample_facts() -> StatusFacts {
             },
             free: Ok(1000),
         }],
+        library_roots: vec!["/music".into()],
         default_folder_id: Some("f1".into()),
         running_batches: vec![RunningBatch {
             batch_id: "b1".into(),

@@ -16,7 +16,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
-use super::{settings, status, McpCaller};
+use super::{library, settings, status, McpCaller};
 use crate::connection::ConnectionState;
 
 /// What the server tells a client at `initialize`.
@@ -48,6 +48,9 @@ pub(crate) struct ToolSpec {
 /// descriptions.
 pub(crate) const COMMON_CODES: &str = "invalid_input, rate_limited, settings_unreadable";
 
+/// The failure codes of every tool that reads the caller's Navidrome.
+pub(crate) const NAVIDROME_CODES: &str = "navidrome_not_linked, navidrome_auth_failed, navidrome_unreachable, navidrome_circuit_open, navidrome_refused";
+
 /// Every tool, in the fixed order `tools/list` answers (MCP 2026-07-28
 /// `server/tools.mdx`, "deterministic order").
 pub(crate) const TOOLS: &[ToolSpec] = &[
@@ -55,7 +58,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         name: "get_status",
         title: "Soulful status",
         description: |calls_a_minute| {
-            format!("Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work, and why not when they do not, with the importer issues that stand; the user's Navidrome link (connected, admin or not, whether this account can start a scan, and the scan status: songs is the library's song count while no scan runs, files_scanned the files read so far while one does); the user's folders with free space and which one is the default; the batches downloading now; whether this app may delete music; and the address Soulful is reached at. A folder_id holds until the folder is removed; a batch_id while its batch runs. Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.")
+            format!("Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work, and why not when they do not, with the importer issues that stand; the user's Navidrome link (connected, admin or not, whether this account can start a scan, and the scan status: songs is the library's song count while no scan runs, files_scanned the files read so far while one does); the user's folders with free space, which one is the default, and in_navidrome (listed when a Navidrome library Soulful has located on this machine holds the folder, so imports into it show up in Navidrome; unknown when Soulful has not located one that does); the batches downloading now; whether this app may delete music; and the address Soulful is reached at. A folder_id holds until the folder is removed; a batch_id while its batch runs. Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.")
         },
         // The schema for a tool without arguments (`server/tools.mdx`, "Tool").
         input_schema: r#"{"type": "object", "additionalProperties": false}"#,
@@ -90,6 +93,19 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         idempotent: true,
         open_world: false,
         call: |state, caller, args| Box::pin(settings::list_folders(state, caller, args)),
+    },
+    ToolSpec {
+        name: "get_library_stats",
+        title: "Library statistics",
+        description: |_| {
+            format!("Counts the tracks, albums and artists in the user's Navidrome library, how many tracks the user rated and how (average and per star), and the 20 most common genres. Takes no arguments. Reads the whole library, so it can take several seconds on a large one. Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}.")
+        },
+        input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(library::get_library_stats(state, caller, args)),
     },
 ];
 
@@ -272,7 +288,7 @@ mod tests {
     /// before an unknown name.
     fn valid_args(tool: &str) -> Value {
         match tool {
-            "get_status" | "get_settings" | "list_folders" => json!({}),
+            "get_status" | "get_settings" | "list_folders" | "get_library_stats" => json!({}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }

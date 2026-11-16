@@ -319,7 +319,8 @@ pub(crate) trait NavidromeOf: Send + Sync {
     ) -> Result<Arc<NavidromeClient>, NavidromeLookupError>;
 }
 
-struct ServerNavidrome;
+/// The server's Navidrome per user: the cached client navidrome_client_for_user builds.
+pub(crate) struct ServerNavidrome;
 
 #[async_trait]
 impl NavidromeOf for ServerNavidrome {
@@ -721,18 +722,16 @@ mod tests {
     use crate::models::navidrome_library::NavidromeLibraryRow;
     use crate::server_fns::download::test_support::item;
     use crate::services::NavidromeLookupError;
-    use crate::test_navidrome::NavidromeStub;
-    use async_trait::async_trait;
+    use crate::test_navidrome::{NavidromeFor, NavidromeStub};
     use shared::download::{
         DownloadEvent, DownloadProgress, DownloadQuery, DownloadState, IndexState, JobSlot,
     };
     use shared::failure::{FailureCode, Stage, UserActionCode};
     use soulbeet::navidrome::models::NativeSong;
-    use soulbeet::navidrome::{NavidromeClient, ScanStatus};
+    use soulbeet::navidrome::ScanStatus;
     use soulbeet::{ImportMode, ImportedItem};
     use sqlx::SqlitePool;
     use std::path::Path;
-    use std::sync::Arc;
     use tokio::sync::broadcast;
 
     fn at(text: &str) -> chrono::DateTime<chrono::Utc> {
@@ -1139,18 +1138,6 @@ mod tests {
 
     const IDLE: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"scanStatus":{"scanning":false,"count":1342,"folderCount":120,"lastScan":"2026-11-15T10:02:00Z","scanType":"quick","elapsedTime":4000000000}}}"#;
 
-    struct Navidrome(Result<Arc<NavidromeClient>, fn() -> NavidromeLookupError>);
-
-    #[async_trait]
-    impl NavidromeOf for Navidrome {
-        async fn navidrome_of(
-            &self,
-            _: &UserId,
-        ) -> Result<Arc<NavidromeClient>, NavidromeLookupError> {
-            self.0.clone().map_err(|e| e())
-        }
-    }
-
     /// A user of its own (the user channels are process-wide) with job j1 whose slot 0 is
     /// imported and waiting as `wait`, its row as finish() sends it.
     async fn indexing(
@@ -1233,7 +1220,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut IndexRunner::default(),
             1_005,
         )
@@ -1260,7 +1247,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut IndexRunner::default(),
             1_005,
         )
@@ -1287,7 +1274,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut IndexRunner::default(),
             1_005,
         )
@@ -1329,7 +1316,7 @@ mod tests {
             index_round(
                 &db,
                 &ledger,
-                &Navidrome(Ok(navi.client())),
+                &NavidromeFor(Ok(navi.client())),
                 &mut runner,
                 now,
             )
@@ -1359,7 +1346,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut runner,
             1_005,
         )
@@ -1375,7 +1362,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut runner,
             1_010,
         )
@@ -1386,7 +1373,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut runner,
             1_005 + INDEX_GIVE_UP_SECS,
         )
@@ -1407,7 +1394,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Err(|| NavidromeLookupError::NotLinked)),
+            &NavidromeFor(Err(|| NavidromeLookupError::NotLinked)),
             &mut IndexRunner::default(),
             1_005,
         )
@@ -1429,7 +1416,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut runner,
             1_005,
         )
@@ -1439,7 +1426,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut runner,
             1_005 + INDEX_GIVE_UP_SECS,
         )
@@ -1526,7 +1513,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut IndexRunner::default(),
             1_005,
         )
@@ -1575,7 +1562,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut IndexRunner::default(),
             1_005,
         )
@@ -1613,7 +1600,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut IndexRunner::default(),
             1_005,
         )
@@ -1650,7 +1637,7 @@ mod tests {
             index_round(
                 &db,
                 &ledger,
-                &Navidrome(Ok(navi.client())),
+                &NavidromeFor(Ok(navi.client())),
                 &mut runner,
                 now,
             )
@@ -1665,7 +1652,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut runner,
             50_000 + INDEX_GIVE_UP_SECS,
         )
@@ -1712,7 +1699,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Ok(navi.client())),
+            &NavidromeFor(Ok(navi.client())),
             &mut IndexRunner::default(),
             1_005,
         )
@@ -1738,7 +1725,7 @@ mod tests {
         index_round(
             &db,
             &ledger,
-            &Navidrome(Err(|| NavidromeLookupError::NotLinked)),
+            &NavidromeFor(Err(|| NavidromeLookupError::NotLinked)),
             &mut IndexRunner::default(),
             1_005,
         )

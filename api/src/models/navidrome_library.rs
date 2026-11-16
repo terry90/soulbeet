@@ -22,6 +22,17 @@ impl NavidromeLibraryRow {
         .map_err(|e| e.to_string())
     }
 
+    /// Every library whose place on this machine is known, by library id.
+    pub(crate) async fn all_in(db: &SqlitePool) -> Result<Vec<Self>, String> {
+        sqlx::query_as::<_, Self>(
+            "SELECT library_id, navidrome_path, local_path FROM navidrome_libraries \
+             ORDER BY library_id",
+        )
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())
+    }
+
     /// Stores `row`, replacing what was known of its library.
     pub(crate) async fn upsert_in(db: &SqlitePool, row: &Self) -> Result<(), String> {
         sqlx::query(

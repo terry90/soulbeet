@@ -19,6 +19,10 @@ use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin, Verdict};
 #[cfg(feature = "server")]
 use crate::core::folders::folder_not_found;
 #[cfg(feature = "server")]
+use crate::core::index::ServerNavidrome;
+#[cfg(feature = "server")]
+use crate::core::library;
+#[cfg(feature = "server")]
 use crate::core::{database_failure, logged};
 #[cfg(feature = "server")]
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
@@ -396,61 +400,10 @@ pub async fn check_report_real_path(user_id: &str) -> Result<Option<bool>, Strin
 
 #[get("/api/navidrome/library-stats", auth: AuthSession)]
 pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
-    let client = navidrome_client_for_user(&auth.0.user_id)
+    let client = library::navidrome_for(&ServerNavidrome, &auth.0, Stage::LibraryCheck)
         .await
-        .map_err(server_error)?;
-    let songs = client
-        .get_all_songs_with_ratings()
-        .await
-        .map_err(server_error)?;
-
-    let albums = client.get_all_albums().await.map_err(server_error)?;
-
-    let total_tracks = songs.len() as u32;
-    let mut rated_tracks = 0u32;
-    let mut rating_sum = 0.0f64;
-    let mut rating_distribution = [0u32; 5];
-    let mut genres: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut artists: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for song in &songs {
-        if let Some(artist) = &song.artist {
-            artists.insert(artist.to_lowercase());
-        }
-        if let Some(genre) = &song.genre {
-            if !genre.is_empty() {
-                *genres.entry(genre.clone()).or_default() += 1;
-            }
-        }
-        if let Some(rating) = song.user_rating {
-            if (1..=5).contains(&rating) {
-                rated_tracks += 1;
-                rating_sum += rating as f64;
-                rating_distribution[(rating - 1) as usize] += 1;
-            }
-        }
-    }
-
-    let average_rating = if rated_tracks > 0 {
-        rating_sum / rated_tracks as f64
-    } else {
-        0.0
-    };
-
-    let mut genre_vec: Vec<(String, u32)> = genres.into_iter().collect();
-    genre_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
-    genre_vec.truncate(20);
-
-    Ok(LibraryStats {
-        total_tracks,
-        rated_tracks,
-        unrated_tracks: total_tracks - rated_tracks,
-        average_rating,
-        rating_distribution,
-        total_albums: albums.len() as u32,
-        total_artists: artists.len() as u32,
-        genres: genre_vec,
-    })
+        .map_err(failure_error)?;
+    library::stats(&client).await.map_err(failure_error)
 }
 
 /// Promotes in its own task, so the status and history updates always follow

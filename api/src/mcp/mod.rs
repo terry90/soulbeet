@@ -20,6 +20,7 @@ use crate::oauth::{now_unix, oauth_error, SCOPE};
 
 mod args;
 pub(crate) mod contract;
+pub(crate) mod library;
 mod paging;
 pub(crate) mod server;
 pub(crate) mod settings;

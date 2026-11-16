@@ -17,6 +17,7 @@ use serde_json::{json, Map};
 use crate::base_url::{explain_request, BaseExplanation, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
 use crate::connections::LoggedRequest;
+use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::mcp::status::{LiveStatus, StatusSource};
 use crate::oauth::cimd::{CimdFetcher, ClientDocuments, UnbuiltFetcher};
 use crate::oauth::limits::Limits;
@@ -43,6 +44,8 @@ pub struct ConnectionState {
     pub(crate) documents: Arc<dyn ClientDocuments>,
     /// Where `get_status` reads its facts.
     pub(crate) status: Arc<dyn StatusSource>,
+    /// Where the tools get the caller's Navidrome client.
+    pub(crate) navidrome: Arc<dyn NavidromeOf>,
     /// Where the guard records each request.
     pub(crate) log: Arc<RequestLog>,
 }
@@ -65,6 +68,7 @@ impl ConnectionState {
                 }
             },
             status: Arc::new(LiveStatus),
+            navidrome: Arc::new(ServerNavidrome),
             log: LIVE_LOG.clone(),
         }
     }
