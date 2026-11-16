@@ -17,9 +17,10 @@ use crate::auth::{UserCtx, UserId};
 use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
 use crate::core::delete_guard::{paths, song_not_found};
 use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin, Verdict};
-use crate::core::discovery::{promote, track_not_pending, DiscoveryEffects, Replace};
+use crate::core::discovery::{is_not_pending, promote, DiscoveryEffects, Replace};
 use crate::core::folders::folder_not_found;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
+use crate::core::jobs::retry::enable_deletion;
 use crate::core::library::{album_not_found, navidrome_failure, navidrome_for};
 use crate::core::{database_failure, logged};
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
@@ -105,6 +106,14 @@ pub(crate) struct Annotated {
 pub(crate) enum NotSet {
     /// Refused or failed before the write request was sent: nothing changed.
     Refused(Failure),
+    /// Refused before the write request was sent for what the next rating sync would do with the
+    /// song at that rating: delete its file, or promote the pending discovery track
+    /// `discovery_track_id`, which can replace an earlier library copy. Nothing changed.
+    WouldDelete {
+        effect: SyncEffect,
+        discovery_track_id: Option<String>,
+        failure: Failure,
+    },
     /// The write request was sent and failed, so the change may have been made.
     WriteFailed(Failure),
 }
@@ -113,6 +122,7 @@ impl NotSet {
     pub(crate) fn failure(&self) -> &Failure {
         match self {
             NotSet::Refused(f) | NotSet::WriteFailed(f) => f,
+            NotSet::WouldDelete { failure, .. } => failure,
         }
     }
 
@@ -137,23 +147,37 @@ fn one_star_refused() -> Failure {
     ))
 }
 
+/// A rating from an app that may not delete that would have the next rating sync promote a
+/// pending discovery track: the 6 hourly sync promotes with the guard, which replaces an earlier
+/// library copy of the song, deleting it.
+fn promote_refused() -> Failure {
+    Failure::new(
+        FailureCode::PermissionNotGranted,
+        Stage::Input,
+        RetryAdvice::NeedsUser,
+        "This app may not delete music, and at this rating the next rating sync would move this pending discovery track into your library, replacing and deleting any earlier copy of the song there. Promote it with promote_discovery_track, which never replaces a library copy for this app, or allow this app to delete music.",
+    )
+    .with_user_action(enable_deletion())
+}
+
 /// Sets `user`'s rating of `target` to `rating` (0 clears it) for a connected app, after
 /// reading the target as Navidrome lists it for `navi`'s account (a song or album it lists for
 /// no one, or in a library this account cannot see, is not found). For a song, `effect` says
-/// what the next rating sync does with it; a 1-star song rating is refused while the user's
-/// auto-delete is on, or when that setting cannot be read, before anything is written.
+/// what the next rating sync does with it. Refused before anything is written, as WouldDelete:
+/// a 1-star song rating while the user's auto-delete is on, and a rating that would have the
+/// sync promote a pending discovery track when `app_may_delete` is false; also refused when the
+/// settings cannot be read.
 pub(crate) async fn rate(
     db: &SqlitePool,
     navi: &NavidromeClient,
     user: &UserId,
     target: &Target,
     rating: u8,
+    app_may_delete: bool,
 ) -> Result<Annotated, NotSet> {
     let (mut annotated, song) = read(navi, target).await.map_err(NotSet::Refused)?;
     if let Some(song) = song {
-        annotated.effect = sync_effect(db, user, song, rating)
-            .await
-            .map_err(NotSet::Refused)?;
+        annotated.effect = sync_effect(db, user, song, rating, app_may_delete).await?;
     }
     navi.set_rating(target.id(), rating)
         .await
@@ -222,19 +246,25 @@ fn rated(rating: Option<u8>) -> Option<u8> {
 
 /// What the next rating sync does with `song` rated `rating`, as the sync decides it: the
 /// pending discovery track of the user's discovery folder it is promoted or removed, else
-/// nothing. A 1-star rating while auto-delete is on is refused.
+/// nothing. A 1-star rating while auto-delete is on is refused, and so is a promote when
+/// `app_may_delete` is false.
 async fn sync_effect(
     db: &SqlitePool,
     user: &UserId,
     song: SubsonicSong,
     rating: u8,
-) -> Result<Option<SyncEffect>, Failure> {
-    let unreadable = |e: String| database_failure(Stage::Input, e);
+    app_may_delete: bool,
+) -> Result<Option<SyncEffect>, NotSet> {
+    let unreadable = |e: String| NotSet::Refused(database_failure(Stage::Input, e));
     let settings = UserSettings::get_in(db, &user.to_string())
         .await
         .map_err(unreadable)?;
     if rating == 1 && settings.auto_delete_enabled {
-        return Err(one_star_refused());
+        return Err(NotSet::WouldDelete {
+            effect: SyncEffect::DeletesFile,
+            discovery_track_id: None,
+            failure: one_star_refused(),
+        });
     }
     let pending = match &settings.discovery_folder_id {
         Some(folder) => DiscoveryTrackRow::get_pending_by_folder_in(db, folder)
@@ -247,13 +277,16 @@ async fn sync_effect(
         user_rating: (rating > 0).then_some(rating),
         ..song
     };
-    Ok(
-        match pending_action(&rated, &pending, settings.discovery_promote_threshold) {
-            Some(PendingAction::Promote(_)) => Some(SyncEffect::PromotesDiscoveryTrack),
-            Some(PendingAction::Remove(_)) => Some(SyncEffect::RemovesDiscoveryTrack),
-            None => None,
-        },
-    )
+    match pending_action(&rated, &pending, settings.discovery_promote_threshold) {
+        Some(PendingAction::Promote(track)) if !app_may_delete => Err(NotSet::WouldDelete {
+            effect: SyncEffect::PromotesDiscoveryTrack,
+            discovery_track_id: Some(track.id.clone()),
+            failure: promote_refused(),
+        }),
+        Some(PendingAction::Promote(_)) => Ok(Some(SyncEffect::PromotesDiscoveryTrack)),
+        Some(PendingAction::Remove(_)) => Ok(Some(SyncEffect::RemovesDiscoveryTrack)),
+        None => Ok(None),
+    }
 }
 
 /// A failed write of `target`: Navidrome's "data not found" (Subsonic 70) is the target gone.
@@ -341,8 +374,13 @@ impl SyncedTrack {
         }
     }
 
-    fn failed(self, failure: Option<Failure>) -> Self {
+    fn with_failure(self, failure: Option<Failure>) -> Self {
         SyncedTrack { failure, ..self }
+    }
+
+    /// Another promote or removal took the track first: the sync skips it.
+    fn not_pending(&self) -> bool {
+        self.failure.as_ref().is_some_and(is_not_pending)
     }
 }
 
@@ -368,6 +406,8 @@ pub(crate) struct SyncReport {
     pub scanned: u32,
     pub auto_delete: AutoDeleteRan,
     pub tracks: Vec<SyncedTrack>,
+    /// Pending discovery tracks skipped because another promote or removal took them first.
+    pub not_pending: u32,
     /// The entries of auto_delete_songs that carry a failure (D12).
     pub kept: u32,
     /// Why Settings does not list the kept tracks: replace_in failed, so it still lists the
@@ -448,7 +488,8 @@ pub(crate) struct SyncDeps<'a> {
 /// it on and `permit` allows it, storing the tracks it kept. An app that may not delete promotes
 /// with `Replace::Never`, so no library copy is replaced either. Every failure comes before any
 /// action; a failure of an action is its track's entry, and a failure to store the kept tracks
-/// is `kept_not_stored`. Entries in that order.
+/// is `kept_not_stored`. Entries in that order. A pending track another promote or removal took
+/// first is no entry: it is counted in `not_pending`.
 pub(crate) async fn sync_in(
     deps: &SyncDeps<'_>,
     ctx: &UserCtx,
@@ -477,13 +518,20 @@ pub(crate) async fn sync_in(
     for song in &songs {
         if let Some(PendingAction::Promote(track)) = pending_action(song, &pending, threshold) {
             let result = promote(deps.db, deps.discovery, &user, &track.id, replace).await;
-            if let Err(e) = &result {
-                warn!("Failed to promote track {}: {}", track.title, e.message);
+            match &result {
+                Err(e) if is_not_pending(e) => {
+                    info!("Skipped promoting track {}: {}", track.title, e.message)
+                }
+                Err(e) => warn!("Failed to promote track {}: {}", track.title, e.message),
+                Ok(_) => {}
             }
             let entry = SyncedTrack::of(song, SyncAction::Promote, Some(track));
-            tracks.push(entry.failed(result.err()));
+            tracks.push(entry.with_failure(result.err()));
         }
     }
+    let listed = tracks.len();
+    tracks.retain(|t| !t.not_pending());
+    let mut not_pending = (listed - tracks.len()) as u32;
 
     let auto_delete = match (settings.auto_delete_enabled, permit) {
         (false, _) => AutoDeleteRan::Off,
@@ -495,11 +543,15 @@ pub(crate) async fn sync_in(
         AutoDeleteRan::Off => info!("Auto-delete is disabled for this user"),
         AutoDeleteRan::NotAllowed => info!("Auto-delete is skipped: this app may not delete"),
         AutoDeleteRan::On => {
-            let run = auto_delete_songs(deps.guard, &user, &songs, &pending, deps.queue).await;
+            let mut run = auto_delete_songs(deps.guard, &user, &songs, &pending, deps.queue).await;
+            let listed = run.len();
+            run.retain(|t| !t.not_pending());
+            not_pending += (listed - run.len()) as u32;
             let kept_tracks = kept_of(&run);
             if let Err(e) = DeletionBlockRow::replace_in(deps.db, &ctx.user_id, &kept_tracks).await
             {
-                warn!("Could not store the tracks auto-delete kept: {e}");
+                let name = &ctx.username;
+                warn!("Could not store the tracks auto-delete kept for {name}: {e}");
                 kept_not_stored = Some(database_failure(Stage::Delete, e));
             }
             kept = kept_tracks.len() as u32;
@@ -510,6 +562,7 @@ pub(crate) async fn sync_in(
         scanned: songs.len() as u32,
         auto_delete,
         tracks,
+        not_pending,
         kept,
         kept_not_stored,
     };
@@ -567,7 +620,8 @@ pub(crate) async fn sync(ctx: &UserCtx, permit: AutoDeletePermit) -> Result<Sync
 
 /// Discovery's own cleanup (D12): removes the pending track of each song of `songs` that
 /// pending_action removes, through remove_staged_in with its folder, with no Navidrome call.
-/// An entry for each removal, done or failed; a track no longer pending is skipped.
+/// An entry for each removal, done or failed; one of a track no longer pending carries
+/// track_not_pending, which sync_in counts as skipped.
 pub(crate) async fn remove_disliked_pending_in(
     db: &SqlitePool,
     songs: &[SubsonicSong],
@@ -585,17 +639,15 @@ pub(crate) async fn remove_disliked_pending_in(
             Ok(None) => Err(folder_not_found()),
             Err(e) => Err(database_failure(Stage::Delete, e)),
         };
-        let entry = SyncedTrack::of(song, SyncAction::RemoveFromDiscovery, Some(track));
-        match result {
-            Ok(()) => removed.push(entry),
-            Err(f) if f == track_not_pending() => {
+        match &result {
+            Err(f) if is_not_pending(f) => {
                 info!("Skipped removing track {}: {}", track.title, f.message)
             }
-            Err(f) => {
-                warn!("Failed to remove track {}: {}", track.title, logged(&f));
-                removed.push(entry.failed(Some(f)));
-            }
+            Err(f) => warn!("Failed to remove track {}: {}", track.title, logged(f)),
+            Ok(()) => {}
         }
+        let entry = SyncedTrack::of(song, SyncAction::RemoveFromDiscovery, Some(track));
+        removed.push(entry.with_failure(result.err()));
     }
     removed
 }
@@ -606,7 +658,8 @@ pub(crate) async fn remove_disliked_pending_in(
 /// star is removed; one rated otherwise since `songs` was listed is skipped, also when the
 /// guard refuses it. A song whose file an earlier deletion of `actor` removed, which Navidrome
 /// lists until it notices, is skipped. Every other song is an entry, with the failure that kept
-/// it when one did.
+/// it when one did; a discovery track no longer pending carries track_not_pending, which
+/// sync_in counts as skipped.
 pub(crate) async fn auto_delete_songs(
     guard: &Guard<'_>,
     actor: &UserId,
@@ -641,7 +694,7 @@ pub(crate) async fn auto_delete_songs(
                 let done = guard
                     .carry_out(actor, checked, reason, Origin::Auto, forget)
                     .await;
-                Some(delete.failed(done.err().map(NotRemoved::into_failure)))
+                Some(delete.with_failure(done.err().map(NotRemoved::into_failure)))
             }
             Ok(Verdict::Library(_)) => {
                 skipped("no longer rated 1");
@@ -656,20 +709,17 @@ pub(crate) async fn auto_delete_songs(
                     Ok(None) => Err(folder_not_found()),
                     Err(e) => Err(database_failure(Stage::Delete, e)),
                 };
-                match result {
-                    Err(f) if f == track_not_pending() => {
-                        skipped("no longer pending in discovery");
-                        None
-                    }
-                    result => Some(remove.failed(result.err())),
+                if result.as_ref().is_err_and(is_not_pending) {
+                    skipped("no longer pending in discovery");
                 }
+                Some(remove.with_failure(result.err()))
             }
             Ok(Verdict::Discovery { .. }) => {
                 skipped("no longer rated 1");
                 None
             }
             Err(f) => match still_rated_one(guard, actor, &song.id).await {
-                true => Some(delete.failed(Some(f))),
+                true => Some(delete.with_failure(Some(f))),
                 false => {
                     skipped("no longer rated 1");
                     None
@@ -770,7 +820,7 @@ mod tests {
             &[&song_body(HOLY.0, HOLY.1, Some(4), false)],
         );
         let (alice, holy) = (lib.alice(), Target::Song(HOLY.0.into()));
-        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1)
+        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1, true)
             .await
             .unwrap();
         assert_eq!(
@@ -798,7 +848,7 @@ mod tests {
             },
         )
         .await;
-        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1).await;
+        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1, false).await;
         assert_eq!(a.unwrap().effect, Some(SyncEffect::RemovesDiscoveryTrack));
         let sent = format!("id={}&rating=1", HOLY.0);
         assert_eq!(navi.posted("/rest/setRating"), [sent.clone(), sent.clone()]);
@@ -806,12 +856,16 @@ mod tests {
         // On: refused, pending track or not (it could be promoted first, then deleted).
         set(&lib.db, auto_delete(true)).await;
         assert_eq!(
-            rate(&lib.db, &navi.client(), &alice, &holy, 1).await,
-            Err(NotSet::Refused(one_star_refused()))
+            rate(&lib.db, &navi.client(), &alice, &holy, 1, true).await,
+            Err(NotSet::WouldDelete {
+                effect: SyncEffect::DeletesFile,
+                discovery_track_id: None,
+                failure: one_star_refused()
+            })
         );
         // A setting that cannot be read refuses too.
         lib.db.close().await;
-        let e = rate(&lib.db, &navi.client(), &alice, &holy, 1)
+        let e = rate(&lib.db, &navi.client(), &alice, &holy, 1, true)
             .await
             .unwrap_err();
         assert_eq!(
@@ -842,17 +896,38 @@ mod tests {
         )
         .await;
         let holy = Target::Song(HOLY.0.into());
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 3)
+        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 3, true)
             .await
             .unwrap();
         assert_eq!(
             (a.previous_rating, a.previously_starred, a.effect),
             (None, true, Some(SyncEffect::PromotesDiscoveryTrack))
         );
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 2)
+        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 2, false)
             .await
             .unwrap();
         assert_eq!(a.effect, None);
+        // From an app that may not delete: the 6 hourly sync would promote it with the guard,
+        // replacing an earlier library copy, so nothing is written.
+        assert_eq!(
+            rate(&lib.db, &navi.client(), &lib.alice(), &holy, 4, false).await,
+            Err(NotSet::WouldDelete {
+                effect: SyncEffect::PromotesDiscoveryTrack,
+                discovery_track_id: Some("t1".into()),
+                failure: promote_refused()
+            })
+        );
+        assert_eq!(navi.posted("/rest/setRating").len(), 2);
+        let f = promote_refused();
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.user_action.map(|a| a.code)),
+            (
+                FailureCode::PermissionNotGranted,
+                Stage::Input,
+                RetryAdvice::NeedsUser,
+                Some(UserActionCode::EnableDeletion)
+            )
+        );
     }
 
     #[tokio::test]
@@ -863,7 +938,7 @@ mod tests {
         let navi = NavidromeStub::start();
         navi.answer("/rest/getAlbum", &[&album_body(WINTER, "Winter Songs", 0)]);
         let winter = Target::Album(WINTER.into());
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &winter, 1)
+        let a = rate(&lib.db, &navi.client(), &lib.alice(), &winter, 1, false)
             .await
             .unwrap();
         assert_eq!(
@@ -920,7 +995,15 @@ mod tests {
         let db = test_db::migrated().await;
         let alice = UserId::new("alice");
         assert_eq!(
-            rate(&db, &navi.client(), &alice, &Target::Song("gone".into()), 5).await,
+            rate(
+                &db,
+                &navi.client(),
+                &alice,
+                &Target::Song("gone".into()),
+                5,
+                true
+            )
+            .await,
             Err(NotSet::Refused(song_not_found()))
         );
         assert_eq!(
@@ -942,7 +1025,7 @@ mod tests {
         let db = test_db::migrated().await;
         let holy = Target::Song(HOLY.0.into());
         assert_eq!(
-            rate(&db, &navi.client(), &UserId::new("alice"), &holy, 2).await,
+            rate(&db, &navi.client(), &UserId::new("alice"), &holy, 2, true).await,
             Err(NotSet::WriteFailed(song_not_found()))
         );
     }
@@ -1437,7 +1520,7 @@ mod tests {
             (AutoDeleteRan::NotAllowed, 0)
         );
         assert!(lib.root.join("music/alice/A/x.flac").exists());
-        assert_eq!(lib.fake.ratings_set(), vec![], "the guard never ran");
+        assert_eq!(lib.fake.reads_by("alice"), 0, "the guard never ran");
     }
 
     #[tokio::test]
@@ -1496,6 +1579,77 @@ mod tests {
                 (first, music.clone(), Replace::Never),
                 (second, music, Replace::Guarded(Origin::Auto))
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_track_another_action_took_first_is_skipped_and_counted() {
+        // Two songs whose files share each pending track's file name: the first promote and the
+        // first removal take the track, the second finds it no longer pending.
+        let lib = Library::new().await;
+        set(
+            &lib.db,
+            UpdateUserSettings {
+                discovery_folder_id: Some("alice-music".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        for (id, name) in [("t1", "03.flac"), ("t2", "04.flac")] {
+            let staged = lib.root.join("music/alice/Discovery/Explore").join(name);
+            std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+            std::fs::write(&staged, b"audio").unwrap();
+            lib.pending_track(id, "alice-music", "Explore", &staged, None)
+                .await;
+        }
+        let mut body: serde_json::Value = serde_json::from_str(&search3_body(&[
+            ("s5", "O Holy Night", 5),
+            ("s6", "O Holy Night", 5),
+            ("s7", "Silent Night", 1),
+            ("s8", "Silent Night", 1),
+        ]))
+        .unwrap();
+        let songs = body["subsonic-response"]["searchResult3"]["song"]
+            .as_array_mut()
+            .unwrap();
+        for (song, path) in songs.iter_mut().zip([
+            "Marrow Choir/Explore/03.flac",
+            "Marrow Choir/Winter/03.flac",
+            "Marrow Choir/Explore/04.flac",
+            "Marrow Choir/Winter/04.flac",
+        ]) {
+            song["path"] = serde_json::json!(path);
+        }
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/search3", &[&body.to_string()]);
+        let (of, guard, runs, discovery, queue) = (
+            NavidromeFor(Ok(navi.client())),
+            lib.guard(),
+            SyncRuns::default(),
+            effects(),
+            queue(),
+        );
+        let deps = deps(&lib, &of, &guard, &queue, &discovery, &runs);
+        let report = sync_in(&deps, &test_ctx("alice"), AutoDeletePermit::Allowed)
+            .await
+            .unwrap();
+        assert_eq!(
+            acts(&report.tracks),
+            vec![
+                ("s7", SyncAction::RemoveFromDiscovery, None),
+                ("s5", SyncAction::Promote, None)
+            ]
+        );
+        assert_eq!(report.not_pending, 2);
+        assert_eq!(
+            report.counts(),
+            SyncResult {
+                deleted_tracks: 0,
+                promoted_tracks: 1,
+                removed_tracks: 1,
+                total_songs_scanned: 4,
+                kept_tracks: 0
+            }
         );
     }
 

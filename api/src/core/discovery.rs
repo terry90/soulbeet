@@ -119,6 +119,12 @@ pub(crate) fn track_not_pending() -> Failure {
     )
 }
 
+/// Whether `f`, from a promote or a staging removal, is `track_not_pending`: the only
+/// expired_handle either gives.
+pub(crate) fn is_not_pending(f: &Failure) -> bool {
+    f.code == FailureCode::ExpiredHandle
+}
+
 pub(crate) fn promote_file_gone() -> Failure {
     Failure::new(
         FailureCode::ImportFilesGone,

@@ -19,13 +19,6 @@ use crate::core::delete_guard::Origin;
 use crate::core::discovery::{self, expires_at, lifetime_of, parse_profiles, Overview, Replace};
 use crate::models::user_settings::UserSettings;
 
-/// The profiles get_discovery lists, in this order.
-const PROFILES: [DiscoveryProfile; 3] = [
-    DiscoveryProfile::Conservative,
-    DiscoveryProfile::Balanced,
-    DiscoveryProfile::Adventurous,
-];
-
 /// The most pending tracks get_discovery lists: three profiles of at most 50 tracks.
 const PENDING_MAX: usize = 150;
 
@@ -72,7 +65,7 @@ pub(crate) const PROMOTE_DISCOVERY_TRACK: ToolSpec = ToolSpec {
     title: "Keep a discovery track",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Moves a pending discovery track into this user's library folder through beets, as rating it at the promote threshold would at the next rating sync. track_id comes from get_discovery. Takes seconds to a minute. Failure codes: {common}, unknown_handle, not_owner, expired_handle (no longer pending: promoted, removed or being promoted), import_files_gone (the staged file is gone; next offers its removal), the import_* codes, already_running.")
+        format!("Moves a pending discovery track into this user's library folder through beets, as rating it at the promote threshold would at the next rating sync, except that without deletion switched on for this app an earlier library copy of the song is never replaced: the promote then ends import_already_in_library, the track stays pending, and next offers removing the staged copy. track_id comes from get_discovery. Takes seconds to a minute. Failure codes: {common}, unknown_handle, not_owner, expired_handle (no longer pending: promoted, removed or being promoted), import_files_gone (the staged file is gone; next offers its removal), the import_* codes, already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["track_id"], "properties": {"track_id": {"type": "string", "minLength": 1, "maxLength": 500}, "#,
@@ -130,7 +123,7 @@ fn overview_fields(o: &Overview) -> Map<String, Value> {
     let s = &o.settings;
     let active = parse_profiles(&s.discovery_profiles);
     let lifetimes = s.parse_lifetime_days();
-    let profiles: Vec<Value> = PROFILES
+    let profiles: Vec<Value> = DiscoveryProfile::ALL
         .iter()
         .map(|profile| {
             let name = profile.to_string();

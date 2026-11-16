@@ -182,6 +182,12 @@ impl Args {
             .ok_or_else(refused)
     }
 
+    /// A required `true` or `false`.
+    pub(crate) fn bool(&self, name: &str) -> Result<bool, ToolError> {
+        self.opt_bool(name)?
+            .ok_or_else(|| self.refuse(name, "true or false"))
+    }
+
     /// `true` or `false`.
     pub(crate) fn opt_bool(&self, name: &str) -> Result<Option<bool>, ToolError> {
         let Some(value) = self.given(name) else {
@@ -291,7 +297,8 @@ impl Args {
         let Some(value) = self.given(name) else {
             return Ok(None);
         };
-        let refused = || self.refuse(name, &format!("a list of {}", choices.join(", ")));
+        let expected = format!("a list of one or more of {}, each once", choices.join(", "));
+        let refused = || self.refuse(name, &expected);
         let mut chosen: Vec<&'static str> = Vec::new();
         for item in value.as_array().ok_or_else(refused)? {
             let choice = item
@@ -593,6 +600,11 @@ pub(crate) mod tests {
         assert_eq!(
             a.opt_bool("kept").unwrap_err().failure.message,
             "find_sources: kept must be true or false"
+        );
+        assert!(a.bool("lossless_only").unwrap());
+        assert_eq!(
+            a.bool("missing").unwrap_err().failure.message,
+            "find_sources: missing must be true or false"
         );
         assert_eq!(
             a.opt_strings("job_ids", 2).unwrap(),

@@ -1295,14 +1295,9 @@ async fn discard_download(src: &std::path::Path, download_base: &std::path::Path
 pub async fn generate_recommendations_internal(user_id: &str) -> Result<u32, String> {
     use shared::recommendation::DiscoveryProfile;
 
-    let profiles = [
-        DiscoveryProfile::Conservative,
-        DiscoveryProfile::Balanced,
-        DiscoveryProfile::Adventurous,
-    ];
     let mut total = 0u32;
 
-    for profile in &profiles {
+    for profile in &DiscoveryProfile::ALL {
         match generate_recommendations_for_user(user_id, *profile).await {
             Ok(count) => total += count,
             Err(e) => {

@@ -43,7 +43,7 @@ pub(crate) const SYNC_RATINGS: ToolSpec = ToolSpec {
     title: "Run the rating sync",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Runs this user's rating sync now, as Soulful does every 6 hours: pending discovery tracks rated at or above the promote threshold move into the library, 1-star ones are deleted, and with auto-delete on and deletion switched on for this app, other 1-star songs' files are deleted unless the delete checks keep them (another listener rated or starred them, a download wants them, the file cannot be placed). Without the switch, auto-delete is skipped (auto_delete not_allowed_for_this_app) and the 6 hourly sync does it. Returns one entry per track acted on with what was done or the failure that stopped it; the top level is partial when any entry failed. A very long report keeps the first entries and counts the rest in entries_omitted; Settings lists every kept track, unless kept_not_stored holds the error that stopped storing them, when Settings still lists the previous sync's. Takes seconds to minutes with a large library. Failure codes: {common}, {NAVIDROME_CODES}, already_running (a sync for this user is running, or a call with this request_key still runs), partial, and per entry the delete_*, import_* and unknown_handle codes.")
+        format!("Runs this user's rating sync now, as Soulful does every 6 hours: pending discovery tracks rated at or above the promote threshold move into the library, 1-star ones are deleted, and with auto-delete on and deletion switched on for this app, other 1-star songs' files are deleted unless the delete checks keep them (another listener rated or starred them, a download wants them, the file cannot be placed). Without the switch, auto-delete is skipped (auto_delete not_allowed_for_this_app) and the 6 hourly sync does it, and a promote never replaces an earlier library copy of the song: it ends import_already_in_library and the track stays pending, as promote_discovery_track does. Returns one entry per track acted on with what was done or the failure that stopped it; the top level is partial when any entry failed. A pending track that another promote or removal took during the sync is skipped and counted in skipped_not_pending. A report too long for one answer leaves out done entries before failed ones, from the end, and counts them in entries_omitted, the failed ones among them in failed_entries_omitted; Settings lists every kept track, unless kept_not_stored holds the error that stopped storing them, when Settings still lists the previous sync's. Takes seconds to minutes with a large library. Failure codes: {common}, {NAVIDROME_CODES}, already_running (a sync for this user is running, or a call with this request_key still runs), partial, and per entry the delete_*, import_*, unknown_handle and settings_unreadable codes.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"#,
@@ -134,6 +134,7 @@ fn report_items(r: &SyncReport, left_out: &[usize]) -> Items {
         "kept_tracks": r.kept,
         "entries_omitted": left_out.len(),
         "failed_entries_omitted": failed_left_out,
+        "skipped_not_pending": r.not_pending,
         "kept_not_stored": r.kept_not_stored.as_ref().map(|f| error_object(&ToolError {
             failure: cut(f),
             facts: Map::new(),
@@ -200,7 +201,7 @@ mod tests {
 
     use super::*;
     use crate::connection::test_util::{
-        alice_app, call_tool, document, mcp_app, text_of, FixedSync,
+        alice_app, alice_caller, call_tool, document, mcp_app, text_of, FixedSync,
     };
     use crate::core::database_failure;
     use crate::core::delete_guard::blocked_by_other_user;
@@ -224,6 +225,7 @@ mod tests {
             auto_delete: AutoDeleteRan::On,
             kept: 1,
             kept_not_stored: None,
+            not_pending: 0,
             tracks: vec![
                 done("s1", SyncAction::Delete),
                 SyncedTrack {
@@ -275,6 +277,7 @@ mod tests {
             auto_delete: AutoDeleteRan::On,
             kept: 0,
             kept_not_stored: Some(database_failure(Stage::Delete, "disk I/O error")),
+            not_pending: 0,
             tracks: vec![done("s1", SyncAction::Delete)],
         };
         let doc: Value = from_str(text_of(&report_result(&report))).unwrap();
@@ -308,6 +311,7 @@ mod tests {
             auto_delete: AutoDeleteRan::On,
             kept: 200,
             kept_not_stored: None,
+            not_pending: 0,
             tracks,
         };
         let text = text_of(&report_result(&report)).to_string();
@@ -349,6 +353,7 @@ mod tests {
             auto_delete: AutoDeleteRan::On,
             kept: 1,
             kept_not_stored: None,
+            not_pending: 0,
             tracks,
         };
         let doc: Value = from_str(text_of(&report_result(&report))).unwrap();
@@ -370,6 +375,7 @@ mod tests {
             auto_delete: AutoDeleteRan::NotAllowed,
             kept: 0,
             kept_not_stored: None,
+            not_pending: 0,
             tracks: vec![],
         })));
         let (db, app, token) = alice_app(ConnectionState {
@@ -391,6 +397,45 @@ mod tests {
                 ("u1".to_string(), AutoDeletePermit::Allowed)
             ]
         );
+    }
+
+    /// Waits for `gate`, then says it ran to its end.
+    struct GatedSync {
+        gate: Arc<tokio::sync::Notify>,
+        ended: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl RatingSync for GatedSync {
+        async fn sync(&self, _: &UserCtx, _: AutoDeletePermit) -> Result<SyncReport, Failure> {
+            self.gate.notified().await;
+            if let Some(ended) = self.ended.lock().unwrap().take() {
+                let _ = ended.send(());
+            }
+            Err(ratings::sync_running())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sync_runs_to_its_end_when_the_call_is_dropped() {
+        let (ended, end) = tokio::sync::oneshot::channel();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = ConnectionState {
+            ratings: Arc::new(GatedSync {
+                gate: gate.clone(),
+                ended: std::sync::Mutex::new(Some(ended)),
+            }),
+            ..ConnectionState::for_test(test_db::migrated().await)
+        };
+        let caller = alice_caller(false);
+        // The client leaves while the sync runs: the call's future is dropped.
+        let call = sync_ratings(&state, &caller, None);
+        let short = std::time::Duration::from_millis(50);
+        assert!(tokio::time::timeout(short, call).await.is_err());
+        gate.notify_one();
+        let long = std::time::Duration::from_secs(5);
+        let ended = tokio::time::timeout(long, end).await;
+        assert!(matches!(ended, Ok(Ok(()))), "the sync ran to its end");
     }
 
     #[tokio::test]

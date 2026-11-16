@@ -4,6 +4,7 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
+use shared::recommendation::DiscoveryProfile;
 
 use super::args::Args;
 use super::contract::NextCall;
@@ -16,13 +17,12 @@ use super::status::{chosen_folder, folder_fields, with_free_space};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::discovery::parse_profiles;
+use crate::core::jobs::retry::enable_deletion;
 use crate::core::library::library_roots_in;
+use crate::core::settings::Setting;
 use crate::core::{folders, settings};
 use crate::models::folder::Folder;
 use crate::models::user_settings::{UpdateUserSettings, UserSettings};
-
-/// The discovery profiles, as `UserSettings` names them in its maps.
-const PROFILES: [&str; 3] = ["Conservative", "Balanced", "Adventurous"];
 
 /// The settings document (D14): what is saved, never a key or token.
 pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<String, Value> {
@@ -34,14 +34,14 @@ pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<Strin
         .iter()
         .map(ToString::to_string)
         .collect();
-    let playlist_names: Map<String, Value> = PROFILES
+    let playlist_names: Map<String, Value> = DiscoveryProfile::NAMES
         .iter()
         .map(|p| {
             let name = UserSettings::get_playlist_name_for_profile(&s.discovery_playlist_name, p);
             (p.to_string(), json!(name))
         })
         .collect();
-    let playlist_ids: Map<String, Value> = PROFILES
+    let playlist_ids: Map<String, Value> = DiscoveryProfile::NAMES
         .iter()
         .filter_map(|p| {
             UserSettings::get_playlist_id_for_profile(&s.discovery_navidrome_playlist_id, p)
@@ -162,7 +162,7 @@ pub(crate) const UPDATE_SETTINGS: ToolSpec = ToolSpec {
     title: "Change settings",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Changes this user's Soulful settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulful's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, its folder, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map, and the promote threshold 1 to 5). Turning discovery off, changing its folder or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true), already_running.")
+        format!("Changes this user's Soulful settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulful's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, its folder, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map, and the promote threshold 1 to 5, which only an app allowed to delete music may change, since a promote can replace an earlier library copy). Turning discovery off, changing its folder or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true, or discovery_promote_threshold from an app that may not delete), already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"default_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "auto_delete": {"type": "boolean"}, "discovery_enabled": {"type": "boolean"}, "discovery_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "discovery_profiles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["Conservative", "Balanced", "Adventurous"]}}, "discovery_track_counts": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_lifetime_days": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_playlist_names": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "string"}, "Balanced": {"type": "string"}, "Adventurous": {"type": "string"}}}, "discovery_promote_threshold": {"type": "integer", "minimum": 0, "maximum": 255}, "#,
@@ -192,16 +192,28 @@ fn auto_delete_on_refused() -> Failure {
     ))
 }
 
-/// The settings a call changes, each with the argument that names it.
+/// Lowering the promote threshold has the next rating sync promote pending discovery tracks
+/// rated below the old one, and a promote can replace an earlier library copy, deleting it.
+fn promote_threshold_refused() -> Failure {
+    Failure::new(
+        FailureCode::PermissionNotGranted,
+        Stage::Input,
+        RetryAdvice::NeedsUser,
+        "This app may not delete music, so it cannot change the discovery promote threshold: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
+    )
+    .with_user_action(enable_deletion())
+}
+
+/// The settings a call changes.
 struct Changes {
     update: UpdateUserSettings,
     auto_delete_on: bool,
 }
 
 fn read_changes(args: &Args) -> Result<Changes, ToolError> {
-    const PROFILES_KNOWN: &[&str] = &["Conservative", "Balanced", "Adventurous"];
+    let profiles = &DiscoveryProfile::NAMES;
     let map = |name| {
-        args.opt_object(name, PROFILES_KNOWN)
+        args.opt_object(name, profiles)
             .map(|object| object.map(|o| o.as_value().to_string()))
     };
     let auto_delete = args.opt_bool("auto_delete")?;
@@ -211,7 +223,7 @@ fn read_changes(args: &Args) -> Result<Changes, ToolError> {
         discovery_enabled: args.opt_bool("discovery_enabled")?,
         discovery_folder_id: args.opt_string("discovery_folder_id")?,
         discovery_profiles: args
-            .opt_choices("discovery_profiles", PROFILES_KNOWN)?
+            .opt_choices("discovery_profiles", profiles)?
             .map(|profiles| profiles.join(",")),
         discovery_track_count: map("discovery_track_counts")?,
         discovery_lifetime_days: map("discovery_lifetime_days")?,
@@ -227,72 +239,17 @@ fn read_changes(args: &Args) -> Result<Changes, ToolError> {
     })
 }
 
-/// Each argument of a call with only its own setting, to tell which one a refusal is about.
-fn single_changes(update: &UpdateUserSettings) -> [(&'static str, UpdateUserSettings); 7] {
-    let only = |f: fn(&mut UpdateUserSettings, &UpdateUserSettings)| {
-        let mut one = UpdateUserSettings::default();
-        f(&mut one, update);
-        one
-    };
-    [
-        (
-            "default_folder_id",
-            only(|o, u| o.default_download_folder_id = u.default_download_folder_id.clone()),
-        ),
-        (
-            "discovery_folder_id",
-            only(|o, u| o.discovery_folder_id = u.discovery_folder_id.clone()),
-        ),
-        (
-            "discovery_profiles",
-            only(|o, u| o.discovery_profiles = u.discovery_profiles.clone()),
-        ),
-        (
-            "discovery_track_counts",
-            only(|o, u| o.discovery_track_count = u.discovery_track_count.clone()),
-        ),
-        (
-            "discovery_lifetime_days",
-            only(|o, u| o.discovery_lifetime_days = u.discovery_lifetime_days.clone()),
-        ),
-        (
-            "discovery_playlist_names",
-            only(|o, u| o.discovery_playlist_name = u.discovery_playlist_name.clone()),
-        ),
-        (
-            "discovery_promote_threshold",
-            only(|o, u| o.discovery_promote_threshold = u.discovery_promote_threshold),
-        ),
-    ]
-}
-
-/// The argument a refusal of `update_in` is about: the first whose setting alone is refused.
-async fn refused_argument(
-    db: &sqlx::SqlitePool,
-    ctx: &crate::auth::UserCtx,
-    update: &UpdateUserSettings,
-    failure: &Failure,
-) -> Option<&'static str> {
-    for (name, one) in single_changes(update) {
-        let refused = match failure.code {
-            FailureCode::InvalidInput => settings::validate(&one).is_err(),
-            FailureCode::UnknownHandle => {
-                let folder = one
-                    .default_download_folder_id
-                    .or(one.discovery_folder_id)
-                    .filter(|id| !id.is_empty());
-                match folder {
-                    Some(id) => folders::owned_in(db, ctx, &id).await.is_err(),
-                    None => false,
-                }
-            }
-            _ => false,
-        };
-        if refused {
-            return Some(name);
-        }
+/// The argument that sets `setting`.
+fn argument_of(setting: Setting) -> &'static str {
+    match setting {
+        Setting::DefaultFolder => "default_folder_id",
+        Setting::DiscoveryFolder => "discovery_folder_id",
+        Setting::DiscoveryProfiles => "discovery_profiles",
+        Setting::DiscoveryTrackCounts => "discovery_track_counts",
+        Setting::DiscoveryLifetimes => "discovery_lifetime_days",
+        Setting::DiscoveryPlaylistNames => "discovery_playlist_names",
+        Setting::DiscoveryPromoteThreshold => "discovery_promote_threshold",
     }
-    None
 }
 
 /// `update_settings`: the settings a call names, checked as the web page's are, and the
@@ -321,24 +278,28 @@ async fn update_settings(
         Err(e) => return failed(e),
     };
     let call = args.as_value();
-    let (db, navidrome, ctx) = (
+    let (db, navidrome, ctx, may_delete) = (
         state.db.clone(),
         state.navidrome.clone(),
         caller.ctx.clone(),
+        caller.allow_delete,
     );
     let work = async move {
         if changes.auto_delete_on {
             return refusal(&args, auto_delete_on_refused(), field_facts("auto_delete"));
         }
-        let saved = match settings::update_in(&db, &*navidrome, &ctx, changes.update.clone()).await
-        {
+        if changes.update.discovery_promote_threshold.is_some() && !may_delete {
+            let facts = field_facts("discovery_promote_threshold");
+            return refusal(&args, promote_threshold_refused(), facts);
+        }
+        let saved = match settings::update_in(&db, &*navidrome, &ctx, changes.update).await {
             Ok(saved) => saved,
-            Err(failure) => {
-                let facts = match refused_argument(&db, &ctx, &changes.update, &failure).await {
-                    Some(field) => field_facts(field),
+            Err(not_saved) => {
+                let facts = match not_saved.setting {
+                    Some(setting) => field_facts(argument_of(setting)),
                     None => Map::new(),
                 };
-                let mut error = upstream_error(failure, facts, args.same_call());
+                let mut error = upstream_error(not_saved.failure, facts, args.same_call());
                 if error.failure.code == FailureCode::UnknownHandle {
                     error.next = vec![NextCall::new("list_folders", json!({}))];
                 }
@@ -569,6 +530,12 @@ mod tests {
                     .auto_delete_enabled
             );
         }
+        // Turned on in Soulful, it is turned off from the app, switch or not.
+        let on = UpdateUserSettings {
+            auto_delete_enabled: Some(true),
+            ..Default::default()
+        };
+        UserSettings::upsert_in(&db, "u1", on).await.unwrap();
         let off = document(
             &call_tool(
                 app,
@@ -579,6 +546,48 @@ mod tests {
             .await,
         );
         assert_eq!(off["settings"]["auto_delete_enabled"], false);
+        assert!(
+            !UserSettings::get_in(&db, "u1")
+                .await
+                .unwrap()
+                .auto_delete_enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn the_promote_threshold_is_changed_only_by_an_app_that_may_delete() {
+        // A lower threshold has the 6 hourly sync promote pending tracks rated below the old
+        // one, and a promote can replace an earlier library copy.
+        let (db, app, token) = mcp_app().await;
+        let lower = json!({"discovery_promote_threshold": 1, "request_key": "k"});
+        let error =
+            &document(&call_tool(app.clone(), &token, "update_settings", lower.clone()).await)
+                ["error"];
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["retry"].as_str(),
+                error["user_action"]["code"].as_str()
+            ),
+            (
+                Some("permission_not_granted"),
+                Some("needs_user"),
+                Some("enable_deletion")
+            )
+        );
+        assert_eq!(
+            (&error["facts"], &error["next"]),
+            (&json!({"field": "discovery_promote_threshold"}), &json!([]))
+        );
+        let saved = UserSettings::get_in(&db, "u1").await.unwrap();
+        assert_eq!(saved.discovery_promote_threshold, 3);
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        // Nothing was saved, so the key was let go.
+        let doc = document(&call_tool(app, &token, "update_settings", lower).await);
+        assert_eq!(doc["settings"]["discovery"]["promote_threshold"], 1);
     }
 
     #[tokio::test]
@@ -620,11 +629,11 @@ mod tests {
             app,
             &token,
             "update_settings",
-            json!({"discovery_promote_threshold": 4}),
+            json!({"discovery_enabled": true}),
         )
         .await
         .to_string();
-        assert!(text.contains(r#"\"promote_threshold\":4"#), "{text}");
+        assert!(text.contains(r#"\"enabled\":true"#), "{text}");
         assert!(
             !text.contains("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e")
                 && !text.contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"),
@@ -676,7 +685,7 @@ mod tests {
         )["error"];
         assert_eq!(
             error["message"],
-            "update_settings: discovery_profiles must be a list of Conservative, Balanced, Adventurous"
+            "update_settings: discovery_profiles must be a list of one or more of Conservative, Balanced, Adventurous, each once"
         );
         let error = &document(
             &call_tool(
@@ -689,7 +698,7 @@ mod tests {
         )["error"];
         assert_eq!(
             error["message"],
-            "update_settings: discovery_profiles must be a list of Conservative, Balanced, Adventurous"
+            "update_settings: discovery_profiles must be a list of one or more of Conservative, Balanced, Adventurous, each once"
         );
     }
 
@@ -712,5 +721,27 @@ mod tests {
         );
         let saved = UserSettings::get_in(&db, "u1").await.unwrap();
         assert_eq!(saved.discovery_profiles, "Adventurous,Balanced");
+    }
+
+    #[tokio::test]
+    async fn a_playlist_name_is_saved_trimmed() {
+        let (db, app, token) = mcp_app().await;
+        let doc = document(
+            &call_tool(app, &token, "update_settings", json!({
+                "discovery_playlist_names": {"Conservative": " Calm ", "Balanced": "Mid", "Adventurous": "Wild\n"},
+            })).await,
+        );
+        assert_eq!(
+            doc["settings"]["discovery"]["playlist_names"],
+            json!({"Conservative": "Calm", "Balanced": "Mid", "Adventurous": "Wild"})
+        );
+        let saved = UserSettings::get_in(&db, "u1").await.unwrap();
+        assert_eq!(
+            UserSettings::get_playlist_name_for_profile(
+                &saved.discovery_playlist_name,
+                "Conservative"
+            ),
+            "Calm"
+        );
     }
 }

@@ -6,10 +6,9 @@ use crate::core::{database_failure, folders::owned_in};
 use crate::models::user_settings::{UpdateUserSettings, UserSettings};
 use serde_json::Value;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+use shared::recommendation::DiscoveryProfile;
 use sqlx::SqlitePool;
 
-/// The discovery profiles, as the settings maps name them.
-const PROFILES: [&str; 3] = ["Conservative", "Balanced", "Adventurous"];
 const PLAYLIST_NAME_MAX_CHARS: usize = 255;
 
 pub async fn get(ctx: &UserCtx) -> Result<UserSettings, Failure> {
@@ -23,7 +22,36 @@ pub(crate) async fn get_in(db: &SqlitePool, ctx: &UserCtx) -> Result<UserSetting
 }
 
 pub async fn update(ctx: &UserCtx, update: UpdateUserSettings) -> Result<UserSettings, Failure> {
-    update_in(&crate::db::DB, &ServerNavidrome, ctx, update).await
+    (update_in(&crate::db::DB, &ServerNavidrome, ctx, update).await).map_err(|n| n.failure)
+}
+
+/// A setting `update_in` checks, named in its refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Setting {
+    DefaultFolder,
+    DiscoveryFolder,
+    DiscoveryProfiles,
+    DiscoveryTrackCounts,
+    DiscoveryLifetimes,
+    DiscoveryPlaylistNames,
+    DiscoveryPromoteThreshold,
+}
+
+/// A change `update_in` did not save: why, and the setting it refused, None when the failure is
+/// not about one (the database).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NotSaved {
+    pub failure: Failure,
+    pub setting: Option<Setting>,
+}
+
+impl NotSaved {
+    fn of(setting: Setting) -> impl FnOnce(Failure) -> NotSaved {
+        move |failure| NotSaved {
+            failure,
+            setting: Some(setting),
+        }
+    }
 }
 
 fn refused(message: String) -> Failure {
@@ -41,63 +69,76 @@ fn unknown_profile(profile: &str) -> Failure {
     ))
 }
 
-/// The discovery values of `update` that are given, against the bounds the Settings inputs carry.
-/// Each map must name all three profiles.
-pub(crate) fn validate(update: &UpdateUserSettings) -> Result<(), Failure> {
+/// `update` with its discovery values checked against the bounds the Settings inputs carry, and
+/// its playlist names trimmed (D14). Each map must name all three profiles.
+pub(crate) fn checked(mut update: UpdateUserSettings) -> Result<UpdateUserSettings, NotSaved> {
     if let Some(profiles) = &update.discovery_profiles {
+        let profiles_refused = NotSaved::of(Setting::DiscoveryProfiles);
         let names = || profiles.split(',').map(str::trim).filter(|p| !p.is_empty());
         if names().next().is_none() {
-            return Err(refused(
+            return Err(profiles_refused(refused(
                 "At least one discovery profile must be selected".into(),
-            ));
+            )));
         }
-        let unknown = names().find(|p| !PROFILES.contains(p));
+        let unknown = names().find(|p| !DiscoveryProfile::NAMES.contains(p));
         if let Some(profile) = unknown {
-            return Err(unknown_profile(profile));
+            return Err(profiles_refused(unknown_profile(profile)));
         }
     }
     if let Some(counts) = &update.discovery_track_count {
-        for (profile, n) in profile_values(counts, "track counts", Value::as_i64)? {
+        let values = profile_values(counts, "track counts", Value::as_i64);
+        for (profile, n) in values.map_err(NotSaved::of(Setting::DiscoveryTrackCounts))? {
             if !(1..=50).contains(&n) {
-                return Err(refused(format!(
-                    "Discovery track count for {profile} must be 1 to 50, not {n}"
+                return Err(NotSaved::of(Setting::DiscoveryTrackCounts)(refused(
+                    format!("Discovery track count for {profile} must be 1 to 50, not {n}"),
                 )));
             }
         }
     }
     if let Some(lifetimes) = &update.discovery_lifetime_days {
-        for (profile, n) in profile_values(lifetimes, "lifetimes", Value::as_i64)? {
+        let values = profile_values(lifetimes, "lifetimes", Value::as_i64);
+        for (profile, n) in values.map_err(NotSaved::of(Setting::DiscoveryLifetimes))? {
             if !(1..=90).contains(&n) {
-                return Err(refused(format!(
+                return Err(NotSaved::of(Setting::DiscoveryLifetimes)(refused(format!(
                     "Discovery lifetime for {profile} must be 1 to 90 days, not {n}"
-                )));
+                ))));
             }
         }
     }
     if let Some(names) = &update.discovery_playlist_name {
-        for (profile, name) in profile_values(names, "playlist names", |v| {
+        let names_refused = NotSaved::of(Setting::DiscoveryPlaylistNames);
+        let trimmed = profile_values(names, "playlist names", |v| {
             v.as_str().map(|name| name.trim().to_string())
-        })? {
+        });
+        let trimmed = match trimmed {
+            Ok(trimmed) => trimmed,
+            Err(f) => return Err(names_refused(f)),
+        };
+        for (profile, name) in &trimmed {
             if name.is_empty() {
-                return Err(refused(format!(
+                return Err(names_refused(refused(format!(
                     "The discovery playlist name for {profile} is empty"
-                )));
+                ))));
             }
             if name.chars().count() > PLAYLIST_NAME_MAX_CHARS {
-                return Err(refused(format!(
+                return Err(names_refused(refused(format!(
                     "The discovery playlist name for {profile} is longer than {PLAYLIST_NAME_MAX_CHARS} characters"
-                )));
+                ))));
             }
         }
+        let map: serde_json::Map<String, Value> = (trimmed.into_iter())
+            .map(|(profile, name)| (profile.to_string(), Value::String(name)))
+            .collect();
+        update.discovery_playlist_name = Some(Value::Object(map).to_string());
     }
     if let Some(n) = update.discovery_promote_threshold {
         if !(1..=5).contains(&n) {
-            return Err(refused(format!(
-                "The discovery promote threshold must be 1 to 5, not {n}"
+            return Err(NotSaved::of(Setting::DiscoveryPromoteThreshold)(refused(
+                format!("The discovery promote threshold must be 1 to 5, not {n}"),
             )));
         }
     }
-    Ok(())
+    Ok(update)
 }
 
 /// The value of each profile in the JSON object `json`, in profile order, read by `read`.
@@ -115,15 +156,21 @@ fn profile_values<T>(
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json) else {
         return Err(not_an_object());
     };
-    if let Some(profile) = map.keys().find(|k| !PROFILES.contains(&k.as_str())) {
+    if let Some(profile) = map
+        .keys()
+        .find(|k| !DiscoveryProfile::NAMES.contains(&k.as_str()))
+    {
         return Err(unknown_profile(profile));
     }
-    if PROFILES.iter().any(|p| !map.contains_key(*p)) {
+    if DiscoveryProfile::NAMES
+        .iter()
+        .any(|p| !map.contains_key(*p))
+    {
         return Err(refused(format!(
             "Discovery {what} must name Conservative, Balanced and Adventurous"
         )));
     }
-    PROFILES
+    DiscoveryProfile::NAMES
         .iter()
         .map(|p| {
             map.get(*p)
@@ -141,13 +188,17 @@ pub(crate) async fn update_in(
     navidrome: &dyn NavidromeOf,
     ctx: &UserCtx,
     update: UpdateUserSettings,
-) -> Result<UserSettings, Failure> {
-    validate(&update)?;
+) -> Result<UserSettings, NotSaved> {
+    let update = checked(update)?;
     check_folder_choices(db, ctx, &update).await?;
-    let old = get_in(db, ctx).await?;
+    let unsaved = |failure| NotSaved {
+        failure,
+        setting: None,
+    };
+    let old = get_in(db, ctx).await.map_err(unsaved)?;
     let result = UserSettings::upsert_in(db, &ctx.user_id, update.clone())
         .await
-        .map_err(|e| database_failure(Stage::Input, e))?;
+        .map_err(|e| unsaved(database_failure(Stage::Input, e)))?;
     cleanup_stale_discovery_playlists(db, navidrome, ctx, &old, &update).await;
 
     Ok(result)
@@ -161,13 +212,19 @@ async fn check_folder_choices(
     db: &SqlitePool,
     ctx: &UserCtx,
     update: &UpdateUserSettings,
-) -> Result<(), Failure> {
+) -> Result<(), NotSaved> {
     let chosen = [
-        &update.discovery_folder_id,
-        &update.default_download_folder_id,
+        (Setting::DefaultFolder, &update.default_download_folder_id),
+        (Setting::DiscoveryFolder, &update.discovery_folder_id),
     ];
-    for id in chosen.into_iter().flatten().filter(|id| !id.is_empty()) {
-        owned_in(db, ctx, id).await?;
+    for (setting, id) in chosen {
+        if let Some(id) = id.as_deref().filter(|id| !id.is_empty()) {
+            owned_in(db, ctx, id).await.map_err(|failure| {
+                // A database failure is not about the folder.
+                let setting = (failure.code == FailureCode::UnknownHandle).then_some(setting);
+                NotSaved { failure, setting }
+            })?;
+        }
     }
     Ok(())
 }
@@ -267,7 +324,7 @@ mod tests {
     use crate::core::{folder_of, test_ctx};
     use crate::db::test_db;
     use crate::services::NavidromeLookupError;
-    use crate::test_navidrome::NavidromeFor;
+    use crate::test_navidrome::{NavidromeFor, NavidromeStub};
 
     const NOT_LINKED: NavidromeFor = NavidromeFor(Err(|| NavidromeLookupError::NotLinked));
 
@@ -277,7 +334,7 @@ mod tests {
             discovery_track_count: Some(json.into()),
             ..Default::default()
         };
-        assert!(validate(&counts(
+        assert!(checked(counts(
             r#"{"Conservative":10,"Balanced":50,"Adventurous":1}"#
         ))
         .is_ok());
@@ -321,11 +378,24 @@ mod tests {
                 "The discovery playlist name for Balanced is longer than 255 characters",
             ),
         ] {
-            let f = validate(&update).unwrap_err();
+            let refused = checked(update.clone()).unwrap_err();
+            let f = refused.failure;
             assert_eq!(
                 (f.code, f.stage, f.message.as_str()),
                 (FailureCode::InvalidInput, Stage::Input, message)
             );
+            let setting = if update.discovery_track_count.is_some() {
+                Setting::DiscoveryTrackCounts
+            } else if update.discovery_lifetime_days.is_some() {
+                Setting::DiscoveryLifetimes
+            } else if update.discovery_promote_threshold.is_some() {
+                Setting::DiscoveryPromoteThreshold
+            } else if update.discovery_profiles.is_some() {
+                Setting::DiscoveryProfiles
+            } else {
+                Setting::DiscoveryPlaylistNames
+            };
+            assert_eq!(refused.setting, Some(setting), "{message}");
         }
     }
 
@@ -351,6 +421,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dropped_profile_has_its_discovery_playlist_deleted_and_forgotten() {
+        let db = test_db::migrated().await;
+        folder_of(&db, "alice").await;
+        let ids = r#"{"Balanced":"9fR2kLm4NpQ7sT1vW3xY5z","Adventurous":"2kD8sP4vX7zQ1mN5bT3wYa"}"#;
+        UserSettings::upsert_in(&db, "alice", UpdateUserSettings::default())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_settings SET discovery_navidrome_playlist_id = ?")
+            .bind(ids)
+            .execute(&db)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        let of = NavidromeFor(Ok(navi.client()));
+        let update = UpdateUserSettings {
+            discovery_profiles: Some("Conservative,Balanced".into()),
+            ..Default::default()
+        };
+        let saved = update_in(&db, &of, &test_ctx("alice"), update).await;
+        assert_eq!(saved.unwrap().discovery_profiles, "Conservative,Balanced");
+        assert_eq!(
+            navi.asked(),
+            ["/auth/login", "/api/playlist/2kD8sP4vX7zQ1mN5bT3wYa"]
+        );
+        let kept = UserSettings::get_in(&db, "alice").await.unwrap();
+        assert_eq!(
+            kept.discovery_navidrome_playlist_id.as_deref(),
+            Some(r#"{"Balanced":"9fR2kLm4NpQ7sT1vW3xY5z"}"#)
+        );
+        // Discovery turned off: the rest goes too.
+        let off = UpdateUserSettings {
+            discovery_enabled: Some(false),
+            ..Default::default()
+        };
+        sqlx::query("UPDATE user_settings SET discovery_enabled = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        update_in(&db, &of, &test_ctx("alice"), off).await.unwrap();
+        assert_eq!(
+            navi.asked().last().map(String::as_str),
+            Some("/api/playlist/9fR2kLm4NpQ7sT1vW3xY5z")
+        );
+        let kept = UserSettings::get_in(&db, "alice").await.unwrap();
+        assert_eq!(kept.discovery_navidrome_playlist_id, None);
+    }
+
+    #[tokio::test]
     async fn another_users_folder_cannot_be_chosen() {
         let db = test_db::migrated().await;
         let alice_folder = folder_of(&db, "alice").await;
@@ -365,9 +483,16 @@ mod tests {
                 ..Default::default()
             },
         ] {
+            let setting = match update.discovery_folder_id {
+                Some(_) => Setting::DiscoveryFolder,
+                None => Setting::DefaultFolder,
+            };
             assert_eq!(
                 check_folder_choices(&db, &test_ctx("bob"), &update).await,
-                Err(folder_not_found())
+                Err(NotSaved {
+                    failure: folder_not_found(),
+                    setting: Some(setting)
+                })
             );
         }
     }
@@ -390,7 +515,10 @@ mod tests {
         };
         assert_eq!(
             check_folder_choices(&db, &test_ctx("bob"), &update).await,
-            Err(folder_not_found())
+            Err(NotSaved {
+                failure: folder_not_found(),
+                setting: Some(Setting::DiscoveryFolder)
+            })
         );
     }
 

@@ -347,17 +347,11 @@ async fn run_automation() {
                     user.username, result.total_songs_scanned, result.deleted_tracks,
                     result.promoted_tracks, result.removed_tracks, result.kept_tracks
                 );
-                if let Some(f) = &report.kept_not_stored {
-                    warn!(
-                        "Automation: the tracks auto-delete kept for {} were not stored: {}",
-                        user.username,
-                        crate::core::logged(f)
-                    );
-                }
             }
             Err(f) => info!(
                 "Automation: sync failed for {}: {}",
-                user.username, f.message
+                user.username,
+                crate::core::logged(&f)
             ),
         }
     }
@@ -445,7 +439,7 @@ async fn run_automation() {
                 .await
                 {
                     Ok(()) => expired_count += 1,
-                    Err(f) if f == crate::core::discovery::track_not_pending() => debug!(
+                    Err(f) if crate::core::discovery::is_not_pending(&f) => debug!(
                         "Automation: {} of user {} is no longer pending, so it does not expire",
                         track.title, user.username
                     ),

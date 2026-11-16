@@ -2,10 +2,11 @@
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{cut_json, FailureCode, Stage, TEXT_MAX_CHARS};
+use shared::failure::{cut_json, Stage, TEXT_MAX_CHARS};
 
 use super::args::Args;
-use super::contract::{failed, invalid_value, success, upstream_error, ToolError};
+use super::contract::{failed, invalid_value, success, upstream_error, NextCall, ToolError};
+use super::discovery::PROMOTE_DISCOVERY_TRACK;
 use super::keys::{keyed, request_key, Keyed};
 use super::library::navidrome_of;
 use super::refs::request_key_schema;
@@ -23,7 +24,7 @@ pub(crate) const SET_RATING: ToolSpec = ToolSpec {
     title: "Rate a song or album",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Sets this user's own rating (0 to 5, 0 clears it) of a song or album in Navidrome; other users' ratings are theirs and are never read or changed. For a song, rating_sync says what the next rating sync will do with it: move a pending discovery track into the library, or delete one rated 1. While this user's auto-delete is on, a 1-star rating of a song is refused and nothing is written, since the next rating sync would delete its file: the user rates it 1 star in Navidrome instead. Album ratings are never refused. Song and album ids stay valid while the files stay in the library. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome lists no such song or album for this user), permission_not_granted (a 1-star song rating while auto-delete is on), already_running.")
+        format!("Sets this user's own rating (0 to 5, 0 clears it) of a song or album in Navidrome; other users' ratings are theirs and are never read or changed. For a song, rating_sync says what the next rating sync will do with it: move a pending discovery track into the library, replacing an earlier copy of the song there, or delete one rated 1. While this user's auto-delete is on, a 1-star rating of a song is refused and nothing is written, since the next rating sync would delete its file: the user rates it 1 star in Navidrome instead. Without deletion switched on for this app, a rating that would have the next rating sync move a pending discovery track into the library is refused too, since that can replace and delete an earlier copy; next offers promote_discovery_track, which never replaces one for this app. Album ratings are never refused. Song and album ids stay valid while the files stay in the library. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome lists no such song or album for this user), permission_not_granted (a 1-star song rating while auto-delete is on, or a promoting rating from an app that may not delete), already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["rating"], "properties": {"song_id": {"type": "string", "minLength": 1, "maxLength": 500}, "album_id": {"type": "string", "minLength": 1, "maxLength": 500}, "rating": {"type": "integer", "minimum": 0, "maximum": 5}, "#,
@@ -78,9 +79,9 @@ async fn set_rating(
         Err(e) => return failed(e),
     };
     let call = args.as_value();
-    let (db, user) = (state.db.clone(), caller.ctx.id());
+    let (db, user, may_delete) = (state.db.clone(), caller.ctx.id(), caller.allow_delete);
     let work = async move {
-        match ratings::rate(&db, &navi, &user, &target, rating).await {
+        match ratings::rate(&db, &navi, &user, &target, rating, may_delete).await {
             Ok(a) => {
                 let mut fields = annotated_fields(&a);
                 fields.insert("rating".into(), json!(rating));
@@ -102,8 +103,7 @@ async fn set_star(
     let args = Args::new(SET_STAR.name, args, SET_STAR_ARGS);
     let read = async {
         let (song_id, album_id) = (args.opt_string("song_id")?, args.opt_string("album_id")?);
-        let starred = (args.opt_bool("starred")?)
-            .ok_or_else(|| invalid_value(args.tool(), "starred", "true or false"))?;
+        let starred = args.bool("starred")?;
         let key = request_key(&args)?;
         args.finish()?;
         let target = target_of(&args, song_id, album_id)?;
@@ -187,17 +187,27 @@ fn rating_sync(effect: Option<SyncEffect>) -> Value {
 }
 
 /// The answer to a rating or star not made; its key keeps it once the write request was sent,
-/// since the change may have been made. A refused 1-star rating says what the sync would do.
+/// since the change may have been made. A rating refused for what the sync would do says what
+/// that is, and a refused promote offers promote_discovery_track.
 fn not_set(args: &Args, target: &Target, r: NotSet) -> Keyed {
-    let failure = r.failure().clone();
     let mut facts = target_fields(target);
-    if failure.code == FailureCode::PermissionNotGranted {
-        facts.insert(
-            "rating_sync".into(),
-            rating_sync(Some(SyncEffect::DeletesFile)),
-        );
+    let mut next = vec![];
+    if let NotSet::WouldDelete {
+        effect,
+        discovery_track_id,
+        ..
+    } = &r
+    {
+        facts.insert("rating_sync".into(), rating_sync(Some(*effect)));
+        if let Some(track_id) = discovery_track_id {
+            facts.insert("discovery_track_id".into(), json!(track_id));
+            let promote = json!({"track_id": track_id});
+            next.push(NextCall::new(PROMOTE_DISCOVERY_TRACK.name, promote));
+        }
     }
-    let result = failed(upstream_error(failure, facts, args.same_call()));
+    let mut error = upstream_error(r.failure().clone(), facts, args.same_call());
+    error.next.extend(next);
+    let result = failed(error);
     if r.after_write() {
         Keyed::Kept(result)
     } else {
@@ -211,7 +221,9 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::connection::test_util::{call_tool, document, mcp_app_with};
+    use crate::connection::test_util::{access_token, call_tool, document, mcp_app_with, RESOURCE};
+    use crate::connection::{router, ConnectionState};
+    use crate::core::delete_guard::test_support::Library;
     use crate::models::user_settings::{UpdateUserSettings, UserSettings};
     use crate::test_navidrome::{
         song_body, subsonic_failed, NavidromeFor, NavidromeStub, HOLY, OK,
@@ -297,6 +309,77 @@ mod tests {
                 "artist": "Marrow Choir", "album": "Winter Songs", "rating": 2,
                 "previous_rating": 4, "previously_starred": false, "rating_sync": null})
         );
+    }
+
+    #[tokio::test]
+    async fn a_promoting_rating_needs_the_deletion_switch() {
+        // The 6 hourly sync promotes a pending track through the guard, which replaces an
+        // earlier library copy of the song: an app that may not delete must not set that up.
+        let lib = Library::new().await;
+        let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
+        lib.pending_track("t1", "alice-music", "Explore", &staged, Some(HOLY.0))
+            .await;
+        let folder = UpdateUserSettings {
+            discovery_folder_id: Some("alice-music".into()),
+            ..Default::default()
+        };
+        UserSettings::upsert_in(&lib.db, "alice", folder)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getSong", &[&song_body(HOLY.0, HOLY.1, None, false)]);
+        navi.answer("/rest/setRating", &[OK]);
+        let state = ConnectionState {
+            navidrome: Arc::new(NavidromeFor(Ok(navi.client()))),
+            ..ConnectionState::for_test(lib.db.clone())
+        };
+        let (app, token) = (
+            router(state),
+            access_token(&lib.db, "alice", RESOURCE).await,
+        );
+        let five = json!({"song_id": HOLY.0, "rating": 5});
+        let error =
+            &document(&call_tool(app.clone(), &token, "set_rating", five.clone()).await)["error"];
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["retry"].as_str(),
+                error["user_action"]["code"].as_str()
+            ),
+            (
+                Some("permission_not_granted"),
+                Some("needs_user"),
+                Some("enable_deletion")
+            )
+        );
+        assert_eq!(
+            (&error["facts"], &error["next"]),
+            (
+                &json!({"kind": "song", "id": HOLY.0, "discovery_track_id": "t1",
+                    "rating_sync": {"effect": "promotes_discovery_track",
+                        "message": "This is a pending discovery track: the next rating sync moves it into your library"}}),
+                &json!([{"tool": "promote_discovery_track", "args": {"track_id": "t1"}}])
+            )
+        );
+        assert!(!navi.asked().contains(&"/rest/setRating".to_string()));
+        // Below the threshold nothing is promoted, so the rating is written.
+        let doc = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "set_rating",
+                json!({"song_id": HOLY.0, "rating": 2}),
+            )
+            .await,
+        );
+        assert_eq!(doc["rating_sync"], json!(null));
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        let doc = document(&call_tool(app, &token, "set_rating", five).await);
+        assert_eq!(doc["rating_sync"]["effect"], "promotes_discovery_track");
+        assert_eq!(navi.posted("/rest/setRating").len(), 2);
     }
 
     #[tokio::test]
