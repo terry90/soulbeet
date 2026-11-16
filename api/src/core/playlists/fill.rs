@@ -439,7 +439,7 @@ mod tests {
     };
     use crate::core::playlists::{playlist_not_found, NotEditable};
     use crate::core::test_ctx;
-    use crate::ledger::{Admitted, LedgerError, JOB_KEPT_SECS};
+    use crate::ledger::{Admitted, LedgerError, JOB_KEPT_SECS, KEY_KEPT_SECS};
     use crate::services::NavidromeLookupError;
     use crate::test_navidrome::{
         native_playlist, native_song, native_songs, playlist_body, playlist_rows, playlists_body,
@@ -1143,6 +1143,25 @@ mod tests {
             matches!(&r, PlaylistRefusal::Unfollowed { playlist_id, .. } if playlist_id == ADVENT),
             "{r:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_jobless_batch_whose_playlist_never_began_goes_with_its_request_key() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        batch_of_downloads(&acq, 1).await;
+        // The call stopped between create_batch and begin's set_playlist.
+        playlist_batch_of_running(&acq, "b-orphan").await;
+        let kept = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM batches WHERE id = 'b-orphan'")
+                .fetch_one(&acq.db)
+                .await
+                .unwrap()
+        };
+        let now = chrono::Utc::now().timestamp();
+        acq.ledger.prune(now + KEY_KEPT_SECS - 60).await.unwrap();
+        assert_eq!(kept().await, 1);
+        acq.ledger.prune(now + KEY_KEPT_SECS + 1).await.unwrap();
+        assert_eq!(kept().await, 0);
     }
 
     #[tokio::test]

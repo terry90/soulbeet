@@ -8,6 +8,7 @@ use serde_json::Value;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::recommendation::DiscoveryProfile;
 use sqlx::SqlitePool;
+use std::ops::RangeInclusive;
 
 const PLAYLIST_NAME_MAX_CHARS: usize = 255;
 
@@ -71,6 +72,13 @@ fn unknown_profile(profile: &str) -> Failure {
 
 /// `update` with its discovery values checked against the bounds the Settings inputs carry, and
 /// its playlist names trimmed (D14). Each map must name all three profiles.
+/// The track count each discovery profile may have.
+pub(crate) const TRACK_COUNTS: RangeInclusive<i64> = 1..=50;
+/// The days a discovery profile's tracks may wait for a rating.
+pub(crate) const LIFETIME_DAYS: RangeInclusive<i64> = 1..=90;
+/// The rating at which the rating sync promotes a pending discovery track.
+pub(crate) const PROMOTE_THRESHOLDS: RangeInclusive<u8> = 1..=5;
+
 pub(crate) fn checked(mut update: UpdateUserSettings) -> Result<UpdateUserSettings, NotSaved> {
     if let Some(profiles) = &update.discovery_profiles {
         let profiles_refused = NotSaved::of(Setting::DiscoveryProfiles);
@@ -88,9 +96,10 @@ pub(crate) fn checked(mut update: UpdateUserSettings) -> Result<UpdateUserSettin
     if let Some(counts) = &update.discovery_track_count {
         let values = profile_values(counts, "track counts", Value::as_i64);
         for (profile, n) in values.map_err(NotSaved::of(Setting::DiscoveryTrackCounts))? {
-            if !(1..=50).contains(&n) {
+            if !TRACK_COUNTS.contains(&n) {
+                let (min, max) = (TRACK_COUNTS.start(), TRACK_COUNTS.end());
                 return Err(NotSaved::of(Setting::DiscoveryTrackCounts)(refused(
-                    format!("Discovery track count for {profile} must be 1 to 50, not {n}"),
+                    format!("Discovery track count for {profile} must be {min} to {max}, not {n}"),
                 )));
             }
         }
@@ -98,9 +107,10 @@ pub(crate) fn checked(mut update: UpdateUserSettings) -> Result<UpdateUserSettin
     if let Some(lifetimes) = &update.discovery_lifetime_days {
         let values = profile_values(lifetimes, "lifetimes", Value::as_i64);
         for (profile, n) in values.map_err(NotSaved::of(Setting::DiscoveryLifetimes))? {
-            if !(1..=90).contains(&n) {
+            if !LIFETIME_DAYS.contains(&n) {
+                let (min, max) = (LIFETIME_DAYS.start(), LIFETIME_DAYS.end());
                 return Err(NotSaved::of(Setting::DiscoveryLifetimes)(refused(format!(
-                    "Discovery lifetime for {profile} must be 1 to 90 days, not {n}"
+                    "Discovery lifetime for {profile} must be {min} to {max} days, not {n}"
                 ))));
             }
         }
@@ -132,9 +142,10 @@ pub(crate) fn checked(mut update: UpdateUserSettings) -> Result<UpdateUserSettin
         update.discovery_playlist_name = Some(Value::Object(map).to_string());
     }
     if let Some(n) = update.discovery_promote_threshold {
-        if !(1..=5).contains(&n) {
+        if !PROMOTE_THRESHOLDS.contains(&n) {
+            let (min, max) = (PROMOTE_THRESHOLDS.start(), PROMOTE_THRESHOLDS.end());
             return Err(NotSaved::of(Setting::DiscoveryPromoteThreshold)(refused(
-                format!("The discovery promote threshold must be 1 to 5, not {n}"),
+                format!("The discovery promote threshold must be {min} to {max}, not {n}"),
             )));
         }
     }

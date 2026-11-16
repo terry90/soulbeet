@@ -1015,8 +1015,9 @@ impl Ledger {
     /// waiting for a source whose search is gone or expired (D11) and stamps
     /// their updated_at with `now`, deletes terminal jobs with
     /// updated_at < now - JOB_KEPT_SECS, then batches with no job left made
-    /// before now - JOB_KEPT_SECS whose playlist waits for no job, and request
-    /// keys reserved before now - KEY_KEPT_SECS.
+    /// before now - JOB_KEPT_SECS whose playlist waits for no job, those with
+    /// no job and no playlist order made before now - KEY_KEPT_SECS, and
+    /// request keys reserved before now - KEY_KEPT_SECS.
     pub async fn prune(&self, now: i64) -> Result<Pruned, LedgerError> {
         self.write(|reply| Write::Prune { now, reply }).await
     }

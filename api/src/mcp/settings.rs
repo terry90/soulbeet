@@ -18,7 +18,7 @@ use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::discovery::parse_profiles;
 use crate::core::library::library_roots_in;
-use crate::core::settings::Setting;
+use crate::core::settings::{Setting, PROMOTE_THRESHOLDS};
 use crate::core::{folders, settings};
 use crate::models::folder::Folder;
 use crate::models::user_settings::{UpdateUserSettings, UserSettings};
@@ -164,7 +164,7 @@ pub(crate) const UPDATE_SETTINGS: ToolSpec = ToolSpec {
         format!("Changes this user's Soulful settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulful's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map). The discovery folder and the promote threshold are changed only by the user, in Soulful's Settings, whether or not deletion is switched on for this app: the rating sync moves the folder's pending tracks rated at or above the threshold into the library, and a promote can replace and delete an earlier library copy outside this app's daily limit. Turning discovery off or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true, discovery_folder_id or discovery_promote_threshold), already_running.")
     },
     input_schema: concat!(
-        r#"{"type": "object", "additionalProperties": false, "properties": {"default_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "auto_delete": {"type": "boolean"}, "discovery_enabled": {"type": "boolean"}, "discovery_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "discovery_profiles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["Conservative", "Balanced", "Adventurous"]}}, "discovery_track_counts": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_lifetime_days": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_playlist_names": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "string"}, "Balanced": {"type": "string"}, "Adventurous": {"type": "string"}}}, "discovery_promote_threshold": {"type": "integer", "minimum": 0, "maximum": 255}, "#,
+        r#"{"type": "object", "additionalProperties": false, "properties": {"default_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "auto_delete": {"type": "boolean"}, "discovery_enabled": {"type": "boolean"}, "discovery_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "discovery_profiles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["Conservative", "Balanced", "Adventurous"]}}, "discovery_track_counts": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer", "minimum": 1, "maximum": 50}, "Balanced": {"type": "integer", "minimum": 1, "maximum": 50}, "Adventurous": {"type": "integer", "minimum": 1, "maximum": 50}}}, "discovery_lifetime_days": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer", "minimum": 1, "maximum": 90}, "Balanced": {"type": "integer", "minimum": 1, "maximum": 90}, "Adventurous": {"type": "integer", "minimum": 1, "maximum": 90}}}, "discovery_playlist_names": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "string"}, "Balanced": {"type": "string"}, "Adventurous": {"type": "string"}}}, "discovery_promote_threshold": {"type": "integer", "minimum": 1, "maximum": 5}, "#,
         request_key_schema!(),
         "}}"
     ),
@@ -252,7 +252,11 @@ fn read_changes(args: &Args) -> Result<Changes, ToolError> {
         discovery_lifetime_days: map("discovery_lifetime_days")?,
         discovery_playlist_name: map("discovery_playlist_names")?,
         discovery_promote_threshold: args
-            .opt_u32("discovery_promote_threshold", 0, 255)?
+            .opt_u32(
+                "discovery_promote_threshold",
+                u32::from(*PROMOTE_THRESHOLDS.start()),
+                u32::from(*PROMOTE_THRESHOLDS.end()),
+            )?
             .map(|n| n as u8),
         ..Default::default()
     };
@@ -506,6 +510,7 @@ mod tests {
     }
 
     use crate::connection::test_util::{call_tool, document, mcp_app};
+    use crate::core::settings::{LIFETIME_DAYS, TRACK_COUNTS};
 
     #[tokio::test]
     async fn auto_delete_is_turned_on_only_in_soulfuls_settings() {
@@ -699,6 +704,31 @@ mod tests {
             !text.contains("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e")
                 && !text.contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_schema_states_the_bounds_settings_keep() {
+        let schema: Value = serde_json::from_str(UPDATE_SETTINGS.input_schema).unwrap();
+        let bounds = |value: &Value| (value["minimum"].as_i64(), value["maximum"].as_i64());
+        let range = |r: &std::ops::RangeInclusive<i64>| (Some(*r.start()), Some(*r.end()));
+        for profile in DiscoveryProfile::NAMES {
+            let props = &schema["properties"];
+            assert_eq!(
+                bounds(&props["discovery_track_counts"]["properties"][profile]),
+                range(&TRACK_COUNTS)
+            );
+            assert_eq!(
+                bounds(&props["discovery_lifetime_days"]["properties"][profile]),
+                range(&LIFETIME_DAYS)
+            );
+        }
+        assert_eq!(
+            bounds(&schema["properties"]["discovery_promote_threshold"]),
+            (
+                Some(i64::from(*PROMOTE_THRESHOLDS.start())),
+                Some(i64::from(*PROMOTE_THRESHOLDS.end()))
+            )
         );
     }
 

@@ -1590,6 +1590,16 @@ impl Writer {
         .bind(now - JOB_KEPT_SECS)
         .execute(&mut *tx)
         .await?;
+        // One with no job and no playlist order never got either: its call stopped between
+        // create_batch and set_playlist. Only that call's request key could still lead to it, so
+        // it goes once the key does.
+        sqlx::query(
+            "DELETE FROM batches WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = batches.id) \
+             AND playlist_order IS NULL AND created_at < ?",
+        )
+        .bind(now - KEY_KEPT_SECS)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM request_keys WHERE created_at < ?")
             .bind(now - KEY_KEPT_SECS)
             .execute(&mut *tx)
