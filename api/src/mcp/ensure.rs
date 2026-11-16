@@ -713,7 +713,7 @@ mod tests {
     use crate::server_fns::download::test_support::{group, item, search_result, track};
     use crate::test_navidrome::{
         native_playlist, native_song, native_songs, playlist_body, playlist_rows, playlists_body,
-        NavidromeFor, NavidromeStub, ADVENT, HOLY, SILENT,
+        NavidromeFor, NavidromeStub, ADVENT, BAD_GATEWAY, HOLY, SILENT,
     };
 
     #[tokio::test]
@@ -933,8 +933,12 @@ mod tests {
         let (db, acq, _, token) = app_with_acquire().await;
         let navi = NavidromeStub::start();
         // nginx's 502 page, as step 8's one_failed_lookup_makes_the_result_partial sends it.
-        navi.answer_when("/api/song", "title=Marrow+Choir+Silent+Night", 502,
-            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n");
+        navi.answer_when(
+            "/api/song",
+            "title=Marrow+Choir+Silent+Night",
+            502,
+            BAD_GATEWAY,
+        );
         navi.answer_when("/api/song", "title=Marrow+Choir+O+Holy+Night", 200, "[]");
         let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
         let doc = document(
@@ -970,8 +974,7 @@ mod tests {
         let (db, acq, _, token) = app_with_acquire().await;
         let navi = NavidromeStub::start();
         // nginx's 502 page for every lookup.
-        navi.answer_when("/api/song", "title=", 502,
-            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n");
+        navi.answer_when("/api/song", "title=", 502, BAD_GATEWAY);
         let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
         let long = |c: char, i: usize| format!("{} {i}", c.to_string().repeat(480));
         let items: Vec<Value> = (0..50)
@@ -1742,9 +1745,6 @@ mod tests {
             (1, 1)
         );
     }
-
-    /// nginx's 502 page, as step 8's one_failed_lookup_makes_the_result_partial sends it.
-    const BAD_GATEWAY: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
 
     /// `navi` finds Silent Night in alice's library and lists it present; O Holy Night it does
     /// not have; she has no playlist yet.

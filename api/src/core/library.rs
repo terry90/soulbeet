@@ -2,7 +2,7 @@
 //! songs that match a track the caller names, and whether imports into a
 //! folder show up there.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -650,13 +650,72 @@ pub(crate) fn listing(folder: &Path, roots: &[PathBuf]) -> Listing {
     }
 }
 
+/// Songs `duplicates` reads from Navidrome in one request.
+pub(crate) const DUPLICATE_PAGE: u32 = 1000;
+
+/// Songs of the library that share an artist and title (compared as `match_key` does).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SongGroup {
+    /// The first song's artist and title, as it has them.
+    pub artist: String,
+    pub title: String,
+    /// Whether the songs are one recording: true when each has a recording MBID and they are
+    /// all equal, false when each has one and they differ, None when a song has none.
+    pub same_recording: Option<bool>,
+    /// The songs, by id.
+    pub songs: Vec<SongFacts>,
+}
+
+/// D11: every present song of the caller through `list_songs`, DUPLICATE_PAGE at a time until a
+/// short page, grouped by (match_key(artist), match_key(title)); the groups of two or more,
+/// ordered by that key. A page that fails fails the search, since a part would miss copies.
+pub async fn duplicates(navi: &NavidromeClient) -> Result<Vec<SongGroup>, Failure> {
+    let failure = |e: NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
+    let mut by_key: BTreeMap<(String, String), Vec<SongFacts>> = BTreeMap::new();
+    let mut start = 0;
+    loop {
+        let page = navi
+            .list_songs(start, start + DUPLICATE_PAGE)
+            .await
+            .map_err(failure)?;
+        let last = page.len() < DUPLICATE_PAGE as usize;
+        for song in &page {
+            by_key
+                .entry((match_key(&song.artist), match_key(&song.title)))
+                .or_default()
+                .push(SongFacts::from(song));
+        }
+        if last {
+            break;
+        }
+        start += DUPLICATE_PAGE;
+    }
+    Ok(by_key
+        .into_values()
+        .filter(|songs| songs.len() > 1)
+        .map(|mut songs| {
+            songs.sort_by(|a, b| a.song_id.cmp(&b.song_id));
+            let mbids: Option<Vec<&str>> =
+                songs.iter().map(|s| s.recording_mbid.as_deref()).collect();
+            let same_recording =
+                mbids.map(|ids| ids.iter().all(|id| id.eq_ignore_ascii_case(ids[0])));
+            SongGroup {
+                artist: songs[0].artist.clone().unwrap_or_default(),
+                title: songs[0].title.clone(),
+                same_recording,
+                songs,
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::models::navidrome_library::NavidromeLibraryRow;
     use crate::test_navidrome::{
-        child, native_song, song_requests, subsonic_failed, subsonic_ok, NavidromeStub,
+        child, native_song, song_requests, subsonic_failed, subsonic_ok, NavidromeStub, BAD_GATEWAY,
     };
     use serde_json::json;
     use shared::failure::{Cause, FailureCode, RetryAdvice, Service};
@@ -1290,5 +1349,119 @@ mod tests {
                 "Find songs failed: HTTP 502"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn songs_held_twice_are_grouped_across_pages_and_say_whether_they_are_one_recording() {
+        let navi = NavidromeStub::start();
+        let mbid = Some("0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c");
+        // A full first page: 998 distinct songs, then two copies of O Holy Night; the second page
+        // holds Silent Night twice, one without an MBID.
+        let mut first: Vec<String> = (0..998)
+            .map(|i| {
+                native_song(
+                    &format!("f{i:04}"),
+                    "Filler",
+                    &format!("Track {i}"),
+                    200.0,
+                    None,
+                )
+            })
+            .collect();
+        first.push(native_song(
+            "a1",
+            "Marrow Choir",
+            "O Holy Night",
+            263.4,
+            mbid,
+        ));
+        first.push(native_song(
+            "a2",
+            "marrow choir",
+            "O Holy Night!",
+            262.0,
+            mbid,
+        ));
+        let second = [
+            native_song(
+                "b1",
+                "Marrow Choir",
+                "Silent Night",
+                222.0,
+                Some("6a09041b-0f79-3278-88d9-0552dd28d37f"),
+            ),
+            native_song("b2", "Marrow Choir", "Silent Night", 222.0, None),
+        ];
+        navi.answer(
+            "/api/song",
+            &[
+                &format!("[{}]", first.join(",")),
+                &format!("[{}]", second.join(",")),
+            ],
+        );
+        let groups = duplicates(&navi.client()).await.unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|g| (
+                    g.title.as_str(),
+                    g.same_recording,
+                    g.songs
+                        .iter()
+                        .map(|s| s.song_id.as_str())
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("O Holy Night", Some(true), vec!["a1", "a2"]),
+                ("Silent Night", None, vec!["b1", "b2"])
+            ]
+        );
+        assert!(song_requests(&navi)
+            .iter()
+            .any(|t| t.contains("_start=1000&_end=2000")));
+    }
+
+    #[tokio::test]
+    async fn two_different_recordings_of_one_song_are_not_the_same_recording() {
+        let navi = NavidromeStub::start();
+        let songs = [
+            native_song(
+                "a",
+                "Marrow Choir",
+                "Silent Night",
+                222.0,
+                Some("6a09041b-0f79-3278-88d9-0552dd28d37f"),
+            ),
+            native_song(
+                "b",
+                "Marrow Choir",
+                "Silent Night",
+                222.0,
+                Some("0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c"),
+            ),
+            native_song("c", "Marrow Choir", "Away in a Manger", 180.0, None),
+        ];
+        navi.answer("/api/song", &[&format!("[{}]", songs.join(","))]);
+        let groups = duplicates(&navi.client()).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].same_recording, Some(false));
+        assert_eq!(song_requests(&navi).len(), 1, "a short page is the last");
+    }
+
+    #[tokio::test]
+    async fn a_page_that_fails_fails_the_search_instead_of_answering_a_part() {
+        let navi = NavidromeStub::start();
+        navi.answer_when("/api/song", "_start=0", 502, BAD_GATEWAY);
+        let f = duplicates(&navi.client()).await.unwrap_err();
+        assert_eq!(
+            (f.code, f.stage, f.retry),
+            (
+                FailureCode::NavidromeUnreachable,
+                Stage::LibraryCheck,
+                RetryAdvice::SameSourceLater
+            )
+        );
+        assert_eq!(f.cause.map(|c| c.status), Some(Some(502)));
     }
 }

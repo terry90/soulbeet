@@ -271,6 +271,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     discovery::PROMOTE_DISCOVERY_TRACK,
     discovery::REMOVE_DISCOVERY_TRACK,
     sync::SYNC_RATINGS,
+    deletion::FIND_DUPLICATES,
     deletion::PREVIEW_DELETE_TRACKS,
     deletion::DELETE_TRACKS,
     deletion::GET_DELETION_HISTORY,
@@ -490,7 +491,7 @@ mod tests {
             "get_status" | "get_settings" | "list_folders" | "get_library_stats"
             | "list_starred" | "list_playlists" | "get_jobs" | "list_batches" | "get_discovery"
             | "run_discovery" | "sync_ratings" => json!({}),
-            "get_deletion_history" => json!({}),
+            "get_deletion_history" | "find_duplicates" => json!({}),
             "find_in_library" => {
                 json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
             }
@@ -624,6 +625,7 @@ mod tests {
         ("promote_discovery_track", false, true, false, false),
         ("remove_discovery_track", false, true, true, false),
         ("sync_ratings", false, true, false, false),
+        ("find_duplicates", true, false, true, false),
         ("preview_delete_tracks", false, false, false, false),
         ("delete_tracks", false, true, true, false),
         ("get_deletion_history", true, false, true, false),

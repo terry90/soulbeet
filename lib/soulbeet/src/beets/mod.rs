@@ -6,7 +6,6 @@ mod runner;
 
 pub use probe::{python_from_shebang, resolve_on_path};
 pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
-pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 
 use crate::audio::count_audio_files;
 use crate::{
@@ -328,10 +327,6 @@ impl MusicImporter for BeetsImporter {
     fn refused(&self, issue: String) -> ImportResult {
         let action = fix_beets(&issue);
         ImportResult::refused(issue).with_user_action(action)
-    }
-
-    async fn find_duplicates(&self, libraries: &[&Path]) -> Result<DuplicateReport, String> {
-        library::find_duplicates_across_libraries(&self.settings, libraries).await
     }
 
     async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
@@ -1072,17 +1067,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_library_passes_the_library_dir_and_skips_prompt_noise() {
+    async fn forgetting_reads_the_item_through_prompt_noise_and_passes_the_library_dir() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let beet = script(
             d,
             "beet",
             &format!(
-                "printf '%s\\n' \"$@\" > '{}/args.txt'; \
-                 echo 'Enter the code: @@sb@@/m/a.flac|||A|||T|||Al|||AA'; \
-                 echo noise; \
-                 echo '@@sb@@/m/b.flac|||B|||T2|||Al|||AA'",
+                "echo \"$*\" >> '{}/args.txt'; \
+                 case \" $* \" in *\" ls \"*) echo 'Enter the code: @@sb@@7'; echo noise;; esac",
                 d.display()
             ),
         )
@@ -1092,20 +1085,26 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join(".beets_library.db"), "").unwrap();
 
-        let tracks = library::query_library(&s, &root).await.unwrap();
+        let outcome = library::forget_item(&s, &root, Path::new("/m/a.flac")).await;
 
-        let args = lines(&d.join("args.txt"));
-        let at = args.iter().position(|a| a == "-d").expect("no -d");
-        assert_eq!(args[at + 1], root.to_string_lossy());
-        assert_eq!(tracks.len(), 2);
-        let paths: Vec<&str> = tracks.iter().map(|t| t.path.as_str()).collect();
-        assert_eq!(paths, ["/m/a.flac", "/m/b.flac"]);
-        assert_eq!(tracks[1].artist, "B");
-        assert_eq!(tracks[1].album_artist, "AA");
+        assert!(matches!(outcome, ForgetOutcome::Removed), "{outcome:?}");
+        let calls = lines(&d.join("args.txt"));
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1].contains(" remove ") && calls[1].ends_with("id:7"),
+            "{}",
+            calls[1]
+        );
+        for call in &calls {
+            assert!(
+                call.contains(&format!("-d {}", root.display())),
+                "no -d root in {call}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn query_library_retries_once_when_the_db_is_locked() {
+    async fn forgetting_retries_once_when_the_db_is_locked() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let beet = script(
@@ -1114,7 +1113,7 @@ mod tests {
             &format!(
                 "if [ ! -e '{d}/locked-once' ]; then : > '{d}/locked-once'; \
                    echo 'database access error: database is locked' >&2; exit 1; fi; \
-                 echo '@@sb@@/m/a.flac|||A|||T|||Al|||AA'",
+                 case \" $* \" in *\" ls \"*) echo '@@sb@@7';; esac",
                 d = d.display()
             ),
         )
@@ -1122,8 +1121,8 @@ mod tests {
         let s = settings(d, beet, None);
         std::fs::write(d.join(".beets_library.db"), "").unwrap();
 
-        let tracks = library::query_library(&s, d).await.unwrap();
-        assert_eq!(tracks.len(), 1);
+        let outcome = library::forget_item(&s, d, Path::new("/m/a.flac")).await;
+        assert!(matches!(outcome, ForgetOutcome::Removed), "{outcome:?}");
     }
 
     /// beets words what a person does about its own setup and a full disk,
@@ -1211,15 +1210,5 @@ mod tests {
                 "Settings > Config",
             ))
         );
-    }
-
-    #[tokio::test]
-    async fn query_library_without_a_db_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = settings(dir.path(), PathBuf::from("/nonexistent/beet"), None);
-        assert!(library::query_library(&s, dir.path())
-            .await
-            .unwrap()
-            .is_empty());
     }
 }

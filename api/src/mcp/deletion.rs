@@ -13,6 +13,7 @@ use super::contract::{
     answer, failed, items, items_text, upstream_error, ItemResult, Items, NextCall, ToolError,
 };
 use super::keys::{keyed, request_key, Keyed};
+use super::library::navidrome_of;
 use super::paging::{fit, leave_out, Keep, Page, RESULT_MAX_CHARS};
 use super::refs::{page_schema, request_key_schema};
 use super::server::{common_codes, ToolSpec, NAVIDROME_CODES};
@@ -27,9 +28,11 @@ use crate::core::deletion::{
     self, App, ConfirmOutcome, Confirmed, Preview, PreviewEntry, PreviewOutcome, SONGS_PER_TOKEN,
     TOKEN_SECS,
 };
-use crate::core::library::SongFacts;
+use crate::core::library::{self, SongFacts, SongGroup};
 use crate::models::deletion_review::DeletionReviewRow;
 use crate::oauth::now_unix;
+
+const DUPLICATES_ARGS: &[&str] = &["limit", "cursor"];
 
 const PREVIEW_ARGS: &[&str] = &["song_ids", "reason"];
 
@@ -39,6 +42,25 @@ const HISTORY_ARGS: &[&str] = &["limit", "cursor"];
 
 /// Most of the caller's playlists an allowed song lists; `playlists_omitted` counts the rest.
 const PLAYLISTS_SHOWN: usize = 10;
+
+pub(crate) const FIND_DUPLICATES: ToolSpec = ToolSpec {
+    name: "find_duplicates",
+    title: "Duplicate songs",
+    description: |calls_a_minute| {
+        let common = common_codes(calls_a_minute);
+        format!("Finds songs the user's Navidrome library holds more than once: groups of present songs with the same artist and title (compared without case, accents or punctuation), each song with its id, album, format, bitrate, size, duration, path, recording MBID and this user's rating, and per group same_recording: true when every song has the same recording MBID, false when they have different ones, null when one has none. A group lists at most {SONGS_PER_TOKEN} songs and songs_omitted counts the rest. Reads the whole library, so it can take seconds to a minute on a large one. The song ids work in preview_delete_tracks. Failure codes: {common}, {NAVIDROME_CODES}.")
+    },
+    input_schema: concat!(
+        r#"{"type": "object", "additionalProperties": false, "properties": {"#,
+        page_schema!(),
+        "}}"
+    ),
+    read_only: true,
+    destructive: false,
+    idempotent: true,
+    open_world: false,
+    call: |state, caller, args| Box::pin(find_duplicates(state, caller, args)),
+};
 
 pub(crate) const PREVIEW_DELETE_TRACKS: ToolSpec = ToolSpec {
     name: "preview_delete_tracks",
@@ -120,6 +142,41 @@ fn deletion_off() -> ToolError {
         tried: vec![],
         next: vec![],
     }
+}
+
+/// `find_duplicates`: a page of the groups of songs the caller's library holds twice.
+async fn find_duplicates(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new(FIND_DUPLICATES.name, args, DUPLICATES_ARGS);
+    answer(
+        async {
+            let page = Page::read(&args, json!({}))?;
+            args.finish()?;
+            let navi = navidrome_of(state, caller, Stage::LibraryCheck, &args).await?;
+            let groups = library::duplicates(&navi)
+                .await
+                .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
+            let groups: Vec<Value> = groups.iter().map(group_value).collect();
+            let shown = groups.get(page.offset..).unwrap_or_default().to_vec();
+            Ok(fit(Map::new(), "groups", shown, &page, false))
+        }
+        .await,
+    )
+}
+
+/// `group` with at most SONGS_PER_TOKEN songs, and `songs_omitted` counting the rest.
+fn group_value(group: &SongGroup) -> Value {
+    let mut value = json!(group);
+    let songs = value["songs"]
+        .as_array_mut()
+        .expect("a group lists its songs");
+    let omitted = songs.len().saturating_sub(SONGS_PER_TOKEN);
+    songs.truncate(SONGS_PER_TOKEN);
+    value["songs_omitted"] = json!(omitted);
+    value
 }
 
 /// `preview_delete_tracks`: each song checked, and a token for those every rule allows.
@@ -519,11 +576,12 @@ mod tests {
 
     use super::*;
     use crate::connection::test_util::{
-        access_token, app_on_library, call_tool, document, RESOURCE,
+        access_token, app_on_library, call_tool, document, mcp_app, mcp_app_with, RESOURCE,
     };
     use crate::core::delete_guard::quota::{daily_limit, enable_deletion};
     use crate::core::delete_guard::test_support::Library;
     use crate::core::deletion::tokens::{token_expired, token_not_found, token_used};
+    use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub};
 
     async fn preview_s1(app: &axum::Router, token: &str) -> Value {
         document(
@@ -1158,5 +1216,76 @@ mod tests {
         for text in [preview, delete] {
             assert!(text.contains(&format!("At most {DAILY_APP_DELETIONS} tracks a day")));
         }
+    }
+
+    #[tokio::test]
+    async fn find_duplicates_through_the_router() {
+        let navi = NavidromeStub::start();
+        let songs = [
+            native_song("a1", "Marrow Choir", "O Holy Night", 263.4, None),
+            native_song("a2", "Marrow Choir", "O Holy Night", 262.0, None),
+            native_song("z1", "Marrow Choir", "Silent Night", 222.0, None),
+        ];
+        navi.answer("/api/song", &[&format!("[{}]", songs.join(","))]);
+        let (_, app, token) =
+            mcp_app_with(std::sync::Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let doc = document(&call_tool(app, &token, "find_duplicates", json!({})).await);
+        assert_eq!(doc["ok"], true);
+        let groups = doc["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            (
+                groups[0]["title"].as_str(),
+                groups[0]["same_recording"].clone(),
+                groups[0]["songs_omitted"].clone()
+            ),
+            (Some("O Holy Night"), json!(null), json!(0))
+        );
+        let ids: Vec<&str> = groups[0]["songs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["song_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["a1", "a2"]);
+        assert_eq!(doc["cursor"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn a_group_lists_at_most_one_tokens_worth_of_songs() {
+        let navi = NavidromeStub::start();
+        let songs: Vec<String> = (0..SONGS_PER_TOKEN + 3)
+            .map(|i| {
+                native_song(
+                    &format!("s{i:03}"),
+                    "Marrow Choir",
+                    "Silent Night",
+                    222.0,
+                    None,
+                )
+            })
+            .collect();
+        navi.answer("/api/song", &[&format!("[{}]", songs.join(","))]);
+        let (_, app, token) =
+            mcp_app_with(std::sync::Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let doc = document(&call_tool(app, &token, "find_duplicates", json!({})).await);
+        let group = &doc["groups"][0];
+        assert_eq!(
+            (
+                group["songs"].as_array().unwrap().len(),
+                group["songs_omitted"].clone()
+            ),
+            (SONGS_PER_TOKEN, json!(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn find_duplicates_without_navidrome_says_how_to_link() {
+        let (_, app, token) = mcp_app().await;
+        let result = call_tool(app, &token, "find_duplicates", json!({})).await;
+        assert_eq!(result["isError"], true);
+        let e = &document(&result)["error"];
+        assert_eq!(e["code"], "navidrome_not_linked");
+        assert_eq!(e["user_action"]["code"], "relink_navidrome");
     }
 }

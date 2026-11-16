@@ -751,8 +751,8 @@ mod tests {
     use crate::mcp::paging::RESULT_MAX_CHARS;
     use crate::test_navidrome::{
         native_playlist, native_songs, playlist_body, playlist_row, playlist_rows, playlists_body,
-        subsonic_failed, subsonic_ok, NavidromeFor, NavidromeStub, ADVENT, AWAY, DISCOVERY_RULES,
-        HOLY, SILENT,
+        subsonic_failed, subsonic_ok, NavidromeFor, NavidromeStub, ADVENT, AWAY, BAD_GATEWAY,
+        DISCOVERY_RULES, HOLY, SILENT,
     };
 
     #[tokio::test]
@@ -831,7 +831,7 @@ mod tests {
     async fn an_unreachable_navidrome_is_offered_again() {
         let navi = NavidromeStub::start();
         // nginx's 502 page (src/http/ngx_http_special_response.c)
-        navi.answer_when("/rest/getPlaylists", "", 502, "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n");
+        navi.answer_when("/rest/getPlaylists", "", 502, BAD_GATEWAY);
         let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
         let e = &document(&call_tool(app, &token, "list_playlists", json!({"limit": 10})).await)
             ["error"];
@@ -1073,7 +1073,7 @@ mod tests {
     async fn an_unreachable_navidrome_offers_the_same_call_without_its_key() {
         let navi = NavidromeStub::start();
         // nginx's 502 page (src/http/ngx_http_special_response.c)
-        navi.answer_when("/rest/getPlaylist", "", 502, "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n");
+        navi.answer_when("/rest/getPlaylist", "", 502, BAD_GATEWAY);
         let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
         let error = &document(
             &call_tool(
@@ -1641,9 +1641,6 @@ mod tests {
             )
         );
     }
-
-    /// nginx's answer when Navidrome behind it does not answer.
-    const BAD_GATEWAY: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
 
     /// `navi` answers alice's static, empty playlist ADVENT, and HOLY as present.
     fn empty_advent(navi: &NavidromeStub) {

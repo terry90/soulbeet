@@ -6,7 +6,6 @@ use shared::{
         SkipKind, SourcePresence,
     },
     failure::{Failure, UserAction},
-    library::DuplicateReport,
     metadata::{AlbumWithTracks, Provider, SearchResult as MetadataSearchResult},
     recommendation::{
         ArtistPopularity, CandidateSet, Listen, ProfileConfig, RankedArtist, RankedTrack,
@@ -437,11 +436,6 @@ pub trait MusicImporter: Send + Sync {
     /// The result of a job not run because of `issue`, the title of one of
     /// this importer's blocking health issues.
     fn refused(&self, issue: String) -> ImportResult;
-
-    async fn find_duplicates(
-        &self,
-        libraries: &[&Path],
-    ) -> std::result::Result<DuplicateReport, String>;
 
     /// Removes the item at exactly `file` from the library of `library`,
     /// leaving the file alone.

@@ -82,7 +82,6 @@ pub async fn refusal(importer: &dyn MusicImporter) -> Option<String> {
 mod tests {
     use super::*;
     use shared::failure::{FailureCode, RetryAdvice, Stage};
-    use shared::library::DuplicateReport;
     use shared::system::HealthIssue;
     use soulbeet::{
         DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportResult, Relocation,
@@ -129,9 +128,6 @@ mod tests {
             unreachable!()
         }
         fn refused(&self, _: String) -> ImportResult {
-            unreachable!()
-        }
-        async fn find_duplicates(&self, _: &[&Path]) -> Result<DuplicateReport, String> {
             unreachable!()
         }
         async fn forget(&self, _: &Path, _: &Path) -> ForgetOutcome {

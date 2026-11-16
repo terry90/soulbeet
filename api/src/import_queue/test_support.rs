@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use shared::download::{
     DownloadEvent, DownloadProgress, DownloadState, MatchCandidate, MatchChoices, MatchKind,
 };
-use shared::library::DuplicateReport;
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::{
     DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
@@ -332,10 +331,6 @@ impl MusicImporter for StubImporter {
 
     fn refused(&self, issue: String) -> ImportResult {
         ImportResult::refused(issue)
-    }
-
-    async fn find_duplicates(&self, _: &[&Path]) -> Result<DuplicateReport, String> {
-        unreachable!()
     }
 
     async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {

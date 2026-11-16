@@ -1,6 +1,5 @@
 use crate::models;
 use dioxus::prelude::*;
-use shared::library::DuplicateReport;
 
 #[cfg(feature = "server")]
 use super::{failure_error, refusal_error, server_error};
@@ -13,8 +12,6 @@ use crate::folder_policy::{
 };
 #[cfg(feature = "server")]
 use crate::models::folder_root::FolderRoot;
-#[cfg(feature = "server")]
-use crate::services::music_importer;
 #[cfg(feature = "server")]
 use crate::AdminSession;
 #[cfg(feature = "server")]
@@ -154,26 +151,4 @@ pub async fn set_folder_shared(folder_id: String, shared: bool) -> Result<(), Se
     models::folder::Folder::set_shared(&folder_id, shared)
         .await
         .map_err(server_error)
-}
-
-/// Find duplicate tracks across all of the user's library folders.
-/// Returns tracks that exist in multiple libraries (same artist + title).
-#[get("/api/folders/duplicates", auth: AuthSession)]
-pub async fn get_folder_duplicates() -> Result<DuplicateReport, ServerFnError> {
-    let folders = models::folder::Folder::get_all_by_user(&auth.0.user_id)
-        .await
-        .map_err(server_error)?;
-
-    if folders.len() < 2 {
-        return Ok(DuplicateReport {
-            duplicates: vec![],
-            total_duplicate_tracks: 0,
-            libraries_scanned: folders.iter().map(|f| f.path.clone()).collect(),
-        });
-    }
-
-    let paths: Vec<&Path> = folders.iter().map(|f| Path::new(&f.path)).collect();
-
-    let importer = music_importer(None).await.map_err(server_error)?;
-    importer.find_duplicates(&paths).await.map_err(server_error)
 }

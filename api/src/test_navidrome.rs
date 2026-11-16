@@ -487,3 +487,7 @@ pub(crate) fn subsonic_song(id: &str, title: &str, rating: Option<u8>) -> Subson
         track: None,
     }
 }
+
+/// nginx's 502 page (src/http/ngx_http_special_response.c) as a proxy in front of Navidrome
+/// sends it; the native client keeps it as the failure's cause (client.rs, `native_failure`).
+pub(crate) const BAD_GATEWAY: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";

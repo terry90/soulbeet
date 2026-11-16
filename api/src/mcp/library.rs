@@ -395,7 +395,7 @@ mod tests {
     use crate::services::NavidromeLookupError;
     use crate::test_navidrome::{
         child, native_song, song_requests, subsonic_failed, subsonic_ok, NavidromeFor,
-        NavidromeStub,
+        NavidromeStub, BAD_GATEWAY,
     };
 
     #[tokio::test]
@@ -528,8 +528,6 @@ mod tests {
     }
 
     /// nginx's 502 page (src/http/ngx_http_special_response.c), which the native client keeps
-    /// as the cause (client.rs, `native_failure`).
-    const NGINX_502: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
 
     #[tokio::test]
     async fn a_reference_navidrome_would_drop_is_refused_before_navidrome_is_asked() {
@@ -641,7 +639,7 @@ mod tests {
             "/api/song",
             "title=Marrow+Choir+Silent+Night",
             502,
-            NGINX_502,
+            BAD_GATEWAY,
         );
         let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
         let result = call_tool(
@@ -682,7 +680,7 @@ mod tests {
         );
         assert_eq!(
             (&e["cause"]["status"], &e["cause"]["raw"]),
-            (&json!(502), &json!(NGINX_502))
+            (&json!(502), &json!(BAD_GATEWAY))
         );
         assert_eq!(
             e["facts"],
@@ -698,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn failed_entries_count_toward_the_cap() {
         let navi = NavidromeStub::start();
-        navi.answer_when("/api/song", "", 502, NGINX_502);
+        navi.answer_when("/api/song", "", 502, BAD_GATEWAY);
         let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
         // An album name long enough that 100 failed entries, each repeating its reference in `next`, pass 60,000 characters.
         let album = "Christmas Songs and Carols from the Cathedral, Recorded Live ".repeat(6);

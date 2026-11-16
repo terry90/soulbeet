@@ -5,17 +5,12 @@ use super::BeetsSettings;
 use crate::traits::{ForgetOutcome, Relocation};
 use serde::Deserialize;
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
-use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
-use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use tracing::{info, warn};
 
 /// Starts every `beet ls` row, so text a plugin prints before it (a prompt
 /// without a newline) cannot be read as part of the row.
 const ROW_MARKER: &str = "@@sb@@";
-const FIELD_SEP: &str = "|||";
-const LS_FORMAT: &str = "@@sb@@$path|||$artist|||$title|||$album|||$albumartist";
 const ID_FORMAT: &str = "@@sb@@$id";
 
 /// One item as `beet export -l -f jsonlines -i id,path` prints it: beets' formatted values,
@@ -30,19 +25,6 @@ pub(crate) fn library_db(root: &Path) -> PathBuf {
     root.join(".beets_library.db")
 }
 
-fn parse_row(row: &str, library: &str) -> Option<LibraryTrack> {
-    let mut fields = row.split(FIELD_SEP);
-    let mut next = || fields.next().map(str::to_string);
-    Some(LibraryTrack {
-        path: next()?,
-        artist: next()?,
-        title: next()?,
-        album: next()?,
-        album_artist: next()?,
-        library_path: library.to_string(),
-    })
-}
-
 /// Whether the folder `root` has a library db. A folder that cannot be read
 /// is an error, not a folder without one.
 async fn has_library(root: &Path) -> Result<bool, String> {
@@ -50,29 +32,6 @@ async fn has_library(root: &Path) -> Result<bool, String> {
     tokio::fs::try_exists(&db)
         .await
         .map_err(|e| format!("Could not read {}: {e}", db.display()))
-}
-
-/// Every track in the library under `root`. A folder without a library db has
-/// no tracks.
-pub(crate) async fn query_library(
-    s: &BeetsSettings,
-    root: &Path,
-) -> Result<Vec<LibraryTrack>, String> {
-    if !has_library(root).await? {
-        return Ok(Vec::new());
-    }
-    let library = library_db(root).to_string_lossy().into_owned();
-    let rows = run_library(
-        s,
-        root,
-        None,
-        vec!["ls".into(), "-f".into(), LS_FORMAT.into()],
-    )
-    .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| parse_row(row, &library))
-        .collect())
 }
 
 /// Drops the item at exactly `file` from the library under `root`, leaving
@@ -426,65 +385,6 @@ async fn run_library(
             RunEnd::SpawnFailed(e) => failed(format!("Could not start beets: {e}"), None),
         };
     }
-}
-
-/// Tracks with the same artist and title in more than one of `roots`.
-pub(crate) async fn find_duplicates_across_libraries(
-    s: &BeetsSettings,
-    roots: &[&Path],
-) -> Result<DuplicateReport, String> {
-    let mut all_tracks: Vec<LibraryTrack> = Vec::new();
-    let mut libraries_scanned: Vec<String> = Vec::new();
-
-    for root in roots {
-        info!("Scanning library: {:?}", library_db(root));
-        match query_library(s, root).await {
-            Ok(tracks) => {
-                info!("Found {} tracks in {:?}", tracks.len(), root);
-                all_tracks.extend(tracks);
-                libraries_scanned.push(root.to_string_lossy().to_string());
-            }
-            Err(e) => {
-                warn!("Failed to scan library {:?}: {}", root, e);
-            }
-        }
-    }
-
-    // Grouped by (artist, title), compared case-insensitively.
-    let mut track_groups: HashMap<(String, String), Vec<LibraryTrack>> = HashMap::new();
-    for track in all_tracks {
-        let key = (
-            track.artist.to_lowercase().trim().to_string(),
-            track.title.to_lowercase().trim().to_string(),
-        );
-        track_groups.entry(key).or_default().push(track);
-    }
-
-    let duplicates: Vec<DuplicateGroup> = track_groups
-        .into_iter()
-        .filter(|(_, tracks)| {
-            let unique_libs: HashSet<_> = tracks.iter().map(|t| &t.library_path).collect();
-            unique_libs.len() > 1
-        })
-        .map(|((artist, title), tracks)| {
-            // Shown with the first track's original case.
-            let display_artist = tracks.first().map(|t| t.artist.clone()).unwrap_or(artist);
-            let display_title = tracks.first().map(|t| t.title.clone()).unwrap_or(title);
-            DuplicateGroup {
-                artist: display_artist,
-                title: display_title,
-                tracks,
-            }
-        })
-        .collect();
-
-    let total_duplicate_tracks: usize = duplicates.iter().map(|g| g.tracks.len()).sum();
-
-    Ok(DuplicateReport {
-        duplicates,
-        total_duplicate_tracks,
-        libraries_scanned,
-    })
 }
 
 #[cfg(test)]
@@ -950,10 +850,6 @@ mod tests {
         assert!(matches!(
             forget_item(&settings, &root, &root.join("a.flac")).await,
             ForgetOutcome::Failed(e) if e.starts_with(&expected)
-        ));
-        assert!(matches!(
-            query_library(&settings, &root).await,
-            Err(e) if e.starts_with(&expected)
         ));
     }
 }

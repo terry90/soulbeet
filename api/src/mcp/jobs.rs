@@ -1264,7 +1264,7 @@ mod tests {
     #[tokio::test]
     async fn one_lookup_that_fails_keeps_the_songs_the_others_found() {
         use crate::connection::test_util::app_with_navidrome;
-        use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub};
+        use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub, BAD_GATEWAY};
         use std::sync::Arc;
         let (db, acq, effects, token) = jobs_app().await;
         let navi = NavidromeStub::start();
@@ -1278,8 +1278,12 @@ mod tests {
             ),
         );
         // nginx's 502 page for the other lookup.
-        navi.answer_when("/api/song", "title=Marrow+Choir+Silent+Night", 502,
-            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n");
+        navi.answer_when(
+            "/api/song",
+            "title=Marrow+Choir+Silent+Night",
+            502,
+            BAD_GATEWAY,
+        );
         // The library's two copies beets found, each the size Navidrome lists (sparse: nothing
         // is written).
         let copy = |title: &str| {

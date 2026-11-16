@@ -799,6 +799,23 @@ impl NavidromeClient {
         .await
     }
 
+    /// Present songs (missing=false) in id order, rows `start` to `end` (exclusive). The
+    /// `missing` filter is `booleanFilter` (persistence/mediafile_repository.go:125,
+    /// persistence/sql_restful.go:104-107 in 0.64.2).
+    pub async fn list_songs(&self, start: u32, end: u32) -> Result<Vec<NativeSong>> {
+        self.native_songs(
+            "List songs",
+            &[
+                ("_start", start.to_string()),
+                ("_end", end.to_string()),
+                ("_sort", "id".to_string()),
+                ("_order", "ASC".to_string()),
+                ("missing", "false".to_string()),
+            ],
+        )
+        .await
+    }
+
     /// Present songs (missing=false), the one Navidrome added last first, rows `start` to `end`
     /// (exclusive). The `created_at` sort is `media_file.created_at`
     /// (persistence/mediafile_repository.go:86), set when a file is first stored (`:132`) and kept
@@ -2308,6 +2325,36 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, NavidromeError::Parse(_)), "{err:?}");
         }
+    }
+
+    /// nginx's 502 page, as step 8's one_failed_lookup_makes_the_result_partial sends it.
+    const BAD_GATEWAY: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+
+    #[tokio::test]
+    async fn present_songs_are_listed_a_page_at_a_time_in_id_order() {
+        let (url, seen) = serve(vec![
+            reply(LOGIN),
+            reply(NATIVE_SONG),
+            Reply {
+                status: 502,
+                body: BAD_GATEWAY.into(),
+            },
+        ]);
+        let c = client(&url);
+        let songs = c.list_songs(0, 1000).await.unwrap();
+        assert_eq!(
+            songs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["3sG8kPq0WmZ1xYbN4vTcDe"]
+        );
+        assert_eq!(
+            seen.lock().unwrap()[1].target,
+            "/api/song?_start=0&_end=1000&_sort=id&_order=ASC&missing=false"
+        );
+        let err = c.list_songs(1000, 2000).await.unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Http { action: "List songs", status: 502, body: None, raw: Some(r) } if r == BAD_GATEWAY),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
