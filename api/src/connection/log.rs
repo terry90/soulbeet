@@ -9,10 +9,22 @@ use axum::http::HeaderMap;
 use crate::base_url::{BaseUrl, BaseUrlError};
 use crate::connections::LoggedRequest;
 
-/// How many requests the log keeps of each kind: refused or failed ones,
-/// and answered ones. Kept apart, so a day of routine calls does not push
-/// the last refusals out.
+/// How many requests the log keeps of each kind: the refusals an admin
+/// needs (`NEEDED_REFUSALS`), other refused or failed ones, and answered
+/// ones. Kept apart, so a day of routine calls does not push the last
+/// refusals out, and scanners' 404s and expired tokens' 401s do not push
+/// out the refusal that says why Claude cannot connect.
 pub(crate) const LOG_CAPACITY: usize = 50;
+
+/// The connection layer's refusals that say why Claude cannot connect at
+/// all, which an admin reads in Settings to fix the instance.
+const NEEDED_REFUSALS: [&str; 5] = [
+    "origin_not_allowed",
+    "https_required",
+    "mcp_unavailable",
+    "mcp_disabled",
+    "address_unreadable",
+];
 
 /// How many characters of a path, an address problem or a header value an
 /// entry keeps.
@@ -22,12 +34,14 @@ const FIELD_CHARS: usize = 200;
 struct Entries {
     /// Numbers the entries in the order they were recorded.
     next: u64,
+    needed: VecDeque<(u64, LoggedRequest)>,
     refused: VecDeque<(u64, LoggedRequest)>,
     answered: VecDeque<(u64, LoggedRequest)>,
 }
 
-/// The newest `LOG_CAPACITY` refused or unanswered requests and the newest
-/// `LOG_CAPACITY` answered ones.
+/// The newest `LOG_CAPACITY` requests refused with one of
+/// `NEEDED_REFUSALS`, of other refused or unanswered requests, and of
+/// answered ones.
 #[derive(Default)]
 pub(crate) struct RequestLog {
     entries: Mutex<Entries>,
@@ -46,7 +60,13 @@ impl RequestLog {
         let mut entries = self.lock();
         let seq = entries.next;
         entries.next += 1;
-        let kind = if is_refused(&entry) {
+        let needed = entry
+            .refusal
+            .as_deref()
+            .is_some_and(|code| NEEDED_REFUSALS.contains(&code));
+        let kind = if needed {
+            &mut entries.needed
+        } else if is_refused(&entry) {
             &mut entries.refused
         } else {
             &mut entries.answered
@@ -57,11 +77,15 @@ impl RequestLog {
         kind.push_front((seq, entry));
     }
 
-    /// The entries of both kinds, newest first.
+    /// The entries of every kind, newest first.
     pub(crate) fn recent(&self) -> Vec<LoggedRequest> {
         let entries = self.lock();
-        let mut all: Vec<&(u64, LoggedRequest)> =
-            entries.refused.iter().chain(&entries.answered).collect();
+        let mut all: Vec<&(u64, LoggedRequest)> = entries
+            .needed
+            .iter()
+            .chain(&entries.refused)
+            .chain(&entries.answered)
+            .collect();
         all.sort_unstable_by_key(|(seq, _)| std::cmp::Reverse(*seq));
         all.into_iter().map(|(_, entry)| entry.clone()).collect()
     }
@@ -190,6 +214,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1, Some(403)), (2, Some(401)), (3, None)]
         );
+    }
+
+    #[test]
+    fn scanners_and_expired_tokens_do_not_push_out_why_claude_cannot_connect() {
+        let log = RequestLog::default();
+        for (at, code) in NEEDED_REFUSALS.iter().enumerate() {
+            log.record(entry(at as i64, Some(403), Some(code)));
+        }
+        // A scanner's probes and a client retrying with an expired token.
+        for at in 10..10_000 {
+            match at % 2 {
+                0 => log.record(entry(at, Some(404), Some("not_found"))),
+                _ => log.record(entry(at, Some(401), None)),
+            }
+        }
+        let recent = log.recent();
+        assert_eq!(recent.len(), LOG_CAPACITY + NEEDED_REFUSALS.len());
+        let kept: Vec<_> = recent
+            .iter()
+            .rev()
+            .take(NEEDED_REFUSALS.len())
+            .map(|e| e.refusal.clone().unwrap())
+            .collect();
+        assert_eq!(kept, NEEDED_REFUSALS);
     }
 
     #[test]

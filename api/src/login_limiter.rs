@@ -10,6 +10,8 @@ use std::fmt;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::oauth::limits::{retry_after_seconds, try_again_in};
+
 /// Consecutive failures an account may make before waits start.
 pub const FREE_FAILURES: u32 = 3;
 /// Longest wait after a failure.
@@ -40,10 +42,10 @@ impl fmt::Display for LoginBlock {
             LoginBlock::Account { retry_after } => ("for this account", retry_after),
             LoginBlock::Server { retry_after } => ("on this server", retry_after),
         };
-        let seconds = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
         write!(
             f,
-            "Too many failed sign-ins {what}. Try again in {seconds} seconds."
+            "Too many failed sign-ins {what}. {}",
+            try_again_in(retry_after_seconds(*retry_after))
         )
     }
 }
@@ -451,6 +453,13 @@ mod tests {
         assert_eq!(
             server.to_string(),
             "Too many failed sign-ins on this server. Try again in 30 seconds."
+        );
+        let last = LoginBlock::Account {
+            retry_after: Duration::from_millis(400),
+        };
+        assert_eq!(
+            last.to_string(),
+            "Too many failed sign-ins for this account. Try again in 1 second."
         );
     }
 }
