@@ -251,7 +251,7 @@ pub enum TimeoutKind {
     Total(Duration),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskCount {
     pub imported: u32,
     pub total: u32,

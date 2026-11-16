@@ -49,7 +49,7 @@ fn refusal(
 
 /// The row has no kept job: none was kept, it was lost on restart or
 /// dropped as the oldest, or a retry from another row of it took it.
-pub(super) fn nothing_to_retry() -> ImportRefusal {
+pub(crate) fn nothing_to_retry() -> ImportRefusal {
     refusal(
         FailureCode::UnknownHandle,
         Stage::Input,
@@ -60,7 +60,7 @@ pub(super) fn nothing_to_retry() -> ImportRefusal {
 }
 
 /// The kept files were deleted. The retry took the job, so it is gone too.
-pub(super) fn files_gone() -> ImportRefusal {
+pub(crate) fn files_gone() -> ImportRefusal {
     refusal(
         FailureCode::ImportFilesGone,
         Stage::Import,

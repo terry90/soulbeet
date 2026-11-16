@@ -5,6 +5,7 @@
 
 use crate::auth::UserId;
 use crate::core::library::SongFacts;
+use crate::import_queue::KeptRun;
 use crate::transfer_registry::TransferRegistry;
 use serde::{Deserialize, Serialize};
 use shared::download::{
@@ -129,6 +130,10 @@ pub struct StoredImport {
     /// reads as `Guarded`.
     #[serde(default)]
     pub duplicates: DuplicateRule,
+    /// What the import's last run knew; None before it first ran, and in a row stored before
+    /// runs were kept.
+    #[serde(default)]
+    pub last_run: Option<KeptRun>,
 }
 
 /// How a batch's imports treat what the library already has.
@@ -865,12 +870,16 @@ impl Ledger {
         self.write(|reply| Write::Prune { now, reply }).await
     }
 
-    /// Waits until every write sent before it is applied.
+    /// Waits until every write sent before it is applied, so a read after it sees the events
+    /// another part (the import queue) recorded before.
+    pub async fn applied(&self) -> Result<(), LedgerError> {
+        self.write(|reply| Write::Settled { reply }).await
+    }
+
+    /// `applied`, in a test whose writer runs.
     #[cfg(test)]
     pub async fn settled(&self) {
-        self.write(|reply| Write::Settled { reply })
-            .await
-            .expect("the ledger writer runs");
+        self.applied().await.expect("the ledger writer runs");
     }
 }
 
@@ -1409,6 +1418,7 @@ mod tests {
             choices: None,
             choice: DriverChoice::Auto,
             duplicates: DuplicateRule::Guarded,
+            last_run: None,
             rows: vec![(
                 slot.clone(),
                 row_of("j1", 0, "01.flac", DownloadState::ImportQueued(1), 100),
@@ -1624,6 +1634,7 @@ mod tests {
             choices: None,
             choice: DriverChoice::Auto,
             duplicates: DuplicateRule::Skip,
+            last_run: None,
             rows: vec![(
                 slot.clone(),
                 row_of("j1", 0, "01.flac", DownloadState::ImportQueued(1), 100),
@@ -1681,6 +1692,7 @@ mod tests {
             choices: None,
             choice: DriverChoice::Auto,
             duplicates: DuplicateRule::Guarded,
+            last_run: None,
             rows: vec![(
                 JobSlot {
                     job: "j1".into(),
@@ -2830,6 +2842,7 @@ mod tests {
                 choices: None,
                 choice: DriverChoice::Auto,
                 duplicates: DuplicateRule::Guarded,
+                last_run: None,
                 rows: vec![(slot.clone(), imported.clone())],
             },
             rows: vec![imported.clone()],

@@ -1061,6 +1061,7 @@ pub async fn generate_discovery_playlist_internal(
                         choices: None,
                         // Discovery's staging keeps its own rules (section 13).
                         duplicates: Duplicates::AsConfigured,
+                        last_run: None,
                     })
                     .await
                     .wait()

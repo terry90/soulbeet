@@ -26,6 +26,7 @@ use shared::failure::{Failure, Stage};
 use soulbeet::{DownloadBackend, ImportMode};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::Notify;
 use tracing::{info, warn};
@@ -61,11 +62,14 @@ pub(crate) struct Acquire {
     pub searches: Arc<Searches>,
     /// Where finished downloads are imported and kept imports wait for a decision.
     pub queue: ImportQueue,
+    /// The folder downloads land in, which kept imports are shown relative to.
+    pub download_base: PathBuf,
     /// The jobs a runner takes on now.
     runners: Runners,
 }
 
-/// The server's: its database, LEDGER, the live effects, one line of searches and IMPORT_QUEUE.
+/// The server's: its database, LEDGER, the live effects, one line of searches, IMPORT_QUEUE and
+/// the configured download folder.
 pub(crate) static ACQUIRE: LazyLock<Arc<Acquire>> = LazyLock::new(|| {
     Arc::new(Acquire {
         db: (*crate::db::DB).clone(),
@@ -73,6 +77,7 @@ pub(crate) static ACQUIRE: LazyLock<Arc<Acquire>> = LazyLock::new(|| {
         effects: Arc::new(LiveEffects),
         searches: Arc::default(),
         queue: IMPORT_QUEUE.clone(),
+        download_base: crate::config::CONFIG.download_path().clone(),
         runners: Runners::default(),
     })
 });
@@ -558,26 +563,31 @@ mod test_effects {
 
     impl Acquire {
         /// An `Acquire` on `db` with its own ledger writer, line of searches and import queue
-        /// (whose ledger events reach that ledger), acting through the `TestEffects` it returns.
+        /// (importing through the `TestEffects`' importer, its ledger events reaching that
+        /// ledger), and a download folder of its own, acting through the `TestEffects` it
+        /// returns, which holds that folder until both are dropped.
         pub(crate) fn for_test(db: SqlitePool) -> (Arc<Acquire>, Arc<TestEffects>) {
             let ledger = Ledger::start(db.clone());
+            let importer = Arc::new(StubImporter::new());
             let effects = Arc::new(TestEffects {
                 ledger: ledger.clone(),
                 stub: StubBackend::new(vec![]),
-                importer: StubImporter::new(),
+                importer: importer.clone(),
+                downloads: tempfile::tempdir().expect("a test download folder"),
                 tracks: Mutex::default(),
                 hydrate_error: Mutex::default(),
                 backend_held: watch::Sender::new(false),
                 backend_calls_held: AtomicUsize::new(0),
                 enqueued: Mutex::default(),
             });
-            let deps = RecordingDeps::into_ledger(Arc::new(StubImporter::new()), ledger.clone());
+            let deps = RecordingDeps::into_ledger(importer, ledger.clone());
             let acquire = Acquire {
                 ledger,
                 db,
                 effects: effects.clone(),
                 searches: Arc::default(),
                 queue: ImportQueue::new(deps),
+                download_base: effects.downloads.path().to_path_buf(),
                 runners: Runners::default(),
             };
             (Arc::new(acquire), effects)
@@ -585,15 +595,18 @@ mod test_effects {
     }
 
     /// Answers the `StubBackend` it holds, blocks imports as its `StubImporter`'s health says
-    /// (ready until `importer().set_health`), and hydrates through step 3's `hydrate_in` on a
-    /// provider whose album has the tracks `set_tracks` gave (none until then), or whose
+    /// (ready until `importer().set_health`), the importer the queue imports through, and
+    /// hydrates through step 3's `hydrate_in` on a provider whose album has the tracks
+    /// `set_tracks` gave (none until then), or whose
     /// `get_album` answers the error `fail_hydrate` gave. Keeps every enqueue and answers it
     /// with each item enqueued, recording only its send (Enqueued), as enqueue_and_watch records
     /// it before the backend hears of it.
     pub(crate) struct TestEffects {
         ledger: Ledger,
         stub: Arc<StubBackend>,
-        importer: StubImporter,
+        importer: Arc<StubImporter>,
+        /// The download folder of the `Acquire` made with it.
+        downloads: tempfile::TempDir,
         tracks: Mutex<Vec<Track>>,
         hydrate_error: Mutex<Option<MetadataError>>,
         /// While true, `backend` calls wait for it to turn false.
@@ -652,7 +665,7 @@ mod test_effects {
         }
 
         async fn importer_blocked(&self) -> Option<Failure> {
-            blocking_failure_of(&self.importer)
+            blocking_failure_of(self.importer.as_ref())
         }
 
         async fn hydrate(&self, _ctx: &UserCtx, query: &mut DownloadQuery) -> Result<(), Failure> {

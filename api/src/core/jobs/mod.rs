@@ -10,7 +10,7 @@ use crate::core::sources::{self, Candidate, RECENT_FAILURES_SECS};
 use crate::ledger::store::{self, AttemptRecord, JobRecord, StoredSearch, TimelineEntry};
 use crate::ledger::{
     Admitted, BatchOrigin, IndexWait, JobKind, JobOptions, JobState, Ledger, NewJob, NewJobBatch,
-    SlotResult, MCP_UNFINISHED_JOBS_PER_USER,
+    SlotResult, StoredImport, MCP_UNFINISHED_JOBS_PER_USER,
 };
 use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
@@ -25,6 +25,7 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub(crate) mod decide;
 pub(crate) mod retry;
 pub mod runner;
 #[cfg(test)]
@@ -359,6 +360,8 @@ pub(crate) struct SlotView {
     pub result: Option<SlotResult>,
     /// Its import's wait for Navidrome, kept once the wait ended.
     pub index_wait: Option<IndexWait>,
+    /// The import it waits for a decision on, while it does.
+    pub kept: Option<StoredImport>,
 }
 
 /// A job with everything the ledger keeps of it.
@@ -430,6 +433,7 @@ pub(crate) async fn views_of(
                 row: track.row,
                 result: track.result,
                 index_wait: track.index_wait,
+                kept: track.kept,
             })
             .collect();
         let timeline = store::timeline_of(db, &job.id).await.map_err(failed)?;

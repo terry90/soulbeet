@@ -9,6 +9,7 @@ mod rows;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub(crate) use choice::{files_gone, nothing_to_retry};
 pub use retry::{forget_retries, import_choices_for, retry_import_for};
 pub(crate) use rows::import_failure;
 
@@ -19,12 +20,13 @@ use crate::ledger::{
 };
 use async_trait::async_trait;
 use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, MatchChoices};
 use shared::failure::Failure;
 use soulbeet::audio::{count_audio_files, is_audio_path};
 use soulbeet::{
     DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    MusicImporter, SkipReason,
+    MusicImporter, SkipReason, SourceFile, TaskCount,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -63,6 +65,17 @@ pub struct ImportJob {
     pub choices: Option<Arc<MatchChoices>>,
     /// What becomes of the library's earlier copy beets finds.
     pub duplicates: Duplicates,
+    /// What the last run of these files knew; None before the importer first ran them.
+    pub last_run: Option<Arc<KeptRun>>,
+}
+
+/// What the last run of a kept import knew (design 11.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptRun {
+    pub tasks: TaskCount,
+    pub output_tail: String,
+    /// The files with their tags, from the last automatic run.
+    pub files: Vec<SourceFile>,
 }
 
 /// How an import treats the library's earlier copy of what it imports.
@@ -111,6 +124,7 @@ impl ImportJob {
                 Duplicates::Skip => DuplicateRule::Skip,
                 Duplicates::Guarded { .. } | Duplicates::AsConfigured => DuplicateRule::Guarded,
             },
+            last_run: self.last_run.as_deref().cloned(),
         })
     }
 
@@ -138,6 +152,7 @@ impl ImportJob {
             cleanup_root: stored.cleanup_root,
             choice: stored.choice,
             choices: stored.choices.map(Arc::new),
+            last_run: stored.last_run.map(Arc::new),
         }
     }
 
@@ -616,8 +631,13 @@ impl Shared {
             (DriverChoice::Auto, true) => outcome.result.choices.clone().map(Arc::new),
             _ => job.choices.clone(),
         };
+        let last_run = match outcome.ran {
+            true => Some(Arc::new(last_run(job, &outcome.result))),
+            false => job.last_run.clone(),
+        };
         let job = Arc::new(ImportJob {
             choices,
+            last_run,
             ..job.clone()
         });
         // Stored before the rows go out, so their Retry button always finds
@@ -637,6 +657,20 @@ impl Shared {
         }
         self.dismiss(dropped);
         state.send_replace(JobState::Done(Box::new(outcome)));
+    }
+}
+
+/// What a run of `job` that ended with `result` knew: its tasks and output, and the files an
+/// automatic run read, which a chosen run (beets reads no files for it) keeps from before.
+fn last_run(job: &ImportJob, result: &ImportResult) -> KeptRun {
+    let files = match job.choice {
+        DriverChoice::Auto => result.files.clone(),
+        _ => (job.last_run.as_ref()).map_or_else(Vec::new, |before| before.files.clone()),
+    };
+    KeptRun {
+        tasks: result.tasks,
+        output_tail: result.output_tail.clone(),
+        files,
     }
 }
 
@@ -755,6 +789,7 @@ pub async fn import_to_library(
                 actor: actor.clone(),
                 origin,
             },
+            last_run: None,
         })
         .await
         .wait()
@@ -802,12 +837,13 @@ pub static IMPORT_QUEUE: LazyLock<ImportQueue> =
 mod tests {
     use super::choice::{files_gone, nothing_to_retry};
     use super::test_support::{
-        alice, bob, broken, imported, no_match, row, RecordingDeps, StubImporter,
+        alice, bob, broken, candidate, imported, no_match, row, track_choices, RecordingDeps,
+        StubImporter,
     };
     use super::*;
     use crate::core::delete_guard::test_support::{wanted, Library};
     use shared::download::{DownloadState, ImportChoice, JobSlot};
-    use soulbeet::{ForgetOutcome, ImportOutcome, ImportedItem, SkipReason};
+    use soulbeet::{ForgetOutcome, ImportOutcome, ImportedItem, SkipReason, SourceFile, TaskCount};
     use std::time::Duration;
 
     pub(super) fn queue(
@@ -837,6 +873,7 @@ mod tests {
             choice: DriverChoice::Auto,
             choices: None,
             duplicates: Duplicates::AsConfigured,
+            last_run: None,
         }
     }
 
@@ -1365,6 +1402,74 @@ mod tests {
             queue.import_choices(&alice(), "a").unwrap_err(),
             nothing_to_retry()
         );
+    }
+
+    #[tokio::test]
+    async fn a_kept_import_remembers_its_last_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let source = file(tmp.path(), "dl/X [1f2e3d4c]/01 - Song Number 1.flac");
+        let read = SourceFile {
+            path: source.clone(),
+            artist: "Zzqx Artist".into(),
+            title: "Song Number 1".into(),
+            album: "Qzz Album".into(),
+            track: Some(1),
+            length_secs: Some(214),
+        };
+        stub.script(ImportResult {
+            choices: Some(track_choices(vec![candidate("FakeSrc", "w1")])),
+            files: vec![read.clone()],
+            ..no_match(1)
+        });
+        let kept = owned(job(source, &tmp.path().join("lib")), &alice(), &["a"]);
+        finish(queue.submit(kept).await).await;
+        let automatic = KeptRun {
+            tasks: TaskCount {
+                imported: 0,
+                total: 1,
+            },
+            output_tail: "skipped tail".into(),
+            files: vec![read.clone()],
+        };
+        // None while a retry has the import.
+        let last_run = |queue: &ImportQueue| {
+            let job = queue.kept(&alice(), "a").ok()?;
+            job.last_run.as_deref().cloned()
+        };
+        assert_eq!(last_run(&queue), Some(automatic));
+
+        // A pick reads no files: the automatic run's stay, with the pick's own tail.
+        stub.script(ImportResult {
+            output_tail: "pick tail".into(),
+            ..ImportResult::failed(
+                FailKind::ChoiceInvalid,
+                "FakeSrc has no recording w1".into(),
+            )
+        });
+        let pick = ImportChoice::Candidate {
+            data_source: "FakeSrc".into(),
+            id: "w1".into(),
+        };
+        queue.retry(&alice(), "a", pick).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while last_run(&queue).is_none_or(|run| run.output_tail != "pick tail") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pick ran and was kept");
+        let picked = KeptRun {
+            tasks: TaskCount::default(),
+            output_tail: "pick tail".into(),
+            files: vec![read],
+        };
+        assert_eq!(last_run(&queue), Some(picked.clone()));
+
+        // Stored and read back after a restart, it keeps the run.
+        let job = queue.kept(&alice(), "a").unwrap();
+        let rebuilt = ImportJob::from_stored(job.stored().unwrap(), alice());
+        assert_eq!(rebuilt.last_run.as_deref(), Some(&picked));
     }
 
     #[tokio::test]

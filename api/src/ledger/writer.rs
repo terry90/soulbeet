@@ -103,7 +103,7 @@ pub(super) enum Write {
         event: Box<JobEvent>,
         reply: Reply<()>,
     },
-    #[cfg(test)]
+    /// Answered once every write sent before it is applied.
     Settled {
         reply: Reply<()>,
     },
@@ -394,7 +394,6 @@ impl Writer {
                 let stored = self.event(*event).await;
                 self.finish(reply, "record a job's change", stored)
             }
-            #[cfg(test)]
             Write::Settled { reply } => {
                 let _ = reply.send(Ok(()));
             }

@@ -17,7 +17,8 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
 use super::{
-    batches, ensure, jobs, library, metadata, playlists, settings, sources, status, McpCaller,
+    batches, ensure, imports, jobs, library, metadata, playlists, settings, sources, status,
+    McpCaller,
 };
 use crate::connection::ConnectionState;
 
@@ -254,6 +255,8 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     jobs::CANCEL_JOB,
     jobs::DISMISS_JOB,
     ensure::DOWNLOAD_SOURCE_TOOL,
+    imports::GET_IMPORT_CHOICES,
+    imports::RESOLVE_IMPORT,
 ];
 
 impl ToolSpec {
@@ -495,6 +498,10 @@ mod tests {
             }
             "download_source" => json!({"candidate_id": "3f1c0d52-8a8e-4c2b-9d61-2b7f0e5a4c19:0",
                 "job_id": "5b0e3c2a-7d41-4f6e-9a18-c3d2e1f0a9b8"}),
+            "get_import_choices" => json!({"job_id": "5b0e3c2a-7d41-4f6e-9a18-c3d2e1f0a9b8"}),
+            "resolve_import" => {
+                json!({"job_id": "5b0e3c2a-7d41-4f6e-9a18-c3d2e1f0a9b8", "choice": "retry"})
+            }
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -561,6 +568,8 @@ mod tests {
         ("cancel_job", false, false, false, true),
         ("dismiss_job", false, false, false, true),
         ("download_source", false, false, false, true),
+        ("get_import_choices", true, false, true, false),
+        ("resolve_import", false, false, false, false),
     ];
 
     #[test]

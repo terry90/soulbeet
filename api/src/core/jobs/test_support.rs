@@ -1,12 +1,13 @@
 //! Ledger states of MCP jobs for tests, each built the way its code path builds it: through
 //! `Ledger::{create_batch, record, transition, ..}` only. Every job id is a new uuid.
 
-use super::runner::{Acquire, MCP_DOWNLOADS_PER_USER};
+use super::runner::{Acquire, TestEffects, MCP_DOWNLOADS_PER_USER};
 use super::{job_records, views_of, AlbumRef, JobSelect, JobView, Wanted};
 use crate::auth::UserId;
 use crate::core::index::not_found_after_scan;
 use crate::core::library::Reference;
 use crate::core::test_ctx;
+use crate::import_queue::test_support::{no_match, track_choices};
 use crate::import_queue::ImportJob;
 use crate::ledger::store;
 use crate::ledger::{
@@ -15,13 +16,16 @@ use crate::ledger::{
     Transitioned,
 };
 use crate::server_fns::download::monitor::cancelled_on_request;
+use crate::server_fns::download::process::import_job;
 use crate::server_fns::download::test_support::{group, item, transfer};
 use shared::download::{
     DownloadProgress, DownloadQuery, DownloadState, DownloadableItem, IndexState, JobSlot,
-    SearchStats,
+    MatchCandidate, SearchStats,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
-use soulbeet::{DriverChoice, ImportMode, ImportOutcome, ImportedItem, SkipReason};
+use soulbeet::{
+    DriverChoice, ImportMode, ImportOutcome, ImportResult, ImportedItem, SkipReason, SourceFile,
+};
 use sqlx::SqlitePool;
 use std::path::Path;
 
@@ -645,6 +649,7 @@ fn import_of(job: &str, title: &str, source: &Path) -> StoredImport {
         choice: DriverChoice::Auto,
         rows: vec![(slot_0(job), row)],
         duplicates: DuplicateRule::Skip,
+        last_run: None,
     }
 }
 
@@ -697,6 +702,75 @@ pub(crate) async fn duplicate_track_job(
 pub(crate) async fn kept_track_job(acq: &Acquire, title: &str, source: &Path) -> String {
     let job = importing_track_job(acq, title, source).await;
     keep(acq, import_of(&job, title, source), true).await;
+    job
+}
+
+/// A run that skipped Song Number 1 for want of a close match after weighing `candidates`
+/// MusicBrainz recordings (the best 0.612 alike, each next one 0.07 less), having read one file
+/// tagged Zzqx Artist - Song Number 1.
+pub(crate) fn no_match_with_files(candidates: u16) -> ImportResult {
+    let weighed = (0..candidates)
+        .map(|i| MatchCandidate {
+            data_source: "MusicBrainz".into(),
+            id: format!("6c1e4d9a-2b7f-4e83-9a51-0d3f8c7b2e{i:02}"),
+            artist: "Zzqx Artist".into(),
+            title: "Song Number 1".into(),
+            album: Some("Qzz Album".into()),
+            year: Some(2019),
+            country: Some("XW".into()),
+            disambig: None,
+            per_mille: 612 - 70 * i,
+            // beets' penalty names (beets/autotag/distance.py).
+            differs: vec!["album".into(), "track_length".into()],
+            length_secs: Some(214),
+            tracks: None,
+        })
+        .collect();
+    let read = SourceFile {
+        path: "01 - Song Number 1.flac".into(),
+        artist: "Zzqx Artist".into(),
+        title: "Song Number 1".into(),
+        album: "Qzz Album".into(),
+        track: Some(1),
+        length_secs: Some(214),
+    };
+    ImportResult {
+        choices: Some(track_choices(weighed)),
+        files: vec![read],
+        ..no_match(candidates.into())
+    }
+}
+
+/// alice's MCP job for Marrow Choir - Song Number 1 whose download, "01 - Song Number 1.flac" in
+/// "Come Over [1f2e3d4c]" under `acq`'s download folder, the import queue ran with `result` (its
+/// files read from that download) and kept for a decision, as the queue's finish records it.
+/// `effects` are `acq`'s.
+pub(crate) async fn kept_track_job_with(
+    acq: &Acquire,
+    effects: &TestEffects,
+    mut result: ImportResult,
+) -> String {
+    let title = "Song Number 1";
+    let job = downloading_track_job_with(acq, title, auto_options()).await;
+    let source = (acq.download_base).join("Come Over [1f2e3d4c]/01 - Song Number 1.flac");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"flac").unwrap();
+    for file in &mut result.files {
+        file.path = source.clone();
+    }
+    effects.importer().script(result);
+    let row = in_progress(&job, title).with_state(DownloadState::Completed);
+    let import = import_job(
+        source,
+        ImportMode::Singleton,
+        vec![row],
+        &acq.download_base.join("library"),
+        &alice(),
+        DuplicateRule::Skip,
+        &acq.download_base,
+    );
+    acq.queue.submit(import).await.wait().await;
+    acq.ledger.settled().await;
     job
 }
 
@@ -787,6 +861,7 @@ pub(crate) async fn kept_album_job(
             choice: DriverChoice::Auto,
             rows: vec![(slot, row)],
             duplicates: DuplicateRule::Skip,
+            last_run: None,
         };
         acq.ledger
             .record(JobEvent::ImportQueued(Box::new(import.clone())));

@@ -6,6 +6,7 @@ use shared::failure::{Failure, RetryAdvice, Stage};
 
 use super::contract::NextCall;
 use super::facts::candidate_document;
+use crate::core::jobs::decide::kept_imports;
 use crate::core::jobs::{allowed, job_failure, JobView, RetryMode, Untried};
 use crate::ledger::{BatchOrigin, JobState, Transition};
 
@@ -16,8 +17,10 @@ const CHOICES_OFFERED: usize = 3;
 /// waiting for a source choice: download_source for each of its first untried candidates, with
 /// that candidate's facts. Each retry_job mode `allowed` accepts, with its deciding facts, unless
 /// the job's failure needs a person (its user_action says what; retry_job still accepts a mode
-/// once they acted). dismiss_job and cancel_job where those transitions apply. A web UI job is
-/// offered only the wait and dismiss_job: its own pipeline runs it.
+/// once they acted). A job waiting for an import decision: get_import_choices and resolve_import's
+/// retry for each import it keeps, naming its slot when it keeps several. dismiss_job and
+/// cancel_job where those transitions apply. A web UI job is offered only the wait, the import
+/// decision and dismiss_job: its own pipeline runs it.
 pub(crate) fn next_calls(view: &JobView, untried: &Untried) -> Vec<NextCall> {
     use JobState::*;
     let job = &view.job;
@@ -46,6 +49,18 @@ pub(crate) fn next_calls(view: &JobView, untried: &Untried) -> Vec<NextCall> {
                 args: json!({"job_id": id, "candidate_id": candidate.id}),
                 facts,
             });
+        }
+    }
+    if job.state == NeedsDecision {
+        let kept = kept_imports(view);
+        for import in &kept {
+            let mut args = json!({"job_id": id});
+            if kept.len() > 1 {
+                args["slot"] = json!(import.slots[0]);
+            }
+            next.push(NextCall::new("get_import_choices", args.clone()));
+            args["choice"] = json!("retry");
+            next.push(NextCall::new("resolve_import", args));
         }
     }
     let failure = job_failure(view);

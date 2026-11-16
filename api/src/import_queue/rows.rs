@@ -228,6 +228,7 @@ mod tests {
             choice: DriverChoice::Auto,
             choices: None,
             duplicates: crate::import_queue::Duplicates::AsConfigured,
+            last_run: None,
         }
     }
 

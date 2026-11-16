@@ -226,13 +226,17 @@ impl ImportQueue {
         Ok(())
     }
 
-    /// What the kept job of `item` can pick from, leaving it kept.
-    pub fn import_choices(&self, user: &UserId, item: &str) -> Result<MatchChoices, ImportRefusal> {
-        let job = self
-            .shared
+    /// The kept job of `item`, left kept: its sources, mode, matches and last run.
+    pub fn kept(&self, user: &UserId, item: &str) -> Result<Arc<ImportJob>, ImportRefusal> {
+        self.shared
             .retries
             .peek(user, item)
-            .ok_or_else(nothing_to_retry)?;
+            .ok_or_else(nothing_to_retry)
+    }
+
+    /// What the kept job of `item` can pick from, leaving it kept.
+    pub fn import_choices(&self, user: &UserId, item: &str) -> Result<MatchChoices, ImportRefusal> {
+        let job = self.kept(user, item)?;
         Ok(job.choices.as_deref().cloned().unwrap_or(MatchChoices {
             kind: match job.mode {
                 ImportMode::Album => MatchKind::Album,
@@ -696,6 +700,7 @@ mod tests {
             choice: DriverChoice::Auto,
             choices: None,
             duplicates: crate::import_queue::Duplicates::AsConfigured,
+            last_run: None,
         })
     }
 

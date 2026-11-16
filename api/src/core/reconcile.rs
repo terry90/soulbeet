@@ -1724,6 +1724,7 @@ mod tests {
                 choices: None,
                 choice: DriverChoice::Auto,
                 duplicates: DuplicateRule::Guarded,
+                last_run: None,
                 rows: vec![(slot, row)],
             })));
         }
@@ -1816,6 +1817,7 @@ mod tests {
                 choices: None,
                 choice: DriverChoice::Auto,
                 duplicates: DuplicateRule::Guarded,
+                last_run: None,
                 rows: vec![(slot, row.clone().with_state(DownloadState::ImportQueued(1)))],
             };
             // As the import queue's finish records a kept import.

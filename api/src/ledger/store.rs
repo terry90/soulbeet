@@ -674,24 +674,40 @@ pub struct JobTrack {
     /// Kept after the wait ends, so a slot failed at the index stage still has it.
     pub index_wait: Option<IndexWait>,
     pub result: Option<SlotResult>,
+    /// The import a slot waiting for a decision keeps; None in any other state.
+    pub kept: Option<StoredImport>,
 }
 
 /// `job`'s slots, in order.
 pub async fn tracks_of(db: &SqlitePool, job: &str) -> Result<Vec<JobTrack>, sqlx::Error> {
-    type Row = (u32, String, Option<String>, Option<String>, Option<String>);
+    type Row = (
+        u32,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT slot, state, last_row, index_wait, result FROM job_tracks \
+        "SELECT slot, state, last_row, index_wait, result, import_job FROM job_tracks \
          WHERE job_id = ? ORDER BY slot",
     )
     .bind(job)
     .fetch_all(db)
     .await?;
     rows.into_iter()
-        .map(|(slot, state, row, index_wait, result)| {
+        .map(|(slot, state, row, index_wait, result, import)| {
             let row: Option<DownloadProgress> = row.as_deref().map(json).transpose()?;
+            let state = state_named(&state)?;
+            // Only a kept import is read here; a queued or running one is the import queue's.
+            let kept = match state {
+                JobState::NeedsDecision => import.as_deref().map(json).transpose()?,
+                _ => None,
+            };
             Ok(JobTrack {
                 slot,
-                state: state_named(&state)?,
+                state,
+                kept,
                 row: row.map(|row| {
                     row.with_job(JobSlot {
                         job: job.to_string(),
@@ -944,6 +960,7 @@ mod tests {
             choices: None,
             choice: DriverChoice::Auto,
             duplicates: DuplicateRule::Guarded,
+            last_run: None,
             rows: vec![(
                 slot(1),
                 DownloadProgress::queued("t-02".into(), "peer_a".into(), "02.flac".into(), 100)

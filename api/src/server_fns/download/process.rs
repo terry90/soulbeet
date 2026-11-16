@@ -143,6 +143,7 @@ pub fn import_job(
         choice: DriverChoice::Auto,
         choices: None,
         duplicates: Duplicates::of(duplicates, user),
+        last_run: None,
     }
 }
 

@@ -17,8 +17,8 @@ use tracing::warn;
 
 use super::args::{repeatable, Args};
 use super::contract::{
-    answer, failed, invalid_value, success, too_large_to_repeat, upstream_error, NextCall,
-    ToolError,
+    answer, applied_unread, failed, invalid_value, success, too_large_to_repeat, upstream_error,
+    NextCall, ToolError,
 };
 use super::facts::{
     asks_backend, job_document, live_facts, results_of, unanswered, Detail, LiveFacts, ReadNow,
@@ -573,7 +573,7 @@ impl JobTool {
     }
 
     /// `view`'s full document, as get_jobs gives it.
-    async fn document(&self, view: &JobView) -> Result<Map<String, Value>, Failure> {
+    pub(crate) async fn document(&self, view: &JobView) -> Result<Map<String, Value>, Failure> {
         let now = chrono::Utc::now().timestamp();
         let untried = untried(&self.acquire.db, view, now).await?;
         let ctx = &self.caller.ctx;
@@ -670,25 +670,6 @@ impl JobTool {
         let now = chrono::Utc::now().timestamp();
         let untried = untried(&self.acquire.db, &view, now).await?;
         Ok(Some((view, untried)))
-    }
-}
-
-/// A change made to job `job` that could not be read after it: the read's `failure`, the facts
-/// that the change was made, and get_jobs for the job, never the call again (it would find the
-/// job changed).
-fn applied_unread(job: String, failure: Failure) -> ToolError {
-    let facts = Map::from_iter([
-        ("job_id".to_string(), json!(job)),
-        ("changed".to_string(), json!(true)),
-    ]);
-    ToolError {
-        failure,
-        facts,
-        tried: vec![],
-        next: vec![NextCall::new(
-            "get_jobs",
-            json!({"job_ids": [job], "detail": "full"}),
-        )],
     }
 }
 

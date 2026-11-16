@@ -1271,6 +1271,7 @@ mod tests {
                 choices: None,
                 choice: DriverChoice::Auto,
                 duplicates: DuplicateRule::Guarded,
+                last_run: None,
                 rows: vec![(slot.clone(), row.clone())],
             },
             rows: vec![row],
