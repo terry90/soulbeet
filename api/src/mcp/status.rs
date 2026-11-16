@@ -16,7 +16,8 @@ use shared::failure::{Failure, Stage};
 use shared::system::{HealthLevel, SystemHealth};
 use soulbeet::navidrome::ScanStatus;
 
-use super::contract::{failed, invalid_input, success, NextCall, ToolError};
+use super::args::Args;
+use super::contract::{failed, success, ToolError};
 use super::McpCaller;
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
@@ -193,16 +194,8 @@ pub(crate) async fn call(
     caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
-    if let Some(field) = args.iter().flat_map(|args| args.keys()).min() {
-        return failed(invalid_input(
-            "get_status",
-            field,
-            "it takes no arguments",
-            vec![NextCall {
-                tool: "get_status",
-                args: json!({}),
-            }],
-        ));
+    if let Err(e) = Args::new("get_status", args, &[]).finish() {
+        return failed(e);
     }
     match state.status.gather(&caller.ctx).await {
         Ok(facts) => success(status_fields(&facts, caller)),

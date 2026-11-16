@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 /// Longest `Cause.raw` kept, in characters.
 pub const RAW_MAX_CHARS: usize = 2000;
 
+/// Longest text field taken from another service into a tool result, in
+/// characters, see `cut_chars`.
+pub const TEXT_MAX_CHARS: usize = 500;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Failure {
     pub code: FailureCode,
@@ -78,28 +82,44 @@ impl Cause {
     }
 }
 
-/// `raw` when it has at most RAW_MAX_CHARS characters. A longer one keeps
-/// its start and its end, which for a beets tail holds the fatal lines,
-/// around a line saying how many characters were left out, all within
-/// RAW_MAX_CHARS characters. Cuts fall on char boundaries.
 fn cut_raw(raw: String) -> String {
-    let total = raw.chars().count();
-    if total <= RAW_MAX_CHARS {
-        return raw;
+    cut_chars(raw, RAW_MAX_CHARS)
+}
+
+/// `text` when it has at most `max_chars` characters. A longer one keeps
+/// its start and its end, which for a beets tail holds the fatal lines,
+/// around a line saying how many characters were left out, `max_chars`
+/// characters in all. Cuts fall on char boundaries.
+pub fn cut_chars(text: String, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text;
     }
     let marker = |left_out: usize| format!("\n[{left_out} characters left out]\n");
-    // The marker for `total` is at least as long as the one written.
-    let kept = RAW_MAX_CHARS - marker(total).chars().count();
+    let mut kept = max_chars - marker(total).chars().count();
+    // Each character kept is one fewer left out, whose count can be a
+    // digit shorter: keep characters until the marker leaves no room.
+    loop {
+        let room = max_chars - marker(total - kept).chars().count();
+        if room == kept {
+            break;
+        }
+        kept = room;
+    }
     let head = kept / 2;
     let tail = kept - head;
-    let byte_at = |chars: usize| raw.char_indices().nth(chars).map_or(raw.len(), |(i, _)| i);
+    let byte_at = |chars: usize| {
+        text.char_indices()
+            .nth(chars)
+            .map_or(text.len(), |(i, _)| i)
+    };
     let head_end = byte_at(head);
     let tail_start = byte_at(total - tail);
     format!(
         "{}{}{}",
-        &raw[..head_end],
+        &text[..head_end],
         marker(total - kept),
-        &raw[tail_start..]
+        &text[tail_start..]
     )
 }
 
@@ -145,6 +165,9 @@ pub enum RetryAdvice {
     NeedsDecision,
     NeedsUser,
     NotRetryable,
+    /// Some items of a call failed: each failed item's own error says
+    /// whether and how to retry it.
+    PerItem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -318,6 +341,8 @@ failure_codes! {
     DeleteFailed => "delete_failed",
     DeleteDailyLimit => "delete_daily_limit",
     ServerRestarted => "server_restarted",
+    /// Some items of a call failed and the others were done (design 10.1).
+    Partial => "partial",
 }
 
 #[cfg(test)]
@@ -326,11 +351,11 @@ mod tests {
 
     /// Design section 7 and 13 codes, by stage, with `settings_unreadable`,
     /// `backend_response_unreadable`, `search_query_rejected`,
-    /// `search_already_running`, `search_lost`, `import_disk_full` and
-    /// `delete_failed`, and
+    /// `search_already_running`, `search_lost`, `import_disk_full`,
+    /// `delete_failed` and `partial` (design 10.1), and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 78] = [
+    const NAMES: [&str; 79] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -409,6 +434,7 @@ mod tests {
         "delete_failed",
         "delete_daily_limit",
         "server_restarted",
+        "partial",
     ];
 
     #[test]
@@ -538,6 +564,21 @@ mod tests {
         let one_over = raw_of(format!("{}x", "é".repeat(RAW_MAX_CHARS)));
         assert!(one_over.chars().count() <= RAW_MAX_CHARS);
         assert!(one_over.ends_with("éx") && one_over.contains(" characters left out]"));
+    }
+
+    #[test]
+    fn per_item_advice_is_written_per_item() {
+        assert_eq!(
+            serde_json::to_value(RetryAdvice::PerItem).unwrap(),
+            "per_item"
+        );
+    }
+
+    #[test]
+    fn a_text_cut_at_500_characters_has_500_and_says_what_was_left_out() {
+        let cut = cut_chars("x".repeat(10_000), TEXT_MAX_CHARS);
+        assert_eq!(cut.chars().count(), TEXT_MAX_CHARS);
+        assert!(cut.contains(" characters left out]"), "{cut}");
     }
 
     #[test]

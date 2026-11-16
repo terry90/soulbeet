@@ -18,7 +18,9 @@ use crate::oauth::grants::access_in;
 use crate::oauth::metadata::{mcp_url, resource_metadata_url};
 use crate::oauth::{now_unix, oauth_error, SCOPE};
 
+mod args;
 pub(crate) mod contract;
+mod paging;
 pub(crate) mod server;
 pub(crate) mod status;
 
