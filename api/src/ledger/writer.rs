@@ -2,16 +2,18 @@
 //! in the order it was sent.
 
 use super::{
-    job_state, recording_keys, Admitted, BatchOrigin, ClaimedJob, ImportDone, IndexWait, JobEvent,
-    JobState, KeyReservation, LedgerError, LiveRows, NewJob, NewJobBatch, NewSearch, Pruned,
-    RecordingKeys, RequestKey, SearchOutcome, SlotResult, Transition, Transitioned, JOB_KEPT_SECS,
-    KEY_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER, SEARCH_KEPT_SECS, TERMINAL_SQL,
+    items_label, job_state, recording_keys, Admitted, BatchOrigin, ClaimedJob, ImportDone,
+    IndexWait, JobEvent, JobState, KeyReservation, LedgerError, LiveRows, NewJob, NewJobBatch,
+    NewSearch, Pruned, RecordingKeys, RequestKey, SearchOutcome, SlotResult, Transition,
+    Transitioned, JOB_KEPT_SECS, KEY_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER, SEARCH_KEPT_SECS,
+    TERMINAL_SQL,
 };
 use crate::auth::UserId;
 use crate::transfer_registry::TransferRegistry;
 use serde_json::{Map, Value};
 use shared::download::{
-    DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, IndexState, JobSlot,
+    DownloadProgress, DownloadQuery, DownloadState, DownloadableGroup, DownloadableItem,
+    IndexState, JobSlot,
 };
 use shared::failure::{Failure, FailureCode, Stage};
 use soulbeet::ImportMode;
@@ -1125,6 +1127,8 @@ impl Writer {
         let mut tx = self.db.begin().await?;
         let mut written = false;
         let mut admitted = Vec::with_capacity(jobs.len());
+        // What the jobs taken want, for a batch the caller did not name.
+        let mut taken: Vec<DownloadQuery> = Vec::new();
         for job in jobs {
             let keys = recording_keys(&job.wanted, job.kind);
             if let Some((running, state)) = same_recording(&mut tx, &job.user, &keys).await? {
@@ -1145,8 +1149,18 @@ impl Writer {
                 insert_batch(&mut tx, &batch).await?;
                 written = true;
             }
+            taken.push(job.wanted.clone());
             self.insert_job(&mut tx, job, &batch.id, keys).await?;
             admitted.push(Admitted::Created);
+        }
+        if written && batch.label.is_none() {
+            // Named after the jobs it holds, not those refused.
+            let wanted: Vec<&DownloadQuery> = taken.iter().collect();
+            sqlx::query("UPDATE batches SET label = ? WHERE id = ?")
+                .bind(items_label(&wanted))
+                .bind(&batch.id)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(admitted)

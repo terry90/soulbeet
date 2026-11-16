@@ -12,13 +12,49 @@ use tracing::warn;
 
 use super::retry::wrong_job_state;
 use super::runner::Acquire;
-use super::{job_not_found, job_view, untried, JobView};
+use super::{job_not_found, job_view, JobView};
 use crate::auth::UserCtx;
 use crate::core::database_failure;
 use crate::import_queue::{files_gone, nothing_to_retry, ImportJob};
 use crate::ledger::JobState;
-use crate::mcp::contract::{applied_unread, invalid_value, NextCall, ToolError};
-use crate::mcp::next::next_calls;
+
+/// Why a read or a decision of a kept import was refused.
+#[derive(Debug)]
+pub(crate) enum Why {
+    /// The job, the import queue or the database refused: the failure and its facts.
+    Failed(Failure, Map<String, Value>),
+    /// `slot` must be `expected`: the job keeps several imports.
+    Slot { expected: String },
+}
+
+/// A refused read or decision of a kept import.
+#[derive(Debug)]
+pub(crate) struct Refused {
+    pub why: Why,
+    /// The job as read after the refusal, for its state and the calls it takes; None for an id
+    /// that is no job of the caller's, or a job that could not be read again.
+    pub job: Option<JobView>,
+    /// The refusal changed the job: the take found the kept files gone and failed the import's
+    /// slots.
+    pub changed: bool,
+    /// The tool whose call the job's calls leave out: it would be refused the same way.
+    pub refused_tool: Option<&'static str>,
+}
+
+impl Refused {
+    /// `failure` alone: an id the caller has no job for, or a read that failed.
+    fn bare(failure: Failure) -> Refused {
+        Refused {
+            why: Why::Failed(failure, Map::new()),
+            job: None,
+            changed: false,
+            refused_tool: None,
+        }
+    }
+}
+
+/// A decision made: the job as it is after it, or the failure of reading it then.
+pub(crate) type Decided = Result<JobView, Failure>;
 
 /// What a job's kept import offers to decide on.
 #[derive(Debug)]
@@ -98,7 +134,7 @@ pub(crate) async fn import_choices(
     ctx: &UserCtx,
     job: &str,
     slot: Option<u32>,
-) -> Result<ImportChoices, ToolError> {
+) -> Result<ImportChoices, Refused> {
     const TOOL: &str = "get_import_choices";
     let (view, item) = waiting(acquire, ctx, job, slot, TOOL).await?;
     let kept = match acquire.queue.kept(&ctx.id(), &item) {
@@ -142,17 +178,17 @@ pub(crate) async fn import_choices(
 /// `decision` on the kept import of `ctx`'s job `job` (`slot` as `import_choices` takes it),
 /// through the import queue: a retry with the choice, or the discard dismiss_job makes, which
 /// deletes only Soulful's own kept copy. Either takes the kept import first, so one decision
-/// already taken refuses the next with nothing_to_retry, the import gone. The job as it is after
-/// the decision, whose import then runs on its own; a refusal carries `kept` and the calls the job
-/// takes now, and `changed` when it changed the job (the kept files were gone, so its slots
-/// failed).
+/// already taken refuses the next with nothing_to_retry, the import gone. The decision made
+/// answers the job as it is after it, whose import then runs on its own; a refusal carries `kept`
+/// and the job as read after it, and is `changed` when it changed the job (the kept files were
+/// gone, so its slots failed).
 pub(crate) async fn resolve(
     acquire: &Acquire,
     ctx: &UserCtx,
     job: &str,
     slot: Option<u32>,
     decision: Decision,
-) -> Result<JobView, ToolError> {
+) -> Result<Decided, Refused> {
     let (_, item) = waiting(acquire, ctx, job, slot, "resolve_import").await?;
     let choice = match decision {
         Decision::Retry => Some(ImportChoice::Auto),
@@ -169,9 +205,7 @@ pub(crate) async fn resolve(
         None => queue.discard(&user, &item).await.map(drop),
     };
     match decided {
-        Ok(()) => read_after(acquire, ctx, job)
-            .await
-            .map_err(|failure| applied_unread(job.to_string(), failure)),
+        Ok(()) => Ok(read_after(acquire, ctx, job).await),
         Err(refusal) => Err(refused(acquire, ctx, job, refusal, None).await),
     }
 }
@@ -191,13 +225,13 @@ async fn waiting(
     job: &str,
     slot: Option<u32>,
     tool: &'static str,
-) -> Result<(JobView, String), ToolError> {
+) -> Result<(JobView, String), Refused> {
     let view = (job_view(acquire, ctx, job).await)
-        .map_err(bare)?
-        .ok_or_else(|| bare(job_not_found()))?;
+        .map_err(Refused::bare)?
+        .ok_or_else(|| Refused::bare(job_not_found()))?;
     if view.job.state != JobState::NeedsDecision {
         let (failure, facts) = wrong_job_state(view.job.state, tool, &[JobState::NeedsDecision]);
-        return Err(refusal_of(acquire, &view, failure, facts, Some(tool)).await);
+        return Err(refusal_of(view, Why::Failed(failure, facts), Some(tool)));
     }
     let imports = kept_imports(&view);
     let chosen = match slot {
@@ -213,7 +247,7 @@ async fn waiting(
         // No waiting slot has a row to name its kept import by.
         let nothing = nothing_to_retry();
         let facts = kept_facts(nothing.kept);
-        return Err(refusal_of(acquire, &view, nothing.failure, facts, None).await);
+        return Err(refusal_of(view, Why::Failed(nothing.failure, facts), None));
     }
     let slots: Vec<String> = (imports.iter())
         .flat_map(|import| &import.slots)
@@ -223,71 +257,47 @@ async fn waiting(
         "one of {}, the slots waiting for a decision",
         slots.join(", ")
     );
-    let ToolError { failure, facts, .. } = invalid_value(tool, "slot", &expected);
-    Err(refusal_of(acquire, &view, failure, facts, None).await)
+    Err(refusal_of(view, Why::Slot { expected }, None))
 }
 
-/// The import queue's refusal of a call on `ctx`'s job `job`, its `kept` in the facts (and
-/// `changed` when the take failed the job's slots), with the job's state and the calls it takes as
-/// read again now. `refused_tool` is left out of them: it would answer the same.
+/// The import queue's refusal of a call on `ctx`'s job `job`, its `kept` in the facts, changed
+/// when the take failed the job's slots, with the job as read again now. `refused_tool`'s call is
+/// left out of the calls the job takes: it would answer the same.
 async fn refused(
     acquire: &Acquire,
     ctx: &UserCtx,
     job: &str,
     refusal: ImportRefusal,
-    refused_tool: Option<&str>,
-) -> ToolError {
+    refused_tool: Option<&'static str>,
+) -> Refused {
     let ImportRefusal { failure, kept } = refusal;
-    let mut facts = kept_facts(kept);
     // A take that found the files gone failed the import's slots.
-    if failure.code == FailureCode::ImportFilesGone && kept == KeptImport::Gone {
-        facts.insert("changed".into(), json!(true));
-    }
-    match read_after(acquire, ctx, job).await {
-        Ok(view) => refusal_of(acquire, &view, failure, facts, refused_tool).await,
+    let changed = failure.code == FailureCode::ImportFilesGone && kept == KeptImport::Gone;
+    let job = match read_after(acquire, ctx, job).await {
+        Ok(view) => Some(view),
         Err(f) => {
             warn!(
                 "Could not read job {job} again after a refused decision: {}",
                 f.message
             );
-            ToolError {
-                failure,
-                facts,
-                tried: vec![],
-                next: vec![],
-            }
+            None
         }
+    };
+    Refused {
+        why: Why::Failed(failure, kept_facts(kept)),
+        job,
+        changed,
+        refused_tool,
     }
 }
 
-/// `failure` with `facts` and `view`'s state, offering the calls `view`'s job takes, but
-/// `refused_tool`.
-async fn refusal_of(
-    acquire: &Acquire,
-    view: &JobView,
-    failure: Failure,
-    mut facts: Map<String, Value>,
-    refused_tool: Option<&str>,
-) -> ToolError {
-    facts.insert("state".into(), json!(view.job.state.as_str()));
-    let now = chrono::Utc::now().timestamp();
-    let next: Vec<NextCall> = match untried(&acquire.db, view, now).await {
-        Ok(untried) => (next_calls(view, &untried).into_iter())
-            .filter(|call| Some(call.tool) != refused_tool)
-            .collect(),
-        Err(f) => {
-            warn!(
-                "Could not read the sources of job {} after a refusal: {}",
-                view.job.id, f.message
-            );
-            vec![]
-        }
-    };
-    ToolError {
-        failure,
-        facts,
-        tried: vec![],
-        next,
+/// `why` of `view`'s job, unchanged, leaving `refused_tool`'s call out of the calls it takes.
+fn refusal_of(view: JobView, why: Why, refused_tool: Option<&'static str>) -> Refused {
+    Refused {
+        why,
+        job: Some(view),
+        changed: false,
+        refused_tool,
     }
 }
 
@@ -298,16 +308,6 @@ fn kept_facts(kept: KeptImport) -> Map<String, Value> {
         KeptImport::Gone => "gone",
     };
     Map::from_iter([("kept".to_string(), json!(kept))])
-}
-
-/// `failure` alone: an id the caller has no job for, or a read that failed.
-fn bare(failure: Failure) -> ToolError {
-    ToolError {
-        failure,
-        facts: Map::new(),
-        tried: vec![],
-        next: vec![],
-    }
 }
 
 /// The folder `job`'s files are kept in: an album's source folder, a track's file's folder.
@@ -343,6 +343,14 @@ mod tests {
     };
     use crate::core::test_ctx;
     use crate::ledger::{store, JobState};
+
+    /// The failure and facts of a refusal that is not about `slot`.
+    fn failed(refused: &Refused) -> (&Failure, &Map<String, Value>) {
+        match &refused.why {
+            Why::Failed(failure, facts) => (failure, facts),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn the_choices_name_the_kept_files_their_tags_and_beets_candidates() {
@@ -395,18 +403,16 @@ mod tests {
             .filter_map(Result::err)
             .collect::<Vec<_>>();
         assert_eq!(refused.len(), 1);
+        let (failure, facts) = failed(&refused[0]);
         assert_eq!(
-            (
-                refused[0].failure.code,
-                refused[0].failure.message.as_str(),
-                &refused[0].facts["kept"]
-            ),
+            (failure.code, failure.message.as_str(), &facts["kept"]),
             (
                 FailureCode::UnknownHandle,
                 "Nothing to retry",
                 &json!("gone")
             )
         );
+        assert!(!refused[0].changed);
         acq.ledger.settled().await;
         let state = store::job_state(&acq.db, &job).await.unwrap();
         assert_eq!(state == JobState::Dismissed, discard_won, "{state:?}");
@@ -425,37 +431,21 @@ mod tests {
         let job = kept_album_job(&acq, [&files[0], &files[1]], [true, true]).await;
         let ctx = test_ctx("alice");
         let refused = import_choices(&acq, &ctx, &job, None).await.unwrap_err();
-        assert_eq!(
-            (refused.failure.code, &refused.facts["expected"]),
-            (
-                FailureCode::InvalidInput,
-                &json!("one of 0, 1, the slots waiting for a decision")
-            )
+        assert!(
+            matches!(&refused.why, Why::Slot { expected }
+                if expected == "one of 0, 1, the slots waiting for a decision"),
+            "{refused:?}"
         );
-        let offered: Vec<_> = (refused.next.iter())
-            .map(|call| (call.tool, call.args.clone()))
-            .collect();
         assert_eq!(
-            offered,
-            vec![
-                ("get_import_choices", json!({"job_id": job, "slot": 0})),
-                (
-                    "resolve_import",
-                    json!({"job_id": job, "slot": 0, "choice": "retry"})
-                ),
-                ("get_import_choices", json!({"job_id": job, "slot": 1})),
-                (
-                    "resolve_import",
-                    json!({"job_id": job, "slot": 1, "choice": "retry"})
-                ),
-                ("dismiss_job", json!({"job_id": job})),
-            ]
+            refused.refused_tool, None,
+            "its calls with a slot are offered"
         );
         // Restored after a restart from a row kept before runs were: no run is known.
         let second = import_choices(&acq, &ctx, &job, Some(1)).await.unwrap();
         assert_eq!((second.tasks, second.output_tail), (None, None));
         let view = resolve(&acq, &ctx, &job, Some(1), Decision::Discard)
             .await
+            .unwrap()
             .unwrap();
         let states: Vec<JobState> = view.slots.iter().map(|s| s.state).collect();
         assert_eq!(states, vec![JobState::NeedsDecision, JobState::Dismissed]);
@@ -471,30 +461,23 @@ mod tests {
         std::fs::remove_dir_all(acq.download_base.join("Come Over [1f2e3d4c]")).unwrap();
         let ctx = test_ctx("alice");
         let shown = import_choices(&acq, &ctx, &job, None).await.unwrap_err();
+        let (failure, facts) = failed(&shown);
         assert_eq!(
-            (shown.failure.code, &shown.facts["kept"]),
+            (failure.code, &facts["kept"]),
             (FailureCode::ImportFilesGone, &json!("kept"))
         );
-        let tools: Vec<&str> = shown.next.iter().map(|call| call.tool).collect();
-        assert_eq!(tools, vec!["resolve_import", "dismiss_job"]);
+        assert!(!shown.changed);
+        assert_eq!(shown.refused_tool, Some("get_import_choices"));
         let decided = resolve(&acq, &ctx, &job, None, Decision::AsIs)
             .await
             .unwrap_err();
+        let (failure, facts) = failed(&decided);
         assert_eq!(
-            (
-                decided.failure.code,
-                &decided.facts["kept"],
-                &decided.facts["changed"],
-                &decided.facts["state"]
-            ),
-            (
-                FailureCode::ImportFilesGone,
-                &json!("gone"),
-                &json!(true),
-                &json!("failed")
-            )
+            (failure.code, &facts["kept"]),
+            (FailureCode::ImportFilesGone, &json!("gone"))
         );
-        assert!(decided.next.iter().any(|call| call.tool == "dismiss_job"));
+        assert!(decided.changed);
+        assert_eq!(decided.job.unwrap().job.state, JobState::Failed);
         assert_eq!(effects.importer().calls(), 1, "nothing imported again");
     }
 
@@ -508,14 +491,15 @@ mod tests {
             resolve(&acq, &ctx, &job, None, Decision::Discard),
             resolve(&acq, &ctx, &job, None, Decision::Retry)
         );
-        assert_eq!(discarded.unwrap().job.state, JobState::Dismissed);
+        assert_eq!(discarded.unwrap().unwrap().job.state, JobState::Dismissed);
         let refused = retried.unwrap_err();
+        let (failure, facts) = failed(&refused);
         assert_eq!(
-            (refused.failure.code, &refused.facts["kept"]),
+            (failure.code, &facts["kept"]),
             (FailureCode::UnknownHandle, &json!("gone"))
         );
         // Read after the discard: nothing is left to decide.
-        assert_eq!(refused.facts["state"], "dismissed");
+        assert_eq!(refused.job.unwrap().job.state, JobState::Dismissed);
         assert_eq!(effects.importer().calls(), 1, "only the first run imported");
     }
 
@@ -534,11 +518,12 @@ mod tests {
         )
         .await
         .unwrap_err();
+        let (failure, facts) = failed(&refused);
         assert_eq!(
-            refused.failure.message,
+            failure.message,
             "Track imports need a MusicBrainz recording, not a release"
         );
-        assert_eq!(refused.facts["kept"], "kept");
-        assert_eq!(refused.next[0].tool, "get_import_choices");
+        assert_eq!(facts["kept"], "kept");
+        assert_eq!(refused.job.unwrap().job.state, JobState::NeedsDecision);
     }
 }

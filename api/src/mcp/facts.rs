@@ -19,6 +19,7 @@ use soulbeet::{DownloadBackend, ImportedItem};
 
 use super::contract::{error_object, NextCall, ToolError};
 use super::next::next_calls;
+use super::paging::{leave_out, length, Keep};
 use crate::core::jobs::retry::enable_deletion;
 use crate::core::jobs::{
     current_attempt, failed_slot, job_failure, job_filters, picked_file, shown_row, JobView,
@@ -384,7 +385,44 @@ pub(crate) fn job_document(
         doc.insert("missing_titles".into(), json!(missing));
     }
     doc.insert("next".into(), json!(next));
+    bounded(&mut doc);
     Value::Object(doc)
+}
+
+/// The most characters of a full job document, so that one job always fits an answer with what
+/// goes around it (RESULT_MAX_CHARS, less get_jobs' page cursor and its since call naming up to
+/// MAX_JOB_IDS job ids, or get_batch's batch fields).
+pub(crate) const JOB_DOCUMENT_MAX_CHARS: usize = 45_000;
+
+/// `doc` within JOB_DOCUMENT_MAX_CHARS. While it is longer, items are left out whole, so no id is
+/// cut, in this order: the oldest timeline entries, the oldest earlier attempts, the last items of
+/// each import's lists (the last import's first), the last missing titles, then the last slots.
+/// Each list's `{list}_omitted` counts what it left out.
+fn bounded(doc: &mut Map<String, Value>) {
+    let over = |doc: &Map<String, Value>| length(doc).saturating_sub(JOB_DOCUMENT_MAX_CHARS);
+    for list in ["timeline", "tried"] {
+        let over = over(doc);
+        leave_out(doc, list, Keep::Newest, over);
+    }
+    let imports = doc
+        .get("results")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    for import in (0..imports).rev() {
+        for list in ["applied", "existing", "listed", "library_songs"] {
+            let over = over(doc);
+            let result = (doc.get_mut("results"))
+                .and_then(|results| results.get_mut(import))
+                .and_then(Value::as_object_mut);
+            if let Some(result) = result {
+                leave_out(result, list, Keep::First, over);
+            }
+        }
+    }
+    for list in ["missing_titles", "slots"] {
+        let over = over(doc);
+        leave_out(doc, list, Keep::First, over);
+    }
 }
 
 /// What the job asks for, as a reference names it (D1): a track's artist, title and the album,
@@ -810,7 +848,7 @@ mod tests {
     use crate::core::jobs::retry::{retry, RetryAnswer};
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
-        auto_options, done_track_job, failed_track_job, mcp_track_job, search_of,
+        auto_options, done_track_job, failed_track_job, mcp_album_job, mcp_track_job, search_of,
         test_db_with_alice, view_of,
     };
     use crate::core::jobs::{untried, RetryMode};
@@ -995,6 +1033,50 @@ mod tests {
             doc["failure"]["facts"]["dropped_by_filter"]["not_lossless"],
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_large_albums_full_document_keeps_within_its_bound_and_counts_what_it_left_out() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let mbid = "6a09041b-0f79-3278-88d9-0552dd28d37f";
+        let job = mcp_album_job(&acq, "Kowloon", "Come Over", mbid).await;
+        let search_id = search_of(&acq, &job).await;
+        // A box set of 100 tracks whose names are as long as a peer may make them.
+        let long = "x".repeat(480);
+        let items = (0..100)
+            .map(|i| {
+                let file = format!("a\\{long}\\{i:03}.flac");
+                (i, item("peer_a", &format!("{long} {i}"), &file))
+            })
+            .collect();
+        let pick = crate::ledger::Transition::Pick { items, search_id };
+        let user = crate::core::test_ctx("alice").id();
+        acq.ledger.transition(&user, &job, pick).await.unwrap();
+        let view = view_of(&acq, &job).await;
+        let doc = job_document(
+            &view,
+            &Untried::default(),
+            Detail::Full,
+            &ReadNow::default(),
+            false,
+        );
+        let Value::Object(fields) = &doc else {
+            panic!("{doc}")
+        };
+        assert!(
+            length(fields) <= JOB_DOCUMENT_MAX_CHARS,
+            "{}",
+            length(fields)
+        );
+        let shown = doc["slots"].as_array().unwrap();
+        assert!(shown.len() < 100);
+        assert_eq!(
+            shown.len() as u64 + doc["slots_omitted"].as_u64().unwrap(),
+            100
+        );
+        for (i, slot) in shown.iter().enumerate() {
+            assert_eq!(slot["slot"], i);
+        }
     }
 
     #[test]

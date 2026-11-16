@@ -22,6 +22,7 @@ use super::contract::{
 };
 use super::facts::{
     asks_backend, job_document, live_facts, results_of, unanswered, Detail, LiveFacts, ReadNow,
+    JOB_DOCUMENT_MAX_CHARS,
 };
 use super::keys::{keyed, request_key, Keyed};
 use super::next::next_calls;
@@ -78,7 +79,7 @@ pub(crate) const GET_JOBS: ToolSpec = ToolSpec {
     title: "Show jobs",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Shows jobs by job_ids, or by batch_id and states. Summary detail gives each job's state and failure code; full detail gives the current download with live bytes, speed, place in the source's queue and whether the source is online, earlier attempts with their failures (tried), the timeline, what beets applied and Navidrome lists (or, while Navidrome has not listed it yet, when the import ended and whether a scan was asked for; get_status says whether Navidrome is scanning), and next: the calls that can be made for the job now. wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action: needs_source_choice, needs_decision or failed; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Each answer has change_cursor: pass it as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to it. Job ids stay valid 30 days after the job ends. Failure codes: {common}, unknown_handle (a job id this user has no job for; facts.unknown_job_ids names them).")
+        format!("Shows jobs by job_ids, or by batch_id and states. Summary detail gives each job's state and failure code; full detail gives the current download with live bytes, speed, place in the source's queue and whether the source is online, earlier attempts with their failures (tried), the timeline, what beets applied and Navidrome lists (or, while Navidrome has not listed it yet, when the import ended and whether a scan was asked for; get_status says whether Navidrome is scanning), and next: the calls that can be made for the job now. A full document longer than {JOB_DOCUMENT_MAX_CHARS} characters leaves items out whole, the oldest timeline entries and earlier attempts first, then the last items of each import, of missing_titles and of slots, each list's {{list}}_omitted counting them. wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action: needs_source_choice, needs_decision or failed; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Each answer has change_cursor: pass it as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to it. Job ids stay valid 30 days after the job ends. Failure codes: {common}, unknown_handle (a job id this user has no job for; facts.unknown_job_ids names them).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"job_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1}}, "batch_id": {"type": "string", "minLength": 1}, "states": {"type": "array", "items": {"enum": ["searching", "queued", "downloading", "importing", "indexing", "done", "needs_source_choice", "needs_decision", "failed", "cancelled", "dismissed"]}}, "detail": {"enum": ["summary", "full"]}, "since": {"type": "integer", "minimum": 0}, "#,
@@ -612,7 +613,7 @@ impl JobTool {
         match answered {
             Ok(RetryAnswer::Applied(view)) => Keyed::Kept(match self.document(&view).await {
                 Ok(fields) => success(fields),
-                Err(f) => failed(upstream_error(f, Map::new(), None)),
+                Err(f) => failed(applied_unread(view.job.id.clone(), f)),
             }),
             Ok(RetryAnswer::AppliedUnread { job, failure }) => {
                 Keyed::Kept(failed(applied_unread(job, failure)))
@@ -926,6 +927,43 @@ mod tests {
                 Some(silent)
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_retry_made_whose_document_cannot_be_built_says_it_was_made() {
+        let (db, acq, _, token) = jobs_app().await;
+        let job = failed_track_job(&acq).await;
+        let other = downloading_track_job_with(&acq, "Silent Night", auto_options()).await;
+        // Once the retry is written, the sources' recent failures can no longer be read: a row
+        // whose failure is not JSON.
+        sqlx::query(&format!(
+            "CREATE TRIGGER unreadable AFTER UPDATE OF state ON jobs \
+             WHEN NEW.id = '{job}' AND NEW.state = 'queued' \
+             BEGIN INSERT INTO job_attempts (job_id, slot, n, source, ended_at, failure) \
+             VALUES ('{other}', 0, 99, 'peer_x', strftime('%s', 'now'), 'not json'); END"
+        ))
+        .execute(&db)
+        .await
+        .unwrap();
+        let call = json!({"job_id": job, "mode": "next_source", "request_key": "k1"});
+        let first = call_tool(app_of(&db, &acq), &token, "retry_job", call.clone()).await;
+        let error = document(&first)["error"].clone();
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["facts"]["job_id"].as_str(),
+                error["facts"]["changed"].as_bool()
+            ),
+            (Some("settings_unreadable"), Some(job.as_str()), Some(true)),
+            "{error}"
+        );
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "get_jobs", "args": {"job_ids": [job], "detail": "full"}}])
+        );
+        // Kept for the key: the repeat says the same, not wrong_job_state.
+        let again = call_tool(app_of(&db, &acq), &token, "retry_job", call).await;
+        assert_eq!(document(&again), document(&first));
     }
 
     #[tokio::test]

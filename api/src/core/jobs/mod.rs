@@ -81,15 +81,6 @@ impl Wanted {
         }
     }
 
-    /// What it is called in labels: "{artist} - {title}".
-    pub fn label(&self) -> String {
-        let (artist, title) = match self {
-            Wanted::Track(r) => (&r.artist, &r.title),
-            Wanted::Album(a) => (&a.artist, &a.title),
-        };
-        format!("{artist} - {title}")
-    }
-
     /// The reference as a refused item's facts: `kind`, and a track's five fields (`null` when
     /// not given) or an album's three.
     pub(crate) fn facts(&self) -> Map<String, Value> {
@@ -116,6 +107,13 @@ pub(crate) enum EnsureItem {
     Created {
         job_id: String,
         fuzzy: Vec<String>,
+    },
+    /// The user's unfinished job `job_id` already wants this recording: already_running with
+    /// `facts` (the reference, the job and its state).
+    AlreadyRunning {
+        job_id: String,
+        failure: Failure,
+        facts: Map<String, Value>,
     },
     Refused(Failure, Map<String, Value>),
 }
@@ -201,8 +199,8 @@ pub(crate) async fn folder_for(
 /// reached (no link at all is no lookup: every item gets a job). Then looks each track up with
 /// `find`, one at a time in input order: one the library holds by MBID or exactly is
 /// `InLibrary`, one whose lookup failed is refused with that failure. Makes one batch, labelled
-/// `label`, else after its items, with a job for each other item (an album always gets one),
-/// each with a new search id, and starts the runner on each new job.
+/// `label`, else after the jobs it holds (`items_label`), with a job for each other item (an
+/// album always gets one), each with a new search id, and starts the runner on each new job.
 pub(crate) async fn ensure(
     acquire: &Arc<Acquire>,
     navidrome: &dyn NavidromeOf,
@@ -250,17 +248,11 @@ pub(crate) async fn ensure(
     let library_checked = navi.is_some();
     let mut batch_id = None;
     if !wanting.is_empty() {
-        let label = label.unwrap_or_else(|| {
-            let first = items[wanting[0].0].label();
-            match wanting.len() {
-                1 => first,
-                n => format!("{first} and {} more", n - 1),
-            }
-        });
+        // Without a label given, the writer names the batch after the jobs it takes.
         let batch = NewJobBatch {
             id: uuid::Uuid::new_v4().to_string(),
             user: ctx.id(),
-            label: Some(label),
+            label,
             origin: BatchOrigin::Mcp,
         };
         let id = batch.id.clone();
@@ -270,11 +262,16 @@ pub(crate) async fn ensure(
         let ids: Vec<String> = jobs.iter().map(|job| job.id.clone()).collect();
         let admitted = (acquire.ledger.create_batch(batch, jobs).await)
             .map_err(|e| database_failure(Stage::Input, e))?;
+        if admitted.len() != ids.len() {
+            // The writer answers each job it is given, in order.
+            let e = format!("{} jobs written, {} answered", ids.len(), admitted.len());
+            return Err(database_failure(Stage::Input, e).into());
+        }
         for (((i, fuzzy), job_id), admitted) in wanting.into_iter().zip(ids).zip(admitted) {
-            let refused = |(failure, facts): (Failure, Map<String, Value>)| {
+            let with_reference = |more: Map<String, Value>| {
                 let mut all = items[i].facts();
-                all.extend(facts);
-                EnsureItem::Refused(failure, all)
+                all.extend(more);
+                all
             };
             results[i] = Some(match admitted {
                 Admitted::Created => {
@@ -283,15 +280,27 @@ pub(crate) async fn ensure(
                     EnsureItem::Created { job_id, fuzzy }
                 }
                 Admitted::AlreadyRunning { job, state } => {
-                    refused(job_already_running(&job, state))
+                    let (failure, facts) = job_already_running(&job, state);
+                    EnsureItem::AlreadyRunning {
+                        job_id: job,
+                        failure,
+                        facts: with_reference(facts),
+                    }
                 }
-                Admitted::OverLimit { unfinished } => refused(over_limit(unfinished)),
+                Admitted::OverLimit { unfinished } => {
+                    let (failure, facts) = over_limit(unfinished);
+                    EnsureItem::Refused(failure, with_reference(facts))
+                }
             });
         }
     }
+    // Every item has its answer: one looked up, or one that waited for its job.
+    let items = (results.into_iter())
+        .map(|item| item.expect("each item is answered"))
+        .collect();
     Ok(Ensured {
         batch_id,
-        items: results.into_iter().flatten().collect(),
+        items,
         library_checked,
     })
 }
@@ -712,6 +721,7 @@ pub(crate) fn job_not_found() -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::items_label;
 
     #[test]
     fn a_reference_becomes_the_query_a_search_scores_against() {
@@ -740,8 +750,11 @@ mod tests {
             )
         );
         assert_eq!(
-            (track.kind(), track.label()),
-            (JobKind::Track, "Marrow Choir - O Holy Night".to_string())
+            (track.kind(), items_label(&[&query])),
+            (
+                JobKind::Track,
+                Some("Marrow Choir - O Holy Night".to_string())
+            )
         );
 
         let album = Wanted::Album(AlbumRef {
@@ -760,8 +773,11 @@ mod tests {
             )
         );
         assert_eq!(
-            (album.kind(), album.label()),
-            (JobKind::Album, "Kowloon - Come Over".to_string())
+            (album.kind(), items_label(&[&query, &query])),
+            (
+                JobKind::Album,
+                Some("Kowloon - Come Over and 1 more".to_string())
+            )
         );
     }
 }

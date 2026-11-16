@@ -210,6 +210,48 @@ pub(crate) fn fit(
     fields
 }
 
+/// The characters of `doc`'s compact JSON text.
+pub(crate) fn length(doc: &Map<String, Value>) -> usize {
+    serde_json::to_string(doc).map_or(0, |text| text.chars().count())
+}
+
+/// Which items of a list stay when some are left out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// The first ones, a list in its own order.
+    First,
+    /// The last ones: the newest of a list kept oldest first.
+    Newest,
+}
+
+/// Leaves items of the list `list` of `object` out, whole (an id is never cut), from the end
+/// `keep` does not keep, until `over` characters are gone, counting them in `{list}_omitted` next
+/// to it (added to a count already there). Nothing when `over` is 0 or `object` has no such list.
+pub(crate) fn leave_out(object: &mut Map<String, Value>, list: &str, keep: Keep, over: usize) {
+    if over == 0 {
+        return;
+    }
+    let left_out = format!("{list}_omitted");
+    let Some(Value::Array(items)) = object.get_mut(list) else {
+        return;
+    };
+    // The count costs its name and digits.
+    let needed = over + left_out.len() + 24;
+    let (mut gone, mut count) = (0, 0);
+    while gone < needed && !items.is_empty() {
+        let item = match keep {
+            Keep::First => items.pop(),
+            Keep::Newest => Some(items.remove(0)),
+        };
+        gone += item.map_or(0, |item| chars(&item) + 1);
+        count += 1;
+    }
+    if count > 0 {
+        let before = object.get(&left_out).and_then(Value::as_u64).unwrap_or(0);
+        object.insert(left_out, json!(before + count));
+    }
+}
+
 /// `fields` with `key: items[..k]` and `left_out_key: items.len() - k`, k
 /// the most leading items that keep the document within RESULT_MAX_CHARS
 /// once "ok" is added: for a list sent whole, with no cursor to page it.

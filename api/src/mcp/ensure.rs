@@ -7,11 +7,12 @@ use shared::failure::{Failure, FailureCode, Stage};
 
 use super::args::{repeatable, Args};
 use super::contract::{
-    failed, invalid_value, items, too_large_to_repeat, upstream_error, ItemResult, Items, NextCall,
-    ToolError,
+    failed, invalid_value, items, items_text, too_large_to_repeat, upstream_error, ItemResult,
+    Items, NextCall, ToolError,
 };
 use super::jobs::JobTool;
 use super::keys::{keyed, request_key, Keyed};
+use super::paging::RESULT_MAX_CHARS;
 use super::refs::{
     filters, filters_schema, reference_schema, reference_value, request_key_schema, wanted,
     REFERENCE_FIELDS,
@@ -55,7 +56,7 @@ pub(crate) const ENSURE_IN_LIBRARY: ToolSpec = ToolSpec {
     title: "Get music into the library",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file: a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. Failure codes: {common}, folder_required, unknown_handle (folder_id), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial.")
+        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file: a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo and then its next calls, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["items"], "properties": {"items": {"type": "array", "minItems": 1, "maxItems": 50, "items": "#,
@@ -189,7 +190,7 @@ async fn run(
         ),
         ("next".to_string(), json!(next)),
     ]);
-    let result = items(Items {
+    let mut answered = Items {
         stage: Stage::Input,
         noun: "items",
         start: 0,
@@ -197,11 +198,59 @@ async fn run(
         pending: 0,
         cursor: None,
         fields,
-    });
+    };
+    bounded(&mut answered);
+    let result = items(answered);
     if keep {
         Keyed::Kept(result)
     } else {
         Keyed::Released(result)
+    }
+}
+
+/// The reference fields a refused item's facts echo.
+const ECHOED: [&str; 7] = [
+    "kind",
+    "artist",
+    "title",
+    "album",
+    "recording_mbid",
+    "release_mbid",
+    "duration_s",
+];
+
+/// `answered` within RESULT_MAX_CHARS (D4). Past it, refused items, the last first, leave out the
+/// reference their facts echo (the caller has it by its index), then their calls in `next`; each
+/// one's `facts.omitted` names what it left out. Ids (a job that already wants the recording)
+/// stay.
+fn bounded(answered: &mut Items) {
+    let over = |answered: &Items| items_text(answered).chars().count() > RESULT_MAX_CHARS;
+    for step in ["reference", "next"] {
+        for at in (0..answered.results.len()).rev() {
+            if !over(answered) {
+                return;
+            }
+            let ItemResult::Failed(error) = &mut answered.results[at] else {
+                continue;
+            };
+            let left_out = match step {
+                "reference" => {
+                    let before = error.facts.len();
+                    error
+                        .facts
+                        .retain(|name, _| !ECHOED.contains(&name.as_str()));
+                    error.facts.len() < before
+                }
+                _ => !std::mem::take(&mut error.next).is_empty(),
+            };
+            if !left_out {
+                continue;
+            }
+            let omitted = error.facts.entry("omitted").or_insert_with(|| json!([]));
+            if let Value::Array(omitted) = omitted {
+                omitted.push(json!(step));
+            }
+        }
     }
 }
 
@@ -213,12 +262,24 @@ fn item_result(item: EnsureItem, given: &Value, call: &Value) -> ItemResult {
         EnsureItem::InLibrary { song_ids } => json!({"status": "in_library", "song_ids": song_ids}),
         EnsureItem::Created { job_id, fuzzy } => json!({"status": "job_created", "job_id": job_id,
             "state": JobState::Searching.as_str(), "fuzzy_matches": fuzzy}),
+        EnsureItem::AlreadyRunning {
+            job_id,
+            failure,
+            facts,
+        } => {
+            let next = vec![NextCall::new(
+                "get_jobs",
+                json!({"job_ids": [job_id], "detail": "full"}),
+            )];
+            return ItemResult::Failed(ToolError {
+                failure,
+                facts,
+                tried: vec![],
+                next,
+            });
+        }
         EnsureItem::Refused(failure, facts) => {
             let next = match failure.code {
-                FailureCode::AlreadyRunning => vec![NextCall::new(
-                    "get_jobs",
-                    json!({"job_ids": [facts["job_id"]], "detail": "full"}),
-                )],
                 FailureCode::RateLimited => vec![NextCall::new("list_batches", json!({}))],
                 _ => {
                     let mut alone = call.clone();
@@ -659,6 +720,41 @@ mod tests {
         );
         assert_eq!(doc["results"][1]["status"], "job_created");
         assert_eq!(doc["next"][0]["tool"], "get_batch");
+    }
+
+    #[tokio::test]
+    async fn fifty_refused_items_keep_their_answer_within_the_cap() {
+        let (db, acq, _, token) = app_with_acquire().await;
+        let navi = NavidromeStub::start();
+        // nginx's 502 page for every lookup.
+        navi.answer_when("/api/song", "title=", 502,
+            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n");
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let long = |c: char, i: usize| format!("{} {i}", c.to_string().repeat(480));
+        let items: Vec<Value> = (0..50)
+            .map(|i| json!({"artist": long('a', i), "title": long('t', i), "album": long('l', i)}))
+            .collect();
+        let result = call_tool(app, &token, "ensure_in_library", json!({"items": items})).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.chars().count() <= crate::mcp::paging::RESULT_MAX_CHARS,
+            "{}",
+            text.chars().count()
+        );
+        let doc = document(&result);
+        let results = doc["results"].as_array().unwrap();
+        assert_eq!(results.len(), 50, "every item is answered");
+        // Every echo of a reference goes first; the first items keep the call that repeats them.
+        let first = &results[0]["error"];
+        assert_eq!(
+            (first["code"].as_str(), first["facts"].get("artist")),
+            (Some("navidrome_unreachable"), None)
+        );
+        assert_eq!(first["facts"]["omitted"], json!(["reference"]));
+        assert_eq!(first["next"][0]["args"]["items"][0]["artist"], long('a', 0));
+        let last = &results[49]["error"];
+        assert_eq!(last["facts"]["omitted"], json!(["reference", "next"]));
+        assert_eq!(last["next"], json!([]));
     }
 
     #[tokio::test]

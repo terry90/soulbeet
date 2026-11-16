@@ -5,19 +5,22 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::download::MatchCandidate;
 use shared::failure::{cut_chars, RetryAdvice, RAW_MAX_CHARS, TEXT_MAX_CHARS};
+use tracing::warn;
 
 use super::args::Args;
-use super::contract::{
-    answer, failed, invalid_value, success, upstream_error, NextCall, ToolError,
-};
+use super::contract::{failed, invalid_value, success, upstream_error, NextCall, ToolError};
 use super::jobs::JobTool;
 use super::keys::{keyed, request_key, Keyed};
-use super::paging::fit_whole;
+use super::next::next_calls;
+use super::paging::{fit_whole, leave_out, length, Keep};
 use super::refs::request_key_schema;
 use super::server::{common_codes, ToolSpec};
 use super::McpCaller;
 use crate::connection::ConnectionState;
-use crate::core::jobs::decide::{import_choices, resolve, Decision, ImportChoices};
+use crate::core::jobs::decide::{import_choices, resolve, Decision, ImportChoices, Refused, Why};
+use crate::core::jobs::retry::RetryAnswer;
+use crate::core::jobs::runner::Acquire;
+use crate::core::jobs::untried;
 
 const GET_IMPORT_CHOICES_ARGS: &[&str] = &["job_id", "slot"];
 
@@ -39,7 +42,7 @@ pub(crate) const GET_IMPORT_CHOICES: ToolSpec = ToolSpec {
     title: "Show import choices",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Shows what a job waiting for an import decision (needs_decision) kept for it: kept_folder, the folder of the downloaded files relative to Soulful's download folder; files, each file relative to kept_folder with the tags beets read (artist, title, album, track, length_s), files_omitted counting those left out to stay under 60,000 characters; tasks, how many of beets' tasks imported of how many, and output_tail, the end of beets' output, from its last run; candidates, the matches beets weighed and found too far (data_source, id, artist, title, album, year, country, disambiguation, distance from 0 for an exact match to 1, the fields that differ, and for an album how the files fit its tracks); and allowed_choices, the choices resolve_import takes for it. A job of an album the web page imported track by track can keep several imports: slot then names one, any slot waiting for it. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; resolve_import or dismiss_job ends the job).")
+        format!("Shows what a job waiting for an import decision (needs_decision) kept for it: kept_folder, the folder of the downloaded files relative to Soulful's download folder; files, each file relative to kept_folder with the tags beets read (artist, title, album, track, length_s), files_omitted counting those left out to stay under 60,000 characters; tasks, how many of beets' tasks imported of how many, and output_tail, the end of beets' output, from its last run; candidates, the matches beets weighed and found too far (data_source, id, artist, title, album, year, country, disambiguation, distance from 0 for an exact match to 1, the fields that differ, and for an album how the files fit its tracks; past 30,000 characters the farthest are left out, candidates_omitted counting them); and allowed_choices, the choices resolve_import takes for it. A job of an album the web page imported track by track can keep several imports: slot then names one, any slot waiting for it. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; resolve_import or dismiss_job ends the job).")
     },
     input_schema: r#"{"type": "object", "additionalProperties": false, "required": ["job_id"], "properties": {"job_id": {"type": "string", "minLength": 1}, "slot": {"type": "integer", "minimum": 0}}}"#,
     read_only: true,
@@ -77,25 +80,68 @@ fn offered(e: ToolError, again: Option<NextCall>) -> ToolError {
     }
 }
 
+/// `refused` as `tool`'s error: its failure and facts (`changed` when it changed the job), with
+/// the job's state and the calls it takes as read after it, but `refused.refused_tool`'s.
+async fn refusal_error(acquire: &Acquire, tool: &'static str, refused: Refused) -> ToolError {
+    let (failure, mut facts) = match refused.why {
+        Why::Failed(failure, facts) => (failure, facts),
+        Why::Slot { expected } => {
+            let ToolError { failure, facts, .. } = invalid_value(tool, "slot", &expected);
+            (failure, facts)
+        }
+    };
+    if refused.changed {
+        facts.insert("changed".into(), json!(true));
+    }
+    let mut next = vec![];
+    if let Some(view) = &refused.job {
+        facts.insert("state".into(), json!(view.job.state.as_str()));
+        let now = chrono::Utc::now().timestamp();
+        match untried(&acquire.db, view, now).await {
+            Ok(untried) => {
+                next = (next_calls(view, &untried).into_iter())
+                    .filter(|call| Some(call.tool) != refused.refused_tool)
+                    .collect();
+            }
+            Err(f) => warn!(
+                "Could not read the sources of job {} after a refusal: {}",
+                view.job.id, f.message
+            ),
+        }
+    }
+    ToolError {
+        failure,
+        facts,
+        tried: vec![],
+        next,
+    }
+}
+
 /// `get_import_choices`: what the caller's job waiting for an import decision kept.
 pub(crate) async fn get_import_choices(
     state: &ConnectionState,
     caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
-    let args = Args::new("get_import_choices", args, GET_IMPORT_CHOICES_ARGS);
-    answer(
-        async {
-            let job_id = args.string("job_id")?;
-            let slot = args.opt_u32("slot", 0, 999)?;
-            args.finish()?;
-            let choices = import_choices(&state.acquire, &caller.ctx, &job_id, slot)
-                .await
-                .map_err(|e| offered(e, args.same_call()))?;
-            Ok(choices_document(choices))
+    const TOOL: &str = "get_import_choices";
+    let args = Args::new(TOOL, args, GET_IMPORT_CHOICES_ARGS);
+    let read = || -> Result<(String, Option<u32>), ToolError> {
+        let job_id = args.string("job_id")?;
+        let slot = args.opt_u32("slot", 0, 999)?;
+        args.finish()?;
+        Ok((job_id, slot))
+    };
+    let (job_id, slot) = match read() {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    match import_choices(&state.acquire, &caller.ctx, &job_id, slot).await {
+        Ok(choices) => success(choices_document(choices)),
+        Err(refused) => {
+            let error = refusal_error(&state.acquire, TOOL, refused).await;
+            failed(offered(error, args.same_call()))
         }
-        .await,
-    )
+    }
 }
 
 /// Text from beets or a peer as a result shows it.
@@ -103,7 +149,12 @@ fn cut(text: &str) -> String {
     cut_chars(text.to_string(), TEXT_MAX_CHARS)
 }
 
-/// What get_import_choices answers: the files last, as many as fit.
+/// The most characters of get_import_choices' answer before its files: past it, the last
+/// candidates (the farthest) are left out, so the files keep the rest of the RESULT_MAX_CHARS.
+const CHOICES_MAX_CHARS: usize = 30_000;
+
+/// What get_import_choices answers: the candidates within CHOICES_MAX_CHARS, best first,
+/// `candidates_omitted` counting those left out, then the files, as many as fit.
 fn choices_document(choices: ImportChoices) -> Map<String, Value> {
     let candidates: Vec<Value> = (choices.candidates.iter())
         .flat_map(|c| &c.candidates)
@@ -118,6 +169,8 @@ fn choices_document(choices: ImportChoices) -> Map<String, Value> {
     fields.insert("output_tail".into(), json!(tail));
     fields.insert("candidates".into(), Value::Array(candidates));
     fields.insert("allowed_choices".into(), json!(choices.allowed));
+    let over = length(&fields).saturating_sub(CHOICES_MAX_CHARS);
+    leave_out(&mut fields, "candidates", Keep::First, over);
     // The tags were cut when beets' report was read.
     let files = (choices.files.iter())
         .map(|f| {
@@ -209,8 +262,8 @@ fn read_resolve(args: &Args) -> Result<ResolveCall, ToolError> {
 }
 
 /// `resolve_import`: the decision on the caller's job's kept import, once per request key. A
-/// decision made answers the job's full document; a refusal that changed the job (`changed` in
-/// its facts) is kept for the key too, any other lets the key go.
+/// decision made is answered as every change to a job is (`JobTool::answer`); a refusal that
+/// changed the job is kept for the key too, any other lets the key go.
 pub(crate) async fn resolve_import(
     state: &ConnectionState,
     caller: &McpCaller,
@@ -233,12 +286,24 @@ pub(crate) async fn resolve_import(
     let again = args.same_call();
     let work = async move {
         match resolve(&on.acquire, &on.caller.ctx, &job_id, slot, decision).await {
-            Ok(view) => Keyed::Kept(match on.document(&view).await {
-                Ok(fields) => success(fields),
-                Err(f) => failed(upstream_error(f, Map::new(), None)),
-            }),
-            Err(e) if e.facts.get("changed") == Some(&json!(true)) => Keyed::Kept(failed(e)),
-            Err(e) => Keyed::Released(failed(offered(e, again))),
+            Ok(decided) => {
+                let answered = match decided {
+                    Ok(view) => RetryAnswer::Applied(Box::new(view)),
+                    Err(failure) => RetryAnswer::AppliedUnread {
+                        job: job_id.clone(),
+                        failure,
+                    },
+                };
+                on.answer(Some(&job_id), Ok(answered), None).await
+            }
+            Err(refused) => {
+                let changed = refused.changed;
+                let error = refusal_error(&on.acquire, "resolve_import", refused).await;
+                match changed {
+                    true => Keyed::Kept(failed(error)),
+                    false => Keyed::Released(failed(offered(error, again))),
+                }
+            }
         }
     };
     keyed(&state.acquire, caller, "resolve_import", key, &call, work).await
@@ -251,8 +316,171 @@ mod tests {
     use crate::connection::test_util::{app_of, call_tool, document, jobs_app};
     use crate::core::folder_of;
     use crate::core::jobs::test_support::{
-        downloading_track_job, kept_track_job_with, no_match_with_files, track_job_of,
+        downloading_track_job, kept_album_job, kept_track_job_with, no_match_with_files,
+        track_job_of,
     };
+    use soulbeet::DriverChoice;
+    use std::time::Duration;
+
+    /// The tools `error` offers, in order.
+    fn offered(error: &serde_json::Value) -> Vec<&str> {
+        (error["next"].as_array().unwrap().iter())
+            .map(|call| call["tool"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_farthest_candidates_are_left_out_past_their_share_of_the_answer() {
+        use crate::core::jobs::decide::import_choices;
+        use crate::core::jobs::runner::Acquire;
+        use crate::core::jobs::test_support::test_db_with_alice;
+        use crate::mcp::paging::{length, RESULT_MAX_CHARS};
+        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let job = kept_track_job_with(&acq, &effects, no_match_with_files(1)).await;
+        let ctx = crate::core::test_ctx("alice");
+        let mut choices = import_choices(&acq, &ctx, &job, None).await.unwrap();
+        // Forty matches whose names are as long as a provider's may be.
+        let long = "x".repeat(500);
+        let kept = choices.candidates.as_mut().unwrap();
+        let far = shared::download::MatchCandidate {
+            artist: long.clone(),
+            title: long.clone(),
+            album: Some(long.clone()),
+            disambig: Some(long),
+            ..kept.candidates[0].clone()
+        };
+        kept.candidates = vec![far; 40];
+        let doc = super::choices_document(choices);
+        assert!(length(&doc) < RESULT_MAX_CHARS, "{}", length(&doc));
+        let shown = doc["candidates"].as_array().unwrap().len();
+        assert!(shown > 0 && shown < 40, "{shown}");
+        assert_eq!(
+            shown as u64 + doc["candidates_omitted"].as_u64().unwrap(),
+            40
+        );
+        assert_eq!(
+            doc["files"].as_array().unwrap().len(),
+            1,
+            "the files keep their share"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_choice_made_is_answered_with_the_job_and_runs_its_import() {
+        let picked = "6c1e4d9a-2b7f-4e83-9a51-0d3f8c7b2e00";
+        let mbid = "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8";
+        let decisions = [
+            (json!({"choice": "as_is"}), DriverChoice::AsIs),
+            (
+                json!({"choice": "candidate", "data_source": "MusicBrainz", "id": picked}),
+                DriverChoice::Pick {
+                    data_source: "MusicBrainz".into(),
+                    id: picked.into(),
+                },
+            ),
+            (
+                json!({"choice": "musicbrainz", "musicbrainz": mbid}),
+                DriverChoice::Pick {
+                    data_source: "MusicBrainz".into(),
+                    id: mbid.into(),
+                },
+            ),
+        ];
+        for (decision, ran) in decisions {
+            let (db, acq, effects, token) = jobs_app().await;
+            let app = app_of(&db, &acq);
+            let job = kept_track_job_with(&acq, &effects, no_match_with_files(2)).await;
+            let runs = effects.importer().calls();
+            let mut call = decision.clone();
+            call["job_id"] = json!(job);
+            let doc = document(&call_tool(app, &token, "resolve_import", call).await);
+            assert_eq!(
+                (doc["ok"].as_bool(), doc["job_id"].as_str()),
+                (Some(true), Some(job.as_str())),
+                "{decision}: {doc}"
+            );
+            assert!(doc["next"].is_array(), "the job's full document");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while effects.importer().calls() == runs {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the decided import runs");
+            assert_eq!(
+                effects.importer().choices().last(),
+                Some(&ran),
+                "{decision}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_decision_offers_what_the_job_takes_now() {
+        let (db, acq, effects, token) = jobs_app().await;
+        let app = app_of(&db, &acq);
+        // A job keeping one import per file: a slot names one.
+        let dir = tempfile::tempdir().unwrap();
+        let files = ["07.flac", "08.flac"].map(|name| {
+            let file = dir.path().join(name);
+            std::fs::write(&file, b"flac").unwrap();
+            file
+        });
+        let album = kept_album_job(&acq, [&files[0], &files[1]], [true, true]).await;
+        let error = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "get_import_choices",
+                json!({"job_id": album}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            (error["code"].as_str(), error["facts"]["field"].as_str()),
+            (Some("invalid_input"), Some("slot"))
+        );
+        assert_eq!(
+            error["next"],
+            json!([
+                {"tool": "get_import_choices", "args": {"job_id": album, "slot": 0}},
+                {"tool": "resolve_import", "args": {"job_id": album, "slot": 0, "choice": "retry"}},
+                {"tool": "get_import_choices", "args": {"job_id": album, "slot": 1}},
+                {"tool": "resolve_import", "args": {"job_id": album, "slot": 1, "choice": "retry"}},
+                {"tool": "dismiss_job", "args": {"job_id": album}},
+            ])
+        );
+        // A MusicBrainz release for a track import: decide again, with the choices.
+        let track = kept_track_job_with(&acq, &effects, no_match_with_files(0)).await;
+        let error = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "resolve_import",
+                json!({"job_id": track, "choice": "musicbrainz",
+                    "musicbrainz": "https://musicbrainz.org/release/6a09041b-0f79-3278-88d9-0552dd28d37f"}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            (
+                error["facts"]["kept"].as_str(),
+                error["facts"]["state"].as_str()
+            ),
+            (Some("kept"), Some("needs_decision"))
+        );
+        assert_eq!(offered(&error)[0], "get_import_choices");
+        // Kept files deleted: shown gone, without offering the same read again.
+        std::fs::remove_dir_all(acq.download_base.join("Come Over [1f2e3d4c]")).unwrap();
+        let error =
+            document(&call_tool(app, &token, "get_import_choices", json!({"job_id": track})).await)
+                ["error"]
+                .clone();
+        assert_eq!(error["code"], "import_files_gone");
+        assert_eq!(offered(&error), vec!["resolve_import", "dismiss_job"]);
+    }
 
     #[tokio::test]
     async fn get_import_choices_needs_a_job_of_the_caller_waiting_for_a_decision() {
@@ -302,9 +530,14 @@ mod tests {
         let first = call_tool(app.clone(), &token, "resolve_import", call.clone()).await;
         let error = &document(&first)["error"];
         assert_eq!(
-            (error["code"].as_str(), error["facts"]["state"].as_str()),
-            (Some("import_files_gone"), Some("failed"))
+            (
+                error["code"].as_str(),
+                error["facts"]["state"].as_str(),
+                error["facts"]["changed"].as_bool()
+            ),
+            (Some("import_files_gone"), Some("failed"), Some(true))
         );
+        assert!(offered(error).contains(&"dismiss_job"));
         // The slots failed: the repeat answers that, not what the job is now asked again.
         let again = call_tool(app, &token, "resolve_import", call).await;
         assert_eq!(document(&again), document(&first));

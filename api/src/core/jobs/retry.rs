@@ -693,7 +693,8 @@ pub(crate) async fn download_source(
     let batch = NewJobBatch {
         id: uuid::Uuid::new_v4().to_string(),
         user: ctx.id(),
-        label: Some(wanted.label()),
+        // Named by the writer after its one job.
+        label: None,
         origin: BatchOrigin::Mcp,
     };
     let job = NewJob {

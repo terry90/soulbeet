@@ -427,8 +427,25 @@ pub fn recording_keys(wanted: &DownloadQuery, kind: JobKind) -> RecordingKeys {
 pub struct NewJobBatch {
     pub id: String,
     pub user: UserId,
+    /// None for an MCP batch the caller did not name: `create_batch` names it after the jobs it
+    /// takes (`items_label`).
     pub label: Option<String>,
     pub origin: BatchOrigin,
+}
+
+/// What a batch of jobs for `wanted` is called when its caller named none: the first one's
+/// "{artist} - {title}", and how many more there are. None for no job.
+pub fn items_label(wanted: &[&DownloadQuery]) -> Option<String> {
+    let name = |query: &DownloadQuery| match (&query.album, query.tracks.first()) {
+        (Some(album), _) => format!("{} - {}", album.artist, album.title),
+        (None, Some(track)) => format!("{} - {}", track.artist, track.title),
+        (None, None) => String::new(),
+    };
+    let first = name(wanted.first()?);
+    Some(match wanted.len() {
+        1 => first,
+        n => format!("{first} and {} more", n - 1),
+    })
 }
 
 pub struct NewJob {
@@ -2543,6 +2560,43 @@ mod tests {
             }
         ));
         assert!(!marks.job_cancelled(&placed), "an ended job keeps no mark");
+    }
+
+    #[tokio::test]
+    async fn a_batch_given_no_name_is_named_after_the_jobs_it_takes() {
+        let (ledger, db, alice, _) = ledger().await;
+        let night = || wanted_track("Marrow Choir", "O Holy Night", None);
+        ledger
+            .create_batch(batch_of("b1"), vec![mcp_job("j1", &alice, night())])
+            .await
+            .unwrap();
+        let unnamed = NewJobBatch {
+            label: None,
+            ..batch_of("b2")
+        };
+        let jobs = vec![
+            mcp_job("j2", &alice, night()),
+            mcp_job(
+                "j3",
+                &alice,
+                wanted_track("Marrow Choir", "Silent Night", None),
+            ),
+            mcp_job(
+                "j4",
+                &alice,
+                wanted_track("Marrow Choir", "Coventry Carol", None),
+            ),
+        ];
+        let admitted = ledger.create_batch(unnamed, jobs).await.unwrap();
+        assert!(matches!(admitted[0], Admitted::AlreadyRunning { .. }));
+        let label: Option<String> = sqlx::query_scalar("SELECT label FROM batches WHERE id = 'b2'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            label.as_deref(),
+            Some("Marrow Choir - Silent Night and 1 more")
+        );
     }
 
     #[tokio::test]

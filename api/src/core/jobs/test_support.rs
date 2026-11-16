@@ -76,7 +76,7 @@ async fn mcp_job(acq: &Acquire, wanted: Wanted, options: JobOptions) -> String {
 /// `user`'s MCP job for `wanted` into their folder `{user}-folder` (`core::folder_of`'s), in a
 /// batch of its own, searching under a new search id.
 async fn mcp_job_of(acq: &Acquire, user: &str, wanted: Wanted, options: JobOptions) -> String {
-    let label = wanted.label();
+    let label = crate::ledger::items_label(&[&wanted.query()]).expect("one job");
     let (_, mut jobs) = mcp_batch(acq, user, &label, vec![wanted], options).await;
     jobs.remove(0)
 }
