@@ -315,10 +315,10 @@ pub struct MatchHow {
     ///   Such a song is no exact match: `exact` needs the length within
     ///   DURATION_TOLERANCE_S when the reference gives one.
     /// - `album`: given, and the song has none. The album never decides the
-    ///   kind, whether it agrees, differs or is unchecked: `mbid` and
-    ///   `exact` look at the MBID, artist, title and length only, and
-    ///   `fuzzy`'s score at title and artist. It is reported, in `differs`
-    ///   or here, for the caller to weigh.
+    ///   kind, whether it agrees, differs or is unchecked: `mbid` looks at
+    ///   the MBID alone, `exact` at artist, title and length, and `fuzzy`'s
+    ///   score at title and artist. It is reported, in `differs` or here,
+    ///   for the caller to weigh.
     pub unchecked: Vec<&'static str>,
 }
 

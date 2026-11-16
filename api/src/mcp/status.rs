@@ -269,10 +269,11 @@ pub(crate) async fn call(
 /// a Python error, to RAW_MAX_CHARS like a cause. The running batches and
 /// then the folders are listed while the document stays within
 /// RESULT_MAX_CHARS; `running_batches_left_out` and `folders_left_out`
-/// count the rest (list_folders pages through the folders). The importer
-/// issues are sent whole: beside a few fixed ones they come from the beets
-/// probe's report, one line the probe keeps under 8,000 characters by
-/// cutting each plugin error to 500, 200, 80 or 0 characters
+/// count the rest (list_folders pages through the folders). The list of
+/// importer issues is not fitted, only each issue's texts are cut: beside
+/// a few fixed ones the issues come from the beets probe's report, one
+/// line the probe usually holds under 8,000 characters by cutting each
+/// plugin error to 500, 200, 80 or 0 characters
 /// (lib/soulbeet/src/beets/probe.py, `MAX_LINE`), or from the probe's
 /// output tail.
 pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<String, Value> {
