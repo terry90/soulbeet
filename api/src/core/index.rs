@@ -1265,6 +1265,7 @@ mod tests {
         ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
             import: StoredImport {
                 sources: vec![wait.import.clone().into()],
+                files: vec![wait.import.clone().into()],
                 target: wait.library.clone(),
                 album: false,
                 cleanup_root: None,

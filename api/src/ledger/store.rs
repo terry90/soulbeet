@@ -206,7 +206,7 @@ fn job_of(row: JobRow) -> Result<JobRecord, sqlx::Error> {
             shared: row.folder_shared,
         },
         batch_id: row.batch_id,
-        origin: origin_named(Some(&row.origin))?,
+        origin: origin_named(&row.origin)?,
         kind: kind_named(&row.kind)?,
         wanted: json(&row.wanted)?,
         options: row.options.as_deref().map(json).transpose()?,
@@ -417,7 +417,7 @@ struct UnfinishedRow {
     monitor_batch_id: Option<String>,
     batch_label: Option<String>,
     request: Option<String>,
-    origin: Option<String>,
+    origin: String,
     options: Option<String>,
     excluded_sources: String,
     cancel_requested: bool,
@@ -438,12 +438,13 @@ fn state_named(name: &str) -> Result<JobState, sqlx::Error> {
         .ok_or_else(|| sqlx::Error::Decode(format!("unknown job state {name:?}").into()))
 }
 
-/// A batch's stored origin; a job without a batch is the web UI's.
-fn origin_named(name: Option<&str>) -> Result<BatchOrigin, sqlx::Error> {
+/// A batch's stored origin. Every job has its batch: the writer makes one with every job, and
+/// the migration gave each earlier job one of its own.
+fn origin_named(name: &str) -> Result<BatchOrigin, sqlx::Error> {
     match name {
-        Some("mcp") => Ok(BatchOrigin::Mcp),
-        Some("ui") | None => Ok(BatchOrigin::Ui),
-        Some(other) => Err(sqlx::Error::Decode(
+        "mcp" => Ok(BatchOrigin::Mcp),
+        "ui" => Ok(BatchOrigin::Ui),
+        other => Err(sqlx::Error::Decode(
             format!("unknown batch origin {other:?}").into(),
         )),
     }
@@ -474,7 +475,7 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
                 j.wanted, j.import_mode, j.state, j.search_id, j.monitor_batch_id, j.batch_label, \
                 j.request, b.origin, j.options, j.excluded_sources, j.cancel_requested \
          FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
-         LEFT JOIN batches b ON b.id = j.batch_id \
+         JOIN batches b ON b.id = j.batch_id \
          WHERE j.state NOT IN {TERMINAL_SQL} ORDER BY j.created_at, j.rowid"
     ))
     .fetch_all(db)
@@ -571,7 +572,7 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
                 monitor_batch_id: row.monitor_batch_id,
                 batch_label: row.batch_label,
                 request: row.request,
-                origin: origin_named(row.origin.as_deref())?,
+                origin: origin_named(&row.origin)?,
                 options: row.options.as_deref().map(json).transpose()?,
                 excluded_sources: json(&row.excluded_sources)?,
                 cancel_requested: row.cancel_requested,
@@ -811,7 +812,7 @@ async fn batches_where(
                 id,
                 created_at,
                 label,
-                origin: origin_named(Some(&origin))?,
+                origin: origin_named(&origin)?,
                 counts: BTreeMap::new(),
             });
         }
@@ -954,6 +955,7 @@ mod tests {
         });
         let import = StoredImport {
             sources: vec!["/downloads/b/02.flac".into()],
+            files: vec!["/downloads/b/02.flac".into()],
             target: "/music".into(),
             album: false,
             cleanup_root: None,

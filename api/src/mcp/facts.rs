@@ -36,6 +36,19 @@ fn cut(text: &str) -> String {
     cut_chars(text.to_string(), TEXT_MAX_CHARS)
 }
 
+/// `facts` with each text cut as `cut` cuts one: what a backend reports of a file is the peer's.
+fn cut_texts(facts: &Map<String, Value>) -> Map<String, Value> {
+    (facts.iter())
+        .map(|(name, value)| {
+            let value = match value {
+                Value::String(text) => json!(cut(text)),
+                other => other.clone(),
+            };
+            (name.clone(), value)
+        })
+        .collect()
+}
+
 /// The wanted length of the file `item` stands for: the wanted track of its title, or the one
 /// wanted track of a track search.
 fn wanted_duration(item: &DownloadableItem, wanted: &DownloadQuery) -> Option<u32> {
@@ -58,7 +71,7 @@ fn file_fields(item: Option<&DownloadableItem>, wanted: &DownloadQuery) -> Map<S
     });
     let Value::Object(fields) = json!({
         "remote_file": item.map(|item| cut(&item.id)),
-        "extension": f.map(|f| &f.extension),
+        "extension": f.and_then(|f| f.extension.as_deref()).map(cut),
         "size_bytes": item.map(|item| item.size),
         "bitrate_kbps": f.map(|f| f.bitrate_kbps),
         "variable_bitrate": f.map(|f| f.variable_bitrate),
@@ -69,7 +82,7 @@ fn file_fields(item: Option<&DownloadableItem>, wanted: &DownloadQuery) -> Map<S
         "match_score": item.map(|item| item.match_score),
         "quality_score": item.map(|item| item.quality_score),
         "below_floor": item.map(|item| item.below_floor),
-        "backend_facts": f.map(|f| &f.backend_facts),
+        "backend_facts": f.map(|f| cut_texts(&f.backend_facts)),
     }) else {
         unreachable!("an object literal is an object");
     };
@@ -477,7 +490,7 @@ fn tried_entry(slot: u32, attempt: &AttemptRecord) -> Value {
         "attempt": attempt.n,
         "source": attempt.source.as_deref().map(cut),
         "remote_file": file.map(|f| cut(&f.id)),
-        "extension": file.and_then(|f| f.facts.extension.as_ref()),
+        "extension": file.and_then(|f| f.facts.extension.as_deref()).map(cut),
         "bitrate_kbps": file.and_then(|f| f.facts.bitrate_kbps),
         "size_bytes": file.and_then(|f| f.size),
         "started_at": attempt.started_at,
@@ -563,7 +576,7 @@ fn job_search_facts(view: &JobView) -> Map<String, Value> {
                 &HashMap::new(),
                 &view.job.excluded_sources,
             );
-            (Some(stats), kept.dropped_by_filter)
+            (stats, kept.dropped_by_filter)
         }
         SearchProgress::Failed(_, stats) => (stats, DroppedByFilter::default()),
         SearchProgress::Running => (None, DroppedByFilter::default()),
@@ -1015,7 +1028,7 @@ mod tests {
         };
         let found = vec![group("peer_b", vec![mp3], 0.85)];
         acq.ledger
-            .search_ended(&search_id, Ok((found, SearchStats::default())))
+            .search_ended(&search_id, Ok((found, Some(SearchStats::default()))))
             .await
             .unwrap();
         crate::core::jobs::runner::drive(&acq, &crate::core::test_ctx("alice"), &job).await;
@@ -1157,6 +1170,11 @@ mod tests {
                 extension: Some("flac".into()),
                 folder_audio_files: Some(11),
                 source_queue_length: Some(4),
+                // What the peer's client wrote, as long as it likes.
+                backend_facts: Map::from_iter([(
+                    "declared_extension".to_string(),
+                    json!("f".repeat(900)),
+                )]),
                 ..FileFacts::default()
             },
             ..item("peer_a", "Wake Up", &format!("a\\{}.flac", "x".repeat(600)))
@@ -1185,6 +1203,8 @@ mod tests {
             (Some(3), Some(true))
         );
         assert!(doc["remote_file"].as_str().unwrap().chars().count() <= TEXT_MAX_CHARS);
+        let declared = doc["backend_facts"]["declared_extension"].as_str().unwrap();
+        assert!(declared.chars().count() <= TEXT_MAX_CHARS);
         assert!(doc.get("files").is_none() && doc.get("tracks_found").is_none());
     }
 

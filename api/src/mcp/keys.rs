@@ -2,7 +2,10 @@
 //! first call's result instead of acting again.
 
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::LazyLock;
+
+use futures::FutureExt;
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Map, Value};
@@ -69,8 +72,8 @@ pub(crate) enum Keyed {
 /// always. `call` is the call's arguments as the tool read them, `request_key` left out: a key
 /// repeated with other arguments is refused. The work runs in its own task, so a client that
 /// leaves does not stop it. A kept answer is stored for the key, failures included; a released
-/// one, or one the ledger could not store, lets the key go. A repeat answers the stored result
-/// while the first call has ended, `key_running` while it runs.
+/// one, one the ledger could not store, or work that panicked lets the key go. A repeat answers
+/// the stored result while the first call has ended, `key_running` while it runs.
 pub(crate) async fn keyed<Fut>(
     acquire: &Acquire,
     caller: &McpCaller,
@@ -125,7 +128,15 @@ where
         Ok(KeyReservation::Fresh) => {
             let ledger = acquire.ledger.clone();
             run(tokio::spawn(async move {
-                let (result, keep) = match work.await {
+                let answered = match AssertUnwindSafe(work).catch_unwind().await {
+                    Ok(answered) => answered,
+                    Err(panic) => {
+                        // Nothing is stored for the key: it is let go, and the panic goes on.
+                        let _ = ledger.release_key(&key, &INSTANCE).await;
+                        std::panic::resume_unwind(panic);
+                    }
+                };
+                let (result, keep) = match answered {
                     Keyed::Kept(result) => (result, true),
                     Keyed::Released(result) => (result, false),
                 };
@@ -301,6 +312,24 @@ mod tests {
         assert_eq!(text_of(&ran), text_of(&answer("second")));
         let again = call_k1(&acquire, &caller, never()).await;
         assert_eq!(text_of(&again), text_of(&answer("second")));
+    }
+
+    #[tokio::test]
+    async fn a_call_that_panicked_leaves_its_key_to_the_next_call() {
+        let (caller, acquire) = alice_on(crate::db::test_db::migrated().await).await;
+        let panicked = tokio::spawn({
+            let (acquire, caller) = (acquire.clone(), caller.clone());
+            async move {
+                call_k1(&acquire, &caller, async {
+                    panic!("a bug in the call");
+                })
+                .await
+            }
+        });
+        assert!(panicked.await.unwrap_err().is_panic());
+        // Not left running: the same call with the same key runs again.
+        let ran = call_k1(&acquire, &caller, async { Keyed::Kept(answer("second")) }).await;
+        assert_eq!(text_of(&ran), text_of(&answer("second")));
     }
 
     #[tokio::test]

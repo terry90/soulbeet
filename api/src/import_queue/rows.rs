@@ -220,6 +220,7 @@ mod tests {
     fn job(source: &str, mode: ImportMode) -> ImportJob {
         ImportJob {
             sources: vec![PathBuf::from(source)],
+            files: vec![PathBuf::from(source)],
             target: PathBuf::from("/music"),
             mode,
             owner: None,

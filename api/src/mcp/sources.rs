@@ -331,7 +331,7 @@ async fn search_answer(
             no_candidate_passed(),
             &id,
             &spec,
-            Some(&stats),
+            stats.as_ref(),
             &view.dropped_by_filter,
         ));
     }
@@ -344,7 +344,7 @@ async fn search_answer(
     fields.insert("search_id".into(), json!(id));
     fields.insert("state".into(), json!("done"));
     fields.insert("expires_at".into(), json!(stored.expires_at));
-    fields.extend(search_facts(Some(&stats), &spec, &view.dropped_by_filter));
+    fields.extend(search_facts(stats.as_ref(), &spec, &view.dropped_by_filter));
     // Room for `next`: its cursor is never longer than the one at the page's end.
     let longest =
         Listing::new("get_sources", &json!({"search_id": id})).cursor(page.offset + page.limit);
@@ -529,6 +529,7 @@ mod tests {
         access_token, add_user, alice_caller, app_of, app_with_acquire, call_tool, count, document,
         text_of, RESOURCE,
     };
+    use crate::core::jobs::runner::TestEffects;
     use crate::mcp::args::tests::obj;
     use crate::server_fns::download::test_support::{group, item, search_result, track};
 
@@ -675,6 +676,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Wake Up", "Come Over", "Lights Out"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_cannot_search_says_who_fixes_it_and_when_to_call_again() {
+        use crate::core::backend_unavailable;
+        use crate::services::BackendLookupError;
+        use soulbeet::error::{MissingSetting, SoulseekError};
+        let (db, acq, effects, token) = app_with_acquire().await;
+        let reference = json!({"artist": "Marrow Choir", "title": "O Holy Night"});
+        let find = |effects: &TestEffects, e: BackendLookupError| {
+            effects.fail_backend(backend_unavailable(Stage::SourceSearch, &e));
+            call_tool(
+                app_of(&db, &acq),
+                &token,
+                "find_sources",
+                json!({"reference": reference}),
+            )
+        };
+        // No slskd URL saved: a person sets it.
+        let unset = BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url));
+        let error = document(&find(&effects, unset).await)["error"].clone();
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["retry"].as_str(),
+                error["user_action"]["code"].as_str()
+            ),
+            (
+                Some("backend_not_configured"),
+                Some("needs_user"),
+                Some("configure_backend")
+            )
+        );
+        assert_eq!(error["next"], json!([]));
+        // slskd does not answer: the same call later.
+        let down = BackendLookupError::Backend(SoulseekError::Api {
+            status: 503,
+            message: "Connection failed: error sending request".into(),
+        });
+        let error = document(&find(&effects, down).await)["error"].clone();
+        assert_eq!(
+            (error["code"].as_str(), error["retry"].as_str()),
+            (Some("backend_unreachable"), Some("same_source_later"))
+        );
+        let mut again = reference.clone();
+        again["kind"] = json!("track");
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "find_sources", "args": {"reference": again}}])
+        );
+        assert!(effects.stub().specs().is_empty(), "nothing was searched");
     }
 
     #[tokio::test]

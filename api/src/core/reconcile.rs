@@ -28,7 +28,7 @@ use crate::server_fns::download::monitor::{
     cancelled_on_request, DownloadMonitor, WatchedTransfer,
 };
 use crate::server_fns::download::process::{
-    find_on_disk, import_job, resolve_on_disk, unresolved_row, ResolvedSlot,
+    find_on_disk, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
 };
 use crate::server_fns::download::utils::{FileId, Unresolved};
 use crate::services::download_backend;
@@ -482,10 +482,7 @@ fn batch_of<'a>(
             downloads.push(Downloads {
                 ctx: job.ctx.clone(),
                 queued: Vec::new(),
-                batch: match job.origin {
-                    BatchOrigin::Ui => batch,
-                    BatchOrigin::Mcp => batch.skipping_duplicates(),
-                },
+                batch: batch.with_duplicates(DuplicateRule::of(job.origin)),
                 slots: Vec::new(),
                 pools: HashMap::new(),
             });
@@ -663,13 +660,15 @@ pub(crate) async fn resume_unfinished(
     info!("Resuming {} unfinished jobs", jobs.len());
 
     let now = chrono::Utc::now().timestamp();
-    // Read once: an MCP job's failover passes flagged sources over (D5).
-    let failures = store::recent_failures(db, now - RECENT_FAILURES_SECS)
-        .await
-        .unwrap_or_else(|e| {
+    // Read once: an MCP job's failover passes flagged sources over (D5). Unread, no source can be
+    // told flagged, so an MCP job resumes with its current transfers and no other source.
+    let failures = match store::recent_failures(db, now - RECENT_FAILURES_SECS).await {
+        Ok(failures) => Some(failures),
+        Err(e) => {
             warn!("Could not read the sources' recent failures to resume jobs: {e}");
-            HashMap::new()
-        });
+            None
+        }
+    };
     let mut kept = Vec::new();
     let mut importing = Vec::new();
     let mut downloads: Vec<Downloads> = Vec::new();
@@ -713,20 +712,22 @@ pub(crate) async fn resume_unfinished(
         }
 
         // An MCP job's alternates are its search's candidates as its own view keeps them.
-        let candidates = match (search, &job.options) {
-            (Some(search), Some(options)) => {
+        let candidates = match (search, &job.options, &failures) {
+            (Some(search), Some(options), Some(failures)) => {
                 let groups = search.candidates.unwrap_or_default();
                 let filters = &options.filters;
                 view(
                     &search.id,
                     &groups,
                     filters,
-                    &failures,
+                    failures,
                     &job.excluded_sources,
                 )
                 .automatic_groups()
             }
-            (search, _) => search.and_then(|s| s.candidates).unwrap_or_default(),
+            (_, Some(_), None) => Vec::new(),
+            (search, None, _) => search.and_then(|s| s.candidates).unwrap_or_default(),
+            (None, Some(_), Some(_)) => Vec::new(),
         };
         let cap = max_sources(&job);
         let mut waiting = Vec::new();
@@ -996,8 +997,7 @@ async fn resume_batch(
         ImportMode::Singleton => {
             for f in finished {
                 let import = import_job(
-                    f.path,
-                    ImportMode::Singleton,
+                    Downloaded::File(f.path),
                     vec![f.row],
                     &batch.target,
                     &user,
@@ -1126,10 +1126,7 @@ async fn enqueue_anew(resume: &dyn Resume, backend: &Arc<dyn DownloadBackend>, q
         label: manual_batch_label(&picked),
         target: PathBuf::from(&job.folder.path),
         import_mode: job.import_mode,
-        duplicates: match job.origin {
-            BatchOrigin::Ui => DuplicateRule::Guarded,
-            BatchOrigin::Mcp => DuplicateRule::Skip,
-        },
+        duplicates: DuplicateRule::of(job.origin),
     };
     resume
         .enqueue(&job.ctx, backend.clone(), fresh.into(), acquisition)
@@ -1428,6 +1425,8 @@ mod tests {
         searched: Mutex<Vec<(String, String, Option<usize>)>>,
         /// Each watched batch's id, duplicates rule and the cap of each slot of its pool.
         rules: Mutex<Vec<(String, DuplicateRule, Vec<usize>)>>,
+        /// Each watched batch's slots, whether each has another source standing by.
+        standing_by: Mutex<Vec<Vec<bool>>>,
         /// The jobs handed to the job runner.
         driven: Mutex<Vec<String>>,
         /// Each job marked cancelled ("cancel_job {job}") and each transfer watched ("watch
@@ -1444,6 +1443,7 @@ mod tests {
                 enqueued: Mutex::default(),
                 searched: Mutex::default(),
                 rules: Mutex::default(),
+                standing_by: Mutex::default(),
                 driven: Mutex::default(),
                 steps: Mutex::default(),
             }
@@ -1487,6 +1487,8 @@ mod tests {
             let caps = (0..pool.slot_count())
                 .map(|s| pool.max_sources(s))
                 .collect();
+            let standing_by = (0..pool.slot_count()).map(|s| pool.has_next(s)).collect();
+            self.standing_by.lock().unwrap().push(standing_by);
             (self.rules.lock().unwrap()).push((
                 batch.owner.batch_id.clone(),
                 batch.duplicates,
@@ -1717,7 +1719,8 @@ mod tests {
             .with_state(DownloadState::ImportQueued(1))
             .with_job(slot.clone());
             ledger.record(JobEvent::ImportQueued(Box::new(StoredImport {
-                sources: vec![source],
+                sources: vec![source.clone()],
+                files: vec![source],
                 target: tmp.path().join("lib"),
                 album: false,
                 cleanup_root: None,
@@ -1810,7 +1813,8 @@ mod tests {
             )
             .with_job(slot.clone());
             let import = StoredImport {
-                sources: vec![source],
+                sources: vec![source.clone()],
+                files: vec![source],
                 target: tmp.path().join("lib"),
                 album: false,
                 cleanup_root: None,
@@ -3205,6 +3209,38 @@ mod tests {
             stored_row(db, &job, 0).await.failure,
             Some(file_taken_by_another_download())
         );
+    }
+
+    #[tokio::test]
+    async fn an_mcp_job_resumes_without_other_sources_when_flagged_ones_cannot_be_told() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (ledger, db) = (&acq.ledger, &acq.db);
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = StubBackend::new(vec![]);
+        // peer_a downloads; its search also found peer_b.
+        let job = downloading_track_job_with(&acq, "Coventry Carol", auto_options()).await;
+        let listed = in_progress(&job, "Coventry Carol");
+        stub.set_listing(vec![transfer(
+            "peer_a",
+            &listed.item,
+            &listed.id,
+            DownloadState::InProgress,
+        )]);
+        // A finished attempt whose failure is not JSON: no source's recent failures can be read.
+        sqlx::query(
+            "INSERT INTO job_attempts (job_id, slot, n, source, ended_at, failure) \
+             VALUES (?, 0, 99, 'peer_x', strftime('%s', 'now'), 'not json')",
+        )
+        .bind(&job)
+        .execute(db)
+        .await
+        .unwrap();
+        let started = Started::on(stub);
+
+        reconcile_in(db, ledger, &queue(), &started, tmp.path()).await;
+
+        assert_eq!(started.watched.lock().unwrap().len(), 1);
+        assert_eq!(*started.standing_by.lock().unwrap(), vec![vec![false]]);
     }
 
     #[tokio::test]

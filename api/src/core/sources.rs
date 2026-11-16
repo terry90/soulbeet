@@ -382,20 +382,18 @@ pub fn server_restarted_search() -> Failure {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchProgress {
     Running,
-    /// Its groups, best first, and what it read.
-    Done(Vec<DownloadableGroup>, SearchStats),
+    /// Its groups, best first, and what it read when the backend finished it (None for groups
+    /// found before a timeout or a failed poll, and for a web UI search, which stores none).
+    Done(Vec<DownloadableGroup>, Option<SearchStats>),
     /// Why it found nothing, and what it read when the backend finished it.
     Failed(Failure, Option<SearchStats>),
 }
 
 impl SearchProgress {
-    /// A stored search with neither candidates nor a failure is running. A web UI search stores
-    /// its candidates without stats, which read as all zero.
+    /// A stored search with neither candidates nor a failure is running.
     pub fn of(stored: &StoredSearch) -> SearchProgress {
         match (&stored.candidates, &stored.failure) {
-            (Some(groups), _) => {
-                SearchProgress::Done(groups.clone(), stored.stats.clone().unwrap_or_default())
-            }
+            (Some(groups), _) => SearchProgress::Done(groups.clone(), stored.stats.clone()),
             (None, Some(failure)) => SearchProgress::Failed(failure.clone(), stored.stats.clone()),
             (None, None) => SearchProgress::Running,
         }
@@ -737,10 +735,7 @@ async fn run_in_line(
         let _place = place;
         if !searches.take_turn(&id).await {
             let outcome = Err((search_stopped(), None));
-            let progress = SearchProgress::of_outcome(&outcome);
-            // The writer logs a write the database refused.
-            let _ = ledger.search_ended(&id, outcome).await;
-            return progress;
+            return ended(&ledger, &id, outcome).await;
         }
         let search = SearchSpec {
             album: query.album,
@@ -768,13 +763,23 @@ async fn run_in_line(
             // Groups found before a timeout or a failed poll come with no stats: the backend
             // reported none.
             best_first(&mut groups);
-            Ok((groups, stats.unwrap_or_default()))
+            Ok((groups, stats))
         };
-        let progress = SearchProgress::of_outcome(&outcome);
-        // The writer logs a write the database refused.
-        let _ = ledger.search_ended(&id, outcome).await;
-        progress
+        ended(&ledger, &id, outcome).await
     }))
+}
+
+/// Stores how search `id` ended: how it ended, or, when that cannot be stored, the database's
+/// failure: what it found would not be kept, so no candidate id could name it.
+async fn ended(ledger: &Ledger, id: &str, outcome: SearchOutcome) -> SearchProgress {
+    let progress = SearchProgress::of_outcome(&outcome);
+    match ledger.search_ended(id, outcome).await {
+        Ok(()) => progress,
+        Err(e) => {
+            warn!("Could not store how search {id} ended: {e}");
+            SearchProgress::Failed(database_failure(Stage::SourceSearch, e), None)
+        }
+    }
 }
 
 /// A stored group offered as a source, with its source's recent failed transfers (D5).
@@ -1608,12 +1613,12 @@ mod tests {
                 Some(spec),
                 SearchProgress::Done(
                     found,
-                    SearchStats {
+                    Some(SearchStats {
                         query_text: "Kowloon One".into(),
                         response_count: 1,
                         file_count: 1,
                         ..Default::default()
-                    }
+                    })
                 )
             )
         );
@@ -1684,7 +1689,98 @@ mod tests {
         assert_eq!(stub.stopped_searches(), vec!["search".to_string()]);
         assert_eq!(
             running.await.unwrap(),
-            SearchProgress::Done(found, SearchStats::default())
+            SearchProgress::Done(found, Some(SearchStats::default()))
+        );
+    }
+
+    #[tokio::test]
+    async fn groups_found_before_a_failed_poll_are_kept_without_counts() {
+        let db = crate::db::test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let stub = StubBackend::new(vec![]);
+        let found = vec![group(
+            "peer_a",
+            vec![item("peer_a", "One", "a/01.flac")],
+            0.9,
+        )];
+        stub.script_polls(vec![
+            Ok(search_result(
+                "search",
+                SearchState::InProgress,
+                found.clone(),
+            )),
+            Err(SoulseekError::Api {
+                status: 503,
+                message: "Circuit breaker is open - slskd appears to be unavailable".into(),
+            }),
+        ]);
+        let ctx = test_ctx("alice");
+        let searches: Arc<Searches> = Arc::default();
+        let task = start_stored(
+            &searches,
+            &ledger,
+            &ctx,
+            stub,
+            run("s1", StoredSpec::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            task.await.unwrap(),
+            SearchProgress::Done(found.clone(), None)
+        );
+        let stored = store::search_of(&db, "s1", &ctx.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stored.candidates, stored.stats),
+            (Some(found), None),
+            "what it read is not known: the backend never finished it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_whose_end_cannot_be_stored_answers_the_databases_failure() {
+        let db = crate::db::test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let stub = StubBackend::new(vec![]);
+        stub.script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            vec![group(
+                "peer_a",
+                vec![item("peer_a", "One", "a/01.flac")],
+                0.9,
+            )],
+        ))]);
+        // The database refuses the search's end (a full disk, a lock held too long).
+        sqlx::query(
+            "CREATE TRIGGER no_end BEFORE UPDATE ON searches \
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let ctx = test_ctx("alice");
+        let searches: Arc<Searches> = Arc::default();
+        let task = start_stored(
+            &searches,
+            &ledger,
+            &ctx,
+            stub,
+            run("s1", StoredSpec::default()),
+        )
+        .await
+        .unwrap();
+        let SearchProgress::Failed(failure, None) = task.await.unwrap() else {
+            panic!("its candidates were not kept")
+        };
+        assert_eq!(
+            (failure.code, failure.stage),
+            (FailureCode::SettingsUnreadable, Stage::SourceSearch)
         );
     }
 

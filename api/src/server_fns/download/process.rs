@@ -118,20 +118,36 @@ pub struct ResolvedSlot {
     pub destination: Option<String>,
 }
 
-/// An import of `source` reporting to `user` through `rows`, which are
+/// What a finished download gave to import.
+pub enum Downloaded {
+    /// One file, imported on its own.
+    File(PathBuf),
+    /// An album's folder, imported whole, and the files its rows downloaded into it: the
+    /// folder may hold other downloads' files too.
+    Album {
+        folder: PathBuf,
+        files: Vec<PathBuf>,
+    },
+}
+
+/// An import of `downloaded` reporting to `user` through `rows`, which are
 /// already stamped with their batch, treating earlier copies by the batch's
 /// `duplicates` rule.
 pub fn import_job(
-    source: PathBuf,
-    mode: ImportMode,
+    downloaded: Downloaded,
     rows: Vec<DownloadProgress>,
     target: &Path,
     user: &UserId,
     duplicates: DuplicateRule,
     base: &Path,
 ) -> ImportJob {
+    let (sources, files, mode) = match downloaded {
+        Downloaded::File(file) => (vec![file.clone()], vec![file], ImportMode::Singleton),
+        Downloaded::Album { folder, files } => (vec![folder], files, ImportMode::Album),
+    };
     ImportJob {
-        sources: vec![source],
+        sources,
+        files,
         target: target.to_path_buf(),
         mode,
         owner: Some(JobOwner {
@@ -157,20 +173,24 @@ pub fn album_jobs(
     duplicates: DuplicateRule,
     base: &Path,
 ) -> Vec<ImportJob> {
-    let mut albums: Vec<(PathBuf, Vec<DownloadProgress>)> = Vec::new();
+    // Each folder, its rows and their files.
+    type Album = (PathBuf, Vec<DownloadProgress>, Vec<PathBuf>);
+    let mut albums: Vec<Album> = Vec::new();
     let mut jobs = Vec::new();
     for slot in resolved {
         match slot.destination {
             Some(destination) => {
                 let folder = base.join(destination);
-                match albums.iter_mut().find(|(f, _)| *f == folder) {
-                    Some((_, rows)) => rows.push(slot.row),
-                    None => albums.push((folder, vec![slot.row])),
+                match albums.iter_mut().find(|(f, _, _)| *f == folder) {
+                    Some((_, rows, files)) => {
+                        rows.push(slot.row);
+                        files.push(slot.path);
+                    }
+                    None => albums.push((folder, vec![slot.row], vec![slot.path])),
                 }
             }
             None => jobs.push(import_job(
-                slot.path,
-                ImportMode::Singleton,
+                Downloaded::File(slot.path),
                 vec![slot.row],
                 target,
                 user,
@@ -179,10 +199,9 @@ pub fn album_jobs(
             )),
         }
     }
-    let album_jobs = albums.into_iter().map(|(folder, rows)| {
+    let album_jobs = albums.into_iter().map(|(folder, rows, files)| {
         import_job(
-            folder,
-            ImportMode::Album,
+            Downloaded::Album { folder, files },
             rows,
             target,
             user,
@@ -246,8 +265,7 @@ mod tests {
         let user = UserId::new("u");
         let job_for = |rule| {
             import_job(
-                PathBuf::from("/dl/X [12345678]/a.flac"),
-                ImportMode::Singleton,
+                Downloaded::File(PathBuf::from("/dl/X [12345678]/a.flac")),
                 vec![row("a")],
                 Path::new("/music"),
                 &user,
@@ -302,7 +320,8 @@ mod tests {
             },
         ];
 
-        let jobs: Vec<(Vec<PathBuf>, ImportMode, Vec<String>)> = album_jobs(
+        type Shown = (Vec<PathBuf>, Vec<PathBuf>, ImportMode, Vec<String>);
+        let jobs: Vec<Shown> = album_jobs(
             resolved,
             Path::new("/music"),
             &UserId::new("u"),
@@ -316,19 +335,25 @@ mod tests {
             let owner = job.owner.unwrap();
             assert_eq!(owner.user_id, UserId::new("u"));
             let items = owner.rows.into_iter().map(|r| r.item).collect();
-            (job.sources, job.mode, items)
+            (job.sources, job.files, job.mode, items)
         })
         .collect();
 
+        // An album's own files are its rows' files, not whatever else its folder holds.
         assert_eq!(
             jobs,
             vec![
                 (
                     vec![PathBuf::from("/dl/X [12345678]")],
+                    vec![
+                        PathBuf::from("/dl/X [12345678]/a.flac"),
+                        PathBuf::from("/dl/X [12345678]/b_639097129778484198.flac")
+                    ],
                     ImportMode::Album,
                     vec!["a".to_string(), "b".to_string()]
                 ),
                 (
+                    vec![PathBuf::from("/dl/Other/f.flac")],
                     vec![PathBuf::from("/dl/Other/f.flac")],
                     ImportMode::Singleton,
                     vec!["adopted".to_string()]

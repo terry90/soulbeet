@@ -651,7 +651,7 @@ mod tests {
         };
         let guarded = same_user(&running);
         assert_eq!(held_failure(&held, &guarded), already_running());
-        let taken = held_failure(&held, &guarded.skipping_duplicates());
+        let taken = held_failure(&held, &guarded.with_duplicates(DuplicateRule::Skip));
         assert_eq!(taken, file_taken_by_another_download());
         assert_eq!(
             (taken.code, taken.stage, taken.retry, taken.message.as_str()),
@@ -670,7 +670,7 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let running = batch("Come Over");
         TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
-        let fresh = same_user(&running).skipping_duplicates();
+        let fresh = same_user(&running).with_duplicates(DuplicateRule::Skip);
 
         let enq = enqueue_request(
             &backend,

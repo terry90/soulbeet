@@ -119,6 +119,10 @@ pub fn job_state(slots: &[JobState]) -> JobState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredImport {
     pub sources: Vec<PathBuf>,
+    /// `ImportJob::files`; none in a row stored before they were kept, whose discard deletes
+    /// nothing.
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
     pub target: PathBuf,
     pub album: bool,
     pub cleanup_root: Option<PathBuf>,
@@ -145,6 +149,16 @@ pub enum DuplicateRule {
     Guarded,
     /// MCP jobs': beets skips what the library has.
     Skip,
+}
+
+impl DuplicateRule {
+    /// The rule of the batches of jobs from `origin`, wherever such a batch is made again.
+    pub fn of(origin: BatchOrigin) -> DuplicateRule {
+        match origin {
+            BatchOrigin::Ui => DuplicateRule::Guarded,
+            BatchOrigin::Mcp => DuplicateRule::Skip,
+        }
+    }
 }
 
 /// Navidrome's two scan times at the first look with Navidrome idle (D8).
@@ -593,10 +607,11 @@ pub struct NewSearch {
     pub spec: Option<StoredSpec>,
 }
 
-/// How a search ended: its groups, best first, and what it read; or its failure and what it
-/// read when it finished.
+/// How a search ended: its groups, best first, or its failure, each with what it read when the
+/// backend finished it (None for a search that timed out or whose poll failed, the groups found
+/// before kept).
 pub type SearchOutcome =
-    Result<(Vec<DownloadableGroup>, SearchStats), (Failure, Option<SearchStats>)>;
+    Result<(Vec<DownloadableGroup>, Option<SearchStats>), (Failure, Option<SearchStats>)>;
 
 /// What one prune removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1112,8 +1127,14 @@ mod tests {
             (Some(spec.clone()), Some(stats.clone()), Some(failure), None)
         );
 
-        // Run again under its id after a restart cut it off: it ends anew.
-        ledger.record_search(search("s1", "alice")).await.unwrap();
+        // Run again under its id after a restart cut it off, with its own spec: it ends anew.
+        ledger
+            .record_search(NewSearch {
+                spec: Some(spec.clone()),
+                ..search("s1", "alice")
+            })
+            .await
+            .unwrap();
         let renewed = read().await;
         assert_eq!(
             (renewed.spec, renewed.stats, renewed.failure),
@@ -1125,7 +1146,7 @@ mod tests {
             0.9,
         )];
         ledger
-            .search_ended("s1", Ok((groups.clone(), stats.clone())))
+            .search_ended("s1", Ok((groups.clone(), Some(stats.clone()))))
             .await
             .unwrap();
         let found = read().await;
@@ -1150,12 +1171,24 @@ mod tests {
             )
             .await
             .unwrap();
-        ledger.record_search(search("s1", "alice")).await.unwrap();
+        // Run again with what it is run with now.
+        let spec = StoredSpec {
+            text: Some("Kowloon One live".into()),
+            ..StoredSpec::default()
+        };
+        let again = NewSearch {
+            spec: Some(spec.clone()),
+            query: wanted_track("Kowloon", "One", None),
+            ..search("s1", "alice")
+        };
+        let query = again.query.clone();
+        ledger.record_search(again).await.unwrap();
         let renewed = store::search_of(&db, "s1", &UserId::new("alice"))
             .await
             .unwrap()
             .expect("alice's");
         assert_eq!(renewed.candidates, None);
+        assert_eq!((renewed.spec, renewed.query), (Some(spec), query));
         let left = renewed.expires_at - chrono::Utc::now().timestamp();
         assert!(
             (SEARCH_KEPT_SECS - 5..=SEARCH_KEPT_SECS).contains(&left),
@@ -1455,6 +1488,7 @@ mod tests {
         });
         let import = StoredImport {
             sources: vec!["/downloads/b/01.flac".into()],
+            files: vec!["/downloads/b/01.flac".into()],
             target: "/music".into(),
             album: false,
             cleanup_root: None,
@@ -1671,6 +1705,7 @@ mod tests {
         };
         let import = StoredImport {
             sources: vec![PathBuf::from("/downloads/b/01.flac")],
+            files: vec![PathBuf::from("/downloads/b/01.flac")],
             target: "/music".into(),
             album: false,
             cleanup_root: None,
@@ -1729,6 +1764,7 @@ mod tests {
         });
         let import = |slot: u32, file: &str| StoredImport {
             sources: vec![PathBuf::from(format!("/downloads/b/{file}"))],
+            files: vec![PathBuf::from(format!("/downloads/b/{file}"))],
             target: "/music".into(),
             album: false,
             cleanup_root: None,
@@ -2937,6 +2973,7 @@ mod tests {
         ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
             import: StoredImport {
                 sources: vec!["/downloads/a/03.flac".into()],
+                files: vec!["/downloads/a/03.flac".into()],
                 target: "/music".into(),
                 album: false,
                 cleanup_root: None,

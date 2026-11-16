@@ -16,7 +16,7 @@ use crate::ledger::{
     Transitioned,
 };
 use crate::server_fns::download::monitor::cancelled_on_request;
-use crate::server_fns::download::process::import_job;
+use crate::server_fns::download::process::{import_job, Downloaded};
 use crate::server_fns::download::test_support::{group, item, transfer};
 use shared::download::{
     DownloadProgress, DownloadQuery, DownloadState, DownloadableItem, IndexState, JobSlot,
@@ -384,7 +384,7 @@ async fn search_found(acq: &Acquire, job: &str, title: &str) -> DownloadableItem
         ),
     ];
     acq.ledger
-        .search_ended(&search_id, Ok((groups, SearchStats::default())))
+        .search_ended(&search_id, Ok((groups, Some(SearchStats::default()))))
         .await
         .unwrap();
     picked
@@ -655,6 +655,7 @@ fn import_of(job: &str, title: &str, source: &Path) -> StoredImport {
     let row = in_progress(job, title).with_state(DownloadState::ImportQueued(1));
     StoredImport {
         sources: vec![source.to_path_buf()],
+        files: vec![source.to_path_buf()],
         target: std::env::temp_dir(),
         album: false,
         cleanup_root: None,
@@ -774,8 +775,7 @@ pub(crate) async fn kept_track_job_with(
     effects.importer().script(result);
     let row = in_progress(&job, title).with_state(DownloadState::Completed);
     let import = import_job(
-        source,
-        ImportMode::Singleton,
+        Downloaded::File(source),
         vec![row],
         &acq.download_base.join("library"),
         &alice(),
@@ -869,6 +869,7 @@ pub(crate) async fn kept_album_job(
         let slot = row.job.clone().unwrap();
         let import = StoredImport {
             sources: vec![source.to_path_buf()],
+            files: vec![source.to_path_buf()],
             target: std::env::temp_dir(),
             album: true,
             cleanup_root: None,

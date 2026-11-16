@@ -1143,7 +1143,7 @@ mod tests {
             0.9,
         )];
         acq.ledger
-            .search_ended(&search_id, Ok((found, SearchStats::default())))
+            .search_ended(&search_id, Ok((found, Some(SearchStats::default()))))
             .await
             .unwrap();
         for candidate in [

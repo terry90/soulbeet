@@ -65,10 +65,10 @@ impl BatchRef {
         }
     }
 
-    /// The batch with imports that skip what the library already has.
-    pub fn skipping_duplicates(self) -> Self {
+    /// The batch with imports that treat what the library already has by `rule`.
+    pub fn with_duplicates(self, rule: DuplicateRule) -> Self {
         Self {
-            duplicates: DuplicateRule::Skip,
+            duplicates: rule,
             ..self
         }
     }
@@ -481,7 +481,7 @@ mod tests {
             running.target.clone(),
             ImportMode::Singleton,
         )
-        .skipping_duplicates();
+        .with_duplicates(DuplicateRule::Skip);
         let claim = registry.claim_for_request(&[key("01.flac"), key("02.flac")], &fresh);
         assert_eq!(
             (

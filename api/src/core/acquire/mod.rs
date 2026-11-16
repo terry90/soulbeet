@@ -107,10 +107,7 @@ impl NewBatch {
             self.target,
             self.import_mode,
         );
-        match self.duplicates {
-            DuplicateRule::Guarded => batch,
-            DuplicateRule::Skip => batch.skipping_duplicates(),
-        }
+        batch.with_duplicates(self.duplicates)
     }
 }
 
@@ -390,62 +387,26 @@ pub(crate) fn spawn_monitor(ctx: &UserCtx, mut monitor: DownloadMonitor) {
     });
 }
 
-/// Deletes `sources` (files, or the files of a folder) and prunes the
-/// folders they leave empty up to `base`. The paths it could not delete,
-/// with the OS error.
-pub(crate) async fn discard_sources(sources: &[PathBuf], base: &Path) -> Vec<(PathBuf, String)> {
+/// Deletes `files`, a job's own downloaded files, and prunes the folders
+/// they leave empty up to `base`; a file already gone still has its folder
+/// pruned. Nothing but these files is deleted: a folder may hold other
+/// downloads. The paths it could not delete, with the OS error.
+pub(crate) async fn discard_files(files: &[PathBuf], base: &Path) -> Vec<(PathBuf, String)> {
     let mut failed = Vec::new();
-    for source in sources {
-        let emptied = match tokio::fs::symlink_metadata(source).await {
-            Ok(meta) if meta.is_dir() => {
-                failed.extend(delete_files_in(source).await);
-                source.as_path()
-            }
-            Ok(_) => match tokio::fs::remove_file(source).await {
-                Ok(()) => source.parent().unwrap_or(base),
-                Err(e) => {
-                    failed.push((source.clone(), e.to_string()));
+    for file in files {
+        match tokio::fs::remove_file(file).await {
+            Ok(()) => {}
+            Err(e) => {
+                let gone = e.kind() == std::io::ErrorKind::NotFound;
+                failed.push((file.clone(), e.to_string()));
+                if !gone {
                     continue;
                 }
-            },
-            Err(e) => {
-                failed.push((source.clone(), e.to_string()));
-                continue;
             }
-        };
-        if let Err(e) = crate::server_fns::cleanup_empty_ancestors(emptied, base).await {
-            failed.push((emptied.to_path_buf(), e.to_string()));
         }
-    }
-    failed
-}
-
-/// Deletes the files directly in `dir`, leaving its folders. The paths it
-/// could not delete, with the OS error.
-async fn delete_files_in(dir: &Path) -> Vec<(PathBuf, String)> {
-    let mut entries = match tokio::fs::read_dir(dir).await {
-        Ok(entries) => entries,
-        Err(e) => return vec![(dir.to_path_buf(), e.to_string())],
-    };
-    let mut failed = Vec::new();
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(e) => {
-                failed.push((dir.to_path_buf(), e.to_string()));
-                break;
-            }
-        };
-        let path = entry.path();
-        match entry.file_type().await {
-            Ok(kind) if kind.is_dir() => {}
-            Ok(_) => {
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    failed.push((path, e.to_string()));
-                }
-            }
-            Err(e) => failed.push((path, e.to_string())),
+        let folder = file.parent().unwrap_or(base);
+        if let Err(e) = crate::server_fns::cleanup_empty_ancestors(folder, base).await {
+            failed.push((folder.to_path_buf(), e.to_string()));
         }
     }
     failed
@@ -544,29 +505,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discarding_names_what_it_could_not_delete() {
+    async fn discarding_deletes_only_the_jobs_files_and_names_what_it_could_not_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("dl");
         let file = base.join("X [1f2e3d4c]/01.flac");
-        let album = base.join("Y [2e3d4c5b]");
-        let missing = base.join("Z [3d4c5b6a]/01.flac");
+        // An album folder slskd's default layout shares with another download of the same
+        // remote folder name: that download's file and the album's cover stay.
+        let album = base.join("Come Over");
+        let others = album.join("05 - Other Song.flac");
+        let gone = base.join("Z [3d4c5b6a]/01.flac");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"x").unwrap();
         std::fs::create_dir_all(&album).unwrap();
-        std::fs::write(album.join("01.flac"), b"x").unwrap();
-        std::fs::write(album.join("cover.jpg"), b"x").unwrap();
+        for name in ["07.flac", "08.flac", "cover.jpg"] {
+            std::fs::write(album.join(name), b"x").unwrap();
+        }
+        std::fs::write(&others, b"x").unwrap();
+        std::fs::create_dir_all(gone.parent().unwrap()).unwrap();
 
-        let failed = discard_sources(&[file.clone(), album.clone(), missing.clone()], &base).await;
+        let files = [
+            file.clone(),
+            album.join("07.flac"),
+            album.join("08.flac"),
+            gone.clone(),
+        ];
+        let failed = discard_files(&files, &base).await;
 
         assert_eq!(
             failed,
             vec![(
-                missing,
+                gone.clone(),
                 "No such file or directory (os error 2)".to_string()
             )]
         );
         assert!(!file.exists() && !file.parent().unwrap().exists());
-        assert!(!album.exists());
+        assert!(!album.join("07.flac").exists() && !album.join("08.flac").exists());
+        assert!(others.exists() && album.join("cover.jpg").exists());
+        assert!(
+            !gone.parent().unwrap().exists(),
+            "a gone file's empty folder is pruned"
+        );
         assert!(base.exists());
     }
 

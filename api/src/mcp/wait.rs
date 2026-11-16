@@ -80,7 +80,7 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             writer
-                .search_ended("s1", Ok((vec![], SearchStats::default())))
+                .search_ended("s1", Ok((vec![], Some(SearchStats::default()))))
                 .await
                 .unwrap();
         });

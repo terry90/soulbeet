@@ -1019,7 +1019,7 @@ impl Writer {
     /// has, in one statement. A search that was stored moves the change number on.
     async fn search_ended(&mut self, id: &str, outcome: SearchOutcome) -> Result<(), LedgerError> {
         let (candidates, stats, failure) = match outcome {
-            Ok((groups, stats)) => (Some(groups), Some(stats), None),
+            Ok((groups, stats)) => (Some(groups), stats, None),
             Err((failure, stats)) => (None, stats, Some(failure)),
         };
         let ended =
@@ -1846,8 +1846,9 @@ async fn insert_search(
     sqlx::query(
         "INSERT INTO searches (id, user_id, backend, expires_at, query, spec) \
          VALUES (?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (id) DO UPDATE SET expires_at = excluded.expires_at, candidates = NULL, \
-         stats = NULL, failure = NULL",
+         ON CONFLICT (id) DO UPDATE SET expires_at = excluded.expires_at, \
+         backend = excluded.backend, query = excluded.query, spec = excluded.spec, \
+         candidates = NULL, stats = NULL, failure = NULL",
     )
     .bind(search.id)
     .bind(search.user.to_string())

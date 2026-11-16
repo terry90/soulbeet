@@ -16,8 +16,8 @@ use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
 use crate::importer_health::blocking_failure;
 use crate::ledger::store::{self, JobRecord, StoredSearch};
 use crate::ledger::{
-    DuplicateRule, JobKind, JobOptions, JobState, Ledger, Pick, StoredSpec, Transition,
-    Transitioned, LEDGER,
+    BatchOrigin, DuplicateRule, JobKind, JobOptions, JobState, Ledger, Pick, StoredSpec,
+    Transition, Transitioned, LEDGER,
 };
 use crate::server_fns::download::enqueue::nothing_enqueued;
 use crate::services::download_backend;
@@ -597,7 +597,7 @@ impl Runner<'_> {
                 JobKind::Track => ImportMode::Singleton,
                 JobKind::Album => ImportMode::Album,
             },
-            duplicates: DuplicateRule::Skip,
+            duplicates: DuplicateRule::of(BatchOrigin::Mcp),
         };
         let acquisition = Acquisition {
             job: self.job.id.clone(),
@@ -663,6 +663,7 @@ mod test_effects {
                 hydrate_error: Mutex::default(),
                 backend_held: watch::Sender::new(false),
                 backend_calls_held: AtomicUsize::new(0),
+                backend_failure: Mutex::default(),
                 enqueued: Mutex::default(),
             });
             let deps = RecordingDeps::into_ledger(importer, ledger.clone());
@@ -697,6 +698,8 @@ mod test_effects {
         /// While true, `backend` calls wait for it to turn false.
         backend_held: watch::Sender<bool>,
         backend_calls_held: AtomicUsize,
+        /// What every `backend` call answers while set.
+        backend_failure: Mutex<Option<Failure>>,
         enqueued: Mutex<Vec<(NewBatch, Acquisition)>>,
     }
 
@@ -726,6 +729,11 @@ mod test_effects {
             self.backend_held.send_replace(false);
         }
 
+        /// Makes every `backend` call answer `failure`.
+        pub(crate) fn fail_backend(&self, failure: Failure) {
+            *self.backend_failure.lock().unwrap() = Some(failure);
+        }
+
         /// The `backend` calls waiting for `release_backend`.
         pub(crate) fn backend_calls_held(&self) -> usize {
             self.backend_calls_held.load(Ordering::SeqCst)
@@ -745,6 +753,9 @@ mod test_effects {
                 self.backend_calls_held.fetch_add(1, Ordering::SeqCst);
                 let _ = held.wait_for(|held| !held).await;
                 self.backend_calls_held.fetch_sub(1, Ordering::SeqCst);
+            }
+            if let Some(failure) = self.backend_failure.lock().unwrap().clone() {
+                return Err(failure);
             }
             Ok(self.stub.clone())
         }
@@ -1343,7 +1354,7 @@ mod tests {
             .await
             .unwrap();
         acq.ledger
-            .search_ended(&old, Ok((stored.clone(), Default::default())))
+            .search_ended(&old, Ok((stored.clone(), Some(Default::default()))))
             .await
             .unwrap();
         sqlx::query("UPDATE searches SET expires_at = 0 WHERE id = ?")

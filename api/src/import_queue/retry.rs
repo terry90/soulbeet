@@ -247,8 +247,8 @@ impl ImportQueue {
     }
 
     /// Takes the kept job of `item` as a retry takes it, so a retry after it
-    /// finds nothing, dismisses its rows' slots and deletes its source files
-    /// under its cleanup root (a job without one keeps them). Taken before the
+    /// finds nothing, dismisses its rows' slots and deletes its own downloaded
+    /// files under its cleanup root (a job without one keeps them). Taken before the
     /// delete, so a deleted file was never also resubmitted. The job, or
     /// nothing_to_retry().
     pub async fn discard(&self, user: &UserId, item: &str) -> Result<ImportJob, ImportRefusal> {
@@ -262,7 +262,7 @@ impl ImportQueue {
             Arc::unwrap_or_clone(job)
         };
         if let Some(root) = &job.cleanup_root {
-            for (path, e) in crate::core::acquire::discard_sources(&job.sources, root).await {
+            for (path, e) in crate::core::acquire::discard_files(&job.files, root).await {
                 warn!(
                     "Could not delete the discarded import {}: {e}",
                     path.display()
@@ -689,6 +689,7 @@ mod tests {
         use crate::import_queue::JobOwner;
         Arc::new(ImportJob {
             sources: vec![std::path::PathBuf::from(format!("/dl/{item}.flac"))],
+            files: vec![std::path::PathBuf::from(format!("/dl/{item}.flac"))],
             target: std::path::PathBuf::from("/music"),
             mode: ImportMode::Singleton,
             owner: Some(JobOwner {

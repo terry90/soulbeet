@@ -1036,7 +1036,7 @@ mod tests {
             "peer_a", folder, 0.9,
         )];
         acq.ledger
-            .search_ended(&search_id, Ok((groups, Default::default())))
+            .search_ended(&search_id, Ok((groups, Some(Default::default()))))
             .await
             .unwrap();
         let target = SourceTarget::New {

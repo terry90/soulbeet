@@ -1052,6 +1052,7 @@ pub async fn generate_discovery_playlist_internal(
                 let outcome = IMPORT_QUEUE
                     .submit(ImportJob {
                         sources: vec![src.clone()],
+                        files: vec![src.clone()],
                         target: discovery_target.clone(),
                         mode: soulbeet::ImportMode::Singleton,
                         owner: None,
@@ -1363,8 +1364,8 @@ fn classify_discovery(outcome: &soulbeet::ImportOutcome) -> DiscoveryImport {
 /// prunes the folder it leaves empty, logging what it could not delete.
 #[cfg(feature = "server")]
 async fn discard_download(src: &std::path::Path, download_base: &std::path::Path) {
-    let sources = [src.to_path_buf()];
-    for (path, e) in crate::core::acquire::discard_sources(&sources, download_base).await {
+    let files = [src.to_path_buf()];
+    for (path, e) in crate::core::acquire::discard_files(&files, download_base).await {
         tracing::warn!(
             "Could not delete the discovery download {}: {e}",
             path.display()

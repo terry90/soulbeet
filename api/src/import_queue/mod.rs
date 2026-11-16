@@ -51,6 +51,10 @@ pub struct JobOwner {
 #[derive(Debug, Clone)]
 pub struct ImportJob {
     pub sources: Vec<PathBuf>,
+    /// The downloaded files the job is of, which discarding it deletes: a singleton's file, an
+    /// album's rows' files. Never the rest of an album's folder: with slskd's default layout,
+    /// downloads from remote folders of one name share it, across jobs and users.
+    pub files: Vec<PathBuf>,
     pub target: PathBuf,
     pub mode: ImportMode,
     /// None for discovery and promote, which have no rows.
@@ -108,6 +112,7 @@ impl ImportJob {
         let owner = self.owner.as_ref()?;
         Some(StoredImport {
             sources: self.sources.clone(),
+            files: self.files.clone(),
             target: self.target.clone(),
             album: matches!(self.mode, ImportMode::Album),
             cleanup_root: self.cleanup_root.clone(),
@@ -135,6 +140,7 @@ impl ImportJob {
         ImportJob {
             duplicates: Duplicates::of(stored.duplicates, &user),
             sources: stored.sources,
+            files: stored.files,
             target: stored.target,
             mode: match stored.album {
                 true => ImportMode::Album,
@@ -605,10 +611,12 @@ impl Shared {
             ),
         }
         let keep = keeps_retry(&outcome.result.outcome, &job.duplicates);
+        // Every owned download job has a cleanup root (`process::import_job`): a Skip job without
+        // one, which nothing makes, would neither keep nor delete a skipped duplicate's copy.
         if let Some(root) = &job.cleanup_root {
             if skipped_duplicate(&outcome.result.outcome, &job.duplicates) {
                 // No retry imports what the library has: the copy is Soulful's own download.
-                for (path, e) in crate::core::acquire::discard_sources(&job.sources, root).await {
+                for (path, e) in crate::core::acquire::discard_files(&job.files, root).await {
                     warn!("Could not delete the duplicate {}: {e}", path.display());
                 }
             } else {
@@ -778,6 +786,7 @@ pub async fn import_to_library(
     let outcome = IMPORT_QUEUE
         .submit(ImportJob {
             sources: vec![src.to_path_buf()],
+            files: vec![src.to_path_buf()],
             target: target.to_path_buf(),
             mode: ImportMode::Singleton,
             owner: None,
@@ -864,7 +873,8 @@ mod tests {
 
     pub(super) fn job(source: PathBuf, target: &Path) -> ImportJob {
         ImportJob {
-            sources: vec![source],
+            sources: vec![source.clone()],
+            files: vec![source],
             target: target.to_path_buf(),
             mode: ImportMode::Singleton,
             owner: None,

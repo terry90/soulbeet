@@ -25,7 +25,9 @@ use tokio::time::Instant;
 
 use super::enqueue::{stopped_rows, transfer_key};
 use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
-use super::process::{album_jobs, import_job, resolve_on_disk, unresolved_row, ResolvedSlot};
+use super::process::{
+    album_jobs, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
+};
 use super::utils::{file_id, FileId};
 use crate::config::CONFIG;
 use crate::core::database_failure;
@@ -1762,8 +1764,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
         );
     }
     let job = import_job(
-        path,
-        ImportMode::Singleton,
+        Downloaded::File(path),
         vec![h.row],
         &h.target,
         &h.owner.user_id,
