@@ -293,6 +293,8 @@ pub enum UserActionCode {
     AddFolder,
     /// A change Soulful does not make for a connected app, which the user can make in Navidrome.
     RateInNavidrome,
+    /// A setting only the user changes, in Soulful's own Settings.
+    EnableAutoDelete,
 }
 
 /// Defines `FailureCode` from one list of variants and wire names: `as_str`

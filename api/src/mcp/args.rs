@@ -269,6 +269,43 @@ impl Args {
         Ok(object)
     }
 
+    /// An optional object, read as `object` reads one.
+    pub(crate) fn opt_object(
+        &self,
+        name: &str,
+        known: &'static [&'static str],
+    ) -> Result<Option<Args>, ToolError> {
+        if self.has(name) {
+            self.object(name, known).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// A list of distinct names among `choices`, as written there.
+    pub(crate) fn opt_choices(
+        &self,
+        name: &str,
+        choices: &'static [&'static str],
+    ) -> Result<Option<Vec<&'static str>>, ToolError> {
+        let Some(value) = self.given(name) else {
+            return Ok(None);
+        };
+        let refused = || self.refuse(name, &format!("a list of {}", choices.join(", ")));
+        let mut chosen: Vec<&'static str> = Vec::new();
+        for item in value.as_array().ok_or_else(refused)? {
+            let choice = item
+                .as_str()
+                .and_then(|text| choices.iter().find(|c| **c == text))
+                .ok_or_else(refused)?;
+            if chosen.contains(choice) {
+                return Err(refused());
+            }
+            chosen.push(choice);
+        }
+        Ok(Some(chosen))
+    }
+
     /// Refuses `name` when it is given: `expected` says why it must be absent.
     pub(crate) fn absent(&self, name: &str, expected: &str) -> Result<(), ToolError> {
         match self.given(name) {

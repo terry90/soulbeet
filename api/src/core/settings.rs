@@ -1,10 +1,16 @@
 //! A user's settings.
 
 use crate::auth::UserCtx;
+use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::{database_failure, folders::owned_in};
 use crate::models::user_settings::{UpdateUserSettings, UserSettings};
-use shared::failure::{Failure, Stage};
+use serde_json::Value;
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use sqlx::SqlitePool;
+
+/// The discovery profiles, as the settings maps name them.
+const PROFILES: [&str; 3] = ["Conservative", "Balanced", "Adventurous"];
+const PLAYLIST_NAME_MAX_CHARS: usize = 255;
 
 pub async fn get(ctx: &UserCtx) -> Result<UserSettings, Failure> {
     get_in(&crate::db::DB, ctx).await
@@ -17,12 +23,130 @@ pub(crate) async fn get_in(db: &SqlitePool, ctx: &UserCtx) -> Result<UserSetting
 }
 
 pub async fn update(ctx: &UserCtx, update: UpdateUserSettings) -> Result<UserSettings, Failure> {
-    check_folder_choices(&crate::db::DB, ctx, &update).await?;
-    let old = get(ctx).await?;
-    let result = UserSettings::upsert(&ctx.user_id, update.clone())
+    update_in(&crate::db::DB, &ServerNavidrome, ctx, update).await
+}
+
+fn refused(message: String) -> Failure {
+    Failure::new(
+        FailureCode::InvalidInput,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        message,
+    )
+}
+
+fn unknown_profile(profile: &str) -> Failure {
+    refused(format!(
+        "Unknown discovery profile '{profile}': use Conservative, Balanced or Adventurous"
+    ))
+}
+
+/// The discovery values of `update` that are given, against the bounds the Settings inputs carry.
+/// Each map must name all three profiles.
+pub(crate) fn validate(update: &UpdateUserSettings) -> Result<(), Failure> {
+    if let Some(profiles) = &update.discovery_profiles {
+        let unknown = profiles
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .find(|p| !PROFILES.contains(p));
+        if let Some(profile) = unknown {
+            return Err(unknown_profile(profile));
+        }
+    }
+    if let Some(counts) = &update.discovery_track_count {
+        for (profile, n) in profile_values(counts, "track counts", Value::as_i64)? {
+            if !(1..=50).contains(&n) {
+                return Err(refused(format!(
+                    "Discovery track count for {profile} must be 1 to 50, not {n}"
+                )));
+            }
+        }
+    }
+    if let Some(lifetimes) = &update.discovery_lifetime_days {
+        for (profile, n) in profile_values(lifetimes, "lifetimes", Value::as_i64)? {
+            if !(1..=90).contains(&n) {
+                return Err(refused(format!(
+                    "Discovery lifetime for {profile} must be 1 to 90 days, not {n}"
+                )));
+            }
+        }
+    }
+    if let Some(names) = &update.discovery_playlist_name {
+        for (profile, name) in profile_values(names, "playlist names", |v| {
+            v.as_str().map(|name| name.trim().to_string())
+        })? {
+            if name.is_empty() {
+                return Err(refused(format!(
+                    "The discovery playlist name for {profile} is empty"
+                )));
+            }
+            if name.chars().count() > PLAYLIST_NAME_MAX_CHARS {
+                return Err(refused(format!(
+                    "The discovery playlist name for {profile} is longer than {PLAYLIST_NAME_MAX_CHARS} characters"
+                )));
+            }
+        }
+    }
+    if let Some(n) = update.discovery_promote_threshold {
+        if !(1..=5).contains(&n) {
+            return Err(refused(format!(
+                "The discovery promote threshold must be 1 to 5, not {n}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The value of each profile in the JSON object `json`, in profile order, read by `read`.
+/// `what` names the map in a refusal.
+fn profile_values<T>(
+    json: &str,
+    what: &str,
+    read: impl Fn(&Value) -> Option<T>,
+) -> Result<Vec<(&'static str, T)>, Failure> {
+    let not_an_object = || {
+        refused(format!(
+            "Discovery {what} are not an object of profile to value"
+        ))
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json) else {
+        return Err(not_an_object());
+    };
+    if let Some(profile) = map.keys().find(|k| !PROFILES.contains(&k.as_str())) {
+        return Err(unknown_profile(profile));
+    }
+    if PROFILES.iter().any(|p| !map.contains_key(*p)) {
+        return Err(refused(format!(
+            "Discovery {what} must name Conservative, Balanced and Adventurous"
+        )));
+    }
+    PROFILES
+        .iter()
+        .map(|p| {
+            map.get(*p)
+                .and_then(&read)
+                .map(|v| (*p, v))
+                .ok_or_else(not_an_object)
+        })
+        .collect()
+}
+
+/// Checks `update`, then the folders it chooses, saves it, and deletes the Navidrome smart
+/// playlists it makes stale. Nothing is saved when a check fails.
+pub(crate) async fn update_in(
+    db: &SqlitePool,
+    navidrome: &dyn NavidromeOf,
+    ctx: &UserCtx,
+    update: UpdateUserSettings,
+) -> Result<UserSettings, Failure> {
+    validate(&update)?;
+    check_folder_choices(db, ctx, &update).await?;
+    let old = get_in(db, ctx).await?;
+    let result = UserSettings::upsert_in(db, &ctx.user_id, update.clone())
         .await
         .map_err(|e| database_failure(Stage::Input, e))?;
-    cleanup_stale_discovery_playlists(&ctx.user_id, &old, &update).await;
+    cleanup_stale_discovery_playlists(db, navidrome, ctx, &old, &update).await;
 
     Ok(result)
 }
@@ -49,7 +173,9 @@ async fn check_folder_choices(
 /// Delete Navidrome smart playlists that are no longer valid because
 /// discovery was disabled, the folder changed, or profiles were removed.
 async fn cleanup_stale_discovery_playlists(
-    user_id: &str,
+    db: &SqlitePool,
+    navidrome: &dyn NavidromeOf,
+    ctx: &UserCtx,
     old: &UserSettings,
     update: &UpdateUserSettings,
 ) {
@@ -75,7 +201,8 @@ async fn cleanup_stale_discovery_playlists(
         return;
     }
 
-    let navi = match crate::services::navidrome_client_for_user(user_id).await {
+    let user_id = ctx.user_id.as_str();
+    let navi = match navidrome.navidrome_of(&ctx.id()).await {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -127,7 +254,7 @@ async fn cleanup_stale_discovery_playlists(
     )
     .bind(&new_json)
     .bind(user_id)
-    .execute(&*crate::db::DB)
+    .execute(db)
     .await;
 }
 
@@ -137,6 +264,85 @@ mod tests {
     use crate::core::folders::folder_not_found;
     use crate::core::{folder_of, test_ctx};
     use crate::db::test_db;
+    use crate::services::NavidromeLookupError;
+    use crate::test_navidrome::NavidromeFor;
+
+    const NOT_LINKED: NavidromeFor = NavidromeFor(Err(|| NavidromeLookupError::NotLinked));
+
+    #[test]
+    fn discovery_values_outside_the_settings_bounds_are_refused() {
+        let counts = |json: &str| UpdateUserSettings {
+            discovery_track_count: Some(json.into()),
+            ..Default::default()
+        };
+        assert!(validate(&counts(
+            r#"{"Conservative":10,"Balanced":50,"Adventurous":1}"#
+        ))
+        .is_ok());
+        let long = format!(
+            r#"{{"Conservative":"Comfort Zone","Balanced":"{}","Adventurous":"Deep Cuts"}}"#,
+            "x".repeat(256)
+        );
+        for (update, message) in [
+            (counts(r#"{"Conservative":10,"Balanced":0,"Adventurous":10}"#), "Discovery track count for Balanced must be 1 to 50, not 0"),
+            (counts(r#"{"Conservative":10,"Balanced":10}"#), "Discovery track counts must name Conservative, Balanced and Adventurous"),
+            (counts(r#"{"Conservative":10,"Balanced":10,"Explore":10}"#), "Unknown discovery profile 'Explore': use Conservative, Balanced or Adventurous"),
+            (counts("30"), "Discovery track counts are not an object of profile to value"),
+            (
+                UpdateUserSettings {
+                    discovery_lifetime_days: Some(r#"{"Conservative":7,"Balanced":91,"Adventurous":7}"#.into()),
+                    ..Default::default()
+                },
+                "Discovery lifetime for Balanced must be 1 to 90 days, not 91",
+            ),
+            (
+                UpdateUserSettings { discovery_promote_threshold: Some(0), ..Default::default() },
+                "The discovery promote threshold must be 1 to 5, not 0",
+            ),
+            (
+                UpdateUserSettings { discovery_profiles: Some("Conservative,Wild".into()), ..Default::default() },
+                "Unknown discovery profile 'Wild': use Conservative, Balanced or Adventurous",
+            ),
+            (
+                UpdateUserSettings {
+                    discovery_playlist_name: Some(r#"{"Conservative":"Comfort Zone","Balanced":" ","Adventurous":"Deep Cuts"}"#.into()),
+                    ..Default::default()
+                },
+                "The discovery playlist name for Balanced is empty",
+            ),
+            (
+                UpdateUserSettings { discovery_playlist_name: Some(long), ..Default::default() },
+                "The discovery playlist name for Balanced is longer than 255 characters",
+            ),
+        ] {
+            let f = validate(&update).unwrap_err();
+            assert_eq!(
+                (f.code, f.stage, f.message.as_str()),
+                (FailureCode::InvalidInput, Stage::Input, message)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_value_writes_nothing() {
+        let db = test_db::migrated().await;
+        let folder = folder_of(&db, "alice").await;
+        let update = UpdateUserSettings {
+            default_download_folder_id: Some(folder),
+            discovery_promote_threshold: Some(9),
+            ..Default::default()
+        };
+        assert!(update_in(&db, &NOT_LINKED, &test_ctx("alice"), update)
+            .await
+            .is_err());
+        assert_eq!(
+            UserSettings::get_in(&db, "alice")
+                .await
+                .unwrap()
+                .default_download_folder_id,
+            None
+        );
+    }
 
     #[tokio::test]
     async fn another_users_folder_cannot_be_chosen() {

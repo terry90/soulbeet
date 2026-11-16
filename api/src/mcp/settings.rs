@@ -3,16 +3,22 @@
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
+
 use super::args::Args;
-use super::contract::{answer, upstream_error, ToolError};
+use super::contract::NextCall;
+use super::contract::{answer, failed, invalid_value, success, upstream_error, ToolError};
+use super::keys::{keyed, request_key, Keyed};
 use super::paging::{fit, Page};
+use super::refs::request_key_schema;
+use super::server::{common_codes, ToolSpec};
 use super::status::{chosen_folder, folder_fields, with_free_space};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::library::library_roots_in;
 use crate::core::{folders, settings};
 use crate::models::folder::Folder;
-use crate::models::user_settings::UserSettings;
+use crate::models::user_settings::{UpdateUserSettings, UserSettings};
 use crate::server_fns::discovery::parse_profiles;
 
 /// The discovery profiles, as `UserSettings` names them in its maps.
@@ -136,6 +142,240 @@ pub(crate) async fn list_folders(
         }
         .await,
     )
+}
+
+const UPDATE_SETTINGS_ARGS: &[&str] = &[
+    "default_folder_id",
+    "auto_delete",
+    "discovery_enabled",
+    "discovery_folder_id",
+    "discovery_profiles",
+    "discovery_track_counts",
+    "discovery_lifetime_days",
+    "discovery_playlist_names",
+    "discovery_promote_threshold",
+    "request_key",
+];
+
+pub(crate) const UPDATE_SETTINGS: ToolSpec = ToolSpec {
+    name: "update_settings",
+    title: "Change settings",
+    description: |calls_a_minute| {
+        let common = common_codes(calls_a_minute);
+        format!("Changes this user's Soulful settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulful's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, its folder, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map, and the promote threshold 1 to 5). Turning discovery off, changing its folder or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true), already_running.")
+    },
+    input_schema: concat!(
+        r#"{"type": "object", "additionalProperties": false, "properties": {"default_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "auto_delete": {"type": "boolean"}, "discovery_enabled": {"type": "boolean"}, "discovery_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "discovery_profiles": {"type": "array", "uniqueItems": true, "items": {"enum": ["Conservative", "Balanced", "Adventurous"]}}, "discovery_track_counts": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_lifetime_days": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_playlist_names": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "string"}, "Balanced": {"type": "string"}, "Adventurous": {"type": "string"}}}, "discovery_promote_threshold": {"type": "integer", "minimum": 0, "maximum": 255}, "#,
+        request_key_schema!(),
+        "}}"
+    ),
+    read_only: false,
+    destructive: false,
+    idempotent: true,
+    open_world: false,
+    call: |state, caller, args| Box::pin(update_settings(state, caller, args)),
+};
+
+/// Turning auto-delete on makes every rating sync delete the files of the songs the user rated
+/// 1 star, so only the user does it, in Soulful.
+fn auto_delete_on_refused() -> Failure {
+    Failure::new(
+        FailureCode::PermissionNotGranted,
+        Stage::Input,
+        RetryAdvice::NeedsUser,
+        "Only you can turn auto-delete on, in Soulful's Settings: it deletes the files of songs you rate 1 star at every rating sync",
+    )
+    .with_user_action(UserAction::new(
+        UserActionCode::EnableAutoDelete,
+        "Turn on auto-delete yourself",
+        "Soulful Settings > Library",
+    ))
+}
+
+/// The settings a call changes, each with the argument that names it.
+struct Changes {
+    update: UpdateUserSettings,
+    auto_delete_on: bool,
+}
+
+fn read_changes(args: &Args) -> Result<Changes, ToolError> {
+    const PROFILES_KNOWN: &[&str] = &["Conservative", "Balanced", "Adventurous"];
+    let map = |name| {
+        args.opt_object(name, PROFILES_KNOWN)
+            .map(|object| object.map(|o| o.as_value().to_string()))
+    };
+    let auto_delete = args.opt_bool("auto_delete")?;
+    let update = UpdateUserSettings {
+        default_download_folder_id: args.opt_string("default_folder_id")?,
+        auto_delete_enabled: auto_delete,
+        discovery_enabled: args.opt_bool("discovery_enabled")?,
+        discovery_folder_id: args.opt_string("discovery_folder_id")?,
+        discovery_profiles: args
+            .opt_choices("discovery_profiles", PROFILES_KNOWN)?
+            .map(|profiles| profiles.join(",")),
+        discovery_track_count: map("discovery_track_counts")?,
+        discovery_lifetime_days: map("discovery_lifetime_days")?,
+        discovery_playlist_name: map("discovery_playlist_names")?,
+        discovery_promote_threshold: args
+            .opt_u32("discovery_promote_threshold", 0, 255)?
+            .map(|n| n as u8),
+        ..Default::default()
+    };
+    Ok(Changes {
+        update,
+        auto_delete_on: auto_delete == Some(true),
+    })
+}
+
+/// Each argument of a call with only its own setting, to tell which one a refusal is about.
+fn single_changes(update: &UpdateUserSettings) -> [(&'static str, UpdateUserSettings); 7] {
+    let only = |f: fn(&mut UpdateUserSettings, &UpdateUserSettings)| {
+        let mut one = UpdateUserSettings::default();
+        f(&mut one, update);
+        one
+    };
+    [
+        (
+            "default_folder_id",
+            only(|o, u| o.default_download_folder_id = u.default_download_folder_id.clone()),
+        ),
+        (
+            "discovery_folder_id",
+            only(|o, u| o.discovery_folder_id = u.discovery_folder_id.clone()),
+        ),
+        (
+            "discovery_profiles",
+            only(|o, u| o.discovery_profiles = u.discovery_profiles.clone()),
+        ),
+        (
+            "discovery_track_counts",
+            only(|o, u| o.discovery_track_count = u.discovery_track_count.clone()),
+        ),
+        (
+            "discovery_lifetime_days",
+            only(|o, u| o.discovery_lifetime_days = u.discovery_lifetime_days.clone()),
+        ),
+        (
+            "discovery_playlist_names",
+            only(|o, u| o.discovery_playlist_name = u.discovery_playlist_name.clone()),
+        ),
+        (
+            "discovery_promote_threshold",
+            only(|o, u| o.discovery_promote_threshold = u.discovery_promote_threshold),
+        ),
+    ]
+}
+
+/// The argument a refusal of `update_in` is about: the first whose setting alone is refused.
+async fn refused_argument(
+    db: &sqlx::SqlitePool,
+    ctx: &crate::auth::UserCtx,
+    update: &UpdateUserSettings,
+    failure: &Failure,
+) -> Option<&'static str> {
+    for (name, one) in single_changes(update) {
+        let refused = match failure.code {
+            FailureCode::InvalidInput => settings::validate(&one).is_err(),
+            FailureCode::UnknownHandle => {
+                let folder = one
+                    .default_download_folder_id
+                    .or(one.discovery_folder_id)
+                    .filter(|id| !id.is_empty());
+                match folder {
+                    Some(id) => folders::owned_in(db, ctx, &id).await.is_err(),
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+        if refused {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// `update_settings`: the settings a call names, checked as the web page's are, and the
+/// settings as saved.
+async fn update_settings(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new(UPDATE_SETTINGS.name, args, UPDATE_SETTINGS_ARGS);
+    let read = || {
+        let changes = read_changes(&args)?;
+        let key = request_key(&args)?;
+        args.finish()?;
+        if changes.update == UpdateUserSettings::default() {
+            return Err(invalid_value(
+                args.tool(),
+                "default_folder_id",
+                "given when no other setting is",
+            ));
+        }
+        Ok::<_, ToolError>((changes, key))
+    };
+    let (changes, key) = match read() {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let call = args.as_value();
+    let (db, navidrome, ctx) = (
+        state.db.clone(),
+        state.navidrome.clone(),
+        caller.ctx.clone(),
+    );
+    let work = async move {
+        if changes.auto_delete_on {
+            return refusal(&args, auto_delete_on_refused(), field_facts("auto_delete"));
+        }
+        let saved = match settings::update_in(&db, &*navidrome, &ctx, changes.update.clone()).await
+        {
+            Ok(saved) => saved,
+            Err(failure) => {
+                let facts = match refused_argument(&db, &ctx, &changes.update, &failure).await {
+                    Some(field) => field_facts(field),
+                    None => Map::new(),
+                };
+                let mut error = upstream_error(failure, facts, args.same_call());
+                if error.failure.code == FailureCode::UnknownHandle {
+                    error.next = vec![NextCall::new("list_folders", json!({}))];
+                }
+                return Keyed::Released(failed(error));
+            }
+        };
+        // The settings are saved: a folder list that fails now still keeps the key.
+        match folders::list_in(&db, &ctx).await {
+            Ok(folders) => {
+                let mut fields = Map::new();
+                fields.insert(
+                    "settings".into(),
+                    Value::Object(settings_fields(&saved, &folders)),
+                );
+                Keyed::Kept(success(fields))
+            }
+            Err(failure) => Keyed::Kept(failed(upstream_error(failure, Map::new(), None))),
+        }
+    };
+    keyed(
+        &state.acquire,
+        caller,
+        UPDATE_SETTINGS.name,
+        key,
+        &call,
+        work,
+    )
+    .await
+}
+
+fn field_facts(field: &str) -> Map<String, Value> {
+    Map::from_iter([("field".to_string(), json!(field))])
+}
+
+/// A refusal before anything is saved, which lets the request key go.
+fn refusal(args: &Args, failure: Failure, facts: Map<String, Value>) -> Keyed {
+    Keyed::Released(failed(upstream_error(failure, facts, args.same_call())))
 }
 
 #[cfg(test)]
@@ -276,5 +516,188 @@ mod tests {
                 &json!({"Balanced": "9fR2kLm4NpQ7sT1vW3xY5z"})
             )
         );
+    }
+
+    use crate::connection::test_util::{call_tool, document, mcp_app};
+
+    #[tokio::test]
+    async fn auto_delete_is_turned_on_only_in_soulfuls_settings() {
+        let (db, app, token) = mcp_app().await;
+        for allow_delete in [0, 1] {
+            sqlx::query("UPDATE oauth_grants SET allow_delete = ?")
+                .bind(allow_delete)
+                .execute(&db)
+                .await
+                .unwrap();
+            let result = call_tool(
+                app.clone(),
+                &token,
+                "update_settings",
+                json!({"auto_delete": true, "request_key": "k"}),
+            )
+            .await;
+            let error = &document(&result)["error"];
+            assert_eq!(
+                (
+                    error["code"].as_str(),
+                    error["stage"].as_str(),
+                    error["retry"].as_str()
+                ),
+                (
+                    Some("permission_not_granted"),
+                    Some("input"),
+                    Some("needs_user")
+                ),
+                "allow_delete {allow_delete}"
+            );
+            assert_eq!(
+                error["message"],
+                "Only you can turn auto-delete on, in Soulful's Settings: it deletes the files of songs you rate 1 star at every rating sync"
+            );
+            assert_eq!(
+                error["user_action"],
+                json!({"code": "enable_auto_delete", "what": "Turn on auto-delete yourself", "where": "Soulful Settings > Library"})
+            );
+            assert_eq!(
+                (&error["facts"], &error["next"]),
+                (&json!({"field": "auto_delete"}), &json!([]))
+            );
+            assert!(
+                !UserSettings::get_in(&db, "u1")
+                    .await
+                    .unwrap()
+                    .auto_delete_enabled
+            );
+        }
+        let off = document(
+            &call_tool(
+                app,
+                &token,
+                "update_settings",
+                json!({"auto_delete": false}),
+            )
+            .await,
+        );
+        assert_eq!(off["settings"]["auto_delete_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn another_users_folder_is_not_a_choice_and_credentials_never_show() {
+        let (db, app, token) = mcp_app().await;
+        let bobs = crate::core::folder_of(&db, "bob").await;
+        UserSettings::upsert_in(
+            &db,
+            "u1",
+            UpdateUserSettings {
+                lastfm_api_key: Some("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e".into()),
+                listenbrainz_token: Some("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let error = &document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "update_settings",
+                json!({"default_folder_id": bobs}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (error["code"].as_str(), error["message"].as_str()),
+            (Some("unknown_handle"), Some("Folder not found"))
+        );
+        assert_eq!(
+            (&error["facts"], &error["next"]),
+            (
+                &json!({"field": "default_folder_id"}),
+                &json!([{"tool": "list_folders", "args": {}}])
+            )
+        );
+        let text = call_tool(
+            app,
+            &token,
+            "update_settings",
+            json!({"discovery_promote_threshold": 4}),
+        )
+        .await
+        .to_string();
+        assert!(text.contains(r#"\"promote_threshold\":4"#), "{text}");
+        assert!(
+            !text.contains("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e")
+                && !text.contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_out_of_bounds_names_its_argument() {
+        let (_, app, token) = mcp_app().await;
+        let error = &document(
+            &call_tool(app.clone(), &token, "update_settings",
+                json!({"discovery_track_counts": {"Conservative": 10, "Balanced": 0, "Adventurous": 10}})).await,
+        )["error"];
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["message"].as_str(),
+                &error["facts"]
+            ),
+            (
+                Some("invalid_input"),
+                Some("Discovery track count for Balanced must be 1 to 50, not 0"),
+                &json!({"field": "discovery_track_counts"})
+            )
+        );
+        let error = &document(
+            &call_tool(app.clone(), &token, "update_settings",
+                json!({"discovery_lifetime_days": {"Conservative": 7, "Balanced": 7, "Explore": 7}})).await,
+        )["error"];
+        assert_eq!(
+            error["message"],
+            "update_settings takes no argument named 'discovery_lifetime_days.Explore': it takes only Conservative, Balanced, Adventurous"
+        );
+        let error =
+            &document(&call_tool(app.clone(), &token, "update_settings", json!({})).await)["error"];
+        assert_eq!(
+            error["message"],
+            "update_settings: default_folder_id must be given when no other setting is"
+        );
+        let error = &document(
+            &call_tool(
+                app,
+                &token,
+                "update_settings",
+                json!({"discovery_profiles": ["Balanced", "Balanced"]}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            error["message"],
+            "update_settings: discovery_profiles must be a list of Conservative, Balanced, Adventurous"
+        );
+    }
+
+    #[tokio::test]
+    async fn profiles_and_maps_are_saved_as_the_page_saves_them() {
+        let (db, app, token) = mcp_app().await;
+        let doc = document(
+            &call_tool(app, &token, "update_settings", json!({
+                "discovery_profiles": ["Adventurous", "Balanced"],
+                "discovery_playlist_names": {"Conservative": "Calm", "Balanced": "Mid", "Adventurous": "Wild"},
+            })).await,
+        );
+        assert_eq!(
+            doc["settings"]["discovery"]["profiles"],
+            json!(["Adventurous", "Balanced"])
+        );
+        assert_eq!(
+            doc["settings"]["discovery"]["playlist_names"]["Adventurous"],
+            "Wild"
+        );
+        let saved = UserSettings::get_in(&db, "u1").await.unwrap();
+        assert_eq!(saved.discovery_profiles, "Adventurous,Balanced");
     }
 }

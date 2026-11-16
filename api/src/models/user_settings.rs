@@ -26,7 +26,7 @@ pub struct UserSettings {
     pub default_download_folder_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub struct UpdateUserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_metadata_provider: Option<String>,
