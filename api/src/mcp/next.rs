@@ -127,13 +127,15 @@ fn retry_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::UserId;
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
         cancelled_track_job, choosing_track_job, done_track_job, downloading_track_job,
         exhausted_track_job, failed_track_job, failed_track_job_with, failed_web_ui_job,
-        index_failed_track_job, view_of,
+        index_failed_track_job, queued_track_jobs, view_of,
     };
     use crate::core::jobs::untried;
+    use crate::ledger::{store, Transitioned};
     use shared::failure::{FailureCode, UserAction, UserActionCode};
 
     async fn read(acq: &Acquire, job: &str) -> (JobView, Untried) {
@@ -307,5 +309,32 @@ mod tests {
         // Its failure could not be written: nothing changes it before the next start.
         view.stranded = true;
         assert!(!waits(&view));
+    }
+
+    #[tokio::test]
+    async fn a_stranded_job_cancelled_and_retried_is_offered_its_wait_again() {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = queued_track_jobs(&acq, 1).await.remove(0);
+        let waits = |view: &JobView| {
+            (next_calls(view, &Untried::default()).iter()).any(|call| call.tool == "get_jobs")
+        };
+        acq.ledger.strand(&job);
+        assert!(!waits(&view_of(&acq, &job).await));
+        // cancel_job, then retry_job same_source: the retry starts a runner for it.
+        let picks = store::queued_picks(&acq.db, &job).await.unwrap();
+        let user = UserId::new("alice");
+        for change in [
+            Transition::Cancel,
+            Transition::Queue {
+                items: picks,
+                search_id: None,
+            },
+        ] {
+            let done = acq.ledger.transition(&user, &job, change).await.unwrap();
+            assert!(matches!(done, Transitioned::Applied { .. }), "{done:?}");
+        }
+        let view = view_of(&acq, &job).await;
+        assert_eq!((view.job.state, view.stranded), (JobState::Queued, false));
+        assert!(waits(&view));
     }
 }

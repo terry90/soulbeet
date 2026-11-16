@@ -720,7 +720,7 @@ impl Ledger {
     }
 
     /// `job`'s failure could not be written: it waits, searching or queued, with no runner until
-    /// the next start of the server, which forgets this.
+    /// the next start of the server, which forgets this, or until a transition of it is applied.
     pub fn strand(&self, job: &str) {
         self.stranded.lock().unwrap().insert(job.to_string());
     }
@@ -843,20 +843,27 @@ impl Ledger {
     }
 
     /// `user`'s job `job` changed as `change` says when its state is one `allowed_from` lists.
+    /// Once applied, the job is no longer stranded (`strand`): the call that moved it starts its
+    /// runner, or ends it.
     pub async fn transition(
         &self,
         user: &UserId,
         job: &str,
         change: Transition,
     ) -> Result<Transitioned, LedgerError> {
-        let (user, job) = (user.clone(), job.to_string());
-        self.write(|reply| Write::Transition {
-            user,
-            job,
-            change: Box::new(change),
-            reply,
-        })
-        .await
+        let (user, id) = (user.clone(), job.to_string());
+        let changed = self
+            .write(|reply| Write::Transition {
+                user,
+                job: id,
+                change: Box::new(change),
+                reply,
+            })
+            .await?;
+        if let Transitioned::Applied { .. } = changed {
+            self.stranded.lock().unwrap().remove(job);
+        }
+        Ok(changed)
     }
 
     /// Records `search` as its user's for SEARCH_KEPT_SECS. A search of the same
