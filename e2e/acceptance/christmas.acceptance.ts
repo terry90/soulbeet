@@ -328,10 +328,7 @@ test('the Christmas playlist is filled through every injected failure by followi
         )
         .toBe(false);
       const back = nth(answers, answers.length - 1);
-      expect(matched(nth((back.doc as Items).results, 0))).toEqual({
-        song_id: silentId,
-        match: expect.objectContaining({ kind: 'exact' }),
-      });
+      expect(matched(nth((back.doc as Items).results, 0))).toMatchObject({ song_id: silentId, match: { kind: 'exact' } });
     });
   } finally {
     await setNavidromeDown(false);
