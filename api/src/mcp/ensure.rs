@@ -251,8 +251,8 @@ fn read_ensure(args: &Args) -> Result<(Ensure, Option<String>), ToolError> {
 /// key keeps the answer of a call that made a batch, wrote the playlist or tried to, refused
 /// no item, or took replace_existing's token; a refusal of the call or of the token before it
 /// was taken, or of an item when nothing was written, and the same call can run again. `app`
-/// takes the token. No answer a key keeps carries the token: an item's call alone leaves
-/// replace_existing out.
+/// takes the token. No answer a key keeps carries the token: there an item's call alone leaves
+/// replace_existing out, as it does once the token is taken.
 async fn run(
     acquire: &Arc<Acquire>,
     navidrome: &dyn NavidromeOf,
@@ -330,9 +330,14 @@ async fn run(
         Some(Err(e)) => (None, Some(e)),
         None => (None, None),
     };
+    // An answer the key keeps is stored, so its calls never carry the token. A released answer
+    // is not, and while the token is unused an item's call alone keeps it, so the item can still
+    // replace the copy its preview named.
     let mut alone = call;
     if let Value::Object(fields) = &mut alone {
-        fields.remove("replace_existing");
+        if keep || ensured.token_taken {
+            fields.remove("replace_existing");
+        }
     }
     let results = (ensured.items.into_iter())
         .zip(&given)
@@ -1762,6 +1767,65 @@ mod tests {
         assert_eq!(count(&db, "request_keys").await, 1);
         let again = document(&call_tool(app, &token, "ensure_in_library", call).await);
         assert_eq!(again, doc);
+    }
+
+    #[tokio::test]
+    async fn an_items_call_alone_keeps_an_unused_token_only_in_an_answer_no_key_keeps() {
+        let (db, acq, effects, token) = app_with_acquire().await;
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer_when(
+            "/api/song",
+            "title=Marrow+Choir+O+Holy+Night",
+            502,
+            BAD_GATEWAY,
+        );
+        navi.answer_when("/api/song", "title=Marrow+Choir+Silent+Night", 200, "[]");
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let app_id = u1_app(&db).await;
+        let file = previewed_in(effects.library(), HOLY.0, "Marrow Choir/x.flac");
+        let issued = issue_in(&db, &app_id, DeletionReason::Replaced, &[file], now_unix())
+            .await
+            .unwrap();
+        let replace = json!({"confirmation_token": issued.secret});
+        let alone_of = |doc: &Value| doc["results"][0]["error"]["next"][0]["args"].clone();
+        // The lookup failed and nothing was written: the answer is let go, and the item's call
+        // alone can still replace.
+        let holy = json!({"artist": "Marrow Choir", "title": "O Holy Night"});
+        let doc = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "ensure_in_library",
+                json!({"items": [holy], "replace_existing": replace, "request_key": "k1"}),
+            )
+            .await,
+        );
+        assert_eq!(
+            alone_of(&doc),
+            json!({"items": [holy], "replace_existing": replace}),
+            "{doc}"
+        );
+        assert_eq!(count(&db, "request_keys").await, 0);
+        // Another item made a job, so the key keeps the answer: no call in it carries the token.
+        let silent = json!({"artist": "Marrow Choir", "title": "Silent Night"});
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "ensure_in_library",
+                json!({"items": [holy, silent], "replace_existing": replace, "request_key": "k2"}),
+            )
+            .await,
+        );
+        assert_eq!(alone_of(&doc), json!({"items": [holy]}), "{doc}");
+        assert!(!doc.to_string().contains(&issued.secret));
+        take_in(&db, &app_id, &issued.secret, None, now_unix())
+            .await
+            .expect("the token is still unused");
     }
 
     /// The id of `source`'s candidate in the search of alice's job `job`.

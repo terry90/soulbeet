@@ -22,10 +22,9 @@ const CHOICES_OFFERED: usize = 3;
 /// once they acted). A job waiting for an import decision: get_import_choices and resolve_import's
 /// retry for each import it keeps, naming its slot when it keeps several. dismiss_job and
 /// cancel_job where those transitions apply. A web UI job is offered only the wait, the import
-/// decision and dismiss_job: its own pipeline runs it. With `deletion_enabled` (D14) the retry
-/// entries are followed by a preview, never a deletion, of what the job left behind: for a slot
-/// failed with result_rejected, the songs its result lists (the wrong copy); for a done slot, the
-/// copies a replacing import did not replace.
+/// decision and dismiss_job: its own pipeline runs it. With `deletion_enabled` (D14) an app's job
+/// follows the retry entries with previews, never a deletion, of what it left behind
+/// (leftover_previews).
 pub(crate) fn next_calls(
     view: &JobView,
     untried: &Untried,
@@ -90,7 +89,7 @@ pub(crate) fn next_calls(
             }
         }
     }
-    if deletion_enabled {
+    if mcp && deletion_enabled {
         next.extend(leftover_previews(view));
     }
     let job_call = |tool| NextCall::new(tool, json!({"job_id": id}));
@@ -103,14 +102,15 @@ pub(crate) fn next_calls(
     next
 }
 
-/// preview_delete_tracks, reason replaced, for each slot's leftovers (D14), at most
-/// SONGS_PER_TOKEN songs a call.
+/// preview_delete_tracks, reason replaced, of what the job left behind (D14): for a slot failed
+/// with result_rejected, the songs its result lists (the wrong copy); for a done slot, the copies
+/// a replacing import did not replace. Each song once, in slot order, SONGS_PER_TOKEN a call.
 fn leftover_previews(view: &JobView) -> Vec<NextCall> {
-    let mut previews = Vec::new();
+    let mut songs: Vec<&str> = Vec::new();
     for slot in &view.slots {
         let rejected = slot.state == JobState::Failed
             && slot_failure(slot).is_some_and(|f| f.code == FailureCode::ResultRejected);
-        let songs: Vec<&str> = match (&slot.result, slot.state) {
+        let left: Vec<&str> = match (&slot.result, slot.state) {
             (
                 Some(SlotResult::Imported {
                     listed: Some(listed),
@@ -123,16 +123,20 @@ fn leftover_previews(view: &JobView) -> Vec<NextCall> {
             }
             _ => continue,
         };
-        if songs.is_empty() {
-            continue;
+        for song in left {
+            if !songs.contains(&song) {
+                songs.push(song);
+            }
         }
-        let songs = &songs[..songs.len().min(SONGS_PER_TOKEN)];
-        previews.push(NextCall::new(
-            "preview_delete_tracks",
-            json!({"song_ids": songs, "reason": "replaced"}),
-        ));
     }
-    previews
+    (songs.chunks(SONGS_PER_TOKEN))
+        .map(|songs| {
+            NextCall::new(
+                "preview_delete_tracks",
+                json!({"song_ids": songs, "reason": "replaced"}),
+            )
+        })
+        .collect()
 }
 
 /// retry_job in `mode` for the job, with its deciding facts: same_source the wait its failure
@@ -416,6 +420,13 @@ mod tests {
             .await
             .unwrap();
         let (view, untried) = read(&acq, &job).await;
+        assert_eq!(
+            (
+                view.slots[0].state,
+                slot_failure(&view.slots[0]).map(|f| f.code)
+            ),
+            (JobState::Failed, Some(FailureCode::ResultRejected))
+        );
         let next = next_calls(&view, &untried, true);
         assert!(
             next.iter().all(|c| c.tool != "preview_delete_tracks"),
@@ -441,7 +452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_preview_offer_names_at_most_one_tokens_songs() {
+    async fn the_leftovers_are_offered_once_each_one_tokens_songs_a_call() {
         let (acq, _) = Acquire::for_alice().await;
         let job = done_track_job(&acq).await;
         let mut view = view_of(&acq, &job).await;
@@ -449,14 +460,19 @@ mod tests {
             panic!("{:?}", view.slots[0].result)
         };
         *not_replaced = (0..SONGS_PER_TOKEN + 5).map(|i| format!("s{i}")).collect();
+        not_replaced.push("s0".into());
         let next = next_calls(&view, &Untried::default(), true);
-        let offered = next
-            .iter()
-            .find(|c| c.tool == "preview_delete_tracks")
-            .unwrap();
+        let offered: Vec<Vec<String>> = (next.iter())
+            .filter(|c| c.tool == "preview_delete_tracks")
+            .map(|c| serde_json::from_value(c.args["song_ids"].clone()).unwrap())
+            .collect();
+        let all: Vec<String> = (0..SONGS_PER_TOKEN + 5).map(|i| format!("s{i}")).collect();
         assert_eq!(
-            offered.args["song_ids"].as_array().unwrap().len(),
-            SONGS_PER_TOKEN
+            offered,
+            vec![
+                all[..SONGS_PER_TOKEN].to_vec(),
+                all[SONGS_PER_TOKEN..].to_vec()
+            ]
         );
     }
 }
