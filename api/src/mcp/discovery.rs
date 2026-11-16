@@ -16,7 +16,9 @@ use super::server::{common_codes, ToolSpec};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::delete_guard::Origin;
-use crate::core::discovery::{self, expires_at, lifetime_of, parse_profiles, Overview, Replace};
+use crate::core::discovery::{
+    self, expires_at, lifetime_of, parse_profiles, NotDone, Overview, Replace,
+};
 use crate::models::user_settings::UserSettings;
 
 /// The most pending tracks get_discovery lists: three profiles of at most 50 tracks.
@@ -318,18 +320,15 @@ async fn remove_discovery_track(
     keyed(&state.acquire, caller, name, key, &call, work).await
 }
 
-/// The answer to a promote or removal of `track_id`. The refusals made before the track is
-/// claimed let the key go: an unknown or another user's track, one no longer pending, and a
-/// database that could not be read. A database failure after the claim leaves the track
-/// claimed or pending with its file in place, so a repeat cannot act twice either. Every other
-/// failure came after the claim and is kept.
+/// The answer to a promote or removal of `track_id`. A refusal made before the track was
+/// claimed lets the key go; a failure after the claim is kept.
 fn track_answer(
     args: &Args,
     track_id: &str,
-    result: Result<DiscoveryTrack, Failure>,
+    result: Result<DiscoveryTrack, NotDone>,
     status: &str,
 ) -> Keyed {
-    let failure = match result {
+    let not_done = match result {
         Ok(track) => {
             let cut = |text: String| cut_json(text, TEXT_MAX_CHARS);
             let Value::Object(fields) = json!({
@@ -342,13 +341,11 @@ fn track_answer(
             };
             return Keyed::Kept(success(fields));
         }
-        Err(failure) => failure,
+        Err(not_done) => not_done,
     };
+    let released = matches!(not_done, NotDone::Unclaimed(_));
+    let failure = not_done.into_failure();
     use FailureCode::*;
-    let released = matches!(
-        failure.code,
-        UnknownHandle | NotOwner | ExpiredHandle | SettingsUnreadable
-    );
     let next = match failure.code {
         UnknownHandle | NotOwner | ExpiredHandle => Some(NextCall::new("get_discovery", json!({}))),
         ImportFilesGone | ImportAlreadyInLibrary => Some(NextCall::new(
@@ -389,6 +386,7 @@ mod tests {
     use crate::core::discovery::Replace;
     use crate::import_queue::import_failure;
     use crate::import_queue::test_support::no_match;
+    use crate::mcp::paging::RESULT_MAX_CHARS;
     use crate::models::user_settings::{UpdateUserSettings, UserSettings};
 
     async fn discovery_app(lib: &Library, effects: Arc<TestDiscovery>) -> (Router, String) {
@@ -442,6 +440,138 @@ mod tests {
             (doc["folder"]["folder_id"].as_str(), doc["run"].is_null()),
             (Some("alice-music"), true)
         );
+    }
+
+    #[tokio::test]
+    async fn only_the_callers_own_discovery_folder_is_listed() {
+        // A stored choice of bob's folder, as no check of today allows but an older one did.
+        let lib = Library::new().await;
+        UserSettings::upsert_in(&lib.db, "alice", UpdateUserSettings::default())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_settings SET discovery_folder_id = 'bob-music'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        let staged = lib.root.join("music/bob/Discovery/Balanced/03.flac");
+        lib.pending_track("t1", "bob-music", "Balanced", &staged, None)
+            .await;
+        let (app, token) = discovery_app(&lib, Arc::new(TestDiscovery::default())).await;
+        let doc = document(&call_tool(app, &token, "get_discovery", json!({})).await);
+        assert_eq!(
+            (
+                &doc["folder"],
+                &doc["pending"],
+                doc["pending_total"].as_u64()
+            ),
+            (&json!(null), &json!([]), Some(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_150_pending_tracks_are_listed_and_a_long_list_is_cut_and_counted() {
+        let lib = Library::new().await;
+        let folder = UpdateUserSettings {
+            discovery_folder_id: Some("alice-music".into()),
+            ..Default::default()
+        };
+        UserSettings::upsert_in(&lib.db, "alice", folder)
+            .await
+            .unwrap();
+        let long = "x".repeat(400);
+        for i in 0..151 {
+            let id = format!("t{i:03}");
+            let staged = lib
+                .root
+                .join(format!("music/alice/Discovery/Balanced/{id}.flac"));
+            lib.pending_track(&id, "alice-music", "Balanced", &staged, None)
+                .await;
+        }
+        let (app, token) = discovery_app(&lib, Arc::new(TestDiscovery::default())).await;
+        let doc = document(&call_tool(app.clone(), &token, "get_discovery", json!({})).await);
+        assert_eq!(
+            (
+                doc["pending"].as_array().map(Vec::len),
+                doc["pending_total"].as_u64(),
+                doc.get("pending_omitted")
+            ),
+            (Some(150), Some(151), None)
+        );
+        // Tags long enough that 150 tracks do not fit in one answer.
+        sqlx::query("UPDATE discovery_tracks SET title = ?, artist = ?, album = ?")
+            .bind(&long)
+            .bind(&long)
+            .bind(&long)
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        let result = call_tool(app, &token, "get_discovery", json!({})).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.chars().count() <= RESULT_MAX_CHARS);
+        let doc = document(&result);
+        let (shown, omitted) = (
+            doc["pending"].as_array().unwrap().len() as u64,
+            doc["pending_omitted"].as_u64().unwrap(),
+        );
+        assert_eq!(
+            (shown + omitted, doc["pending_total"].as_u64()),
+            (150, Some(151))
+        );
+        assert_eq!(doc["pending"][0]["track_id"], "t000");
+    }
+
+    #[tokio::test]
+    async fn a_promote_that_fails_after_its_claim_keeps_its_key() {
+        // The import is done, then the database refuses to mark the track promoted.
+        let lib = Library::new().await;
+        let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"audio").unwrap();
+        lib.pending_track("t1", "alice-music", "Explore", &staged, None)
+            .await;
+        sqlx::query(
+            "CREATE TRIGGER refuse_promoted BEFORE UPDATE ON discovery_tracks \
+             WHEN NEW.status = 'Promoted' BEGIN SELECT RAISE(FAIL, 'disk I/O error'); END",
+        )
+        .execute(&lib.db)
+        .await
+        .unwrap();
+        let effects = Arc::new(TestDiscovery::default());
+        let (app, token) = discovery_app(&lib, effects.clone()).await;
+        let call = json!({"track_id": "t1", "request_key": "k"});
+        let first = call_tool(app.clone(), &token, "promote_discovery_track", call.clone()).await;
+        assert_eq!(
+            document(&first)["error"]["code"].as_str(),
+            Some("settings_unreadable")
+        );
+        // The repeat answers the stored result instead of trying again.
+        let again = call_tool(app, &token, "promote_discovery_track", call).await;
+        assert_eq!(again["content"], first["content"]);
+        assert_eq!(effects.imports().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_discovery_refuses_a_cleared_folder() {
+        let lib = Library::new().await;
+        let cleared = UpdateUserSettings {
+            discovery_enabled: Some(true),
+            discovery_folder_id: Some(String::new()),
+            ..Default::default()
+        };
+        UserSettings::upsert_in(&lib.db, "alice", cleared)
+            .await
+            .unwrap();
+        let effects = Arc::new(TestDiscovery::default());
+        let (app, token) = discovery_app(&lib, effects.clone()).await;
+        let error = &document(&call_tool(app, &token, "run_discovery", json!({})).await)["error"];
+        assert_eq!(
+            (error["code"].as_str(), &error["next"]),
+            (
+                Some("folder_required"),
+                &json!([{"tool": "list_folders", "args": {}}])
+            )
+        );
+        assert!(effects.generated().is_empty());
     }
 
     #[tokio::test]

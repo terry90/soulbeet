@@ -230,14 +230,14 @@ impl DiscoveryTrackRow {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Marks the track Removed if it is Pending (D16): true when this call changed it, false
+    /// Marks the track Removing if it is Pending (D16): true when this call changed it, false
     /// when another call holds or ended it.
-    pub(crate) async fn try_set_removed_in(
+    pub(crate) async fn try_set_removing_in(
         db: &sqlx::SqlitePool,
         id: &str,
     ) -> Result<bool, String> {
         let result = sqlx::query(
-            "UPDATE discovery_tracks SET status = 'Removed' WHERE id = ? AND status = 'Pending'",
+            "UPDATE discovery_tracks SET status = 'Removing' WHERE id = ? AND status = 'Pending'",
         )
         .bind(id)
         .execute(db)
@@ -246,13 +246,14 @@ impl DiscoveryTrackRow {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Reset any tracks stuck in Promoting back to Pending.
-    /// Called once at startup, for a server that stopped mid-promote.
-    pub async fn reset_stale_promoting() -> Result<u64, String> {
+    /// Puts every track claimed for a promote or a removal (Promoting, Removing) back to
+    /// Pending. Called once at startup, for a server that stopped while one ran: the expiry or
+    /// a later call then deals with its file.
+    pub(crate) async fn reset_stale_claims_in(db: &sqlx::SqlitePool) -> Result<u64, String> {
         let result = sqlx::query(
-            "UPDATE discovery_tracks SET status = 'Pending' WHERE status = 'Promoting'",
+            "UPDATE discovery_tracks SET status = 'Pending' WHERE status IN ('Promoting', 'Removing')",
         )
-        .execute(&*DB)
+        .execute(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(result.rows_affected())

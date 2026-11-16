@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::auth::{UserCtx, UserId};
 use crate::core::database_failure;
-use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
+use crate::core::delete_guard::staging::{claim_removal_in, remove_claimed_in, StagedOutcome};
 use crate::core::delete_guard::Origin;
 use crate::core::folders::folder_not_found;
 use crate::models::discovery_history::DiscoveryHistoryRow;
@@ -227,8 +227,10 @@ pub(crate) async fn start_in(
     }
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
     let track_counts = settings.parse_track_counts();
-    let folder_id =
-        (settings.discovery_folder_id.as_ref()).ok_or_else(discovery_folder_required)?;
+    // Settings clears the choice by storing an empty id.
+    let folder_id = (settings.discovery_folder_id.as_ref())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(discovery_folder_required)?;
     let mut profiles = Vec::new();
     for profile in &selected_profiles {
         let profile = profile.to_string();
@@ -354,6 +356,23 @@ async fn claim_for_promote_in(
     Ok(owned)
 }
 
+/// Why a promote or a removal of a discovery track was not done.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NotDone {
+    /// Refused before the track was claimed: nothing changed.
+    Unclaimed(Failure),
+    /// Failed after the track was claimed.
+    Claimed(Failure),
+}
+
+impl NotDone {
+    pub(crate) fn into_failure(self) -> Failure {
+        match self {
+            NotDone::Unclaimed(f) | NotDone::Claimed(f) => f,
+        }
+    }
+}
+
 /// Moves `user`'s pending track `track_id` into its folder's library through `effects.import`
 /// with `replace`, claiming it first (D16). Runs in its own task, so the status and history
 /// updates always follow the import even when the caller goes away while the import waits in
@@ -364,7 +383,7 @@ pub(crate) async fn promote(
     user: &UserId,
     track_id: &str,
     replace: Replace,
-) -> Result<DiscoveryTrack, Failure> {
+) -> Result<DiscoveryTrack, NotDone> {
     let (db, effects, user, track_id) = (
         db.clone(),
         effects.clone(),
@@ -373,7 +392,7 @@ pub(crate) async fn promote(
     );
     tokio::spawn(async move { promote_detached(&db, &*effects, &user, &track_id, replace).await })
         .await
-        .unwrap_or_else(|e| Err(promote_stopped(&e)))
+        .unwrap_or_else(|e| Err(NotDone::Claimed(promote_stopped(&e))))
 }
 
 async fn promote_detached(
@@ -382,8 +401,24 @@ async fn promote_detached(
     user: &UserId,
     track_id: &str,
     replace: Replace,
+) -> Result<DiscoveryTrack, NotDone> {
+    let (track, folder) = (claim_for_promote_in(db, track_id, &user.to_string()).await)
+        .map_err(NotDone::Unclaimed)?;
+    promote_claimed(db, effects, user, track, folder, replace)
+        .await
+        .map_err(NotDone::Claimed)
+}
+
+/// The promote of `track`, which claim_for_promote_in claimed.
+async fn promote_claimed(
+    db: &SqlitePool,
+    effects: &dyn DiscoveryEffects,
+    user: &UserId,
+    track: DiscoveryTrack,
+    folder: Folder,
+    replace: Replace,
 ) -> Result<DiscoveryTrack, Failure> {
-    let (track, folder) = claim_for_promote_in(db, track_id, &user.to_string()).await?;
+    let track_id = track.id.as_str();
     let back_to_pending = || async {
         if let Err(e) =
             DiscoveryTrackRow::update_status_in(db, track_id, &DiscoveryStatus::Pending).await
@@ -441,15 +476,20 @@ async fn promote_detached(
 }
 
 /// Deletes `user`'s pending track `track_id` from its profile folder and marks it removed,
-/// through `remove_staged_in`, which claims it first (D16). The track as removed.
+/// claiming it first (claim_removal_in, D16). The track as removed.
 pub(crate) async fn remove_in(
     db: &SqlitePool,
     user: &UserId,
     track_id: &str,
-) -> Result<DiscoveryTrack, Failure> {
+) -> Result<DiscoveryTrack, NotDone> {
     let (track, folder) =
-        owned_discovery_track_in(db, track_id, &user.to_string(), Stage::Delete).await?;
-    remove_staged_in(db, &track, &folder, StagedOutcome::Removed).await?;
+        (owned_discovery_track_in(db, track_id, &user.to_string(), Stage::Delete).await)
+            .map_err(NotDone::Unclaimed)?;
+    claim_removal_in(db, &track)
+        .await
+        .map_err(NotDone::Unclaimed)?;
+    (remove_claimed_in(db, &track, &folder, StagedOutcome::Removed).await)
+        .map_err(NotDone::Claimed)?;
     Ok(DiscoveryTrack {
         status: DiscoveryStatus::Removed,
         ..track
@@ -740,6 +780,19 @@ mod tests {
             start_in(&lib.db, &effects, &ctx).await.unwrap_err().message,
             "No download folder configured for discovery"
         );
+        // How Settings clears the choice.
+        let cleared = UpdateUserSettings {
+            discovery_folder_id: Some(String::new()),
+            ..Default::default()
+        };
+        UserSettings::upsert_in(&lib.db, "alice", cleared)
+            .await
+            .unwrap();
+        assert_eq!(
+            start_in(&lib.db, &effects, &ctx).await,
+            Err(discovery_folder_required())
+        );
+        assert!(effects.generated().is_empty());
         UserSettings::upsert_in(
             &lib.db,
             "alice",
@@ -789,13 +842,12 @@ mod tests {
         assert_eq!(
             promote(&lib.db, &effects, &bob, "t1", ui)
                 .await
-                .unwrap_err()
-                .message,
-            "Not authorized to modify this track"
+                .unwrap_err(),
+            NotDone::Unclaimed(not_your_track())
         );
         assert_eq!(
-            remove_in(&lib.db, &bob, "t1").await.unwrap_err().message,
-            "Not authorized to modify this track"
+            remove_in(&lib.db, &bob, "t1").await.unwrap_err(),
+            NotDone::Unclaimed(not_your_track())
         );
         assert!(staged.exists());
         assert_eq!(lib.track_status("t1").await, "Pending");
@@ -826,11 +878,11 @@ mod tests {
             promote(&lib.db, &effects, &lib.alice(), "t1", ui)
                 .await
                 .unwrap_err(),
-            track_not_pending()
+            NotDone::Unclaimed(track_not_pending())
         );
         assert_eq!(
             remove_in(&lib.db, &lib.alice(), "t1").await.unwrap_err(),
-            track_not_pending()
+            NotDone::Unclaimed(track_not_pending())
         );
         assert!(staged.exists());
         release.notify_one();
@@ -847,7 +899,7 @@ mod tests {
         let staged = staged_file(&lib);
         lib.pending_track("t1", "alice-music", "Explore", &staged, None)
             .await;
-        for status in ["Promoting", "Promoted", "Removed"] {
+        for status in ["Promoting", "Promoted", "Removing", "Removed"] {
             sqlx::query("UPDATE discovery_tracks SET status = ? WHERE id = 't1'")
                 .bind(status)
                 .execute(&lib.db)
@@ -855,7 +907,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 remove_in(&lib.db, &lib.alice(), "t1").await.unwrap_err(),
-                track_not_pending(),
+                NotDone::Unclaimed(track_not_pending()),
                 "{status}"
             );
             assert_eq!(lib.track_status("t1").await, status);
@@ -886,7 +938,7 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            promote_file_gone()
+            NotDone::Claimed(promote_file_gone())
         );
         assert_eq!(lib.track_status("t1").await, "Pending");
     }

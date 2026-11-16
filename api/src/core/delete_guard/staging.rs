@@ -34,26 +34,48 @@ impl StagedOutcome {
     }
 }
 
-/// Removes a pending discovery track's file, marks the track Removed and sets the outcome of
-/// the folder owner's discovery history for its artist and title (a history write that fails
-/// is logged and does not fail the removal). The track is claimed first, Pending to Removed
-/// (D16): `track_not_pending` when another call holds or ended it, and Pending again when the
-/// removal then fails. The stored path must canonicalize to a regular file strictly inside the
-/// canonical `Discovery/<profile>` of `folder`, in no deeper folder of another user; a file
-/// already gone is only marked. The file goes through unlink_if_same with the identity read
-/// just before; empty parents are pruned up to the profile folder.
+/// Removes a pending discovery track's file: claims it (claim_removal_in), then
+/// remove_claimed_in.
 pub(crate) async fn remove_staged_in(
     db: &SqlitePool,
     track: &DiscoveryTrack,
     folder: &Folder,
     outcome: StagedOutcome,
 ) -> Result<(), Failure> {
-    let claimed = DiscoveryTrackRow::try_set_removed_in(db, &track.id)
+    claim_removal_in(db, track).await?;
+    remove_claimed_in(db, track, folder, outcome).await
+}
+
+/// Claims `track` for its removal, Pending to Removing (D16): `track_not_pending` when another
+/// call holds or ended it. A server that stops before the removal ends leaves it Removing, which
+/// the next start puts back to Pending.
+pub(crate) async fn claim_removal_in(
+    db: &SqlitePool,
+    track: &DiscoveryTrack,
+) -> Result<(), Failure> {
+    let claimed = DiscoveryTrackRow::try_set_removing_in(db, &track.id)
         .await
         .map_err(|e| database_failure(Stage::Delete, e))?;
-    if !claimed {
-        return Err(track_not_pending());
+    match claimed {
+        true => Ok(()),
+        false => Err(track_not_pending()),
     }
+}
+
+/// Removes the file of `track`, which claim_removal_in claimed, marks the track Removed and sets
+/// the outcome of the folder owner's discovery history for its artist and title (a status or
+/// history write that fails is logged and does not fail the removal: a track left Removing goes
+/// back to Pending at the next start, and the expiry then marks it, its file being gone). The
+/// track is Pending again when the removal fails. The stored path must canonicalize to a regular
+/// file strictly inside the canonical `Discovery/<profile>` of `folder`, in no deeper folder of
+/// another user; a file already gone is only marked. The file goes through unlink_if_same with
+/// the identity read just before; empty parents are pruned up to the profile folder.
+pub(crate) async fn remove_claimed_in(
+    db: &SqlitePool,
+    track: &DiscoveryTrack,
+    folder: &Folder,
+    outcome: StagedOutcome,
+) -> Result<(), Failure> {
     let stored = Path::new(&track.path);
     let removed = match tokio::fs::canonicalize(stored).await {
         Ok(path) => remove_contained(db, &path, track, folder).await,
@@ -67,6 +89,11 @@ pub(crate) async fn remove_staged_in(
             warn!("Could not set '{}' back to pending: {e}", track.title);
         }
         return Err(failure);
+    }
+    if let Err(e) =
+        DiscoveryTrackRow::update_status_in(db, &track.id, &DiscoveryStatus::Removed).await
+    {
+        warn!("Could not mark '{}' removed: {e}", track.title);
     }
     if let Err(e) = DiscoveryHistoryRow::update_outcome_in(
         db,
@@ -273,6 +300,39 @@ mod tests {
             ),
             ("Pending".into(), "suggested".into())
         );
+    }
+
+    #[tokio::test]
+    async fn a_removal_cut_off_by_a_stop_goes_back_to_pending_at_the_next_start() {
+        let lib = Library::new().await;
+        let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"audio").unwrap();
+        let track = lib
+            .pending_track("t1", "alice-music", "Explore", &staged, None)
+            .await;
+        // The server stops after the claim, before the file is touched.
+        claim_removal_in(&lib.db, &track).await.unwrap();
+        assert_eq!(lib.track_status("t1").await, "Removing");
+        assert_eq!(
+            claim_removal_in(&lib.db, &track).await,
+            Err(track_not_pending())
+        );
+        assert_eq!(
+            DiscoveryTrackRow::reset_stale_claims_in(&lib.db).await,
+            Ok(1)
+        );
+        assert_eq!(lib.track_status("t1").await, "Pending");
+        remove_staged_in(
+            &lib.db,
+            &track,
+            &alices_folder(&lib),
+            StagedOutcome::Expired,
+        )
+        .await
+        .unwrap();
+        assert!(!staged.exists());
+        assert_eq!(lib.track_status("t1").await, "Removed");
     }
 
     #[tokio::test]

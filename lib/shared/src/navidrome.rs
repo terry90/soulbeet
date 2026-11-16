@@ -79,6 +79,8 @@ pub enum DiscoveryStatus {
     Pending,
     Promoting,
     Promoted,
+    /// Claimed for removal: its staged file is being deleted.
+    Removing,
     Removed,
 }
 
@@ -88,6 +90,7 @@ impl std::fmt::Display for DiscoveryStatus {
             DiscoveryStatus::Pending => write!(f, "Pending"),
             DiscoveryStatus::Promoting => write!(f, "Promoting"),
             DiscoveryStatus::Promoted => write!(f, "Promoted"),
+            DiscoveryStatus::Removing => write!(f, "Removing"),
             DiscoveryStatus::Removed => write!(f, "Removed"),
         }
     }
@@ -100,6 +103,7 @@ impl std::str::FromStr for DiscoveryStatus {
             "Pending" => Ok(DiscoveryStatus::Pending),
             "Promoting" => Ok(DiscoveryStatus::Promoting),
             "Promoted" => Ok(DiscoveryStatus::Promoted),
+            "Removing" => Ok(DiscoveryStatus::Removing),
             "Removed" => Ok(DiscoveryStatus::Removed),
             _ => Err(format!("Unknown discovery status: {}", s)),
         }

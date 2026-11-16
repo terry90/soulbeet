@@ -17,7 +17,7 @@ use crate::auth::{UserCtx, UserId};
 use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
 use crate::core::delete_guard::{paths, song_not_found};
 use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin, Verdict};
-use crate::core::discovery::{is_not_pending, promote, DiscoveryEffects, Replace};
+use crate::core::discovery::{is_not_pending, promote, DiscoveryEffects, NotDone, Replace};
 use crate::core::folders::folder_not_found;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::jobs::retry::enable_deletion;
@@ -517,7 +517,8 @@ pub(crate) async fn sync_in(
     };
     for song in &songs {
         if let Some(PendingAction::Promote(track)) = pending_action(song, &pending, threshold) {
-            let result = promote(deps.db, deps.discovery, &user, &track.id, replace).await;
+            let result = (promote(deps.db, deps.discovery, &user, &track.id, replace).await)
+                .map_err(NotDone::into_failure);
             match &result {
                 Err(e) if is_not_pending(e) => {
                     info!("Skipped promoting track {}: {}", track.title, e.message)

@@ -234,14 +234,16 @@ pub fn start_channel_cleanup_task() {
 
         // Start the automation task (sync ratings, discovery)
         tokio::spawn(async {
-            // A promote runs to the end in its own task, so a track can only
-            // be left Promoting by a previous process.
-            match crate::models::discovery_playlist::DiscoveryTrackRow::reset_stale_promoting()
-                .await
+            // A promote or removal runs to its end once started, so a track can only be left
+            // Promoting or Removing by a previous process.
+            match crate::models::discovery_playlist::DiscoveryTrackRow::reset_stale_claims_in(
+                &crate::db::DB,
+            )
+            .await
             {
                 Ok(0) => {}
-                Ok(n) => info!("Reset {n} tracks left Promoting by a previous run"),
-                Err(e) => warn!("Could not reset tracks left Promoting: {e}"),
+                Ok(n) => info!("Reset {n} tracks left Promoting or Removing by a previous run"),
+                Err(e) => warn!("Could not reset tracks left Promoting or Removing: {e}"),
             }
             // Wait 30s for server to be fully ready
             tokio::time::sleep(Duration::from_secs(30)).await;
