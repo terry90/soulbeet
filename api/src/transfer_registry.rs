@@ -11,6 +11,7 @@
 //! The monitor only finishes once no reservation is outstanding.
 
 use crate::auth::UserId;
+use crate::ledger::DuplicateRule;
 use shared::download::{batch_folder, DownloadableItem, JobSlot};
 use soulbeet::ImportMode;
 use std::collections::{HashMap, HashSet};
@@ -25,8 +26,8 @@ pub struct TransferOwner {
 }
 
 /// A running batch: who owns it, its name, the folder its transfers are
-/// enqueued into, the library folder they are imported into and the inbox
-/// that takes more of them.
+/// enqueued into, the library folder they are imported into, how its imports
+/// treat what the library has and the inbox that takes more of them.
 #[derive(Clone, Debug)]
 pub struct BatchRef {
     pub owner: TransferOwner,
@@ -35,11 +36,12 @@ pub struct BatchRef {
     pub target: PathBuf,
     pub inbox: Arc<BatchInbox>,
     pub import_mode: ImportMode,
+    pub duplicates: DuplicateRule,
 }
 
 impl BatchRef {
     /// A new batch downloading into `batch_folder(label, batch_id)` and
-    /// importing into `target` in `import_mode`.
+    /// importing into `target` in `import_mode`, its duplicates guarded.
     pub fn new(
         owner: TransferOwner,
         label: String,
@@ -54,6 +56,15 @@ impl BatchRef {
             target,
             inbox: BatchInbox::new(),
             import_mode,
+            duplicates: DuplicateRule::Guarded,
+        }
+    }
+
+    /// The batch with imports that skip what the library already has.
+    pub fn skipping_duplicates(self) -> Self {
+        Self {
+            duplicates: DuplicateRule::Skip,
+            ..self
         }
     }
 }
@@ -175,8 +186,8 @@ impl TransferRegistry {
 
     /// Claims a request's free keys in one step, for the batch that will
     /// download them. When the user is already downloading some of the files
-    /// into `fresh`'s library folder in its import mode and that batch still takes files, its
-    /// inbox is reserved and the free keys go straight to it. Otherwise they
+    /// into `fresh`'s library folder in its import mode and duplicates rule and that batch still
+    /// takes files, its inbox is reserved and the free keys go straight to it. Otherwise they
     /// go to `fresh`. No other request ever sees them owned by a batch that
     /// gets no monitor.
     pub fn claim_for_request(&self, keys: &[TransferKey], fresh: &BatchRef) -> RequestClaim {
@@ -188,7 +199,9 @@ impl TransferRegistry {
                 .mine
                 .iter()
                 .filter(|(_, running)| {
-                    running.target == fresh.target && running.import_mode == fresh.import_mode
+                    running.target == fresh.target
+                        && running.import_mode == fresh.import_mode
+                        && running.duplicates == fresh.duplicates
                 })
                 .find_map(|(_, running)| Some((running.clone(), running.inbox.reserve()?))),
         };
@@ -460,6 +473,32 @@ mod tests {
             peer: "peer_a".to_string(),
             filename: filename.to_string(),
         }
+    }
+
+    #[test]
+    fn a_request_never_joins_a_batch_with_another_duplicates_rule() {
+        let registry = TransferRegistry::default();
+        let running = batch("user-a", "b1", ImportMode::Singleton);
+        registry.claim(&[key("01.flac")], &running);
+        let fresh = BatchRef::new(
+            TransferOwner {
+                user_id: UserId::new("user-a"),
+                batch_id: "b2".into(),
+            },
+            "Come Over".into(),
+            running.target.clone(),
+            ImportMode::Singleton,
+        )
+        .skipping_duplicates();
+        let claim = registry.claim_for_request(&[key("01.flac"), key("02.flac")], &fresh);
+        assert_eq!(
+            (
+                claim.batch.owner.batch_id.as_str(),
+                claim.batch.duplicates,
+                claim.reservation.is_none()
+            ),
+            ("b2", DuplicateRule::Skip, true)
+        );
     }
 
     #[test]

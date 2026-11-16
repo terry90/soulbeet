@@ -124,6 +124,21 @@ pub struct StoredImport {
     /// How the run decides on a match: a retry the user chose for runs that way again.
     pub choice: DriverChoice,
     pub rows: Vec<(JobSlot, DownloadProgress)>,
+    /// How the run treats the library's earlier copy; a row stored before the rule was kept
+    /// reads as `Guarded`.
+    #[serde(default)]
+    pub duplicates: DuplicateRule,
+}
+
+/// How a batch's imports treat what the library already has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateRule {
+    /// The web UI's: beets as configured, removals through the delete guard.
+    #[default]
+    Guarded,
+    /// MCP jobs': beets skips what the library has.
+    Skip,
 }
 
 /// Navidrome's two scan times at the first look with Navidrome idle (D8).
@@ -1191,6 +1206,7 @@ mod tests {
             cleanup_root: None,
             choices: None,
             choice: DriverChoice::Auto,
+            duplicates: DuplicateRule::Guarded,
             rows: vec![(
                 slot.clone(),
                 row_of("j1", 0, "01.flac", DownloadState::ImportQueued(1), 100),
@@ -1403,6 +1419,7 @@ mod tests {
             cleanup_root: None,
             choices: None,
             choice: DriverChoice::Auto,
+            duplicates: DuplicateRule::Guarded,
             rows: vec![(
                 JobSlot {
                     job: "j1".into(),
@@ -2515,6 +2532,7 @@ mod tests {
                 cleanup_root: None,
                 choices: None,
                 choice: DriverChoice::Auto,
+                duplicates: DuplicateRule::Guarded,
                 rows: vec![(slot.clone(), imported.clone())],
             },
             rows: vec![imported.clone()],

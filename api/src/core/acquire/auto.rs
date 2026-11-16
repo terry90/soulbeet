@@ -7,7 +7,9 @@ use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
 use crate::core::sources::{self, Searched};
 use crate::core::{backend_unavailable, database_failure};
 use crate::globals::get_or_create_user_channel;
-use crate::ledger::{JobEvent, JobKind, JobState, Ledger, NewJob, NewSearch, LEDGER};
+use crate::ledger::{
+    DuplicateRule, JobEvent, JobKind, JobState, Ledger, NewJob, NewSearch, LEDGER,
+};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::not_enqueued_failure;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
@@ -320,6 +322,7 @@ pub(crate) async fn run_search(
         label: auto_batch_label(&picked),
         target,
         import_mode: run.import_mode,
+        duplicates: DuplicateRule::Guarded,
     };
     let items = numbered(picked.items);
     ledger.record(JobEvent::Picked {

@@ -8,8 +8,8 @@ use std::sync::Mutex;
 
 use super::utils::{file_id, resolve_download_path, resolve_in_destination, FileId, Unresolved};
 use crate::auth::UserId;
-use crate::core::delete_guard::Origin;
 use crate::import_queue::{Duplicates, ImportJob, JobOwner};
+use crate::ledger::DuplicateRule;
 
 /// Maximum number of retries when waiting for a downloaded file to appear on disk.
 /// With exponential backoff (500ms, 1s, 2s, 4s, 8s), this covers ~15.5s total.
@@ -119,13 +119,15 @@ pub struct ResolvedSlot {
 }
 
 /// An import of `source` reporting to `user` through `rows`, which are
-/// already stamped with their batch.
+/// already stamped with their batch, treating earlier copies by the batch's
+/// `duplicates` rule.
 pub fn import_job(
     source: PathBuf,
     mode: ImportMode,
     rows: Vec<DownloadProgress>,
     target: &Path,
     user: &UserId,
+    duplicates: DuplicateRule,
     base: &Path,
 ) -> ImportJob {
     ImportJob {
@@ -140,10 +142,7 @@ pub fn import_job(
         cleanup_root: Some(base.to_path_buf()),
         choice: DriverChoice::Auto,
         choices: None,
-        duplicates: Duplicates::Guarded {
-            actor: user.clone(),
-            origin: Origin::Ui,
-        },
+        duplicates: Duplicates::of(duplicates, user),
     }
 }
 
@@ -154,6 +153,7 @@ pub fn album_jobs(
     resolved: Vec<ResolvedSlot>,
     target: &Path,
     user: &UserId,
+    duplicates: DuplicateRule,
     base: &Path,
 ) -> Vec<ImportJob> {
     let mut albums: Vec<(PathBuf, Vec<DownloadProgress>)> = Vec::new();
@@ -173,19 +173,29 @@ pub fn album_jobs(
                 vec![slot.row],
                 target,
                 user,
+                duplicates,
                 base,
             )),
         }
     }
-    let album_jobs = albums
-        .into_iter()
-        .map(|(folder, rows)| import_job(folder, ImportMode::Album, rows, target, user, base));
+    let album_jobs = albums.into_iter().map(|(folder, rows)| {
+        import_job(
+            folder,
+            ImportMode::Album,
+            rows,
+            target,
+            user,
+            duplicates,
+            base,
+        )
+    });
     album_jobs.chain(jobs).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::delete_guard::Origin;
     use crate::import_queue::test_support::row;
     use shared::download::DownloadState;
     use shared::failure::UserActionCode;
@@ -231,6 +241,46 @@ mod tests {
     }
 
     #[test]
+    fn import_job_takes_the_batchs_duplicates_rule() {
+        let user = UserId::new("u");
+        let job_for = |rule| {
+            import_job(
+                PathBuf::from("/dl/X [12345678]/a.flac"),
+                ImportMode::Singleton,
+                vec![row("a")],
+                Path::new("/music"),
+                &user,
+                rule,
+                Path::new("/dl"),
+            )
+        };
+        assert!(matches!(
+            job_for(DuplicateRule::Skip).duplicates,
+            Duplicates::Skip
+        ));
+        assert!(matches!(
+            job_for(DuplicateRule::Guarded).duplicates,
+            Duplicates::Guarded { actor, origin: Origin::Ui } if actor == user
+        ));
+        let resolved = |destination: Option<&str>| ResolvedSlot {
+            row: row("a"),
+            path: PathBuf::from("/dl/X [12345678]/a.flac"),
+            destination: destination.map(str::to_string),
+        };
+        let albums = album_jobs(
+            vec![resolved(Some("X [12345678]")), resolved(None)],
+            Path::new("/music"),
+            &user,
+            DuplicateRule::Skip,
+            Path::new("/dl"),
+        );
+        assert_eq!(albums.len(), 2);
+        assert!(albums
+            .iter()
+            .all(|job| matches!(job.duplicates, Duplicates::Skip)));
+    }
+
+    #[test]
     fn an_album_imports_its_batch_folder_once_and_adopted_files_alone() {
         let batch = Some("X [12345678]".to_string());
         let resolved = vec![
@@ -255,6 +305,7 @@ mod tests {
             resolved,
             Path::new("/music"),
             &UserId::new("u"),
+            DuplicateRule::Guarded,
             Path::new("/dl"),
         )
         .into_iter()

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use super::failover::{alternates_for, item_index};
 use crate::core::acquire::Acquisition;
+use crate::ledger::DuplicateRule;
 use crate::transfer_registry::{
     AddedSlot, BatchRef, Claim, InboxReservation, RequestClaim, TransferKey, TransferRegistry,
 };
@@ -28,6 +29,10 @@ pub const ANOTHER_FOLDER: &str = "already downloading into another folder";
 /// Reason for a file the same user's batch is already downloading into the
 /// same folder.
 pub const ALREADY_MINE: &str = "already downloading for this user";
+/// Reason for a file of a batch that skips duplicates, which another batch of
+/// the same user is already downloading into the same folder.
+const TAKEN_BY_ANOTHER_DOWNLOAD: &str =
+    "Another download of this user takes the same file into this folder";
 /// Row text for a file that joined a batch whose monitor had stopped.
 pub const MONITOR_STOPPED: &str = "Download monitoring stopped";
 /// Reason for a file the backend answered nothing for.
@@ -87,6 +92,18 @@ pub fn already_running() -> Failure {
     )
 }
 
+/// Another batch of the same user is downloading the file into this folder
+/// for a batch that skips duplicates, which must not hand its slot over to
+/// that batch: the batch's own import would never run on it.
+pub(crate) fn file_taken_by_another_download() -> Failure {
+    Failure::new(
+        FailureCode::AlreadyRunning,
+        Stage::Enqueue,
+        RetryAdvice::OtherSource,
+        TAKEN_BY_ANOTHER_DOWNLOAD,
+    )
+}
+
 pub fn transfer_key(backend: &'static str, peer: &str, filename: &str) -> TransferKey {
     TransferKey {
         backend,
@@ -138,6 +155,8 @@ pub fn held_failure(claim: &Claim, batch: &BatchRef) -> Failure {
         other_user()
     } else if claim.mine[0].1.target != batch.target {
         another_folder(RetryAdvice::OtherSource)
+    } else if batch.duplicates == DuplicateRule::Skip {
+        file_taken_by_another_download()
     } else {
         already_running()
     }
@@ -365,14 +384,19 @@ fn sort_claim(
 
     // A batch importing elsewhere neither takes this request's files nor
     // lets it import the shared ones here. `batch` imports into the folder
-    // the request asked for, whichever batch it is.
+    // the request asked for, whichever batch it is. A file held here is
+    // pursued by the batch holding it, unless `batch` skips duplicates.
     let (here, elsewhere): (Vec<_>, Vec<_>) = claim
         .mine
         .iter()
         .partition(|(_, running)| running.target == batch.target);
+    let held = match batch.duplicates {
+        DuplicateRule::Guarded => EnqueueStatus::AlreadyRunning,
+        DuplicateRule::Skip => EnqueueStatus::Failed(file_taken_by_another_download()),
+    };
     let results: Vec<QueuedDownload> = here
         .iter()
-        .map(|(key, _)| not_enqueued(key, EnqueueStatus::AlreadyRunning))
+        .map(|(key, _)| not_enqueued(key, held.clone()))
         .chain(
             claim
                 .other_user
@@ -616,6 +640,66 @@ mod tests {
         );
         assert_eq!(nothing.cause, None);
         assert_eq!(nothing, nothing_enqueued());
+    }
+
+    #[test]
+    fn a_file_another_download_holds_fails_a_skip_batch_and_is_dismissed_for_a_guarded_one() {
+        let running = batch("Come Over");
+        let held = Claim {
+            mine: vec![(transfer_key("slskd", "peer_a", "01.flac"), running.clone())],
+            ..Claim::default()
+        };
+        let guarded = same_user(&running);
+        assert_eq!(held_failure(&held, &guarded), already_running());
+        let taken = held_failure(&held, &guarded.skipping_duplicates());
+        assert_eq!(taken, file_taken_by_another_download());
+        assert_eq!(
+            (taken.code, taken.stage, taken.retry, taken.message.as_str()),
+            (
+                FailureCode::AlreadyRunning,
+                Stage::Enqueue,
+                RetryAdvice::OtherSource,
+                "Another download of this user takes the same file into this folder"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skip_request_fails_the_files_the_users_guarded_batch_holds() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = batch("Come Over");
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
+        let fresh = same_user(&running).skipping_duplicates();
+
+        let enq = enqueue_request(
+            &backend,
+            vec![
+                item("peer_a", "One", "01.flac"),
+                item("peer_a", "Two", "02.flac"),
+            ],
+            fresh.clone(),
+        )
+        .await;
+
+        let taken = enq.results.iter().find(|q| q.item == "01.flac").unwrap();
+        assert_eq!(
+            taken.status,
+            EnqueueStatus::Failed(file_taken_by_another_download())
+        );
+        assert_eq!(
+            statuses(&enq.results),
+            vec![
+                (
+                    "01.flac".to_string(),
+                    Answer::Failed(FailureCode::AlreadyRunning)
+                ),
+                ("02.flac".to_string(), Answer::Enqueued),
+            ]
+        );
+        assert!(matches!(enq.watcher, Watcher::Own));
+        assert_eq!(enq.batch.owner, fresh.owner);
+        assert_eq!(stub.destinations(), vec![fresh.destination.clone()]);
     }
 
     #[tokio::test]

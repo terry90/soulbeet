@@ -1359,12 +1359,15 @@ fn classify_discovery(outcome: &soulbeet::ImportOutcome) -> DiscoveryImport {
 }
 
 /// Deletes a download discovery could not import (it has no retry) and
-/// prunes the folder it leaves empty.
+/// prunes the folder it leaves empty, logging what it could not delete.
 #[cfg(feature = "server")]
 async fn discard_download(src: &std::path::Path, download_base: &std::path::Path) {
-    let _ = tokio::fs::remove_file(src).await;
-    if let Some(dir) = src.parent() {
-        let _ = super::cleanup_empty_ancestors(dir, download_base).await;
+    let sources = [src.to_path_buf()];
+    for (path, e) in crate::core::acquire::discard_sources(&sources, download_base).await {
+        tracing::warn!(
+            "Could not delete the discovery download {}: {e}",
+            path.display()
+        );
     }
 }
 

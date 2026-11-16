@@ -3,25 +3,37 @@
 //! after a restart the ledger's kept imports are restored.
 
 use super::choice::{files_gone, nothing_to_retry, resolve};
-use super::{ImportJob, ImportQueue, IMPORT_QUEUE};
+use super::{Duplicates, ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
 use crate::ledger::{self, JobEvent};
 use shared::download::{ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind};
 use soulbeet::{ImportMode, ImportOutcome, SkipReason};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use tracing::warn;
 
 /// Rows a client loses on reload are never forgotten by it, so each user
 /// keeps at most this many, the oldest dropped first.
 const MAX_PER_USER: usize = 200;
 
-/// Whether a job that ended with `outcome` is kept for a retry. Not when it
-/// imported, or when nothing was left to import, which no retry can fix.
-pub(super) fn keeps_retry(outcome: &ImportOutcome) -> bool {
+/// Whether a job of `duplicates` that ended with `outcome` is kept for a retry.
+/// Not when it imported, when nothing was left to import, or when it skipped
+/// what the library has: no retry can fix those.
+pub(super) fn keeps_retry(outcome: &ImportOutcome, duplicates: &Duplicates) -> bool {
     !matches!(
         outcome,
         ImportOutcome::Imported { .. } | ImportOutcome::Skipped(SkipReason::NothingToImport)
-    )
+    ) && !skipped_duplicate(outcome, duplicates)
+}
+
+/// Whether a job of `duplicates` that ended with `outcome` skipped what the
+/// library has because it was asked to.
+pub(super) fn skipped_duplicate(outcome: &ImportOutcome, duplicates: &Duplicates) -> bool {
+    matches!(duplicates, Duplicates::Skip)
+        && matches!(
+            outcome,
+            ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { .. })
+        )
 }
 
 struct Kept {
@@ -228,6 +240,32 @@ impl ImportQueue {
             },
             candidates: vec![],
         }))
+    }
+
+    /// Takes the kept job of `item` as a retry takes it, so a retry after it
+    /// finds nothing, dismisses its rows' slots and deletes its source files
+    /// under its cleanup root (a job without one keeps them). Taken before the
+    /// delete, so a deleted file was never also resubmitted. The job, or
+    /// nothing_to_retry().
+    pub async fn discard(&self, user: &UserId, item: &str) -> Result<ImportJob, ImportRefusal> {
+        let job = {
+            let _emit = self.shared.emit_lock.lock().await;
+            let (job, (), dropped) = self.shared.retries.take(user, item, |_| Ok(()))?;
+            let own = job.owner.iter().flat_map(|owner| &owner.rows);
+            let mut slots: Vec<JobSlot> = own.filter_map(|row| row.job.clone()).collect();
+            slots.extend(dropped);
+            self.shared.dismiss(slots);
+            Arc::unwrap_or_clone(job)
+        };
+        if let Some(root) = &job.cleanup_root {
+            for (path, e) in crate::core::acquire::discard_sources(&job.sources, root).await {
+                warn!(
+                    "Could not delete the discarded import {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Ok(job)
     }
 
     /// Drops the kept jobs of `items` and dismisses their slots (D5).

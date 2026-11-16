@@ -811,8 +811,8 @@ mod tests {
     use crate::auth::UserId;
     use crate::core::delete_guard::test_support::{mtime, set_mtime};
     use crate::ledger::{
-        store, ImportDone, IndexWait, JobEvent, JobKind, JobState, Ledger, NewJob, ScanBaseline,
-        SlotResult, StoredImport,
+        store, DuplicateRule, ImportDone, IndexWait, JobEvent, JobKind, JobState, Ledger, NewJob,
+        ScanBaseline, SlotResult, StoredImport,
     };
     use crate::models::navidrome_library::NavidromeLibraryRow;
     use crate::server_fns::download::test_support::item;
@@ -1270,6 +1270,7 @@ mod tests {
                 cleanup_root: None,
                 choices: None,
                 choice: DriverChoice::Auto,
+                duplicates: DuplicateRule::Guarded,
                 rows: vec![(slot.clone(), row.clone())],
             },
             rows: vec![row],

@@ -16,9 +16,9 @@ use crate::core::{backend_unavailable, database_failure, sources};
 use crate::globals::{get_or_create_user_channel, send_user_event};
 use crate::import_queue::{ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::ledger::store::{self, SlotRecord, StoredSearch, Unfinished, UnfinishedJob};
-use crate::ledger::{JobEvent, JobState, Ledger, NewSearch, StoredImport, LEDGER};
+use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger, NewSearch, StoredImport, LEDGER};
 use crate::models::folder::Folder;
-use crate::server_fns::download::enqueue::{held_failure, transfer_key};
+use crate::server_fns::download::enqueue::{already_running, held_failure, transfer_key};
 use crate::server_fns::download::failover::{alternates_for, SourcePool, MAX_SOURCES_PER_TRACK};
 use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
 use crate::server_fns::download::process::{
@@ -866,6 +866,7 @@ async fn resume_batch(
                     vec![f.row],
                     &batch.target,
                     &user,
+                    batch.duplicates,
                     download_base,
                 );
                 queue.submit(import).await;
@@ -888,7 +889,8 @@ async fn resume_batch(
             continue;
         }
         let failure = held_failure(&claim, &batch);
-        if failure.code == FailureCode::AlreadyRunning {
+        // Another of the user's batches pursues it, unless this one skips duplicates.
+        if failure == already_running() {
             dismissed.push(w.job);
         } else {
             held.push(
@@ -989,6 +991,7 @@ async fn enqueue_anew(resume: &dyn Resume, backend: &Arc<dyn DownloadBackend>, q
         label: manual_batch_label(&picked),
         target: PathBuf::from(&job.folder.path),
         import_mode: job.import_mode,
+        duplicates: DuplicateRule::Guarded,
     };
     resume
         .enqueue(&job.ctx, backend.clone(), fresh.into(), acquisition)
@@ -1545,6 +1548,7 @@ mod tests {
                 cleanup_root: None,
                 choices: None,
                 choice: DriverChoice::Auto,
+                duplicates: DuplicateRule::Guarded,
                 rows: vec![(slot, row)],
             })));
         }
@@ -1636,6 +1640,7 @@ mod tests {
                 cleanup_root: None,
                 choices: None,
                 choice: DriverChoice::Auto,
+                duplicates: DuplicateRule::Guarded,
                 rows: vec![(slot, row.clone().with_state(DownloadState::ImportQueued(1)))],
             };
             // As the import queue's finish records a kept import.

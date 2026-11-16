@@ -5,7 +5,7 @@ use crate::config::CONFIG;
 use crate::core::sources;
 use crate::core::{backend_unavailable, database_failure};
 use crate::ledger::store::StoredSearch;
-use crate::ledger::{JobKind, JobState, Ledger, NewJob, LEDGER};
+use crate::ledger::{DuplicateRule, JobKind, JobState, Ledger, NewJob, LEDGER};
 use crate::models::folder::Folder;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 use crate::services::{download_backend, BackendLookupError};
@@ -143,6 +143,7 @@ async fn start_manual(
         label: manual_batch_label(&items),
         target,
         import_mode,
+        duplicates: DuplicateRule::Guarded,
     };
     let acquisition = Acquisition {
         job,

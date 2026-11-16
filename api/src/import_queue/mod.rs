@@ -14,7 +14,9 @@ pub(crate) use rows::import_failure;
 
 use crate::auth::UserId;
 use crate::core::delete_guard::{Guard, Origin};
-use crate::ledger::{self, ImportDone, IndexWait, JobEvent, SlotResult, StoredImport};
+use crate::ledger::{
+    self, DuplicateRule, ImportDone, IndexWait, JobEvent, SlotResult, StoredImport,
+};
 use async_trait::async_trait;
 use futures::FutureExt;
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, MatchChoices};
@@ -22,7 +24,7 @@ use shared::failure::Failure;
 use soulbeet::audio::{count_audio_files, is_audio_path};
 use soulbeet::{
     DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    MusicImporter,
+    MusicImporter, SkipReason,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -32,7 +34,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
-use retry::{keeps_retry, RetryStore};
+use retry::{keeps_retry, skipped_duplicate, RetryStore};
 use rows::{row_with_state, rows_for_done, rows_with_state};
 
 const WORKER_STOPPED: &str = "import worker stopped";
@@ -70,6 +72,21 @@ pub enum Duplicates {
     AsConfigured,
     /// beets reports the removals it wants; the guard decides them for `actor`.
     Guarded { actor: UserId, origin: Origin },
+    /// beets skips what the library already has (MCP jobs); a skip is not kept for a retry.
+    Skip,
+}
+
+impl Duplicates {
+    /// How the imports of a batch of `user` with `rule` treat earlier copies.
+    pub fn of(rule: DuplicateRule, user: &UserId) -> Duplicates {
+        match rule {
+            DuplicateRule::Guarded => Duplicates::Guarded {
+                actor: user.clone(),
+                origin: Origin::Ui,
+            },
+            DuplicateRule::Skip => Duplicates::Skip,
+        }
+    }
 }
 
 impl ImportJob {
@@ -89,17 +106,20 @@ impl ImportJob {
                 .iter()
                 .filter_map(|row| Some((row.job.clone()?, row.clone())))
                 .collect(),
+            // A job with rows is a download or a retry of one, never AsConfigured.
+            duplicates: match self.duplicates {
+                Duplicates::Skip => DuplicateRule::Skip,
+                Duplicates::Guarded { .. } | Duplicates::AsConfigured => DuplicateRule::Guarded,
+            },
         })
     }
 
     /// The job `stored` describes, reporting to `user` through its rows (jobs set). Every
-    /// stored import is a download or a retry, so its earlier copies are guarded for `user`.
+    /// stored import is a download or a retry, so its earlier copies are treated by its rule
+    /// for `user`.
     pub fn from_stored(stored: StoredImport, user: UserId) -> ImportJob {
         ImportJob {
-            duplicates: Duplicates::Guarded {
-                actor: user.clone(),
-                origin: Origin::Ui,
-            },
+            duplicates: Duplicates::of(stored.duplicates, &user),
             sources: stored.sources,
             target: stored.target,
             mode: match stored.album {
@@ -489,6 +509,7 @@ impl Shared {
         let duplicates = match job.duplicates {
             Duplicates::AsConfigured => DuplicateRun::AsConfigured,
             Duplicates::Guarded { .. } => DuplicateRun::ReportRemovals,
+            Duplicates::Skip => DuplicateRun::Skip,
         };
         let mut result = importer
             .import(&sources, target, job.mode, &job.choice, duplicates)
@@ -568,15 +589,23 @@ impl Shared {
                 outcome.result
             ),
         }
+        let keep = keeps_retry(&outcome.result.outcome, &job.duplicates);
         if let Some(root) = &job.cleanup_root {
-            // beets moves the files out but leaves their folders behind.
-            for source in &job.sources {
-                let dir = match job.mode {
-                    ImportMode::Album => Some(source.as_path()),
-                    ImportMode::Singleton => source.parent(),
-                };
-                if let Some(dir) = dir {
-                    let _ = crate::server_fns::cleanup_empty_ancestors(dir, root).await;
+            if skipped_duplicate(&outcome.result.outcome, &job.duplicates) {
+                // No retry imports what the library has: the copy is Soulful's own download.
+                for (path, e) in crate::core::acquire::discard_sources(&job.sources, root).await {
+                    warn!("Could not delete the duplicate {}: {e}", path.display());
+                }
+            } else {
+                // beets moves the files out but leaves their folders behind.
+                for source in &job.sources {
+                    let dir = match job.mode {
+                        ImportMode::Album => Some(source.as_path()),
+                        ImportMode::Singleton => source.parent(),
+                    };
+                    if let Some(dir) = dir {
+                        let _ = crate::server_fns::cleanup_empty_ancestors(dir, root).await;
+                    }
                 }
             }
         }
@@ -594,7 +623,6 @@ impl Shared {
         // Stored before the rows go out, so their Retry button always finds
         // it, and under the lock, so the ledger hears what the store did in
         // the order the store did it.
-        let keep = keeps_retry(&outcome.result.outcome);
         let _emit = self.emit_lock.lock().await;
         let dropped = self.retries.record(&job, keep);
         if let Some(owner) = &job.owner {
@@ -653,6 +681,15 @@ fn ledger_end(
                     listed: None,
                 };
                 (slot.clone(), result)
+            })
+            .collect(),
+        // Only a duplicate that is not kept ends with what the library has.
+        ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing }) if !keep => import
+            .rows
+            .iter()
+            .map(|(slot, _)| {
+                let existing = existing.clone();
+                (slot.clone(), SlotResult::AlreadyInLibrary { existing })
             })
             .collect(),
         _ => vec![],
@@ -765,7 +802,7 @@ pub static IMPORT_QUEUE: LazyLock<ImportQueue> =
 mod tests {
     use super::choice::{files_gone, nothing_to_retry};
     use super::test_support::{
-        alice, broken, imported, no_match, row, RecordingDeps, StubImporter,
+        alice, bob, broken, imported, no_match, row, RecordingDeps, StubImporter,
     };
     use super::*;
     use crate::core::delete_guard::test_support::{wanted, Library};
@@ -1352,6 +1389,177 @@ mod tests {
                 job: "j1".into(),
                 slot: 0
             }]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skipped_duplicate_of_an_mcp_job_is_not_kept_and_its_copy_is_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        let existing = ImportedItem {
+            path: "Zzqx Artist/Qzz Album/01 Song Number 1.mp3".into(),
+            recording_mbid: Some("dfeb96a7-f78a-4b04-93ce-c39e28c9a173".into()),
+            artist: "Zzqx Artist".into(),
+            title: "Song Number 1".into(),
+            beets_id: Some(7),
+            release_mbid: None,
+            album: "Qzz Album".into(),
+            match_per_mille: None,
+        };
+        stub.script(ImportResult {
+            outcome: ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+                existing: vec![existing.clone()],
+            }),
+            ..imported()
+        });
+        let source = file(tmp.path(), "dl/X [1f2e3d4c]/01.flac");
+        let mut job = owned(
+            job(source.clone(), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        job.duplicates = Duplicates::Skip;
+        job.cleanup_root = Some(tmp.path().join("dl"));
+        finish(queue.submit(job).await).await;
+
+        assert_eq!(stub.duplicate_runs(), vec![DuplicateRun::Skip]);
+        assert!(!source.exists() && !tmp.path().join("dl/X [1f2e3d4c]").exists());
+        assert!(tmp.path().join("dl").exists());
+        assert_eq!(
+            queue.import_choices(&alice(), "a").unwrap_err(),
+            nothing_to_retry()
+        );
+        let last = deps.rows_for(&alice()).pop().unwrap();
+        assert!(!last[0].retryable, "{last:?}");
+        let Some(JobEvent::ImportDone(done)) = deps.ledger_events().pop() else {
+            panic!("{:?}", deps.ledger_events())
+        };
+        assert_eq!(
+            (done.next, done.index, done.results),
+            (
+                ledger::JobState::Failed,
+                None,
+                vec![(
+                    JobSlot {
+                        job: "j1".into(),
+                        slot: 0
+                    },
+                    SlotResult::AlreadyInLibrary {
+                        existing: vec![existing]
+                    }
+                )]
+            )
+        );
+    }
+
+    /// A guarded job beets skipped as a duplicate stays kept, its files in place.
+    #[tokio::test]
+    async fn a_skipped_duplicate_of_a_guarded_job_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(ImportResult {
+            outcome: ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing: vec![] }),
+            ..imported()
+        });
+        let source = file(tmp.path(), "dl/X [1f2e3d4c]/01.flac");
+        let mut job = owned(
+            job(source.clone(), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        job.duplicates = Duplicates::of(DuplicateRule::Guarded, &alice());
+        job.cleanup_root = Some(tmp.path().join("dl"));
+        finish(queue.submit(job).await).await;
+
+        assert!(source.exists());
+        assert!(queue.import_choices(&alice(), "a").is_ok());
+        let Some(JobEvent::ImportDone(done)) = deps.ledger_events().pop() else {
+            panic!("{:?}", deps.ledger_events())
+        };
+        assert_eq!(
+            (done.next, done.results),
+            (ledger::JobState::NeedsDecision, vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discarded_kept_import_is_gone_for_a_retry_and_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(no_match(2));
+        let source = file(tmp.path(), "dl/X [1f2e3d4c]/a.flac");
+        let mut kept = owned(
+            job(source.clone(), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        kept.cleanup_root = Some(tmp.path().join("dl"));
+        finish(queue.submit(kept).await).await;
+
+        assert_eq!(
+            queue.discard(&bob(), "a").await.unwrap_err(),
+            nothing_to_retry()
+        );
+        let discarded = queue.discard(&alice(), "a").await.unwrap();
+        assert_eq!(discarded.sources, vec![source.clone()]);
+        assert!(!source.exists() && !tmp.path().join("dl/X [1f2e3d4c]").exists());
+        assert!(tmp.path().join("dl").exists());
+        assert_eq!(
+            deps.ledger_events().pop(),
+            Some(JobEvent::Dismiss(vec![JobSlot {
+                job: "j1".into(),
+                slot: 0
+            }]))
+        );
+        assert_eq!(
+            queue
+                .retry(&alice(), "a", ImportChoice::Auto)
+                .await
+                .unwrap_err(),
+            nothing_to_retry()
+        );
+        assert_eq!(
+            queue.discard(&alice(), "a").await.unwrap_err(),
+            nothing_to_retry()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kept_mcp_import_rebuilt_after_a_restart_still_skips_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let source = file(tmp.path(), "dl/a.flac");
+        let mut job = owned(job(source, &tmp.path().join("lib")), &alice(), &["a"]);
+        job.duplicates = Duplicates::Skip;
+        let stored = job.stored().unwrap();
+        assert_eq!(stored.duplicates, DuplicateRule::Skip);
+        // What the restore after a restart does with the stored row.
+        queue
+            .restore(ImportJob::from_stored(stored, alice()))
+            .await
+            .unwrap();
+        queue
+            .retry(&alice(), "a", ImportChoice::Auto)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stub.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await
+            }
+        })
+        .await
+        .expect("the restored import ran");
+        assert_eq!(stub.duplicate_runs(), vec![DuplicateRun::Skip]);
+
+        let old: StoredImport = serde_json::from_value(serde_json::json!({
+            "sources": ["/dl/a.flac"], "target": "/music", "album": false,
+            "cleanup_root": null, "choices": null, "choice": "auto", "rows": []
+        }))
+        .unwrap();
+        assert_eq!(
+            old.duplicates,
+            DuplicateRule::Guarded,
+            "a row stored before the rule was kept"
         );
     }
 

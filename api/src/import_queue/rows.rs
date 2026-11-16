@@ -119,7 +119,7 @@ pub fn rows_for_done(
         _ => (None, None),
     };
     // Same rule as the retry store, so a row offers Retry only when one is kept.
-    let retryable = keeps_retry(&result.outcome);
+    let retryable = keeps_retry(&result.outcome, &job.duplicates);
     let local_path = retryable.then(|| kept_in(job)).flatten();
     let output = (!result.output_tail.is_empty()).then(|| result.output_tail.clone());
     let skip = match &result.outcome {

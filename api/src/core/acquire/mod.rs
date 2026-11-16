@@ -16,7 +16,7 @@ pub use manual::download;
 use crate::auth::UserCtx;
 use crate::core::{database_failure, target_unwritable};
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
-use crate::ledger::{JobEvent, JobState, Ledger};
+use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{
     another_folder, claim_into, claim_request, deliver, failed_reason, nothing_enqueued,
@@ -33,7 +33,7 @@ use shared::download::{
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::SoulseekError;
 use soulbeet::{DownloadBackend, ImportMode};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Name for a manual download's batch: the album its items share, or the
@@ -67,12 +67,14 @@ pub(super) fn request_stopped(e: &tokio::task::JoinError) -> Failure {
 
 /// The batch a request starts when it joins no running one. It downloads
 /// into `batch_folder(label, batch_id)` and imports into `target` in
-/// `import_mode`; the request's user owns it.
+/// `import_mode`, treating what the library has by `duplicates`; the
+/// request's user owns it.
 pub struct NewBatch {
     pub batch_id: String,
     pub label: String,
     pub target: PathBuf,
     pub import_mode: ImportMode,
+    pub duplicates: DuplicateRule,
 }
 
 /// The batch a request's files go into.
@@ -95,7 +97,7 @@ impl From<NewBatch> for RequestBatch {
 
 impl NewBatch {
     fn owned_by(self, ctx: &UserCtx) -> BatchRef {
-        BatchRef::new(
+        let batch = BatchRef::new(
             TransferOwner {
                 user_id: ctx.id(),
                 batch_id: self.batch_id,
@@ -103,7 +105,11 @@ impl NewBatch {
             self.label,
             self.target,
             self.import_mode,
-        )
+        );
+        match self.duplicates {
+            DuplicateRule::Guarded => batch,
+            DuplicateRule::Skip => batch.skipping_duplicates(),
+        }
     }
 }
 
@@ -382,6 +388,67 @@ pub(crate) fn spawn_monitor(ctx: &UserCtx, mut monitor: DownloadMonitor) {
     });
 }
 
+/// Deletes `sources` (files, or the files of a folder) and prunes the
+/// folders they leave empty up to `base`. The paths it could not delete,
+/// with the OS error.
+pub(crate) async fn discard_sources(sources: &[PathBuf], base: &Path) -> Vec<(PathBuf, String)> {
+    let mut failed = Vec::new();
+    for source in sources {
+        let emptied = match tokio::fs::symlink_metadata(source).await {
+            Ok(meta) if meta.is_dir() => {
+                failed.extend(delete_files_in(source).await);
+                source.as_path()
+            }
+            Ok(_) => match tokio::fs::remove_file(source).await {
+                Ok(()) => source.parent().unwrap_or(base),
+                Err(e) => {
+                    failed.push((source.clone(), e.to_string()));
+                    continue;
+                }
+            },
+            Err(e) => {
+                failed.push((source.clone(), e.to_string()));
+                continue;
+            }
+        };
+        if let Err(e) = crate::server_fns::cleanup_empty_ancestors(emptied, base).await {
+            failed.push((emptied.to_path_buf(), e.to_string()));
+        }
+    }
+    failed
+}
+
+/// Deletes the files directly in `dir`, leaving its folders. The paths it
+/// could not delete, with the OS error.
+async fn delete_files_in(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) => return vec![(dir.to_path_buf(), e.to_string())],
+    };
+    let mut failed = Vec::new();
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                failed.push((dir.to_path_buf(), e.to_string()));
+                break;
+            }
+        };
+        let path = entry.path();
+        match entry.file_type().await {
+            Ok(kind) if kind.is_dir() => {}
+            Ok(_) => {
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    failed.push((path, e.to_string()));
+                }
+            }
+            Err(e) => failed.push((path, e.to_string())),
+        }
+    }
+    failed
+}
+
 /// The search's groups without the picked files, best score first, empty
 /// groups dropped.
 pub(crate) fn alternates_from(
@@ -418,7 +485,7 @@ mod tests {
     use super::test_support::{ctx_of, own_ctx};
     use super::*;
     use crate::auth::UserId;
-    use crate::ledger::{JobKind, NewJob};
+    use crate::ledger::{DuplicateRule, JobKind, NewJob};
     use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
     use crate::server_fns::download::test_support::{
         batch, group, item, key, ScriptedOutcome, StubBackend,
@@ -434,6 +501,7 @@ mod tests {
             label: "Come Over".to_string(),
             target,
             import_mode: running.import_mode,
+            duplicates: DuplicateRule::Guarded,
         }
     }
 
@@ -456,7 +524,48 @@ mod tests {
             label: label.to_string(),
             target: PathBuf::from("/music"),
             import_mode: ImportMode::Singleton,
+            duplicates: DuplicateRule::Guarded,
         }
+    }
+
+    #[test]
+    fn a_fresh_batch_carries_its_duplicates_rule() {
+        let running = batch("Come Over");
+        let ctx = ctx_of(&running);
+        for rule in [DuplicateRule::Guarded, DuplicateRule::Skip] {
+            let fresh = NewBatch {
+                duplicates: rule,
+                ..new_batch("Come Over")
+            };
+            assert_eq!(fresh.owned_by(&ctx).duplicates, rule);
+        }
+    }
+
+    #[tokio::test]
+    async fn discarding_names_what_it_could_not_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("dl");
+        let file = base.join("X [1f2e3d4c]/01.flac");
+        let album = base.join("Y [2e3d4c5b]");
+        let missing = base.join("Z [3d4c5b6a]/01.flac");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01.flac"), b"x").unwrap();
+        std::fs::write(album.join("cover.jpg"), b"x").unwrap();
+
+        let failed = discard_sources(&[file.clone(), album.clone(), missing.clone()], &base).await;
+
+        assert_eq!(
+            failed,
+            vec![(
+                missing,
+                "No such file or directory (os error 2)".to_string()
+            )]
+        );
+        assert!(!file.exists() && !file.parent().unwrap().exists());
+        assert!(!album.exists());
+        assert!(base.exists());
     }
 
     #[test]

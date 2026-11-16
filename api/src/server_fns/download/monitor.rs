@@ -31,7 +31,7 @@ use crate::config::CONFIG;
 use crate::core::database_failure;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
-use crate::ledger::{JobEvent, JobState, Ledger};
+use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger};
 use crate::services::{download_backend, BackendLookupError};
 use crate::transfer_registry::{AddedSlot, BatchRef, TransferKey, TransferOwner, TransferRegistry};
 
@@ -1406,6 +1406,7 @@ impl DownloadMonitor {
             destination: self.tracked_files[slot].destination.clone(),
             key: self.slot_key(slot, backend.id()),
             owner: self.batch.owner.clone(),
+            duplicates: self.batch.duplicates,
             target: self.target_path.clone(),
             download_base: self.download_base.clone(),
             claimed: Arc::clone(&self.claimed),
@@ -1671,6 +1672,7 @@ impl DownloadMonitor {
             resolved,
             &self.target_path,
             &self.batch.owner.user_id,
+            self.batch.duplicates,
             &self.download_base,
         );
         info!(
@@ -1706,6 +1708,8 @@ struct Handoff {
     destination: Option<String>,
     key: TransferKey,
     owner: TransferOwner,
+    /// How the import treats earlier copies: the batch's rule.
+    duplicates: DuplicateRule,
     target: PathBuf,
     download_base: PathBuf,
     claimed: Arc<Mutex<HashSet<FileId>>>,
@@ -1753,6 +1757,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
         vec![h.row],
         &h.target,
         &h.owner.user_id,
+        h.duplicates,
         &h.download_base,
     );
     IMPORT_QUEUE.submit(job).await.wait().await;

@@ -478,7 +478,7 @@ pub async fn job_state(db: &SqlitePool, job: &str) -> Option<JobState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::{JobEvent, JobKind, Ledger, NewJob};
+    use crate::ledger::{DuplicateRule, JobEvent, JobKind, Ledger, NewJob};
     use crate::server_fns::download::test_support::item;
     use shared::download::DownloadState;
     use soulbeet::DriverChoice;
@@ -539,6 +539,7 @@ mod tests {
             cleanup_root: None,
             choices: None,
             choice: DriverChoice::Auto,
+            duplicates: DuplicateRule::Guarded,
             rows: vec![(
                 slot(1),
                 DownloadProgress::queued("t-02".into(), "peer_a".into(), "02.flac".into(), 100)
