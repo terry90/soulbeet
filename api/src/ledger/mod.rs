@@ -974,14 +974,16 @@ impl Ledger {
     /// At `now`: deletes searches with expires_at <= now, dismisses jobs
     /// waiting for a source whose search is gone or expired (D11) and stamps
     /// their updated_at with `now`, deletes terminal jobs with
-    /// updated_at < now - JOB_KEPT_SECS, then batches with no job left, and
-    /// request keys reserved before now - KEY_KEPT_SECS.
+    /// updated_at < now - JOB_KEPT_SECS, then batches with no job left made
+    /// before now - JOB_KEPT_SECS whose playlist waits for no job, and request
+    /// keys reserved before now - KEY_KEPT_SECS.
     pub async fn prune(&self, now: i64) -> Result<Pruned, LedgerError> {
         self.write(|reply| Write::Prune { now, reply }).await
     }
 
     /// `batch` fills playlist `playlist_id` in `order`, with no fill failure yet. Like the other
-    /// playlist writes, it leaves the change number as it is: the fill runner wakes on it.
+    /// playlist writes, it leaves the change number as it is: the fill runner wakes on it. Each
+    /// of them fails when the batch is gone.
     pub async fn set_playlist(
         &self,
         batch: &str,
@@ -1029,6 +1031,14 @@ impl Ledger {
             reply,
         })
         .await
+    }
+
+    /// Removes `batch` when it holds no job and fills no playlist: a playlist batch whose jobs
+    /// all run for earlier calls, once its playlist could not be begun.
+    pub async fn remove_followless_batch(&self, batch: &str) -> Result<(), LedgerError> {
+        let batch = batch.to_string();
+        self.write(|reply| Write::RemoveFollowlessBatch { batch, reply })
+            .await
     }
 
     /// Waits until every write sent before it is applied, so a read after it sees the events

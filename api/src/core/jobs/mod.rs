@@ -121,7 +121,8 @@ pub(crate) enum EnsureItem {
 /// What `ensure` did, its items in input order.
 #[derive(Debug)]
 pub(crate) struct Ensured {
-    /// The batch holding the jobs made; None when no job was made, and no batch was written.
+    /// The batch holding the jobs made, or, `for_playlist`, the one whose playlist waits for the
+    /// jobs already running; None when no batch was written.
     pub batch_id: Option<String>,
     pub items: Vec<EnsureItem>,
     /// False when the user has no Navidrome link: nothing was looked up (step 5 D9).

@@ -17,6 +17,7 @@ use shared::download::{
 };
 use shared::failure::{Failure, FailureCode, Stage};
 use soulbeet::ImportMode;
+use sqlx::sqlite::SqliteQueryResult;
 use sqlx::{Sqlite, SqliteConnection, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::mem::Discriminant;
@@ -114,6 +115,10 @@ pub(super) enum Write {
     SetPlaylistFailure {
         batch: String,
         failure: Option<Failure>,
+        reply: Reply<()>,
+    },
+    RemoveFollowlessBatch {
+        batch: String,
         reply: Reply<()>,
     },
     Event(JobEvent),
@@ -438,6 +443,10 @@ impl Writer {
             } => {
                 let set = set_playlist_failure(&self.db, &batch, failure.as_ref()).await;
                 self.finish(reply, "store a batch's playlist failure", set)
+            }
+            Write::RemoveFollowlessBatch { batch, reply } => {
+                let removed = remove_followless_batch(&self.db, &batch).await;
+                self.finish(reply, "remove a batch that follows nothing", removed)
             }
             Write::Event(event) => {
                 let recorded = self.event(event).await;
@@ -1568,12 +1577,17 @@ impl Writer {
         .execute(&mut *tx)
         .await?
         .rows_affected();
-        // A batch whose playlist waits for jobs of earlier calls has none of its own.
+        // A batch with no job left goes once it is older than JOB_KEPT_SECS, which one whose
+        // jobs were pruned always is. A playlist batch whose jobs all run for earlier calls never
+        // held one, nor a playlist order until `set_playlist`: it is kept that long, and longer
+        // while its playlist waits for one of those jobs.
         sqlx::query(
             "DELETE FROM batches WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = batches.id) \
+             AND created_at < ? \
              AND NOT EXISTS (SELECT 1 FROM json_each(batches.playlist_order) e \
                              WHERE json_extract(e.value, '$.settled') = 0)",
         )
+        .bind(now - JOB_KEPT_SECS)
         .execute(&mut *tx)
         .await?;
         sqlx::query("DELETE FROM request_keys WHERE created_at < ?")
@@ -1688,7 +1702,7 @@ async fn set_playlist(
     playlist_id: &str,
     order: &[OrderEntry],
 ) -> Result<(), LedgerError> {
-    sqlx::query(
+    let done = sqlx::query(
         "UPDATE batches SET playlist_id = ?, playlist_order = ?, playlist_failure = NULL \
          WHERE id = ?",
     )
@@ -1697,7 +1711,7 @@ async fn set_playlist(
     .bind(batch)
     .execute(db)
     .await?;
-    Ok(())
+    batch_updated(done, batch)
 }
 
 async fn set_playlist_order(
@@ -1706,7 +1720,7 @@ async fn set_playlist_order(
     order: &[OrderEntry],
     hidden_dropped: u32,
 ) -> Result<(), LedgerError> {
-    sqlx::query(
+    let done = sqlx::query(
         "UPDATE batches SET playlist_order = ?, \
          playlist_hidden_dropped = playlist_hidden_dropped + ? WHERE id = ?",
     )
@@ -1715,7 +1729,7 @@ async fn set_playlist_order(
     .bind(batch)
     .execute(db)
     .await?;
-    Ok(())
+    batch_updated(done, batch)
 }
 
 async fn set_playlist_failure(
@@ -1723,11 +1737,31 @@ async fn set_playlist_failure(
     batch: &str,
     failure: Option<&Failure>,
 ) -> Result<(), LedgerError> {
-    sqlx::query("UPDATE batches SET playlist_failure = ? WHERE id = ?")
+    let done = sqlx::query("UPDATE batches SET playlist_failure = ? WHERE id = ?")
         .bind(failure.map(serde_json::to_string).transpose()?)
         .bind(batch)
         .execute(db)
         .await?;
+    batch_updated(done, batch)
+}
+
+/// An update of `batch`'s row that found none failed: the batch is gone.
+fn batch_updated(done: SqliteQueryResult, batch: &str) -> Result<(), LedgerError> {
+    match done.rows_affected() {
+        0 => Err(LedgerError(format!("batch {batch} is gone"))),
+        _ => Ok(()),
+    }
+}
+
+/// Removes `batch` when it holds no job and fills no playlist.
+async fn remove_followless_batch(db: &SqlitePool, batch: &str) -> Result<(), LedgerError> {
+    sqlx::query(
+        "DELETE FROM batches WHERE id = ? AND playlist_order IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = batches.id)",
+    )
+    .bind(batch)
+    .execute(db)
+    .await?;
     Ok(())
 }
 

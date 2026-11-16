@@ -255,7 +255,7 @@ async fn run(
     };
     let folder_id = folder_id.as_deref();
     let for_playlist = playlist.is_some();
-    let ensured = match ensure(
+    let mut ensured = match ensure(
         acquire,
         navidrome,
         ctx,
@@ -272,7 +272,7 @@ async fn run(
     };
     let written = match &playlist {
         Some((target, navi)) => {
-            let batch = ensured.batch_id.as_deref();
+            let batch = &mut ensured.batch_id;
             let written = begin(&acquire.ledger, navi, ctx, batch, target, &ensured.items).await;
             Some((target, written))
         }
@@ -1896,6 +1896,33 @@ mod tests {
             .await,
         );
         assert_eq!(batch["playlist"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_playlist_that_fails_for_items_whose_jobs_all_run_already_leaves_no_batch() {
+        let (db, acq, effects, token) = jobs_app().await;
+        let _held = effects.stub().hold_searches();
+        let navi = NavidromeStub::start();
+        navi.answer_when("/api/song", "title=", 200, "[]");
+        navi.answer("/rest/getPlaylists", &[&playlists_body(&[])]);
+        navi.answer_when("/rest/createPlaylist", "", 502, BAD_GATEWAY);
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let items = json!({"items": christmas_items(), "folder_id": "alice-folder"});
+        call_tool(app.clone(), &token, "ensure_in_library", items).await;
+        let with_playlist = json!({"items": christmas_items(), "folder_id": "alice-folder",
+            "playlist": {"create": {"name": "Christmas"}}});
+        let doc = document(&call_tool(app, &token, "ensure_in_library", with_playlist).await);
+        assert_eq!(
+            (
+                doc["playlist"]["ok"].as_bool(),
+                doc["playlist"]["error"]["code"].as_str()
+            ),
+            (Some(false), Some("navidrome_unreachable")),
+            "{doc}"
+        );
+        // Its batch would follow nothing: there is none to follow.
+        assert_eq!((&doc["batch_id"], &doc["next"]), (&Value::Null, &json!([])));
+        assert_eq!(count(&db, "batches").await, 1);
     }
 
     #[tokio::test]

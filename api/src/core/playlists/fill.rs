@@ -93,8 +93,29 @@ pub(crate) async fn prepare(
 /// settled, in that order, created with them or appended to the caller's playlist, with the
 /// usual checks and read back; a song the playlist already lists is not added again
 /// (`new_songs`). Then `batch`, when ensure made one, stores that order for the fill; a batch
-/// that could not store it is Unfollowed.
+/// that could not store it is Unfollowed. When begin fails and the batch holds no job of its own
+/// (every item's job runs for an earlier call), the batch follows nothing: it is removed, and
+/// `batch` is None after.
 pub(crate) async fn begin(
+    ledger: &Ledger,
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    batch: &mut Option<String>,
+    target: &PlaylistTarget,
+    items: &[EnsureItem],
+) -> Result<Written, PlaylistRefusal> {
+    let begun = write_and_follow(ledger, navi, ctx, batch.as_deref(), target, items).await;
+    let jobless = !(items.iter()).any(|item| matches!(item, EnsureItem::Created { .. }));
+    if let (Err(_), true, Some(id)) = (&begun, jobless, batch.as_deref()) {
+        // The writer logs a removal it could not make; the batch then goes at a later prune.
+        let _ = ledger.remove_followless_batch(id).await;
+        *batch = None;
+    }
+    begun
+}
+
+/// The playlist write and the stored order of `begin`.
+async fn write_and_follow(
     ledger: &Ledger,
     navi: &NavidromeClient,
     ctx: &UserCtx,
@@ -418,7 +439,7 @@ mod tests {
     };
     use crate::core::playlists::{playlist_not_found, NotEditable};
     use crate::core::test_ctx;
-    use crate::ledger::Admitted;
+    use crate::ledger::{Admitted, LedgerError, JOB_KEPT_SECS};
     use crate::services::NavidromeLookupError;
     use crate::test_navidrome::{
         native_playlist, native_song, native_songs, playlist_body, playlist_rows, playlists_body,
@@ -760,7 +781,7 @@ mod tests {
             &acq.ledger,
             &navi.client(),
             &ctx,
-            Some(&batch),
+            &mut Some(batch.clone()),
             &target,
             &items,
         )
@@ -870,9 +891,16 @@ mod tests {
         });
         let ctx = test_ctx("alice");
         let items = ensured("j-made");
-        let r = begin(&ledger, &navi.client(), &ctx, Some("b1"), &target, &items)
-            .await
-            .unwrap_err();
+        let r = begin(
+            &ledger,
+            &navi.client(),
+            &ctx,
+            &mut Some("b1".into()),
+            &target,
+            &items,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(&r, PlaylistRefusal::Unfollowed { playlist_id, failure }
                 if playlist_id == ADVENT && failure.code == FailureCode::SettingsUnreadable),
@@ -1050,15 +1078,124 @@ mod tests {
             navi.posted("/rest/updatePlaylist"),
             vec![format!("playlistId={ADVENT}&songIdToAdd={}", SILENT.0)]
         );
-        // Settled, it goes at the next prune.
+        // Settled, it is kept as long as a batch whose job ended now, then goes.
+        let now = chrono::Utc::now().timestamp();
+        acq.ledger.prune(now).await.unwrap();
+        assert!(store::playlist_of(&db, "b-playlist", &alice())
+            .await
+            .unwrap()
+            .is_some());
+        acq.ledger.prune(now + JOB_KEPT_SECS + 1).await.unwrap();
+        assert!(store::playlist_of(&db, "b-playlist", &alice())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_jobless_playlist_batch_outlives_a_prune_before_its_order_is_stored() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        let db = acq.db.clone();
+        let (_, jobs) = batch_of_downloads(&acq, 1).await;
+        playlist_batch_of_running(&acq, "b-playlist").await;
+        // A prune between create_batch and begin's set_playlist.
         acq.ledger
             .prune(chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        acq.ledger
+            .set_playlist("b-playlist", ADVENT, vec![waiting(&jobs[0])])
             .await
             .unwrap();
         assert!(store::playlist_of(&db, "b-playlist", &alice())
             .await
             .unwrap()
-            .is_none());
+            .is_some());
+        // No playlist write takes a batch that is gone.
+        let gone = Err(LedgerError("batch b-gone is gone".into()));
+        assert_eq!(
+            acq.ledger.set_playlist("b-gone", ADVENT, vec![]).await,
+            gone
+        );
+        assert_eq!(
+            acq.ledger.set_playlist_order("b-gone", vec![], 0).await,
+            gone
+        );
+        assert_eq!(acq.ledger.set_playlist_failure("b-gone", None).await, gone);
+        // begin says the batch does not follow the playlist it wrote.
+        let navi = NavidromeStub::start();
+        let holy = [(1, HOLY.0, HOLY.1, false)];
+        advent(&navi, &holy, &holy);
+        let (ctx, target) = (test_ctx("alice"), PlaylistTarget::Existing(ADVENT.into()));
+        let mut batch = Some("b-gone".to_string());
+        let r = begin(
+            &acq.ledger,
+            &navi.client(),
+            &ctx,
+            &mut batch,
+            &target,
+            &ensured(&jobs[0]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&r, PlaylistRefusal::Unfollowed { playlist_id, .. } if playlist_id == ADVENT),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_batch_with_no_job_of_its_own_goes_when_its_playlist_cannot_begin() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        let db = acq.db.clone();
+        let (with_jobs, jobs) = batch_of_downloads(&acq, 1).await;
+        playlist_batch_of_running(&acq, "b-playlist").await;
+        let navi = NavidromeStub::start();
+        // server/subsonic/playlists.go:47 (0.64.2)
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&subsonic_failed(70, "playlist not found")],
+        );
+        let (ctx, target) = (test_ctx("alice"), PlaylistTarget::Existing(ADVENT.into()));
+        let (failure, facts) = job_already_running(&jobs[0], JobState::Downloading);
+        let running = [EnsureItem::AlreadyRunning {
+            job_id: jobs[0].clone(),
+            failure,
+            facts,
+        }];
+        let batches = || async {
+            sqlx::query_scalar::<_, String>("SELECT id FROM batches ORDER BY id")
+                .fetch_all(&db)
+                .await
+                .unwrap()
+        };
+        let mut batch = Some("b-playlist".to_string());
+        let r = begin(
+            &acq.ledger,
+            &navi.client(),
+            &ctx,
+            &mut batch,
+            &target,
+            &running,
+        )
+        .await;
+        assert_eq!(r.unwrap_err().failure(), playlist_not_found(ADVENT));
+        assert_eq!(batch, None, "it follows nothing");
+        assert_eq!(batches().await, vec![with_jobs.clone()]);
+        // A batch holding a job of its own stays: its job goes on.
+        let mut batch = Some(with_jobs.clone());
+        let r = begin(
+            &acq.ledger,
+            &navi.client(),
+            &ctx,
+            &mut batch,
+            &target,
+            &ensured(&jobs[0]),
+        )
+        .await;
+        assert!(r.is_err());
+        assert_eq!(batch, Some(with_jobs.clone()));
+        assert_eq!(batches().await, vec![with_jobs]);
     }
 
     #[tokio::test]
@@ -1075,7 +1212,7 @@ mod tests {
             &acq.ledger,
             &navi.client(),
             &ctx,
-            Some(&batch),
+            &mut Some(batch.clone()),
             &target,
             &items,
         )
