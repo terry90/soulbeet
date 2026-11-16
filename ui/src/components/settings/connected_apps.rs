@@ -29,6 +29,16 @@ pub fn ConnectedAppsPanel() -> Element {
     let origin = use_browser_origin();
     let mut apps = use_resource(move || async move { auth.call(get_connected_apps()).await });
     let mut error = use_signal(String::new);
+    // The app whose switch is being saved, from the click until the list is read again: its box
+    // takes no click meanwhile, so a second one sends nothing.
+    let mut saving = use_signal(|| None::<String>);
+    use_effect(move || {
+        // The list is read again after every change (finish), and only then does the box show
+        // the stored value: Resource::restart keeps the old list until the new one is set.
+        if apps.read().is_some() {
+            saving.set(None);
+        }
+    });
 
     // Every change reloads the list, so it shows what the server holds.
     let mut finish = move |result: Result<(), ServerFnError>| {
@@ -51,7 +61,9 @@ pub fn ConnectedAppsPanel() -> Element {
                     AppList {
                         apps: list.clone(),
                         origin: origin(),
+                        saving: saving(),
                         on_allow_delete: move |(grant_id, allowed): (String, bool)| {
+                            saving.set(Some(grant_id.clone()));
                             spawn(async move { finish(auth.call(set_app_deletion(grant_id, allowed)).await) });
                         },
                         on_disconnect: move |grant_id: String| {
@@ -64,9 +76,9 @@ pub fn ConnectedAppsPanel() -> Element {
     }
 }
 
-/// An app the user asked to disconnect, waiting for confirmation.
+/// An app waiting for the user's yes: to disconnect it, or to let it delete music.
 #[derive(Clone, PartialEq)]
-struct PendingDisconnect {
+struct PendingApp {
     grant_id: String,
     app_host: String,
 }
@@ -78,23 +90,27 @@ fn needs_confirmation(was_allowed: bool) -> bool {
     !was_allowed
 }
 
+/// What turning deletion on for `app_host` lets it do, asked before it is turned on: everything
+/// the switch opens, including the two deletions that need no preview, and the limit shared by
+/// every app of the user.
 fn enable_deletion_message(app_host: &str) -> String {
     format!(
-        "Let {app_host} delete music from your library? It has to show you what it would delete and get your yes each time, at most {DAILY_APP_DELETIONS} tracks a day. Deleted files cannot be restored."
+        "Let {app_host} delete music from your library? Before deleting tracks it has to show you what it would delete and get your yes. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. At most {DAILY_APP_DELETIONS} tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored."
     )
 }
 
 /// One row per app, or how to connect one. `origin` is the page's, empty
-/// until the browser has it.
+/// until the browser has it. `saving` is the app whose switch is being saved.
 #[component]
 fn AppList(
     apps: Vec<ConnectedApp>,
     origin: String,
+    saving: Option<String>,
     on_allow_delete: EventHandler<(String, bool)>,
     on_disconnect: EventHandler<String>,
 ) -> Element {
-    let mut pending = use_signal(|| None::<PendingDisconnect>);
-    let mut pending_enable = use_signal(|| None::<PendingDisconnect>);
+    let mut pending = use_signal(|| None::<PendingApp>);
+    let mut pending_enable = use_signal(|| None::<PendingApp>);
 
     rsx! {
         if apps.is_empty() {
@@ -127,13 +143,16 @@ fn AppList(
                                         input {
                                             r#type: "checkbox",
                                             checked: app.allow_delete,
+                                            // A box being saved fires no click, so a second click
+                                            // before the list is read again sends nothing.
+                                            disabled: saving.as_deref() == Some(app.grant_id.as_str()),
                                             // The click is cancelled so the browser never toggles the
                                             // box itself: it only changes when `checked` changes, that
                                             // is when the stored value does. A cancelled confirmation
                                             // therefore leaves it as stored. (Resource::restart keeps
                                             // the old value, so a reload would not reset a toggled box.)
                                             onclick: {
-                                                let asked = PendingDisconnect {
+                                                let asked = PendingApp {
                                                     grant_id: app.grant_id.clone(),
                                                     app_host: app.app_host.clone(),
                                                 };
@@ -155,7 +174,7 @@ fn AppList(
                             button {
                                 class: REMOVE_BUTTON_CLASS,
                                 onclick: {
-                                    let asked = PendingDisconnect {
+                                    let asked = PendingApp {
                                         grant_id: app.grant_id.clone(),
                                         app_host: app.app_host.clone(),
                                     };
@@ -205,13 +224,18 @@ mod tests {
     use super::*;
 
     fn render(apps: Vec<ConnectedApp>, origin: &str) -> String {
+        render_saving(apps, origin, None)
+    }
+
+    /// render, with the switch of grant `saving` being saved.
+    fn render_saving(apps: Vec<ConnectedApp>, origin: &str, saving: Option<&str>) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |(apps, origin): (Vec<ConnectedApp>, String)| {
+            |(apps, origin, saving): (Vec<ConnectedApp>, String, Option<String>)| {
                 rsx! {
-                    AppList { apps, origin, on_allow_delete: |_| {}, on_disconnect: |_| {} }
+                    AppList { apps, origin, saving, on_allow_delete: |_| {}, on_disconnect: |_| {} }
                 }
             },
-            (apps, origin.to_string()),
+            (apps, origin.to_string(), saving.map(str::to_string)),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
@@ -244,7 +268,7 @@ mod tests {
     fn turning_deletion_on_asks_with_the_apps_name() {
         assert_eq!(
             enable_deletion_message("claude.ai"),
-            "Let claude.ai delete music from your library? It has to show you what it would delete and get your yes each time, at most 100 tracks a day. Deleted files cannot be restored."
+            "Let claude.ai delete music from your library? Before deleting tracks it has to show you what it would delete and get your yes. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. At most 100 tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored."
         );
     }
 
@@ -267,6 +291,15 @@ mod tests {
         ] {
             assert!(html.contains(text), "{text}");
         }
+    }
+
+    #[test]
+    fn the_switch_being_saved_takes_no_click() {
+        let apps = || vec![app(true, None, false, None)];
+        let html = render_saving(apps(), "https://music.example.com", Some("g1"));
+        assert!(html.contains("disabled"), "{html}");
+        let html = render(apps(), "https://music.example.com");
+        assert!(!html.contains("disabled"), "{html}");
     }
 
     #[test]
