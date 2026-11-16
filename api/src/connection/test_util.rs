@@ -510,6 +510,15 @@ pub(crate) fn app_with_navidrome(
     })
 }
 
+/// The id of `user_id`'s one grant, as it is: nothing is redeemed.
+pub(crate) async fn grant_of(db: &SqlitePool, user_id: &str) -> String {
+    sqlx::query_scalar("SELECT id FROM oauth_grants WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(db)
+        .await
+        .unwrap()
+}
+
 /// The id of the grant `user_id` holds for `resource`, made with an access token of theirs.
 pub(crate) async fn grant_id_of(db: &SqlitePool, user_id: &str, resource: &str) -> String {
     access_token(db, user_id, resource).await;

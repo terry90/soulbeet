@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, Failure, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS};
+use shared::navidrome::DAILY_APP_DELETIONS;
 
 use super::args::Args;
 use super::contract::{
@@ -43,7 +44,7 @@ pub(crate) const SYNC_RATINGS: ToolSpec = ToolSpec {
     title: "Run the rating sync",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Runs this user's rating sync now, as Soulful does every 6 hours: pending discovery tracks rated at or above the promote threshold move into the library, 1-star ones are deleted, and with auto-delete on and deletion switched on for this app, other 1-star songs' files are deleted unless the delete checks keep them (another listener rated, starred or kept them in a playlist, a download wants them, the file cannot be placed). Without the switch, auto-delete is skipped (auto_delete not_allowed_for_this_app) and the 6 hourly sync does it, and a promote never replaces an earlier library copy of the song: it ends import_already_in_library and the track stays pending, as promote_discovery_track does. Returns one entry per track acted on with what was done or the failure that stopped it; the top level is partial when any entry failed. A pending track that another promote or removal took during the sync is skipped and counted in skipped_not_pending. A report too long for one answer leaves out done entries before failed ones, from the end, and counts them in entries_omitted, the failed ones among them in failed_entries_omitted; Settings lists every kept track, unless kept_not_stored holds the error that stopped storing them, when Settings still lists the previous sync's. Takes seconds to minutes with a large library. Failure codes: {common}, {NAVIDROME_CODES}, already_running (a sync for this user is running, or a call with this request_key still runs), partial, and per entry the delete_*, import_*, unknown_handle and settings_unreadable codes.")
+        format!("Runs this user's rating sync now, as Soulful does every 6 hours: pending discovery tracks rated at or above the promote threshold move into the library, 1-star ones are deleted, and with auto-delete on and deletion switched on for this app, other 1-star songs' files are deleted as this app's deletions, without a preview, unless the delete checks keep them (another listener rated, starred or kept them in a playlist, a download wants them, the file cannot be placed, or delete_daily_limit: at most {DAILY_APP_DELETIONS} tracks a day are deleted through connected apps, replacements by a promote included). Without the switch, auto-delete is skipped (auto_delete not_allowed_for_this_app) and the 6 hourly sync does it, and a promote never replaces an earlier library copy of the song: it ends import_already_in_library and the track stays pending, as promote_discovery_track does. Returns one entry per track acted on with what was done or the failure that stopped it; the top level is partial when any entry failed. A pending track that another promote or removal took during the sync is skipped and counted in skipped_not_pending. A report too long for one answer leaves out done entries before failed ones, from the end, and counts them in entries_omitted, the failed ones among them in failed_entries_omitted; Settings lists every kept track, unless kept_not_stored holds the error that stopped storing them, when Settings still lists the previous sync's. Takes seconds to minutes with a large library. Failure codes: {common}, {NAVIDROME_CODES}, already_running (a sync for this user is running, or a call with this request_key still runs), partial, and per entry the delete_*, import_*, unknown_handle and settings_unreadable codes.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"#,
@@ -57,7 +58,8 @@ pub(crate) const SYNC_RATINGS: ToolSpec = ToolSpec {
     call: |state, caller, args| Box::pin(sync_ratings(state, caller, args)),
 };
 
-/// `sync_ratings`: the caller's rating sync, with auto-delete only when the app may delete.
+/// `sync_ratings`: the caller's rating sync, with auto-delete only when the app may delete, as
+/// the app.
 pub(crate) async fn sync_ratings(
     state: &ConnectionState,
     caller: &McpCaller,
@@ -74,7 +76,9 @@ pub(crate) async fn sync_ratings(
         Err(e) => return failed(e),
     };
     let permit = match caller.allow_delete {
-        true => AutoDeletePermit::Allowed,
+        true => AutoDeletePermit::ForApp {
+            grant_id: caller.grant_id.clone(),
+        },
         false => AutoDeletePermit::NotForThisApp,
     };
     let call = args.as_value();
@@ -201,7 +205,7 @@ mod tests {
 
     use super::*;
     use crate::connection::test_util::{
-        alice_app, alice_caller, call_tool, document, mcp_app, text_of, FixedSync,
+        alice_app, alice_caller, call_tool, document, grant_of, mcp_app, text_of, FixedSync,
     };
     use crate::core::database_failure;
     use crate::core::delete_guard::blocked_by_other_user;
@@ -390,11 +394,12 @@ mod tests {
             .await
             .unwrap();
         call_tool(app, &token, "sync_ratings", json!({})).await;
+        let grant_id = grant_of(&db, "u1").await;
         assert_eq!(
             fixed.calls(),
             vec![
                 ("u1".to_string(), AutoDeletePermit::NotForThisApp),
-                ("u1".to_string(), AutoDeletePermit::Allowed)
+                ("u1".to_string(), AutoDeletePermit::ForApp { grant_id })
             ]
         );
     }

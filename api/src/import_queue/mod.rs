@@ -558,7 +558,7 @@ impl Shared {
                     &self.deps.guard(),
                     importer.as_ref(),
                     actor,
-                    *origin,
+                    origin,
                     &exempt,
                     target,
                     result,

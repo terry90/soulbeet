@@ -611,7 +611,7 @@ mod tests {
         ("update_settings", false, false, true, false),
         ("get_discovery", true, false, true, false),
         ("run_discovery", false, false, false, true),
-        ("promote_discovery_track", false, false, false, false),
+        ("promote_discovery_track", false, true, false, false),
         ("remove_discovery_track", false, true, true, false),
         ("sync_ratings", false, true, false, false),
     ];

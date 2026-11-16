@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 use shared::download::{DownloadableItem, SourcePresence};
-use shared::failure::{
-    cut_chars, Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode, TEXT_MAX_CHARS,
-};
+use shared::failure::{cut_chars, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
 use soulbeet::error::PeerAsk;
 use soulbeet::ImportMode;
 
@@ -151,16 +149,6 @@ pub(crate) fn source_blocked() -> Failure {
         Stage::Enqueue,
         RetryAdvice::OtherSource,
         "slskd's blacklist holds this source",
-    )
-}
-
-/// Design 11.5: how a person lets this app delete music, so a rejected file can be removed
-/// (step 7 D7: the checkbox "Allow deleting music").
-pub(crate) fn enable_deletion() -> UserAction {
-    UserAction::new(
-        UserActionCode::EnableDeletion,
-        "Allow deleting music for this app",
-        "Settings > Users > Connected apps",
     )
 }
 

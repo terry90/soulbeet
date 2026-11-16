@@ -429,6 +429,29 @@ fn app_host(kind: ClientKind, client_id: &str, redirect_uri: &str) -> Result<Str
         .ok_or_else(|| format!("{named_by} names no host"))
 }
 
+/// Grant `grant_id`'s user id, whether it allows deletion, and its app's
+/// host (app_host), read on `conn` (the caller's transaction); None when no
+/// such grant exists (revoked, or replaced by a new authorization).
+pub(crate) async fn grant_app_in(
+    conn: &mut sqlx::SqliteConnection,
+    grant_id: &str,
+) -> Result<Option<(String, bool, String)>, String> {
+    let row: Option<(String, bool, String, String, String)> = sqlx::query_as(
+        "SELECT g.user_id, g.allow_delete, c.kind, c.client_id, g.redirect_uri \
+         FROM oauth_grants g JOIN oauth_clients c ON c.client_id = g.client_id \
+         WHERE g.id = ?",
+    )
+    .bind(grant_id)
+    .fetch_optional(conn)
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some((user_id, allow_delete, kind, client_id, redirect_uri)) = row else {
+        return Ok(None);
+    };
+    let host = app_host(ClientKind::from_db(&kind)?, &client_id, &redirect_uri)?;
+    Ok(Some((user_id, allow_delete, host)))
+}
+
 /// Turns deletion through grant `grant_id` on or off. Only the grant's own
 /// user can (D7): false when it is not `ctx`'s.
 pub(crate) async fn set_allow_delete_in(
@@ -1519,14 +1542,6 @@ mod tests {
             .await
             .unwrap();
         db
-    }
-
-    async fn grant_of(db: &SqlitePool, user_id: &str) -> String {
-        sqlx::query_scalar("SELECT id FROM oauth_grants WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_one(db)
-            .await
-            .unwrap()
     }
 
     #[tokio::test]

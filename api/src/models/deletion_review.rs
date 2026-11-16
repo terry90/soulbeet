@@ -18,6 +18,8 @@ pub struct DeletionReviewRow {
     pub rating: Option<i32>,
     pub reason: String,
     pub created_at: String,
+    pub origin: String,
+    pub client: Option<String>,
 }
 
 /// One deletion, as the guard records it.
@@ -35,9 +37,11 @@ pub struct DeletionRecord {
     pub path: String,
     /// The caller's own rating, None when unrated.
     pub rating: Option<u8>,
-    /// What started the removal: "ui" or "auto".
+    /// What started the removal: "ui", "auto" or "mcp".
     pub origin: &'static str,
     pub reason: DeletionReason,
+    /// The connected app's host for an "mcp" removal, else None.
+    pub client: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -45,8 +49,8 @@ impl TryFrom<DeletionReviewRow> for DeletionReview {
     type Error = String;
 
     fn try_from(row: DeletionReviewRow) -> Result<Self, String> {
-        let reason = serde_json::from_value(serde_json::Value::String(row.reason))
-            .map_err(|e| format!("Deletion {} has an unknown reason: {e}", row.id))?;
+        let reason = DeletionReason::parse(&row.reason)
+            .ok_or_else(|| format!("Unknown deletion reason {}", row.reason))?;
         Ok(DeletionReview {
             id: row.id,
             song_id: row.song_id,
@@ -57,6 +61,8 @@ impl TryFrom<DeletionReviewRow> for DeletionReview {
             rating: row.rating.map(|r| r as u8),
             reason,
             created_at: row.created_at,
+            origin: row.origin,
+            client: row.client,
         })
     }
 }
@@ -70,8 +76,8 @@ impl DeletionReviewRow {
         record: &DeletionRecord,
     ) -> Result<(), String> {
         sqlx::query(
-            "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, path, rating, origin, reason)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, path, rating, origin, reason, client)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
         )
         .bind(&record.id)
         .bind(&record.user_id)
@@ -83,6 +89,7 @@ impl DeletionReviewRow {
         .bind(record.rating.map(i32::from))
         .bind(record.origin)
         .bind(record.reason.as_str())
+        .bind(&record.client)
         .execute(conn)
         .await
         .map_err(|e| e.to_string())?;
@@ -99,12 +106,25 @@ impl DeletionReviewRow {
         user_id: &str,
         limit: u32,
     ) -> Result<Vec<DeletionReview>, String> {
+        Self::page_in(db, user_id, 0, limit).await
+    }
+
+    /// The user's deletions newest first (ties by id, as created_at has whole seconds), `limit`
+    /// of them from `offset`, with what started each and the app's host. A reason this version
+    /// does not know is an error.
+    pub(crate) async fn page_in(
+        db: &SqlitePool,
+        user_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<DeletionReview>, String> {
         sqlx::query_as::<_, DeletionReviewRow>(
-            "SELECT id, song_id, title, artist, album, path, rating, reason, created_at
-             FROM deletion_reviews WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, song_id, title, artist, album, path, rating, reason, created_at, origin, client
+             FROM deletion_reviews WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
         .bind(user_id)
         .bind(limit)
+        .bind(offset)
         .fetch_all(db)
         .await
         .map_err(|e| e.to_string())?
@@ -167,12 +187,112 @@ mod tests {
         .await
         .unwrap();
         test_db::apply(&db, test_db::DELETION_AUDIT).await;
+        test_db::apply(&db, test_db::DELETE_TOOLS).await;
         let history = DeletionReviewRow::history_in(&db, "alice", 10)
             .await
             .unwrap();
         assert_eq!(
             (history[0].song_id.as_str(), history[0].reason),
             ("s1", DeletionReason::Disliked)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_from_before_the_upgrade_has_no_app() {
+        let db = test_db::migrated_before(test_db::DELETE_TOOLS).await;
+        sqlx::query(
+            "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, path, rating, origin, reason) \
+             VALUES ('r1', 'alice', 's1', 'O Holy Night', 'Marrow Choir', 'Winter Songs', '/music/x.flac', 1, 'auto', 'disliked')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        test_db::apply(&db, test_db::DELETE_TOOLS).await;
+        let page = DeletionReviewRow::page_in(&db, "alice", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                page.len(),
+                page[0].origin.as_str(),
+                page[0].client.as_deref(),
+                page[0].reason
+            ),
+            (1, "auto", None, DeletionReason::Disliked)
+        );
+    }
+
+    #[tokio::test]
+    async fn pages_run_newest_first() {
+        let db = test_db::migrated().await;
+        for (title, ago) in [
+            ("first", "-3 hours"),
+            ("second", "-2 hours"),
+            ("third", "-1 hours"),
+        ] {
+            sqlx::query(
+                "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, origin, reason, client, created_at) \
+                 VALUES (?, 'alice', 's', ?, 'Marrow Choir', 'Winter Songs', 'mcp', 'cleanup', 'claude.ai', datetime('now', ?))",
+            )
+            .bind(title)
+            .bind(title)
+            .bind(ago)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let titles = |page: Vec<DeletionReview>| -> Vec<String> {
+            page.into_iter().map(|r| r.title).collect()
+        };
+        let all = DeletionReviewRow::page_in(&db, "alice", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                all[0].origin.as_str(),
+                all[0].client.as_deref(),
+                all[0].reason
+            ),
+            ("mcp", Some("claude.ai"), DeletionReason::Cleanup)
+        );
+        assert_eq!(titles(all), ["third", "second", "first"]);
+        assert_eq!(
+            titles(
+                DeletionReviewRow::page_in(&db, "alice", 1, 1)
+                    .await
+                    .unwrap()
+            ),
+            ["second"]
+        );
+        assert_eq!(
+            titles(
+                DeletionReviewRow::history_in(&db, "alice", 2)
+                    .await
+                    .unwrap()
+            ),
+            titles(
+                DeletionReviewRow::page_in(&db, "alice", 0, 2)
+                    .await
+                    .unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reason_this_version_does_not_know_is_an_error() {
+        let db = test_db::migrated().await;
+        sqlx::query(
+            "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, origin, reason) \
+             VALUES ('r1', 'alice', 's', 't', 'a', 'al', 'auto', 'because')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            DeletionReviewRow::page_in(&db, "alice", 0, 10)
+                .await
+                .unwrap_err(),
+            "Unknown deletion reason because"
         );
     }
 
@@ -197,6 +317,7 @@ mod tests {
                     rating: Some(1),
                     origin: "auto",
                     reason,
+                    client: None,
                 },
             )
             .await

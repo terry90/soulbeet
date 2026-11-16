@@ -1,7 +1,8 @@
 //! Navidrome as the guard sees it, and a temp library to check files in.
 
-use super::{Guard, Listeners};
+use super::{Guard, Listeners, Origin};
 use crate::auth::UserId;
+use crate::connection::test_util::{CLAUDE_CALLBACK, RESOURCE};
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::services::NavidromeLookupError;
 use shared::download::DownloadQuery;
@@ -483,9 +484,13 @@ pub(crate) struct Library {
 
 impl Library {
     pub async fn new() -> Library {
+        Library::new_on(crate::db::test_db::migrated().await).await
+    }
+
+    /// As new(), on `db` (a test_db::migrated_file for tests of writers running at once).
+    pub async fn new_on(db: SqlitePool) -> Library {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let db = crate::db::test_db::migrated().await;
         for (user, token) in [
             ("alice", Some("cipher")),
             ("bob", Some("cipher")),
@@ -553,6 +558,52 @@ impl Library {
 
     pub fn alice(&self) -> UserId {
         UserId::new("alice")
+    }
+
+    /// Inserts the registered client `dcr_c` (redirect URI CLAUDE_CALLBACK, so its app host is
+    /// claude.ai) when absent, and grant `grant_id` of `user` on it with `allow_delete`; returns
+    /// the grant as an Origin::Mcp.
+    pub async fn app(&self, grant_id: &str, user: &str, allow_delete: bool) -> Origin {
+        sqlx::query(
+            "INSERT INTO oauth_clients (client_id, kind, client_name, redirect_uris, created_at) \
+             VALUES ('dcr_c', 'dcr', 'Claude', ?, 0) ON CONFLICT (client_id) DO NOTHING",
+        )
+        .bind(format!("[\"{CLAUDE_CALLBACK}\"]"))
+        .execute(&self.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_grants (id, user_id, client_id, redirect_uri, resource, scope, allow_delete, created_at) \
+             VALUES (?, ?, 'dcr_c', ?, ?, 'soulful offline_access', ?, 0)",
+        )
+        .bind(grant_id)
+        .bind(user)
+        .bind(CLAUDE_CALLBACK)
+        .bind(RESOURCE)
+        .bind(allow_delete)
+        .execute(&self.db)
+        .await
+        .unwrap();
+        Origin::Mcp {
+            grant_id: grant_id.into(),
+        }
+    }
+
+    /// Inserts `n` audit rows of alice with origin mcp and no path, created `ago` seconds before
+    /// now.
+    pub async fn app_deletions(&self, n: u32, ago: i64) {
+        for _ in 0..n {
+            sqlx::query(
+                "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, origin, reason, client, created_at) \
+                 VALUES (?, 'alice', 's-earlier', 'Earlier', 'Marrow Choir', 'Winter Songs', 'mcp', 'cleanup', 'claude.ai', \
+                         datetime('now', ?))",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(format!("-{ago} seconds"))
+            .execute(&self.db)
+            .await
+            .unwrap();
+        }
     }
 
     /// Writes `bytes` at `{root}/music/{rel}`, modified at mtime(), as the records say.

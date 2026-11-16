@@ -4,7 +4,9 @@
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, Failure, FailureCode, TEXT_MAX_CHARS};
-use shared::navidrome::{DiscoveryProgress, DiscoveryTrack, GenerationStatus, ProfilePhase};
+use shared::navidrome::{
+    DiscoveryProgress, DiscoveryTrack, GenerationStatus, ProfilePhase, DAILY_APP_DELETIONS,
+};
 use shared::recommendation::DiscoveryProfile;
 
 use super::args::Args;
@@ -67,7 +69,7 @@ pub(crate) const PROMOTE_DISCOVERY_TRACK: ToolSpec = ToolSpec {
     title: "Keep a discovery track",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Moves a pending discovery track into this user's library folder through beets, as rating it at the promote threshold would at the next rating sync, except that without deletion switched on for this app an earlier library copy of the song is never replaced: the promote then ends import_already_in_library, the track stays pending, and next offers removing the staged copy. track_id comes from get_discovery. Takes seconds to a minute. Failure codes: {common}, unknown_handle, not_owner, expired_handle (no longer pending: promoted, removed or being promoted), import_files_gone (the staged file is gone; next offers its removal), the import_* codes, already_running.")
+        format!("Moves a pending discovery track into this user's library folder through beets, as rating it at the promote threshold would at the next rating sync, except that without deletion switched on for this app an earlier library copy of the song is never replaced: the promote then ends import_already_in_library, the track stays pending, and next offers removing the staged copy. With the switch on, an earlier copy is replaced without a preview, as this app's deletion: counted in the {DAILY_APP_DELETIONS} tracks a day connected apps may delete and named in the deletion history. track_id comes from get_discovery. Takes seconds to a minute. Failure codes: {common}, unknown_handle, not_owner, expired_handle (no longer pending: promoted, removed or being promoted), import_files_gone (the staged file is gone; next offers its removal), the import_* codes, already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["track_id"], "properties": {"track_id": {"type": "string", "minLength": 1, "maxLength": 500}, "#,
@@ -75,7 +77,7 @@ pub(crate) const PROMOTE_DISCOVERY_TRACK: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: false,
     open_world: false,
     call: |state, caller, args| Box::pin(promote_discovery_track(state, caller, args)),
@@ -274,7 +276,8 @@ fn read_track_call(args: &Args) -> Result<(String, Option<String>), ToolError> {
 }
 
 /// `promote_discovery_track`: the caller's pending track moved into the library. An earlier
-/// copy there is replaced only when the app may delete.
+/// copy there is replaced only when the app may delete, as the app (checked against its switch
+/// and the day's room when it is removed, and named in the history).
 async fn promote_discovery_track(
     state: &ConnectionState,
     caller: &McpCaller,
@@ -286,7 +289,9 @@ async fn promote_discovery_track(
         Err(e) => return failed(e),
     };
     let replace = match caller.allow_delete {
-        true => Replace::Guarded(Origin::Auto),
+        true => Replace::Guarded(Origin::Mcp {
+            grant_id: caller.grant_id.clone(),
+        }),
         false => Replace::Never,
     };
     let call = args.as_value();
@@ -378,7 +383,7 @@ mod tests {
     use serde_json::json;
     use soulbeet::{ImportOutcome, ImportResult, SkipReason};
 
-    use crate::connection::test_util::{access_token, call_tool, document, RESOURCE};
+    use crate::connection::test_util::{access_token, call_tool, document, grant_of, RESOURCE};
     use crate::connection::{router, ConnectionState};
     use crate::core::delete_guard::test_support::Library;
     use crate::core::delete_guard::Origin;
@@ -764,11 +769,14 @@ mod tests {
         );
         assert_eq!(doc["status"], "promoted");
         let music = lib.root.join("music/alice");
+        let app = Origin::Mcp {
+            grant_id: grant_of(&lib.db, "alice").await,
+        };
         assert_eq!(
             effects.imports(),
             vec![
                 (first, music.clone(), Replace::Never),
-                (second, music, Replace::Guarded(Origin::Auto))
+                (second, music, Replace::Guarded(app))
             ]
         );
     }

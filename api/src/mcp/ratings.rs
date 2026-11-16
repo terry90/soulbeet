@@ -24,7 +24,7 @@ pub(crate) const SET_RATING: ToolSpec = ToolSpec {
     title: "Rate a song or album",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Sets this user's own rating (0 to 5, 0 clears it) of a song or album in Navidrome; other users' ratings are theirs and are never read or changed. For a song, rating_sync says what the next rating sync will do with it: move a pending discovery track into the library, replacing an earlier copy of the song there, or delete one rated 1. While this user's auto-delete is on, a 1-star rating of a song is refused and nothing is written, since the next rating sync would delete its file: the user rates it 1 star in Navidrome instead. Without deletion switched on for this app, a rating at or above the promote threshold of a song that is a pending discovery track, in the discovery folder or another folder of this user, is refused too, since a rating sync would move it into the library, which can replace and delete an earlier copy; next offers promote_discovery_track, which never replaces one for this app. Album ratings are never refused. Song and album ids stay valid while the files stay in the library. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome lists no such song or album for this user), permission_not_granted (a 1-star song rating while auto-delete is on, or a promoting rating from an app that may not delete), already_running.")
+        format!("Sets this user's own rating (0 to 5, 0 clears it) of a song or album in Navidrome; other users' ratings are theirs and are never read or changed. For a song, rating_sync says what the next rating sync will do with it: move a pending discovery track into the library, replacing an earlier copy of the song there, or delete one rated 1. While this user's auto-delete is on, a 1-star rating of a song is refused and nothing is written, since the next rating sync would delete its file: the user rates it 1 star in Navidrome instead. A rating at or above the promote threshold of a song that is a pending discovery track, in the discovery folder or another folder of this user, is refused too, whether or not deletion is switched on for this app, since a rating sync would move it into the library, which can replace and delete an earlier copy outside this app's daily limit; next offers promote_discovery_track, which replaces one only while deletion is switched on for this app, counted in its daily limit. Album ratings are never refused. Song and album ids stay valid while the files stay in the library. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome lists no such song or album for this user), permission_not_granted (a 1-star song rating while auto-delete is on, or a promoting rating), already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["rating"], "properties": {"song_id": {"type": "string", "minLength": 1, "maxLength": 500}, "album_id": {"type": "string", "minLength": 1, "maxLength": 500}, "rating": {"type": "integer", "minimum": 0, "maximum": 5}, "#,
@@ -79,9 +79,9 @@ async fn set_rating(
         Err(e) => return failed(e),
     };
     let call = args.as_value();
-    let (db, user, may_delete) = (state.db.clone(), caller.ctx.id(), caller.allow_delete);
+    let (db, user) = (state.db.clone(), caller.ctx.id());
     let work = async move {
-        match ratings::rate(&db, &navi, &user, &target, rating, may_delete).await {
+        match ratings::rate(&db, &navi, &user, &target, rating).await {
             Ok(a) => {
                 let mut fields = annotated_fields(&a);
                 fields.insert("rating".into(), json!(rating));
@@ -312,9 +312,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_promoting_rating_needs_the_deletion_switch() {
+    async fn a_promoting_rating_is_refused_whatever_the_switch() {
         // The 6 hourly sync promotes a pending track through the guard, which replaces an
-        // earlier library copy of the song: an app that may not delete must not set that up.
+        // earlier library copy of the song as Soulful's own deletion: no app may set that up.
         let lib = Library::new().await;
         let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
         lib.pending_track("t1", "alice-music", "Explore", &staged, Some(HOLY.0))
@@ -338,29 +338,33 @@ mod tests {
             access_token(&lib.db, "alice", RESOURCE).await,
         );
         let five = json!({"song_id": HOLY.0, "rating": 5});
-        let error =
-            &document(&call_tool(app.clone(), &token, "set_rating", five.clone()).await)["error"];
-        assert_eq!(
-            (
-                error["code"].as_str(),
-                error["retry"].as_str(),
-                error["user_action"]["code"].as_str()
-            ),
-            (
-                Some("permission_not_granted"),
-                Some("needs_user"),
-                Some("enable_deletion")
-            )
-        );
-        assert_eq!(
-            (&error["facts"], &error["next"]),
-            (
-                &json!({"kind": "song", "id": HOLY.0, "discovery_track_id": "t1",
-                    "rating_sync": {"effect": "promotes_discovery_track",
-                        "message": "This is a pending discovery track: the next rating sync moves it into your library"}}),
-                &json!([{"tool": "promote_discovery_track", "args": {"track_id": "t1"}}])
-            )
-        );
+        let refused = |doc: serde_json::Value| {
+            let error = &doc["error"];
+            assert_eq!(
+                (
+                    error["code"].as_str(),
+                    error["retry"].as_str(),
+                    error["user_action"]["code"].as_str()
+                ),
+                (
+                    Some("permission_not_granted"),
+                    Some("needs_user"),
+                    Some("rate_in_navidrome")
+                )
+            );
+            assert_eq!(
+                (&error["facts"], &error["next"]),
+                (
+                    &json!({"kind": "song", "id": HOLY.0, "discovery_track_id": "t1",
+                        "rating_sync": {"effect": "promotes_discovery_track",
+                            "message": "This is a pending discovery track: the next rating sync moves it into your library"}}),
+                    &json!([{"tool": "promote_discovery_track", "args": {"track_id": "t1"}}])
+                )
+            );
+        };
+        refused(document(
+            &call_tool(app.clone(), &token, "set_rating", five.clone()).await,
+        ));
         assert!(!navi.asked().contains(&"/rest/setRating".to_string()));
         // Below the threshold nothing is promoted, so the rating is written.
         let doc = document(
@@ -377,9 +381,8 @@ mod tests {
             .execute(&lib.db)
             .await
             .unwrap();
-        let doc = document(&call_tool(app, &token, "set_rating", five).await);
-        assert_eq!(doc["rating_sync"]["effect"], "promotes_discovery_track");
-        assert_eq!(navi.posted("/rest/setRating").len(), 2);
+        refused(document(&call_tool(app, &token, "set_rating", five).await));
+        assert_eq!(navi.posted("/rest/setRating").len(), 1);
     }
 
     #[tokio::test]

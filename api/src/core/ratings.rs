@@ -20,7 +20,6 @@ use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin, Verdict};
 use crate::core::discovery::{is_not_pending, promote, DiscoveryEffects, NotDone, Replace};
 use crate::core::folders::folder_not_found;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
-use crate::core::jobs::retry::enable_deletion;
 use crate::core::library::{album_not_found, navidrome_failure, navidrome_for};
 use crate::core::{database_failure, logged};
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
@@ -147,17 +146,22 @@ fn one_star_refused() -> Failure {
     ))
 }
 
-/// A rating from an app that may not delete that would have the next rating sync promote a
-/// pending discovery track: the 6 hourly sync promotes with the guard, which replaces an earlier
-/// library copy of the song, deleting it.
+/// A rating from a connected app that would have the next rating sync promote a pending discovery
+/// track: the sync promotes with the guard, which can replace an earlier library copy of the
+/// song, deleting it as Soulful's own deletion, past the app's switch, its daily room and its
+/// name in the history. promote_discovery_track replaces as the app.
 fn promote_refused() -> Failure {
     Failure::new(
         FailureCode::PermissionNotGranted,
         Stage::Input,
         RetryAdvice::NeedsUser,
-        "This app may not delete music, and at this rating the next rating sync would move this pending discovery track into your library, replacing and deleting any earlier copy of the song there. Promote it with promote_discovery_track, which never replaces a library copy for this app, or allow this app to delete music.",
+        "A rating from a connected app at or above the promote threshold would have the next rating sync move this pending discovery track into your library, replacing and deleting any earlier copy of the song there. Promote it with promote_discovery_track, which replaces an earlier copy only while this app may delete music, within its daily limit, or rate the song yourself in Navidrome.",
     )
-    .with_user_action(enable_deletion())
+    .with_user_action(UserAction::new(
+        UserActionCode::RateInNavidrome,
+        "Rate the song yourself in Navidrome",
+        "Navidrome",
+    ))
 }
 
 /// Sets `user`'s rating of `target` to `rating` (0 clears it) for a connected app, after
@@ -165,19 +169,17 @@ fn promote_refused() -> Failure {
 /// no one, or in a library this account cannot see, is not found). For a song, `effect` says
 /// what the next rating sync does with it. Refused before anything is written, as WouldDelete:
 /// a 1-star song rating while the user's auto-delete is on, and a rating that would have the
-/// sync promote a pending discovery track when `app_may_delete` is false; also refused when the
-/// settings cannot be read.
+/// sync promote a pending discovery track; also refused when the settings cannot be read.
 pub(crate) async fn rate(
     db: &SqlitePool,
     navi: &NavidromeClient,
     user: &UserId,
     target: &Target,
     rating: u8,
-    app_may_delete: bool,
 ) -> Result<Annotated, NotSet> {
     let (mut annotated, song) = read(navi, target).await.map_err(NotSet::Refused)?;
     if let Some(song) = song {
-        annotated.effect = sync_effect(db, user, song, rating, app_may_delete).await?;
+        annotated.effect = sync_effect(db, user, song, rating).await?;
     }
     navi.set_rating(target.id(), rating)
         .await
@@ -246,16 +248,14 @@ fn rated(rating: Option<u8>) -> Option<u8> {
 
 /// What the next rating sync does with `song` rated `rating`, as the sync decides it: the
 /// pending discovery track of the user's discovery folder it is promoted or removed, else
-/// nothing. A 1-star rating while auto-delete is on is refused. When `app_may_delete` is false,
-/// so is a rating at which a pending track of any folder of the user would be promoted: the
-/// sync reads only the discovery folder's tracks, but the folder can be changed back later, by
-/// the user or an app that may delete.
+/// nothing. A 1-star rating while auto-delete is on is refused, and so is a rating at which a
+/// pending track of any folder of the user would be promoted: the sync reads only the discovery
+/// folder's tracks, but the folder can be changed back later.
 async fn sync_effect(
     db: &SqlitePool,
     user: &UserId,
     song: SubsonicSong,
     rating: u8,
-    app_may_delete: bool,
 ) -> Result<Option<SyncEffect>, NotSet> {
     let unreadable = |e: String| NotSet::Refused(database_failure(Stage::Input, e));
     let settings = UserSettings::get_in(db, &user.to_string())
@@ -277,9 +277,7 @@ async fn sync_effect(
         ..song
     };
     let threshold = settings.discovery_promote_threshold;
-    if let (false, Some(PendingAction::Promote(track))) =
-        (app_may_delete, pending_action(&rated, &pending, threshold))
-    {
+    if let Some(PendingAction::Promote(track)) = pending_action(&rated, &pending, threshold) {
         return Err(NotSet::WouldDelete {
             effect: SyncEffect::PromotesDiscoveryTrack,
             discovery_track_id: Some(track.id.clone()),
@@ -288,9 +286,9 @@ async fn sync_effect(
     }
     pending.retain(|t| Some(&t.folder_id) == settings.discovery_folder_id.as_ref());
     Ok(match pending_action(&rated, &pending, threshold) {
-        Some(PendingAction::Promote(_)) => Some(SyncEffect::PromotesDiscoveryTrack),
         Some(PendingAction::Remove(_)) => Some(SyncEffect::RemovesDiscoveryTrack),
-        None => None,
+        // A promote of a track of this folder was refused above.
+        Some(PendingAction::Promote(_)) | None => None,
     })
 }
 
@@ -389,10 +387,16 @@ impl SyncedTrack {
     }
 }
 
-/// Whether this sync may run auto-delete (D15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whether this sync may run auto-delete, and as whom (D15, step 11 D16).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutoDeletePermit {
+    /// The web UI or the automation: Soulful deletes on its own (Origin::Auto).
     Allowed,
+    /// A connected app whose switch is on: its deletions are Origin::Mcp { grant_id }, each
+    /// checked against the switch and the day's room, and named in the audit.
+    ForApp {
+        grant_id: String,
+    },
     NotForThisApp,
 }
 
@@ -490,8 +494,10 @@ pub(crate) struct SyncDeps<'a> {
 /// `ctx`'s rating sync, once `deps.runs` gave it the user's claim: lists the songs with the
 /// caller's ratings, removes the pending discovery tracks rated 1 (remove_disliked_pending_in),
 /// promotes those rated at the threshold or above, then runs auto-delete when the settings have
-/// it on and `permit` allows it, storing the tracks it kept. An app that may not delete promotes
-/// with `Replace::Never`, so no library copy is replaced either. Every failure comes before any
+/// it on and `permit` allows it, storing the tracks it kept. Promotes replace and auto-delete
+/// deletes as `permit` says: Origin::Auto for Allowed, the app's Origin::Mcp for ForApp (each
+/// file checked against its switch and the day's room); an app that may not delete promotes with
+/// `Replace::Never`, so no library copy is replaced either. Every failure comes before any
 /// action; a failure of an action is its track's entry, and a failure to store the kept tracks
 /// is `kept_not_stored`. Entries in that order. A pending track another promote or removal took
 /// first is no entry: it is counted in `not_pending`.
@@ -516,14 +522,18 @@ pub(crate) async fn sync_in(
     };
 
     let mut tracks = remove_disliked_pending_in(deps.db, &songs, &pending, threshold).await;
-    let replace = match permit {
-        AutoDeletePermit::Allowed => Replace::Guarded(Origin::Auto),
-        AutoDeletePermit::NotForThisApp => Replace::Never,
+    let origin = match &permit {
+        AutoDeletePermit::Allowed => Some(Origin::Auto),
+        AutoDeletePermit::ForApp { grant_id } => Some(Origin::Mcp {
+            grant_id: grant_id.clone(),
+        }),
+        AutoDeletePermit::NotForThisApp => None,
     };
+    let replace = origin.clone().map_or(Replace::Never, Replace::Guarded);
     for song in &songs {
         if let Some(PendingAction::Promote(track)) = pending_action(song, &pending, threshold) {
-            let result = (promote(deps.db, deps.discovery, &user, &track.id, replace).await)
-                .map_err(NotDone::into_failure);
+            let promoted = promote(deps.db, deps.discovery, &user, &track.id, replace.clone());
+            let result = promoted.await.map_err(NotDone::into_failure);
             match &result {
                 Err(e) if is_not_pending(e) => {
                     info!("Skipped promoting track {}: {}", track.title, e.message)
@@ -539,17 +549,18 @@ pub(crate) async fn sync_in(
     tracks.retain(|t| !t.not_pending());
     let mut not_pending = (listed - tracks.len()) as u32;
 
-    let auto_delete = match (settings.auto_delete_enabled, permit) {
-        (false, _) => AutoDeleteRan::Off,
-        (true, AutoDeletePermit::Allowed) => AutoDeleteRan::On,
-        (true, AutoDeletePermit::NotForThisApp) => AutoDeleteRan::NotAllowed,
+    let (auto_delete, deleting_as) = match (settings.auto_delete_enabled, &origin) {
+        (false, _) => (AutoDeleteRan::Off, None),
+        (true, None) => (AutoDeleteRan::NotAllowed, None),
+        (true, Some(origin)) => (AutoDeleteRan::On, Some(origin)),
     };
     let (mut kept, mut kept_not_stored) = (0, None);
-    match auto_delete {
-        AutoDeleteRan::Off => info!("Auto-delete is disabled for this user"),
-        AutoDeleteRan::NotAllowed => info!("Auto-delete is skipped: this app may not delete"),
-        AutoDeleteRan::On => {
-            let mut run = auto_delete_songs(deps.guard, &user, &songs, &pending, deps.queue).await;
+    match deleting_as {
+        None if auto_delete == AutoDeleteRan::Off => info!("Auto-delete is disabled for this user"),
+        None => info!("Auto-delete is skipped: this app may not delete"),
+        Some(origin) => {
+            let mut run =
+                auto_delete_songs(deps.guard, &user, &songs, &pending, deps.queue, origin).await;
             let listed = run.len();
             run.retain(|t| !t.not_pending());
             not_pending += (listed - run.len()) as u32;
@@ -659,8 +670,8 @@ pub(crate) async fn remove_disliked_pending_in(
 }
 
 /// Deletes through the guard every song of `songs` that `actor` rated 1 and pending_track_for
-/// does not match in `pending`: a library file is carried out, a pending discovery track the
-/// guard finds is removed as a staged track. Only a song the fresh record still shows at 1
+/// does not match in `pending`: a library file is carried out as `origin`, a pending discovery
+/// track the guard finds is removed as a staged track. Only a song the fresh record still shows at 1
 /// star is removed; one rated otherwise since `songs` was listed is skipped, also when the
 /// guard refuses it. A song whose file an earlier deletion of `actor` removed, which Navidrome
 /// lists until it notices, is skipped. Every other song is an entry, with the failure that kept
@@ -672,6 +683,7 @@ pub(crate) async fn auto_delete_songs(
     songs: &[SubsonicSong],
     pending: &[DiscoveryTrack],
     queue: &ImportQueue,
+    origin: &Origin,
 ) -> Vec<SyncedTrack> {
     let mut run = Vec::new();
     let deleted = match DeletionReviewRow::deleted_files_in(guard.db, &actor.to_string()).await {
@@ -698,7 +710,7 @@ pub(crate) async fn auto_delete_songs(
                 let reason = DeletionReason::Disliked;
                 // Its only warning, an unrecorded deletion, is logged where it happens.
                 let done = guard
-                    .carry_out(actor, checked, reason, Origin::Auto, forget)
+                    .carry_out(actor, checked, reason, origin, forget)
                     .await;
                 Some(delete.with_failure(done.err().map(NotRemoved::into_failure)))
             }
@@ -826,7 +838,7 @@ mod tests {
             &[&song_body(HOLY.0, HOLY.1, Some(4), false)],
         );
         let (alice, holy) = (lib.alice(), Target::Song(HOLY.0.into()));
-        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1, true)
+        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1)
             .await
             .unwrap();
         assert_eq!(
@@ -854,7 +866,7 @@ mod tests {
             },
         )
         .await;
-        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1, false).await;
+        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1).await;
         assert_eq!(a.unwrap().effect, Some(SyncEffect::RemovesDiscoveryTrack));
         let sent = format!("id={}&rating=1", HOLY.0);
         assert_eq!(navi.posted("/rest/setRating"), [sent.clone(), sent.clone()]);
@@ -862,7 +874,7 @@ mod tests {
         // On: refused, pending track or not (it could be promoted first, then deleted).
         set(&lib.db, auto_delete(true)).await;
         assert_eq!(
-            rate(&lib.db, &navi.client(), &alice, &holy, 1, true).await,
+            rate(&lib.db, &navi.client(), &alice, &holy, 1).await,
             Err(NotSet::WouldDelete {
                 effect: SyncEffect::DeletesFile,
                 discovery_track_id: None,
@@ -871,7 +883,7 @@ mod tests {
         );
         // A setting that cannot be read refuses too.
         lib.db.close().await;
-        let e = rate(&lib.db, &navi.client(), &alice, &holy, 1, true)
+        let e = rate(&lib.db, &navi.client(), &alice, &holy, 1)
             .await
             .unwrap_err();
         assert_eq!(
@@ -882,7 +894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pending_track_rated_at_the_threshold_is_promoted() {
+    async fn a_rating_that_would_promote_a_pending_track_is_refused_for_every_app() {
         let lib = Library::new().await;
         let navi = NavidromeStub::start();
         navi.answer("/rest/getSong", &[&song_body(HOLY.0, HOLY.1, None, true)]);
@@ -902,28 +914,24 @@ mod tests {
         )
         .await;
         let holy = Target::Song(HOLY.0.into());
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 3, true)
-            .await
-            .unwrap();
+        // The 6 hourly sync would promote it with the guard as Soulful's own deletion, replacing
+        // an earlier library copy past the app's switch and daily room, so nothing is written.
         assert_eq!(
-            (a.previous_rating, a.previously_starred, a.effect),
-            (None, true, Some(SyncEffect::PromotesDiscoveryTrack))
-        );
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 2, false)
-            .await
-            .unwrap();
-        assert_eq!(a.effect, None);
-        // From an app that may not delete: the 6 hourly sync would promote it with the guard,
-        // replacing an earlier library copy, so nothing is written.
-        assert_eq!(
-            rate(&lib.db, &navi.client(), &lib.alice(), &holy, 4, false).await,
+            rate(&lib.db, &navi.client(), &lib.alice(), &holy, 3).await,
             Err(NotSet::WouldDelete {
                 effect: SyncEffect::PromotesDiscoveryTrack,
                 discovery_track_id: Some("t1".into()),
                 failure: promote_refused()
             })
         );
-        assert_eq!(navi.posted("/rest/setRating").len(), 2);
+        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            (a.previous_rating, a.previously_starred, a.effect),
+            (None, true, None)
+        );
+        assert_eq!(navi.posted("/rest/setRating").len(), 1);
         let f = promote_refused();
         assert_eq!(
             (f.code, f.stage, f.retry, f.user_action.map(|a| a.code)),
@@ -931,7 +939,7 @@ mod tests {
                 FailureCode::PermissionNotGranted,
                 Stage::Input,
                 RetryAdvice::NeedsUser,
-                Some(UserActionCode::EnableDeletion)
+                Some(UserActionCode::RateInNavidrome)
             )
         );
     }
@@ -962,7 +970,7 @@ mod tests {
         navi.answer("/rest/getSong", &[&song_body(HOLY.0, HOLY.1, None, false)]);
         let holy = Target::Song(HOLY.0.into());
         assert_eq!(
-            rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5, false).await,
+            rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5).await,
             Err(NotSet::WouldDelete {
                 effect: SyncEffect::PromotesDiscoveryTrack,
                 discovery_track_id: Some("t1".into()),
@@ -970,22 +978,16 @@ mod tests {
             })
         );
         assert_eq!(navi.posted("/rest/setRating").len(), 0);
-        // An app that may delete rates it: the next sync reads alice-other only, so it does
-        // nothing with the song.
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5, true)
-            .await
-            .unwrap();
-        assert_eq!(a.effect, None);
         // With t1 no longer pending, bob's track is no reason to refuse.
         sqlx::query("UPDATE discovery_tracks SET status = 'Removed' WHERE id = 't1'")
             .execute(&lib.db)
             .await
             .unwrap();
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5, false)
+        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5)
             .await
             .unwrap();
         assert_eq!(a.effect, None);
-        assert_eq!(navi.posted("/rest/setRating").len(), 2);
+        assert_eq!(navi.posted("/rest/setRating").len(), 1);
     }
 
     #[tokio::test]
@@ -996,7 +998,7 @@ mod tests {
         let navi = NavidromeStub::start();
         navi.answer("/rest/getAlbum", &[&album_body(WINTER, "Winter Songs", 0)]);
         let winter = Target::Album(WINTER.into());
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &winter, 1, false)
+        let a = rate(&lib.db, &navi.client(), &lib.alice(), &winter, 1)
             .await
             .unwrap();
         assert_eq!(
@@ -1053,15 +1055,7 @@ mod tests {
         let db = test_db::migrated().await;
         let alice = UserId::new("alice");
         assert_eq!(
-            rate(
-                &db,
-                &navi.client(),
-                &alice,
-                &Target::Song("gone".into()),
-                5,
-                true
-            )
-            .await,
+            rate(&db, &navi.client(), &alice, &Target::Song("gone".into()), 5).await,
             Err(NotSet::Refused(song_not_found()))
         );
         assert_eq!(
@@ -1083,7 +1077,7 @@ mod tests {
         let db = test_db::migrated().await;
         let holy = Target::Song(HOLY.0.into());
         assert_eq!(
-            rate(&db, &navi.client(), &UserId::new("alice"), &holy, 2, true).await,
+            rate(&db, &navi.client(), &UserId::new("alice"), &holy, 2).await,
             Err(NotSet::WriteFailed(song_not_found()))
         );
     }
@@ -1139,7 +1133,15 @@ mod tests {
             subsonic_song("s2", "Silent Night", Some(1)),
             subsonic_song("s3", "Away in a Manger", Some(5)),
         ];
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue()).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue(),
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(
             acts(&run),
             vec![
@@ -1184,7 +1186,15 @@ mod tests {
         let lib = Library::new().await;
         lib.fake.rates("alice", "s1", 4);
         let songs = [subsonic_song("s1", "O Holy Night", Some(1))];
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue()).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue(),
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(run, vec![]);
         assert!(lib.root.join("music/alice/A/x.flac").exists());
     }
@@ -1195,11 +1205,27 @@ mod tests {
         lib.fake.stars("bob", "s1");
         lib.fake.rates("alice", "s1", 4);
         let (songs, queue) = ([subsonic_song("s1", "O Holy Night", Some(1))], queue());
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue,
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(run, vec![]);
         // Still at 1 star, the same refusal keeps it.
         lib.fake.rates("alice", "s1", 1);
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue,
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(
             acts(&run),
             vec![(
@@ -1215,16 +1241,40 @@ mod tests {
     async fn a_song_deleted_earlier_that_navidrome_still_lists_is_neither_checked_nor_kept() {
         let lib = Library::new().await;
         let (songs, queue) = ([subsonic_song("s1", "O Holy Night", Some(1))], queue());
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue,
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(acts(&run), vec![("s1", SyncAction::Delete, None)]);
         // The next sync lists it again: Navidrome has not scanned since. Only its record is
         // read: the guard never checks it, so no rating is sent.
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue,
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(run, vec![]);
         assert_eq!(lib.fake.ratings_set().len(), 1);
         // A file at that path again (re-imported) is checked as usual.
         lib.write("alice/A/x.flac", b"audio");
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue,
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(acts(&run), vec![("s1", SyncAction::Delete, None)]);
     }
 
@@ -1232,7 +1282,15 @@ mod tests {
     async fn a_song_navidrome_moved_to_another_file_since_its_deletion_is_checked_again() {
         let lib = Library::new().await;
         let (songs, queue) = ([subsonic_song("s1", "O Holy Night", Some(1))], queue());
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue,
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(acts(&run), vec![("s1", SyncAction::Delete, None)]);
         // Re-imported at another path: Navidrome's scanner matched the missing file to the new
         // one and gave it the song's id and alice's rating of 1 (moveMatched).
@@ -1244,7 +1302,15 @@ mod tests {
             },
             "al1",
         );
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue,
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(acts(&run), vec![("s1", SyncAction::Delete, None)]);
         assert!(!lib.root.join("music/alice/B/x.flac").exists());
     }
@@ -1260,7 +1326,15 @@ mod tests {
         lib.pending_track("t1", "alice-music", "Explore", &staged, None)
             .await;
         let songs = [subsonic_song("s5", "03", Some(1))];
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue()).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            &songs,
+            &[],
+            &queue(),
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(
             (acts(&run), run[0].discovery_track_id.as_deref()),
             (
@@ -1311,7 +1385,15 @@ mod tests {
             vec![]
         );
         assert!(staged.exists());
-        let run = auto_delete_songs(&lib.guard(), &lib.alice(), songs, &pending, &queue()).await;
+        let run = auto_delete_songs(
+            &lib.guard(),
+            &lib.alice(),
+            songs,
+            &pending,
+            &queue(),
+            &Origin::Auto,
+        )
+        .await;
         assert_eq!(run, vec![]);
         let removed = remove_disliked_pending_in(&lib.db, songs, &pending, 3).await;
         assert_eq!(
@@ -1582,7 +1664,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_promote_for_an_app_that_may_not_delete_never_replaces_a_library_copy() {
+    async fn a_sync_an_app_started_deletes_as_that_app_within_its_daily_limit() {
+        let lib = Library::new().await;
+        lib.song("s2", "alice/B/y.flac", b"audio");
+        lib.fake.rates("alice", "s2", 1);
+        lib.app("g1", "alice", true).await;
+        lib.app_deletions(99, 3_600).await;
+        set(&lib.db, auto_delete(true)).await;
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/search3",
+            &[
+                &search3_body(&[("s1", "O Holy Night", 1), ("s2", "Silent Night", 1)]),
+                &search3_body(&[("s2", "Silent Night", 1)]),
+            ],
+        );
+        let (of, guard, runs, discovery, queue) = (
+            NavidromeFor(Ok(navi.client())),
+            lib.guard(),
+            SyncRuns::default(),
+            effects(),
+            queue(),
+        );
+        let deps = deps(&lib, &of, &guard, &queue, &discovery, &runs);
+        let app = AutoDeletePermit::ForApp {
+            grant_id: "g1".into(),
+        };
+        let report = sync_in(&deps, &test_ctx("alice"), app).await.unwrap();
+        assert_eq!(
+            report
+                .tracks
+                .iter()
+                .map(|t| (t.song_id.as_str(), t.failure.as_ref().map(|f| f.code)))
+                .collect::<Vec<_>>(),
+            vec![("s1", None), ("s2", Some(FailureCode::DeleteDailyLimit))]
+        );
+        assert_eq!(report.auto_delete, AutoDeleteRan::On);
+        assert!(
+            !lib.root.join("music/alice/A/x.flac").exists()
+                && lib.root.join("music/alice/B/y.flac").exists()
+        );
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT origin, client FROM deletion_reviews WHERE song_id = 's1'")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap();
+        assert_eq!(row, ("mcp".into(), Some("claude.ai".into())));
+        // Settings lists the track the limit kept.
+        let listed = DeletionBlockRow::for_user_in(&lib.db, "alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            (listed.len(), listed[0].title.as_str()),
+            (1, "Silent Night")
+        );
+        // The web UI's sync and the automation stay origin auto and are not counted.
+        let report = sync_in(&deps, &test_ctx("alice"), AutoDeletePermit::Allowed)
+            .await
+            .unwrap();
+        assert_eq!(
+            report
+                .tracks
+                .iter()
+                .map(|t| (t.song_id.as_str(), t.failure.is_none()))
+                .collect::<Vec<_>>(),
+            vec![("s2", true)]
+        );
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT origin, client FROM deletion_reviews WHERE song_id = 's2'")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap();
+        assert_eq!(row, ("auto".into(), None));
+    }
+
+    #[tokio::test]
+    async fn a_promote_replaces_a_library_copy_only_as_the_permit_allows() {
         let lib = Library::new().await;
         set(
             &lib.db,
@@ -1598,7 +1755,7 @@ mod tests {
             std::fs::write(&staged, b"audio").unwrap();
             staged
         };
-        let (first, second) = (staged("03.flac"), staged("04.flac"));
+        let (first, second, third) = (staged("03.flac"), staged("04.flac"), staged("05.flac"));
         lib.pending_track("t1", "alice-music", "Explore", &first, Some("s5"))
             .await;
         let navi = NavidromeStub::start();
@@ -1607,6 +1764,7 @@ mod tests {
             &[&search3_body(&[
                 ("s5", "O Holy Night", 5),
                 ("s6", "Silent Night", 5),
+                ("s7", "Away in a Manger", 5),
             ])],
         );
         let test = Arc::new(TestDiscovery::default());
@@ -1630,12 +1788,23 @@ mod tests {
         sync_in(&deps, &test_ctx("alice"), AutoDeletePermit::Allowed)
             .await
             .unwrap();
+        // A sync an app with the switch started replaces as that app.
+        lib.pending_track("t3", "alice-music", "Explore", &third, Some("s7"))
+            .await;
+        let app = AutoDeletePermit::ForApp {
+            grant_id: "g1".into(),
+        };
+        sync_in(&deps, &test_ctx("alice"), app).await.unwrap();
         let music = lib.root.join("music/alice");
+        let as_app = Origin::Mcp {
+            grant_id: "g1".into(),
+        };
         assert_eq!(
             test.imports(),
             vec![
                 (first, music.clone(), Replace::Never),
-                (second, music, Replace::Guarded(Origin::Auto))
+                (second, music.clone(), Replace::Guarded(Origin::Auto)),
+                (third, music, Replace::Guarded(as_app))
             ]
         );
     }

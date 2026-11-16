@@ -27,7 +27,7 @@ use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
 
 /// How a promote treats an earlier copy of the song in the library.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Replace {
     /// beets may replace it, through the delete guard with this origin.
     Guarded(Origin),
@@ -870,6 +870,7 @@ mod tests {
         let ui = Replace::Guarded(Origin::Ui);
         let first = tokio::spawn({
             let (db, effects, alice) = (lib.db.clone(), effects.clone(), lib.alice());
+            let ui = ui.clone();
             async move { promote(&db, &effects, &alice, "t1", ui).await }
         });
         // The first holds the claim and waits in its import.

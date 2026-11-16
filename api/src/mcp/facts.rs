@@ -20,7 +20,7 @@ use soulbeet::{DownloadBackend, ImportedItem};
 use super::contract::{error_object, NextCall, ToolError};
 use super::next::next_calls;
 use super::paging::{chars, leave_out, length, Keep};
-use crate::core::jobs::retry::enable_deletion;
+use crate::core::delete_guard::quota::enable_deletion;
 use crate::core::jobs::{
     current_attempt, failed_slot, job_failure, job_filters, picked_file, shown_row, JobView,
     SlotView, Untried,

@@ -26,7 +26,16 @@ pub struct DeletionReview {
     pub rating: Option<u8>,
     pub reason: DeletionReason,
     pub created_at: String,
+    /// What started the deletion: "ui", "auto" or "mcp" (a connected app).
+    #[serde(default)]
+    pub origin: String,
+    /// The connected app's host, for an app's deletion.
+    #[serde(default)]
+    pub client: Option<String>,
 }
+
+/// Deletions per user in any 24 hours through connected apps (design 13, D4).
+pub const DAILY_APP_DELETIONS: u32 = 100;
 
 /// Why a file was deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,14 +45,28 @@ pub enum DeletionReason {
     Disliked,
     /// A new copy of it was imported.
     Replaced,
+    /// Its listener asked to have it removed.
+    Cleanup,
 }
 
 impl DeletionReason {
+    /// Every reason's name, in variant order; as_str and parse read it.
+    pub const NAMES: &'static [&'static str] = &["disliked", "replaced", "cleanup"];
+
+    const ALL: [DeletionReason; 3] = [
+        DeletionReason::Disliked,
+        DeletionReason::Replaced,
+        DeletionReason::Cleanup,
+    ];
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            DeletionReason::Disliked => "disliked",
-            DeletionReason::Replaced => "replaced",
-        }
+        Self::NAMES[self as usize]
+    }
+
+    /// The reason named `text`, None for a name NAMES does not hold.
+    pub fn parse(text: &str) -> Option<DeletionReason> {
+        let at = Self::NAMES.iter().position(|name| *name == text)?;
+        Some(Self::ALL[at])
     }
 }
 
@@ -248,6 +271,17 @@ impl DiscoveryProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_reason_reads_back_from_its_name() {
+        for name in DeletionReason::NAMES {
+            let reason = DeletionReason::parse(name).unwrap();
+            assert_eq!(reason.as_str(), *name);
+            // The wire name is the same.
+            assert_eq!(serde_json::to_value(reason).unwrap(), *name);
+        }
+        assert_eq!(DeletionReason::parse("because"), None);
+    }
 
     #[test]
     fn progress_from_an_older_server_reads_without_a_failure() {

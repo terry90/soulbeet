@@ -18,6 +18,7 @@ use unlink::UnlinkError;
 
 mod listeners;
 pub mod paths;
+pub(crate) mod quota;
 mod rules;
 pub(crate) mod staging;
 #[cfg(test)]
@@ -89,19 +90,23 @@ pub struct Checked {
 }
 
 /// What started a removal, as the audit records it (D13).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     /// Someone in the web UI.
     Ui,
     /// Soulful on its own, from a rating sync.
     Auto,
+    /// A connected app, through OAuth grant `grant_id`: it removes only while that grant is the
+    /// actor's with deletion on, within the day's room (quota).
+    Mcp { grant_id: String },
 }
 
 impl Origin {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Origin::Ui => "ui",
             Origin::Auto => "auto",
+            Origin::Mcp { .. } => "mcp",
         }
     }
 }
@@ -305,24 +310,27 @@ impl Guard<'_> {
     }
 
     /// Rule 6 and the removal: the audit row (actor, song, title, artist, album, path, the
-    /// caller's rating, origin, reason) in a transaction; unlink_if_same(checked.path, checked.id);
-    /// commit; one info line "Deleted {path} ({reason}, {origin})"; then the forget and pruning
-    /// the empty parents up to checked.folder. Ok holds the deletion's warnings: a commit that
-    /// failed (logged where it happens), and with `ForgetVia::Worker` a forget that did not
-    /// remove one item (with `ForgetVia::Queue` that one is logged). Nothing may use `self.db`
-    /// while the transaction is open, so the row is built before it begins. The unlink, the
-    /// commit, its warning, the info line and the spawn of a queued forget run in one spawned
-    /// task, which a dropped caller does not cancel. A removal that stops without saying whether
-    /// it unlinked is settled by lost_removal: when nothing is at the path the removal is done
-    /// and goes on to its forget and pruning; when another file is there it is done without
-    /// them (Left::AnotherFile); when the file is still there it is Kept; when it cannot be
-    /// looked at it is Unconfirmed.
+    /// caller's rating, origin, reason, the app's host for an app) in a transaction begun with
+    /// BEGIN IMMEDIATE (D6); for Origin::Mcp, inside it and before the row, the grant must be the
+    /// actor's with deletion on (quota::deleting_app_in, D5) and the day must have room for one
+    /// more (quota::room_in, D4), else the file is Kept with that refusal; then
+    /// unlink_if_same(checked.path, checked.id); commit; one info line
+    /// "Deleted {path} ({reason}, {origin})"; then the forget and pruning the empty parents up to
+    /// checked.folder. Ok holds the deletion's warnings: a commit that failed (logged where it
+    /// happens), and with `ForgetVia::Worker` a forget that did not remove one item (with
+    /// `ForgetVia::Queue` that one is logged). Nothing may use `self.db` while the transaction is
+    /// open, so the row is built before it begins. The unlink, the commit, its warning, the info
+    /// line and the spawn of a queued forget run in one spawned task, which a dropped caller does
+    /// not cancel. A removal that stops without saying whether it unlinked is settled by
+    /// lost_removal: when nothing is at the path the removal is done and goes on to its forget
+    /// and pruning; when another file is there it is done without them (Left::AnotherFile); when
+    /// the file is still there it is Kept; when it cannot be looked at it is Unconfirmed.
     pub async fn carry_out(
         &self,
         actor: &UserId,
         checked: Checked,
         reason: DeletionReason,
-        origin: Origin,
+        origin: &Origin,
         forget: ForgetVia<'_>,
     ) -> Result<Vec<String>, NotRemoved> {
         let Checked {
@@ -331,15 +339,25 @@ impl Guard<'_> {
             folder,
             id,
         } = checked;
-        let record = record_of(actor, *song, &path, reason, origin);
+        let mut record = record_of(actor, *song, &path, reason, origin);
+        let unavailable = |e| NotRemoved::Kept(database_failure(Stage::Delete, e));
         let mut tx = self
             .db
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|e| NotRemoved::Kept(database_failure(Stage::Delete, e)))?;
+            .map_err(|e| unavailable(e.to_string()))?;
+        if let Origin::Mcp { grant_id } = origin {
+            let host = quota::deleting_app_in(&mut tx, actor, grant_id)
+                .await
+                .map_err(NotRemoved::Kept)?;
+            quota::room_in(&mut tx, actor, 1, crate::oauth::now_unix())
+                .await
+                .map_err(NotRemoved::Kept)?;
+            record.client = Some(host);
+        }
         DeletionReviewRow::insert_in(&mut tx, &record)
             .await
-            .map_err(|e| NotRemoved::Kept(database_failure(Stage::Delete, e)))?;
+            .map_err(unavailable)?;
         let (queued, in_worker) = match forget {
             ForgetVia::Queue(queue) => (Some(queue), None),
             ForgetVia::Worker { importer, library } => (None, Some((importer, library))),
@@ -385,7 +403,7 @@ impl Guard<'_> {
                 "Deleted {} ({}, {})",
                 target.display(),
                 reason.as_str(),
-                origin.as_str()
+                kept.origin
             );
             if let Some(queue) = queued {
                 tokio::spawn(forget_queued(queue, target, root, left));
@@ -463,13 +481,13 @@ impl Guard<'_> {
     }
 }
 
-/// The audit row of `actor`'s removal of `song`'s file `path`, with a new id.
+/// The audit row of `actor`'s removal of `song`'s file `path`, with a new id and no app host.
 fn record_of(
     actor: &UserId,
     song: NativeSong,
     path: &Path,
     reason: DeletionReason,
-    origin: Origin,
+    origin: &Origin,
 ) -> DeletionRecord {
     DeletionRecord {
         id: uuid::Uuid::new_v4().to_string(),
@@ -482,6 +500,7 @@ fn record_of(
         path: path.to_string_lossy().into_owned(),
         origin: origin.as_str(),
         reason,
+        client: None,
     }
 }
 
@@ -527,7 +546,10 @@ enum Left {
 /// when it is gone, with nothing or another file at its path, the removal is done and its row
 /// is recorded once (`record` keeps its id), and Ok holds the warning when that row could not
 /// be stored (logged here) and what is at the path; when the path cannot be read nothing is
-/// recorded and it is Unconfirmed: the file may have been deleted.
+/// recorded and it is Unconfirmed: the file may have been deleted. The row keeps its app's host.
+/// An app's room was checked in the transaction that was dropped, so another app deletion
+/// committed meanwhile can bring the day's count one over the limit. Accepted: the file is gone,
+/// and its row must be written.
 async fn lost_removal(
     db: &SqlitePool,
     record: &DeletionRecord,
@@ -754,6 +776,7 @@ pub(crate) fn delete_failed(e: &std::io::Error) -> Failure {
 
 #[cfg(test)]
 mod tests {
+    use super::quota::{permission_not_granted, room_in, DAY_SECS};
     use super::test_support::{wanted, FakeNavidrome, Library};
     use super::*;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
@@ -2266,7 +2289,7 @@ mod tests {
                 &lib.alice(),
                 checked,
                 DeletionReason::Disliked,
-                Origin::Auto,
+                &Origin::Auto,
                 ForgetVia::Worker {
                     importer: &stub,
                     library: &folder,
@@ -2307,7 +2330,7 @@ mod tests {
                 &lib.alice(),
                 checked,
                 DeletionReason::Disliked,
-                Origin::Auto,
+                &Origin::Auto,
                 ForgetVia::Queue(queue.clone()),
             )
             .await
@@ -2337,7 +2360,7 @@ mod tests {
             &alice,
             checked,
             DeletionReason::Disliked,
-            Origin::Auto,
+            &Origin::Auto,
             ForgetVia::Queue(queue),
         ));
         // The test runtime has one thread: the removal task only runs while this task sleeps,
@@ -2370,6 +2393,167 @@ mod tests {
         );
     }
 
+    async fn delete_as(lib: &Library, origin: &Origin) -> Result<Vec<String>, Failure> {
+        let stub = StubImporter::new();
+        let checked = checked(lib).await;
+        let folder = checked.folder.clone();
+        let forget = ForgetVia::Worker {
+            importer: &stub,
+            library: &folder,
+        };
+        lib.guard()
+            .carry_out(
+                &lib.alice(),
+                checked,
+                DeletionReason::Cleanup,
+                origin,
+                forget,
+            )
+            .await
+            .map_err(NotRemoved::into_failure)
+    }
+
+    #[tokio::test]
+    async fn an_app_deletion_records_the_app_by_name() {
+        let lib = Library::new().await;
+        let app = lib.app("g1", "alice", true).await;
+        delete_as(&lib, &app).await.unwrap();
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT origin, reason, client FROM deletion_reviews")
+                .fetch_all(&lib.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![("mcp".into(), "cleanup".into(), Some("claude.ai".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_app_whose_switch_is_off_or_that_was_disconnected_deletes_nothing() {
+        for state in ["off", "revoked", "bobs"] {
+            let lib = Library::new().await;
+            let app = match state {
+                "off" => lib.app("g1", "alice", false).await,
+                "bobs" => lib.app("g2", "bob", true).await,
+                _ => {
+                    let app = lib.app("g1", "alice", true).await;
+                    sqlx::query("DELETE FROM oauth_grants WHERE id = 'g1'")
+                        .execute(&lib.db)
+                        .await
+                        .unwrap();
+                    app
+                }
+            };
+            assert_eq!(
+                delete_as(&lib, &app).await.unwrap_err(),
+                permission_not_granted(),
+                "{state}"
+            );
+            assert!(lib.root.join("music/alice/A/x.flac").exists(), "{state}");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deletion_reviews")
+                    .fetch_one(&lib.db)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_hundredth_app_deletion_of_a_day_is_the_last() {
+        let lib = Library::new().await;
+        let app = lib.app("g1", "alice", true).await;
+        lib.app_deletions(100, 3_600).await;
+        let f = delete_as(&lib, &app).await.unwrap_err();
+        assert_eq!(
+            (f.code, f.retry),
+            (FailureCode::DeleteDailyLimit, RetryAdvice::SameSourceLater)
+        );
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        // Rows older than a day do not count, and the rating sync's and the UI's deletions never do.
+        let lib = Library::new().await;
+        let app = lib.app("g1", "alice", true).await;
+        lib.app_deletions(99, 3_600).await;
+        lib.app_deletions(50, DAY_SECS + 60).await;
+        delete_as(&lib, &app).await.unwrap();
+        let lib = Library::new().await;
+        lib.app_deletions(100, 3_600).await;
+        delete_as(&lib, &Origin::Auto).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_limit_says_when_room_frees_for_the_request() {
+        let lib = Library::new().await;
+        let now = 1_800_000_000; // 2027-01-15T08:00:00Z
+        for (n, ago) in [(40, 86_000), (60, 100)] {
+            for _ in 0..n {
+                sqlx::query(
+                    "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, origin, reason, created_at) \
+                     VALUES (?, 'alice', 's', 't', 'a', 'al', 'mcp', 'cleanup', datetime(?, 'unixepoch'))",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(now - ago)
+                .execute(&lib.db)
+                .await
+                .unwrap();
+            }
+        }
+        let mut conn = lib.db.acquire().await.unwrap();
+        let f = room_in(&mut conn, &lib.alice(), 5, now).await.unwrap_err();
+        assert_eq!(f.retry_after_seconds, Some(400));
+        assert_eq!(f.message, "At most 100 tracks a day can be deleted through connected apps, and 100 were deleted in the last 24 hours. 5 more can be deleted from 2027-01-15 08:06:40 UTC.");
+        assert_eq!(
+            room_in(&mut conn, &UserId::new("bob"), 25, now).await,
+            Ok(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn two_app_deletions_never_pass_the_limit_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::new_on(crate::db::test_db::migrated_file(dir.path()).await).await;
+        lib.song("s2", "alice/B/y.flac", b"audio");
+        let app = lib.app("g1", "alice", true).await;
+        lib.app_deletions(99, 3_600).await;
+        let a = checked(&lib).await;
+        let b = library_verdict(lib.guard().check_song(&lib.alice(), "s2").await);
+        let stub = StubImporter::new();
+        let (folder_a, folder_b) = (a.folder.clone(), b.folder.clone());
+        let (guard, alice) = (lib.guard(), lib.alice());
+        let forget = |library| ForgetVia::Worker {
+            importer: &stub,
+            library,
+        };
+        let (ra, rb) = tokio::join!(
+            guard.carry_out(&alice, a, DeletionReason::Cleanup, &app, forget(&folder_a)),
+            guard.carry_out(&alice, b, DeletionReason::Cleanup, &app, forget(&folder_b))
+        );
+        let (ra, rb) = (
+            ra.map_err(NotRemoved::into_failure),
+            rb.map_err(NotRemoved::into_failure),
+        );
+        assert_eq!([ra.is_ok(), rb.is_ok()].iter().filter(|ok| **ok).count(), 1);
+        assert_eq!(
+            [&ra, &rb]
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .map(|f| f.code)
+                .collect::<Vec<_>>(),
+            vec![FailureCode::DeleteDailyLimit]
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM deletion_reviews WHERE origin = 'mcp'"
+            )
+            .fetch_one(&lib.db)
+            .await
+            .unwrap(),
+            100
+        );
+    }
+
     #[tokio::test]
     async fn a_path_component_swapped_for_a_symlink_is_not_followed() {
         let lib = Library::new().await;
@@ -2391,7 +2575,7 @@ mod tests {
                 &lib.alice(),
                 checked,
                 DeletionReason::Disliked,
-                Origin::Auto,
+                &Origin::Auto,
                 ForgetVia::Worker {
                     importer: &stub,
                     library: &lib.root.join("music/alice"),
@@ -2435,7 +2619,7 @@ mod tests {
                 &lib.alice(),
                 checked,
                 DeletionReason::Disliked,
-                Origin::Auto,
+                &Origin::Auto,
                 ForgetVia::Worker {
                     importer: &stub,
                     library: &lib.root.join("music/alice"),
@@ -2462,7 +2646,7 @@ mod tests {
                 &lib.alice(),
                 checked,
                 DeletionReason::Disliked,
-                Origin::Auto,
+                &Origin::Auto,
                 ForgetVia::Worker {
                     importer: &stub,
                     library: &lib.root.join("music/alice"),
@@ -2492,7 +2676,7 @@ mod tests {
             *song,
             &path,
             DeletionReason::Disliked,
-            Origin::Auto,
+            &Origin::Auto,
         );
         let rows = || async {
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deletion_reviews")
