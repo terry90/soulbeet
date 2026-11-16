@@ -3,7 +3,7 @@
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{Failure, FailureCode, Stage};
+use shared::failure::{cut_json, Failure, FailureCode, Stage, TEXT_MAX_CHARS};
 
 use super::args::{repeatable, Args};
 use super::contract::{
@@ -56,7 +56,7 @@ pub(crate) const ENSURE_IN_LIBRARY: ToolSpec = ToolSpec {
     title: "Get music into the library",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file: a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo and then its next calls, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial.")
+        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file: a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo, then its next calls, then its cause.raw, then cuts its message, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["items"], "properties": {"items": {"type": "array", "minItems": 1, "maxItems": 50, "items": "#,
@@ -220,12 +220,14 @@ const ECHOED: [&str; 7] = [
 ];
 
 /// `answered` within RESULT_MAX_CHARS (D4). Past it, refused items, the last first, leave out the
-/// reference their facts echo (the caller has it by its index), then their calls in `next`; each
+/// reference their facts echo (the caller has it by its index), then their calls in `next`, then
+/// their failure's `cause.raw`, then cut their failure's message to TEXT_MAX_CHARS as sent; each
 /// one's `facts.omitted` names what it left out. Ids (a job that already wants the recording)
-/// stay.
+/// stay. What is left of a refused item is Soulful's own fields, its ids and that message, so
+/// MAX_ITEMS of them keep within the bound whatever the failures held.
 fn bounded(answered: &mut Items) {
     let over = |answered: &Items| items_text(answered).chars().count() > RESULT_MAX_CHARS;
-    for step in ["reference", "next"] {
+    for step in ["reference", "next", "cause.raw", "message"] {
         for at in (0..answered.results.len()).rev() {
             if !over(answered) {
                 return;
@@ -241,7 +243,16 @@ fn bounded(answered: &mut Items) {
                         .retain(|name, _| !ECHOED.contains(&name.as_str()));
                     error.facts.len() < before
                 }
-                _ => !std::mem::take(&mut error.next).is_empty(),
+                "next" => !std::mem::take(&mut error.next).is_empty(),
+                "cause.raw" => (error.failure.cause.as_mut())
+                    .is_some_and(|cause| !std::mem::take(&mut cause.raw).is_empty()),
+                _ => {
+                    let message = &mut error.failure.message;
+                    let cut = cut_json(message.clone(), TEXT_MAX_CHARS);
+                    let changed = cut != *message;
+                    *message = cut;
+                    changed
+                }
             };
             if !left_out {
                 continue;
@@ -457,6 +468,7 @@ mod tests {
 
     use std::time::Duration;
 
+    use super::{Failure, FailureCode, Stage, RESULT_MAX_CHARS};
     use shared::download::{DownloadQuery, SearchState, SearchStats};
 
     use crate::auth::UserId;
@@ -756,6 +768,128 @@ mod tests {
         let last = &results[49]["error"];
         assert_eq!(last["facts"]["omitted"], json!(["reference", "next"]));
         assert_eq!(last["next"], json!([]));
+    }
+
+    /// The answer `run` builds for MAX_ITEMS items each refused with `failure`, before it is
+    /// bounded: every item echoes a reference whose texts are as long as a caller may send them
+    /// and offers the call again for itself.
+    fn refused_with(failure: &Failure) -> super::Items {
+        use crate::core::library::Reference;
+        let long = |c: char, i: usize| format!("{} {i}", c.to_string().repeat(480));
+        let given: Vec<Value> = (0..super::MAX_ITEMS)
+            .map(|i| json!({"artist": long('a', i), "title": long('t', i), "album": long('l', i)}))
+            .collect();
+        let call = json!({ "items": given });
+        let results = (0..super::MAX_ITEMS)
+            .map(|i| {
+                let reference = Reference {
+                    artist: long('a', i),
+                    title: long('t', i),
+                    album: Some(long('l', i)),
+                    recording_mbid: None,
+                    duration_s: None,
+                };
+                let facts = crate::core::jobs::Wanted::Track(reference).facts();
+                let item = super::EnsureItem::Refused(failure.clone(), facts);
+                super::item_result(item, &given[i], &call)
+            })
+            .collect();
+        let fields = serde_json::Map::from_iter([
+            ("batch_id".to_string(), Value::Null),
+            ("library_checked".to_string(), json!(true)),
+            ("next".to_string(), json!([])),
+        ]);
+        super::Items {
+            stage: shared::failure::Stage::Input,
+            noun: "items",
+            start: 0,
+            results,
+            pending: 0,
+            cursor: None,
+            fields,
+        }
+    }
+
+    /// The error of `answered`'s item `at`, as sent.
+    fn sent_error(answered: &super::Items, at: usize) -> Value {
+        let doc: Value = serde_json::from_str(&super::items_text(answered)).unwrap();
+        doc["results"][at]["error"].clone()
+    }
+
+    #[test]
+    fn fifty_refused_items_each_with_a_long_cause_keep_within_the_cap() {
+        use shared::failure::{RetryAdvice, Service, RAW_MAX_CHARS};
+        // A Navidrome lookup that failed with a cause as long as one is kept, all quotes, each
+        // sent as 2 characters.
+        let failure = Failure::new(
+            FailureCode::NavidromeUnreachable,
+            Stage::LibraryCheck,
+            RetryAdvice::SameSourceLater,
+            "Find songs failed: HTTP 502",
+        )
+        .with_cause(Service::Navidrome, Some(502), "\"".repeat(RAW_MAX_CHARS));
+        let mut answered = refused_with(&failure);
+        super::bounded(&mut answered);
+        let text = super::items_text(&answered);
+        assert!(
+            text.chars().count() <= RESULT_MAX_CHARS,
+            "{}",
+            text.chars().count()
+        );
+        let first = sent_error(&answered, 0);
+        assert_eq!(first["facts"]["omitted"], json!(["reference", "next"]));
+        assert_eq!(
+            first["cause"]["raw"]
+                .as_str()
+                .map(|raw| raw.chars().count()),
+            Some(RAW_MAX_CHARS)
+        );
+        let last = sent_error(&answered, super::MAX_ITEMS - 1);
+        assert_eq!(
+            last["facts"]["omitted"],
+            json!(["reference", "next", "cause.raw"])
+        );
+        assert_eq!(
+            (
+                &last["cause"]["service"],
+                &last["cause"]["status"],
+                &last["cause"]["raw"]
+            ),
+            (&json!("navidrome"), &json!(502), &json!(""))
+        );
+        assert_eq!(last["message"], "Find songs failed: HTTP 502");
+    }
+
+    #[test]
+    fn refused_items_whose_messages_are_long_keep_within_the_cap() {
+        use shared::failure::{json_chars, RetryAdvice, Service, RAW_MAX_CHARS};
+        // No failure Soulful makes has such a message: the bound holds whatever one holds.
+        let failure = Failure::new(
+            FailureCode::NavidromeUnreachable,
+            Stage::LibraryCheck,
+            RetryAdvice::SameSourceLater,
+            "\"".repeat(5 * RAW_MAX_CHARS),
+        )
+        .with_cause(Service::Navidrome, Some(502), "\"".repeat(RAW_MAX_CHARS));
+        let mut answered = refused_with(&failure);
+        super::bounded(&mut answered);
+        let text = super::items_text(&answered);
+        assert!(
+            text.chars().count() <= RESULT_MAX_CHARS,
+            "{}",
+            text.chars().count()
+        );
+        let last = sent_error(&answered, super::MAX_ITEMS - 1);
+        assert_eq!(
+            last["facts"]["omitted"],
+            json!(["reference", "next", "cause.raw", "message"])
+        );
+        let message = last["message"].as_str().unwrap();
+        assert!(
+            json_chars(message) <= shared::failure::TEXT_MAX_CHARS,
+            "{message}"
+        );
+        assert_eq!(last["code"], "navidrome_unreachable");
     }
 
     #[tokio::test]

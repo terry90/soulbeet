@@ -808,6 +808,194 @@ async fn keep(acq: &Acquire, import: StoredImport, queued: bool) {
     acq.ledger.settled().await;
 }
 
+/// The release of alice's album jobs for Kowloon - Come Over.
+const COME_OVER: &str = "6a09041b-0f79-3278-88d9-0552dd28d37f";
+
+/// alice's album job for Kowloon - Come Over whose search read the tracklist `tracklist` and
+/// found peer_a's folder of `picked` (titles, one file each), which were picked, took a download
+/// place and finished downloading: the job and the slots' rows, Completed, slot by slot.
+async fn downloaded_album_job(
+    acq: &Acquire,
+    tracklist: &[String],
+    picked: &[String],
+) -> (String, Vec<DownloadProgress>) {
+    let job = mcp_album_job(acq, "Kowloon", "Come Over", COME_OVER).await;
+    let record = store::job_record(&acq.db, &job, &alice())
+        .await
+        .unwrap()
+        .unwrap();
+    let search_id = record.search_id.unwrap();
+    // The runner reads the tracklist into the query before the search runs.
+    let mut query = record.wanted;
+    query.tracks = (tracklist.iter())
+        .map(|title| crate::server_fns::download::test_support::track("Kowloon", title))
+        .collect();
+    let spec = StoredSpec {
+        filters: record.options.unwrap().filters,
+        ..StoredSpec::default()
+    };
+    acq.ledger
+        .record_search(NewSearch {
+            id: search_id.clone(),
+            user: alice(),
+            backend: Some("slskd".into()),
+            query,
+            spec: Some(spec),
+        })
+        .await
+        .unwrap();
+    let files: Vec<DownloadableItem> = (picked.iter().enumerate())
+        .map(|(i, title)| item("peer_a", title, &format!("a/{:02} - {title}.flac", i + 1)))
+        .collect();
+    let groups = vec![group("peer_a", files.clone(), 0.9)];
+    acq.ledger
+        .search_ended(&search_id, Ok((groups, Some(SearchStats::default()))))
+        .await
+        .unwrap();
+    let items = (0..).zip(files.clone()).collect();
+    applied(acq, &job, Transition::Pick { items, search_id }).await;
+    assert!(acq
+        .ledger
+        .claim_download(&job, MCP_DOWNLOADS_PER_USER)
+        .await
+        .unwrap());
+    let rows: Vec<DownloadProgress> = (0..)
+        .zip(&files)
+        .map(|(slot, file)| {
+            let row = transfer(
+                "peer_a",
+                &file.id,
+                &format!("t-{}", file.id),
+                DownloadState::Completed,
+            );
+            row.with_job(JobSlot {
+                job: job.clone(),
+                slot,
+            })
+        })
+        .collect();
+    acq.ledger.record(JobEvent::Slots {
+        state: JobState::Downloading,
+        rows: rows.clone(),
+    });
+    acq.ledger.settled().await;
+    (job, rows)
+}
+
+/// The import of the downloaded `rows` (each slot's file under /downloads) into alice's folder
+/// as their batch queues it, skipping what the library has: an album whole when `album`.
+fn import_of_rows(rows: &[DownloadProgress], album: bool) -> StoredImport {
+    let files: Vec<std::path::PathBuf> = (rows.iter())
+        .map(|row| Path::new("/downloads/Come Over").join(&row.item))
+        .collect();
+    let sources = match album {
+        true => vec![Path::new("/downloads/Come Over").to_path_buf()],
+        false => files.clone(),
+    };
+    StoredImport {
+        sources,
+        files,
+        target: std::env::temp_dir(),
+        album,
+        cleanup_root: None,
+        choices: None,
+        choice: DriverChoice::Auto,
+        rows: (rows.iter())
+            .map(|row| {
+                let queued = row.clone().with_state(DownloadState::ImportQueued(1));
+                (row.job.clone().unwrap(), queued)
+            })
+            .collect(),
+        duplicates: DuplicateRule::Skip,
+        last_run: None,
+    }
+}
+
+/// What beets applied or found for Kowloon - `title` of Come Over, as library item `beets_id`.
+fn album_item(title: &str, beets_id: u64) -> ImportedItem {
+    ImportedItem {
+        path: format!("Kowloon/Come Over/{title}.flac").into(),
+        recording_mbid: None,
+        artist: "Kowloon".into(),
+        title: title.into(),
+        album: "Come Over".into(),
+        beets_id: Some(beets_id),
+        release_mbid: Some(COME_OVER.into()),
+        match_per_mille: Some(960),
+    }
+}
+
+/// alice's album job for Kowloon - Come Over, whose tracklist has Wake Up, Come Over and Ready to
+/// Go; peer_a's files of the first two were downloaded and imported whole as the release, as a
+/// user without Navidrome's import ends: done, Ready to Go taken by no slot.
+pub(crate) async fn imported_album_job(acq: &Acquire) -> String {
+    let tracklist = ["Wake Up", "Come Over", "Ready to Go"].map(String::from);
+    let picked = &tracklist[..2];
+    let (job, rows) = downloaded_album_job(acq, &tracklist, picked).await;
+    let import = import_of_rows(&rows, true);
+    acq.ledger
+        .record(JobEvent::ImportQueued(Box::new(import.clone())));
+    let applied = (picked.iter().zip(1..))
+        .map(|(title, id)| album_item(title, id))
+        .collect();
+    let result = SlotResult::Imported {
+        applied,
+        untagged: false,
+        listed: None,
+    };
+    acq.ledger
+        .record(JobEvent::ImportDone(Box::new(crate::ledger::ImportDone {
+            results: (rows.iter())
+                .map(|row| (row.job.clone().unwrap(), result.clone()))
+                .collect(),
+            rows: (rows.into_iter())
+                .map(|row| row.with_state(DownloadState::Imported))
+                .collect(),
+            import,
+            next: JobState::Done,
+            index: None,
+        })));
+    acq.ledger.settled().await;
+    job
+}
+
+/// alice's album job for Kowloon - Come Over of `n` tracks ("Track 1" and on), each downloaded
+/// from peer_a and imported on its own, as the web page imports an album track by track; beets
+/// skipped each because the library has its own copy of it: every slot failed with its own
+/// already_in_library result.
+pub(crate) async fn duplicate_album_job(acq: &Acquire, n: usize) -> String {
+    let tracklist: Vec<String> = (1..=n).map(|i| format!("Track {i}")).collect();
+    let (job, rows) = downloaded_album_job(acq, &tracklist, &tracklist).await;
+    for (row, (title, id)) in rows.into_iter().zip(tracklist.iter().zip(1..)) {
+        let import = import_of_rows(std::slice::from_ref(&row), false);
+        acq.ledger
+            .record(JobEvent::ImportQueued(Box::new(import.clone())));
+        let existing = vec![album_item(title, id)];
+        let skipped = ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+            existing: existing.clone(),
+        });
+        let failure = Failure::new(
+            FailureCode::ImportAlreadyInLibrary,
+            Stage::Import,
+            RetryAdvice::NotRetryable,
+            skipped.to_string(),
+        );
+        let slot = row.job.clone().unwrap();
+        acq.ledger
+            .record(JobEvent::ImportDone(Box::new(crate::ledger::ImportDone {
+                import,
+                rows: vec![row
+                    .with_state(DownloadState::ImportSkipped)
+                    .with_failure(failure)],
+                next: JobState::Failed,
+                index: None,
+                results: vec![(slot, SlotResult::AlreadyInLibrary { existing })],
+            })));
+    }
+    acq.ledger.settled().await;
+    job
+}
+
 /// alice's album job for Kowloon - Come Over whose two files, from peer_a, were imported apart,
 /// each import kept for a decision: the job, and each slot's import, in `acq`'s queue only when
 /// `queued` says so (one a restart could not restore is kept in the ledger alone). `sources`

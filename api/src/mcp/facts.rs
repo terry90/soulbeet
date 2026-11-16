@@ -410,8 +410,10 @@ pub(crate) const JOB_DOCUMENT_MAX_CHARS: usize = 45_000;
 
 /// `doc` within JOB_DOCUMENT_MAX_CHARS. While it is longer, items are left out whole, so no id is
 /// cut, in this order: the oldest timeline entries, the oldest earlier attempts, the last items of
-/// each import's lists (the last import's first), the last missing titles, then the last slots.
-/// Each list's `{list}_omitted` counts what it left out.
+/// each import's lists (the last import's first), the `cause.raw` of each import's
+/// library_songs_failure (the last import's first, its `facts.omitted` naming it), the last
+/// missing titles, the last results, then the last slots. Each list's `{list}_omitted` counts what
+/// it left out.
 fn bounded(doc: &mut Map<String, Value>) {
     let over = |doc: &Map<String, Value>| length(doc).saturating_sub(JOB_DOCUMENT_MAX_CHARS);
     for list in ["timeline", "tried"] {
@@ -422,21 +424,47 @@ fn bounded(doc: &mut Map<String, Value>) {
         .get("results")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
+    fn result_at(doc: &mut Map<String, Value>, import: usize) -> Option<&mut Map<String, Value>> {
+        (doc.get_mut("results"))
+            .and_then(|results| results.get_mut(import))
+            .and_then(Value::as_object_mut)
+    }
     for import in (0..imports).rev() {
         for list in ["applied", "existing", "listed", "library_songs"] {
             let over = over(doc);
-            let result = (doc.get_mut("results"))
-                .and_then(|results| results.get_mut(import))
-                .and_then(Value::as_object_mut);
-            if let Some(result) = result {
+            if let Some(result) = result_at(doc, import) {
                 leave_out(result, list, Keep::First, over);
             }
         }
     }
-    for list in ["missing_titles", "slots"] {
+    for import in (0..imports).rev() {
+        if over(doc) == 0 {
+            return;
+        }
+        let failure = result_at(doc, import)
+            .and_then(|result| result.get_mut("library_songs_failure"))
+            .and_then(Value::as_object_mut);
+        if let Some(failure) = failure {
+            without_raw(failure);
+        }
+    }
+    for list in ["missing_titles", "results", "slots"] {
         let over = over(doc);
         leave_out(doc, list, Keep::First, over);
     }
+}
+
+/// `error`, an error object, without its cause's raw text, its `facts.omitted` naming it. Nothing
+/// when it has none.
+fn without_raw(error: &mut Map<String, Value>) {
+    let raw = (error.get_mut("cause"))
+        .and_then(Value::as_object_mut)
+        .and_then(|cause| cause.get_mut("raw"));
+    match raw {
+        Some(raw) if raw.as_str().is_some_and(|text| !text.is_empty()) => *raw = json!(""),
+        _ => return,
+    }
+    error.insert("facts".into(), json!({"omitted": ["cause.raw"]}));
 }
 
 /// What the job asks for, as a reference names it (D1): a track's artist, title and the album,
@@ -1236,6 +1264,129 @@ mod tests {
         );
         for (i, slot) in shown.iter().enumerate() {
             assert_eq!(slot["slot"], i);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_album_of_a_hundred_duplicates_keeps_within_its_bound_and_counts_its_results() {
+        use crate::core::jobs::test_support::duplicate_album_job;
+        use shared::failure::{RetryAdvice, Service, Stage, RAW_MAX_CHARS};
+        let (acq, _) = Acquire::for_alice().await;
+        let job = duplicate_album_job(&acq, 100).await;
+        let view = view_of(&acq, &job).await;
+        // Each import's songs looked up now, every lookup failing with a cause as long as one is
+        // kept, all quotes, each sent as 2 characters.
+        let failed = Failure::new(
+            FailureCode::NavidromeUnreachable,
+            Stage::Index,
+            RetryAdvice::SameSourceLater,
+            "Find songs failed: HTTP 502",
+        )
+        .with_cause(Service::Navidrome, Some(502), "\"".repeat(RAW_MAX_CHARS));
+        let now = ReadNow {
+            live: HashMap::new(),
+            library: (0..100)
+                .map(|slot| (slot, (Some(vec![]), Some(failed.clone()))))
+                .collect(),
+        };
+        let doc = job_document(&view, &Untried::default(), Detail::Full, &now, false);
+        let Value::Object(fields) = &doc else {
+            panic!("{doc}")
+        };
+        assert!(
+            length(fields) <= JOB_DOCUMENT_MAX_CHARS,
+            "{}",
+            length(fields)
+        );
+        let shown = doc["results"].as_array().unwrap();
+        assert_eq!(
+            shown.len() as u64 + doc["results_omitted"].as_u64().unwrap(),
+            100
+        );
+        for (i, result) in shown.iter().enumerate() {
+            assert_eq!(result["slots"], json!([i]));
+            let failure = &result["library_songs_failure"];
+            assert_eq!(
+                (
+                    &failure["code"],
+                    &failure["cause"]["raw"],
+                    &failure["facts"]
+                ),
+                (
+                    &json!("navidrome_unreachable"),
+                    &json!(""),
+                    &json!({"omitted": ["cause.raw"]})
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_album_imported_whole_says_how_it_matches_the_release_and_what_it_misses() {
+        use crate::core::jobs::test_support::imported_album_job;
+        let (acq, _) = Acquire::for_alice().await;
+        let job = imported_album_job(&acq).await;
+        let view = view_of(&acq, &job).await;
+        let doc = job_document(
+            &view,
+            &Untried::default(),
+            Detail::Full,
+            &ReadNow::default(),
+            false,
+        );
+        assert_eq!(doc["state"], "done", "{doc}");
+        assert_eq!(doc["missing_titles"], json!(["Ready to Go"]));
+        let results = doc["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "one import, shown once: {doc}");
+        assert_eq!(
+            (&results[0]["kind"], &results[0]["slots"]),
+            (&json!("imported"), &json!([0, 1]))
+        );
+        assert_eq!(
+            results[0]["matches_wanted"],
+            json!({"release_mbid": "equal", "tracks_wanted": 3, "tracks_imported": 2,
+                "missing_titles": ["Ready to Go"]})
+        );
+        let titles: Vec<&Value> = (results[0]["applied"].as_array().unwrap().iter())
+            .map(|item| &item["title"])
+            .collect();
+        assert_eq!(titles, [&json!("Wake Up"), &json!("Come Over")]);
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_does_not_answer_within_ten_seconds_is_answered_for_who_was_asked() {
+        use soulbeet::error::PeerAsk;
+        let never = || std::future::pending::<soulbeet::error::Result<Option<u32>>>();
+        for (ask, code) in [
+            (
+                PeerAsk::QueuePosition,
+                FailureCode::TransferConnectionFailed,
+            ),
+            (PeerAsk::Presence, FailureCode::BackendUnreachable),
+        ] {
+            tokio::time::pause();
+            let read = answered(ask, never());
+            tokio::pin!(read);
+            let before = LIVE_READ_WAIT - Duration::from_millis(1);
+            let early = tokio::time::timeout(before, &mut read).await;
+            let answer = read.await;
+            tokio::time::resume();
+            assert!(early.is_err(), "answered before 10 seconds: {early:?}");
+            let failure = answer.unwrap_err();
+            assert_eq!(
+                (
+                    failure.code,
+                    failure.stage,
+                    failure.retry,
+                    failure.message.as_str()
+                ),
+                (
+                    code,
+                    Stage::Transfer,
+                    RetryAdvice::SameSourceLater,
+                    "no answer within 10 seconds"
+                )
+            );
         }
     }
 
