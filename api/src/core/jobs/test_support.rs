@@ -328,7 +328,7 @@ pub(crate) async fn downloading_track_job_with(
 /// alice's searching track job `job` for Marrow Choir - `title`, downloading: its search found a
 /// peer_a and a peer_b group, peer_a was picked, took a download place and was enqueued, and
 /// one InProgress row came for it.
-async fn start_downloading(acq: &Acquire, job: &str, title: &str) {
+pub(crate) async fn start_downloading(acq: &Acquire, job: &str, title: &str) {
     let picked = search_found(acq, job, title).await;
     let search_id = search_of(acq, job).await;
     applied(

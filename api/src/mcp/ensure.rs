@@ -703,14 +703,17 @@ mod tests {
     use crate::core::acquire::{Acquisition, NewBatch};
     use crate::core::folder_of;
     use crate::core::jobs::runner::{Acquire, TestEffects};
-    use crate::core::jobs::test_support::{batch_of_searches, choosing_track_job, view_of};
+    use crate::core::jobs::test_support::{
+        batch_of_searches, choosing_track_job, settle_done, start_downloading, view_of,
+    };
+    use crate::core::playlists::fill::round;
     use crate::import_queue::test_support::{broken, ready};
     use crate::ledger::MCP_UNFINISHED_JOBS_PER_USER;
     use crate::ledger::{NewSearch, StoredSpec};
     use crate::server_fns::download::test_support::{group, item, search_result, track};
     use crate::test_navidrome::{
-        native_song, native_songs, playlist_body, playlist_rows, playlists_body, NavidromeFor,
-        NavidromeStub, ADVENT, SILENT,
+        native_playlist, native_song, native_songs, playlist_body, playlist_rows, playlists_body,
+        NavidromeFor, NavidromeStub, ADVENT, HOLY, SILENT,
     };
 
     #[tokio::test]
@@ -1896,6 +1899,105 @@ mod tests {
             .await,
         );
         assert_eq!(batch["playlist"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_playlist_of_items_whose_jobs_all_run_already_is_filled_as_those_jobs_finish() {
+        let (db, acq, effects, token) = jobs_app().await;
+        // The runners stay in their searches: the test moves the jobs on itself.
+        let _held = effects.stub().hold_searches();
+        let navi = NavidromeStub::start();
+        navi.answer_when("/api/song", "title=", 200, "[]");
+        navi.answer(
+            "/api/song",
+            &[&native_songs(&[(SILENT.0, false), (HOLY.0, false)])],
+        );
+        navi.answer("/rest/getPlaylists", &[&playlists_body(&[])]);
+        let christmas = playlist_body(ADVENT, "Christmas", "alice", false, "", &[]);
+        navi.answer("/rest/createPlaylist", &[&christmas]);
+        navi.answer("/rest/getPlaylist", &[&christmas]);
+        let tracks = format!("/api/playlist/{ADVENT}/tracks");
+        navi.answer(&tracks, &["[]"]);
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let items = json!({"items": christmas_items(), "folder_id": "alice-folder"});
+        let first = document(&call_tool(app.clone(), &token, "ensure_in_library", items).await);
+        let jobs: Vec<String> = (0..2)
+            .map(|i| first["results"][i]["job_id"].as_str().unwrap().to_string())
+            .collect();
+        let with_playlist = json!({"items": christmas_items(), "folder_id": "alice-folder",
+            "playlist": {"create": {"name": "Christmas"}}});
+        let doc =
+            document(&call_tool(app.clone(), &token, "ensure_in_library", with_playlist).await);
+        let batch_id = doc["batch_id"].as_str().expect("a batch for the playlist");
+        assert_ne!(Some(batch_id), first["batch_id"].as_str());
+        assert_eq!(
+            (
+                doc["results"][0]["error"]["facts"]["job_id"].as_str(),
+                doc["results"][1]["error"]["facts"]["job_id"].as_str()
+            ),
+            (Some(jobs[0].as_str()), Some(jobs[1].as_str())),
+            "{doc}"
+        );
+        assert_eq!(
+            (
+                doc["playlist"]["ok"].as_bool(),
+                doc["playlist"]["playlist_id"].as_str(),
+                &doc["playlist"]["song_ids"]
+            ),
+            (Some(true), Some(ADVENT), &json!([])),
+            "{doc}"
+        );
+        assert_eq!(
+            doc["next"],
+            json!([{"tool": "get_batch", "args": {"batch_id": batch_id, "wait_seconds": 180,
+                "wait_for": "needs_action"}}])
+        );
+        let playlist_state = || async {
+            document(
+                &call_tool(
+                    app.clone(),
+                    &token,
+                    "get_batch",
+                    json!({"batch_id": batch_id}),
+                )
+                .await,
+            )["playlist"]
+                .clone()
+        };
+        assert_eq!(
+            playlist_state().await,
+            json!({"playlist_id": ADVENT, "settled": 0, "waiting": 2, "failure": null,
+                "hidden_entries_dropped": 0})
+        );
+        // The second job ends first: each song still goes to its item's place.
+        for (job, (song, title)) in jobs.iter().zip([SILENT, HOLY]).rev() {
+            start_downloading(&acq, job, title).await;
+            settle_done(&acq, job, song).await;
+        }
+        navi.answer(
+            &tracks,
+            &[
+                "[]",
+                &playlist_rows(&[(1, SILENT.0, SILENT.1, false), (2, HOLY.0, HOLY.1, false)]),
+            ],
+        );
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&native_playlist(ADVENT, "Christmas", 0, false, None)],
+        );
+        round(&db, &acq.ledger, &NavidromeFor(Ok(navi.client()))).await;
+        assert_eq!(
+            navi.posted("/rest/updatePlaylist"),
+            vec![format!(
+                "playlistId={ADVENT}&songIdToAdd={}&songIdToAdd={}",
+                SILENT.0, HOLY.0
+            )]
+        );
+        assert_eq!(
+            playlist_state().await,
+            json!({"playlist_id": ADVENT, "settled": 2, "waiting": 0, "failure": null,
+                "hidden_entries_dropped": 0})
+        );
     }
 
     #[tokio::test]
