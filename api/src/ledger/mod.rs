@@ -478,7 +478,8 @@ pub enum Transition {
     /// unfinished slot's row. A job whose user asked to cancel it ends cancelled instead.
     Fail { failure: Failure },
     /// Searching again under `search_id`; the job's slots are set aside (dismissed), their
-    /// attempts kept. `filters`, when given, become the job's filters.
+    /// attempts kept. `filters`, when given, become the job's filters; a job without options (a
+    /// web UI job) takes none, and the write fails.
     Search {
         search_id: String,
         filters: Option<SourceFilters>,
@@ -491,7 +492,7 @@ pub enum Transition {
     },
     /// A done job's result is rejected: its slots fail with `failure` and `source` is excluded.
     Reject { source: String, failure: Failure },
-    /// The slots that failed at the index stage wait for Navidrome again from `now`.
+    /// The slots whose wait for Navidrome failed (their row's `index`) wait again from `now`.
     Reindex { now: i64 },
 }
 
@@ -524,7 +525,8 @@ pub enum Transitioned {
         to: JobState,
         seq: i64,
     },
-    /// The job is in `state`, which the change is not allowed from.
+    /// The job is in `state`, which the change is not allowed from, or in which it changes
+    /// nothing (a Reindex of a job none of whose slots failed waiting for Navidrome).
     Refused { state: JobState },
     /// No job of the user has that id.
     #[default]
@@ -2839,9 +2841,16 @@ mod tests {
                 },
             )],
         })));
+        // As the index runner ends a wait that failed: the row keeps its state, its index fails.
+        let lost = DownloadProgress {
+            index: Some(IndexState::Failed(
+                crate::core::index::not_found_after_scan(),
+            )),
+            ..imported.clone()
+        };
         ledger.record(JobEvent::Slots {
             state: JobState::Failed,
-            rows: vec![imported.failed_with(crate::core::index::not_found_after_scan())],
+            rows: vec![lost],
         });
         ledger.settled().await;
         assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
@@ -2871,6 +2880,124 @@ mod tests {
                     ..wait
                 }
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reindex_of_a_job_that_did_not_fail_at_the_index_changes_nothing() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create_batch(
+                batch_of("b1"),
+                vec![NewJob {
+                    state: JobState::Queued,
+                    picked: vec![(0, item("peer_a", "O Holy Night", "a/03.flac"))],
+                    ..mcp_job(
+                        "j1",
+                        &alice,
+                        wanted_track("Marrow Choir", "O Holy Night", None),
+                    )
+                }],
+            )
+            .await
+            .unwrap();
+        // Its transfer failed, with a failure at the index stage on the row itself: only a wait
+        // for Navidrome that failed is waited for again.
+        let failed = row_of("j1", 0, "a/03.flac", DownloadState::Queued, 0)
+            .failed_with(crate::core::index::not_found_after_scan());
+        ledger.record(JobEvent::Slots {
+            state: JobState::Failed,
+            rows: vec![failed],
+        });
+        ledger.settled().await;
+        let before = *ledger.changes().borrow();
+        assert_eq!(
+            ledger
+                .transition(&UserId::new("alice"), "j1", Transition::Reindex { now: 77 })
+                .await
+                .unwrap(),
+            Transitioned::Refused {
+                state: JobState::Failed
+            }
+        );
+        assert_eq!(*ledger.changes().borrow(), before);
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
+    }
+
+    #[tokio::test]
+    async fn a_queued_job_that_may_have_sent_its_files_is_marked_not_ended() {
+        let (ledger, db, alice, _) = ledger().await;
+        let jobs = queued_carols(1, &alice);
+        let sent = jobs[0].id.clone();
+        ledger.create_batch(batch_of("b1"), jobs).await.unwrap();
+        // Its files were recorded as sent; a restart left it queued without its place.
+        ledger.record(JobEvent::Enqueued {
+            job: sent.clone(),
+            monitor_batch_id: "m1".into(),
+            batch_label: "Christmas".into(),
+            request: "r1".into(),
+        });
+        // A web UI job's pipeline sends without a place and records its send itself.
+        let ui = uuid::Uuid::new_v4().to_string();
+        ledger
+            .create(job(&ui, "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        let user = UserId::new("alice");
+        for job in [&sent, &ui] {
+            assert!(matches!(
+                ledger
+                    .transition(&user, job, Transition::Cancel)
+                    .await
+                    .unwrap(),
+                Transitioned::Applied {
+                    from: JobState::Queued,
+                    to: JobState::Queued,
+                    ..
+                }
+            ));
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT cancel_requested FROM jobs WHERE id = ?")
+                    .bind(job)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(TransferRegistry::global().job_cancelled(job));
+        }
+    }
+
+    #[tokio::test]
+    async fn filters_for_a_job_without_options_are_refused_not_dropped() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Searching, None), None)
+            .await
+            .unwrap();
+        let user = UserId::new("alice");
+        ledger
+            .transition(&user, "j1", Transition::AwaitChoice)
+            .await
+            .unwrap();
+        let filters = SourceFilters {
+            lossless_only: true,
+            ..SourceFilters::default()
+        };
+        let refused = ledger
+            .transition(
+                &user,
+                "j1",
+                Transition::Search {
+                    search_id: "s2".into(),
+                    filters: Some(filters),
+                },
+            )
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(
+            store::job_state(&db, "j1").await,
+            Some(JobState::NeedsSourceChoice)
         );
     }
 
@@ -3140,8 +3267,10 @@ mod tests {
     #[tokio::test]
     async fn each_applied_transition_is_on_the_timeline_once() {
         let (ledger, db, alice, _) = ledger().await;
+        // An MCP job, which a cancel before its runner sent anything ends at once.
+        let wanted = wanted_track("Marrow Choir", "One", None);
         ledger
-            .create(job("j1", "alice", &alice, JobState::Searching, None), None)
+            .create_batch(batch_of("b1"), vec![mcp_job("j1", &alice, wanted)])
             .await
             .unwrap();
         let alice_id = UserId::new("alice");

@@ -1160,20 +1160,35 @@ impl Writer {
         change: Transition,
     ) -> Result<Transitioned, LedgerError> {
         let mut tx = self.db.begin().await?;
-        let found: Option<(String, bool, bool)> = sqlx::query_as(
-            "SELECT state, gate_held, cancel_requested FROM jobs WHERE id = ? AND user_id = ?",
+        // `sent`: a monitor batch or a backend request is recorded for the job's current pick,
+        // so its files may have reached the backend.
+        let found: Option<(String, bool, bool, Option<String>, bool, bool)> = sqlx::query_as(
+            "SELECT j.state, j.gate_held, j.cancel_requested, b.origin, \
+                    j.monitor_batch_id IS NOT NULL OR j.request IS NOT NULL, \
+                    j.options IS NOT NULL \
+             FROM jobs j LEFT JOIN batches b ON b.id = j.batch_id \
+             WHERE j.id = ? AND j.user_id = ?",
         )
         .bind(job)
         .bind(user.to_string())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((state, gate_held, cancel_requested)) = found else {
+        let Some((state, gate_held, cancel_requested, origin, sent, has_options)) = found else {
             return Ok(Transitioned::Unknown);
         };
         let from = state_named(&state)?;
         if !change.allowed_from().contains(&from) {
             return Ok(Transitioned::Refused { state: from });
         }
+        // Only an MCP job's runner holds a place before it sends, and records the send first: a
+        // queued MCP job without a place and without a recorded send cannot have transfers. A web
+        // UI job's pipeline sends without either.
+        let mcp = origin.as_deref() == Some(BatchOrigin::Mcp.as_str());
+        let may_have_transfers = match from {
+            JobState::Downloading => true,
+            JobState::Queued => !mcp || gate_held || sent,
+            _ => false,
+        };
         // The slots a transition moves are on the timeline as the transition's entries.
         let picked = |event, items: &[(u32, DownloadableItem)]| -> Vec<Entry> {
             (items.iter())
@@ -1185,7 +1200,7 @@ impl Writer {
                 .collect()
         };
         let (to, entries) = match change {
-            Transition::Cancel if from == JobState::Downloading || gate_held => {
+            Transition::Cancel if may_have_transfers => {
                 // Its transfers may exist: every monitor stops them on its next poll.
                 sqlx::query("UPDATE jobs SET cancel_requested = 1 WHERE id = ?")
                     .bind(job)
@@ -1241,6 +1256,15 @@ impl Writer {
                 }
                 let to = JobState::Failed;
                 (to, vec![Entry::at(to, "failed").failure(&failure)])
+            }
+            Transition::Search {
+                filters: Some(_), ..
+            } if !has_options => {
+                // A web UI job keeps no options to hold them in; dropping them would search
+                // without what the caller asked for.
+                return Err(LedgerError(format!(
+                    "job {job} keeps no options, so it takes no filters"
+                )));
             }
             Transition::Search { search_id, filters } => {
                 // Every slot, ended ones too: the new search's pick reopens those it fills.
@@ -1300,7 +1324,10 @@ impl Writer {
                 (to, vec![entry])
             }
             Transition::Reindex { now } => {
-                self.reindex(&mut tx, job, now).await?;
+                if self.reindex(&mut tx, job, now).await? == 0 {
+                    // No slot failed waiting for Navidrome: nothing changes.
+                    return Ok(Transitioned::Refused { state: from });
+                }
                 let to = self.followed_state(&mut tx, job).await?.unwrap_or(from);
                 (to, vec![Entry::at(to, "waiting_for_navidrome_again")])
             }
@@ -1313,14 +1340,14 @@ impl Writer {
         Ok(Transitioned::Applied { from, to, seq })
     }
 
-    /// Moves each failed slot of `job` whose row failed at the index stage back to indexing,
-    /// waiting from `now` as if its import had just ended.
+    /// Moves each failed slot of `job` whose row's wait for Navidrome failed at the index stage
+    /// back to indexing, waiting from `now` as if its import had just ended: how many it moved.
     async fn reindex(
         &mut self,
         tx: &mut SqliteConnection,
         job: &str,
         now: i64,
-    ) -> Result<(), LedgerError> {
+    ) -> Result<usize, LedgerError> {
         let failed: Vec<(u32, String, String)> = sqlx::query_as(
             "SELECT slot, last_row, index_wait FROM job_tracks \
              WHERE job_id = ? AND state = ? AND last_row IS NOT NULL AND index_wait IS NOT NULL",
@@ -1329,11 +1356,13 @@ impl Writer {
         .bind(JobState::Failed.as_str())
         .fetch_all(&mut *tx)
         .await?;
+        let mut moved = 0;
         for (slot, row, wait) in failed {
             let row: DownloadProgress = serde_json::from_str(&row)?;
-            if row.failure.map(|f| f.stage) != Some(Stage::Index) {
+            if !matches!(&row.index, Some(IndexState::Failed(f)) if f.stage == Stage::Index) {
                 continue;
             }
+            moved += 1;
             let wait = IndexWait {
                 since: now,
                 baseline: None,
@@ -1350,8 +1379,10 @@ impl Writer {
             .execute(&mut *tx)
             .await?;
         }
-        self.forget(job);
-        Ok(())
+        if moved > 0 {
+            self.forget(job);
+        }
+        Ok(moved)
     }
 
     async fn claim_source_choice(
