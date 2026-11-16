@@ -1368,7 +1368,7 @@ async fn discard_download(src: &std::path::Path, download_base: &std::path::Path
 }
 
 #[cfg(feature = "server")]
-fn parse_profiles(s: &str) -> Vec<shared::recommendation::DiscoveryProfile> {
+pub(crate) fn parse_profiles(s: &str) -> Vec<shared::recommendation::DiscoveryProfile> {
     let mut profiles = Vec::new();
     for part in s.split(',') {
         if let Ok(p) = part.trim().parse() {

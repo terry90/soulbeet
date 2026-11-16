@@ -7,7 +7,11 @@ use shared::failure::{Failure, Stage};
 use sqlx::SqlitePool;
 
 pub async fn get(ctx: &UserCtx) -> Result<UserSettings, Failure> {
-    UserSettings::get(&ctx.user_id)
+    get_in(&crate::db::DB, ctx).await
+}
+
+pub(crate) async fn get_in(db: &SqlitePool, ctx: &UserCtx) -> Result<UserSettings, Failure> {
+    UserSettings::get_in(db, &ctx.user_id)
         .await
         .map_err(|e| database_failure(Stage::Input, e))
 }

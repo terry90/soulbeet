@@ -164,7 +164,10 @@ async fn an_mcp_client_signs_in_lists_tools_calls_get_status_and_refreshes() {
     let tools = legacy.list_all_tools().await.unwrap();
     assert_eq!(
         tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
-        vec!["get_status"]
+        crate::mcp::server::TOOLS
+            .iter()
+            .map(|t| t.name)
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         tools[0].annotations.as_ref().unwrap().read_only_hint,

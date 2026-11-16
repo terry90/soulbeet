@@ -76,7 +76,7 @@ impl StatusSource for LiveStatus {
         let (health, navidrome, folders, settings) = tokio::join!(
             system_health(ctx),
             navidrome_facts(ctx),
-            folder_facts(ctx),
+            async { Ok::<_, Failure>(with_free_space(folders::list(ctx).await?).await) },
             settings::get(ctx),
         );
         Ok(StatusFacts {
@@ -91,7 +91,7 @@ impl StatusSource for LiveStatus {
 
 /// The folder a settings choice names: an empty id is a cleared choice
 /// (core::settings::check_folder_choices), so no folder.
-fn chosen_folder(id: Option<String>) -> Option<String> {
+pub(crate) fn chosen_folder(id: Option<String>) -> Option<String> {
     id.filter(|id| !id.is_empty())
 }
 
@@ -105,13 +105,31 @@ async fn navidrome_facts(ctx: &UserCtx) -> Option<NavidromeFacts> {
     })
 }
 
-async fn folder_facts(ctx: &UserCtx) -> Result<Vec<FolderFacts>, Failure> {
-    let folders = folders::list(ctx).await?;
-    Ok(join_all(folders.into_iter().map(|folder| async move {
+/// Each folder with the free space of the filesystem it is on, all read at
+/// once.
+pub(crate) async fn with_free_space(folders: Vec<Folder>) -> Vec<FolderFacts> {
+    join_all(folders.into_iter().map(|folder| async move {
         let free = FREE_SPACE.read(PathBuf::from(&folder.path)).await;
         FolderFacts { folder, free }
     }))
-    .await)
+    .await
+}
+
+/// One folder as `get_status` and `list_folders` report it.
+pub(crate) fn folder_fields(f: &FolderFacts, default_folder_id: Option<&str>) -> Value {
+    let (free_bytes, free_space_failure) = match &f.free {
+        Ok(bytes) => (json!(bytes), Value::Null),
+        Err(e) => (Value::Null, json!(e)),
+    };
+    json!({
+        "folder_id": f.folder.id,
+        "name": f.folder.name,
+        "path": f.folder.path,
+        "shared": f.folder.shared,
+        "default": Some(f.folder.id.as_str()) == default_folder_id,
+        "free_bytes": free_bytes,
+        "free_space_failure": free_space_failure,
+    })
 }
 
 /// The running instance's free-space reads.
@@ -230,20 +248,7 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
     let folders: Vec<Value> = facts
         .folders
         .iter()
-        .map(|f| {
-            let (free_bytes, free_space_failure) = match &f.free {
-                Ok(bytes) => (json!(bytes), Value::Null),
-                Err(e) => (Value::Null, json!(e)),
-            };
-            json!({
-                "folder_id": f.folder.id,
-                "name": f.folder.name,
-                "path": f.folder.path,
-                "default": Some(f.folder.id.as_str()) == default,
-                "free_bytes": free_bytes,
-                "free_space_failure": free_space_failure,
-            })
-        })
+        .map(|f| folder_fields(f, default))
         .collect();
     let running_batches: Vec<Value> = facts
         .running_batches
@@ -345,7 +350,7 @@ mod tests {
                               "scan": {"scanning": false, "songs": 1342, "files_scanned": null,
                                        "last_scan": "2026-11-14T21:03:11.519322+00:00", "error": null},
                               "scan_failure": null},
-                "folders": [{"folder_id": "f1", "name": "Music", "path": "/music/alice", "default": true, "free_bytes": 1000,
+                "folders": [{"folder_id": "f1", "name": "Music", "path": "/music/alice", "shared": false, "default": true, "free_bytes": 1000,
                              "free_space_failure": null}],
                 "default_folder_id": "f1",
                 "running_batches": [{"batch_id": "b1", "label": "Come Over", "transfers": 2}],

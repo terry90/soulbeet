@@ -434,6 +434,33 @@ pub(crate) async fn post_rpc(
     (status, headers, json)
 }
 
+/// A `tools/call` of `name` with `arguments` as the user the token is for;
+/// the result object.
+pub(crate) async fn call_tool(
+    app: Router,
+    token: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let bearer = format!("Bearer {token}");
+    let (_, _, body) = post_rpc(
+        app,
+        &[
+            ("host", HOST),
+            ("authorization", &bearer),
+            ("mcp-protocol-version", "2025-11-25"),
+        ],
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": arguments}}),
+    )
+    .await;
+    body["result"].clone()
+}
+
+/// The JSON document a tool result's first block holds.
+pub(crate) fn document(result: &serde_json::Value) -> serde_json::Value {
+    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
 /// The rows in `table`, a test's literal table name.
 pub(crate) async fn count(db: &SqlitePool, table: &str) -> i64 {
     sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))

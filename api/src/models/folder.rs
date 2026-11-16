@@ -61,9 +61,18 @@ impl Folder {
     }
 
     pub async fn get_all_by_user(user_id: &str) -> Result<Vec<Folder>, String> {
-        sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE user_id = ?")
+        Self::get_all_by_user_in(&DB, user_id).await
+    }
+
+    /// In the order the folders were added (`rowid`), so a page of them
+    /// has stable offsets.
+    pub(crate) async fn get_all_by_user_in(
+        db: &SqlitePool,
+        user_id: &str,
+    ) -> Result<Vec<Folder>, String> {
+        sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE user_id = ? ORDER BY rowid")
             .bind(user_id)
-            .fetch_all(&*DB)
+            .fetch_all(db)
             .await
             .map_err(|e| e.to_string())
     }
@@ -155,6 +164,7 @@ fn match_folder<'a>(folders: &'a [Folder], path: &str) -> Option<&'a Folder> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::db::test_db;
 
     #[test]
     fn folder_matching_is_component_wise() {
@@ -176,5 +186,30 @@ mod tests {
         );
         assert!(match_folder(&folders, "/music/rock/../../etc").is_none());
         assert!(match_folder(&folders, "/elsewhere").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_users_folders_come_in_the_order_they_were_added() {
+        let db = test_db::migrated().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1', 'alice', 'x')")
+            .execute(&db)
+            .await
+            .unwrap();
+        for (id, name) in [("fb", "Music"), ("fa", "Archive")] {
+            sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES (?, 'u1', ?, ?)")
+                .bind(id)
+                .bind(name)
+                .bind(format!("/music/{id}"))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let ids: Vec<String> = Folder::get_all_by_user_in(&db, "u1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(ids, ["fb", "fa"]); // neither by id nor by name
     }
 }

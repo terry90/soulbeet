@@ -22,6 +22,7 @@ mod args;
 pub(crate) mod contract;
 mod paging;
 pub(crate) mod server;
+pub(crate) mod settings;
 pub(crate) mod status;
 
 const NO_TOKEN: &str = "No access token was sent";

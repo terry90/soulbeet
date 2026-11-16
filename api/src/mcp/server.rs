@@ -16,7 +16,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
-use super::{status, McpCaller};
+use super::{settings, status, McpCaller};
 use crate::connection::ConnectionState;
 
 /// What the server tells a client at `initialize`.
@@ -44,22 +44,54 @@ pub(crate) struct ToolSpec {
     pub call: ToolHandler,
 }
 
+/// The failure codes every tool can answer, written once for the
+/// descriptions.
+pub(crate) const COMMON_CODES: &str = "invalid_input, rate_limited, settings_unreadable";
+
 /// Every tool, in the fixed order `tools/list` answers (MCP 2026-07-28
 /// `server/tools.mdx`, "deterministic order").
-pub(crate) const TOOLS: &[ToolSpec] = &[ToolSpec {
-    name: "get_status",
-    title: "Soulful status",
-    description: |calls_a_minute| {
-        format!("Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work, and why not when they do not, with the importer issues that stand; the user's Navidrome link (connected, admin or not, whether this account can start a scan, and the scan status: songs is the library's song count while no scan runs, files_scanned the files read so far while one does); the user's folders with free space and which one is the default; the batches downloading now; whether this app may delete music; and the address Soulful is reached at. A folder_id holds until the folder is removed; a batch_id while its batch runs. Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.")
+pub(crate) const TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "get_status",
+        title: "Soulful status",
+        description: |calls_a_minute| {
+            format!("Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work, and why not when they do not, with the importer issues that stand; the user's Navidrome link (connected, admin or not, whether this account can start a scan, and the scan status: songs is the library's song count while no scan runs, files_scanned the files read so far while one does); the user's folders with free space and which one is the default; the batches downloading now; whether this app may delete music; and the address Soulful is reached at. A folder_id holds until the folder is removed; a batch_id while its batch runs. Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.")
+        },
+        // The schema for a tool without arguments (`server/tools.mdx`, "Tool").
+        input_schema: r#"{"type": "object", "additionalProperties": false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(status::call(state, caller, args)),
     },
-    // The schema for a tool without arguments (`server/tools.mdx`, "Tool").
-    input_schema: r#"{"type": "object", "additionalProperties": false}"#,
-    read_only: true,
-    destructive: false,
-    idempotent: true,
-    open_world: false,
-    call: |state, caller, args| Box::pin(status::call(state, caller, args)),
-}];
+    ToolSpec {
+        name: "get_settings",
+        title: "Soulful settings",
+        description: |_| {
+            format!("Shows the user's Soulful settings: default download folder and whether it still exists, auto-delete on a 1 star rating, the default metadata provider, the Last.fm and ListenBrainz user names and whether a key or token is saved (never the key or token), and the discovery settings. Takes no arguments. Failure codes: {COMMON_CODES}.")
+        },
+        input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(settings::get_settings(state, caller, args)),
+    },
+    ToolSpec {
+        name: "list_folders",
+        title: "Library folders",
+        description: |_| {
+            format!("Lists the user's library folders with their ids, paths, free space, whether each is shared and which is the default. Folder ids stay valid until the folder is deleted in Settings. Pages of 25 by default (limit up to 100); pass back cursor for the next page. Failure codes: {COMMON_CODES}.")
+        },
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(settings::list_folders(state, caller, args)),
+    },
+];
 
 impl ToolSpec {
     /// The rmcp tool, every hint set (design 10.3), its description naming
@@ -163,7 +195,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use axum::Router;
     use serde_json::{from_str, json, Value};
     use shared::failure::Stage;
 
@@ -173,29 +204,11 @@ mod tests {
     use crate::core::database_failure;
     use crate::db::test_db;
     use crate::mcp::status::status_fields;
+    use crate::models::user_settings::{UpdateUserSettings, UserSettings};
     use crate::oauth::limits::{Limits, WindowLimiter};
 
-    async fn call(app: Router, token: &str, name: &str, arguments: Value) -> Value {
-        let bearer = format!("Bearer {token}");
-        let (_, _, body) = post_rpc(
-            app,
-            &[
-                ("host", HOST),
-                ("authorization", &bearer),
-                ("mcp-protocol-version", "2025-11-25"),
-            ],
-            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": arguments}}),
-        )
-        .await;
-        body["result"].clone()
-    }
-
-    fn document(result: &Value) -> Value {
-        from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
-    }
-
     #[tokio::test]
-    async fn tools_list_declares_get_status_with_every_hint() {
+    async fn tools_list_declares_every_tool_with_every_hint() {
         let (_, app, token) = mcp_app().await;
         let bearer = format!("Bearer {token}");
         let (_, _, body) = post_rpc(
@@ -209,30 +222,30 @@ mod tests {
         )
         .await;
         let tools = body["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        let t = &tools[0];
-        assert_eq!(
-            (
-                t["name"].as_str(),
-                t["title"].as_str(),
-                t["description"].as_str()
-            ),
-            (
-                Some("get_status"),
-                Some("Soulful status"),
-                Some((TOOLS[0].description)(120).as_str())
-            )
-        );
-        assert!(t["description"]
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, TOOLS.iter().map(|t| t.name).collect::<Vec<_>>());
+        for (t, spec) in tools.iter().zip(TOOLS) {
+            assert_eq!(t["title"], spec.title, "{}", spec.name);
+            assert_eq!(t["description"], (spec.description)(120), "{}", spec.name);
+            assert_eq!(
+                t["annotations"],
+                json!({"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}),
+                "{}",
+                spec.name
+            );
+            assert_eq!(
+                t["inputSchema"],
+                from_str::<Value>(spec.input_schema).unwrap(),
+                "{}",
+                spec.name
+            );
+        }
+        assert!(tools[0]["description"]
             .as_str()
             .unwrap()
             .contains("more than 120 tool calls in a minute"));
         assert_eq!(
-            t["annotations"],
-            json!({"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false})
-        );
-        assert_eq!(
-            t["inputSchema"],
+            tools[0]["inputSchema"],
             json!({"type": "object", "additionalProperties": false})
         );
     }
@@ -240,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn get_status_answers_one_json_document() {
         let (_, app, token) = mcp_app().await;
-        let result = call(app, &token, "get_status", json!({})).await;
+        let result = call_tool(app, &token, "get_status", json!({})).await;
         assert_eq!(
             (
                 result["isError"].as_bool(),
@@ -254,17 +267,24 @@ mod tests {
         assert_eq!(document(&result), Value::Object(want));
     }
 
+    /// A call to `tool` that reads without refusal. A tool that takes a
+    /// required argument needs an arm here, since that argument is refused
+    /// before an unknown name.
+    fn valid_args(tool: &str) -> Value {
+        match tool {
+            "get_status" | "get_settings" | "list_folders" => json!({}),
+            other => panic!("no valid call for {other} in valid_args"),
+        }
+    }
+
     #[tokio::test]
     async fn every_tool_answers_an_unknown_argument_with_invalid_input() {
         let (_, app, token) = mcp_app().await;
         for spec in TOOLS {
-            let result = call(
-                app.clone(),
-                &token,
-                spec.name,
-                json!({"verbose": true, "zzz": 1}),
-            )
-            .await;
+            let mut args = valid_args(spec.name);
+            args["verbose"] = json!(true);
+            args["zzz"] = json!(1);
+            let result = call_tool(app.clone(), &token, spec.name, args).await;
             assert_eq!(result["isError"], true, "{}", spec.name);
             let error = &document(&result)["error"];
             assert_eq!(
@@ -277,19 +297,90 @@ mod tests {
                 "{}",
                 spec.name
             );
-            assert!(
-                !error["next"].as_array().unwrap().is_empty(),
+            assert_eq!(
+                error["next"],
+                json!([{"tool": spec.name, "args": valid_args(spec.name)}]),
                 "{}",
                 spec.name
             );
         }
         let error =
-            &document(&call(app, &token, "get_status", json!({"verbose": true})).await)["error"];
+            &document(&call_tool(app, &token, "get_status", json!({"verbose": true})).await)
+                ["error"];
         assert_eq!(
             error["message"],
             "get_status takes no argument named 'verbose': it takes no arguments"
         );
         assert_eq!(error["next"], json!([{"tool": "get_status", "args": {}}]));
+    }
+
+    #[tokio::test]
+    async fn get_settings_and_list_folders_read_the_callers_rows() {
+        let (db, app, token) = mcp_app().await;
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().to_str().unwrap().to_string();
+        let missing = dir.path().join("missing").to_str().unwrap().to_string();
+        for (id, name, path) in [("f1", "Music", present), ("f0", "Archive", missing)] {
+            sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES (?, 'u1', ?, ?)")
+                .bind(id)
+                .bind(name)
+                .bind(path)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        UserSettings::upsert_in(
+            &db,
+            "u1",
+            UpdateUserSettings {
+                default_download_folder_id: Some("f1".into()),
+                lastfm_api_key: Some("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let settings = call_tool(app.clone(), &token, "get_settings", json!({})).await;
+        assert_eq!(settings["isError"], false);
+        let doc = document(&settings);
+        assert_eq!(
+            (
+                doc["ok"].as_bool(),
+                doc["default_folder_found"].as_bool(),
+                doc["lastfm"]["api_key_saved"].as_bool()
+            ),
+            (Some(true), Some(true), Some(true))
+        );
+        assert!(!settings
+            .to_string()
+            .contains("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e"));
+        let first =
+            document(&call_tool(app.clone(), &token, "list_folders", json!({"limit": 1})).await);
+        let f = &first["folders"][0];
+        assert_eq!(f["folder_id"], "f1");
+        assert_eq!(
+            (f["shared"].as_bool(), f["default"].as_bool()),
+            (Some(false), Some(true))
+        );
+        assert!(f["free_bytes"].is_u64(), "{first}");
+        assert_eq!(f["free_space_failure"], Value::Null);
+        let second = document(
+            &call_tool(
+                app,
+                &token,
+                "list_folders",
+                json!({"limit": 1, "cursor": first["cursor"]}),
+            )
+            .await,
+        );
+        let f = &second["folders"][0];
+        assert_eq!(f["folder_id"], "f0");
+        assert_eq!(f["free_bytes"], Value::Null);
+        assert_eq!(
+            f["free_space_failure"],
+            "No such file or directory (os error 2)"
+        );
+        assert_eq!(second["cursor"], Value::Null);
     }
 
     #[tokio::test]
@@ -306,10 +397,10 @@ mod tests {
             ..ConnectionState::for_test(db)
         });
         assert_eq!(
-            call(app.clone(), &token, "get_status", json!({})).await["isError"],
+            call_tool(app.clone(), &token, "get_status", json!({})).await["isError"],
             false
         );
-        let result = call(app, &token, "get_status", json!({})).await;
+        let result = call_tool(app, &token, "get_status", json!({})).await;
         assert_eq!(result["isError"], true);
         let error = &document(&result)["error"];
         let wait = error["retry_after_seconds"].as_u64().unwrap();
@@ -367,7 +458,7 @@ mod tests {
             status: Arc::new(FixedStatus(Err(failure.clone()))),
             ..ConnectionState::for_test(db)
         });
-        let result = call(app, &token, "get_status", json!({})).await;
+        let result = call_tool(app, &token, "get_status", json!({})).await;
         assert_eq!(result["isError"], true);
         let error = &document(&result)["error"];
         assert_eq!(

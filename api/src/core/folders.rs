@@ -25,7 +25,11 @@ pub(crate) fn ensure_owner(folder: Option<Folder>, ctx: &UserCtx) -> Result<Fold
 }
 
 pub async fn list(ctx: &UserCtx) -> Result<Vec<Folder>, Failure> {
-    Folder::get_all_by_user(&ctx.user_id)
+    list_in(&DB, ctx).await
+}
+
+pub(crate) async fn list_in(db: &SqlitePool, ctx: &UserCtx) -> Result<Vec<Folder>, Failure> {
+    Folder::get_all_by_user_in(db, &ctx.user_id)
         .await
         .map_err(|e| database_failure(Stage::Input, e))
 }
