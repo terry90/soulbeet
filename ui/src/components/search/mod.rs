@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn an_album_query_carries_the_album_and_its_provider() {
         let album = Album {
-            id: "lastfm:marrow choir:winter songs".to_string(),
+            id: "lastfm:album:marrow choir:winter songs".to_string(),
             title: "Winter Songs".to_string(),
             artist: "Marrow Choir".to_string(),
             release_date: None,

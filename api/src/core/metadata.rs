@@ -90,10 +90,14 @@ async fn album_in(provider: &dyn MetadataProvider, id: &str) -> Result<AlbumWith
 /// The provider that looks up the album `id` a search by `searched` gave.
 /// A Last.fm search gives an album Last.fm has an MBID for that MBID as its
 /// id: a MusicBrainz release id, which MusicBrainz looks up whichever search
-/// gave it. Only Last.fm's own ids go to Last.fm.
+/// gave it. Only Last.fm's own ids go to Last.fm, in either form: the web
+/// UI and a resumed job can hold an album id written before ids named their
+/// kind (`LastFmId::album_in_any_form`).
 fn album_lookup_provider(searched: Option<Provider>, id: &str) -> Option<Provider> {
     match searched {
-        Some(Provider::LastFm) if !soulbeet::lastfm::is_album_id(id) => Some(Provider::MusicBrainz),
+        Some(Provider::LastFm) if !soulbeet::lastfm::is_album_id_in_any_form(id) => {
+            Some(Provider::MusicBrainz)
+        }
         searched => searched,
     }
 }
@@ -208,6 +212,7 @@ mod tests {
     use super::*;
     use shared::failure::Service;
     use shared::metadata::SearchResult as MetadataSearchResult;
+    use soulbeet::lastfm::LastFmId;
 
     /// Fails every call the way step 3's with_retry does when MusicBrainz gives no answer.
     struct Unanswered;
@@ -342,7 +347,7 @@ mod tests {
     #[test]
     fn a_release_id_is_looked_up_by_the_provider_it_belongs_to() {
         let mbid = "317d1e85-3f9e-463e-939b-bebf47aa2178";
-        let lastfm = "lastfm:bing crosby:white christmas";
+        let lastfm = &LastFmId::album("Bing Crosby", "White Christmas").id();
         let provider = |id, key| release_provider(id, key).map(|p| p.id());
         assert_eq!(provider(mbid, None).unwrap(), Provider::MusicBrainz);
         assert_eq!(provider(mbid, Some("a1b2")).unwrap(), Provider::MusicBrainz);
@@ -468,9 +473,14 @@ mod tests {
     #[test]
     fn an_album_id_is_looked_up_by_the_provider_it_belongs_to() {
         let mbid = "8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f";
-        let lastfm = "lastfm:marrow choir:winter songs";
+        let lastfm = &LastFmId::album("Marrow Choir", "Winter Songs").id();
         assert_eq!(
             album_lookup_provider(Some(Provider::LastFm), lastfm),
+            Some(Provider::LastFm)
+        );
+        // An album id the web UI or a job kept from before ids named their kind.
+        assert_eq!(
+            album_lookup_provider(Some(Provider::LastFm), "lastfm:marrow choir:winter songs"),
             Some(Provider::LastFm)
         );
         assert_eq!(

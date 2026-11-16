@@ -23,7 +23,8 @@ const RECORDING_ARGS: &[&str] = &["recording_mbid", "limit", "cursor"];
 const KINDS: &[&str] = &["recording", "release", "artist"];
 const PROVIDERS: &[&str] = &[providers::MUSICBRAINZ, providers::LASTFM];
 
-const RELEASE_ID: &str = "a MusicBrainz release id or a lastfm: id from search_music";
+const RELEASE_ID: &str =
+    "a MusicBrainz release id or the lastfm: id of a release from search_music";
 
 /// A text from MusicBrainz or Last.fm, cut as any outside text is. Ids are
 /// never cut: see `whole_ids`.
@@ -279,7 +280,10 @@ pub(crate) async fn search_music(
     )
 }
 
-/// An MBID by `Args::mbid`'s rule, lowercase, or a `lastfm:` id as given.
+/// An MBID by `Args::mbid`'s rule, lowercase, or a Last.fm album id as
+/// given. A Last.fm track id, or an id of the form Soulful wrote before ids
+/// named their kind, is refused: a tool call never holds one, since no tool
+/// gave out that form, and a track id read as an album names another one.
 fn read_release_id(args: &Args) -> Result<String, ToolError> {
     let refused = || invalid_value(RELEASE, "release_id", RELEASE_ID);
     let id = args.string("release_id").map_err(|_| refused())?;
@@ -469,7 +473,12 @@ mod tests {
             ("get_recording_releases", json!({"recording_mbid": "4d04e9b5"}),
              "get_recording_releases: recording_mbid must be a MusicBrainz id: 36 characters, 8-4-4-4-12 hexadecimal digits"),
             ("get_release", json!({"release_id": "White Christmas"}),
-             "get_release: release_id must be a MusicBrainz release id or a lastfm: id from search_music"),
+             "get_release: release_id must be a MusicBrainz release id or the lastfm: id of a release from search_music"),
+            // A recording's id from a Last.fm search names no release.
+            ("get_release", json!({"release_id": "lastfm:track:bing crosby:white christmas"}),
+             "get_release: release_id must be a MusicBrainz release id or the lastfm: id of a release from search_music"),
+            ("get_release", json!({"release_id": "lastfm:bing crosby:white christmas"}),
+             "get_release: release_id must be a MusicBrainz release id or the lastfm: id of a release from search_music"),
         ] {
             let e = &document(&call_tool(app.clone(), &token, name, args).await)["error"];
             assert_eq!(

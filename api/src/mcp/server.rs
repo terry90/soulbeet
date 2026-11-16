@@ -219,7 +219,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Release",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id or a lastfm: id that search_music gave. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. Pages of 25 tracks by default (limit up to 100). Failure codes: {common}, {METADATA_CODES}.")
+            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id or the lastfm: id search_music gave a release. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. Pages of 25 tracks by default (limit up to 100). Failure codes: {common}, {METADATA_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"release_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["release_id"],"additionalProperties":false}"#,
         read_only: true,

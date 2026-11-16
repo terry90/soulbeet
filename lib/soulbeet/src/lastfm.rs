@@ -860,28 +860,135 @@ fn format_duration(seconds: Option<u32>) -> Option<String> {
     })
 }
 
-/// The artist and album a `lastfm:{artist}:{album}` id from `search_albums`
-/// names. A search gives an album Last.fm has an MBID for that MBID as its
-/// id instead: that id is MusicBrainz's, and MusicBrainz looks it up.
-fn album_name(id: &str) -> Option<(&str, &str)> {
-    id.strip_prefix(ID_PREFIX)?.split_once(':')
-}
-
-/// Whether `id` is an album id of Last.fm's own, which only Last.fm can look
-/// up.
-pub fn is_album_id(id: &str) -> bool {
-    album_name(id).is_some()
-}
-
 /// What starts the ids Last.fm results get when Last.fm has no MBID for them.
 const ID_PREFIX: &str = "lastfm:";
 
-fn generate_lastfm_id(artist: &str, name: &str) -> String {
-    format!(
-        "{ID_PREFIX}{}:{}",
-        artist.to_lowercase(),
-        name.to_lowercase()
-    )
+/// What a Last.fm id names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastFmKind {
+    Album,
+    Track,
+}
+
+impl LastFmKind {
+    fn tag(self) -> &'static str {
+        match self {
+            LastFmKind::Album => "album",
+            LastFmKind::Track => "track",
+        }
+    }
+}
+
+/// A Last.fm album or track that Last.fm has no MBID for, named by its
+/// artist and name, both lowercased. A search gives an entry Last.fm has an
+/// MBID for that MBID as its id instead: that id is MusicBrainz's, and
+/// MusicBrainz looks it up.
+///
+/// Its id is `lastfm:{kind}:{artist}:{name}`, kind `album` or `track`, with
+/// `%` written `%25` and `:` written `%3A` in the artist and the name, so
+/// the colons after the prefix are the three that separate the parts, and
+/// an id reads back as the entry it was made from. `id` makes it and
+/// `parse` reads it; nothing else writes or reads these ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastFmId {
+    pub kind: LastFmKind,
+    pub artist: String,
+    pub name: String,
+}
+
+impl LastFmId {
+    fn new(kind: LastFmKind, artist: &str, name: &str) -> Self {
+        LastFmId {
+            kind,
+            artist: artist.to_lowercase(),
+            name: name.to_lowercase(),
+        }
+    }
+
+    pub fn album(artist: &str, name: &str) -> Self {
+        Self::new(LastFmKind::Album, artist, name)
+    }
+
+    pub fn track(artist: &str, name: &str) -> Self {
+        Self::new(LastFmKind::Track, artist, name)
+    }
+
+    pub fn id(&self) -> String {
+        let escape = |part: &str| part.replace('%', "%25").replace(':', "%3A");
+        format!(
+            "{ID_PREFIX}{}:{}:{}",
+            self.kind.tag(),
+            escape(&self.artist),
+            escape(&self.name)
+        )
+    }
+
+    /// The entry an id from `id` names; None for anything else, an id of
+    /// the earlier form among them (`album_in_any_form`).
+    pub fn parse(id: &str) -> Option<Self> {
+        let mut parts = id.strip_prefix(ID_PREFIX)?.split(':');
+        let kind = match parts.next()? {
+            "album" => LastFmKind::Album,
+            "track" => LastFmKind::Track,
+            _ => return None,
+        };
+        let (artist, name) = (unescape(parts.next()?)?, unescape(parts.next()?)?);
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(LastFmId { kind, artist, name })
+    }
+
+    /// The album `id` names, read as `parse` reads it or in the form album
+    /// ids had before ids named their kind, `lastfm:{artist}:{album}` with
+    /// the artist up to the first colon. That form is read only where an
+    /// album id kept from before can arrive: a download job's `wanted`
+    /// album in the jobs table, whose tracklist is looked up when the job
+    /// resumes after a restart, and a web UI page loaded before the upgrade
+    /// that expands or downloads an album from its results. A track id is
+    /// never an album, in either form: a track id of the earlier form
+    /// cannot be told from an album id, so only album contexts read it.
+    pub fn album_in_any_form(id: &str) -> Option<Self> {
+        if let Some(parsed) = Self::parse(id) {
+            return (parsed.kind == LastFmKind::Album).then_some(parsed);
+        }
+        let (artist, name) = id.strip_prefix(ID_PREFIX)?.split_once(':')?;
+        Some(LastFmId {
+            kind: LastFmKind::Album,
+            artist: artist.to_string(),
+            name: name.to_string(),
+        })
+    }
+}
+
+/// A part of an id with `%25` and `%3A` read back; None for any other `%`.
+fn unescape(part: &str) -> Option<String> {
+    let mut out = String::with_capacity(part.len());
+    let mut rest = part;
+    while let Some(at) = rest.find('%') {
+        out.push_str(&rest[..at]);
+        let code = rest.get(at + 1..at + 3)?;
+        out.push(match code {
+            "25" => '%',
+            "3A" | "3a" => ':',
+            _ => return None,
+        });
+        rest = &rest[at + 3..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Whether `id` is an album id of Last.fm's own, as `LastFmId::id` writes
+/// it, which only Last.fm can look up. A track id is not one.
+pub fn is_album_id(id: &str) -> bool {
+    LastFmId::parse(id).is_some_and(|parsed| parsed.kind == LastFmKind::Album)
+}
+
+/// `is_album_id`, or an album id of the earlier form
+/// (`LastFmId::album_in_any_form`).
+pub fn is_album_id_in_any_form(id: &str) -> bool {
+    LastFmId::album_in_any_form(id).is_some()
 }
 
 fn time_period_to_lastfm(period: TimePeriod) -> &'static str {
@@ -931,7 +1038,7 @@ impl crate::MetadataProvider for LastFmProvider {
                 let mbid = nonempty_mbid(a.mbid);
                 let id = mbid
                     .clone()
-                    .unwrap_or_else(|| generate_lastfm_id(&a.artist, &a.name));
+                    .unwrap_or_else(|| LastFmId::album(&a.artist, &a.name).id());
                 let cover_url = LastFmImage::get_largest(&a.image);
                 SearchResult::Album(Album {
                     id,
@@ -960,7 +1067,7 @@ impl crate::MetadataProvider for LastFmProvider {
                 let mbid = nonempty_mbid(t.mbid);
                 let id = mbid
                     .clone()
-                    .unwrap_or_else(|| generate_lastfm_id(&t.artist, &t.name));
+                    .unwrap_or_else(|| LastFmId::track(&t.artist, &t.name).id());
                 SearchResult::Track(Track {
                     id,
                     title: t.name,
@@ -977,12 +1084,15 @@ impl crate::MetadataProvider for LastFmProvider {
     }
 
     async fn get_album(&self, id: &str) -> std::result::Result<AlbumWithTracks, MetadataError> {
-        let name = album_name(id).ok_or_else(|| MetadataError::Rejected {
+        let album = LastFmId::album_in_any_form(id).ok_or_else(|| MetadataError::Rejected {
             service: Service::Lastfm,
             status: None,
             raw: format!("{id} is not a Last.fm album id"),
         })?;
-        let info = self.get_album_info(id, name).await?;
+        let album_id = album.id();
+        let info = self
+            .get_album_info(&album_id, (&album.artist, &album.name))
+            .await?;
 
         let album_mbid = nonempty_mbid(info.mbid.clone());
         let cover_url = LastFmImage::get_largest(&info.image);
@@ -996,13 +1106,13 @@ impl crate::MetadataProvider for LastFmProvider {
                     .map(|track| {
                         let track_mbid = nonempty_mbid(track.mbid);
                         Track {
-                            id: generate_lastfm_id(&info.artist, &track.name),
+                            id: LastFmId::track(&info.artist, &track.name).id(),
                             title: track.name,
                             artist: track
                                 .artist
                                 .map(|a| a.name)
                                 .unwrap_or_else(|| info.artist.clone()),
-                            album_id: Some(id.to_string()),
+                            album_id: Some(album_id.clone()),
                             album_title: Some(info.name.clone()),
                             release_date: info.wiki.as_ref().and_then(|w| w.published.clone()),
                             duration: format_duration(track.duration),
@@ -1016,7 +1126,7 @@ impl crate::MetadataProvider for LastFmProvider {
 
         Ok(AlbumWithTracks {
             album: Album {
-                id: id.to_string(),
+                id: album_id,
                 title: info.name,
                 artist: info.artist,
                 release_date: info.wiki.and_then(|w| w.published),
@@ -1237,15 +1347,70 @@ mod tests {
 
     #[test]
     fn only_lastfms_own_album_ids_name_an_album() {
-        assert_eq!(
-            album_name("lastfm:marrow choir:winter songs"),
-            Some(("marrow choir", "winter songs"))
-        );
-        assert!(is_album_id(&generate_lastfm_id(
-            "Marrow Choir",
-            "Winter Songs"
-        )));
+        let album = LastFmId::album("Marrow Choir", "Winter Songs").id();
+        assert_eq!(album, "lastfm:album:marrow choir:winter songs");
+        assert!(is_album_id(&album));
         assert!(!is_album_id("8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f"));
+        assert!(!is_album_id_in_any_form(
+            "8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f"
+        ));
+    }
+
+    #[test]
+    fn an_id_reads_back_as_the_entry_it_was_made_from() {
+        for (artist, name) in [
+            ("Marrow Choir", "Winter Songs"),
+            // A colon in the artist split the earlier form at the wrong place.
+            ("Sunn O))): Live", "Vol. 1: Kingdoms"),
+            ("100%", "50%3A off: %25"),
+            ("", "::"),
+        ] {
+            for entry in [LastFmId::album(artist, name), LastFmId::track(artist, name)] {
+                assert_eq!(LastFmId::parse(&entry.id()), Some(entry.clone()));
+                assert_eq!(
+                    (entry.artist.as_str(), entry.name.as_str()),
+                    (artist.to_lowercase().as_str(), name.to_lowercase().as_str())
+                );
+            }
+        }
+        for broken in [
+            "lastfm:album:a",
+            "lastfm:album:a:b:c",
+            "lastfm:album:a%2:b",
+            "lastfm:album:a%20b:c",
+            "lastfm:single:a:b",
+        ] {
+            assert_eq!(LastFmId::parse(broken), None, "{broken}");
+        }
+    }
+
+    #[test]
+    fn a_track_id_is_never_an_album_id() {
+        let track = LastFmId::track("Bing Crosby", "White Christmas").id();
+        assert_eq!(track, "lastfm:track:bing crosby:white christmas");
+        assert!(!is_album_id(&track));
+        assert_eq!(LastFmId::album_in_any_form(&track), None);
+        assert_ne!(
+            track,
+            LastFmId::album("Bing Crosby", "White Christmas").id()
+        );
+    }
+
+    #[test]
+    fn an_album_id_of_the_earlier_form_is_read_only_as_an_album_kept_from_before() {
+        // As Soulful wrote it before ids named their kind, and as jobs.wanted may still hold it.
+        let earlier = "lastfm:marrow choir:winter songs";
+        assert!(!is_album_id(earlier));
+        assert_eq!(LastFmId::parse(earlier), None);
+        assert_eq!(
+            LastFmId::album_in_any_form(earlier),
+            Some(LastFmId::album("Marrow Choir", "Winter Songs"))
+        );
+        // The earlier form split at the first colon: what it meant is read as it was.
+        assert_eq!(
+            LastFmId::album_in_any_form("lastfm:sunn o))):live:vol. 1"),
+            Some(LastFmId::album("sunn o)))", "live:vol. 1"))
+        );
     }
 
     #[tokio::test]
