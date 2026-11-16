@@ -16,7 +16,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
-use super::{library, settings, status, McpCaller};
+use super::{library, playlists, settings, status, McpCaller};
 use crate::connection::ConnectionState;
 
 /// What the server tells a client at `initialize`.
@@ -158,6 +158,32 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         idempotent: true,
         open_world: false,
         call: |state, caller, args| Box::pin(library::list_starred(state, caller, args)),
+    },
+    ToolSpec {
+        name: "list_playlists",
+        title: "Playlists",
+        description: |_| {
+            format!("Lists the user's Navidrome playlists and other users' public ones (owned false), by name, with id, comment, owner, whether public, song count, duration and when it was created and changed. Playlist ids stay valid until the playlist is deleted. Pages of 25 by default (limit up to 100). Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}.")
+        },
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(playlists::list_playlists(state, caller, args)),
+    },
+    ToolSpec {
+        name: "get_playlist",
+        title: "Playlist",
+        description: |_| {
+            format!("Shows one playlist with its entries in order. position is the entry's 0-based place in Navidrome's list, the number the playlist write tools take; songs of libraries this account cannot see are left out, so positions can skip numbers. Each entry has the song facts of find_in_library and missing, true when its file is gone. Pages of 25 entries by default (limit up to 100). Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}, playlist_not_found (no playlist with this id, or another user's private one).")
+        },
+        input_schema: r#"{"type":"object","properties":{"playlist_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["playlist_id"],"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(playlists::get_playlist(state, caller, args)),
     },
 ];
 
@@ -341,12 +367,13 @@ mod tests {
     fn valid_args(tool: &str) -> Value {
         match tool {
             "get_status" | "get_settings" | "list_folders" | "get_library_stats"
-            | "list_starred" => json!({}),
+            | "list_starred" | "list_playlists" => json!({}),
             "find_in_library" => {
                 json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
             }
             "search_library" => json!({"query": "night"}),
             "get_library_album" => json!({"album_id": "7hQ2nLr5VxZ0cYbM8wTkAf"}),
+            "get_playlist" => json!({"playlist_id": "9fR2kLm4NpQ7sT1vW3xY5z"}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }

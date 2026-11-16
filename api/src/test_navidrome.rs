@@ -219,6 +219,25 @@ pub(crate) fn native_song(
     song.to_string()
 }
 
+/// A native `GET /api/playlist/{id}/tracks` row (model.PlaylistTrack, model/playlist.go:224-229):
+/// `native_song`'s record whose own `id` is the track's 1-based `place`, the song's id being
+/// `mediaFileId`, and `missing` as given.
+pub(crate) fn playlist_row(
+    place: u32,
+    song_id: &str,
+    artist: &str,
+    title: &str,
+    missing: bool,
+) -> String {
+    let mut row: serde_json::Value =
+        serde_json::from_str(&native_song(song_id, artist, title, 263.4, None))
+            .expect("native_song writes JSON");
+    row["id"] = json!(place.to_string());
+    row["mediaFileId"] = json!(song_id);
+    row["missing"] = json!(missing);
+    row.to_string()
+}
+
 /// A Subsonic song child (the SONG shape of the soulbeet client tests) with these values: track 3
 /// of "Winter Songs", rated 4 and starred by this user, no genre (`"genres":[]`).
 pub(crate) fn child(id: &str, artist: &str, title: &str) -> String {

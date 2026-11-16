@@ -12,6 +12,7 @@ pub mod health;
 pub mod index;
 pub mod library;
 pub mod metadata;
+pub mod playlists;
 pub mod reconcile;
 pub mod settings;
 pub mod sources;

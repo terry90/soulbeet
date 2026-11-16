@@ -22,6 +22,7 @@ mod args;
 pub(crate) mod contract;
 pub(crate) mod library;
 mod paging;
+pub(crate) mod playlists;
 pub(crate) mod server;
 pub(crate) mod settings;
 pub(crate) mod status;
