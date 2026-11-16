@@ -65,31 +65,82 @@ async fn mcp_job(acq: &Acquire, wanted: Wanted, options: JobOptions) -> String {
 /// `user`'s MCP job for `wanted` into their folder `{user}-folder` (`core::folder_of`'s), in a
 /// batch of its own, searching under a new search id.
 async fn mcp_job_of(acq: &Acquire, user: &str, wanted: Wanted, options: JobOptions) -> String {
-    let id = uuid::Uuid::new_v4().to_string();
+    let label = wanted.label();
+    let (_, mut jobs) = mcp_batch(acq, user, &label, vec![wanted], options).await;
+    jobs.remove(0)
+}
+
+/// `user`'s MCP batch `label` with a job for each of `wanted`, in order, each searching under a
+/// new search id: the batch's id and its jobs' ids.
+async fn mcp_batch(
+    acq: &Acquire,
+    user: &str,
+    label: &str,
+    wanted: Vec<Wanted>,
+    options: JobOptions,
+) -> (String, Vec<String>) {
     let batch = NewJobBatch {
         id: uuid::Uuid::new_v4().to_string(),
         user: UserId::new(user),
-        label: Some(wanted.label()),
+        label: Some(label.to_string()),
         origin: BatchOrigin::Mcp,
     };
-    let job = NewJob {
-        id: id.clone(),
-        user: UserId::new(user),
-        folder_id: format!("{user}-folder"),
-        wanted: wanted.query(),
-        import_mode: match wanted.kind() {
-            crate::ledger::JobKind::Track => ImportMode::Singleton,
-            crate::ledger::JobKind::Album => ImportMode::Album,
-        },
-        state: JobState::Searching,
-        search_id: Some(uuid::Uuid::new_v4().to_string()),
-        picked: vec![],
-        kind: wanted.kind(),
-        options: Some(options),
-    };
-    let admitted = acq.ledger.create_batch(batch, vec![job]).await.unwrap();
-    assert_eq!(admitted, vec![Admitted::Created]);
-    id
+    let batch_id = batch.id.clone();
+    let jobs: Vec<NewJob> = wanted
+        .into_iter()
+        .map(|wanted| NewJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            user: UserId::new(user),
+            folder_id: format!("{user}-folder"),
+            wanted: wanted.query(),
+            import_mode: match wanted.kind() {
+                crate::ledger::JobKind::Track => ImportMode::Singleton,
+                crate::ledger::JobKind::Album => ImportMode::Album,
+            },
+            state: JobState::Searching,
+            search_id: Some(uuid::Uuid::new_v4().to_string()),
+            picked: vec![],
+            kind: wanted.kind(),
+            options: Some(options.clone()),
+        })
+        .collect();
+    let ids = jobs.iter().map(|job| job.id.clone()).collect::<Vec<_>>();
+    let admitted = acq.ledger.create_batch(batch, jobs).await.unwrap();
+    assert_eq!(admitted, vec![Admitted::Created; ids.len()]);
+    (batch_id, ids)
+}
+
+/// alice's MCP batch `label` with one searching job, for Marrow Choir - `label`: the batch's id.
+pub(crate) async fn named_batch(acq: &Acquire, label: &str) -> String {
+    let wanted = vec![track("Marrow Choir", label)];
+    mcp_batch(acq, ALICE, label, wanted, auto_options()).await.0
+}
+
+/// alice's MCP batch "Winter Songs" of `n` track jobs ("Song Number 1" and on), each
+/// downloading as `start_downloading` leaves it: the batch's id and its jobs' ids.
+pub(crate) async fn batch_of_downloads(acq: &Acquire, n: usize) -> (String, Vec<String>) {
+    let titles: Vec<String> = (1..=n).map(|i| format!("Song Number {i}")).collect();
+    let wanted = titles.iter().map(|t| track("Marrow Choir", t)).collect();
+    let (batch, jobs) = mcp_batch(acq, ALICE, "Winter Songs", wanted, auto_options()).await;
+    for (job, title) in jobs.iter().zip(&titles) {
+        start_downloading(acq, job, title).await;
+    }
+    (batch, jobs)
+}
+
+/// The transfer of alice's downloading `job` failed with `failure` and no source is left: its
+/// slot's row, failed, as the monitor reports it.
+pub(crate) async fn fail_slot(acq: &Acquire, job: &str, failure: Failure) {
+    let view = view_of(acq, job).await;
+    let row = view.slots[0]
+        .row
+        .clone()
+        .expect("a downloading slot has a row");
+    acq.ledger.record(JobEvent::Slots {
+        state: JobState::Failed,
+        rows: vec![row.failed_with(failure)],
+    });
+    acq.ledger.settled().await;
 }
 
 fn track(artist: &str, title: &str) -> Wanted {
@@ -211,16 +262,23 @@ pub(crate) async fn downloading_track_job(acq: &Acquire) -> String {
     downloading_track_job_with(acq, "O Holy Night", auto_options()).await
 }
 
-/// alice's MCP job for Marrow Choir - `title` with `options`, downloading: its search found a
-/// peer_a and a peer_b group, peer_a was picked, took a download place and was enqueued, and
-/// one InProgress row came for it.
+/// alice's MCP job for Marrow Choir - `title` with `options`, downloading as `start_downloading`
+/// leaves it.
 pub(crate) async fn downloading_track_job_with(
     acq: &Acquire,
     title: &str,
     options: JobOptions,
 ) -> String {
     let job = mcp_track_job(acq, "Marrow Choir", title, options).await;
-    let record = store::job_record(&acq.db, &job, &alice())
+    start_downloading(acq, &job, title).await;
+    job
+}
+
+/// alice's searching track job `job` for Marrow Choir - `title`, downloading: its search found a
+/// peer_a and a peer_b group, peer_a was picked, took a download place and was enqueued, and
+/// one InProgress row came for it.
+async fn start_downloading(acq: &Acquire, job: &str, title: &str) {
+    let record = store::job_record(&acq.db, job, &alice())
         .await
         .unwrap()
         .unwrap();
@@ -254,7 +312,7 @@ pub(crate) async fn downloading_track_job_with(
         .unwrap();
     applied(
         acq,
-        &job,
+        job,
         Transition::Pick {
             items: vec![(0, picked)],
         },
@@ -262,21 +320,20 @@ pub(crate) async fn downloading_track_job_with(
     .await;
     assert!(acq
         .ledger
-        .claim_download(&job, MCP_DOWNLOADS_PER_USER)
+        .claim_download(job, MCP_DOWNLOADS_PER_USER)
         .await
         .unwrap());
     acq.ledger.record(JobEvent::Enqueued {
-        job: job.clone(),
+        job: job.to_string(),
         monitor_batch_id: uuid::Uuid::new_v4().to_string(),
         batch_label: "Come Over".into(),
         request: uuid::Uuid::new_v4().to_string(),
     });
     acq.ledger.record(JobEvent::Slots {
         state: JobState::Downloading,
-        rows: vec![in_progress(&job, title)],
+        rows: vec![in_progress(job, title)],
     });
     acq.ledger.settled().await;
-    job
 }
 
 /// `downloading_track_job`, whose transfer from peer_a the peer rejected for a file it does not

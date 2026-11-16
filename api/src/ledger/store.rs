@@ -13,7 +13,7 @@ use shared::download::{
 use shared::failure::{Failure, Stage};
 use soulbeet::ImportMode;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::warn;
 
 /// A source search as stored: what it looked for, where, and what it found.
@@ -744,6 +744,121 @@ pub async fn recent_failures(
     Ok(rows.into_iter().collect())
 }
 
+/// A batch as stored, with how many of its jobs are in each state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchRecord {
+    pub id: String,
+    pub created_at: i64,
+    pub label: Option<String>,
+    pub origin: BatchOrigin,
+    /// By state name; a state no job is in is left out.
+    pub counts: BTreeMap<String, u32>,
+}
+
+/// `user`'s batches, newest first: only `id` when given, only those created at or after `since`
+/// when given. Each has its jobs counted by state.
+async fn batches_where(
+    db: &SqlitePool,
+    user: &UserId,
+    id: Option<&str>,
+    since: Option<i64>,
+) -> Result<Vec<BatchRecord>, sqlx::Error> {
+    let mut sql = "SELECT b.id, b.created_at, b.label, b.origin, j.state, COUNT(j.id) \
+                   FROM batches b LEFT JOIN jobs j ON j.batch_id = b.id WHERE b.user_id = ?"
+        .to_string();
+    if id.is_some() {
+        sql += " AND b.id = ?";
+    }
+    if since.is_some() {
+        sql += " AND b.created_at >= ?";
+    }
+    // created_at has one-second resolution: insertion order breaks its ties.
+    sql += " GROUP BY b.id, j.state ORDER BY b.created_at DESC, b.rowid DESC";
+    type Row = (String, i64, Option<String>, String, Option<String>, u32);
+    let mut query = sqlx::query_as::<_, Row>(&sql).bind(user.to_string());
+    if let Some(id) = id {
+        query = query.bind(id);
+    }
+    if let Some(since) = since {
+        query = query.bind(since);
+    }
+    let mut batches: Vec<BatchRecord> = Vec::new();
+    for (id, created_at, label, origin, state, count) in query.fetch_all(db).await? {
+        if batches.last().is_none_or(|b| b.id != id) {
+            batches.push(BatchRecord {
+                id,
+                created_at,
+                label,
+                origin: origin_named(Some(&origin))?,
+                counts: BTreeMap::new(),
+            });
+        }
+        if let (Some(state), Some(batch)) = (state, batches.last_mut()) {
+            batch
+                .counts
+                .insert(state_named(&state)?.as_str().to_string(), count);
+        }
+    }
+    Ok(batches)
+}
+
+/// `user`'s batch `id`; None for an unknown id or another user's.
+pub async fn batch_of(
+    db: &SqlitePool,
+    id: &str,
+    user: &UserId,
+) -> Result<Option<BatchRecord>, sqlx::Error> {
+    Ok(batches_where(db, user, Some(id), None).await?.pop())
+}
+
+/// `user`'s batches, newest first; `label` matches case-insensitively as a substring, `since` on
+/// created_at.
+pub async fn batches_of(
+    db: &SqlitePool,
+    user: &UserId,
+    label: Option<&str>,
+    since: Option<i64>,
+) -> Result<Vec<BatchRecord>, sqlx::Error> {
+    let mut batches = batches_where(db, user, None, since).await?;
+    // Folded here: SQLite's lower() folds ASCII letters only.
+    if let Some(label) = label.map(str::to_lowercase) {
+        batches.retain(|b| (b.label.as_deref()).is_some_and(|l| l.to_lowercase().contains(&label)));
+    }
+    Ok(batches)
+}
+
+/// A batch with a job not yet in a terminal state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunningBatch {
+    pub batch_id: String,
+    pub label: Option<String>,
+    pub unfinished_jobs: u32,
+}
+
+/// D13: `user`'s batches with an unfinished job, newest first.
+pub async fn running_batches(
+    db: &SqlitePool,
+    user: &UserId,
+) -> Result<Vec<RunningBatch>, sqlx::Error> {
+    // created_at has one-second resolution: insertion order breaks its ties.
+    let rows: Vec<(String, Option<String>, u32)> = sqlx::query_as(&format!(
+        "SELECT b.id, b.label, COUNT(*) FROM batches b JOIN jobs j ON j.batch_id = b.id \
+         WHERE b.user_id = ? AND j.state NOT IN {TERMINAL_SQL} \
+         GROUP BY b.id ORDER BY b.created_at DESC, b.rowid DESC"
+    ))
+    .bind(user.to_string())
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(batch_id, label, unfinished_jobs)| RunningBatch {
+            batch_id,
+            label,
+            unfinished_jobs,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 pub async fn job_state(db: &SqlitePool, job: &str) -> Option<JobState> {
     let state: Option<String> = sqlx::query_scalar("SELECT state FROM jobs WHERE id = ?")
@@ -757,6 +872,10 @@ pub async fn job_state(db: &SqlitePool, job: &str) -> Option<JobState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::jobs::runner::Acquire;
+    use crate::core::jobs::test_support::{
+        batch_of_downloads, named_batch, test_db_with_alice, track_job_of,
+    };
     use crate::ledger::{DuplicateRule, JobEvent, JobKind, Ledger, NewJob};
     use crate::server_fns::download::test_support::item;
     use shared::download::DownloadState;
@@ -866,5 +985,74 @@ mod tests {
         });
         ledger.settled().await;
         assert!(unfinished(&db).await.unwrap().jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_batches_are_the_batches_with_unfinished_jobs() {
+        let db = test_db_with_alice().await;
+        crate::core::folder_of(&db, "bob").await;
+        let (acq, _) = Acquire::for_test(db.clone());
+        let (running, jobs) = batch_of_downloads(&acq, 2).await;
+        let end = |job: &str, state| JobEvent::Ended {
+            job: job.to_string(),
+            state,
+            failure: None,
+        };
+        acq.ledger.record(end(&jobs[0], JobState::Done));
+        let ended = named_batch(&acq, "Advent").await;
+        let advent = jobs_of(&db, &UserId::new("alice"), None, Some(&ended), &[])
+            .await
+            .unwrap();
+        acq.ledger.record(end(&advent[0].id, JobState::Failed));
+        track_job_of(&acq, "bob").await;
+        acq.ledger.settled().await;
+        assert_eq!(
+            running_batches(&db, &UserId::new("alice")).await.unwrap(),
+            vec![RunningBatch {
+                batch_id: running,
+                label: Some("Winter Songs".into()),
+                unfinished_jobs: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn batches_are_read_newest_first_with_their_counts_and_found_by_label() {
+        let db = test_db_with_alice().await;
+        let (acq, _) = Acquire::for_test(db.clone());
+        let (downloads, _) = batch_of_downloads(&acq, 2).await;
+        let advent = named_batch(&acq, "Été d'Advent").await;
+        let alice = UserId::new("alice");
+        let all = batches_of(&db, &alice, None, None).await.unwrap();
+        assert_eq!(
+            all.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            vec![advent.as_str(), downloads.as_str()]
+        );
+        assert_eq!(
+            (all[1].label.as_deref(), all[1].origin, &all[1].counts),
+            (
+                Some("Winter Songs"),
+                BatchOrigin::Mcp,
+                &BTreeMap::from([("downloading".to_string(), 2)])
+            )
+        );
+        // Unicode letters fold too.
+        let found = batches_of(&db, &alice, Some("ÉTÉ"), None).await.unwrap();
+        assert_eq!(found.len(), 1);
+        let later = all[0].created_at + 1;
+        assert!(batches_of(&db, &alice, None, Some(later))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            batch_of(&db, &downloads, &alice).await.unwrap().as_ref(),
+            Some(&all[1])
+        );
+        assert_eq!(
+            batch_of(&db, &downloads, &UserId::new("bob"))
+                .await
+                .unwrap(),
+            None
+        );
     }
 }

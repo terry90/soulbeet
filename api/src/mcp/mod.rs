@@ -19,6 +19,7 @@ use crate::oauth::metadata::{mcp_url, resource_metadata_url};
 use crate::oauth::{now_unix, oauth_error, SCOPE};
 
 mod args;
+mod batches;
 pub(crate) mod contract;
 mod facts;
 mod jobs;

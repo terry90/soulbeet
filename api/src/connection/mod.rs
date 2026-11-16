@@ -60,11 +60,12 @@ pub struct ConnectionState {
 impl ConnectionState {
     /// The running instance's configuration and security checks.
     pub fn live() -> ConnectionState {
+        let db = (*crate::db::DB).clone();
         ConnectionState {
             mcp_off: CONFIG.mcp_off().map(str::to_string),
             public_url: CONFIG.public_url().cloned(),
             gate: crate::security::gate_reasons,
-            db: (*crate::db::DB).clone(),
+            db: db.clone(),
             limits: Arc::new(Limits::default()),
             key: crate::secret_key::current(),
             documents: match CimdFetcher::new() {
@@ -74,7 +75,7 @@ impl ConnectionState {
                     Arc::new(UnbuiltFetcher(e))
                 }
             },
-            status: Arc::new(LiveStatus),
+            status: Arc::new(LiveStatus { db }),
             navidrome: Arc::new(ServerNavidrome),
             navidrome_music_path: CONFIG.navidrome_music_path().map(Path::to_path_buf),
             log: LIVE_LOG.clone(),

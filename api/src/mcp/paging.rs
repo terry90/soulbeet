@@ -134,7 +134,7 @@ fn empty_document(fields: &Map<String, Value>, key: &str) -> Map<String, Value> 
 /// The most k up to `candidates` such that `base` characters, `items[..k]`
 /// with a comma between items, and `tail(k)` characters stay within
 /// RESULT_MAX_CHARS.
-fn longest_fitting(
+pub(crate) fn longest_fitting(
     base: usize,
     items: &[Value],
     candidates: usize,
@@ -186,7 +186,8 @@ fn fitting(
     longest_fitting(base, items, candidates, cursor).max(candidates.min(1))
 }
 
-fn chars(value: &Value) -> usize {
+/// The characters of `value`'s compact JSON text.
+pub(crate) fn chars(value: &Value) -> usize {
     value.to_string().chars().count()
 }
 

@@ -53,7 +53,8 @@ const STATES: [JobState; 11] = [
     JobState::Dismissed,
 ];
 
-const MAX_JOB_IDS: usize = 100;
+/// The most job ids a get_jobs call takes.
+pub(crate) const MAX_JOB_IDS: usize = 100;
 
 pub(crate) const GET_JOBS: ToolSpec = ToolSpec {
     name: "get_jobs",
@@ -85,24 +86,38 @@ pub(crate) enum WaitFor {
 }
 
 impl WaitFor {
+    /// `wait_seconds` (0 to 180, default 0) and `wait_for` (default any_change).
+    pub(crate) fn read(args: &Args) -> Result<(Duration, WaitFor), ToolError> {
+        let wait = args.opt_u32("wait_seconds", 0, 180)?.unwrap_or(0);
+        let wait_for =
+            match args.opt_choice("wait_for", &["any_change", "needs_action", "all_terminal"])? {
+                Some("needs_action") => WaitFor::NeedsAction,
+                Some("all_terminal") => WaitFor::AllTerminal,
+                _ => WaitFor::AnyChange,
+            };
+        Ok((Duration::from_secs(wait.into()), wait_for))
+    }
+
     /// Over the selected jobs: AnyChange when one's changed_seq is above `since`; NeedsAction
-    /// when one is needs_source_choice, needs_decision or failed, or all are terminal;
-    /// AllTerminal when all are.
+    /// when one needs action, or all are terminal; AllTerminal when all are.
     pub(crate) fn holds(self, jobs: &[JobView], since: i64) -> bool {
         let all_terminal = || jobs.iter().all(|v| v.job.state.is_terminal());
         match self {
             WaitFor::AnyChange => jobs.iter().any(|v| v.job.changed_seq > since),
             WaitFor::NeedsAction => {
-                jobs.iter().any(|v| {
-                    matches!(
-                        v.job.state,
-                        JobState::NeedsSourceChoice | JobState::NeedsDecision | JobState::Failed
-                    )
-                }) || all_terminal()
+                jobs.iter().any(|v| needs_action(v.job.state)) || all_terminal()
             }
             WaitFor::AllTerminal => all_terminal(),
         }
     }
+}
+
+/// Whether a job in `state` waits for the user: needs_source_choice, needs_decision or failed.
+pub(crate) fn needs_action(state: JobState) -> bool {
+    matches!(
+        state,
+        JobState::NeedsSourceChoice | JobState::NeedsDecision | JobState::Failed
+    )
 }
 
 /// A get_jobs call as read.
@@ -132,13 +147,7 @@ fn read_call(args: &Args) -> Result<Call, ToolError> {
         "full" => Detail::Full,
         _ => Detail::Summary,
     };
-    let wait = args.opt_u32("wait_seconds", 0, 180)?.unwrap_or(0);
-    let wait_for =
-        match args.opt_choice("wait_for", &["any_change", "needs_action", "all_terminal"])? {
-            Some("needs_action") => WaitFor::NeedsAction,
-            Some("all_terminal") => WaitFor::AllTerminal,
-            _ => WaitFor::AnyChange,
-        };
+    let (wait, wait_for) = WaitFor::read(args)?;
     let names: Vec<&str> = states.iter().map(|s| s.as_str()).collect();
     let listing = json!({"job_ids": job_ids, "batch_id": batch_id, "states": names,
         "detail": detail_name});
@@ -156,7 +165,7 @@ fn read_call(args: &Args) -> Result<Call, ToolError> {
     Ok(Call {
         select,
         detail,
-        wait: Duration::from_secs(wait.into()),
+        wait,
         wait_for,
         page,
     })
@@ -278,7 +287,11 @@ fn unknown_jobs(args: &Args, select: &JobSelect, unknown: Vec<String>) -> ToolEr
 /// What the full documents of `views` read now: the backend's answers about each running
 /// transfer, all asked at once, and the songs Navidrome lists for each import beets found in the
 /// library.
-async fn read_now(state: &ConnectionState, caller: &McpCaller, views: &[JobView]) -> Vec<ReadNow> {
+pub(crate) async fn read_now(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    views: &[JobView],
+) -> Vec<ReadNow> {
     let mut reads: Vec<ReadNow> = views.iter().map(|_| ReadNow::default()).collect();
     let running: Vec<(usize, u32, &DownloadProgress)> = (views.iter().enumerate())
         .flat_map(|(i, view)| {
@@ -361,7 +374,6 @@ async fn listed_songs(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use serde_json::{json, Value};
@@ -369,27 +381,16 @@ mod tests {
         DownloadProgress, DownloadState, JobSlot, SearchResult, SearchState, SearchStats,
     };
     use soulbeet::ImportedItem;
-    use sqlx::SqlitePool;
 
-    use crate::connection::test_util::{access_token, app_of, call_tool, document, RESOURCE};
+    use crate::connection::test_util::{app_of, call_tool, document, jobs_app};
     use crate::core::folder_of;
-    use crate::core::jobs::runner::{drive, Acquire, TestEffects};
+    use crate::core::jobs::runner::drive;
     use crate::core::jobs::test_support::{
-        auto_options, downloading_track_job, duplicate_track_job, mcp_track_job,
-        test_db_with_alice, track_job_of,
+        auto_options, downloading_track_job, duplicate_track_job, mcp_track_job, track_job_of,
     };
     use crate::core::test_ctx;
     use crate::ledger::{JobEvent, JobState};
     use crate::server_fns::download::test_support::{search_result, transfer};
-
-    /// The jobs of `core::jobs::test_support` are alice's (user id `alice`): a database with her,
-    /// the acquisition acting on it, its effects and her access token.
-    async fn jobs_app() -> (SqlitePool, Arc<Acquire>, Arc<TestEffects>, String) {
-        let db = test_db_with_alice().await;
-        let token = access_token(&db, "alice", RESOURCE).await;
-        let (acq, effects) = Acquire::for_test(db.clone());
-        (db, acq, effects, token)
-    }
 
     #[tokio::test]
     async fn full_detail_shows_the_live_transfer_and_its_place_in_the_queue() {

@@ -69,14 +69,6 @@ impl BatchRef {
     }
 }
 
-/// A batch that holds transfers now, and how many.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RunningBatch {
-    pub batch_id: String,
-    pub label: String,
-    pub transfers: usize,
-}
-
 /// One transfer, by exact strings: slskd refuses a second unfinished
 /// transfer of the same peer and filename, case included.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -307,31 +299,6 @@ impl TransferRegistry {
         self.held().cancelled_jobs.remove(job);
     }
 
-    /// `user`'s batches holding a transfer now, each with how many it holds,
-    /// sorted by label, then batch id.
-    pub fn running_batches(&self, user: &UserId) -> Vec<RunningBatch> {
-        let held = self.held();
-        let mut counts: HashMap<&str, (&str, usize)> = HashMap::new();
-        for batch in held.owners.values() {
-            if &batch.owner.user_id == user {
-                counts
-                    .entry(&batch.owner.batch_id)
-                    .or_insert((&batch.label, 0))
-                    .1 += 1;
-            }
-        }
-        let mut batches: Vec<RunningBatch> = counts
-            .into_iter()
-            .map(|(batch_id, (label, transfers))| RunningBatch {
-                batch_id: batch_id.to_string(),
-                label: label.to_string(),
-                transfers,
-            })
-            .collect();
-        batches.sort_by(|a, b| (&a.label, &a.batch_id).cmp(&(&b.label, &b.batch_id)));
-        batches
-    }
-
     /// Whether a batch may start watching a transfer it did not enqueue:
     /// only one nobody owns or one it owns already. Another batch's transfer,
     /// even the same user's, has its own monitor.
@@ -499,45 +466,6 @@ mod tests {
             ),
             ("b2", DuplicateRule::Skip, true)
         );
-    }
-
-    #[test]
-    fn running_batches_lists_the_users_batches_once_each() {
-        let registry = TransferRegistry::default();
-        let advent = BatchRef::new(
-            TransferOwner {
-                user_id: UserId::new("user-a"),
-                batch_id: "b0".into(),
-            },
-            "Advent".into(),
-            PathBuf::from("/music"),
-            ImportMode::Singleton,
-        );
-        registry.claim(
-            &[key("01.flac"), key("02.flac")],
-            &batch("user-a", "b1", ImportMode::Singleton),
-        );
-        registry.claim(&[key("03.flac")], &advent);
-        registry.claim(
-            &[key("04.flac")],
-            &batch("user-b", "b2", ImportMode::Singleton),
-        );
-        assert_eq!(
-            registry.running_batches(&UserId::new("user-a")),
-            vec![
-                RunningBatch {
-                    batch_id: "b0".into(),
-                    label: "Advent".into(),
-                    transfers: 1
-                },
-                RunningBatch {
-                    batch_id: "b1".into(),
-                    label: "Come Over".into(),
-                    transfers: 2
-                },
-            ]
-        );
-        assert!(registry.running_batches(&UserId::new("user-c")).is_empty());
     }
 
     fn slot(filename: &str) -> AddedSlot {

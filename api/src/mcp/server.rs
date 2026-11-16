@@ -16,7 +16,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
-use super::{jobs, library, metadata, playlists, settings, sources, status, McpCaller};
+use super::{batches, jobs, library, metadata, playlists, settings, sources, status, McpCaller};
 use crate::connection::ConnectionState;
 
 /// What the server tells a client at `initialize`.
@@ -64,7 +64,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         name: "get_status",
         title: "Soulful status",
         description: |calls_a_minute| {
-            format!("Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work, and why not when they do not, with the importer issues that stand; the user's Navidrome link (connected, admin or not, whether this account can start a scan, and the scan status: songs is the library's song count while no scan runs, files_scanned the files read so far while one does); the user's folders with free space, which one is the default, and in_navidrome (listed when a Navidrome library Soulful has located on this machine holds the folder, so imports into it show up in Navidrome; unknown when Soulful has not located one that does), as many as fit in one answer, folders_left_out counting the rest, which list_folders pages through; the batches downloading now, listed before the folders and as many as fit, running_batches_left_out counting the rest; whether this app may delete music; and the address Soulful is reached at. A folder_id holds until the folder is removed; a batch_id while its batch runs. Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.")
+            format!("Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work, and why not when they do not, with the importer issues that stand; the user's Navidrome link (connected, admin or not, whether this account can start a scan, and the scan status: songs is the library's song count while no scan runs, files_scanned the files read so far while one does); the user's folders with free space, which one is the default, and in_navidrome (listed when a Navidrome library Soulful has located on this machine holds the folder, so imports into it show up in Navidrome; unknown when Soulful has not located one that does), as many as fit in one answer, folders_left_out counting the rest, which list_folders pages through; the batches with unfinished jobs, from Claude or the web page, listed before the folders and as many as fit, running_batches_left_out counting the rest; whether this app may delete music; and the address Soulful is reached at. A folder_id holds until the folder is removed; a batch_id holds while any of its jobs is kept (30 days after it ends). Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.")
         },
         // The schema for a tool without arguments (`server/tools.mdx`, "Tool").
         input_schema: r#"{"type": "object", "additionalProperties": false}"#,
@@ -245,6 +245,8 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     sources::FIND_SOURCES,
     sources::GET_SOURCES,
     jobs::GET_JOBS,
+    batches::GET_BATCH,
+    batches::LIST_BATCHES,
 ];
 
 impl ToolSpec {
@@ -453,7 +455,7 @@ mod tests {
     fn valid_args(tool: &str) -> Value {
         match tool {
             "get_status" | "get_settings" | "list_folders" | "get_library_stats"
-            | "list_starred" | "list_playlists" | "get_jobs" => json!({}),
+            | "list_starred" | "list_playlists" | "get_jobs" | "list_batches" => json!({}),
             "find_in_library" => {
                 json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
             }
@@ -469,6 +471,7 @@ mod tests {
                 json!({"reference": {"artist": "Marrow Choir", "title": "O Holy Night"}})
             }
             "get_sources" => json!({"search_id": "3f1c0d52-8a8e-4c2b-9d61-2b7f0e5a4c19"}),
+            "get_batch" => json!({"batch_id": "8c2d6f1e-4b7a-4e39-a0d5-71f3b9e2c648"}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -528,6 +531,8 @@ mod tests {
         ("find_sources", false, false, false, true),
         ("get_sources", true, false, true, false),
         ("get_jobs", true, false, true, false),
+        ("get_batch", true, false, true, false),
+        ("list_batches", true, false, true, false),
     ];
 
     #[test]

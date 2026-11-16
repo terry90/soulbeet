@@ -24,7 +24,9 @@ use crate::auth::{Role, UserCtx};
 use crate::base_url::BaseUrl;
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::runner::{Acquire, TestEffects};
+use crate::core::jobs::test_support::test_db_with_alice;
 use crate::db::test_db;
+use crate::ledger::store::RunningBatch;
 use crate::mcp::status::{FolderFacts, NavidromeFacts, StatusFacts, StatusSource};
 use crate::mcp::McpCaller;
 use crate::models::folder::Folder;
@@ -41,7 +43,6 @@ use crate::oauth::secrets::new_secret;
 use crate::secret_key::SecretKey;
 use crate::services::NavidromeLookupError;
 use crate::test_navidrome::NavidromeFor;
-use crate::transfer_registry::RunningBatch;
 
 impl ConnectionState {
     /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits,
@@ -454,6 +455,15 @@ pub(crate) async fn app_with_acquire() -> (SqlitePool, Arc<Acquire>, Arc<TestEff
     (db, acquire, effects, token)
 }
 
+/// The jobs of `core::jobs::test_support` are alice's (user id `alice`): a database with her,
+/// the acquisition acting on it, its effects and her access token.
+pub(crate) async fn jobs_app() -> (SqlitePool, Arc<Acquire>, Arc<TestEffects>, String) {
+    let db = test_db_with_alice().await;
+    let token = access_token(&db, "alice", RESOURCE).await;
+    let (acq, effects) = Acquire::for_test(db.clone());
+    (db, acq, effects, token)
+}
+
 /// The router of `ConnectionState::for_test(db)` acting through `acquire`.
 pub(crate) fn app_of(db: &SqlitePool, acquire: &Arc<Acquire>) -> Router {
     router(ConnectionState {
@@ -606,8 +616,8 @@ pub(crate) fn sample_facts() -> StatusFacts {
         default_folder_id: Some("f1".into()),
         running_batches: vec![RunningBatch {
             batch_id: "b1".into(),
-            label: "Come Over".into(),
-            transfers: 2,
+            label: Some("Come Over".into()),
+            unfinished_jobs: 2,
         }],
     }
 }

@@ -15,6 +15,7 @@ use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, Failure, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS};
 use shared::system::{HealthLevel, SystemHealth};
 use soulbeet::navidrome::ScanStatus;
+use sqlx::SqlitePool;
 
 use super::args::Args;
 use super::contract::{failed, success, ToolError};
@@ -23,11 +24,11 @@ use super::McpCaller;
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
 use crate::core::library::{library_roots_in, listing, navidrome_failure};
-use crate::core::{folders, health::system_health, settings};
+use crate::core::{database_failure, folders, health::system_health, settings};
+use crate::ledger::store::{running_batches, RunningBatch};
 use crate::models::folder::Folder;
 use crate::oauth::metadata::mcp_url;
 use crate::services::{navidrome_client_for_user, DEFAULT_DOWNLOAD_BACKEND};
-use crate::transfer_registry::{RunningBatch, TransferRegistry};
 
 /// How long a folder's free space is waited for.
 const FREE_SPACE_WAIT: Duration = Duration::from_secs(2);
@@ -77,20 +78,24 @@ pub(crate) trait StatusSource: Send + Sync {
     async fn gather(&self, ctx: &UserCtx) -> Result<StatusFacts, Failure>;
 }
 
-/// The running instance's backends, database and registry.
-pub(crate) struct LiveStatus;
+/// The running instance's backends, and its database `db`.
+pub(crate) struct LiveStatus {
+    pub db: SqlitePool,
+}
 
 #[async_trait]
 impl StatusSource for LiveStatus {
     /// Reads every fact at once; fails only when the folders, the library
-    /// roots or the settings cannot be read.
+    /// roots, the settings or the ledger's batches cannot be read.
     async fn gather(&self, ctx: &UserCtx) -> Result<StatusFacts, Failure> {
-        let (health, navidrome, folders, library_roots, settings) = tokio::join!(
+        let user = ctx.id();
+        let (health, navidrome, folders, library_roots, settings, batches) = tokio::join!(
             system_health(ctx),
             navidrome_facts(ctx),
             async { Ok::<_, Failure>(with_free_space(folders::list(ctx).await?).await) },
-            library_roots_in(&crate::db::DB, crate::config::CONFIG.navidrome_music_path()),
+            library_roots_in(&self.db, crate::config::CONFIG.navidrome_music_path()),
             settings::get(ctx),
+            running_batches(&self.db, &user),
         );
         Ok(StatusFacts {
             health,
@@ -98,7 +103,7 @@ impl StatusSource for LiveStatus {
             folders: folders?,
             library_roots: library_roots?,
             default_folder_id: chosen_folder(settings?.default_download_folder_id),
-            running_batches: TransferRegistry::global().running_batches(&ctx.id()),
+            running_batches: batches.map_err(|e| database_failure(Stage::Input, e))?,
         })
     }
 }
@@ -304,8 +309,9 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
         .running_batches
         .iter()
         .map(|b| {
-            json!({"batch_id": b.batch_id, "label": cut_json(b.label.clone(), TEXT_MAX_CHARS),
-                "transfers": b.transfers})
+            json!({"batch_id": b.batch_id,
+                "label": b.label.clone().map(|label| cut_json(label, TEXT_MAX_CHARS)),
+                "unfinished_jobs": b.unfinished_jobs})
         })
         .collect();
     let Value::Object(mut fields) = json!({
@@ -417,7 +423,7 @@ mod tests {
                              "free_space_failure": null, "in_navidrome": "listed"}],
                 "folders_left_out": 0,
                 "default_folder_id": "f1",
-                "running_batches": [{"batch_id": "b1", "label": "Come Over", "transfers": 2}],
+                "running_batches": [{"batch_id": "b1", "label": "Come Over", "unfinished_jobs": 2}],
                 "running_batches_left_out": 0,
                 "deletion_enabled": false
             })
@@ -689,8 +695,8 @@ mod tests {
         facts.running_batches = (0..200)
             .map(|i| RunningBatch {
                 batch_id: format!("b{i}"),
-                label: quotes.clone(),
-                transfers: 1,
+                label: Some(quotes.clone()),
+                unfinished_jobs: 1,
             })
             .collect();
         let mut doc = status_fields(&facts, &alice_caller(false));
