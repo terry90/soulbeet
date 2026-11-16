@@ -6,7 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import type { APIRequestContext, BrowserContext, Locator, Page } from '@playwright/test';
 import { expect } from '@playwright/test';
-import { musicDirForApp } from './env.js';
+import { musicDirForApp, slskdApiKey } from './env.js';
 
 export interface TestUser {
   username: string;
@@ -65,6 +65,28 @@ export async function createFolder(
   });
   expect(response.ok(), `create folder ${unique}: ${response.status()}`).toBeTruthy();
   return { name: unique, path };
+}
+
+/**
+ * Points the app at slskd through Settings > Config and allows `musicDir` as a
+ * folder root, as the logged-in admin of `page`. slskd config is app-wide
+ * (app_config table), not per-user.
+ */
+export async function configureInstance(page: Page, slskdUrl: string, musicDir: string): Promise<void> {
+  await openSettings(page);
+  await page.getByRole('button', { name: 'Config' }).click();
+
+  await page.getByPlaceholder('http://localhost:5030').fill(slskdUrl);
+  await page.getByPlaceholder('Enter slskd API key').fill(slskdApiKey);
+  await page.getByRole('button', { name: 'Save Configuration' }).click();
+
+  await expect(page.getByText('Configuration saved')).toBeVisible();
+
+  // Folders may only be created under a root the admin allows.
+  const roots = await page.request.post('/api/folders/roots', {
+    data: { path: musicDir },
+  });
+  expect(roots.ok(), `allow folder root: ${roots.status()}`).toBeTruthy();
 }
 
 export async function loginViaUi(page: Page, user: TestUser): Promise<void> {

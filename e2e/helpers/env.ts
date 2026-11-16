@@ -63,3 +63,25 @@ export const seededAdminId = '00000000-0000-0000-0000-000000000000';
 
 export const navidromeAdminUser = 'admin';
 export const navidromeAdminPassword = 'e2e-navidrome-admin';
+
+/** Navidrome itself as the host reaches it, never through the stubs' proxy. */
+export const navidromeUrl = process.env.E2E_NAVIDROME_URL ?? 'http://127.0.0.1:4533';
+
+// The MCP instance runs only in compose (compose.mcp.yml), so what it dials
+// and where it keeps music are constants of the suite.
+
+/** The seeded admin's password once setup.mcp.ts changed it, which opens the MCP gate. */
+export const mcpAdminPassword = 'e2e-mcp-admin-password';
+
+/** slskd as the MCP instance dials it. */
+export const mcpSlskdUrlForApp = 'http://stubs:5030';
+
+/** The music root as the MCP instance sees it (the mount point). */
+export const mcpMusicDirForApp = '/music';
+
+/**
+ * The compose command words for the MCP stack, run from e2e/ (for example
+ * "docker compose -f compose.e2e.yml -f compose.mcp.yml"). Only the restart
+ * helper reads it.
+ */
+export const mcpCompose = process.env.E2E_MCP_COMPOSE;

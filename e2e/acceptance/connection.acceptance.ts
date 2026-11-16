@@ -1,0 +1,123 @@
+// Connecting an app: sign-in through the MCP SDK, the tool list, get_status,
+// the challenge without a token, and how a long tool call keeps a proxy's
+// connection alive.
+
+import { expect, test } from '@playwright/test';
+import { uniqueUser } from '../helpers/app.js';
+import { mcpBaseUrl } from '../helpers/env.js';
+import { INITIALIZE, connectAs, mcpUrl, rawPost } from '../helpers/mcp.js';
+import { createNavidromeUser } from '../helpers/navidrome.js';
+
+test('a user connects with the MCP SDK, sees every tool with its hints and their status', async ({ browser }) => {
+  const user = uniqueUser('mcp-conn');
+  await createNavidromeUser(user);
+  const mcp = await connectAs(await (await browser.newContext()).newPage(), user);
+
+  const tools = await mcp.listTools();
+  const names = tools.map((t) => t.name);
+  expect(new Set(names).size).toBe(names.length);
+  for (const t of tools) {
+    expect(t.name, t.name).toMatch(/^[a-z][a-z0-9_]{0,63}$/);
+    expect(t.title, t.name).toBeTruthy();
+    for (const hint of ['readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint'] as const) {
+      expect(typeof t.annotations?.[hint], `${t.name} ${hint}`).toBe('boolean');
+    }
+    if (t.annotations?.readOnlyHint) expect(t.annotations.destructiveHint, t.name).toBe(false);
+  }
+  // The tools that remove something; the Rust registry test owns the full list.
+  expect(tools.filter((t) => t.annotations?.destructiveHint).map((t) => t.name).sort()).toEqual([
+    'delete_playlist',
+    'delete_tracks',
+    'promote_discovery_track',
+    'remove_discovery_track',
+    'sync_ratings',
+  ]);
+
+  expect(await mcp.ok('get_status')).toMatchObject({
+    ok: true,
+    base_url: mcpBaseUrl,
+    mcp_url: mcpUrl,
+    user: { username: user.username, role: 'user' },
+    download_backend: { backend: 'slskd', online: true },
+    navidrome: { connected: true, admin: false, can_trigger_scan: false },
+    deletion_enabled: false,
+  });
+  await mcp.close();
+});
+
+test('a call without a token gets the sign-in challenge', async () => {
+  const r = await rawPost(null, INITIALIZE);
+  expect(r.status).toBe(401);
+  expect(r.headers.get('www-authenticate')).toBe(
+    `Bearer error="invalid_token", error_description="No access token was sent", resource_metadata="${mcpBaseUrl}/.well-known/oauth-protected-resource/mcp", scope="soulful"`,
+  );
+});
+
+/**
+ * rawPost, reading the body as it streams: when the headers came, when the
+ * first SSE comment line (":", a keep-alive) came, and when the body ended.
+ */
+async function timedPost(
+  token: string,
+  headers: Record<string, string>,
+  body: unknown,
+): Promise<{ headersAfterMs: number; firstKeepAliveAfterMs: number | null; endAfterMs: number }> {
+  const start = Date.now();
+  const response = await rawPost(token, body, headers);
+  const headersAfterMs = Date.now() - start;
+  expect(response.status).toBe(200);
+  if (response.body === null) throw new Error('the answer has no body');
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let firstKeepAliveAfterMs: number | null = null;
+  let partial = '';
+  for (let read = await reader.read(); !read.done; read = await reader.read()) {
+    const lines = (partial + decoder.decode(read.value, { stream: true })).split('\n');
+    partial = lines.pop() ?? '';
+    if (firstKeepAliveAfterMs === null && lines.some((line) => line.startsWith(':'))) {
+      firstKeepAliveAfterMs = Date.now() - start;
+    }
+  }
+  return { headersAfterMs, firstKeepAliveAfterMs, endAfterMs: Date.now() - start };
+}
+
+test('a long wait sends headers at once and keep-alives for legacy clients, nothing until the answer for 2026-07-28 ones', async ({
+  browser,
+}) => {
+  const user = uniqueUser('mcp-wait');
+  await createNavidromeUser(user);
+  const mcp = await connectAs(await (await browser.newContext()).newPage(), user);
+  // The user has no job, so the call waits the full 20 s.
+  const call = { name: 'get_jobs', arguments: { states: ['searching'], wait_seconds: 20 } };
+
+  const legacy = await timedPost(mcp.provider.accessToken(), {}, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: call,
+  });
+  expect(legacy.headersAfterMs).toBeLessThan(2_000);
+  // rmcp sends an SSE keep-alive every 15 s.
+  expect(legacy.firstKeepAliveAfterMs).toBeLessThan(17_000);
+  expect(legacy.endAfterMs).toBeGreaterThanOrEqual(19_000);
+
+  const modern = await timedPost(
+    mcp.provider.accessToken(),
+    { 'mcp-protocol-version': '2026-07-28', 'mcp-method': 'tools/call', 'mcp-name': 'get_jobs' },
+    {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: {
+        ...call,
+        _meta: {
+          'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+          'io.modelcontextprotocol/clientInfo': { name: 'soulful-acceptance', version: '1' },
+          'io.modelcontextprotocol/clientCapabilities': {},
+        },
+      },
+    },
+  );
+  expect(modern.headersAfterMs).toBeGreaterThanOrEqual(19_000);
+  await mcp.close();
+});

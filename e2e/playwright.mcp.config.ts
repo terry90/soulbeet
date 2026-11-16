@@ -1,4 +1,4 @@
-import { defineConfig } from '@playwright/test';
+import { defineConfig, devices } from '@playwright/test';
 import { mcpBaseUrl } from './helpers/env.js';
 
 // The MCP acceptance suite. Its stack (compose.mcp.yml) lives outside this
@@ -17,5 +17,20 @@ export default defineConfig({
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
-  projects: [{ name: 'contracts', testMatch: /\.contract\.ts/ }],
+  projects: [
+    { name: 'contracts', testMatch: /\.contract\.ts/ },
+    {
+      // Configures the MCP instance and opens its security gate, once.
+      name: 'setup-mcp',
+      dependencies: ['contracts'],
+      testMatch: /setup\.mcp\.ts/,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'mcp',
+      dependencies: ['setup-mcp'],
+      testMatch: /\.acceptance\.ts/,
+      use: { ...devices['Desktop Chrome'] },
+    },
+  ],
 });
