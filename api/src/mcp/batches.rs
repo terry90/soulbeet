@@ -11,7 +11,7 @@ use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_M
 use super::args::Args;
 use super::contract::{answer, invalid_value, upstream_error, NextCall, ToolError};
 use super::facts::{job_document, Detail, ReadNow};
-use super::jobs::{needs_action, read_now, untried_of, Since, WaitFor, MAX_JOB_IDS};
+use super::jobs::{needs_action, read_now, since_call, untried_of, Since, WaitFor, MAX_JOB_IDS};
 use super::paging::{chars, fit, fit_whole, longest_fitting, Page};
 use super::refs::{page_schema, wait_schema};
 use super::server::{common_codes, ToolSpec};
@@ -30,7 +30,7 @@ pub(crate) const GET_BATCH: ToolSpec = ToolSpec {
     title: "Follow a batch",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Pass the last answer's cursor as since, so a wait does not end again for what was already seen; work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). Failure codes: {common}, unknown_handle.")
+        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Pass the last answer's cursor as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to the cursor. Work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). Failure codes: {common}, unknown_handle.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["batch_id"], "properties": {"batch_id": {"type": "string", "minLength": 1}, "since": {"type": "integer", "minimum": 0}, "#,
@@ -124,7 +124,8 @@ pub(crate) async fn get_batch(
                     next: vec![NextCall::new("list_batches", json!({}))],
                 });
             };
-            batch_document(state, caller, &batch, records, since.seq())
+            let again = args.as_value();
+            batch_document(state, caller, &batch, records, since.seq(), again)
                 .await
                 .map_err(failed)
         }
@@ -134,13 +135,15 @@ pub(crate) async fn get_batch(
 
 /// The batch's fields: its jobs counted by state from `jobs`, the cursor (the highest
 /// changed_seq of its jobs), the jobs changed since `since` and the jobs that need action, the
-/// last two read in full.
+/// last two read in full. While a job is unfinished, `next` offers the call `again` (the
+/// arguments given) with the cursor as its `since`.
 async fn batch_document(
     state: &ConnectionState,
     caller: &McpCaller,
     batch: &BatchRecord,
     jobs: Vec<JobRecord>,
     since: i64,
+    again: Value,
 ) -> Result<Map<String, Value>, Failure> {
     let mut summary: BTreeMap<&str, u32> = BTreeMap::new();
     for job in &jobs {
@@ -148,6 +151,7 @@ async fn batch_document(
     }
     let cursor = jobs.iter().map(|job| job.changed_seq).max().unwrap_or(0);
     let all_terminal = jobs.iter().all(|job| job.state.is_terminal());
+    let follow = (!all_terminal).then(|| since_call("get_batch", again, cursor));
     let shown = (jobs.iter())
         .filter(|job| job.changed_seq > since || needs_action(job.state))
         .cloned()
@@ -193,22 +197,24 @@ async fn batch_document(
             (view.job.id.clone(), document)
         })
         .collect();
-    Ok(fit_actions(fields, needs, changed))
+    Ok(fit_actions(fields, needs, changed, follow))
 }
 
 /// `fields` with `needs_action`, the full documents of `needs` (each with its job id), and
 /// `changed`, the summaries of the changed jobs, newest change first, kept within
 /// RESULT_MAX_CHARS once "ok" is added. The needs-action documents come first: the ids of those
 /// that do not fit go in `needs_action_more`, the first MAX_JOB_IDS of them offered in `next` as
-/// one get_jobs call. The changes fill what is left, `changed_more` counting those left out.
+/// one get_jobs call, before `follow`. The changes fill what is left, `changed_more` counting
+/// those left out.
 fn fit_actions(
     mut fields: Map<String, Value>,
     needs: Vec<(String, Value)>,
     changed: Vec<Value>,
+    follow: Option<NextCall>,
 ) -> Map<String, Value> {
     fields.insert("needs_action".into(), json!([]));
     fields.insert("needs_action_more".into(), json!([]));
-    fields.insert("next".into(), json!([]));
+    fields.insert("next".into(), json!(follow.iter().collect::<Vec<_>>()));
     // Room for the changes' empty list and their count at its longest.
     fields.insert("changed".into(), json!([]));
     fields.insert("changed_more".into(), json!(changed.len()));
@@ -231,7 +237,8 @@ fn fit_actions(
     let more = &ids[k..];
     if !more.is_empty() {
         fields.insert("needs_action_more".into(), json!(more));
-        fields.insert("next".into(), json!([more_call(more)]));
+        let next: Vec<NextCall> = Some(more_call(more)).into_iter().chain(follow).collect();
+        fields.insert("next".into(), json!(next));
     }
     fit_whole(fields, "changed", changed, "changed_more")
 }
@@ -306,7 +313,7 @@ mod tests {
     use serde_json::{json, Map, Value};
     use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 
-    use super::fit_actions;
+    use super::{fit_actions, NextCall};
     use crate::mcp::paging::RESULT_MAX_CHARS;
 
     use crate::connection::test_util::{app_of, call_tool, document, jobs_app};
@@ -390,13 +397,19 @@ mod tests {
         // A full document: its slots and timeline are there.
         assert!(doc["needs_action"][0]["slots"].is_array(), "{doc}");
         assert!(doc["cursor"].as_i64() > cursor.as_i64());
+        // A job still downloads: the same call again, past what this answer showed.
         assert_eq!(
             (
                 &doc["needs_action_more"],
                 doc["changed_more"].as_u64(),
                 &doc["next"]
             ),
-            (&json!([]), Some(0), &json!([]))
+            (
+                &json!([]),
+                Some(0),
+                &json!([{"tool": "get_batch", "args": {"batch_id": batch, "since": doc["cursor"],
+                    "wait_seconds": 180, "wait_for": "needs_action"}}])
+            )
         );
     }
 
@@ -515,14 +528,16 @@ mod tests {
             .collect();
         let changed: Vec<Value> = (0..40).map(|i| json!({"job_id": i, "pad": pad})).collect();
         let fields = Map::from_iter([("batch_id".to_string(), json!("b1"))]);
-        let mut doc = fit_actions(fields, needs.clone(), changed);
+        let follow = NextCall::new("get_batch", json!({"batch_id": "b1", "since": 7}));
+        let mut doc = fit_actions(fields, needs.clone(), changed, Some(follow.clone()));
         let shown = doc["needs_action"].as_array().unwrap().len();
         let more: Vec<Value> = needs[shown..].iter().map(|(id, _)| json!(id)).collect();
         assert!(shown > 1 && shown < 200, "{shown}");
         assert_eq!(doc["needs_action_more"], Value::Array(more.clone()));
         assert_eq!(
             doc["next"],
-            json!([{"tool": "get_jobs", "args": {"job_ids": more[..100], "detail": "full"}}])
+            json!([{"tool": "get_jobs", "args": {"job_ids": more[..100], "detail": "full"}},
+                follow])
         );
         // The needs-action documents leave no room for the changes: they are counted.
         assert_eq!(
@@ -535,7 +550,7 @@ mod tests {
         // With room, the newest changes come first and the oldest are counted.
         let needs = needs[..1].to_vec();
         let changed: Vec<Value> = (0..80).map(|i| json!({"job_id": i, "pad": pad})).collect();
-        let doc = fit_actions(Map::new(), needs, changed);
+        let doc = fit_actions(Map::new(), needs, changed, None);
         let kept = doc["changed"].as_array().unwrap().len();
         assert!(kept > 1 && kept < 80, "{kept}");
         assert_eq!(doc["changed"][0]["job_id"], 0);

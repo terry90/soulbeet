@@ -48,6 +48,7 @@ const GET_JOBS_ARGS: &[&str] = &[
     "batch_id",
     "states",
     "detail",
+    "since",
     "wait_seconds",
     "wait_for",
     "limit",
@@ -77,10 +78,10 @@ pub(crate) const GET_JOBS: ToolSpec = ToolSpec {
     title: "Show jobs",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Shows jobs by job_ids, or by batch_id and states. Summary detail gives each job's state and failure code; full detail gives the current download with live bytes, speed, place in the source's queue and whether the source is online, earlier attempts with their failures (tried), the timeline, what beets applied and Navidrome lists (or, while Navidrome has not listed it yet, when the import ended and whether a scan was asked for; get_status says whether Navidrome is scanning), and next: the calls that can be made for the job now. wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after the call came), needs_action (a job needs action: needs_source_choice, needs_decision or failed) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Job ids stay valid 30 days after the job ends. Failure codes: {common}, unknown_handle (a job id this user has no job for; facts.unknown_job_ids names them).")
+        format!("Shows jobs by job_ids, or by batch_id and states. Summary detail gives each job's state and failure code; full detail gives the current download with live bytes, speed, place in the source's queue and whether the source is online, earlier attempts with their failures (tried), the timeline, what beets applied and Navidrome lists (or, while Navidrome has not listed it yet, when the import ended and whether a scan was asked for; get_status says whether Navidrome is scanning), and next: the calls that can be made for the job now. wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action: needs_source_choice, needs_decision or failed; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Each answer has change_cursor: pass it as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to it. Job ids stay valid 30 days after the job ends. Failure codes: {common}, unknown_handle (a job id this user has no job for; facts.unknown_job_ids names them).")
     },
     input_schema: concat!(
-        r#"{"type": "object", "additionalProperties": false, "properties": {"job_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1}}, "batch_id": {"type": "string", "minLength": 1}, "states": {"type": "array", "items": {"enum": ["searching", "queued", "downloading", "importing", "indexing", "done", "needs_source_choice", "needs_decision", "failed", "cancelled", "dismissed"]}}, "detail": {"enum": ["summary", "full"]}, "#,
+        r#"{"type": "object", "additionalProperties": false, "properties": {"job_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1}}, "batch_id": {"type": "string", "minLength": 1}, "states": {"type": "array", "items": {"enum": ["searching", "queued", "downloading", "importing", "indexing", "done", "needs_source_choice", "needs_decision", "failed", "cancelled", "dismissed"]}}, "detail": {"enum": ["summary", "full"]}, "since": {"type": "integer", "minimum": 0}, "#,
         wait_schema!(),
         ", ",
         page_schema!(),
@@ -164,6 +165,8 @@ pub(crate) fn needs_action(state: JobState) -> bool {
 struct Call {
     select: JobSelect,
     detail: Detail,
+    /// A change_cursor of an earlier answer.
+    since: Option<i64>,
     wait: Duration,
     wait_for: WaitFor,
     page: Page,
@@ -187,6 +190,8 @@ fn read_call(args: &Args) -> Result<Call, ToolError> {
         "full" => Detail::Full,
         _ => Detail::Summary,
     };
+    // A change number, compared with the jobs' changed_seq.
+    let since = args.opt_u32("since", 0, u32::MAX)?.map(i64::from);
     let (wait, wait_for) = WaitFor::read(args)?;
     let names: Vec<&str> = states.iter().map(|s| s.as_str()).collect();
     let listing = json!({"job_ids": job_ids, "batch_id": batch_id, "states": names,
@@ -205,6 +210,7 @@ fn read_call(args: &Args) -> Result<Call, ToolError> {
     Ok(Call {
         select,
         detail,
+        since,
         wait,
         wait_for,
         page,
@@ -243,8 +249,10 @@ pub(crate) async fn get_jobs(
         async {
             let call = read_call(&args)?;
             let acquire = &state.acquire;
-            // The wait takes no cursor: it waits from the change number read now.
-            let since = Since::Now(*acquire.ledger.changes().borrow());
+            let since = match call.since {
+                Some(seq) => Since::Given(seq),
+                None => Since::Now(*acquire.ledger.changes().borrow()),
+            };
             let failed = |f| upstream_error(f, Map::new(), args.same_call());
             // The wait and the page read records; only the page's jobs are read in full.
             let records = wait::until(
@@ -264,6 +272,17 @@ pub(crate) async fn get_jobs(
                 return Err(unknown_jobs(&args, &call.select, unknown));
             }
             let more = records.len() > call.page.offset + call.page.limit;
+            let cursor = records.iter().map(|job| job.changed_seq).max().unwrap_or(0);
+            let unfinished = records.iter().any(|job| !job.state.is_terminal());
+            let mut fields = Map::new();
+            fields.insert("change_cursor".into(), json!(cursor));
+            let mut again = args.as_value();
+            if let Value::Object(given) = &mut again {
+                // A page cursor names a place in the listing as this answer read it.
+                given.remove("cursor");
+            }
+            let follow = unfinished.then(|| since_call("get_jobs", again, cursor));
+            fields.insert("next".into(), json!(follow.iter().collect::<Vec<_>>()));
             let page = (records.into_iter())
                 .skip(call.page.offset)
                 .take(call.page.limit)
@@ -281,10 +300,19 @@ pub(crate) async fn get_jobs(
                     job_document(view, untried, call.detail, now, caller.allow_delete)
                 })
                 .collect();
-            Ok(fit(Map::new(), "jobs", documents, &call.page, more))
+            Ok(fit(fields, "jobs", documents, &call.page, more))
         }
         .await,
     )
+}
+
+/// `tool` called again with `args` (the arguments given), `since` set to `cursor`: the call that
+/// follows unfinished jobs past what an answer showed.
+pub(crate) fn since_call(tool: &'static str, mut args: Value, cursor: i64) -> NextCall {
+    if let Value::Object(given) = &mut args {
+        given.insert("since".into(), json!(cursor));
+    }
+    NextCall::new(tool, args)
 }
 
 /// Each of `views`' untried candidates, the sources' recent failures read once.
@@ -764,11 +792,12 @@ mod tests {
     use crate::core::jobs::runner::drive;
     use crate::core::jobs::test_support::{
         auto_options, downloading_track_job, downloading_track_job_with, duplicate_track_job,
-        failed_track_job, failed_web_ui_job, mcp_track_job, track_job_of,
+        fail_slot, failed_track_job, failed_web_ui_job, mcp_track_job, track_job_of,
     };
     use crate::core::test_ctx;
     use crate::ledger::{JobEvent, JobState};
     use crate::server_fns::download::test_support::{search_result, transfer};
+    use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 
     #[tokio::test]
     async fn full_detail_shows_the_live_transfer_and_its_place_in_the_queue() {
@@ -946,6 +975,45 @@ mod tests {
         });
         let doc = document(&wait.await.unwrap());
         assert_eq!(doc["jobs"][0]["state"], "cancelled", "{doc}");
+    }
+
+    #[tokio::test]
+    async fn a_wait_past_since_skips_a_failure_already_seen() {
+        let (db, acq, _, token) = jobs_app().await;
+        let first = downloading_track_job(&acq).await;
+        let second = downloading_track_job_with(&acq, "Silent Night", auto_options()).await;
+        let app = app_of(&db, &acq);
+        // Soulful's own text for a transfer the user cancelled.
+        let stopped = Failure::new(
+            FailureCode::TransferCancelled,
+            Stage::Transfer,
+            RetryAdvice::NotRetryable,
+            "Cancelled on request",
+        );
+        fail_slot(&acq, &first, stopped.clone()).await;
+        let call = json!({"job_ids": [first, second], "wait_seconds": 120,
+            "wait_for": "needs_action"});
+        let seen = document(&call_tool(app.clone(), &token, "get_jobs", call.clone()).await);
+        let cursor = seen["change_cursor"].clone();
+        let mut again = call.clone();
+        again["since"] = cursor.clone();
+        assert_eq!(
+            seen["next"],
+            json!([{"tool": "get_jobs", "args": again}]),
+            "{seen}"
+        );
+        let wait = tokio::spawn({
+            let (app, token) = (app.clone(), token.clone());
+            async move { call_tool(app, &token, "get_jobs", again).await }
+        });
+        // Under the router test client's 5 s read.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!wait.is_finished(), "the failure was already seen");
+        fail_slot(&acq, &second, stopped).await;
+        let doc = document(&wait.await.unwrap());
+        assert!(doc["change_cursor"].as_i64() > cursor.as_i64(), "{doc}");
+        // Every job ended: nothing to follow.
+        assert_eq!(doc["next"], json!([]));
     }
 
     #[tokio::test]
