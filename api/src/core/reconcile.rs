@@ -1645,6 +1645,7 @@ mod tests {
                 rows: vec![row.with_state(DownloadState::ImportSkipped)],
                 next: JobState::NeedsDecision,
                 index: None,
+                results: vec![],
             })));
         }
         ledger.settled().await;

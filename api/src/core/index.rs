@@ -1,10 +1,11 @@
 //! The index wait: after an import, whether Navidrome lists the imported files (design 11.7).
 
 use super::delete_guard::paths;
+use super::library::SongFacts;
 use crate::auth::UserId;
 use crate::globals::send_user_event;
 use crate::ledger::store::{self, IndexingSlot};
-use crate::ledger::{IndexWait, JobEvent, JobState, Ledger, ScanBaseline};
+use crate::ledger::{IndexWait, JobEvent, JobState, Ledger, ScanBaseline, SlotResult};
 use crate::services::NavidromeLookupError;
 use async_trait::async_trait;
 use shared::download::{DownloadEvent, DownloadProgress, IndexState, JobSlot};
@@ -132,46 +133,59 @@ fn lookup_text(item: &ImportedItem) -> Option<String> {
     .map(|text| text.trim().to_string())
 }
 
-/// Whether every item of `wait` is listed: each looked up by its recording MBID, then by
-/// lookup_text (D7), paging LOOKUP_PAGE at a time until a short page, or, with no text Navidrome
-/// keeps, among the NEWEST_PAGES pages of the songs it added last, where a file just imported
-/// is. Each candidate is checked with is_imported_file against the size of
-/// wait.library.join(item.path) on disk. An item whose file cannot be read is not listed. Every
-/// song of every page the lookup read that it took for the file teaches where the libraries are
-/// on this machine (paths::learn_in), so a library with two such songs, on one page or on two,
-/// teaches nothing.
+/// The song Navidrome lists for each item of `wait`, in order, or None when an item is not
+/// listed (library_songs, the first in id order). Every song library_songs took for an item's
+/// file teaches where the libraries are on this machine (paths::learn_in), so a library with two
+/// such songs, on one page or on two, teaches nothing.
 pub(crate) async fn listed(
     db: &SqlitePool,
     navi: &NavidromeClient,
     wait: &IndexWait,
-) -> Result<bool, NavidromeError> {
+) -> Result<Option<Vec<NativeSong>>, NavidromeError> {
+    let mut listed = Vec::with_capacity(wait.items.len());
     for item in &wait.items {
+        let found = library_songs(navi, &wait.library, item).await?;
+        let Some(first) = found.first().cloned() else {
+            return Ok(None);
+        };
         let local = wait.library.join(&item.path);
-        let Ok(file) = tokio::fs::metadata(&local).await else {
-            return Ok(false);
-        };
-        let size = file.len();
-        let mut found = match &item.recording_mbid {
-            Some(mbid) => lists(navi, mbid, &item.path, size).await?,
-            None => vec![],
-        };
-        if found.is_empty() {
-            found = match lookup_text(item) {
-                Some(text) => lists(navi, &text, &item.path, size).await?,
-                None => among_newest(navi, &item.path, size).await?,
-            };
-        }
-        if found.is_empty() {
-            return Ok(false);
-        }
         if let Err(e) = paths::learn_in(db, &found, &local).await {
             warn!(
                 "Could not learn where Navidrome's libraries are on this machine from {}: {e}",
                 local.display()
             );
         }
+        listed.push(first);
     }
-    Ok(true)
+    Ok(Some(listed))
+}
+
+/// Every song Navidrome lists that is `item`'s file in `library`, in id order: looked up by its
+/// recording MBID, then by lookup_text (D7), paging LOOKUP_PAGE at a time until a short page, or,
+/// with no text Navidrome keeps, among the NEWEST_PAGES pages of the songs it added last, where a
+/// file just imported is. Each candidate is checked with is_imported_file against the size of
+/// library.join(item.path) on disk. Empty when none is or the file cannot be read.
+pub(crate) async fn library_songs(
+    navi: &NavidromeClient,
+    library: &Path,
+    item: &ImportedItem,
+) -> Result<Vec<NativeSong>, NavidromeError> {
+    let Ok(file) = tokio::fs::metadata(library.join(&item.path)).await else {
+        return Ok(vec![]);
+    };
+    let size = file.len();
+    let mut found = match &item.recording_mbid {
+        Some(mbid) => lists(navi, mbid, &item.path, size).await?,
+        None => vec![],
+    };
+    if found.is_empty() {
+        found = match lookup_text(item) {
+            Some(text) => lists(navi, &text, &item.path, size).await?,
+            None => among_newest(navi, &item.path, size).await?,
+        };
+    }
+    found.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(found)
 }
 
 /// Every song of the NEWEST_PAGES pages of LOOKUP_PAGE songs Navidrome added last (up to a short
@@ -337,22 +351,34 @@ impl NavidromeOf for ServerNavidrome {
     }
 }
 
-/// What a runner holds between rounds, by slot: the wait as it last persisted it, or None once
-/// the slot ended (Done or Failed), so a round never acts on an older copy its own write has not
-/// replaced in the database yet; when the runner first held it; and whether a failed scan request
-/// for it was logged. A round drops the slots indexing_slots no longer returns.
+/// What a runner holds between rounds, by slot: the wait as it last persisted it, or that it
+/// ended, so a round never acts on an older copy its own write has not replaced in the database
+/// yet; when the runner first held it; and whether a failed scan request for it was logged. A
+/// round drops the slots indexing_slots no longer returns.
 #[derive(Default)]
 pub(crate) struct IndexRunner {
-    waits: HashMap<JobSlot, Option<IndexWait>>,
+    waits: HashMap<JobSlot, Held>,
     /// On Soulful's clock. A wait a restart interrupted gets its give-up time from here.
     held_since: HashMap<JobSlot, i64>,
     scan_warned: HashSet<JobSlot>,
+}
+
+/// A slot's wait as the runner holds it.
+enum Held {
+    Waiting(IndexWait),
+    /// The slot ended (Done or Failed) waiting as the wait stored with `since`. A slot moved back
+    /// to indexing waits from a later time (a reindex) and is held again.
+    Ended {
+        since: i64,
+    },
 }
 
 /// The slots of one import, waiting together, and the wait as the runner knows it.
 struct Import {
     wait: IndexWait,
     rows: Vec<DownloadProgress>,
+    /// Each slot's result, as stored.
+    results: Vec<(JobSlot, SlotResult)>,
     /// The later of when the import ended and when the runner first held it: a downtime does not
     /// count against the wait.
     since: i64,
@@ -367,7 +393,7 @@ impl Import {
 /// One round at `now`: reads indexing_slots, groups them by user and import, and for each user
 /// asks `navidrome` for a client and reads the scan status once.
 ///
-/// - A slot whose row or wait cannot be read ends failed (Unreadable), logged once.
+/// - A slot whose row, wait or result cannot be read ends failed (Unreadable), logged once.
 /// - NotLinked/NoServer: the slots are Done, rows unchanged (D9).
 /// - Another lookup or status error: Wait, and Fail with e.failure(Stage::Index, e.to_string())
 ///   once INDEX_GIVE_UP_SECS have passed since the import's `since`, counted from no earlier
@@ -382,8 +408,9 @@ impl Import {
 ///   Another start_scan error keeps the wait without the new baseline, so the next idle round
 ///   asks again, and fails it as a status error does once given up; it is logged at warn once
 ///   per wait, then at debug.
-/// - Listed: rows with index Listed, Slots { Done }. Fail(f): rows with index Failed(f),
-///   Slots { Failed }. A changed wait: Indexing. Rows go out with send_user_event.
+/// - Listed: rows with index Listed, Settled { Done } with each slot's result listing the songs
+///   listed() found. Fail(f): rows with index Failed(f), Slots { Failed }. A changed wait:
+///   Indexing. Rows go out with send_user_event.
 pub(crate) async fn index_round(
     db: &SqlitePool,
     ledger: &Ledger,
@@ -417,7 +444,7 @@ pub(crate) async fn index_round(
         let navi = match navidrome.navidrome_of(&user).await {
             Err(NavidromeLookupError::NotLinked | NavidromeLookupError::NoServer) => {
                 for import in imports {
-                    end(ledger, runner, &user, import, JobState::Done, None).await;
+                    end(ledger, runner, &user, import, Ending::Unlinked).await;
                 }
                 continue;
             }
@@ -439,7 +466,9 @@ pub(crate) async fn index_round(
         }
         for import in &imports {
             for slot in import.slots() {
-                runner.waits.insert(slot, Some(import.wait.clone()));
+                runner
+                    .waits
+                    .insert(slot, Held::Waiting(import.wait.clone()));
             }
         }
         let read = match navi {
@@ -478,7 +507,8 @@ pub(crate) async fn index_round(
 }
 
 /// The slots of a round by user, each user's by import, and the rows of the slots the runner
-/// held nothing for. A slot that ended is left out.
+/// holds no wait for. A slot whose wait the runner ended is left out while it is stored with that
+/// wait's `since`.
 fn group(
     runner: &IndexRunner,
     slots: Vec<IndexingSlot>,
@@ -489,12 +519,13 @@ fn group(
         user,
         row,
         wait,
+        result,
     } in slots
     {
-        let wait = match runner.waits.get(&slot) {
-            Some(None) => continue,
-            Some(Some(held)) => held.clone(),
-            None => wait,
+        let (wait, new) = match runner.waits.get(&slot) {
+            Some(Held::Ended { since }) if *since == wait.since => continue,
+            Some(Held::Waiting(held)) => (held.clone(), false),
+            _ => (wait, true),
         };
         let since = wait
             .since
@@ -506,18 +537,20 @@ fn group(
                 users.len() - 1
             }
         };
-        let (_, imports, new) = &mut users[at];
-        if !runner.waits.contains_key(&slot) {
-            new.push(row.clone());
+        let (_, imports, unheld) = &mut users[at];
+        if new {
+            unheld.push(row.clone());
         }
         match imports.iter_mut().find(|i| i.wait.import == wait.import) {
             Some(import) => {
                 import.since = import.since.max(since);
                 import.rows.push(row);
+                import.results.push((slot, result));
             }
             None => imports.push(Import {
                 wait,
                 rows: vec![row],
+                results: vec![(slot, result)],
                 since,
             }),
         }
@@ -552,11 +585,11 @@ async fn advance(
 ) -> Option<ScanAsk> {
     let Reading { user, navi, status } = *read;
     let mut wait = import.wait.clone();
-    let mut found = false;
+    let mut songs = None;
     if !status.scanning && wait.checked != Some(status.last_scan) {
         match listed(db, navi, &wait).await {
             Ok(listed) => {
-                found = listed;
+                songs = listed;
                 wait.checked = Some(status.last_scan);
             }
             Err(e) => {
@@ -567,15 +600,12 @@ async fn advance(
             }
         }
     }
-    match next_step(&wait, status, found, given_up(import.since, now)) {
+    match next_step(&wait, status, songs.is_some(), given_up(import.since, now)) {
         Step::Listed => {
-            let listed = Some(IndexState::Listed);
-            end(ledger, runner, user, import, JobState::Done, listed).await;
+            let listed = songs.iter().flatten().map(SongFacts::from).collect();
+            end(ledger, runner, user, import, Ending::Listed(listed)).await;
         }
-        Step::Fail(f) => {
-            let failed = Some(IndexState::Failed(f));
-            end(ledger, runner, user, import, JobState::Failed, failed).await;
-        }
+        Step::Fail(f) => end(ledger, runner, user, import, Ending::Failed(f)).await,
         Step::StartScan(started) => {
             return Some(ScanAsk {
                 import,
@@ -644,8 +674,8 @@ async fn give_up_after(
     now: i64,
 ) {
     if given_up(import.since, now) {
-        let index = Some(IndexState::Failed(failure.clone()));
-        end(ledger, runner, user, import, JobState::Failed, index).await;
+        let failed = Ending::Failed(failure.clone());
+        end(ledger, runner, user, import, failed).await;
     } else {
         keep(ledger, runner, import, wait);
     }
@@ -658,7 +688,9 @@ fn keep(ledger: &Ledger, runner: &mut IndexRunner, import: Import, wait: IndexWa
     }
     let slots = import.slots();
     for slot in &slots {
-        runner.waits.insert(slot.clone(), Some(wait.clone()));
+        runner
+            .waits
+            .insert(slot.clone(), Held::Waiting(wait.clone()));
     }
     ledger.record(JobEvent::Indexing {
         slots,
@@ -666,35 +698,90 @@ fn keep(ledger: &Ledger, runner: &mut IndexRunner, import: Import, wait: IndexWa
     });
 }
 
-/// Ends the import's slots in `state`; rows with `index` set go to the user, others stay as stored.
+/// How an import's wait ends.
+enum Ending {
+    /// Navidrome lists the songs, one per applied item in order: Done, rows with index Listed,
+    /// each slot's result listing them.
+    Listed(Vec<SongFacts>),
+    /// Failed, rows with index Failed.
+    Failed(Failure),
+    /// A user without Navidrome: Done, rows unchanged (D9).
+    Unlinked,
+}
+
+/// Ends the import's slots as `ending` says; rows with an index set go to the user, others stay
+/// as stored.
 async fn end(
     ledger: &Ledger,
     runner: &mut IndexRunner,
     user: &UserId,
     import: Import,
-    state: JobState,
-    index: Option<IndexState>,
+    ending: Ending,
 ) {
     for slot in import.slots() {
-        runner.waits.insert(slot, None);
+        runner.waits.insert(
+            slot,
+            Held::Ended {
+                since: import.wait.since,
+            },
+        );
     }
-    let rows = match &index {
-        Some(index) => import
+    let indexed = |index: IndexState| -> Vec<DownloadProgress> {
+        import
             .rows
-            .into_iter()
+            .iter()
             .map(|row| DownloadProgress {
                 index: Some(index.clone()),
-                ..row
+                ..row.clone()
             })
-            .collect(),
-        None => import.rows,
+            .collect()
     };
-    ledger.record(JobEvent::Slots {
-        state,
-        rows: rows.clone(),
-    });
-    if index.is_some() {
-        send_user_event(user, DownloadEvent::Progress(rows)).await;
+    let rows = match ending {
+        Ending::Unlinked => {
+            ledger.record(JobEvent::Slots {
+                state: JobState::Done,
+                rows: import.rows,
+            });
+            return;
+        }
+        Ending::Failed(failure) => {
+            let rows = indexed(IndexState::Failed(failure));
+            ledger.record(JobEvent::Slots {
+                state: JobState::Failed,
+                rows: rows.clone(),
+            });
+            rows
+        }
+        Ending::Listed(songs) => {
+            let rows = indexed(IndexState::Listed);
+            let results = import
+                .results
+                .into_iter()
+                .map(|(slot, result)| (slot, listing(result, &songs)))
+                .collect();
+            ledger.record(JobEvent::Settled {
+                state: JobState::Done,
+                rows: rows.clone(),
+                results,
+            });
+            rows
+        }
+    };
+    send_user_event(user, DownloadEvent::Progress(rows)).await;
+}
+
+/// `result` with `songs` as what Navidrome lists for its applied items.
+fn listing(result: SlotResult, songs: &[SongFacts]) -> SlotResult {
+    match result {
+        SlotResult::Imported {
+            applied, untagged, ..
+        } => SlotResult::Imported {
+            applied,
+            untagged,
+            listed: Some(songs.to_vec()),
+        },
+        // Never waits for Navidrome.
+        other @ SlotResult::AlreadyInLibrary { .. } => other,
     }
 }
 
@@ -724,7 +811,8 @@ mod tests {
     use crate::auth::UserId;
     use crate::core::delete_guard::test_support::{mtime, set_mtime};
     use crate::ledger::{
-        store, IndexWait, JobEvent, JobKind, JobState, Ledger, NewJob, ScanBaseline,
+        store, ImportDone, IndexWait, JobEvent, JobKind, JobState, Ledger, NewJob, ScanBaseline,
+        SlotResult, StoredImport,
     };
     use crate::models::navidrome_library::NavidromeLibraryRow;
     use crate::server_fns::download::test_support::item;
@@ -736,7 +824,7 @@ mod tests {
     use shared::failure::{FailureCode, Stage, UserActionCode};
     use soulbeet::navidrome::models::NativeSong;
     use soulbeet::navidrome::ScanStatus;
-    use soulbeet::{ImportMode, ImportedItem};
+    use soulbeet::{DriverChoice, ImportMode, ImportedItem};
     use sqlx::SqlitePool;
     use std::path::Path;
     use tokio::sync::broadcast;
@@ -1067,7 +1155,7 @@ mod tests {
                 &song_json("Zzqx Artist/Best Of/01 Song Number 1.mp3", 4),
             ],
         );
-        assert!(!listed(&db, &navi.client(), &wait).await.unwrap());
+        assert!(listed(&db, &navi.client(), &wait).await.unwrap().is_none());
         navi.answer(
             "/api/song",
             &[&song_json(
@@ -1075,7 +1163,7 @@ mod tests {
                 4,
             )],
         );
-        assert!(listed(&db, &navi.client(), &wait).await.unwrap());
+        assert!(listed(&db, &navi.client(), &wait).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1102,7 +1190,7 @@ mod tests {
             "/api/song",
             &[&format!("[{}]", first.join(",")), &format!("[{second}]")],
         );
-        assert!(listed(&db, &navi.client(), &wait).await.unwrap());
+        assert!(listed(&db, &navi.client(), &wait).await.unwrap().is_some());
         assert_eq!(song_lookups(&navi).len(), 2);
         assert_eq!(NavidromeLibraryRow::get_in(&db, 1).await.unwrap(), None);
     }
@@ -1170,6 +1258,34 @@ mod tests {
 
     const IDLE: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"scanStatus":{"scanning":false,"count":1342,"folderCount":120,"lastScan":"2026-11-15T10:02:00Z","scanType":"quick","elapsedTime":4000000000}}}"#;
 
+    /// Records the import of `row`'s slot ending as the import queue's finish() records an
+    /// import of `wait`'s items: waiting for Navidrome, with what beets applied as its result.
+    fn imported_as(ledger: &Ledger, row: DownloadProgress, wait: IndexWait) {
+        let slot = row.job.clone().unwrap();
+        ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
+            import: StoredImport {
+                sources: vec![wait.import.clone().into()],
+                target: wait.library.clone(),
+                album: false,
+                cleanup_root: None,
+                choices: None,
+                choice: DriverChoice::Auto,
+                rows: vec![(slot.clone(), row.clone())],
+            },
+            rows: vec![row],
+            next: JobState::Indexing,
+            results: vec![(
+                slot,
+                SlotResult::Imported {
+                    applied: wait.items.clone(),
+                    untagged: false,
+                    listed: None,
+                },
+            )],
+            index: Some(wait),
+        })));
+    }
+
     /// A user of its own (the user channels are process-wide) with job j1 whose slot 0 is
     /// imported and waiting as `wait`, its row as finish() sends it.
     async fn indexing(
@@ -1216,17 +1332,157 @@ mod tests {
         });
         let row = DownloadProgress::queued("t-01".into(), "peer_a".into(), "01.mp3".into(), 4)
             .with_state(DownloadState::Imported)
-            .with_job(slot.clone());
-        ledger.record(JobEvent::Slots {
-            state: JobState::Indexing,
-            rows: vec![row],
-        });
-        ledger.record(JobEvent::Indexing {
-            slots: vec![slot],
-            wait: Box::new(wait),
-        });
+            .with_job(slot);
+        imported_as(&ledger, row, wait);
         ledger.settled().await;
         (ledger, db, rx, user)
+    }
+
+    /// Slot 0 of job j1's stored result.
+    async fn result_of(db: &SqlitePool) -> SlotResult {
+        let result: Option<String> =
+            sqlx::query_scalar("SELECT result FROM job_tracks WHERE job_id = 'j1' AND slot = 0")
+                .fetch_one(db)
+                .await
+                .unwrap();
+        serde_json::from_str(&result.unwrap()).unwrap()
+    }
+
+    /// The native record Navidrome sends for imported_in's file (every field of
+    /// model/mediafile.go:53-57 that SongFacts reads; Navidrome writes bitDepth 0 for a lossy
+    /// file).
+    fn listed_mp3(path: &str, size: u64) -> String {
+        format!(
+            r#"[{{"id":"f2c4d1a8b0e94c37a6d5e8b1c2a3f405","libraryId":1,"libraryPath":"/music","path":"{path}",
+        "title":"Song Number 1","album":"Qzz Album","artist":"Zzqx Artist","albumArtist":"Zzqx Artist","size":{size},
+        "suffix":"mp3","duration":263.4,"bitRate":320,"sampleRate":44100,"bitDepth":0,
+        "mbzRecordingID":"dfeb96a7-f78a-4b04-93ce-c39e28c9a173","missing":false,
+        "updatedAt":"2026-11-15T10:01:30.123456789Z"}}]"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_listed_import_stores_the_file_navidrome_lists_and_what_beets_applied() {
+        let library = tempfile::tempdir().unwrap();
+        let wait = imported_in(library.path());
+        let applied = wait.items.clone();
+        let (ledger, db, _rx, _) = indexing(wait).await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        let body = listed_mp3("alice/Zzqx Artist/Qzz Album/01 Song Number 1.mp3", 4);
+        navi.answer("/api/song", &[&body]);
+        index_round(
+            &db,
+            &ledger,
+            &NavidromeFor(Ok(navi.client())),
+            &mut IndexRunner::default(),
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        let SlotResult::Imported {
+            applied: got,
+            untagged: false,
+            listed: Some(songs),
+        } = result_of(&db).await
+        else {
+            panic!()
+        };
+        assert_eq!(got, applied);
+        let [file] = &songs[..] else {
+            panic!("{songs:?}")
+        };
+        assert_eq!(
+            (
+                file.song_id.as_str(),
+                file.format.as_deref(),
+                file.bitrate_kbps,
+                file.size_bytes,
+                file.duration_s,
+                file.path.as_deref()
+            ),
+            (
+                "f2c4d1a8b0e94c37a6d5e8b1c2a3f405",
+                Some("mp3"),
+                Some(320),
+                Some(4),
+                Some(263),
+                Some("alice/Zzqx Artist/Qzz Album/01 Song Number 1.mp3")
+            )
+        );
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Done));
+    }
+
+    #[tokio::test]
+    async fn a_slot_moved_back_to_indexing_after_it_ended_waits_again() {
+        let library = tempfile::tempdir().unwrap();
+        // Waiting again from 2_000, as a reindex leaves it.
+        let (ledger, db, mut rx, _) = indexing(IndexWait {
+            since: 2_000,
+            ..imported_in(library.path())
+        })
+        .await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        navi.answer(
+            "/api/song",
+            &[&song_json(
+                "alice/Zzqx Artist/Qzz Album/01 Song Number 1.mp3",
+                4,
+            )],
+        );
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        let mut runner = IndexRunner::default();
+        // The runner ended this slot's earlier wait, from 1_000, in a round before.
+        runner
+            .waits
+            .insert(slot.clone(), Held::Ended { since: 1_000 });
+        index_round(
+            &db,
+            &ledger,
+            &NavidromeFor(Ok(navi.client())),
+            &mut runner,
+            2_005,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Done));
+        assert_eq!(
+            indexes(&mut rx),
+            vec![Some(IndexState::Waiting), Some(IndexState::Listed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_whose_wait_ended_is_not_looked_up_again() {
+        let library = tempfile::tempdir().unwrap();
+        let (ledger, db, mut rx, _) = indexing(imported_in(library.path())).await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        let mut runner = IndexRunner::default();
+        // This wait ended in a round whose write the database does not hold yet.
+        runner.waits.insert(
+            JobSlot {
+                job: "j1".into(),
+                slot: 0,
+            },
+            Held::Ended { since: 1_000 },
+        );
+        index_round(
+            &db,
+            &ledger,
+            &NavidromeFor(Ok(navi.client())),
+            &mut runner,
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Indexing));
+        assert!(navi.asked().is_empty(), "{:?}", navi.asked());
+        assert!(indexes(&mut rx).is_empty());
     }
 
     fn indexes(rx: &mut broadcast::Receiver<DownloadEvent>) -> Vec<Option<IndexState>> {
@@ -1436,6 +1692,10 @@ mod tests {
         ledger.settled().await;
         assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Done));
         assert!(indexes(&mut rx).is_empty());
+        assert!(matches!(
+            result_of(&db).await,
+            SlotResult::Imported { listed: None, .. }
+        ));
     }
 
     #[tokio::test]
@@ -1708,24 +1968,16 @@ mod tests {
             job: "j1".into(),
             items: vec![(1, item("peer_a", "Song Number 2", "02.mp3"))],
         });
-        ledger.record(JobEvent::Slots {
-            state: JobState::Indexing,
-            rows: vec![DownloadProgress::queued(
-                "t-02".into(),
-                "peer_a".into(),
-                "02.mp3".into(),
-                4,
-            )
-            .with_state(DownloadState::Imported)
-            .with_job(slot.clone())],
-        });
-        ledger.record(JobEvent::Indexing {
-            slots: vec![slot],
-            wait: Box::new(IndexWait {
+        imported_as(
+            &ledger,
+            DownloadProgress::queued("t-02".into(), "peer_a".into(), "02.mp3".into(), 4)
+                .with_state(DownloadState::Imported)
+                .with_job(slot),
+            IndexWait {
                 import: "/downloads/Come Over [1f2e3d4c]/02.flac".into(),
                 ..imported_in(library.path())
-            }),
-        });
+            },
+        );
         ledger.settled().await;
         let navi = NavidromeStub::start();
         navi.answer("/rest/getScanStatus", &[IDLE]);
@@ -1747,24 +1999,33 @@ mod tests {
 
     #[tokio::test]
     async fn a_wait_that_cannot_be_read_ends_and_the_others_go_on() {
-        let library = tempfile::tempdir().unwrap();
-        let (ledger, db, _rx, _) = indexing(imported_in(library.path())).await;
-        sqlx::query("UPDATE job_tracks SET index_wait = '{' WHERE job_id = 'j1'")
+        // A wait that does not parse, and one stored without its import's result.
+        for broken in ["index_wait = '{'", "result = NULL"] {
+            let library = tempfile::tempdir().unwrap();
+            let (ledger, db, _rx, _) = indexing(imported_in(library.path())).await;
+            sqlx::query(&format!(
+                "UPDATE job_tracks SET {broken} WHERE job_id = 'j1'"
+            ))
             .execute(&db)
             .await
             .unwrap();
-        let indexing = store::indexing_slots(&db).await.unwrap();
-        assert!(indexing.slots.is_empty());
-        assert_eq!(indexing.unreadable.len(), 1);
-        index_round(
-            &db,
-            &ledger,
-            &NavidromeFor(Err(|| NavidromeLookupError::NotLinked)),
-            &mut IndexRunner::default(),
-            1_005,
-        )
-        .await;
-        ledger.settled().await;
-        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
+            let indexing = store::indexing_slots(&db).await.unwrap();
+            assert!(indexing.slots.is_empty(), "{broken}");
+            assert_eq!(indexing.unreadable.len(), 1, "{broken}");
+            index_round(
+                &db,
+                &ledger,
+                &NavidromeFor(Err(|| NavidromeLookupError::NotLinked)),
+                &mut IndexRunner::default(),
+                1_005,
+            )
+            .await;
+            ledger.settled().await;
+            assert_eq!(
+                store::job_state(&db, "j1").await,
+                Some(JobState::Failed),
+                "{broken}"
+            );
+        }
     }
 }

@@ -14,7 +14,7 @@ pub(crate) use rows::import_failure;
 
 use crate::auth::UserId;
 use crate::core::delete_guard::{Guard, Origin};
-use crate::ledger::{self, ImportDone, IndexWait, JobEvent, StoredImport};
+use crate::ledger::{self, ImportDone, IndexWait, JobEvent, SlotResult, StoredImport};
 use async_trait::async_trait;
 use futures::FutureExt;
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, MatchChoices};
@@ -600,13 +600,8 @@ impl Shared {
         if let Some(owner) = &job.owner {
             let rows = rows_for_done(&owner.rows, &job, &outcome);
             if let Some(import) = job.stored() {
-                let (next, index) = ledger_end(library, &job, &outcome.result.outcome, keep);
-                self.deps.record(JobEvent::ImportDone(Box::new(ImportDone {
-                    import,
-                    rows: rows.clone(),
-                    next,
-                    index,
-                })));
+                let done = ledger_end(library, import, rows.clone(), &outcome.result.outcome, keep);
+                self.deps.record(JobEvent::ImportDone(Box::new(done)));
             }
             self.deps
                 .emit(&owner.user_id, DownloadEvent::Progress(rows))
@@ -617,15 +612,17 @@ impl Shared {
     }
 }
 
-/// The ledger state the slots of `job` go to after `outcome`, kept for a
-/// retry when `keep`, and the index wait of an import into `library`.
+/// How `import` ended for the ledger, its `rows` sent: the state its slots go
+/// to after `outcome`, kept for a retry when `keep`, the index wait of an
+/// import into `library`, and each slot's result.
 fn ledger_end(
     library: &Path,
-    job: &ImportJob,
+    import: StoredImport,
+    rows: Vec<DownloadProgress>,
     outcome: &ImportOutcome,
     keep: bool,
-) -> (ledger::JobState, Option<IndexWait>) {
-    match (outcome, job.sources.first()) {
+) -> ImportDone {
+    let (next, index) = match (outcome, import.sources.first()) {
         // An import that ran had a source.
         (ImportOutcome::Imported { items, .. }, Some(first)) if !items.is_empty() => (
             ledger::JobState::Indexing,
@@ -642,6 +639,30 @@ fn ledger_end(
         (ImportOutcome::Imported { .. }, _) => (ledger::JobState::Done, None),
         _ if keep => (ledger::JobState::NeedsDecision, None),
         _ => (ledger::JobState::Failed, None),
+    };
+    let results = match outcome {
+        ImportOutcome::Imported {
+            untagged, items, ..
+        } => import
+            .rows
+            .iter()
+            .map(|(slot, _)| {
+                let result = SlotResult::Imported {
+                    applied: items.clone(),
+                    untagged: *untagged,
+                    listed: None,
+                };
+                (slot.clone(), result)
+            })
+            .collect(),
+        _ => vec![],
+    };
+    ImportDone {
+        import,
+        rows,
+        next,
+        index,
+        results,
     }
 }
 
@@ -749,7 +770,7 @@ mod tests {
     use super::*;
     use crate::core::delete_guard::test_support::{wanted, Library};
     use shared::download::{DownloadState, ImportChoice, JobSlot};
-    use soulbeet::{ForgetOutcome, ImportOutcome, SkipReason};
+    use soulbeet::{ForgetOutcome, ImportOutcome, ImportedItem, SkipReason};
     use std::time::Duration;
 
     pub(super) fn queue(
@@ -1201,11 +1222,32 @@ mod tests {
             },
             ..imported()
         };
-        for (scripted, next) in [
-            (imported(), LedgerState::Indexing),
-            (no_items, LedgerState::Done),
-            (no_match(2), LedgerState::NeedsDecision),
-            (ImportResult::nothing_to_import(), LedgerState::Failed),
+        let ImportOutcome::Imported { items, .. } = imported().outcome else {
+            unreachable!()
+        };
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        let applied = |applied: Vec<ImportedItem>| {
+            vec![(
+                slot.clone(),
+                SlotResult::Imported {
+                    applied,
+                    untagged: false,
+                    listed: None,
+                },
+            )]
+        };
+        for (scripted, next, results) in [
+            (imported(), LedgerState::Indexing, applied(items)),
+            (no_items, LedgerState::Done, applied(vec![])),
+            (no_match(2), LedgerState::NeedsDecision, vec![]),
+            (
+                ImportResult::nothing_to_import(),
+                LedgerState::Failed,
+                vec![],
+            ),
         ] {
             let (queue, stub, deps) = queue(StubImporter::new());
             stub.script(scripted);
@@ -1221,10 +1263,6 @@ mod tests {
             )
             .await;
             let events = deps.ledger_events();
-            let slot = JobSlot {
-                job: "j1".into(),
-                slot: 0,
-            };
             assert!(
                 matches!(&events[0], JobEvent::ImportQueued(import) if import.rows[0].0 == slot),
                 "{events:?}"
@@ -1238,6 +1276,7 @@ mod tests {
                 panic!("{events:?}")
             };
             assert_eq!(done.next, next);
+            assert_eq!(done.results, results);
             assert_eq!(
                 done.index
                     .as_ref()

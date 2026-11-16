@@ -4,8 +4,8 @@
 use super::{
     job_state, recording_keys, Admitted, BatchOrigin, ClaimedJob, ImportDone, IndexWait, JobEvent,
     JobState, LedgerError, LiveRows, NewJob, NewJobBatch, NewSearch, Pruned, RecordingKeys,
-    Transition, Transitioned, JOB_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER, SEARCH_KEPT_SECS,
-    TERMINAL_SQL,
+    SlotResult, Transition, Transitioned, JOB_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER,
+    SEARCH_KEPT_SECS, TERMINAL_SQL,
 };
 use crate::auth::UserId;
 use crate::transfer_registry::TransferRegistry;
@@ -517,11 +517,24 @@ impl Writer {
                     rows,
                     next,
                     index,
+                    results,
                 } = *done;
                 let kept = (next == JobState::NeedsDecision)
                     .then(|| serde_json::to_string(&import))
                     .transpose()?;
                 let wait = index.map(|wait| serde_json::to_string(&wait)).transpose()?;
+                // Before the slots move: `next` may end them.
+                for (slot, result) in &results {
+                    sqlx::query(&format!(
+                        "UPDATE job_tracks SET result = ? \
+                         WHERE job_id = ? AND slot = ? AND state NOT IN {TERMINAL_SQL}"
+                    ))
+                    .bind(serde_json::to_string(result)?)
+                    .bind(&slot.job)
+                    .bind(slot.slot)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 for (slot, _) in &import.rows {
                     self.set_slot(&mut tx, slot, next).await?;
                     sqlx::query(&format!(
@@ -558,6 +571,22 @@ impl Writer {
                     .execute(&mut *tx)
                     .await?;
                     jobs.insert(slot.job.clone());
+                }
+            }
+            JobEvent::Settled {
+                state,
+                rows,
+                results,
+            } => {
+                for row in &rows {
+                    let Some(slot) = &row.job else { continue };
+                    let result = results
+                        .iter()
+                        .find(|(of, _)| of == slot)
+                        .map(|(_, result)| result);
+                    if self.put_row(&mut tx, slot, state, row, result).await? {
+                        jobs.insert(slot.job.clone());
+                    }
                 }
             }
             JobEvent::Dismiss(slots) => {
@@ -664,14 +693,29 @@ impl Writer {
         if !self.changes(slot, state, row) {
             return Ok(false);
         }
+        self.put_row(tx, slot, state, row, None).await
+    }
+
+    /// Puts `slot` in `state` with `row` as its last row and `result`, when given, as its
+    /// result, unless the slot already ended. Whether it changed the slot.
+    async fn put_row(
+        &mut self,
+        tx: &mut SqliteConnection,
+        slot: &JobSlot,
+        state: JobState,
+        row: &DownloadProgress,
+        result: Option<&SlotResult>,
+    ) -> Result<bool, LedgerError> {
         self.note(tx, slot).await?;
         let stored_row = serde_json::to_string(row)?;
+        let result = result.map(serde_json::to_string).transpose()?;
         let stored = sqlx::query(&format!(
-            "UPDATE job_tracks SET state = ?, last_row = ? \
+            "UPDATE job_tracks SET state = ?, last_row = ?, result = COALESCE(?, result) \
              WHERE job_id = ? AND slot = ? AND state NOT IN {TERMINAL_SQL}"
         ))
         .bind(state.as_str())
         .bind(&stored_row)
+        .bind(&result)
         .bind(&slot.job)
         .bind(slot.slot)
         .execute(&mut *tx)

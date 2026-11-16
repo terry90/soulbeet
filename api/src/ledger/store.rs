@@ -1,7 +1,7 @@
 //! Reads of the ledger, straight from the pool.
 
 use super::writer::import_mode_named;
-use super::{IndexWait, JobState, StoredImport, TERMINAL_SQL};
+use super::{IndexWait, JobState, SlotResult, StoredImport, TERMINAL_SQL};
 use crate::auth::{Role, UserCtx, UserId};
 use crate::models::folder::Folder;
 use shared::download::{
@@ -103,27 +103,28 @@ pub async fn open_wanted_in(
     query.fetch_all(db).await
 }
 
-/// A slot waiting for Navidrome to list its import, with its owner, its last row (its `job` set)
-/// and the wait.
+/// A slot waiting for Navidrome to list its import, with its owner, its last row (its `job` set),
+/// the wait and the import's result.
 pub struct IndexingSlot {
     pub slot: JobSlot,
     pub user: UserId,
     pub row: DownloadProgress,
     pub wait: IndexWait,
+    pub result: SlotResult,
 }
 
-/// The slots in `indexing`, and those whose row or wait cannot be read.
+/// The slots in `indexing`, and those whose row, wait or result cannot be read.
 pub struct Indexing {
     /// Oldest job first.
     pub slots: Vec<IndexingSlot>,
     pub unreadable: Vec<(JobSlot, sqlx::Error)>,
 }
 
-/// Every slot in `indexing`. One whose row or wait cannot be read is in `unreadable`, so the
-/// others still wait.
+/// Every slot in `indexing`. One whose row, wait or result cannot be read is in `unreadable`, so
+/// the others still wait. Every import that waits stored its result with its wait.
 pub async fn indexing_slots(db: &SqlitePool) -> Result<Indexing, sqlx::Error> {
-    let rows: Vec<(String, u32, String, String, String)> = sqlx::query_as(
-        "SELECT t.job_id, t.slot, j.user_id, t.last_row, t.index_wait \
+    let rows: Vec<(String, u32, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT t.job_id, t.slot, j.user_id, t.last_row, t.index_wait, t.result \
          FROM job_tracks t JOIN jobs j ON j.id = t.job_id \
          WHERE t.state = ? AND t.last_row IS NOT NULL AND t.index_wait IS NOT NULL \
          ORDER BY j.created_at, j.rowid, t.slot",
@@ -135,14 +136,23 @@ pub async fn indexing_slots(db: &SqlitePool) -> Result<Indexing, sqlx::Error> {
         slots: Vec::new(),
         unreadable: Vec::new(),
     };
-    for (job, slot, user, row, wait) in rows {
+    for (job, slot, user, row, wait, result) in rows {
         let slot = JobSlot { job, slot };
-        match json::<DownloadProgress>(&row).and_then(|row| Ok((row, json(&wait)?))) {
-            Ok((row, wait)) => indexing.slots.push(IndexingSlot {
+        let read = || -> Result<_, sqlx::Error> {
+            let result = result.ok_or_else(|| sqlx::Error::Decode("no result stored".into()))?;
+            Ok((
+                json::<DownloadProgress>(&row)?,
+                json(&wait)?,
+                json(&result)?,
+            ))
+        };
+        match read() {
+            Ok((row, wait, result)) => indexing.slots.push(IndexingSlot {
                 row: row.with_job(slot.clone()),
                 slot,
                 user: UserId::new(&user),
                 wait,
+                result,
             }),
             Err(e) => indexing.unreadable.push((slot, e)),
         }

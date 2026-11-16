@@ -4,6 +4,7 @@
 //! order they were made; reads go to the pool (`store`).
 
 use crate::auth::UserId;
+use crate::core::library::SongFacts;
 use crate::transfer_registry::TransferRegistry;
 use serde::{Deserialize, Serialize};
 use shared::download::{
@@ -149,6 +150,23 @@ pub struct IndexWait {
     pub checked: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// What a slot's import gave, held by each slot of the import.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotResult {
+    /// beets imported `applied`, in its order. `listed` holds the song Navidrome lists for each
+    /// applied item, in `applied` order, once the index wait found them all; None while it waits
+    /// and for a user without Navidrome. A song's rating, star and play count are as of the
+    /// listing.
+    Imported {
+        applied: Vec<ImportedItem>,
+        untagged: bool,
+        listed: Option<Vec<SongFacts>>,
+    },
+    /// beets skipped the slot's files as `existing`, the library's own copies.
+    AlreadyInLibrary { existing: Vec<ImportedItem> },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JobEvent {
     NeedsSourceChoice {
@@ -195,6 +213,12 @@ pub enum JobEvent {
         slots: Vec<JobSlot>,
         wait: Box<IndexWait>,
     },
+    /// Slots that end in `state` with their `results`, rows stored as given.
+    Settled {
+        state: JobState,
+        rows: Vec<DownloadProgress>,
+        results: Vec<(JobSlot, SlotResult)>,
+    },
     Dismiss(Vec<JobSlot>),
     /// Slots whose stored state cannot be read: they end failed, their stored row kept.
     Unreadable(Vec<JobSlot>),
@@ -211,6 +235,8 @@ pub struct ImportDone {
     pub rows: Vec<DownloadProgress>,
     pub next: JobState,
     pub index: Option<IndexWait>,
+    /// Each slot's result, for an import that gave one.
+    pub results: Vec<(JobSlot, SlotResult)>,
 }
 
 /// How long a search stays its starter's to poll and pick from.
@@ -1408,11 +1434,23 @@ mod tests {
             baseline: None,
             checked: None,
         };
+        let applied = SlotResult::Imported {
+            applied: wait.items.clone(),
+            untagged: true,
+            listed: None,
+        };
         ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
             import: import(0, "01.flac"),
             rows: vec![row_of("j1", 0, "01.flac", DownloadState::Imported, 100)],
             next: JobState::Indexing,
             index: Some(wait.clone()),
+            results: vec![(
+                JobSlot {
+                    job: "j1".into(),
+                    slot: 0,
+                },
+                applied.clone(),
+            )],
         })));
         ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
             import: import(1, "02.flac"),
@@ -1425,6 +1463,7 @@ mod tests {
             )],
             next: JobState::NeedsDecision,
             index: None,
+            results: vec![],
         })));
         ledger.settled().await;
         let slots: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
@@ -1449,6 +1488,18 @@ mod tests {
                 ("indexing", None, Some(wait)),
                 ("needs_decision", Some(import(1, "02.flac")), None),
             ]
+        );
+        let results: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT result FROM job_tracks WHERE job_id = 'j1' ORDER BY slot")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.as_deref().map(|r| serde_json::from_str(r).unwrap()))
+                .collect::<Vec<Option<SlotResult>>>(),
+            vec![Some(applied), None]
         );
         assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Indexing));
         let rows = store::open_rows(&db, &UserId::new("alice")).await.unwrap();
@@ -2456,10 +2507,28 @@ mod tests {
             }),
             checked: chrono::DateTime::from_timestamp(30, 0),
         };
-        ledger.record(JobEvent::Indexing {
-            slots: vec![slot.clone()],
-            wait: Box::new(wait.clone()),
-        });
+        ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
+            import: StoredImport {
+                sources: vec!["/downloads/a/03.flac".into()],
+                target: "/music".into(),
+                album: false,
+                cleanup_root: None,
+                choices: None,
+                choice: DriverChoice::Auto,
+                rows: vec![(slot.clone(), imported.clone())],
+            },
+            rows: vec![imported.clone()],
+            next: JobState::Indexing,
+            index: Some(wait.clone()),
+            results: vec![(
+                slot.clone(),
+                SlotResult::Imported {
+                    applied: wait.items.clone(),
+                    untagged: false,
+                    listed: None,
+                },
+            )],
+        })));
         ledger.record(JobEvent::Slots {
             state: JobState::Failed,
             rows: vec![imported.failed_with(crate::core::index::not_found_after_scan())],

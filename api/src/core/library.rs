@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
 use shared::navidrome::LibraryStats;
@@ -27,7 +27,7 @@ use crate::models::navidrome_library::NavidromeLibraryRow;
 /// `path` is relative to the song's library, and only a native record has
 /// it: a Subsonic child's is made up, or absolute with ReportRealPath
 /// (server/subsonic/helpers.go:227-231).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SongFacts {
     pub song_id: String,
     pub title: String,
