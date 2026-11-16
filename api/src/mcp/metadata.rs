@@ -2,7 +2,7 @@
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{cut_json, TEXT_MAX_CHARS};
+use shared::failure::{cut_json, json_chars, TEXT_MAX_CHARS};
 use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
 use soulbeet::musicbrainz::{ArtistMatch, RecordingReleases};
 
@@ -25,11 +25,38 @@ const PROVIDERS: &[&str] = &[providers::MUSICBRAINZ, providers::LASTFM];
 
 const RELEASE_ID: &str = "a MusicBrainz release id or a lastfm: id from search_music";
 
-/// A text from MusicBrainz or Last.fm, cut as any outside text is. An id
-/// is cut too: an MBID is far shorter, and a lastfm: id holds Last.fm's
-/// artist and name, which can be as long as any text.
+/// A text from MusicBrainz or Last.fm, cut as any outside text is. Ids are
+/// never cut: see `whole_ids`.
 fn cut(text: String) -> String {
     cut_json(text, TEXT_MAX_CHARS)
+}
+
+/// `entry` with each of its `fields` that holds an id longer than
+/// TEXT_MAX_CHARS of JSON set to null, and `ids_too_long` naming those
+/// fields; an entry whose ids all fit is unchanged. A cut id would still
+/// look like an id and name nothing, so an id is sent whole or not at all.
+/// An MBID is 36 characters; a lastfm: id holds Last.fm's artist and name,
+/// which can be as long as any text.
+fn whole_ids(mut entry: Value, fields: &[&str]) -> Value {
+    let Value::Object(map) = &mut entry else {
+        unreachable!("an entry is an object");
+    };
+    let too_long: Vec<&str> = fields
+        .iter()
+        .copied()
+        .filter(|field| {
+            map.get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|id| json_chars(id) > TEXT_MAX_CHARS)
+        })
+        .collect();
+    if !too_long.is_empty() {
+        for field in &too_long {
+            map.insert(field.to_string(), Value::Null);
+        }
+        map.insert("ids_too_long".into(), json!(too_long));
+    }
+    entry
 }
 
 fn cut_opt(text: Option<String>) -> Option<String> {
@@ -81,18 +108,21 @@ pub(crate) fn music_fields(
 /// when it named none.
 fn recording_entry(t: &Track) -> Value {
     let release = t.album_id.as_ref().map(|id| {
-        json!({"id": cut(id.clone()), "mbid": cut_opt(t.release_mbid.clone()),
-            "title": cut_opt(t.album_title.clone()), "date": cut_opt(t.release_date.clone())})
+        let release = json!({"id": id, "mbid": t.release_mbid,
+            "title": cut_opt(t.album_title.clone()), "date": cut_opt(t.release_date.clone())});
+        whole_ids(release, &["id", "mbid"])
     });
-    json!({"id": cut(t.id.clone()), "recording_mbid": cut_opt(t.mbid.clone()), "title": cut(t.title.clone()),
-        "artist": cut(t.artist.clone()), "duration_s": t.duration_secs(), "release": release})
+    let entry = json!({"id": t.id, "recording_mbid": t.mbid, "title": cut(t.title.clone()),
+        "artist": cut(t.artist.clone()), "duration_s": t.duration_secs(), "release": release});
+    whole_ids(entry, &["id", "recording_mbid"])
 }
 
 /// A found release; `release_types` is null when the provider gave none (D15).
 fn release_entry(a: &Album) -> Value {
-    json!({"id": cut(a.id.clone()), "release_mbid": cut_opt(a.mbid.clone()), "title": cut(a.title.clone()),
+    let entry = json!({"id": a.id, "release_mbid": a.mbid, "title": cut(a.title.clone()),
         "artist": cut(a.artist.clone()), "date": cut_opt(a.release_date.clone()),
-        "release_types": a.release_types})
+        "release_types": a.release_types});
+    whole_ids(entry, &["id", "release_mbid"])
 }
 
 /// D6 for an artist search, which reads MusicBrainz only.
@@ -105,7 +135,7 @@ pub(crate) fn artist_fields(query: &str, found: &[ArtistMatch]) -> Map<String, V
             a.sort_name = cut(a.sort_name);
             a.disambiguation = cut_opt(a.disambiguation);
             a.country = cut_opt(a.country);
-            json!(a)
+            whole_ids(json!(a), &["mbid"])
         })
         .collect();
     search_fields(
@@ -126,18 +156,19 @@ pub(crate) fn release_fields(
     used: Provider,
 ) -> (Map<String, Value>, Vec<Value>) {
     let a = &release.album;
-    let fields = object(
-        json!({"provider_used": used, "release": {"id": cut(a.id.clone()), "mbid": cut_opt(a.mbid.clone()),
-        "title": cut(a.title.clone()), "artist": cut(a.artist.clone()),
-        "date": cut_opt(a.release_date.clone()), "release_types": a.release_types}}),
-    );
+    let album = json!({"id": a.id, "mbid": a.mbid, "title": cut(a.title.clone()),
+        "artist": cut(a.artist.clone()), "date": cut_opt(a.release_date.clone()),
+        "release_types": a.release_types});
+    let fields =
+        object(json!({"provider_used": used, "release": whole_ids(album, &["id", "mbid"])}));
     let tracks = release
         .tracks
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            json!({"position": i + 1, "recording_mbid": cut_opt(t.mbid.clone()), "title": cut(t.title.clone()),
-                "artist": cut(t.artist.clone()), "duration_s": t.duration_secs()})
+            let track = json!({"position": i + 1, "recording_mbid": t.mbid, "title": cut(t.title.clone()),
+                "artist": cut(t.artist.clone()), "duration_s": t.duration_secs()});
+            whole_ids(track, &["recording_mbid"])
         })
         .collect();
     (fields, tracks)
@@ -148,7 +179,7 @@ pub(crate) fn release_fields(
 fn recording_releases_fields(found: &RecordingReleases, page: &Page) -> Map<String, Value> {
     let mut recording = found.recording.clone();
     recording.title = cut(recording.title);
-    recording.artist = cut(recording.artist);
+    recording.artist = cut_opt(recording.artist);
     recording.disambiguation = cut_opt(recording.disambiguation);
     let releases = found
         .releases
@@ -160,10 +191,15 @@ fn recording_releases_fields(found: &RecordingReleases, page: &Page) -> Map<Stri
             if let Some(group) = &mut r.release_group {
                 group.title = cut(std::mem::take(&mut group.title));
             }
-            json!(r)
+            let mut release = whole_ids(json!(r), &["mbid"]);
+            if let Some(group) = release.get_mut("release_group").filter(|g| g.is_object()) {
+                *group = whole_ids(group.take(), &["mbid"]);
+            }
+            release
         })
         .collect();
     let more = page.offset + found.releases.len() < found.release_count as usize;
+    let recording = whole_ids(json!(recording), &["mbid"]);
     let fields = object(json!({"recording": recording, "release_count": found.release_count}));
     fit(fields, "releases", releases, page, more)
 }
@@ -512,7 +548,7 @@ mod tests {
             recording: RecordingInfo {
                 mbid: "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8".into(),
                 title: "Silent Night".into(),
-                artist: "Bing Crosby".into(),
+                artist: Some("Bing Crosby".into()),
                 duration_s: Some(149),
                 disambiguation: None,
                 first_release_date: Some("1995".into()),
@@ -629,22 +665,23 @@ mod tests {
 
     #[test]
     fn a_search_keeps_the_entries_that_fit_and_counts_the_rest() {
-        // 25 recordings whose texts are long and full of quotes, each escaped to 2 characters:
-        // every text is cut to 500 characters as sent, and 25 entries of 8 such texts still pass
-        // 60,000.
+        // 25 recordings whose texts are long and full of quotes, each escaped to 2 characters,
+        // and whose ids are just short enough to be sent whole: every text is cut to 500
+        // characters as sent, and 25 entries of 4 such texts and 4 such ids still pass 60,000.
         let text = "\"".repeat(2_000);
+        let id = |i: usize| format!("{i:>width$}", width = TEXT_MAX_CHARS - 2);
         let tracks: Vec<SearchResult> = (0..25)
             .map(|i| {
                 SearchResult::Track(Track {
-                    id: format!("lastfm:{text}:{text}{i}"),
+                    id: id(i),
                     title: format!("{text}{i}"),
                     artist: text.clone(),
-                    album_id: Some(text.clone()),
+                    album_id: Some(id(i)),
                     album_title: Some(text.clone()),
                     release_date: Some(text.clone()),
                     duration: None,
-                    mbid: Some(text.clone()),
-                    release_mbid: Some(text.clone()),
+                    mbid: Some(id(i)),
+                    release_mbid: Some(id(i)),
                 })
             })
             .collect();
@@ -660,8 +697,15 @@ mod tests {
         let kept = doc["recordings"].as_array().unwrap().len();
         assert!(kept > 0 && kept < 25, "{kept}");
         assert_eq!(doc["left_out"], json!(25 - kept));
-        let id = doc["recordings"][0]["id"].as_str().unwrap();
-        assert!(shared::failure::json_chars(id) <= TEXT_MAX_CHARS, "{id}");
+        let first = &doc["recordings"][0];
+        assert_eq!(
+            (
+                &first["id"],
+                &first["release"]["id"],
+                first.get("ids_too_long")
+            ),
+            (&json!(id(0)), &json!(id(0)), None)
+        );
         doc.insert("ok".into(), json!(true));
         assert!(
             Value::Object(doc).to_string().chars().count() <= crate::mcp::paging::RESULT_MAX_CHARS
@@ -669,7 +713,124 @@ mod tests {
     }
 
     #[test]
-    fn provider_text_is_cut_and_ids_are_not() {
+    fn an_id_too_long_to_return_is_null_and_named_never_cut() {
+        // A lastfm: id of 501 characters, one past what a text field holds.
+        let long_id = format!("lastfm:album:{}", "x".repeat(TEXT_MAX_CHARS + 1 - 13));
+        let short = silent_night();
+        let track = Track {
+            id: long_id.clone(),
+            album_id: Some(long_id.clone()),
+            ..short.clone()
+        };
+        let found = music_fields(
+            "recording",
+            "Silent Night",
+            Provider::LastFm,
+            &SearchResults {
+                provider: Provider::LastFm,
+                results: vec![
+                    SearchResult::Track(track.clone()),
+                    SearchResult::Track(short.clone()),
+                ],
+            },
+        );
+        let (long, kept) = (&found["recordings"][0], &found["recordings"][1]);
+        assert_eq!(
+            (&long["id"], &long["ids_too_long"], &long["title"]),
+            (&Value::Null, &json!(["id"]), &json!("Silent Night"))
+        );
+        assert_eq!(
+            (
+                &long["release"]["id"],
+                &long["release"]["mbid"],
+                &long["release"]["ids_too_long"]
+            ),
+            (&Value::Null, &json!(short.release_mbid), &json!(["id"]))
+        );
+        assert_eq!(
+            (&kept["id"], kept.get("ids_too_long")),
+            (&json!(short.id), None)
+        );
+        let album = Album {
+            id: long_id.clone(),
+            title: "Winter Songs".into(),
+            artist: "Marrow Choir".into(),
+            release_date: None,
+            mbid: None,
+            cover_url: None,
+            release_types: None,
+        };
+        let release = &music_fields(
+            "release",
+            "Winter Songs",
+            Provider::LastFm,
+            &SearchResults {
+                provider: Provider::LastFm,
+                results: vec![SearchResult::Album(album.clone())],
+            },
+        )["releases"][0];
+        assert_eq!(
+            (&release["id"], &release["ids_too_long"]),
+            (&Value::Null, &json!(["id"]))
+        );
+        let (fields, tracks) = release_fields(
+            &AlbumWithTracks {
+                album,
+                tracks: vec![Track {
+                    mbid: Some(long_id.clone()),
+                    ..short
+                }],
+            },
+            Provider::LastFm,
+        );
+        assert_eq!(
+            (
+                &fields["release"]["id"],
+                &fields["release"]["ids_too_long"],
+                &tracks[0]["recording_mbid"],
+                &tracks[0]["ids_too_long"]
+            ),
+            (
+                &Value::Null,
+                &json!(["id"]),
+                &Value::Null,
+                &json!(["recording_mbid"])
+            )
+        );
+        let mut found = silent_night_releases(1);
+        found.recording.mbid = long_id.clone();
+        found.releases[0].mbid = long_id.clone();
+        found.releases[0].release_group.as_mut().unwrap().mbid = long_id.clone();
+        let doc = recording_releases_fields(&found, &recording_page(json!({})));
+        for entry in [
+            &doc["recording"],
+            &doc["releases"][0],
+            &doc["releases"][0]["release_group"],
+        ] {
+            assert_eq!(
+                (&entry["mbid"], &entry["ids_too_long"]),
+                (&Value::Null, &json!(["mbid"]))
+            );
+        }
+        let artist = ArtistMatch {
+            mbid: long_id,
+            name: "Bing Crosby".into(),
+            sort_name: "Crosby, Bing".into(),
+            disambiguation: None,
+            artist_type: None,
+            country: None,
+            begin: None,
+            end: None,
+        };
+        let a = &artist_fields("Bing Crosby", &[artist])["artists"][0];
+        assert_eq!(
+            (&a["mbid"], &a["ids_too_long"]),
+            (&Value::Null, &json!(["mbid"]))
+        );
+    }
+
+    #[test]
+    fn provider_text_is_cut_and_ids_that_fit_are_sent_whole() {
         let long = "x".repeat(TEXT_MAX_CHARS + 1);
         let cut_long = cut_json(long.clone(), TEXT_MAX_CHARS);
         let track = Track {

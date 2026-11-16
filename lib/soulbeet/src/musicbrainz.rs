@@ -52,18 +52,26 @@ fn musicbrainz_client() -> &'static MusicBrainzClient {
     })
 }
 
-/// Formats the artist credits into a single, comma-separated string.
-fn format_artist_credit(credits: &Option<Vec<ArtistCredit>>) -> String {
-    credits
-        .as_ref()
-        .map(|credits| {
-            credits
-                .iter()
-                .map(|credit| credit.name.clone())
-                .collect::<Vec<String>>()
-                .join(", ")
-        })
-        .unwrap_or_else(|| "Unknown Artist".to_string())
+/// The artist credits as one comma-separated text; None when MusicBrainz
+/// sent no artist credit.
+fn format_artist_credit(credits: &Option<Vec<ArtistCredit>>) -> Option<String> {
+    credits.as_ref().map(|credits| {
+        credits
+            .iter()
+            .map(|credit| credit.name.clone())
+            .collect::<Vec<String>>()
+            .join(", ")
+    })
+}
+
+/// What the web UI shows as the artist of a track or album MusicBrainz
+/// sent no artist credit for.
+const NO_CREDIT: &str = "Unknown Artist";
+
+/// `format_artist_credit` for the web UI's tracks and albums, NO_CREDIT for
+/// none.
+fn credited_artist(credits: &Option<Vec<ArtistCredit>>) -> String {
+    format_artist_credit(credits).unwrap_or_else(|| NO_CREDIT.to_string())
 }
 
 /// Formats a duration from milliseconds to a MM:SS string.
@@ -244,7 +252,7 @@ pub async fn search(
             let mut unique_tracks = HashSet::new();
 
             for recording in recordings {
-                let artist_name = format_artist_credit(&recording.artist_credit);
+                let artist_name = credited_artist(&recording.artist_credit);
                 let album_title = recording
                     .releases
                     .as_ref()
@@ -325,7 +333,7 @@ pub async fn search(
                     results.push(SearchResult::Album(Album {
                         id: final_release.id.clone(),
                         title: release_group.title.clone(),
-                        artist: format_artist_credit(&release_group.artist_credit),
+                        artist: credited_artist(&release_group.artist_credit),
                         release_date: final_release.date.as_ref().map(|d| d.0.clone()),
                         mbid: Some(final_release.id.clone()),
                         cover_url: None,
@@ -372,7 +380,7 @@ fn album_from_release(release: Release) -> AlbumWithTracks {
                         tracks.push(Track {
                             id: recording.id.clone(),
                             title: recording.title.clone(),
-                            artist: format_artist_credit(&recording.artist_credit),
+                            artist: credited_artist(&recording.artist_credit),
                             album_id: Some(release.id.clone()),
                             album_title: Some(release.title.clone()),
                             release_date: release.date.as_ref().map(|d| d.0.clone()),
@@ -390,7 +398,7 @@ fn album_from_release(release: Release) -> AlbumWithTracks {
     let album = Album {
         id: release.id.clone(),
         title: release.title,
-        artist: format_artist_credit(&release.artist_credit),
+        artist: credited_artist(&release.artist_credit),
         release_date: release.date.map(|d| d.0),
         mbid: Some(release.id),
         cover_url: None,
@@ -420,7 +428,8 @@ pub struct ArtistMatch {
 pub struct RecordingInfo {
     pub mbid: String,
     pub title: String,
-    pub artist: String,
+    /// The artist credit; None when MusicBrainz sent none.
+    pub artist: Option<String>,
     pub duration_s: Option<u32>,
     pub disambiguation: Option<String>,
     pub first_release_date: Option<String>,
@@ -568,12 +577,21 @@ fn recording_releases_from(
 /// The release group's primary type (when it has one), then its secondary
 /// types, by MusicBrainz's names for them. None when musicbrainz_rs does not
 /// know one of them: it reads such a type as an `Unrecognized*` variant,
-/// which does not carry MusicBrainz's name.
+/// which does not carry MusicBrainz's name. None also when the group has no
+/// type at all: a release group "can have" a primary type
+/// (musicbrainz.org/doc/Release_Group/Type, "Description"), and one that
+/// fits no other is given "Other" ("Any release that does not fit or can't
+/// decisively be placed in any of the categories above"), so a group with
+/// none is one whose type no editor set, not one known to have none.
+/// musicbrainz_rs reads a missing or null "primary-type" as None and a
+/// missing "secondary-types" as empty (`ReleaseGroup` is
+/// `#[serde(default)]`, src/entity/release_group.rs:18-37).
 fn release_types(group: &ReleaseGroup) -> Option<Vec<String>> {
     if group.primary_type == Some(ReleaseGroupPrimaryType::UnrecognizedReleaseGroupPrimaryType)
         || group
             .secondary_types
             .contains(&ReleaseGroupSecondaryType::UnrecognizedReleaseGroupSecondaryType)
+        || (group.primary_type.is_none() && group.secondary_types.is_empty())
     {
         return None;
     }
@@ -716,7 +734,7 @@ mod tests {
                 recording: RecordingInfo {
                     mbid: "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8".into(),
                     title: "Silent Night".into(),
-                    artist: "Bing Crosby".into(),
+                    artist: Some("Bing Crosby".into()),
                     duration_s: Some(149),
                     disambiguation: None,
                     first_release_date: Some("1995".into())
@@ -794,6 +812,45 @@ mod tests {
             serde_json::from_value(page).unwrap();
         let group = page.entities[0].release_group.as_ref().unwrap();
         assert_eq!(release_types(group), None);
+    }
+
+    #[test]
+    fn a_recording_without_an_artist_credit_has_no_artist() {
+        let mut recording: serde_json::Value = serde_json::from_str(RECORDING).unwrap();
+        recording.as_object_mut().unwrap().remove("artist-credit");
+        let r = recording_releases_from(
+            serde_json::from_value(recording).unwrap(),
+            serde_json::from_str(RELEASES).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(r.recording.artist, None);
+    }
+
+    #[test]
+    fn a_release_group_with_no_type_set_has_unknown_types() {
+        // A release group no editor gave a type: MusicBrainz sends "primary-type": null and an empty
+        // "secondary-types" (a lookup or browse answer), or leaves both out (a search answer).
+        let types = |primary: serde_json::Value, secondary: serde_json::Value| {
+            let mut page: serde_json::Value = serde_json::from_str(RELEASES).unwrap();
+            let group = &mut page["releases"][0]["release-group"];
+            group["primary-type"] = primary;
+            group["primary-type-id"] = serde_json::Value::Null;
+            group["secondary-type-ids"] = serde_json::json!([]);
+            group["secondary-types"] = secondary;
+            let page: BrowseResult<Release> = serde_json::from_value(page).unwrap();
+            release_types(page.entities[0].release_group.as_ref().unwrap())
+        };
+        assert_eq!(types(serde_json::Value::Null, serde_json::json!([])), None);
+        let bare: ReleaseGroup = serde_json::from_str(
+            r#"{"id":"a82c4b78-9e9a-390c-af1f-3c8a8a44c555","title":"Merry Christmas"}"#,
+        )
+        .unwrap();
+        assert_eq!(release_types(&bare), None);
+        // The secondary types an editor did set are known without a primary type.
+        assert_eq!(
+            types(serde_json::Value::Null, serde_json::json!(["Live"])),
+            Some(vec!["Live".to_string()])
+        );
     }
 
     #[test]

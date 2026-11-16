@@ -205,7 +205,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Search music",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Searches MusicBrainz (default) or Last.fm for recordings, releases (albums and EPs) or artists, to check that a recording exists and get its ids. Returns MBIDs where the provider has them, titles, artists, dates, release types and durations, and provider_used, which is musicbrainz when Last.fm was asked for and no Last.fm key is saved. Artist search reads MusicBrainz only. Up to 25 results (limit, default 10); left_out counts results left out to keep the answer under 60,000 characters. MBIDs never change; a lastfm: id names a Last.fm entry by its artist and name. MusicBrainz allows one request a second, so a search takes one to a few seconds. Failure codes: {common}, {METADATA_CODES}.")
+            format!("Searches MusicBrainz (default) or Last.fm for recordings, releases (albums and EPs) or artists, to check that a recording exists and get its ids. Returns MBIDs where the provider has them, titles, artists, dates, release types and durations, and provider_used, which is musicbrainz when Last.fm was asked for and no Last.fm key is saved. Artist search reads MusicBrainz only. Up to 25 results (limit, default 10); left_out counts results left out to keep the answer under 60,000 characters. MBIDs never change; a lastfm: id names a Last.fm entry by its artist and name. An id over 500 characters is null, and ids_too_long names its field. MusicBrainz allows one request a second, so a search takes one to a few seconds. Failure codes: {common}, {METADATA_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["recording","release","artist"]},"query":{"type":"string"},"artist":{"type":"string","description":"A credit to narrow a recording or release search"},"provider":{"type":"string","enum":["musicbrainz","lastfm"]},"limit":{"type":"integer","minimum":1,"maximum":25}},"required":["kind","query"],"additionalProperties":false}"#,
         read_only: true,
@@ -219,7 +219,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Release",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id or a lastfm: id that search_music gave. MBIDs never change. Pages of 25 tracks by default (limit up to 100). Failure codes: {common}, {METADATA_CODES}.")
+            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id or a lastfm: id that search_music gave. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. Pages of 25 tracks by default (limit up to 100). Failure codes: {common}, {METADATA_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"release_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["release_id"],"additionalProperties":false}"#,
         read_only: true,
@@ -233,7 +233,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Recording releases",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Shows a MusicBrainz recording (title, artist, length) and the releases it appears on, each with date, country, status and its release group's types, so you can tell a studio album from a compilation or a live record. MBIDs never change. Pages of 25 releases by default (limit up to 100, release_count gives the total). Takes two MusicBrainz requests, about two seconds. Failure codes: {common}, {METADATA_CODES}.")
+            format!("Shows a MusicBrainz recording (title, artist, length) and the releases it appears on, each with date, country, status and its release group's types, so you can tell a studio album from a compilation or a live record. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. Pages of 25 releases by default (limit up to 100, release_count gives the total). Takes two MusicBrainz requests, about two seconds. Failure codes: {common}, {METADATA_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"recording_mbid":{"type":"string","description":"A MusicBrainz recording id"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["recording_mbid"],"additionalProperties":false}"#,
         read_only: true,

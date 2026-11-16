@@ -109,8 +109,8 @@ pub struct Album {
     pub cover_url: Option<String>,
     /// The release group's primary type, then its secondary types, as
     /// MusicBrainz names them; None when the provider gives no release types
-    /// (Last.fm), or when MusicBrainz gives a type musicbrainz_rs does not
-    /// know (D15).
+    /// (Last.fm), when MusicBrainz gives a type musicbrainz_rs does not
+    /// know, or when the release group has no type set (D15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_types: Option<Vec<String>>,
 }
