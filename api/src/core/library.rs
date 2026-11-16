@@ -1,12 +1,15 @@
-//! What the caller's Navidrome library holds, as the tools report it, and
-//! whether imports into a folder show up there.
+//! What the caller's Navidrome library holds, as the tools report it, the
+//! songs that match a track the caller names, and whether imports into a
+//! folder show up there.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
 use shared::failure::{cut_chars, Failure, Stage, TEXT_MAX_CHARS};
 use shared::navidrome::LibraryStats;
+use shared::recommendation::normalize_for_matching;
 use soulbeet::navidrome::models::{NativeSong, SubsonicAlbum, SubsonicArtist, SubsonicSong};
 use soulbeet::navidrome::NavidromeClient;
 use soulbeet::NavidromeError;
@@ -14,7 +17,7 @@ use sqlx::SqlitePool;
 
 use crate::auth::UserCtx;
 use crate::core::database_failure;
-use crate::core::index::NavidromeOf;
+use crate::core::index::{NavidromeOf, LOOKUP_PAGE};
 use crate::models::navidrome_library::NavidromeLibraryRow;
 
 /// A song as the tools report it, from a native record or a Subsonic child
@@ -243,6 +246,233 @@ pub async fn stats(navi: &NavidromeClient) -> Result<LibraryStats, Failure> {
         total_albums: albums.len() as u32,
         total_artists: artists.len() as u32,
         genres: genre_vec,
+    })
+}
+
+/// Most seconds a song's length may differ from the reference's for an exact match.
+pub(crate) const DURATION_TOLERANCE_S: u32 = 5;
+/// Least word similarity, of the title and of the artist, for a fuzzy match.
+pub(crate) const FUZZY_FLOOR: f64 = 0.5;
+/// Matches kept per reference.
+pub(crate) const MATCHES_KEPT: usize = 5;
+/// Most pages of LOOKUP_PAGE songs the text lookup reads.
+pub(crate) const TEXT_LOOKUP_PAGES: u32 = 5;
+/// References looked up at once.
+pub(crate) const LOOKUPS_AT_ONCE: usize = 4;
+
+/// A track to look for in the library, as the caller describes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reference {
+    pub artist: String,
+    pub title: String,
+    pub album: Option<String>,
+    pub recording_mbid: Option<String>,
+    pub duration_s: Option<u32>,
+}
+
+/// How a song matched a reference (D8).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchKind {
+    /// Its recording MBID is the reference's.
+    Mbid,
+    /// Same normalized artist and title, and the length within
+    /// DURATION_TOLERANCE_S when the reference gives one.
+    Exact,
+    /// Similar artist and title; the caller decides whether it is the track.
+    Fuzzy,
+}
+
+/// A song that matched a reference, and how.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Match {
+    #[serde(flatten)]
+    pub song: SongFacts,
+    #[serde(rename = "match")]
+    pub how: MatchHow,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MatchHow {
+    pub kind: MatchKind,
+    /// The mean word similarity of title and artist, for a fuzzy match.
+    pub score: Option<f64>,
+    /// What the song does not share with the reference: `artist`, `title`,
+    /// `album` (when given) and `duration` (when given and more than
+    /// DURATION_TOLERANCE_S off).
+    pub differs: Vec<&'static str>,
+    /// The song's length less the reference's, when both are known.
+    pub duration_delta_s: Option<i64>,
+}
+
+/// What the library holds for a reference.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Found {
+    /// The best MATCHES_KEPT matches, best first.
+    pub matches: Vec<Match>,
+    /// Matches left out of `matches`.
+    pub more_matches: usize,
+    /// The text lookup read TEXT_LOOKUP_PAGES full pages, so Navidrome may
+    /// hold more candidates than were compared.
+    pub candidates_truncated: bool,
+}
+
+/// D8: `s` as normalize_for_matching gives it, or, for a text with no letter
+/// or digit (the band "!!!"), lowercased with its white space collapsed, so
+/// such a name equals only itself and not every name that normalizes to "".
+pub(crate) fn match_key(s: &str) -> String {
+    let key = normalize_for_matching(s);
+    if !key.is_empty() {
+        return key;
+    }
+    s.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The Dice similarity of the words of `a` and `b`'s match keys, each word
+/// counted as often as it occurs: 1.0 for two equal keys.
+fn word_dice(a: &str, b: &str) -> f64 {
+    let (a, b) = (match_key(a), match_key(b));
+    if a == b {
+        return 1.0;
+    }
+    let a: Vec<&str> = a.split(' ').filter(|w| !w.is_empty()).collect();
+    let mut rest: Vec<&str> = b.split(' ').filter(|w| !w.is_empty()).collect();
+    let total = a.len() + rest.len();
+    let mut shared = 0;
+    for word in a {
+        if let Some(at) = rest.iter().position(|w| *w == word) {
+            rest.swap_remove(at);
+            shared += 1;
+        }
+    }
+    (2 * shared) as f64 / total as f64
+}
+
+/// D8. None when `song` is not a match. An MBID is compared ignoring ASCII
+/// case, as UUIDs are. A song whose length Navidrome does not know has no
+/// duration_delta_s, so a reference with a duration matches it at best
+/// fuzzily, with no `duration` in `differs`.
+pub(crate) fn classify(r: &Reference, song: &NativeSong) -> Option<Match> {
+    let facts = SongFacts::from(song);
+    let duration_delta_s = r
+        .duration_s
+        .zip(facts.duration_s)
+        .map(|(wanted, length)| i64::from(length) - i64::from(wanted));
+    let length_off =
+        duration_delta_s.is_some_and(|d| d.unsigned_abs() > u64::from(DURATION_TOLERANCE_S));
+    let same = |a: &str, b: &str| match_key(a) == match_key(b);
+    let (artist_same, title_same) = (same(&r.artist, &song.artist), same(&r.title, &song.title));
+    let mut differs = Vec::new();
+    if !artist_same {
+        differs.push("artist");
+    }
+    if !title_same {
+        differs.push("title");
+    }
+    if r.album
+        .as_deref()
+        .is_some_and(|album| !same(album, &song.album))
+    {
+        differs.push("album");
+    }
+    if length_off {
+        differs.push("duration");
+    }
+    let mbid = r
+        .recording_mbid
+        .as_deref()
+        .zip(song.mbz_recording_id.as_deref())
+        .is_some_and(|(wanted, tagged)| wanted.eq_ignore_ascii_case(tagged));
+    let length_within = r.duration_s.is_none() || (duration_delta_s.is_some() && !length_off);
+    let (kind, score) = if mbid {
+        (MatchKind::Mbid, None)
+    } else if artist_same && title_same && length_within {
+        (MatchKind::Exact, None)
+    } else {
+        let (title, artist) = (
+            word_dice(&r.title, &song.title),
+            word_dice(&r.artist, &song.artist),
+        );
+        if title < FUZZY_FLOOR || artist < FUZZY_FLOOR {
+            return None;
+        }
+        (
+            MatchKind::Fuzzy,
+            Some(((title + artist) / 2.0 * 100.0).round() / 100.0),
+        )
+    };
+    Some(Match {
+        song: facts,
+        how: MatchHow {
+            kind,
+            score,
+            differs,
+            duration_delta_s,
+        },
+    })
+}
+
+/// D8: the MBID lookup (one page) when the reference has a recording MBID,
+/// then, unless it found an mbid match, the text lookup of
+/// "{artist} {title}" in pages of LOOKUP_PAGE up to a short page, at most
+/// TEXT_LOOKUP_PAGES. Each song is classified once, by id. The matches come
+/// mbid first, then exact, then fuzzy by score, ties by song id, cut to
+/// MATCHES_KEPT. Failures are LibraryCheck failures.
+pub async fn find(navi: &NavidromeClient, r: &Reference) -> Result<Found, Failure> {
+    let failure = |e: NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
+    let mut seen = HashSet::new();
+    let mut matches = Vec::new();
+    let mut take = |songs: Vec<NativeSong>, matches: &mut Vec<Match>| {
+        for song in songs {
+            if seen.insert(song.id.clone()) {
+                matches.extend(classify(r, &song));
+            }
+        }
+    };
+    if let Some(mbid) = &r.recording_mbid {
+        let songs = navi
+            .find_songs(mbid, 0, LOOKUP_PAGE)
+            .await
+            .map_err(failure)?;
+        take(songs, &mut matches);
+    }
+    let mut candidates_truncated = false;
+    if !matches.iter().any(|m| m.how.kind == MatchKind::Mbid) {
+        let text = format!("{} {}", r.artist, r.title);
+        for page in 0..TEXT_LOOKUP_PAGES {
+            let start = page * LOOKUP_PAGE;
+            let songs = navi
+                .find_songs(&text, start, start + LOOKUP_PAGE)
+                .await
+                .map_err(failure)?;
+            let short = songs.len() < LOOKUP_PAGE as usize;
+            take(songs, &mut matches);
+            if short {
+                break;
+            }
+            candidates_truncated = page + 1 == TEXT_LOOKUP_PAGES;
+        }
+    }
+    matches.sort_by(|a, b| {
+        (a.how.kind as u8)
+            .cmp(&(b.how.kind as u8))
+            .then(
+                b.how
+                    .score
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.how.score.unwrap_or(0.0)),
+            )
+            .then_with(|| a.song.song_id.cmp(&b.song.song_id))
+    });
+    let more_matches = matches.len().saturating_sub(MATCHES_KEPT);
+    matches.truncate(MATCHES_KEPT);
+    Ok(Found {
+        matches,
+        more_matches,
+        candidates_truncated,
     })
 }
 
@@ -495,6 +725,315 @@ mod tests {
                 PathBuf::from("/mnt/music"),
                 PathBuf::from("/srv/bob")
             ]
+        );
+    }
+
+    const MBID: &str = "0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c";
+
+    fn song(title: &str, artist: &str, duration: f64, mbid: Option<&str>) -> NativeSong {
+        serde_json::from_str(&native_song(
+            "3sG8kPq0WmZ1xYbN4vTcDe",
+            artist,
+            title,
+            duration,
+            mbid,
+        ))
+        .unwrap()
+    }
+
+    fn wanted(artist: &str, title: &str) -> Reference {
+        Reference {
+            artist: artist.into(),
+            title: title.into(),
+            album: None,
+            recording_mbid: None,
+            duration_s: None,
+        }
+    }
+
+    #[test]
+    fn a_song_with_the_recording_mbid_is_an_mbid_match_whatever_its_tags() {
+        let r = Reference {
+            recording_mbid: Some(MBID.into()),
+            ..wanted("Bing Crosby", "Silent Night")
+        };
+        let m = classify(&r, &song("O Holy Night", "Marrow Choir", 263.4, Some(MBID))).unwrap();
+        assert_eq!(
+            m.how,
+            MatchHow {
+                kind: MatchKind::Mbid,
+                score: None,
+                differs: vec!["artist", "title"],
+                duration_delta_s: None
+            }
+        );
+    }
+
+    #[test]
+    fn equal_normalized_artist_and_title_within_five_seconds_is_exact() {
+        let r = Reference {
+            duration_s: Some(268),
+            ..wanted("marrow choir", "O holy night!")
+        };
+        let m = classify(&r, &song("O Holy Night", "Marrow Choir", 263.4, None)).unwrap();
+        assert_eq!(
+            m.how,
+            MatchHow {
+                kind: MatchKind::Exact,
+                score: None,
+                differs: vec![],
+                duration_delta_s: Some(-5)
+            }
+        );
+        let r = Reference {
+            album: Some("Christmas Hymns".into()),
+            ..wanted("Marrow Choir", "O Holy Night")
+        };
+        assert_eq!(
+            classify(&r, &song("O Holy Night", "Marrow Choir", 263.4, None))
+                .unwrap()
+                .how
+                .differs,
+            vec!["album"]
+        );
+    }
+
+    #[test]
+    fn a_longer_title_or_another_length_is_fuzzy_with_what_differs() {
+        let m = classify(
+            &wanted("Marrow Choir", "O Holy Night (Cantique de Noël)"),
+            &song("O Holy Night", "Marrow Choir", 263.4, None),
+        )
+        .unwrap();
+        // title words {o, holy, night, cantique, de, noël} against {o, holy, night}: 2*3/9 = 0.67; artist 1.0
+        assert_eq!(
+            m.how,
+            MatchHow {
+                kind: MatchKind::Fuzzy,
+                score: Some(0.83),
+                differs: vec!["title"],
+                duration_delta_s: None
+            }
+        );
+        let r = Reference {
+            duration_s: Some(275),
+            ..wanted("Marrow Choir", "O Holy Night")
+        };
+        assert_eq!(
+            classify(&r, &song("O Holy Night", "Marrow Choir", 263.4, None))
+                .unwrap()
+                .how,
+            MatchHow {
+                kind: MatchKind::Fuzzy,
+                score: Some(1.0),
+                differs: vec!["duration"],
+                duration_delta_s: Some(-12)
+            }
+        );
+    }
+
+    #[test]
+    fn another_artist_is_not_a_match() {
+        assert_eq!(
+            classify(
+                &wanted("Bing Crosby", "O Holy Night"),
+                &song("O Holy Night", "Marrow Choir", 263.4, None)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_name_without_letters_or_digits_matches_only_itself() {
+        // !!! and their album Myth Takes (2007)
+        assert_eq!(
+            (match_key("!!!"), match_key(" O  Holy Night! ")),
+            ("!!!".to_string(), "o holy night".to_string())
+        );
+        let m = classify(
+            &wanted("!!!", "Myth Takes"),
+            &song("Myth Takes", "!!!", 263.4, None),
+        )
+        .unwrap();
+        assert_eq!(m.how.kind, MatchKind::Exact);
+        assert_eq!(
+            classify(
+                &wanted("!!!", "Myth Takes"),
+                &song("Myth Takes", "???", 263.4, None)
+            )
+            .map(|m| m.how.kind),
+            None
+        );
+    }
+
+    fn song_requests(navi: &NavidromeStub) -> Vec<String> {
+        navi.asked_with_queries()
+            .into_iter()
+            .filter(|t| t.starts_with("/api/song"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_mbid_match_needs_no_text_lookup() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/api/song",
+            &[&format!(
+                "[{}]",
+                native_song(
+                    "3sG8kPq0WmZ1xYbN4vTcDe",
+                    "Marrow Choir",
+                    "O Holy Night",
+                    263.4,
+                    Some(MBID)
+                )
+            )],
+        );
+        let r = Reference {
+            recording_mbid: Some(MBID.into()),
+            ..wanted("Marrow Choir", "O Holy Night")
+        };
+        let found = find(&navi.client(), &r).await.unwrap();
+        assert_eq!(
+            (
+                found.matches.len(),
+                found.matches[0].how.kind,
+                found.more_matches,
+                found.candidates_truncated
+            ),
+            (1, MatchKind::Mbid, 0, false)
+        );
+        assert_eq!(
+            song_requests(&navi),
+            vec![format!(
+                "/api/song?_start=0&_end=100&_sort=id&_order=ASC&title={MBID}&missing=false"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_mbid_match_the_text_lookup_runs_and_sorts_its_matches() {
+        let navi = NavidromeStub::start();
+        navi.answer_when(
+            "/api/song",
+            "title=Marrow",
+            200,
+            &format!(
+                "[{},{}]",
+                native_song(
+                    "f1",
+                    "Marrow Choir",
+                    "O Holy Night (Cantique de Noël)",
+                    263.4,
+                    None
+                ),
+                native_song("e1", "Marrow Choir", "O Holy Night", 263.4, None)
+            ),
+        );
+        navi.answer("/api/song", &["[]"]);
+        let r = Reference {
+            recording_mbid: Some(MBID.into()),
+            ..wanted("Marrow Choir", "O Holy Night")
+        };
+        let found = find(&navi.client(), &r).await.unwrap();
+        assert_eq!(
+            found
+                .matches
+                .iter()
+                .map(|m| (m.song.song_id.as_str(), m.how.kind))
+                .collect::<Vec<_>>(),
+            vec![("e1", MatchKind::Exact), ("f1", MatchKind::Fuzzy)]
+        );
+        assert!(
+            song_requests(&navi)
+                .iter()
+                .any(|t| t.contains("title=Marrow+Choir+O+Holy+Night")),
+            "{:?}",
+            song_requests(&navi)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_song_both_lookups_return_is_kept_once() {
+        let navi = NavidromeStub::start();
+        // Tagged with another recording, so the MBID lookup finds it (as a release track id
+        // would, persistence/mediafile_repository.go:97) but it is no mbid match.
+        let other = "5b1e9d3c-2f4a-4c6e-8d7b-9a0c1e2f3b4d";
+        navi.answer(
+            "/api/song",
+            &[&format!(
+                "[{}]",
+                native_song("e1", "Marrow Choir", "O Holy Night", 263.4, Some(other))
+            )],
+        );
+        let r = Reference {
+            recording_mbid: Some(MBID.into()),
+            ..wanted("Marrow Choir", "O Holy Night")
+        };
+        let found = find(&navi.client(), &r).await.unwrap();
+        assert_eq!(
+            (
+                found.matches.len(),
+                found.matches[0].how.kind,
+                found.more_matches
+            ),
+            (1, MatchKind::Exact, 0)
+        );
+        assert_eq!(song_requests(&navi).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_text_lookup_stops_after_five_full_pages_and_says_so() {
+        let navi = NavidromeStub::start();
+        let pages: Vec<String> = (0..5)
+            .map(|p| {
+                format!(
+                    "[{}]",
+                    (0..100)
+                        .map(|i| native_song(
+                            &format!("s{p}{i:02}"),
+                            "Marrow Choir",
+                            "O Holy Night",
+                            263.4,
+                            None
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
+            .collect();
+        navi.answer(
+            "/api/song",
+            &pages.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let found = find(&navi.client(), &wanted("Marrow Choir", "O Holy Night"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                found.matches.len(),
+                found.more_matches,
+                found.candidates_truncated
+            ),
+            (5, 495, true)
+        );
+        assert_eq!(song_requests(&navi).len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_is_a_library_check_failure() {
+        let navi = NavidromeStub::start();
+        navi.answer_when("/api/song", "", 502, "");
+        let f = find(&navi.client(), &wanted("Marrow Choir", "O Holy Night"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.stage, f.message.as_str()),
+            (
+                FailureCode::NavidromeUnreachable,
+                Stage::LibraryCheck,
+                "Find songs failed: HTTP 502"
+            )
         );
     }
 }

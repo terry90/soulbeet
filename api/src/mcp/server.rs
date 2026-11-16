@@ -107,6 +107,19 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         open_world: false,
         call: |state, caller, args| Box::pin(library::get_library_stats(state, caller, args)),
     },
+    ToolSpec {
+        name: "find_in_library",
+        title: "Find in library",
+        description: |_| {
+            format!("Looks up to 100 tracks in the user's Navidrome library. For each reference, in order: by recording_mbid when given, then by artist and title. Each match has the Navidrome song id, artist, title, album, year, duration, format, bitrate, size, path in the library, recording MBID, the user's rating, star and play count, and match: kind mbid, exact (same normalized artist and title, and duration within 5 s when given) or fuzzy (score 0.5 to 1 and the fields that differ). Fuzzy matches are never accepted for you: decide whether each is the track you want. At most 5 matches per reference (more_matches counts the rest). A result too large for one answer stops at a reference: summary.pending counts the rest and calling again with the same references and cursor continues. Song ids stay valid while the file stays in the library. About a second per ten references. Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}, partial (some references failed; each failed entry has its own error).")
+        },
+        input_schema: r#"{"type":"object","properties":{"references":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","properties":{"artist":{"type":"string"},"title":{"type":"string"},"album":{"type":"string"},"recording_mbid":{"type":"string","description":"A MusicBrainz recording id"},"duration_s":{"type":"integer","minimum":1,"maximum":36000}},"required":["artist","title"],"additionalProperties":false}},"cursor":{"type":"string"}},"required":["references"],"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(library::find_in_library(state, caller, args)),
+    },
 ];
 
 impl ToolSpec {
@@ -289,6 +302,9 @@ mod tests {
     fn valid_args(tool: &str) -> Value {
         match tool {
             "get_status" | "get_settings" | "list_folders" | "get_library_stats" => json!({}),
+            "find_in_library" => {
+                json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
+            }
             other => panic!("no valid call for {other} in valid_args"),
         }
     }

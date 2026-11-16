@@ -48,13 +48,7 @@ impl Cursor {
     /// Navidrome offset holds is refused.
     pub(crate) fn read(args: &Args, list: &Value) -> Result<usize, ToolError> {
         let tool = args.tool();
-        let refused = || {
-            invalid_value(
-                tool,
-                "cursor",
-                &format!("a cursor {tool} returned for the same arguments"),
-            )
-        };
+        let refused = || Cursor::refused(tool);
         let Some(cursor) = args.opt_string("cursor").map_err(|_| refused())? else {
             return Ok(0);
         };
@@ -67,6 +61,15 @@ impl Cursor {
             return Err(refused());
         }
         Ok(body.o as usize)
+    }
+
+    /// The refusal of a cursor `tool` cannot read.
+    pub(crate) fn refused(tool: &'static str) -> ToolError {
+        invalid_value(
+            tool,
+            "cursor",
+            &format!("a cursor {tool} returned for the same arguments"),
+        )
     }
 }
 

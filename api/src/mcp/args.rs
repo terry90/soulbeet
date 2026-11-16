@@ -489,6 +489,7 @@ pub(crate) mod tests {
     fn a_failure_that_could_be_retried_on_a_call_too_large_to_repeat_says_so() {
         let a = large_call(json!({}));
         assert_eq!(a.same_call(), None);
+        // sqlx's text for SQLITE_BUSY: sqlx-core 0.8.6 src/error.rs:44, sqlx-sqlite 0.8.6 src/error.rs:89
         let lookup = NavidromeLookupError::Database(
             "error returned from database: (code: 5) database is locked".into(),
         );

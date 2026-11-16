@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 const INDEX_POLL: Duration = Duration::from_secs(5);
 const INDEX_GIVE_UP_SECS: i64 = 10 * 60;
-const LOOKUP_PAGE: u32 = 100;
+pub(crate) const LOOKUP_PAGE: u32 = 100;
 /// How many pages of the songs Navidrome added last a file no text finds is looked for in.
 const NEWEST_PAGES: u32 = 3;
 
@@ -106,9 +106,14 @@ const NAVIDROME_DROPS: [char; 28] = [
 ];
 
 /// Whether Navidrome's full-text filter keeps a word of `text`. A text it keeps nothing of is no
-/// filter (persistence/sql_search.go:62-66): Navidrome drops it and lists every song
-/// (persistence/sql_restful.go:26-35). Any other symbol is kept, so the band `!!!` is a word.
-fn navidrome_keeps(text: &str) -> bool {
+/// filter: Navidrome drops it and lists every song (persistence/sql_restful.go:26-35). The native
+/// `title` filter is the MBID match or the search backend's (sql_restful.go:109-117). The legacy
+/// backend drops a text SanitizeStrings leaves nothing of (persistence/sql_search_like.go:51-58),
+/// which is this rule; the default FTS backend (conf/configuration.go:1001) searches a text with
+/// no FTS token by LIKE without its quotes and drops it only when that is empty
+/// (persistence/sql_search_fts.go:358-370), so this rule covers it too. Any other symbol is kept,
+/// so the band `!!!` is a word.
+pub(crate) fn navidrome_keeps(text: &str) -> bool {
     text.chars()
         .any(|c| !c.is_whitespace() && !NAVIDROME_DROPS.contains(&c))
 }
@@ -751,6 +756,22 @@ mod tests {
     }
 
     const LOCKED: &str = "running GC: purging empty albums: database is locked"; // Task 2's sources
+
+    #[test]
+    fn navidrome_keeps_all_but_what_its_sanitizer_removes() {
+        for (text, dropped) in [
+            ("()", true),
+            ("\"\" ()", true),
+            (" / \\ ", true),
+            ("“[ ]”", true),
+            ("!!!", false),
+            ("AC/DC", false),
+            ("é", false),
+            ("? +", false),
+        ] {
+            assert_eq!(navidrome_keeps(text), !dropped, "{text}");
+        }
+    }
 
     fn waiting(since: i64) -> IndexWait {
         IndexWait {
