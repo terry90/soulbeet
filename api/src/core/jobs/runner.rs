@@ -2,7 +2,7 @@
 //! and the effects outside them), and the job runner that takes an MCP job from its search to
 //! its enqueue.
 
-use crate::auth::UserCtx;
+use crate::auth::{UserCtx, UserId};
 use crate::core::acquire::{
     alternates_from, enqueue_and_watch, manual_batch_label, numbered, prepare_target, Acquisition,
     NewBatch,
@@ -11,7 +11,7 @@ use crate::core::sources::{
     no_candidate_passed, start_stored, view, Candidate, CandidateView, SearchProgress, SearchRun,
     Searches, RECENT_FAILURES_SECS,
 };
-use crate::core::{backend_unavailable, database_failure, metadata};
+use crate::core::{backend_unavailable, database_failure, logged, metadata};
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
 use crate::importer_health::blocking_failure;
 use crate::ledger::store::{self, JobRecord, StoredSearch};
@@ -19,15 +19,18 @@ use crate::ledger::{
     DuplicateRule, JobKind, JobOptions, JobState, Ledger, Pick, StoredSpec, Transition,
     Transitioned, LEDGER,
 };
+use crate::server_fns::download::enqueue::nothing_enqueued;
 use crate::services::download_backend;
 use async_trait::async_trait;
 use shared::download::{DownloadQuery, DownloadableGroup, DownloadableItem, QueuedDownload};
-use shared::failure::{Failure, Stage};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+use soulbeet::musicbrainz::MusicBrainzProvider;
 use soulbeet::{DownloadBackend, ImportMode};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -39,8 +42,9 @@ pub(crate) trait Effects: Send + Sync {
     /// The failure an import would end with because the importer is broken; None when nothing
     /// blocks imports.
     async fn importer_blocked(&self) -> Option<Failure>;
-    /// Fills an album query's empty tracklist from its metadata provider.
-    async fn hydrate(&self, ctx: &UserCtx, query: &mut DownloadQuery) -> Result<(), Failure>;
+    /// Fills an album query's empty tracklist from MusicBrainz: an MCP album is asked for by
+    /// its release MBID (D1).
+    async fn hydrate(&self, query: &mut DownloadQuery) -> Result<(), Failure>;
     /// Enqueues `acquisition`'s files into `fresh` for `ctx` on `backend` and watches them,
     /// recording every row in the ledger (`enqueue_and_watch`). A failure is already on the
     /// slots it failed.
@@ -94,6 +98,13 @@ struct Runners {
 }
 
 impl Runners {
+    /// Tells the runner that has job `id`, when one has, to look at it again.
+    fn look_again(&self, id: &str) {
+        if let Some(look_again) = self.jobs.lock().unwrap().get(id) {
+            look_again.notify_one();
+        }
+    }
+
     /// Waits until no runner has job `id`, telling the one that has it to look at it again, and
     /// takes it until the returned guard drops.
     async fn take(&self, id: &str) -> RunnerOf<'_> {
@@ -137,6 +148,14 @@ impl Drop for RunnerOf<'_> {
     }
 }
 
+impl Acquire {
+    /// A call changed job `id` (cancel_job): its runner, waiting for a download place, looks at
+    /// it again now rather than when a place is next given up.
+    pub(crate) fn job_changed(&self, id: &str) {
+        self.runners.look_again(id);
+    }
+}
+
 /// The services the server is configured with.
 struct LiveEffects;
 
@@ -152,9 +171,8 @@ impl Effects for LiveEffects {
         blocking_failure().await
     }
 
-    async fn hydrate(&self, ctx: &UserCtx, query: &mut DownloadQuery) -> Result<(), Failure> {
-        let key = metadata::lastfm_key(ctx).await?;
-        metadata::hydrate_album_tracks(query, key.as_deref()).await
+    async fn hydrate(&self, query: &mut DownloadQuery) -> Result<(), Failure> {
+        metadata::hydrate_in(&MusicBrainzProvider::new(), query).await
     }
 
     async fn enqueue(
@@ -176,20 +194,21 @@ pub(crate) const MCP_DOWNLOADS_PER_USER: u32 = 6;
 pub(crate) enum Picked {
     /// The candidate at this index downloads, the others stand by.
     Auto(usize),
-    /// Every candidate waits for Claude (pick review, or none at min_score from an unflagged
-    /// source).
+    /// Every candidate waits for Claude (pick review, or none at min_score a job may take
+    /// without Claude naming it).
     Choose,
 }
 
 /// D4, on `view`'s candidates, best first (never empty: drive fails a job whose view is empty
-/// first): the best one at or above `min_score` whose source is not flagged.
+/// first): the best one at or above `min_score` a job may take without Claude naming it,
+/// neither flagged nor below the floor (`Candidate::automatic`).
 pub(crate) fn pick(candidates: &[Candidate], options: &JobOptions) -> Picked {
     if options.pick == Pick::Review {
         return Picked::Choose;
     }
     candidates
         .iter()
-        .position(|c| !c.flagged() && c.group.score >= options.min_score)
+        .position(|c| c.automatic() && c.group.score >= options.min_score)
         .map_or(Picked::Choose, Picked::Auto)
 }
 
@@ -269,8 +288,49 @@ struct Runner<'a> {
 enum Stop {
     /// The job fails with this.
     Fail(Failure),
-    /// Another call moved the job, or the search's task stopped without an answer.
+    /// Another call moved the job.
     Quietly,
+}
+
+/// A job's search gave its runner no answer: its task stopped (a panic) before it said how the
+/// search went, or the job had no search to read. Searching again is the remedy.
+pub(crate) fn search_unanswered() -> Failure {
+    Failure::new(
+        FailureCode::SearchLost,
+        Stage::SourceSearch,
+        RetryAdvice::SameSourceLater,
+        "The job's search ended without an answer",
+    )
+}
+
+/// The longest a failure that could not be written waits before it is written again.
+const FAIL_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Fails `user`'s job `job` with `failure` (`search_id` the search it came of, when it came of
+/// one), writing it again, waiting longer each time up to FAIL_RETRY_MAX, until the writer
+/// applies or refuses it: a job whose failure was not written would wait with no runner. A
+/// refusal means the job moved on meanwhile.
+pub(crate) async fn fail_job(
+    ledger: &Ledger,
+    user: &UserId,
+    job: &str,
+    failure: Failure,
+    search_id: Option<String>,
+) {
+    info!("Job {job} failed: {}", logged(&failure));
+    let mut wait = Duration::from_secs(1);
+    loop {
+        let change = Transition::Fail {
+            failure: failure.clone(),
+            search_id: search_id.clone(),
+        };
+        match ledger.transition(user, job, change).await {
+            Ok(_) => return,
+            Err(e) => warn!("Could not fail job {job}, trying again in {wait:?}: {e}"),
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(FAIL_RETRY_MAX);
+    }
 }
 
 impl Runner<'_> {
@@ -285,18 +345,34 @@ impl Runner<'_> {
         matches!(applied, Ok(Transitioned::Applied { .. }))
     }
 
-    async fn fail(&self, failure: Failure) {
-        info!("Job {} failed: {}", self.job.id, failure.message);
-        self.transition(Transition::Fail { failure }).await;
+    /// `fail_job` of the runner's job.
+    async fn fail(&self, failure: Failure, search_id: Option<String>) {
+        let user = self.ctx.id();
+        fail_job(
+            &self.acquire.ledger,
+            &user,
+            &self.job.id,
+            failure,
+            search_id,
+        )
+        .await;
     }
 
     /// The searching job's search, then its pick: whether it was queued, not waiting for a
-    /// choice, failed or moved on.
+    /// choice, failed or moved on. Every write after the search names it, so a job cancelled and
+    /// searched again meanwhile is left to its new search's runner (D15).
     async fn search_and_pick(&self) -> bool {
-        let (search_id, groups) = match self.searched().await {
-            Ok(found) => found,
+        let Some(first) = self.job.search_id.clone() else {
+            // The writer gives every searching job its search: one without cannot be answered.
+            warn!("Job {} is searching without a search", self.job.id);
+            self.fail(search_unanswered(), None).await;
+            return false;
+        };
+        let (search_id, searched) = self.searched(first).await;
+        let groups = match searched {
+            Ok(groups) => groups,
             Err(Stop::Fail(failure)) => {
-                self.fail(failure).await;
+                self.fail(failure, Some(search_id)).await;
                 return false;
             }
             Err(Stop::Quietly) => return false,
@@ -304,72 +380,79 @@ impl Runner<'_> {
         let view = match self.view(&search_id, &groups, Stage::SourceSearch).await {
             Ok(view) => view,
             Err(failure) => {
-                self.fail(failure).await;
+                self.fail(failure, Some(search_id)).await;
                 return false;
             }
         };
         if view.candidates.is_empty() {
-            self.fail(no_candidate_passed()).await;
+            self.fail(no_candidate_passed(), Some(search_id)).await;
             return false;
         }
         match pick(&view.candidates, self.options) {
             Picked::Choose => {
-                self.transition(Transition::AwaitChoice).await;
+                self.transition(Transition::AwaitChoice { search_id }).await;
                 false
             }
             Picked::Auto(at) => {
                 let items = numbered(view.candidates[at].group.items.clone());
-                self.transition(Transition::Pick { items }).await
+                self.transition(Transition::Pick { items, search_id }).await
             }
         }
     }
 
-    /// The groups of the job's search and its id: a stored search that ended is read as it is,
-    /// one this process runs is waited for, one a restart cut off runs again under its id, one
-    /// not stored yet runs for the job's query, and one that expired runs again under a new id
-    /// (the old one's candidate ids keep naming what they named).
-    async fn searched(&self) -> Result<(String, Vec<DownloadableGroup>), Stop> {
-        let Some(mut id) = self.job.search_id.clone() else {
-            warn!("Job {} is searching without a search", self.job.id);
-            return Err(Stop::Quietly);
-        };
+    /// The groups of the job's search `id` and the id it ended under: a stored search that ended
+    /// is read as it is, one this process runs is waited for, one a restart cut off runs again
+    /// under its id, one not stored yet runs for the job's query, and one that expired runs
+    /// again under a new id (the old one's candidate ids keep naming what they named).
+    async fn searched(&self, mut id: String) -> (String, Result<Vec<DownloadableGroup>, Stop>) {
         let searches = &self.acquire.searches;
         let progress = loop {
-            let stored = store::search_of(&self.acquire.db, &id, &self.ctx.id())
-                .await
-                .map_err(|e| Stop::Fail(database_failure(Stage::SourceSearch, e)))?;
+            let stored = match store::search_of(&self.acquire.db, &id, &self.ctx.id()).await {
+                Ok(stored) => stored,
+                Err(e) => {
+                    let failure = database_failure(Stage::SourceSearch, e);
+                    return (id, Err(Stop::Fail(failure)));
+                }
+            };
             let Some(stored) = stored else {
-                break self.run(&id, None).await?;
+                break self.run(&id, None).await;
             };
             match SearchProgress::of(&stored) {
                 SearchProgress::Running if searches.runs(&id) => searches.until_left(&id).await,
-                SearchProgress::Running => break self.run(&id, Some(&stored)).await?,
+                SearchProgress::Running => break self.run(&id, Some(&stored)).await,
                 _ if stored.expires_at <= chrono::Utc::now().timestamp() => {
                     let renewed = uuid::Uuid::new_v4().to_string();
                     let change = Transition::SearchAgain {
+                        from: id.clone(),
                         search_id: renewed.clone(),
                     };
                     if !self.transition(change).await {
-                        return Err(Stop::Quietly);
+                        return (id, Err(Stop::Quietly));
                     }
                     id = renewed;
-                    break self.run(&id, Some(&stored)).await?;
+                    break self.run(&id, Some(&stored)).await;
                 }
-                ended => break ended,
+                ended => break Ok(ended),
             }
         };
-        match progress {
-            SearchProgress::Done(groups, _) => Ok((id, groups)),
-            SearchProgress::Failed(failure, _) => Err(Stop::Fail(failure)),
+        let groups = match progress {
+            Ok(SearchProgress::Done(groups, _)) => Ok(groups),
+            Ok(SearchProgress::Failed(failure, _)) => Err(Stop::Fail(failure)),
             // A search task answers how its search ended.
-            SearchProgress::Running => Err(Stop::Quietly),
-        }
+            Ok(SearchProgress::Running) => Err(Stop::Fail(search_unanswered())),
+            Err(failure) => Err(Stop::Fail(failure)),
+        };
+        (id, groups)
     }
 
     /// Runs the job's search `id` and waits for how it ended: for the query and spec of
     /// `stored` (a search run again), else for the job's query, an album's tracklist read
     /// first, with the job's filters.
-    async fn run(&self, id: &str, stored: Option<&StoredSearch>) -> Result<SearchProgress, Stop> {
+    async fn run(
+        &self,
+        id: &str,
+        stored: Option<&StoredSearch>,
+    ) -> Result<SearchProgress, Failure> {
         let spec = || StoredSpec {
             filters: self.options.filters.clone(),
             ..StoredSpec::default()
@@ -382,13 +465,12 @@ impl Runner<'_> {
             None => {
                 let mut query = self.job.wanted.clone();
                 if self.job.kind == JobKind::Album {
-                    (self.acquire.effects.hydrate(self.ctx, &mut query).await)
-                        .map_err(Stop::Fail)?;
+                    self.acquire.effects.hydrate(&mut query).await?;
                 }
                 (query, spec())
             }
         };
-        let backend = self.acquire.effects.backend().await.map_err(Stop::Fail)?;
+        let backend = self.acquire.effects.backend().await?;
         let run = SearchRun {
             id: id.to_string(),
             query,
@@ -401,11 +483,10 @@ impl Runner<'_> {
             backend,
             run,
         )
-        .await
-        .map_err(Stop::Fail)?;
+        .await?;
         task.await.map_err(|e| {
             warn!("The search of job {} stopped: {e}", self.job.id);
-            Stop::Quietly
+            search_unanswered()
         })
     }
 
@@ -431,12 +512,13 @@ impl Runner<'_> {
     }
 
     /// The queued job holding a download place: its slots' current picks enqueued into a batch
-    /// of its own, the unflagged candidates of its search standing by.
+    /// of its own, the automatic candidates of its search standing by.
     async fn download(&self) {
         let (backend, fresh, acquisition) = match self.request().await {
             Ok(Some(request)) => request,
-            Ok(None) => return,
-            Err(failure) => return self.fail(failure).await,
+            // Queued with nothing to send: it gives up the place it holds by failing.
+            Ok(None) => return self.fail(nothing_enqueued(), None).await,
+            Err(failure) => return self.fail(failure, None).await,
         };
         let enqueued = self
             .acquire
@@ -448,8 +530,8 @@ impl Runner<'_> {
     }
 
     /// D8: waits until the job holds one of its user's download places, trying again each time
-    /// one is given up or the job is taken on again (`look_again`). False once the job left
-    /// queued.
+    /// one is given up or the job is taken on again or changed by a call (`look_again`). False
+    /// once the job left queued, or failed because no place could be claimed.
     async fn take_place(&self, look_again: &Notify) -> bool {
         let mut places = self.acquire.ledger.places();
         loop {
@@ -461,7 +543,10 @@ impl Runner<'_> {
             {
                 Ok(true) => return true,
                 Ok(false) => {}
-                Err(_) => return false,
+                Err(e) => {
+                    self.fail(database_failure(Stage::Enqueue, e), None).await;
+                    return false;
+                }
             }
             match store::job_record(&self.acquire.db, &self.job.id, &self.ctx.id()).await {
                 Ok(Some(job)) if job.state == JobState::Queued => {}
@@ -487,7 +572,7 @@ impl Runner<'_> {
 
     /// What the job's enqueue asks for: the backend, a batch of its own importing tracks as
     /// singletons and an album whole (step 5 D1), skipping what the library has, and its slots'
-    /// current picks with the unflagged candidates of its search as alternates. None when it has
+    /// current picks with the automatic candidates of its search as alternates. None when it has
     /// no queued slot left.
     async fn request(
         &self,
@@ -525,7 +610,7 @@ impl Runner<'_> {
         Ok(Some((backend, fresh, acquisition)))
     }
 
-    /// The unflagged candidates of search `search_id` without `picked`, best first; none when
+    /// The automatic candidates of search `search_id` without `picked`, best first; none when
     /// the search is gone or found nothing.
     async fn alternates(
         &self,
@@ -540,7 +625,7 @@ impl Runner<'_> {
             .map_err(|e| database_failure(Stage::Enqueue, e))?;
         let groups = stored.and_then(|s| s.candidates).unwrap_or_default();
         let view = self.view(search_id, &groups, Stage::Enqueue).await?;
-        Ok(alternates_from(&view.unflagged_groups(), picked))
+        Ok(alternates_from(&view.automatic_groups(), picked))
     }
 }
 
@@ -668,7 +753,7 @@ mod test_effects {
             blocking_failure_of(self.importer.as_ref())
         }
 
-        async fn hydrate(&self, _ctx: &UserCtx, query: &mut DownloadQuery) -> Result<(), Failure> {
+        async fn hydrate(&self, query: &mut DownloadQuery) -> Result<(), Failure> {
             let album = match self.hydrate_error.lock().unwrap().clone() {
                 Some(e) => Err(e),
                 None => Ok(self.tracks.lock().unwrap().clone()),
@@ -816,6 +901,19 @@ mod tests {
             ..auto(0.1)
         };
         assert_eq!(pick(&candidates, &review), Picked::Choose);
+        // A file scored below the floor matches another recording: only Claude takes it.
+        let mut weak = candidate("peer_d", 0.79, 0);
+        weak.group.items[0].below_floor = true;
+        let candidates = vec![weak, candidate("peer_c", 0.6, 0)];
+        assert_eq!(pick(&candidates, &auto(0.7)), Picked::Choose);
+        let view = CandidateView {
+            candidates,
+            dropped_by_filter: Default::default(),
+        };
+        let standing_by: Vec<String> = (view.automatic_groups().into_iter())
+            .map(|g| g.source)
+            .collect();
+        assert_eq!(standing_by, vec!["peer_c".to_string()]);
     }
 
     #[tokio::test]

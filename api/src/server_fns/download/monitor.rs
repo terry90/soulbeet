@@ -653,7 +653,10 @@ impl DownloadMonitor {
         // Each source is stored before it is sent, so a restart knows which
         // peer may hold the slot's transfer and in which request. A source
         // the ledger cannot store is not sent. Each refused source is stored
-        // before the next one, so the newest attempt is always the slot's.
+        // before the next one, so an accepted source is the newest attempt.
+        // When every source is refused, the slot ends with `left`, whose
+        // attempt is older than the refused ones: a reader finds a row's
+        // attempt by its source and file, never by its place.
         let (ledger, job) = (self.ledger.clone(), self.tracked_files[slot].job.clone());
         let filename = self.tracked_files[slot].filename.clone();
         let record = |item: &DownloadableItem, request: &str| {

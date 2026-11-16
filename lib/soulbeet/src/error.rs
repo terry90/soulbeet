@@ -1,7 +1,7 @@
 use shared::failure::{
     Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
 };
-use shared::slskd::NOT_LOGGED_IN;
+use shared::slskd::says_not_logged_in;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -177,7 +177,7 @@ impl SoulseekError {
             SoulseekError::Api {
                 status: 500,
                 message,
-            } if message.contains(NOT_LOGGED_IN) => (BackendUnreachable, SameSourceLater),
+            } if says_not_logged_in(message) => (BackendUnreachable, SameSourceLater),
             // slskd could not reach the peer.
             SoulseekError::Api { status: 500, .. } if stage == Stage::Enqueue => {
                 (EnqueueFailed, OtherSource)
@@ -212,6 +212,70 @@ impl SoulseekError {
             _ if code == BackendNotConfigured => failure.with_user_action(configure_slskd()),
             SoulseekError::SlskdTooOld { .. } => failure.with_user_action(upgrade_slskd()),
             _ => failure,
+        }
+    }
+}
+
+/// A question Soulful asks slskd about a peer outside the calls of a transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAsk {
+    /// `GET transfers/downloads/{username}/{id}/position`: slskd asks the peer, now, for the
+    /// transfer's place in its queue.
+    QueuePosition,
+    /// `GET users/{username}/status`: slskd asks the Soulseek server whether the peer is online.
+    Presence,
+}
+
+impl PeerAsk {
+    /// Soulful's own words for the ask that failed: slskd's text, which names peers and remote
+    /// files, stays in the failure's cause.
+    pub fn message(self) -> &'static str {
+        match self {
+            PeerAsk::QueuePosition => {
+                "slskd could not ask the source for this transfer's place in its queue"
+            }
+            PeerAsk::Presence => "slskd could not say whether the source is online",
+        }
+    }
+
+    /// Who did not answer when the ask gets no answer in time: the peer for a place in its
+    /// queue, the Soulseek server for a presence.
+    pub fn unanswered(self) -> FailureCode {
+        match self {
+            PeerAsk::QueuePosition => FailureCode::TransferConnectionFailed,
+            PeerAsk::Presence => FailureCode::BackendUnreachable,
+        }
+    }
+}
+
+impl SoulseekError {
+    /// This error of `ask` as a failure at `stage`, with the ask's own message. slskd answers
+    /// 500 with the exception's text when it is not logged in (backend_unreachable), when the
+    /// peer is offline (peer_offline, read as `UserOffline`), and when the one it asked did not
+    /// answer in time or the transfer is no longer active (`ask.unanswered()`: Soulseek.NET
+    /// `Waiter.cs:161`, `SoulseekClient.cs:1643-1646,3866`). Each says to ask again later.
+    pub fn ask_failure(&self, ask: PeerAsk, stage: Stage) -> Failure {
+        match self {
+            SoulseekError::Api {
+                status: 500,
+                message,
+            } if !says_not_logged_in(message) => Failure::new(
+                ask.unanswered(),
+                stage,
+                RetryAdvice::SameSourceLater,
+                ask.message(),
+            )
+            .with_cause(Service::Slskd, Some(500), message.clone()),
+            // Not the downloads list, whose own code transfer_list_unreadable is.
+            SoulseekError::InvalidResponse(_) => Failure::new(
+                FailureCode::BackendResponseUnreadable,
+                stage,
+                RetryAdvice::NotRetryable,
+                ask.message(),
+            )
+            .with_cause(Service::Slskd, None, self.to_string())
+            .with_user_action(update_soulful_or_slskd()),
+            other => other.failure(stage, ask.message()),
         }
     }
 }
@@ -470,6 +534,81 @@ mod tests {
             gone.failure(Stage::SourceSearch, "m").cause.unwrap().status,
             Some(404)
         );
+    }
+
+    /// slskd's 500 bodies for a failed ask, unwrapped from their JSON string (Program.cs:1051-1053),
+    /// each with Soulful's message and slskd's text kept in the cause.
+    #[test]
+    fn a_failed_ask_about_a_peer_says_who_did_not_answer() {
+        let api = |message: &str| SoulseekError::Api {
+            status: 500,
+            message: message.into(),
+        };
+        let position = PeerAsk::QueuePosition;
+        let cases = [
+            // Soulseek.NET SoulseekClient.cs:1640.
+            (
+                api("The server connection must be Connected and LoggedIn to check download queue position (currently: Disconnected)"),
+                position,
+                FailureCode::BackendUnreachable,
+                RetryAdvice::SameSourceLater,
+            ),
+            // Waiter.cs:161: the peer did not answer.
+            (
+                api("The wait timed out after 5000 milliseconds"),
+                position,
+                FailureCode::TransferConnectionFailed,
+                RetryAdvice::SameSourceLater,
+            ),
+            // SoulseekClient.cs:1643-1646: the transfer ended between two reads.
+            (
+                api("A download of @@kqzbm\\Music\\03 - O Holy Night.flac from user carol_shares is not active"),
+                position,
+                FailureCode::TransferConnectionFailed,
+                RetryAdvice::SameSourceLater,
+            ),
+            // SoulseekClient.cs:3790, as the client reads it.
+            (
+                SoulseekError::UserOffline {
+                    username: "carol_shares".into(),
+                    status: 500,
+                    body: "User carol_shares appears to be offline".into(),
+                },
+                position,
+                FailureCode::PeerOffline,
+                RetryAdvice::OtherSource,
+            ),
+            // SoulseekClient.cs:3866: the Soulseek server did not answer GetStatus in time.
+            (
+                api("The wait timed out after 5000 milliseconds"),
+                PeerAsk::Presence,
+                FailureCode::BackendUnreachable,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                api("The server connection must be connected and logged in to fetch user status (currently: Disconnected)"),
+                PeerAsk::Presence,
+                FailureCode::BackendUnreachable,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                SoulseekError::InvalidResponse("expected i64 at line 1 column 1".into()),
+                position,
+                FailureCode::BackendResponseUnreadable,
+                RetryAdvice::NotRetryable,
+            ),
+        ];
+        for (e, ask, code, retry) in cases {
+            let f = e.ask_failure(ask, Stage::Transfer);
+            assert_eq!((f.code, f.retry), (code, retry), "{e:?}");
+            assert_eq!(f.message, ask.message());
+            let raw = match &e {
+                SoulseekError::Api { message, .. } => message.clone(),
+                SoulseekError::UserOffline { body, .. } => body.clone(),
+                other => other.to_string(),
+            };
+            assert_eq!(f.cause.unwrap().raw, raw, "{e:?}");
+        }
     }
 
     fn offline() -> SoulseekError {

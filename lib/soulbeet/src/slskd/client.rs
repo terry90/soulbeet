@@ -259,6 +259,9 @@ impl SoulseekClient {
                 }
                 Err(e) => {
                     self.circuit_breaker.record_failure().await;
+                    // A failure never holds a request URL (design 10): the URL names the
+                    // slskd host and the peer asked about.
+                    let e = e.without_url();
                     if e.is_timeout() {
                         warn!("Request to {} timed out", endpoint);
                         return Err(SoulseekError::Api {
@@ -821,21 +824,38 @@ impl SoulseekClient {
     /// body is the exception's text written as a JSON string (`:56`, `:614-617`); the error
     /// keeps that text. A transfer between retries or ended answers such a 500, `... is not
     /// active` (Soulseek.NET `SoulseekClient.cs:1643-1646`).
+    ///
+    /// Soulseek.NET reads the peer's place as a signed int (`PlaceInQueueResponse.cs:36,50`) and
+    /// slskd answers it as it is: a place outside u32, which no peer means, is None, as the
+    /// downloads list reads it. A peer slskd found offline is `UserOffline`
+    /// (`SoulseekClient.cs:3790`).
     pub async fn get_place_in_queue(&self, username: &str, id: &str) -> Result<Option<u32>> {
         let endpoint = format!("{}/position", download_endpoint(username, id)?);
         match self
-            .make_request::<u32, ()>(Method::GET, &endpoint, None)
+            .make_request::<i64, ()>(Method::GET, &endpoint, None)
             .await
         {
-            Ok(place) => Ok(Some(place)),
+            Ok(place) => Ok(u32::try_from(place).ok()),
             Err(SoulseekError::Api { status: 404, .. }) => Ok(None),
             Err(SoulseekError::Api {
                 status: 500,
                 message,
-            }) => Err(SoulseekError::Api {
-                status: 500,
-                message: json_text(message),
-            }),
+            }) => {
+                let body = json_text(message);
+                Err(
+                    match body.to_lowercase().contains("appears to be offline") {
+                        true => SoulseekError::UserOffline {
+                            username: username.to_string(),
+                            status: 500,
+                            body,
+                        },
+                        false => SoulseekError::Api {
+                            status: 500,
+                            message: body,
+                        },
+                    },
+                )
+            }
             Err(e) => Err(e),
         }
     }
@@ -855,6 +875,14 @@ impl SoulseekClient {
                 WirePresence::Offline => SourcePresence::Offline,
             }),
             Err(SoulseekError::Api { status: 404, .. }) => Ok(SourcePresence::Blocked),
+            // The global handler writes the exception's text as a JSON string (Program.cs:1051-1053).
+            Err(SoulseekError::Api {
+                status: 500,
+                message,
+            }) => Err(SoulseekError::Api {
+                status: 500,
+                message: json_text(message),
+            }),
             Err(e) => Err(e),
         }
     }
@@ -863,15 +891,21 @@ impl SoulseekClient {
     /// cancels the search's token (`SearchService.cs:414-423`), and the search ends
     /// `Completed, Cancelled` with the responses it had (`SearchService.cs:337-341,359`). 404
     /// (no such search, `:222-225`) is Ok: nothing runs.
+    /// A search this client polls is marked cancelled, so its deadline does not cancel it again
+    /// and its next polls give it the grace a cancelled search has to end.
     pub async fn stop_search(&self, search_id: &str) -> Result<()> {
-        let endpoint = format!("searches/{search_id}");
+        let endpoint = format!("searches/{}", path_segment(search_id)?);
         match self
             .make_request::<(), ()>(Method::PUT, &endpoint, None)
             .await
         {
-            Ok(()) | Err(SoulseekError::Api { status: 404, .. }) => Ok(()),
-            Err(e) => Err(e),
+            Ok(()) | Err(SoulseekError::Api { status: 404, .. }) => {}
+            Err(e) => return Err(e),
         }
+        if let Some(context) = self.active_searches.lock().await.get_mut(search_id) {
+            context.cancelled = true;
+        }
+        Ok(())
     }
 
     /// Checks that slskd answers and is connected and logged in to the
@@ -2708,6 +2742,13 @@ mod tests {
                 status: 500,
                 body: serde_json::to_string(inactive).unwrap(),
             },
+            // A peer's place read as a signed int (PlaceInQueueResponse.cs:36,50).
+            ok("-1"),
+            // SoulseekClient.cs:3790.
+            Reply {
+                status: 500,
+                body: serde_json::to_string("User carol_shares appears to be offline").unwrap(),
+            },
         ]);
         let client = SoulseekClientBuilder::new()
             .base_url(&url)
@@ -2731,6 +2772,19 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(
+            client.get_place_in_queue("carol_shares", id).await.unwrap(),
+            None
+        );
+        let err = client
+            .get_place_in_queue("carol_shares", id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SoulseekError::UserOffline { username, status: 500, body }
+                if username == "carol_shares" && body == "User carol_shares appears to be offline"),
+            "{err:?}"
+        );
+        assert_eq!(
             seen.lock().unwrap()[0].target,
             format!("/api/v0/transfers/downloads/carol_shares/{id}/position")
         );
@@ -2745,6 +2799,12 @@ mod tests {
             Reply {
                 status: 404,
                 body: String::new(),
+            },
+            // The Soulseek server did not answer GetStatus in time (SoulseekClient.cs:3866),
+            // written as a JSON string by the global handler (Program.cs:1051-1053).
+            Reply {
+                status: 500,
+                body: serde_json::to_string("The wait timed out after 5000 milliseconds").unwrap(),
             },
         ]);
         let client = SoulseekClientBuilder::new()
@@ -2763,6 +2823,12 @@ mod tests {
                 expected
             );
         }
+        let err = client.get_user_presence("carol_shares").await.unwrap_err();
+        assert!(
+            matches!(&err, SoulseekError::Api { status: 500, message }
+                if message == "The wait timed out after 5000 milliseconds"),
+            "{err:?}"
+        );
         assert_eq!(
             seen.lock().unwrap()[0].target,
             "/api/v0/users/carol_shares/status"
@@ -2791,5 +2857,32 @@ mod tests {
             ("PUT", format!("/api/v0/searches/{SEARCH_ID}"))
         );
         assert_eq!(sent.body, "");
+        // An id that is no one path segment is never sent.
+        assert!(client.stop_search("..").await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// A search stopped while this client polls it is given the grace a cancelled search has,
+    /// not cancelled again at its deadline.
+    #[tokio::test]
+    async fn a_stopped_search_is_not_cancelled_again_at_its_deadline() {
+        let (client, seen) = searching(
+            vec![
+                ok(""),
+                status(false, 1),
+                status(true, 1),
+                one_response(),
+                no_content(),
+            ],
+            Duration::zero(),
+        )
+        .await;
+        client.stop_search(SEARCH_ID).await.unwrap();
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(poll.state, SearchState::Completed);
+        let stops = (seen.lock().unwrap().iter())
+            .filter(|sent| sent.method == "PUT")
+            .count();
+        assert_eq!(stops, 1);
     }
 }

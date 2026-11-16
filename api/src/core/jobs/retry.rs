@@ -2,6 +2,7 @@
 //! state change is a transition the ledger's writer checks against the job's state, so of two
 //! calls racing on one job only one changes it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
@@ -9,21 +10,23 @@ use shared::download::{DownloadableItem, SourcePresence};
 use shared::failure::{
     cut_chars, Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode, TEXT_MAX_CHARS,
 };
+use soulbeet::error::PeerAsk;
 use soulbeet::ImportMode;
 
-use super::runner::{spawn_drive, Acquire};
+use super::runner::{fail_job, spawn_drive, Acquire};
 use super::{
     allowed, done_source, folder_for, job_already_running, job_failure, job_not_found, job_view,
-    last_tried, over_limit, untried, CallRefused, JobView, RetryMode, Untried, Wanted,
+    over_limit, source_tried, takes_another_source, untried, CallRefused, JobView, RetryMode,
+    Untried, Wanted,
 };
 use crate::auth::UserCtx;
 use crate::core::acquire::{numbered, AUTO_SELECT_SCORE_THRESHOLD};
 use crate::core::sources::{
-    candidate_not_found, owned_search, parse_candidate_id, search_not_found, start_stored,
-    SearchRun,
+    self, candidate_not_found, owned_search, parse_candidate_id, search_not_found, start_stored,
+    view, SearchRun,
 };
 use crate::core::{database_failure, logged};
-use crate::ledger::store::StoredSearch;
+use crate::ledger::store::{self, StoredSearch};
 use crate::ledger::{
     Admitted, BatchOrigin, JobKind, JobOptions, JobState, NewJob, NewJobBatch, Pick, SourceFilters,
     StoredSpec, Transition, Transitioned,
@@ -75,6 +78,10 @@ pub(crate) enum SourceTarget {
 /// What retry_job, cancel_job and download_source say of a job started in the web page, whose
 /// pipeline writes its changes unchecked, so the ledger cannot stop it.
 const WEB_PAGE_JOB: &str = "a job started by ensure_in_library or download_source; this one was started in Soulful's web page, where it can be cancelled or retried";
+
+/// What download_source says of a job whose file is in the library already, waiting for
+/// Navidrome to list it.
+const INDEXED_JOB: &str = "a job whose file is not in the library yet; this one's file is imported and waits for Navidrome to list it, which retry_job index_only waits for again";
 
 /// wrong_job_state: the job is in `state`, and `action` takes a job in one of `allowed`. Facts
 /// `state` and `allowed_states`.
@@ -174,10 +181,16 @@ async fn as_changed(acquire: &Acquire, ctx: &UserCtx, job: &str) -> RetryAnswer 
 
 /// The refusal of a job started in the web page.
 fn web_page_job(view: &JobView) -> Option<RetryAnswer> {
-    (view.job.origin == BatchOrigin::Ui).then(|| RetryAnswer::InvalidInput {
+    (view.job.origin == BatchOrigin::Ui).then(web_page_refusal)
+}
+
+/// What a job started in the web page is refused with: it keeps none of the options an MCP job's
+/// changes write.
+fn web_page_refusal() -> RetryAnswer {
+    RetryAnswer::InvalidInput {
         field: "job_id",
         expected: WEB_PAGE_JOB.to_string(),
-    })
+    }
 }
 
 fn refused((failure, facts): (Failure, Map<String, Value>)) -> RetryAnswer {
@@ -213,6 +226,7 @@ async fn apply(
         }
         Transitioned::Refused { state } => Ok(refused(wrong_job_state(state, action, states))),
         Transitioned::Unknown => Err(job_not_found()),
+        Transitioned::NoOptions => Ok(web_page_refusal()),
     }
 }
 
@@ -237,7 +251,7 @@ pub(crate) async fn retry(
     let action = format!("retry_job {}", mode.as_str());
     let change = match mode {
         RetryMode::SameSource => {
-            let Some((slot, item)) = last_tried(&view) else {
+            let Some((slot, item)) = source_tried(&view) else {
                 return Ok(refusal(&view, &untried, mode));
             };
             if let Err(refused) = source_ready(acquire, &item.source).await {
@@ -316,7 +330,8 @@ fn refusal(view: &JobView, untried: &Untried, mode: RetryMode) -> RetryAnswer {
 }
 
 /// Refuses same_source of `source` when the backend says it is offline or blocked, or cannot
-/// say.
+/// say: then the failure says whether the same call can work later (slskd or the Soulseek server
+/// did not answer) in Soulful's words, slskd's text in its cause.
 async fn source_ready(acquire: &Acquire, source: &str) -> Result<(), RetryAnswer> {
     let backend = acquire.effects.backend().await.map_err(|f| {
         let f = Failure {
@@ -330,7 +345,7 @@ async fn source_ready(acquire: &Acquire, source: &str) -> Result<(), RetryAnswer
         Ok(SourcePresence::Offline) => refused(source_offline()),
         Ok(SourcePresence::Blocked) => refused(source_blocked()),
         Ok(SourcePresence::Online | SourcePresence::Away) => Ok(()),
-        Err(e) => refused(e.failure(Stage::Enqueue, e.to_string())),
+        Err(e) => refused(e.ask_failure(PeerAsk::Presence, Stage::Enqueue)),
     }
 }
 
@@ -397,7 +412,7 @@ async fn search_again(
         None => {
             let mut query = job.wanted.clone();
             if job.kind == JobKind::Album {
-                if let Err(f) = acquire.effects.hydrate(ctx, &mut query).await {
+                if let Err(f) = acquire.effects.hydrate(&mut query).await {
                     return Ok(RetryAnswer::Unavailable(f, Map::new()));
                 }
             }
@@ -434,6 +449,7 @@ async fn search_again(
             return Ok(refused(wrong_job_state(state, action, states)))
         }
         Transitioned::Unknown => return Err(job_not_found()),
+        Transitioned::NoOptions => return Ok(web_page_refusal()),
     }
     // Started before the runner, which then waits for it: a cancel between the two leaves a
     // stop mark that start_stored takes (D9).
@@ -450,8 +466,9 @@ async fn search_again(
 /// The search `search_id` that new_search was to start for `ctx`'s searching job `job` could not
 /// be recorded, so nothing searches with what the caller gave: the job ends failed with
 /// `failure` (cancelled when its user cancelled it meanwhile) and is answered as it then is. A
-/// runner would search the job's own query instead, so none is started. When even that write
-/// fails, the job stays searching with no runner, which cancel_job can end.
+/// runner would search the job's own query instead, so none is started. When that write fails
+/// too, a task writes it again until the database takes it (`fail_job`), so the job does not wait
+/// with no runner.
 async fn search_not_started(
     acquire: &Acquire,
     ctx: &UserCtx,
@@ -465,12 +482,18 @@ async fn search_not_started(
     );
     let fail = Transition::Fail {
         failure: failure.clone(),
+        search_id: Some(search_id.to_string()),
     };
     match acquire.ledger.transition(&ctx.id(), job, fail).await {
         // Failed, or ended another way while the search was being recorded.
         Ok(_) => as_changed(acquire, ctx, job).await,
         Err(e) => {
             tracing::warn!("Could not fail job {job} after its search was not recorded: {e}");
+            let (ledger, user, id) = (acquire.ledger.clone(), ctx.id(), job.to_string());
+            let (search_id, again) = (search_id.to_string(), failure.clone());
+            tokio::spawn(async move {
+                fail_job(&ledger, &user, &id, again, Some(search_id)).await;
+            });
             RetryAnswer::AppliedUnread {
                 job: job.to_string(),
                 failure,
@@ -500,16 +523,21 @@ pub(crate) async fn cancel(
     match changed {
         Transitioned::Applied { stopped_search, .. } => {
             // The search the job held when it was cancelled, which no later search change can
-            // follow.
+            // follow. Not recorded yet only while new_search starts it; a read that fails leaves
+            // a mark, which a search that never runs keeps only until it expires.
             if let Some(id) = stopped_search {
-                acquire.searches.stop(&id).await;
+                let stored = store::search_of(&acquire.db, &id, &ctx.id()).await;
+                let recorded = matches!(stored, Ok(Some(_)));
+                acquire.searches.stop_job_search(&id, recorded).await;
             }
+            acquire.job_changed(job);
             Ok(as_changed(acquire, ctx, job).await)
         }
         Transitioned::Refused { state } => {
             Ok(refused(wrong_job_state(state, "cancel_job", states)))
         }
         Transitioned::Unknown => Err(job_not_found()),
+        Transitioned::NoOptions => Ok(web_page_refusal()),
     }
 }
 
@@ -575,6 +603,7 @@ pub(crate) async fn dismiss(
             return Ok(refused(wrong_job_state(state, "dismiss_job", states)))
         }
         Transitioned::Unknown => return Err(job_not_found()),
+        Transitioned::NoOptions => return Ok(web_page_refusal()),
     }
     Ok(as_changed(acquire, ctx, job).await)
 }
@@ -613,6 +642,12 @@ pub(crate) async fn download_source(
                     return Ok(RetryAnswer::Refused(f, Map::new()));
                 }
             }
+            if !takes_another_source(&view) {
+                return Ok(RetryAnswer::InvalidInput {
+                    field: "job_id",
+                    expected: INDEXED_JOB.to_string(),
+                });
+            }
             let change = Transition::Queue {
                 items: numbered(items),
                 search_id: Some(search.id.clone()),
@@ -650,7 +685,7 @@ pub(crate) async fn download_source(
     };
     let mut query = wanted.query();
     if let Wanted::Album(album) = &wanted {
-        if let Err(f) = acquire.effects.hydrate(ctx, &mut query).await {
+        if let Err(f) = acquire.effects.hydrate(&mut query).await {
             let facts = Map::from_iter([("release_mbid".to_string(), json!(album.release_mbid))]);
             return Ok(RetryAnswer::Unavailable(f, facts));
         }
@@ -702,8 +737,9 @@ pub(crate) async fn download_source(
 }
 
 /// The search and files of `ctx`'s candidate `candidate_id` (D3): one of a live search a tool
-/// started that ended with candidates. Any other id, another user's included, reads like an
-/// unknown one; an expired search is expired_handle.
+/// started that ended with candidates, its files those the search's filters keep, as get_sources
+/// shows them (D6). Any other id, another user's and one get_sources never shows included, reads
+/// like an unknown one; an expired search is expired_handle.
 async fn candidate(
     acquire: &Acquire,
     ctx: &UserCtx,
@@ -718,12 +754,15 @@ async fn candidate(
             FailureCode::UnknownHandle => unknown(),
             _ => search_refused(f, facts.clone()),
         })?;
-    if stored.spec.is_none() {
+    let Some(spec) = &stored.spec else {
         return Err(unknown());
-    }
-    let items = (stored.candidates.as_ref())
-        .and_then(|groups| groups.get(index))
-        .map(|group| group.items.clone())
+    };
+    let groups = stored.candidates.as_deref().unwrap_or_default();
+    let shown = view(&search_id, groups, &spec.filters, &HashMap::new(), &[]);
+    let id = sources::candidate_id(&search_id, index);
+    let items = (shown.candidates.into_iter())
+        .find(|c| c.id == id)
+        .map(|c| c.group.items)
         .ok_or_else(unknown)?;
     Ok((stored, items))
 }
@@ -736,14 +775,15 @@ mod tests {
     use super::*;
     use crate::core::jobs::runner::{drive, TestEffects};
     use crate::core::jobs::test_support::{
-        auto_options, done_track_job, downloading_track_job, failed_track_job,
-        failed_track_job_with, failed_web_ui_job, importing_track_job, index_failed_track_job,
-        kept_album_job, mcp_track_job, queued_track_jobs, stop_slots, test_db_with_alice, view_of,
+        auto_options, done_track_job, downloading_track_job, downloading_track_job_with,
+        failed_track_job, failed_track_job_with, failed_web_ui_job, file_of, importing_track_job,
+        in_progress, index_failed_track_job, kept_album_job, mcp_track_job, queued_track_jobs,
+        stop_slots, test_db_with_alice, view_of,
     };
     use crate::core::sources::{search_stopped, server_restarted_search, SearchProgress, Searches};
     use crate::core::test_ctx;
     use crate::ledger::{store, JobEvent};
-    use crate::server_fns::download::test_support::{search_result, track, transfer};
+    use crate::server_fns::download::test_support::{item, search_result, track, transfer};
     use crate::transfer_registry::TransferRegistry;
     use shared::download::{DownloadQuery, DownloadState, JobSlot, SearchState};
     use soulbeet::DownloadBackend;
@@ -887,11 +927,130 @@ mod tests {
         let waiting = start_stored(&searches, &acq.ledger, &alice(), backend, run)
             .await
             .unwrap();
-        assert!(searches.stop("s9").await);
+        assert!(searches.stop_job_search("s9", true).await);
         assert_eq!(
             waiting.await.unwrap(),
             SearchProgress::Failed(search_stopped(), None)
         );
+    }
+
+    #[tokio::test]
+    async fn a_job_searched_again_after_a_cancel_takes_nothing_from_the_cancelled_search() {
+        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (reached, release) = effects.stub().hold_searches();
+        let found = |source: &str, file: &str| {
+            Ok(search_result(
+                "search",
+                SearchState::Completed,
+                vec![crate::server_fns::download::test_support::group(
+                    source,
+                    vec![item(source, "O Holy Night", file)],
+                    0.9,
+                )],
+            ))
+        };
+        // The cancelled search's answer, then the new one's.
+        effects.stub().script_polls(vec![
+            found("peer_a", "a/03.flac"),
+            found("peer_b", "b/03.flac"),
+        ]);
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", auto_options()).await;
+        let first = tokio::spawn({
+            let (acq, job) = (acq.clone(), job.clone());
+            async move { drive(&acq, &alice(), &job).await }
+        });
+        reached.notified().await;
+        let cancelled = cancel(&acq, &alice(), &job).await.unwrap();
+        assert!(matches!(cancelled, RetryAnswer::Applied(v) if v.job.state == JobState::Cancelled));
+        // Searched again while the cancelled search still runs.
+        let words = NewSearchArgs {
+            query_text: Some("Marrow Choir O Holy Night choir".into()),
+            ..NewSearchArgs::default()
+        };
+        let again = retry(&acq, &alice(), &job, RetryMode::NewSearch, Some(words))
+            .await
+            .unwrap();
+        assert!(matches!(again, RetryAnswer::Applied(v) if v.job.state == JobState::Searching));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), first)
+            .await
+            .unwrap()
+            .unwrap();
+        let sent = enqueued(&effects, 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(effects.enqueued().len(), 1, "enqueued once");
+        assert_eq!(sent[0].1.items[0].1.source, "peer_b");
+        assert_eq!(
+            effects.stub().specs()[1].text.as_deref(),
+            Some("Marrow Choir O Holy Night choir")
+        );
+    }
+
+    #[tokio::test]
+    async fn download_source_takes_only_the_files_the_searchs_filters_keep() {
+        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let album = crate::core::jobs::AlbumRef {
+            artist: "Kowloon".into(),
+            title: "Come Over".into(),
+            release_mbid: "6a09041b-0f79-3278-88d9-0552dd28d37f".into(),
+        };
+        let wanted = Wanted::Album(album);
+        effects.set_tracks(vec![
+            track("Kowloon", "Wake Up"),
+            track("Kowloon", "Come Over"),
+            track("Kowloon", "Lights Out"),
+        ]);
+        let at = |title: &str, file: &str, kbps: u32| DownloadableItem {
+            facts: shared::download::FileFacts {
+                extension: Some("mp3".into()),
+                bitrate_kbps: Some(kbps),
+                ..Default::default()
+            },
+            ..item("peer_a", title, file)
+        };
+        let folder = vec![
+            at("Wake Up", "a/07.mp3", 320),
+            at("Come Over", "a/08.mp3", 128),
+            at("Lights Out", "a/09.mp3", 320),
+        ];
+        let search_id = uuid::Uuid::new_v4().to_string();
+        let spec = StoredSpec {
+            filters: SourceFilters {
+                min_bitrate_kbps: Some(256),
+                ..SourceFilters::default()
+            },
+            ..StoredSpec::default()
+        };
+        acq.ledger
+            .record_search(crate::ledger::NewSearch {
+                id: search_id.clone(),
+                user: alice().id(),
+                backend: Some("slskd".into()),
+                query: wanted.query(),
+                spec: Some(spec),
+            })
+            .await
+            .unwrap();
+        let groups = vec![crate::server_fns::download::test_support::group(
+            "peer_a", folder, 0.9,
+        )];
+        acq.ledger
+            .search_ended(&search_id, Ok((groups, Default::default())))
+            .await
+            .unwrap();
+        let target = SourceTarget::New {
+            wanted,
+            folder_id: Some("alice-folder".into()),
+        };
+        let answer = download_source(&acq, &alice(), target, &format!("{search_id}:0"))
+            .await
+            .unwrap();
+        assert!(matches!(answer, RetryAnswer::Applied(_)), "{answer:?}");
+        let sent = enqueued(&effects, 1).await;
+        let files: Vec<&str> = (sent[0].1.items.iter())
+            .map(|(_, item)| item.id.as_str())
+            .collect();
+        assert_eq!(files, vec!["a/07.mp3", "a/09.mp3"]);
     }
 
     /// slskd's text for a peer whose upload queue is full, which says to retry the same peer later
@@ -939,6 +1098,86 @@ mod tests {
         assert_eq!(enqueued(&effects, 1).await[0].1.items[0].1.source, "peer_a");
     }
 
+    #[tokio::test]
+    async fn same_source_takes_the_source_that_failed_not_an_alternate_failover_was_refused() {
+        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let title = "Silent Night";
+        let job = downloading_track_job_with(&acq, title, auto_options()).await;
+        // peer_a's queue is full; failover's peer_b is refused at its enqueue (the backend, as
+        // slskd answers a peer it cannot reach: Soulseek.NET src/SoulseekClient.cs:3790), and no
+        // source is left, so the slot fails with peer_a's row.
+        let left = in_progress(&job, title).failed_with(peer_busy());
+        acq.ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![left.clone()],
+        });
+        let slot = JobSlot {
+            job: job.clone(),
+            slot: 0,
+        };
+        let alternate = item("peer_b", title, &file_of("b", title));
+        acq.ledger.record(JobEvent::Attempt {
+            slot: slot.clone(),
+            candidate: Some(Box::new(alternate.clone())),
+            request: Some(uuid::Uuid::new_v4().to_string()),
+        });
+        let offline = Failure::new(
+            FailureCode::PeerOffline,
+            Stage::Enqueue,
+            RetryAdvice::OtherSource,
+            "User peer_b appears to be offline",
+        );
+        acq.ledger.record(JobEvent::Refused {
+            slot,
+            candidate: Box::new(alternate),
+            failure: offline,
+        });
+        acq.ledger.record(JobEvent::Slots {
+            state: JobState::Failed,
+            rows: vec![left],
+        });
+        acq.ledger.settled().await;
+        let view = view_of(&acq, &job).await;
+        let left_out = untried(&acq.db, &view, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert!(allowed(&view, &left_out, RetryMode::SameSource));
+        let again = retry(&acq, &alice(), &job, RetryMode::SameSource, None)
+            .await
+            .unwrap();
+        assert!(matches!(again, RetryAnswer::Applied(v) if v.job.state == JobState::Queued));
+        assert_eq!(effects.stub().presence_asked(), vec!["peer_a".to_string()]);
+        assert_eq!(enqueued(&effects, 1).await[0].1.items[0].1.source, "peer_a");
+    }
+
+    #[tokio::test]
+    async fn same_source_waits_for_a_presence_check_slskd_could_not_finish() {
+        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let job = failed_track_job_with(&acq, "Silent Night", peer_busy()).await;
+        // The Soulseek server did not answer GetStatus in time (Soulseek.NET
+        // SoulseekClient.cs:3866), as slskd's global handler answers it (Program.cs:1051-1053).
+        let timed_out = "The wait timed out after 5000 milliseconds";
+        effects.stub().fail_presence(500, timed_out);
+        let RetryAnswer::Unavailable(f, facts) =
+            retry(&acq, &alice(), &job, RetryMode::SameSource, None)
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (f.code, f.retry, f.message.as_str()),
+            (
+                FailureCode::BackendUnreachable,
+                RetryAdvice::SameSourceLater,
+                "slskd could not say whether the source is online"
+            )
+        );
+        assert_eq!(f.cause.unwrap().raw, timed_out);
+        assert_eq!(facts["source"], "peer_a");
+        assert_eq!(view_of(&acq, &job).await.job.state, JobState::Failed);
+    }
+
     /// The `expected` of an invalid_input refusal of `mode`, or a panic naming what came instead.
     fn modes_allowed(answer: RetryAnswer) -> String {
         match answer {
@@ -965,6 +1204,7 @@ mod tests {
         let cut_off = mcp_track_job(&acq, "Marrow Choir", "Coventry Carol", auto_options()).await;
         let fail = Transition::Fail {
             failure: server_restarted_search(),
+            search_id: None,
         };
         let failed = acq.ledger.transition(&alice().id(), &cut_off, fail).await;
         assert!(matches!(failed, Ok(Transitioned::Applied { .. })));
@@ -1055,6 +1295,52 @@ mod tests {
             store::job_state(&acq.db, &job).await,
             Some(JobState::Cancelled)
         );
+    }
+
+    #[tokio::test]
+    async fn a_job_cancelled_while_its_runner_waits_for_a_place_lets_the_runner_go_at_once() {
+        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let jobs = queued_track_jobs(&acq, 7).await;
+        for job in &jobs[..6] {
+            drive(&acq, &alice(), job).await;
+        }
+        let seventh = tokio::spawn({
+            let (acq, job) = (acq.clone(), jobs[6].clone());
+            async move { drive(&acq, &alice(), &job).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!seventh.is_finished(), "it waits for a place");
+        let cancelled = cancel(&acq, &alice(), &jobs[6]).await.unwrap();
+        assert!(matches!(cancelled, RetryAnswer::Applied(v) if v.job.state == JobState::Cancelled));
+        // No place was given up.
+        tokio::time::timeout(Duration::from_secs(2), seventh)
+            .await
+            .expect("the cancel wakes it")
+            .unwrap();
+        assert_eq!(effects.enqueued().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn download_source_refuses_a_job_whose_file_waits_for_navidrome() {
+        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let job = index_failed_track_job(&acq).await;
+        let search = view_of(&acq, &job).await.search.unwrap().id;
+        let answer = download_source(
+            &acq,
+            &alice(),
+            SourceTarget::Job(job.clone()),
+            &format!("{search}:1"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&answer, RetryAnswer::InvalidInput { field: "job_id", expected }
+                if expected == INDEXED_JOB),
+            "{answer:?}"
+        );
+        assert_eq!(view_of(&acq, &job).await.job.state, JobState::Failed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(effects.enqueued().is_empty());
     }
 
     #[tokio::test]

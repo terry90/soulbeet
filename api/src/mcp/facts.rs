@@ -14,12 +14,16 @@ use shared::download::{
 use shared::failure::{cut_chars, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
 use shared::metadata::{Album, Track};
 use shared::recommendation::normalize_for_matching;
+use soulbeet::error::PeerAsk;
 use soulbeet::{DownloadBackend, ImportedItem};
 
 use super::contract::{error_object, NextCall, ToolError};
 use super::next::next_calls;
 use crate::core::jobs::retry::enable_deletion;
-use crate::core::jobs::{failed_slot, job_failure, JobView, SlotView, Untried};
+use crate::core::jobs::{
+    current_attempt, failed_slot, job_failure, job_filters, picked_file, shown_row, JobView,
+    SlotView, Untried,
+};
 use crate::core::library::SongFacts;
 use crate::core::sources::{self, Candidate, DroppedByFilter, SearchProgress};
 use crate::ledger::store::AttemptRecord;
@@ -174,8 +178,9 @@ pub(crate) fn candidate_document(candidate: &Candidate, wanted: &DownloadQuery) 
 }
 
 /// What a search read and what was dropped (design 10.2), each null when the backend did not
-/// finish the search (`stats` None). Files scored below the floor are dropped unless the
-/// search kept them, flagged, as candidates.
+/// finish the search (`stats` None): files that are not audio (covers, playlists), files scored
+/// below the floor unless the search kept them, flagged, as candidates, and what the filters
+/// dropped.
 pub(crate) fn search_facts(
     stats: Option<&SearchStats>,
     spec: &StoredSpec,
@@ -187,6 +192,7 @@ pub(crate) fn search_facts(
             "response_count": s.response_count,
             "file_count": s.file_count,
             "locked_file_count": s.locked_file_count,
+            "dropped_not_audio": s.not_audio,
             "dropped_below_floor": if spec.keep_below_floor { 0 } else { s.below_floor },
             "dropped_by_filter": dropped,
         }),
@@ -195,6 +201,7 @@ pub(crate) fn search_facts(
             "response_count": null,
             "file_count": null,
             "locked_file_count": null,
+            "dropped_not_audio": null,
             "dropped_below_floor": null,
             "dropped_by_filter": null,
         }),
@@ -252,11 +259,14 @@ pub(crate) async fn live_facts(
     let queued = asks_backend(row)?;
     let position = async {
         match queued {
-            true => Some(answered(backend.queue_position(&row.source, &row.id)).await),
+            true => {
+                let asked = backend.queue_position(&row.source, &row.id);
+                Some(answered(PeerAsk::QueuePosition, asked).await)
+            }
             false => None,
         }
     };
-    let presence = answered(backend.source_status(&row.source));
+    let presence = answered(PeerAsk::Presence, backend.source_status(&row.source));
     let (queue_position, presence) = tokio::join!(position, presence);
     Some(LiveFacts {
         queue_position,
@@ -273,12 +283,19 @@ pub(crate) fn unanswered(row: &DownloadProgress, failure: &Failure) -> Option<Li
     })
 }
 
-async fn answered<T>(read: impl Future<Output = soulbeet::error::Result<T>>) -> Result<T, Failure> {
+/// The backend's answer to `ask`, or its failure in Soulful's own words: the backend's text,
+/// which names peers and remote files, stays in the cause. No answer within LIVE_READ_WAIT is
+/// the failure of the one asked (`PeerAsk::unanswered`): the peer for its queue, the Soulseek
+/// server for a presence.
+async fn answered<T>(
+    ask: PeerAsk,
+    read: impl Future<Output = soulbeet::error::Result<T>>,
+) -> Result<T, Failure> {
     match tokio::time::timeout(LIVE_READ_WAIT, read).await {
         Ok(Ok(answer)) => Ok(answer),
-        Ok(Err(e)) => Err(e.failure(Stage::Transfer, e.to_string())),
+        Ok(Err(e)) => Err(e.ask_failure(ask, Stage::Transfer)),
         Err(_) => Err(Failure::new(
-            FailureCode::BackendUnreachable,
+            ask.unanswered(),
             Stage::Transfer,
             RetryAdvice::SameSourceLater,
             "no answer within 10 seconds",
@@ -402,22 +419,6 @@ fn reference_of(kind: JobKind, wanted: &DownloadQuery) -> Value {
     Value::Object(fields)
 }
 
-/// The row a slot shows: its live row while it runs, else the last row stored.
-fn shown_row(slot: &SlotView) -> Option<&DownloadProgress> {
-    slot.live.as_ref().or(slot.row.as_ref())
-}
-
-/// The attempt the slot's row is of: the newest whose candidate is the row's transfer. Without a
-/// row, the newest attempt while it has not ended (a pick not sent yet).
-fn current_attempt(slot: &SlotView) -> Option<&AttemptRecord> {
-    match shown_row(slot) {
-        Some(row) => slot.attempts.iter().rev().find(|a| {
-            (a.candidate.as_ref()).is_some_and(|c| c.source == row.source && c.id == row.item)
-        }),
-        None => slot.attempts.last().filter(|a| a.ended_at.is_none()),
-    }
-}
-
 /// The slot's attempts that ended, but the one its row is of: the newest TRIED_PER_SLOT, oldest
 /// first, and how many older ones are left out.
 fn earlier_attempts(slot: &SlotView) -> (Vec<&AttemptRecord>, usize) {
@@ -508,7 +509,8 @@ fn failure_document(
     })
 }
 
-/// What the job's search read and what the job's filters and excluded sources dropped.
+/// What the job's search read and what the job's filters (as its runner reads the search with
+/// them) and excluded sources dropped.
 fn job_search_facts(view: &JobView) -> Map<String, Value> {
     let Some(search) = &view.search else {
         return search_facts(None, &StoredSpec::default(), &DroppedByFilter::default());
@@ -519,7 +521,7 @@ fn job_search_facts(view: &JobView) -> Map<String, Value> {
             let kept = sources::view(
                 &search.id,
                 &groups,
-                &spec.filters,
+                &job_filters(view),
                 &HashMap::new(),
                 &view.job.excluded_sources,
             );
@@ -573,10 +575,9 @@ fn slot_document(view: &JobView, slot: &SlotView, wanted: &DownloadQuery, now: &
     })
 }
 
-/// The title of the file the slot's current pick took.
+/// The title of the file the slot's pick took (`picked_file`).
 fn picked_title(slot: &SlotView) -> Option<&str> {
-    let attempt = slot.attempts.last()?;
-    attempt.candidate.as_ref().map(|c| c.title.as_str())
+    picked_file(slot).map(|c| c.title.as_str())
 }
 
 /// The slot's current transfer: its source and file, how far it came, the backend's answers
@@ -809,7 +810,8 @@ mod tests {
     use crate::core::jobs::retry::{retry, RetryAnswer};
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
-        done_track_job, failed_track_job, test_db_with_alice, view_of,
+        auto_options, done_track_job, failed_track_job, mcp_track_job, search_of,
+        test_db_with_alice, view_of,
     };
     use crate::core::jobs::{untried, RetryMode};
     use crate::core::test_ctx;
@@ -942,6 +944,59 @@ mod tests {
         assert!(allowed["failure"]["user_action"].is_null());
     }
 
+    #[tokio::test]
+    async fn a_jobs_search_facts_count_what_the_jobs_own_filters_dropped() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let lossless = crate::ledger::JobOptions {
+            filters: crate::ledger::SourceFilters {
+                lossless_only: true,
+                ..Default::default()
+            },
+            ..auto_options()
+        };
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", lossless).await;
+        // Its search was stored without filters, as find_sources stores one with none given.
+        let search_id = search_of(&acq, &job).await;
+        let user = crate::core::test_ctx("alice").id();
+        acq.ledger
+            .record_search(crate::ledger::NewSearch {
+                id: search_id.clone(),
+                user,
+                backend: Some("slskd".into()),
+                query: DownloadQuery::new(vec![track("Marrow Choir", "O Holy Night")]),
+                spec: Some(StoredSpec::default()),
+            })
+            .await
+            .unwrap();
+        let mp3 = DownloadableItem {
+            facts: FileFacts {
+                extension: Some("mp3".into()),
+                ..FileFacts::default()
+            },
+            ..item("peer_b", "O Holy Night", "b/03.mp3")
+        };
+        let found = vec![group("peer_b", vec![mp3], 0.85)];
+        acq.ledger
+            .search_ended(&search_id, Ok((found, SearchStats::default())))
+            .await
+            .unwrap();
+        crate::core::jobs::runner::drive(&acq, &crate::core::test_ctx("alice"), &job).await;
+        acq.ledger.settled().await;
+        let view = view_of(&acq, &job).await;
+        let doc = job_document(
+            &view,
+            &Untried::default(),
+            Detail::Summary,
+            &ReadNow::default(),
+            false,
+        );
+        assert_eq!(doc["failure"]["code"], "search_all_filtered", "{doc}");
+        assert_eq!(
+            doc["failure"]["facts"]["dropped_by_filter"]["not_lossless"],
+            1
+        );
+    }
+
     #[test]
     fn matches_wanted_compares_the_applied_recording() {
         let wanted = Track {
@@ -1057,6 +1112,7 @@ mod tests {
         assert!(facts.values().all(Value::is_null), "{facts:?}");
         let stats = SearchStats {
             query_text: "Kowloon Wake Up".into(),
+            not_audio: 3,
             below_floor: 7,
             ..SearchStats::default()
         };
@@ -1071,7 +1127,7 @@ mod tests {
         assert_eq!(
             Value::Object(search_facts(Some(&stats), &kept, &dropped)),
             json!({"query_text_sent": "Kowloon Wake Up", "response_count": 0, "file_count": 0,
-                "locked_file_count": 0, "dropped_below_floor": 0,
+                "locked_file_count": 0, "dropped_not_audio": 3, "dropped_below_floor": 0,
                 "dropped_by_filter": {"format": 2, "bitrate": 0, "not_lossless": 0,
                     "queue_length": 0, "excluded": 0}})
         );

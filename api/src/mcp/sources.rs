@@ -174,7 +174,7 @@ async fn start_search(
         return Err(too_many_waiting(waiting));
     }
     let mut query = wanted.query();
-    if let Err(f) = acquire.effects.hydrate(ctx, &mut query).await {
+    if let Err(f) = acquire.effects.hydrate(&mut query).await {
         let mut facts = Map::new();
         if let Wanted::Album(album) = &wanted {
             facts.insert("release_mbid".into(), json!(album.release_mbid));
@@ -717,9 +717,15 @@ mod tests {
             (
                 error["facts"]["query_text_sent"].as_str(),
                 error["facts"]["dropped_below_floor"].as_u64(),
+                error["facts"]["dropped_not_audio"].as_u64(),
                 error["facts"]["locked_file_count"].as_u64()
             ),
-            (Some("Marrow Choir O Holy Night"), Some(20), Some(2))
+            (
+                Some("Marrow Choir O Holy Night"),
+                Some(20),
+                Some(3),
+                Some(2)
+            )
         );
         assert!(error["facts"]["search_id"].is_string());
         let reference = json!({"kind": "track", "artist": "Marrow Choir", "title": "O Holy Night"});

@@ -471,17 +471,25 @@ pub enum Transition {
     Cancel,
     /// A job that will not be pursued ends dismissed.
     Dismiss,
-    /// D15, the runner after a search: the job is queued with `items` as its slots.
-    Pick { items: Vec<(u32, DownloadableItem)> },
-    /// D15: the job waits for Claude's choice.
-    AwaitChoice,
-    /// The runner, for a searching job whose search ended and expired: the job searches again
-    /// under `search_id`, so the expired search's candidate ids keep naming what they named.
-    SearchAgain { search_id: String },
+    /// D15, the runner after it read search `search_id`: the job is queued with `items` as its
+    /// slots.
+    Pick {
+        items: Vec<(u32, DownloadableItem)>,
+        search_id: String,
+    },
+    /// D15, the runner after it read search `search_id`: the job waits for Claude's choice.
+    AwaitChoice { search_id: String },
+    /// The runner, for a searching job whose search `from` ended and expired: the job searches
+    /// again under `search_id`, so the expired search's candidate ids keep naming what they named.
+    SearchAgain { from: String, search_id: String },
     /// D15: the job ends failed: a job without unfinished slots with `failure` in `jobs.failure`,
     /// one with them (picked, then the backend or its folder failed) with `failure` on every
     /// unfinished slot's row. A job whose user asked to cancel it ends cancelled instead.
-    Fail { failure: Failure },
+    /// `search_id`: the search the failure came of, when it came of one.
+    Fail {
+        failure: Failure,
+        search_id: Option<String>,
+    },
     /// Searching again under `search_id`; the job's slots are set aside (dismissed), their
     /// attempts kept. `filters`, when given, become the job's filters; a job without options (a
     /// web UI job) takes none, and the write fails.
@@ -508,15 +516,30 @@ impl Transition {
         match self {
             Transition::Cancel => &[Searching, NeedsSourceChoice, Queued, Downloading],
             Transition::Dismiss => &[Failed, Cancelled, NeedsSourceChoice, NeedsDecision],
-            Transition::Pick { .. } | Transition::AwaitChoice | Transition::SearchAgain { .. } => {
-                &[Searching]
-            }
+            Transition::Pick { .. }
+            | Transition::AwaitChoice { .. }
+            | Transition::SearchAgain { .. } => &[Searching],
             Transition::Fail { .. } => &[Searching, Queued],
             Transition::Search { .. } | Transition::Queue { .. } => {
                 &[Failed, Cancelled, NeedsSourceChoice]
             }
             Transition::Reject { .. } => &[Done],
             Transition::Reindex { .. } => &[Failed],
+        }
+    }
+
+    /// The search the change was decided on, which the job must still search with when the
+    /// writer applies it (D15): a job cancelled and searched again under another search while
+    /// its runner read the first one is the new search's, not that runner's.
+    pub(crate) fn decided_on(&self) -> Option<&str> {
+        match self {
+            Transition::Pick { search_id, .. }
+            | Transition::AwaitChoice { search_id }
+            | Transition::SearchAgain {
+                from: search_id, ..
+            } => Some(search_id),
+            Transition::Fail { search_id, .. } => search_id.as_deref(),
+            _ => None,
         }
     }
 }
@@ -539,6 +562,9 @@ pub enum Transitioned {
     /// No job of the user has that id.
     #[default]
     Unknown,
+    /// A Search with filters for a job that keeps no options to hold them in (a web UI job):
+    /// dropping them would search without what the caller asked for.
+    NoOptions,
 }
 
 pub struct NewSearch {
@@ -1896,8 +1922,10 @@ mod tests {
         }])
     }
 
+    /// alice's searching MCP job `id`, under search `search-{id}`.
     fn mcp_job(id: &str, folder: &str, wanted: DownloadQuery) -> NewJob {
         NewJob {
+            search_id: Some(format!("search-{id}")),
             wanted,
             kind: JobKind::Track,
             options: Some(JobOptions {
@@ -2425,7 +2453,8 @@ mod tests {
                     &user,
                     &ids[0],
                     Transition::Pick {
-                        items: vec![(0, item("peer_b", "Carol 0", "b/01.flac"))]
+                        items: vec![(0, item("peer_b", "Carol 0", "b/01.flac"))],
+                        search_id: "s2".into(),
                     }
                 )
                 .await
@@ -2501,7 +2530,8 @@ mod tests {
                     &user,
                     &placed,
                     Transition::Fail {
-                        failure: failed_enqueue
+                        failure: failed_enqueue,
+                        search_id: None,
                     }
                 )
                 .await
@@ -2537,8 +2567,11 @@ mod tests {
         for change in [
             Transition::Pick {
                 items: vec![(0, item("peer_a", "O Holy Night", "a/03.flac"))],
+                search_id: "search-j1".into(),
             },
-            Transition::AwaitChoice,
+            Transition::AwaitChoice {
+                search_id: "search-j1".into(),
+            },
             // Soulful's own text for an empty search (core/sources.rs).
             Transition::Fail {
                 failure: Failure::new(
@@ -2547,6 +2580,7 @@ mod tests {
                     RetryAdvice::OtherQuery,
                     "No results found",
                 ),
+                search_id: Some("search-j1".into()),
             },
         ] {
             assert_eq!(
@@ -2579,7 +2613,13 @@ mod tests {
         let created = *changes.borrow_and_update();
         assert!(created > before);
         let applied = ledger
-            .transition(&UserId::new("alice"), "j1", Transition::AwaitChoice)
+            .transition(
+                &UserId::new("alice"),
+                "j1",
+                Transition::AwaitChoice {
+                    search_id: "search-j1".into(),
+                },
+            )
             .await
             .unwrap();
         let Transitioned::Applied { seq, .. } = applied else {
@@ -2621,7 +2661,14 @@ mod tests {
             let failure = failure.clone();
             assert!(matches!(
                 ledger
-                    .transition(&user, job, Transition::Fail { failure })
+                    .transition(
+                        &user,
+                        job,
+                        Transition::Fail {
+                            failure,
+                            search_id: None,
+                        },
+                    )
                     .await
                     .unwrap(),
                 Transitioned::Applied {
@@ -2988,12 +3035,21 @@ mod tests {
     async fn filters_for_a_job_without_options_are_refused_not_dropped() {
         let (ledger, db, alice, _) = ledger().await;
         ledger
-            .create(job("j1", "alice", &alice, JobState::Searching, None), None)
+            .create(
+                job("j1", "alice", &alice, JobState::Searching, Some("s1")),
+                None,
+            )
             .await
             .unwrap();
         let user = UserId::new("alice");
         ledger
-            .transition(&user, "j1", Transition::AwaitChoice)
+            .transition(
+                &user,
+                "j1",
+                Transition::AwaitChoice {
+                    search_id: "s1".into(),
+                },
+            )
             .await
             .unwrap();
         let filters = SourceFilters {
@@ -3010,7 +3066,7 @@ mod tests {
                 },
             )
             .await;
-        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(refused, Ok(Transitioned::NoOptions));
         assert_eq!(
             store::job_state(&db, "j1").await,
             Some(JobState::NeedsSourceChoice)
@@ -3292,7 +3348,14 @@ mod tests {
         let alice_id = UserId::new("alice");
         let picked = vec![(0, item("peer_a", "One", "a/01.flac"))];
         ledger
-            .transition(&alice_id, "j1", Transition::Pick { items: picked })
+            .transition(
+                &alice_id,
+                "j1",
+                Transition::Pick {
+                    items: picked,
+                    search_id: "search-j1".into(),
+                },
+            )
             .await
             .unwrap();
         ledger

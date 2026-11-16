@@ -721,7 +721,16 @@ impl FileEntry {
 /// occurred. ({text}) ({text}) ...`. With the default 3 attempts the cut
 /// leaves `Disconnected)) ({text}) ({text})`, which still names it. With
 /// `Retry.Attempts = 1` only `Disconnected))` is left, which says nothing.
-pub const NOT_LOGGED_IN: &str = "must be connected and logged in";
+const NOT_LOGGED_IN: &str = "must be connected and logged in";
+
+/// Whether `text` says slskd is not logged in to the Soulseek server, in any case. Most calls
+/// word it as NOT_LOGGED_IN says; the queue position ask words it `The server connection must be
+/// Connected and LoggedIn to check download queue position (currently: {state})` (Soulseek.NET
+/// `SoulseekClient.cs:1640`).
+pub fn says_not_logged_in(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains(NOT_LOGGED_IN) || text.contains("must be connected and loggedin")
+}
 
 /// The exception, in lowercase, slskd's startup cleanup writes on every
 /// download it left unfinished, with state `Completed, Errored` and the
@@ -788,7 +797,7 @@ fn classify_transfer(
             (Stage::Transfer, code, retry, "Transfer rejected by peer")
         }
         DownloadState::Errored => {
-            let (code, retry) = if text.contains(NOT_LOGGED_IN) {
+            let (code, retry) = if says_not_logged_in(&text) {
                 // Every peer fails the same way until slskd logs back in.
                 (
                     FailureCode::BackendUnreachable,

@@ -81,7 +81,10 @@ pub struct DownloadableItem {
 }
 
 /// One file and its source as the backend reported them; None for what it did not report.
+/// Stored with each search's candidates: a field added later reads as its default in what was
+/// stored before.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FileFacts {
     /// Lowercase, from the remote file name.
     pub extension: Option<String>,
@@ -125,8 +128,10 @@ impl SearchSpec {
     }
 }
 
-/// What a finished search read, so an empty one says why.
+/// What a finished search read, so an empty one says why. Stored with each search: a field
+/// added later reads as its default in what was stored before.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SearchStats {
     pub query_text: String,
     pub response_count: u32,
@@ -606,6 +611,25 @@ mod tests {
     use super::*;
     use crate::failure::{FailureCode, RetryAdvice, Stage};
     use crate::metadata::Provider;
+
+    /// Stats and file facts stored before a field was added still read.
+    #[test]
+    fn stored_stats_and_facts_missing_a_field_read_it_as_its_default() {
+        let stats: SearchStats =
+            serde_json::from_str(r#"{"query_text": "Kowloon Wake Up", "file_count": 23}"#).unwrap();
+        assert_eq!(
+            (stats.file_count, stats.not_audio, stats.below_floor),
+            (23, 0, 0)
+        );
+        let facts: FileFacts = serde_json::from_str(r#"{"extension": "flac"}"#).unwrap();
+        assert_eq!(
+            facts,
+            FileFacts {
+                extension: Some("flac".into()),
+                ..FileFacts::default()
+            }
+        );
+    }
 
     #[test]
     fn a_row_failed_with_a_failure_keeps_no_earlier_one() {

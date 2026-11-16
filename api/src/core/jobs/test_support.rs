@@ -218,6 +218,14 @@ pub(crate) async fn mcp_album_job(
     mcp_job(acq, wanted, auto_options()).await
 }
 
+/// The search alice's job `job` searches with.
+pub(crate) async fn search_of(acq: &Acquire, job: &str) -> String {
+    let record = store::job_record(&acq.db, job, &alice()).await.unwrap();
+    record
+        .and_then(|job| job.search_id)
+        .expect("a searching job has its search")
+}
+
 async fn applied(acq: &Acquire, job: &str, change: Transition) {
     let done = acq.ledger.transition(&alice(), job, change).await.unwrap();
     assert!(matches!(done, Transitioned::Applied { .. }), "{done:?}");
@@ -230,7 +238,8 @@ pub(crate) async fn queued_track_jobs(acq: &Acquire, n: usize) -> Vec<String> {
     for i in 1..=n {
         let title = format!("Song Number {i}");
         let job = mcp_track_job(acq, "Marrow Choir", &title, auto_options()).await;
-        applied(acq, &job, Transition::AwaitChoice).await;
+        let search_id = search_of(acq, &job).await;
+        applied(acq, &job, Transition::AwaitChoice { search_id }).await;
         let file = format!("a/{i:02}.flac");
         let queue = Transition::Queue {
             items: vec![(0, item("peer_a", &title, &file))],
@@ -254,7 +263,8 @@ pub(crate) async fn record_failures(acq: &Acquire, source: &str, n: u32) {
             )
         })
         .collect();
-    applied(acq, &job, Transition::Pick { items }).await;
+    let search_id = search_of(acq, &job).await;
+    applied(acq, &job, Transition::Pick { items, search_id }).await;
     // slskd's text for a peer's daily failure limit (slskd Application.cs:808).
     let limit = Failure::new(
         FailureCode::TransferRejectedFailureLimit,
@@ -301,11 +311,13 @@ pub(crate) async fn downloading_track_job_with(
 /// one InProgress row came for it.
 async fn start_downloading(acq: &Acquire, job: &str, title: &str) {
     let picked = search_found(acq, job, title).await;
+    let search_id = search_of(acq, job).await;
     applied(
         acq,
         job,
         Transition::Pick {
             items: vec![(0, picked)],
+            search_id,
         },
     )
     .await;
@@ -384,7 +396,8 @@ pub(crate) async fn choosing_track_job(acq: &Acquire) -> String {
     let title = "O Come All Ye Faithful";
     let job = mcp_track_job(acq, "Marrow Choir", title, auto_options()).await;
     search_found(acq, &job, title).await;
-    applied(acq, &job, Transition::AwaitChoice).await;
+    let search_id = search_of(acq, &job).await;
+    applied(acq, &job, Transition::AwaitChoice { search_id }).await;
     job
 }
 
@@ -817,11 +830,13 @@ pub(crate) async fn kept_album_job(
         item("peer_a", "Wake Up", "a/07.flac"),
         item("peer_a", "Come Over", "a/08.flac"),
     ];
+    let search_id = search_of(acq, &job).await;
     applied(
         acq,
         &job,
         Transition::Pick {
             items: (0..).zip(files.clone()).collect(),
+            search_id,
         },
     )
     .await;

@@ -10,7 +10,7 @@ use crate::core::sources::{self, Candidate, RECENT_FAILURES_SECS};
 use crate::ledger::store::{self, AttemptRecord, JobRecord, StoredSearch, TimelineEntry};
 use crate::ledger::{
     Admitted, BatchOrigin, IndexWait, JobKind, JobOptions, JobState, Ledger, NewJob, NewJobBatch,
-    SlotResult, StoredImport, MCP_UNFINISHED_JOBS_PER_USER,
+    SlotResult, SourceFilters, StoredImport, MCP_UNFINISHED_JOBS_PER_USER,
 };
 use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
@@ -496,9 +496,10 @@ pub(crate) struct Untried {
 }
 
 impl Untried {
-    /// What next_source takes: the first whose source is not flagged (D5).
+    /// What next_source takes: the first a job may take without Claude naming it, neither
+    /// flagged (D5) nor below the floor (`Candidate::automatic`).
     pub(crate) fn best(&self) -> Option<&Candidate> {
-        self.candidates.iter().find(|c| !c.flagged())
+        self.candidates.iter().find(|c| c.automatic())
     }
 }
 
@@ -525,15 +526,10 @@ pub(crate) fn untried_given(view: &JobView, failures: &HashMap<String, u32>, now
     let Some(groups) = &search.candidates else {
         return Untried::default();
     };
-    let filters = match (&view.job.options, &search.spec) {
-        (Some(options), _) => options.filters.clone(),
-        (None, Some(spec)) => spec.filters.clone(),
-        (None, None) => Default::default(),
-    };
     let kept = sources::view(
         &search.id,
         groups,
-        &filters,
+        &job_filters(view),
         failures,
         &view.job.excluded_sources,
     );
@@ -545,6 +541,19 @@ pub(crate) fn untried_given(view: &JobView, failures: &HashMap<String, u32>, now
         .filter(|c| !tried.contains(&c.group.source.as_str()))
         .collect();
     Untried { candidates }
+}
+
+/// The filters the job's search is read with, by its runner and every tool: the job's own, else
+/// (a web UI job keeps none) its search's.
+pub(crate) fn job_filters(view: &JobView) -> SourceFilters {
+    match (
+        &view.job.options,
+        view.search.as_ref().and_then(|s| s.spec.as_ref()),
+    ) {
+        (Some(options), _) => options.filters.clone(),
+        (None, Some(spec)) => spec.filters.clone(),
+        (None, None) => SourceFilters::default(),
+    }
 }
 
 /// How retry_job tries a job again (design 11.5).
@@ -594,8 +603,9 @@ impl RetryMode {
 /// `next` offers by. Only an MCP job is retried here; a job whose import found the recording in
 /// the library is not retried at all. same_source and next_source take track jobs only, and not
 /// one that failed waiting for Navidrome.
-/// same_source takes the last source tried, for a cancelled job or a failure that says to try
-/// that source later (never a failed search, which tried none); next_source the best untried
+/// same_source takes the source its failure names (`source_tried`), for a cancelled job or a
+/// failure that says to try that source later (never a failed search, which tried none);
+/// next_source the best untried
 /// candidate; index_only a slot whose wait for Navidrome failed; reject_result a done slot's
 /// source.
 pub(crate) fn allowed(view: &JobView, untried: &Untried, mode: RetryMode) -> bool {
@@ -607,9 +617,7 @@ pub(crate) fn allowed(view: &JobView, untried: &Untried, mode: RetryMode) -> boo
     if (failure.as_ref()).is_some_and(|f| f.code == FailureCode::ImportAlreadyInLibrary) {
         return false;
     }
-    // A file that waited for Navidrome is in the library: another source of it is not tried.
-    let source_modes =
-        job.kind == JobKind::Track && !(failure.as_ref()).is_some_and(|f| f.stage == Stage::Index);
+    let source_modes = job.kind == JobKind::Track && takes_another_source(view);
     match mode {
         RetryMode::SameSource => {
             let later = || {
@@ -618,7 +626,7 @@ pub(crate) fn allowed(view: &JobView, untried: &Untried, mode: RetryMode) -> boo
                 })
             };
             source_modes
-                && last_tried(view).is_some()
+                && source_tried(view).is_some()
                 && (job.state == JobState::Cancelled || later())
         }
         RetryMode::NextSource => source_modes && untried.best().is_some(),
@@ -628,11 +636,52 @@ pub(crate) fn allowed(view: &JobView, untried: &Untried, mode: RetryMode) -> boo
     }
 }
 
-/// The first slot and the file of its newest attempt that had one: what same_source takes
-/// again (a track job has one slot).
-fn last_tried(view: &JobView) -> Option<(u32, &DownloadableItem)> {
+/// Whether the job may take another source (same_source, next_source, download_source): not
+/// when its recording is already in the library, nor when its file is, waiting for Navidrome to
+/// list it (a failure at the index stage).
+pub(crate) fn takes_another_source(view: &JobView) -> bool {
+    !job_failure(view)
+        .is_some_and(|f| f.code == FailureCode::ImportAlreadyInLibrary || f.stage == Stage::Index)
+}
+
+/// The row a slot shows: its live row while it runs, else the last row stored.
+pub(crate) fn shown_row(slot: &SlotView) -> Option<&DownloadProgress> {
+    slot.live.as_ref().or(slot.row.as_ref())
+}
+
+/// The attempt `row` is of: the newest of the slot's whose candidate is the row's transfer (its
+/// source and file). Failover records each alternate it was refused as an attempt after the one
+/// that failed, so the newest attempt is not always the row's.
+fn row_attempt<'a>(slot: &'a SlotView, row: &DownloadProgress) -> Option<&'a AttemptRecord> {
+    (slot.attempts.iter().rev()).find(|a| {
+        (a.candidate.as_ref()).is_some_and(|c| c.source == row.source && c.id == row.item)
+    })
+}
+
+/// The attempt the slot's shown row is of (`row_attempt`). Without a row, the newest attempt
+/// while it has not ended (a pick not sent yet).
+pub(crate) fn current_attempt(slot: &SlotView) -> Option<&AttemptRecord> {
+    match shown_row(slot) {
+        Some(row) => row_attempt(slot, row),
+        None => slot.attempts.last().filter(|a| a.ended_at.is_none()),
+    }
+}
+
+/// The file the slot's pick took: the file of the transfer its shown row is of, the one its
+/// failure names; without a row (nothing was sent), the file of its newest attempt that had one.
+pub(crate) fn picked_file(slot: &SlotView) -> Option<&DownloadableItem> {
+    let attempt = match shown_row(slot) {
+        Some(row) => row_attempt(slot, row),
+        None => (slot.attempts.iter().rev()).find(|a| a.candidate.is_some()),
+    };
+    attempt?.candidate.as_ref()
+}
+
+/// The first slot and its `picked_file`: what same_source takes again (a track job has one
+/// slot).
+fn source_tried(view: &JobView) -> Option<(u32, &DownloadableItem)> {
     let slot = view.slots.first()?;
-    (slot.attempts.iter().rev()).find_map(|a| Some((slot.slot, a.candidate.as_ref()?)))
+    Some((slot.slot, picked_file(slot)?))
 }
 
 /// Whether `slot` failed waiting for Navidrome: its row's index failed at the index stage.

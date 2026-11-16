@@ -147,6 +147,10 @@ pub struct StubBackend {
     stopped_searches: Mutex<Vec<String>>,
     queue_position: Mutex<Option<u32>>,
     presence: Mutex<SourcePresence>,
+    /// slskd's status and body for every `queue_position` and `source_status` call, while set.
+    queue_position_error: Mutex<Option<(u16, String)>>,
+    presence_error: Mutex<Option<(u16, String)>>,
+    presence_asked: Mutex<Vec<String>>,
 }
 
 /// Holds every `download` (or `start_search`) call until released, after announcing it.
@@ -175,6 +179,9 @@ impl StubBackend {
             stopped_searches: Mutex::new(Vec::new()),
             queue_position: Mutex::new(None),
             presence: Mutex::new(SourcePresence::Online),
+            queue_position_error: Mutex::new(None),
+            presence_error: Mutex::new(None),
+            presence_asked: Mutex::new(Vec::new()),
         })
     }
 
@@ -243,6 +250,21 @@ impl StubBackend {
     /// What `source_status` answers for every source; Online until set.
     pub fn set_presence(&self, presence: SourcePresence) {
         *self.presence.lock().unwrap() = presence;
+    }
+
+    /// Makes every `queue_position` call fail as slskd answers `status` with `body`.
+    pub fn fail_queue_position(&self, status: u16, body: &str) {
+        *self.queue_position_error.lock().unwrap() = Some((status, body.to_string()));
+    }
+
+    /// Makes every `source_status` call fail as slskd answers `status` with `body`.
+    pub fn fail_presence(&self, status: u16, body: &str) {
+        *self.presence_error.lock().unwrap() = Some((status, body.to_string()));
+    }
+
+    /// The source of every `source_status` call, in order.
+    pub fn presence_asked(&self) -> Vec<String> {
+        self.presence_asked.lock().unwrap().clone()
     }
 
     /// What `get_downloads_for` (filtered by peer) and `get_downloads` return.
@@ -430,9 +452,16 @@ impl DownloadBackend for StubBackend {
         Ok(())
     }
     async fn queue_position(&self, _source: &str, _id: &str) -> SoulResult<Option<u32>> {
+        if let Some((status, message)) = self.queue_position_error.lock().unwrap().clone() {
+            return Err(SoulseekError::Api { status, message });
+        }
         Ok(*self.queue_position.lock().unwrap())
     }
-    async fn source_status(&self, _source: &str) -> SoulResult<SourcePresence> {
+    async fn source_status(&self, source: &str) -> SoulResult<SourcePresence> {
+        self.presence_asked.lock().unwrap().push(source.to_string());
+        if let Some((status, message)) = self.presence_error.lock().unwrap().clone() {
+            return Err(SoulseekError::Api { status, message });
+        }
         Ok(*self.presence.lock().unwrap())
     }
     async fn stop_search(&self, search_id: &str) -> SoulResult<()> {

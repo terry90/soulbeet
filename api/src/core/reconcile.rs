@@ -724,7 +724,7 @@ pub(crate) async fn resume_unfinished(
                     &failures,
                     &job.excluded_sources,
                 )
-                .unflagged_groups()
+                .automatic_groups()
             }
             (search, _) => search.and_then(|s| s.candidates).unwrap_or_default(),
         };

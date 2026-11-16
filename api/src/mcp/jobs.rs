@@ -867,6 +867,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_ask_of_the_queue_says_who_did_not_answer_in_soulfuls_words() {
+        let (db, acq, effects, token) = jobs_app().await;
+        let job = downloading_track_job(&acq).await;
+        acq.ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![DownloadProgress {
+                queued_at_source: true,
+                ..transfer(
+                    "carol_shares",
+                    "@@kqzbm\\Music\\Marrow Choir\\Winter Songs\\03 - O Holy Night.flac",
+                    "890f943c-02e1-4d45-af76-d55e3d855684",
+                    DownloadState::Queued,
+                )
+                .with_job(JobSlot {
+                    job: job.clone(),
+                    slot: 0,
+                })
+            }],
+        });
+        acq.ledger.settled().await;
+        let ask = |body: &'static str| {
+            let (db, acq, token, job) = (db.clone(), acq.clone(), token.clone(), job.clone());
+            let effects = effects.clone();
+            async move {
+                effects.stub().fail_queue_position(500, body);
+                let doc = document(
+                    &call_tool(
+                        app_of(&db, &acq),
+                        &token,
+                        "get_jobs",
+                        json!({"job_ids": [job], "detail": "full"}),
+                    )
+                    .await,
+                );
+                doc["jobs"][0]["slots"][0]["current_attempt"]["queue_position_failure"].clone()
+            }
+        };
+        // slskd lost its login: Soulseek.NET words this ask apart (SoulseekClient.cs:1640).
+        let logged_out = ask("The server connection must be Connected and LoggedIn to check download queue position (currently: Disconnected)").await;
+        assert_eq!(
+            (logged_out["code"].as_str(), logged_out["retry"].as_str()),
+            (Some("backend_unreachable"), Some("same_source_later")),
+            "{logged_out}"
+        );
+        // The peer did not answer (Waiter.cs:161); its text stays in the cause.
+        let silent = "The wait timed out after 5000 milliseconds";
+        let unanswered = ask(silent).await;
+        assert_eq!(
+            (
+                unanswered["code"].as_str(),
+                unanswered["message"].as_str(),
+                unanswered["cause"]["raw"].as_str()
+            ),
+            (
+                Some("transfer_connection_failed"),
+                Some("slskd could not ask the source for this transfer's place in its queue"),
+                Some(silent)
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn another_users_job_id_reads_like_an_unknown_one() {
         let (db, acq, _, token) = jobs_app().await;
         folder_of(&db, "bob").await;

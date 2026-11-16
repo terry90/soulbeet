@@ -493,6 +493,7 @@ impl Searches {
     }
 
     /// The backend's id of stored search `id`, once its task started it at the backend.
+    #[cfg(test)]
     pub fn backend_search(&self, id: &str) -> Option<String> {
         let line = self.line.lock().unwrap();
         line.runs
@@ -501,24 +502,30 @@ impl Searches {
             .and_then(|run| run.started.as_ref().map(|(search, _)| search.clone()))
     }
 
-    /// D9: stops stored search `id`. One waiting for the turn never starts and is stored failed
-    /// with `search_stopped`; one running is stopped at the backend and keeps what it found. For
-    /// an id no task runs yet it leaves a stop mark, taken under the lock `start_stored`
-    /// registers with, so a task that starts that id afterwards stores it stopped without
-    /// searching; marks older than SEARCH_KEPT_SECS are dropped when one is added. True when a
-    /// task runs it.
-    pub async fn stop(&self, id: &str) -> bool {
+    /// D9: stops search `id` of a cancelled job when it is the job's own. One waiting for the
+    /// turn never starts and is stored failed with `search_stopped`; one running is stopped at
+    /// the backend and keeps what it found. A find_sources search the job reads (new_search with
+    /// its search_id) is its caller's and runs on. For an id no task runs, it leaves a stop mark
+    /// only when the search is not `recorded` yet (new_search records it after the job's write):
+    /// the mark is taken under the lock `start_stored` registers with, so the task that starts
+    /// that id afterwards stores it stopped without searching. A recorded search no task runs has
+    /// ended, or a restart cut it off: nothing runs it again for a cancelled job. Marks older than
+    /// SEARCH_KEPT_SECS are dropped when one is added. True when it stopped a task's search.
+    pub async fn stop_job_search(&self, id: &str, recorded: bool) -> bool {
         let started = {
             let mut line = self.line.lock().unwrap();
             match line.runs.iter_mut().find(|run| run.id == id) {
-                Some(run) => {
+                Some(run) if run.purpose == SearchFor::Job => {
                     run.stop = true;
                     run.started.clone()
                 }
+                Some(_) => return false,
                 None => {
-                    let now = chrono::Utc::now().timestamp();
-                    line.stops.retain(|_, at| *at > now - SEARCH_KEPT_SECS);
-                    line.stops.insert(id.to_string(), now);
+                    if !recorded {
+                        let now = chrono::Utc::now().timestamp();
+                        line.stops.retain(|_, at| *at > now - SEARCH_KEPT_SECS);
+                        line.stops.insert(id.to_string(), now);
+                    }
                     return false;
                 }
             }
@@ -611,7 +618,7 @@ impl Searches {
     /// Takes the turn with a search of its own until the returned place is dropped, so searches
     /// started meanwhile wait for it.
     #[cfg(test)]
-    pub async fn hold_turn_for_test(self: &Arc<Self>) -> Place {
+    pub(crate) async fn hold_turn_for_test(self: &Arc<Self>) -> Place {
         let id = uuid::Uuid::new_v4().to_string();
         let place = self.enter(&id, UserId::new("tester"));
         self.take_turn(&id).await;
@@ -635,7 +642,7 @@ fn waiting_finds_in(runs: &[Run], user: &UserId) -> Vec<String> {
 }
 
 /// A search's place in `Searches`, given up when dropped (its task ended, however it ended).
-pub struct Place {
+pub(crate) struct Place {
     searches: Arc<Searches>,
     id: String,
 }
@@ -785,6 +792,18 @@ impl Candidate {
     pub fn flagged(&self) -> bool {
         self.recent_failures >= FLAGGED_FAILURES
     }
+
+    /// A file of it was scored below the floor, a match of another recording kept because the
+    /// search asked for those: never taken unless Claude names it (download_source).
+    pub fn below_floor(&self) -> bool {
+        self.group.items.iter().any(|item| item.below_floor)
+    }
+
+    /// Whether a job may take it without Claude naming it: an automatic pick, next_source and
+    /// failover take only a candidate neither flagged (D5) nor below the floor.
+    pub fn automatic(&self) -> bool {
+        !self.flagged() && !self.below_floor()
+    }
 }
 
 /// Files the filters dropped, each under the first filter it failed (D6), and groups of an
@@ -806,11 +825,11 @@ pub struct CandidateView {
 }
 
 impl CandidateView {
-    /// The groups of its candidates whose source is not flagged, the ones a job's automatic
-    /// pick and its failover may use (D4, D5).
-    pub fn unflagged_groups(&self) -> Vec<DownloadableGroup> {
+    /// The groups of its candidates a job may take without Claude naming them (`automatic`):
+    /// what its failover may use (D4, D5).
+    pub fn automatic_groups(&self) -> Vec<DownloadableGroup> {
         (self.candidates.iter())
-            .filter(|c| !c.flagged())
+            .filter(|c| c.automatic())
             .map(|c| c.group.clone())
             .collect()
     }
@@ -1620,8 +1639,11 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         let ctx = test_ctx("alice");
         let searches: Arc<Searches> = Arc::default();
-        // A cancel that came before the runner started its job's search.
-        assert!(!searches.stop("s1").await, "no task runs s1 yet");
+        // A cancel that came before the runner recorded and started its job's search.
+        assert!(
+            !searches.stop_job_search("s1", false).await,
+            "no task runs s1 yet"
+        );
         let stopped = start_stored(
             &searches,
             &ledger,
@@ -1658,12 +1680,65 @@ mod tests {
         })
         .await
         .expect("the backend started it");
-        assert!(searches.stop("s2").await);
+        assert!(searches.stop_job_search("s2", true).await);
         assert_eq!(stub.stopped_searches(), vec!["search".to_string()]);
         assert_eq!(
             running.await.unwrap(),
             SearchProgress::Done(found, SearchStats::default())
         );
+    }
+
+    #[tokio::test]
+    async fn a_job_stops_only_its_own_search_and_marks_only_one_not_recorded_yet() {
+        let db = crate::db::test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let stub = StubBackend::new(vec![]);
+        let (reached, release) = stub.hold_searches();
+        let found = vec![group(
+            "peer_a",
+            vec![item("peer_a", "One", "a/01.flac")],
+            0.9,
+        )];
+        stub.script_polls(vec![
+            Ok(search_result(
+                "search",
+                SearchState::Completed,
+                found.clone(),
+            )),
+            Ok(search_result("search", SearchState::Completed, found)),
+        ]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let ctx = test_ctx("alice");
+        let searches: Arc<Searches> = Arc::default();
+        // A job read a find_sources search, and was cancelled while it ran: it runs on.
+        let find = start_find(
+            &searches,
+            &ledger,
+            &ctx,
+            backend.clone(),
+            run("f1", StoredSpec::default()),
+        )
+        .await
+        .unwrap();
+        reached.notified().await;
+        assert!(!searches.stop_job_search("f1", true).await);
+        release.notify_one();
+        assert!(matches!(find.await.unwrap(), SearchProgress::Done(..)));
+        assert!(stub.stopped_searches().is_empty());
+        // A recorded search no task runs leaves no mark: a later run of its id searches.
+        assert!(!searches.stop_job_search("s1", true).await);
+        let later = start_stored(
+            &searches,
+            &ledger,
+            &ctx,
+            backend,
+            run("s1", StoredSpec::default()),
+        )
+        .await
+        .unwrap();
+        release.notify_one();
+        assert!(matches!(later.await.unwrap(), SearchProgress::Done(..)));
     }
 
     #[tokio::test]

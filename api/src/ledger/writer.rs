@@ -1190,6 +1190,10 @@ impl Writer {
         if !change.allowed_from().contains(&from) {
             return Ok(Transitioned::Refused { state: from });
         }
+        // D15: decided on a search the job no longer searches with.
+        if (change.decided_on()).is_some_and(|read| search_id.as_deref() != Some(read)) {
+            return Ok(Transitioned::Refused { state: from });
+        }
         // Only an MCP job's runner holds a place before it sends, and records the send first: a
         // queued MCP job without a place and without a recorded send cannot have transfers. A web
         // UI job's pipeline sends without either.
@@ -1233,16 +1237,16 @@ impl Writer {
                 let to = JobState::Dismissed;
                 (to, vec![Entry::at(to, "dismissed")])
             }
-            Transition::Pick { items } => {
+            Transition::Pick { items, .. } => {
                 self.pick_slots(&mut tx, job, &items).await?;
                 forget_send(&mut tx, job).await?;
                 (JobState::Queued, picked("picked", &items))
             }
-            Transition::AwaitChoice => {
+            Transition::AwaitChoice { .. } => {
                 let to = JobState::NeedsSourceChoice;
                 (to, vec![Entry::at(to, "waiting_for_source_choice")])
             }
-            Transition::SearchAgain { search_id } => {
+            Transition::SearchAgain { search_id, .. } => {
                 sqlx::query("UPDATE jobs SET search_id = ? WHERE id = ?")
                     .bind(search_id)
                     .bind(job)
@@ -1256,7 +1260,7 @@ impl Writer {
                 let to = JobState::Cancelled;
                 (to, vec![Entry::at(to, "cancelled")])
             }
-            Transition::Fail { failure } => {
+            Transition::Fail { failure, .. } => {
                 if self
                     .fail_slots(&mut tx, job, Failing::Unfinished, &failure)
                     .await?
@@ -1273,13 +1277,7 @@ impl Writer {
             }
             Transition::Search {
                 filters: Some(_), ..
-            } if !has_options => {
-                // A web UI job keeps no options to hold them in; dropping them would search
-                // without what the caller asked for.
-                return Err(LedgerError(format!(
-                    "job {job} keeps no options, so it takes no filters"
-                )));
-            }
+            } if !has_options => return Ok(Transitioned::NoOptions),
             Transition::Search { search_id, filters } => {
                 // Every slot, ended ones too: the new search's pick reopens those it fills.
                 sqlx::query("UPDATE job_tracks SET state = ? WHERE job_id = ?")
