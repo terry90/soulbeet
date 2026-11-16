@@ -467,8 +467,7 @@ async fn search_again(
 /// be recorded, so nothing searches with what the caller gave: the job ends failed with
 /// `failure` (cancelled when its user cancelled it meanwhile) and is answered as it then is. A
 /// runner would search the job's own query instead, so none is started. When that write fails
-/// too, a task writes it again until the database takes it (`fail_job`), so the job does not wait
-/// with no runner.
+/// too, a task writes it again as `fail_job` does; one it gives up is left to the next start.
 async fn search_not_started(
     acquire: &Acquire,
     ctx: &UserCtx,

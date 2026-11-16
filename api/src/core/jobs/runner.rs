@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// What acquisition does outside the ledger, so tests run it on stubs.
 #[async_trait]
@@ -306,10 +306,15 @@ pub(crate) fn search_unanswered() -> Failure {
 /// The longest a failure that could not be written waits before it is written again.
 const FAIL_RETRY_MAX: Duration = Duration::from_secs(30);
 
-/// Fails `user`'s job `job` with `failure` (`search_id` the search it came of, when it came of
-/// one), writing it again, waiting longer each time up to FAIL_RETRY_MAX, until the writer
+/// How many times a failure is written before it is given up: about a minute of waits.
+const FAIL_ATTEMPTS: u32 = 7;
+
+/// Fails `user`'s job `job` with `failure` (`search_id` the search it was decided on, when there
+/// was one), writing it again, waiting longer each time up to FAIL_RETRY_MAX, until the writer
 /// applies or refuses it: a job whose failure was not written would wait with no runner. A
-/// refusal means the job moved on meanwhile.
+/// refusal means the job moved on meanwhile. After FAIL_ATTEMPTS writes the database still
+/// refused, it logs an error and returns, so a runner lets its job go: the job then waits, still
+/// searching or queued, until the next start of the server, whose reconcile resumes or ends it.
 pub(crate) async fn fail_job(
     ledger: &Ledger,
     user: &UserId,
@@ -319,13 +324,17 @@ pub(crate) async fn fail_job(
 ) {
     info!("Job {job} failed: {}", logged(&failure));
     let mut wait = Duration::from_secs(1);
-    loop {
+    for attempt in 1..=FAIL_ATTEMPTS {
         let change = Transition::Fail {
             failure: failure.clone(),
             search_id: search_id.clone(),
         };
         match ledger.transition(user, job, change).await {
             Ok(_) => return,
+            Err(e) if attempt == FAIL_ATTEMPTS => {
+                error!("Could not fail job {job} in {FAIL_ATTEMPTS} writes, leaving it to the next start: {e}");
+                return;
+            }
             Err(e) => warn!("Could not fail job {job}, trying again in {wait:?}: {e}"),
         }
         tokio::time::sleep(wait).await;
@@ -345,7 +354,13 @@ impl Runner<'_> {
         matches!(applied, Ok(Transitioned::Applied { .. }))
     }
 
-    /// `fail_job` of the runner's job.
+    /// The search the runner read its job with: a change it decides from that read names it, so
+    /// a job cancelled and searched again meanwhile is left to its new search's runner (D15).
+    fn read_on(&self) -> Option<String> {
+        self.job.search_id.clone()
+    }
+
+    /// `fail_job` of the runner's job, decided on `search_id`.
     async fn fail(&self, failure: Failure, search_id: Option<String>) {
         let user = self.ctx.id();
         fail_job(
@@ -517,8 +532,8 @@ impl Runner<'_> {
         let (backend, fresh, acquisition) = match self.request().await {
             Ok(Some(request)) => request,
             // Queued with nothing to send: it gives up the place it holds by failing.
-            Ok(None) => return self.fail(nothing_enqueued(), None).await,
-            Err(failure) => return self.fail(failure, None).await,
+            Ok(None) => return self.fail(nothing_enqueued(), self.read_on()).await,
+            Err(failure) => return self.fail(failure, self.read_on()).await,
         };
         let enqueued = self
             .acquire
@@ -544,7 +559,8 @@ impl Runner<'_> {
                 Ok(true) => return true,
                 Ok(false) => {}
                 Err(e) => {
-                    self.fail(database_failure(Stage::Enqueue, e), None).await;
+                    let failure = database_failure(Stage::Enqueue, e);
+                    self.fail(failure, self.read_on()).await;
                     return false;
                 }
             }
@@ -1173,6 +1189,76 @@ mod tests {
         assert_eq!(
             store::job_state(&acq.db, &jobs[6]).await,
             Some(JobState::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runner_that_cannot_enqueue_leaves_a_job_cancelled_and_searched_again_meanwhile() {
+        let (acq, effects) = Acquire::for_alice().await;
+        let job = queued_track_jobs(&acq, 1).await.remove(0);
+        // The job as its runner read it, queued under its first search.
+        let read = (store::job_record(&acq.db, &job, &alice().id()).await)
+            .unwrap()
+            .unwrap();
+        let first = read.search_id.clone();
+        // cancel_job, then retry_job new_search, land before the runner's enqueue fails: the
+        // writes those calls make.
+        let user = alice().id();
+        let renewed = uuid::Uuid::new_v4().to_string();
+        for change in [
+            Transition::Cancel,
+            Transition::Search {
+                search_id: renewed.clone(),
+                filters: None,
+            },
+        ] {
+            let done = acq.ledger.transition(&user, &job, change).await.unwrap();
+            assert!(matches!(done, Transitioned::Applied { .. }), "{done:?}");
+        }
+        effects.fail_backend(Failure::new(
+            FailureCode::BackendNotConfigured,
+            Stage::SourceSearch,
+            RetryAdvice::NeedsUser,
+            "Download backend not available: slskd URL not configured",
+        ));
+        let (ctx, options) = (alice(), read.options.clone().unwrap());
+        let runner = Runner {
+            acquire: &acq,
+            ctx: &ctx,
+            job: &read,
+            options: &options,
+        };
+        runner.download().await;
+        acq.ledger.settled().await;
+        let now = store::job_record(&acq.db, &job, &user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, Some(renewed.clone()));
+        assert_eq!(
+            (now.state, now.search_id),
+            (JobState::Searching, Some(renewed))
+        );
+        assert!(effects.enqueued().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failure_the_database_keeps_refusing_is_given_up_after_its_attempts() {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = queued_track_jobs(&acq, 1).await.remove(0);
+        // Every write is refused from now on.
+        acq.db.close().await;
+        tokio::time::pause();
+        let (user, start) = (alice().id(), tokio::time::Instant::now());
+        let failing = fail_job(&acq.ledger, &user, &job, nothing_enqueued(), None);
+        let given_up = tokio::time::timeout(Duration::from_secs(3600), failing).await;
+        let waited = start.elapsed();
+        tokio::time::resume();
+        assert!(given_up.is_ok(), "fail_job never gave up");
+        // FAIL_ATTEMPTS writes with the waits between them: 1, 2, 4, 8, 16 and 30 seconds.
+        assert!(
+            (Duration::from_secs(61)..Duration::from_secs(62)).contains(&waited),
+            "{waited:?}"
         );
     }
 
