@@ -7,6 +7,7 @@ use crate::services::NavidromeLookupError;
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::json;
+use soulbeet::navidrome::models::SubsonicSong;
 use soulbeet::navidrome::{NavidromeClient, NavidromeClientBuilder};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -414,4 +415,57 @@ pub(crate) fn child(id: &str, artist: &str, title: &str) -> String {
     format!(
         r#"{{"id":{id},"parent":"7hQ2nLr5VxZ0cYbM8wTkAf","isDir":false,"title":{title},"album":"Winter Songs","artist":{artist},"track":3,"size":28734112,"contentType":"audio/flac","suffix":"flac","starred":"2026-11-02T18:04:51.112Z","duration":263,"bitRate":912,"path":{path},"discNumber":1,"albumId":"7hQ2nLr5VxZ0cYbM8wTkAf","artistId":"2kD9pWq4ZxC1vBnM6yTjLs","type":"music","userRating":4,"averageRating":3.5,"bpm":0,"comment":"","sortName":"","mediaType":"song","musicBrainzId":"0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c","isrc":[],"genres":[],"replayGain":{{}},"channelCount":2,"samplingRate":44100}}"#
     )
+}
+
+/// getSong's answer (server/subsonic/browsing.go GetSong): `child(id, "Marrow Choir", title)` rated
+/// `rating` by this user, `userRating` left out for None (responses.go:99, omitempty), and starred
+/// or not.
+pub(crate) fn song_body(id: &str, title: &str, rating: Option<u8>, starred: bool) -> String {
+    let mut song: serde_json::Value =
+        serde_json::from_str(&child(id, "Marrow Choir", title)).expect("child writes JSON");
+    let fields = song.as_object_mut().expect("child writes an object");
+    match rating {
+        Some(rating) => fields.insert("userRating".into(), json!(rating)),
+        None => fields.remove("userRating"),
+    };
+    if !starred {
+        fields.remove("starred");
+    }
+    subsonic_ok(&format!(r#""song":{song}"#))
+}
+
+/// getAlbum's answer for album `id` named `name` by "Marrow Choir", starred and rated `rating` by
+/// this user, without songs. AlbumID3 always sends `userRating`, 0 when unrated (responses.go:269).
+pub(crate) fn album_body(id: &str, name: &str, rating: u8) -> String {
+    let album = json!({
+        "id": id, "name": name, "artist": "Marrow Choir", "artistId": "2kD9pWq4ZxC1vBnM6yTjLs",
+        "songCount": 12, "duration": 2841, "starred": "2026-11-03T09:12:40.004Z", "year": 2019,
+        "userRating": rating, "genres": [], "musicBrainzId": "", "isCompilation": false,
+        "sortName": "", "discTitles": [], "song": [],
+    });
+    subsonic_ok(&format!(r#""album":{album}"#))
+}
+
+/// The song search3 lists for alice: `id` titled `title` by "Marrow Choir" on album "Winter
+/// Songs" ("al1"), rated `rating`, no path.
+pub(crate) fn subsonic_song(id: &str, title: &str, rating: Option<u8>) -> SubsonicSong {
+    SubsonicSong {
+        id: id.into(),
+        title: title.into(),
+        artist: Some("Marrow Choir".into()),
+        album: Some("Winter Songs".into()),
+        album_id: Some("al1".into()),
+        genre: None,
+        duration: None,
+        path: None,
+        user_rating: rating,
+        play_count: None,
+        starred: None,
+        music_brainz_id: None,
+        suffix: None,
+        bit_rate: None,
+        size: None,
+        year: None,
+        track: None,
+    }
 }

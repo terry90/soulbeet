@@ -31,6 +31,7 @@ pub(crate) mod metadata;
 pub(crate) mod next;
 mod paging;
 pub(crate) mod playlists;
+mod ratings;
 mod refs;
 pub(crate) mod server;
 pub(crate) mod settings;

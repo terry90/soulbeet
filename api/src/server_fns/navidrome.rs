@@ -23,6 +23,8 @@ use crate::core::index::ServerNavidrome;
 #[cfg(feature = "server")]
 use crate::core::library;
 #[cfg(feature = "server")]
+use crate::core::ratings::{pending_action, pending_track_for, PendingAction};
+#[cfg(feature = "server")]
 use crate::core::{database_failure, logged};
 #[cfg(feature = "server")]
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
@@ -139,50 +141,6 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
         total_songs_scanned,
         kept_tracks,
     })
-}
-
-/// The pending discovery track `song` is: the track's song id when it has one, else the file
-/// name of the song's Subsonic path, ignoring ASCII case.
-#[cfg(feature = "server")]
-pub(crate) fn pending_track_for<'a>(
-    song: &SubsonicSong,
-    pending: &'a [DiscoveryTrack],
-) -> Option<&'a DiscoveryTrack> {
-    let file_name = |path: &str| Path::new(path).file_name().map(|f| f.to_ascii_lowercase());
-    pending.iter().find(|track| match &track.song_id {
-        Some(song_id) => *song_id == song.id,
-        None => song
-            .path
-            .as_deref()
-            .and_then(file_name)
-            .is_some_and(|name| Some(name) == file_name(&track.path)),
-    })
-}
-
-/// What the rating sync does with a pending discovery track the user rated.
-#[cfg(feature = "server")]
-pub(crate) enum PendingAction<'a> {
-    Promote(&'a DiscoveryTrack),
-    Remove(&'a DiscoveryTrack),
-}
-
-/// Promote the pending track of `song` at `promote_threshold` or above, else remove it at
-/// rating 1.
-#[cfg(feature = "server")]
-pub(crate) fn pending_action<'a>(
-    song: &SubsonicSong,
-    pending: &'a [DiscoveryTrack],
-    promote_threshold: u8,
-) -> Option<PendingAction<'a>> {
-    let rating = song.user_rating?;
-    let track = pending_track_for(song, pending)?;
-    if rating >= promote_threshold {
-        Some(PendingAction::Promote(track))
-    } else if rating == 1 {
-        Some(PendingAction::Remove(track))
-    } else {
-        None
-    }
 }
 
 /// Discovery's own cleanup (D12): removes the pending track of each song of `songs` that
@@ -586,6 +544,7 @@ mod tests {
     use super::*;
     use crate::core::delete_guard::test_support::Library;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
+    use crate::test_navidrome::subsonic_song;
     use soulbeet::navidrome::models::NativeSong;
     use std::sync::Arc;
 
@@ -691,29 +650,6 @@ mod tests {
         assert_eq!(f.message, format!("Promote stopped: {e}"));
     }
 
-    /// The song search3 lists for alice: by "Marrow Choir", no path.
-    fn subsonic(id: &str, title: &str, rating: Option<u8>) -> SubsonicSong {
-        SubsonicSong {
-            id: id.into(),
-            title: title.into(),
-            artist: Some("Marrow Choir".into()),
-            album: Some("Winter Songs".into()),
-            album_id: Some("al1".into()),
-            genre: None,
-            duration: None,
-            path: None,
-            user_rating: rating,
-            play_count: None,
-            starred: None,
-            music_brainz_id: None,
-            suffix: None,
-            bit_rate: None,
-            size: None,
-            year: None,
-            track: None,
-        }
-    }
-
     #[tokio::test]
     async fn one_star_songs_are_deleted_through_the_guard_and_the_kept_ones_say_why() {
         let lib = Library::new().await;
@@ -723,9 +659,9 @@ mod tests {
         let stub = Arc::new(StubImporter::new());
         let queue = ImportQueue::new(RecordingDeps::new(stub.clone()));
         let songs = vec![
-            subsonic("s1", "O Holy Night", Some(1)),
-            subsonic("s2", "Silent Night", Some(1)),
-            subsonic("s3", "Away in a Manger", Some(5)),
+            subsonic_song("s1", "O Holy Night", Some(1)),
+            subsonic_song("s2", "Silent Night", Some(1)),
+            subsonic_song("s3", "Away in a Manger", Some(5)),
         ];
         let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
         assert_eq!((run.deleted, run.removed), (1, 0));
@@ -775,7 +711,7 @@ mod tests {
         let run = auto_delete_songs(
             &lib.guard(),
             &lib.alice(),
-            &[subsonic("s1", "O Holy Night", Some(1))],
+            &[subsonic_song("s1", "O Holy Night", Some(1))],
             &[],
             &queue,
         )
@@ -793,7 +729,7 @@ mod tests {
         let run = auto_delete_songs(
             &lib.guard(),
             &lib.alice(),
-            &[subsonic("s1", "O Holy Night", Some(1))],
+            &[subsonic_song("s1", "O Holy Night", Some(1))],
             &[],
             &queue,
         )
@@ -804,7 +740,7 @@ mod tests {
         let run = auto_delete_songs(
             &lib.guard(),
             &lib.alice(),
-            &[subsonic("s1", "O Holy Night", Some(1))],
+            &[subsonic_song("s1", "O Holy Night", Some(1))],
             &[],
             &queue,
         )
@@ -820,7 +756,7 @@ mod tests {
     async fn a_song_deleted_earlier_that_navidrome_still_lists_is_neither_checked_nor_kept() {
         let lib = Library::new().await;
         let queue = ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())));
-        let songs = [subsonic("s1", "O Holy Night", Some(1))];
+        let songs = [subsonic_song("s1", "O Holy Night", Some(1))];
         let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
         assert_eq!((run.deleted, run.kept.len()), (1, 0));
         // The next sync lists it again: Navidrome has not scanned since. Only its record is
@@ -838,7 +774,7 @@ mod tests {
     async fn a_song_navidrome_moved_to_another_file_since_its_deletion_is_checked_again() {
         let lib = Library::new().await;
         let queue = ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())));
-        let songs = [subsonic("s1", "O Holy Night", Some(1))];
+        let songs = [subsonic_song("s1", "O Holy Night", Some(1))];
         let run = auto_delete_songs(&lib.guard(), &lib.alice(), &songs, &[], &queue).await;
         assert_eq!(run.deleted, 1);
         // Re-imported at another path: Navidrome's scanner matched the missing file to the new
@@ -870,7 +806,7 @@ mod tests {
         let run = auto_delete_songs(
             &lib.guard(),
             &lib.alice(),
-            &[subsonic("s5", "03", Some(1))],
+            &[subsonic_song("s5", "03", Some(1))],
             &[],
             &queue,
         )
@@ -907,7 +843,7 @@ mod tests {
             .await;
         let song = SubsonicSong {
             path: Some("Marrow Choir/Explore/03 - O HOLY NIGHT.flac".into()),
-            ..subsonic("s9", "O Holy Night", Some(1))
+            ..subsonic_song("s9", "O Holy Night", Some(1))
         };
         let pending = vec![track];
         assert!(
@@ -944,32 +880,5 @@ mod tests {
             (lib.fake.reads_by("alice"), lib.fake.reads_by("bob")),
             (0, 0)
         );
-    }
-
-    #[test]
-    fn a_track_with_a_song_id_matches_only_that_song() {
-        let track = DiscoveryTrack {
-            id: "t1".into(),
-            song_id: Some("s5".into()),
-            title: "O Holy Night".into(),
-            artist: "Marrow Choir".into(),
-            album: "Winter Songs".into(),
-            path: "/music/alice/Discovery/Explore/03.flac".into(),
-            folder_id: "alice-music".into(),
-            profile: "Explore".into(),
-            rating: None,
-            status: DiscoveryStatus::Pending,
-            created_at: "2026-11-15 20:00:00".into(),
-        };
-        let same_name = SubsonicSong {
-            path: Some("Marrow Choir/Explore/03.flac".into()),
-            ..subsonic("s6", "O Holy Night", Some(1))
-        };
-        assert!(pending_track_for(&same_name, std::slice::from_ref(&track)).is_none());
-        assert!(pending_track_for(
-            &subsonic("s5", "O Holy Night", Some(1)),
-            std::slice::from_ref(&track)
-        )
-        .is_some());
     }
 }

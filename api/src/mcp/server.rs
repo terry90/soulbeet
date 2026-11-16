@@ -17,8 +17,8 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
 use super::{
-    batches, ensure, imports, jobs, library, metadata, playlists, settings, sources, status,
-    McpCaller,
+    batches, ensure, imports, jobs, library, metadata, playlists, ratings, settings, sources,
+    status, McpCaller,
 };
 use crate::connection::ConnectionState;
 
@@ -263,6 +263,8 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     playlists::SET_PLAYLIST_TRACKS,
     playlists::ADD_PLAYLIST_TRACKS,
     playlists::REMOVE_PLAYLIST_TRACKS,
+    ratings::SET_RATING,
+    ratings::SET_STAR,
 ];
 
 impl ToolSpec {
@@ -518,6 +520,8 @@ mod tests {
                 "song_ids": ["3sG8kPq0WmZ1xYbN4vTcDe"]}),
             "remove_playlist_tracks" => json!({"playlist_id": "6vN2bQ8rT4yH1kL9mX3zPa",
                 "entries": [{"position": 0, "song_id": "3sG8kPq0WmZ1xYbN4vTcDe"}]}),
+            "set_rating" => json!({"song_id": "3sG8kPq0WmZ1xYbN4vTcDe", "rating": 3}),
+            "set_star" => json!({"song_id": "3sG8kPq0WmZ1xYbN4vTcDe", "starred": true}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -592,6 +596,8 @@ mod tests {
         ("set_playlist_tracks", false, false, true, false),
         ("add_playlist_tracks", false, false, false, false),
         ("remove_playlist_tracks", false, false, false, false),
+        ("set_rating", false, false, true, false),
+        ("set_star", false, false, true, false),
     ];
 
     #[test]
@@ -708,6 +714,8 @@ mod tests {
             "set_playlist_tracks",
             "add_playlist_tracks",
             "remove_playlist_tracks",
+            "set_rating",
+            "set_star",
         ] {
             let result = call_tool(app.clone(), &token, name, valid_args(name)).await;
             within_cap(&result, name);

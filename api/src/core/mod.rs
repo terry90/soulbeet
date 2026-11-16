@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod library;
 pub mod metadata;
 pub mod playlists;
+pub mod ratings;
 pub mod reconcile;
 pub mod settings;
 pub mod sources;

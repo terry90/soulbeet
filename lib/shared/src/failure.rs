@@ -291,6 +291,8 @@ pub enum UserActionCode {
     EnableDeletion,
     EnableIndexing,
     AddFolder,
+    /// A change Soulful does not make for a connected app, which the user can make in Navidrome.
+    RateInNavidrome,
 }
 
 /// Defines `FailureCode` from one list of variants and wire names: `as_str`
