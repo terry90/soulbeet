@@ -412,13 +412,11 @@ test('the Christmas playlist is filled through every injected failure by followi
     const done = (await a.ok('get_batch', { batch_id: batchId })) as Batch;
     expect(done.summary).toEqual(expect.objectContaining({ done: 6 }));
     expect(Object.entries(done.summary).filter(([state, n]) => state !== 'done' && n > 0)).toEqual([]);
-    expect(done.playlist).toEqual({
-      playlist_id: playlistId,
-      settled: 8,
-      waiting: 0,
-      failure: null,
-      hidden_entries_dropped: 0,
-    });
+    // The playlist runner places finished jobs in a round of its own, 2 s after a change, at the
+    // latest 60 s after its last round.
+    await expect
+      .poll(async () => ((await a.ok('get_batch', { batch_id: batchId })) as Batch).playlist, { timeout: 90_000 })
+      .toEqual({ playlist_id: playlistId, settled: 8, waiting: 0, failure: null, hidden_entries_dropped: 0 });
     const list = (await a.ok('get_playlist', { playlist_id: playlistId })) as {
       entries: { position: number; song_id: string; title: string }[];
     };
