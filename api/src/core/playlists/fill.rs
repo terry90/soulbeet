@@ -9,11 +9,16 @@ use shared::failure::Stage;
 use soulbeet::navidrome::NavidromeClient;
 use soulbeet::ImportedItem;
 use sqlx::SqlitePool;
+use tokio::sync::OwnedMutexGuard;
 use tracing::warn;
 
-use super::{failed, ids_of, lock, playlist_key, write_tracks, PlaylistRefusal, TrackWrite};
+use super::{
+    create_held, editable, facts, failed, ids_of, lock, name_free, names_key, owned, owned_read,
+    playlist_key, write_tracks, NewPlaylist, PlaylistRefusal, TrackWrite, Written,
+};
 use crate::auth::{UserCtx, UserId};
 use crate::core::index::{library_songs, NavidromeOf, ServerNavidrome};
+use crate::core::jobs::EnsureItem;
 use crate::core::library::navidrome_for;
 use crate::core::{database_failure, logged};
 use crate::ledger::store::{self, BatchPlaylist, BatchToFill};
@@ -25,6 +30,110 @@ const ROUND_PAUSE: Duration = Duration::from_secs(2);
 
 /// The longest the runner waits between rounds.
 const ROUND_EVERY: Duration = Duration::from_secs(60);
+
+/// The playlist an `ensure_in_library` call fills: one of the caller's own, or a new one.
+pub(crate) enum PlaylistTarget {
+    Existing(String),
+    Create(NewPlaylist),
+}
+
+/// One entry per item of `ensure`'s answer, in its order: an item the library has settled with
+/// its first song (its list can hold several copies of the recording), one with a job (made, or
+/// the caller's own already running) waiting for that job, a refused one settled with none.
+pub(crate) fn order_of(items: &[EnsureItem]) -> Vec<OrderEntry> {
+    (items.iter())
+        .map(|item| match item {
+            EnsureItem::InLibrary { song_ids } => OrderEntry {
+                job_id: None,
+                song_ids: song_ids.first().cloned().into_iter().collect(),
+                settled: true,
+            },
+            EnsureItem::Created { job_id, .. } | EnsureItem::AlreadyRunning { job_id, .. } => {
+                OrderEntry {
+                    job_id: Some(job_id.clone()),
+                    song_ids: vec![],
+                    settled: false,
+                }
+            }
+            EnsureItem::Refused(..) => OrderEntry {
+                job_id: None,
+                song_ids: vec![],
+                settled: true,
+            },
+        })
+        .collect()
+}
+
+/// Before `ensure`: refuses a playlist the call cannot fill, before any job is made, and takes the
+/// locks `begin` writes under, which the caller holds until `begin` ran. A new playlist takes
+/// `names_key` and needs its name free; an existing one takes `playlist_key` and must be the
+/// caller's own and static.
+pub(crate) async fn prepare(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    target: &PlaylistTarget,
+) -> Result<Vec<OwnedMutexGuard<()>>, PlaylistRefusal> {
+    match target {
+        PlaylistTarget::Create(new) => {
+            let names = lock(&names_key(ctx)).await;
+            name_free(navi, ctx, new.name.trim(), None, new.allow_duplicate_name).await?;
+            Ok(vec![names])
+        }
+        PlaylistTarget::Existing(id) => {
+            let playlist = lock(&playlist_key(id)).await;
+            let (p, tracks) = owned_read(navi, ctx, id).await?;
+            editable(navi, &facts(&p, &ctx.username), &tracks, &ids_of(&tracks)).await?;
+            Ok(vec![playlist])
+        }
+    }
+}
+
+/// After `ensure`, under the locks `prepare` took: the playlist gets the songs `order_of(items)`
+/// settled, in that order, created with them or appended to the caller's playlist, with the
+/// usual checks and read back. Then `batch`, when ensure made one, stores that order for the
+/// fill; a batch that could not store it is Unfollowed.
+pub(crate) async fn begin(
+    ledger: &Ledger,
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    batch: Option<&str>,
+    target: &PlaylistTarget,
+    items: &[EnsureItem],
+) -> Result<Written, PlaylistRefusal> {
+    let order = order_of(items);
+    let owned_songs: Vec<String> = order.iter().flat_map(|e| e.song_ids.clone()).collect();
+    let written = match target {
+        PlaylistTarget::Create(new) => {
+            let new = NewPlaylist {
+                name: new.name.clone(),
+                comment: new.comment.clone(),
+                public: new.public,
+                song_ids: owned_songs,
+                allow_duplicate_name: new.allow_duplicate_name,
+            };
+            create_held(navi, ctx, &new).await?
+        }
+        PlaylistTarget::Existing(id) if owned_songs.is_empty() => owned(navi, ctx, id).await?,
+        PlaylistTarget::Existing(id) => {
+            write_tracks(navi, ctx, id, |_, tracks| {
+                let mut after = ids_of(tracks);
+                after.extend_from_slice(&owned_songs);
+                Ok((TrackWrite::Append(owned_songs.clone()), after))
+            })
+            .await?
+        }
+    };
+    if let Some(batch) = batch {
+        let playlist_id = written.playlist.playlist_id.clone();
+        (ledger.set_playlist(batch, &playlist_id, order).await).map_err(|e| {
+            PlaylistRefusal::Unfollowed {
+                playlist_id,
+                failure: database_failure(Stage::Playlist, e),
+            }
+        })?;
+    }
+    Ok(written)
+}
 
 /// `current` with each of `ready` (an index of `order` and its songs, in that order) inserted
 /// after the last entry holding a song of the nearest earlier settled item of `order` that the
@@ -291,15 +400,18 @@ pub fn start() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::jobs::job_already_running;
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{batch_of_downloads, duplicate_track_job, settle_done};
-    use crate::core::playlists::playlist_not_found;
+    use crate::core::playlists::{playlist_not_found, NotEditable};
     use crate::core::test_ctx;
     use crate::services::NavidromeLookupError;
     use crate::test_navidrome::{
-        native_playlist, native_song, native_songs, playlist_body, playlist_rows, subsonic_failed,
-        NavidromeFor, NavidromeStub, ADVENT, HOLY, SILENT,
+        native_playlist, native_song, native_songs, playlist_body, playlist_rows, playlists_body,
+        subsonic_failed, NavidromeFor, NavidromeStub, ADVENT, AWAY, DISCOVERY_RULES, HOLY, SILENT,
     };
+    use serde_json::Map;
+    use shared::failure::{Failure, FailureCode, RetryAdvice};
 
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -580,5 +692,173 @@ mod tests {
             .unwrap();
         assert_eq!((stored.failure, stored.order[0].settled), (None, true));
         assert!(store::batches_to_fill(&db).await.unwrap().is_empty());
+    }
+
+    /// The items `ensure` answers for a call of four: one the library has twice (HOLY, then
+    /// AWAY), a job made for `job`, the caller's job "j-running" that already wants the
+    /// recording, and one refused.
+    fn ensured(job: &str) -> Vec<EnsureItem> {
+        let (failure, facts) = job_already_running("j-running", JobState::Downloading);
+        // Navidrome's lookup behind nginx, which answered 502 (a refused item's failure).
+        let refused = Failure::new(
+            FailureCode::NavidromeUnreachable,
+            Stage::LibraryCheck,
+            RetryAdvice::SameSourceLater,
+            "Find songs failed: HTTP 502",
+        );
+        vec![
+            EnsureItem::InLibrary {
+                song_ids: ids(&[HOLY.0, AWAY.0]),
+            },
+            EnsureItem::Created {
+                job_id: job.to_string(),
+                fuzzy: vec![],
+            },
+            EnsureItem::AlreadyRunning {
+                job_id: "j-running".into(),
+                failure,
+                facts,
+            },
+            EnsureItem::Refused(refused, Map::new()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_existing_playlist_gets_the_owned_songs_and_the_batch_its_order() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        let db = acq.db.clone();
+        let (batch, jobs) = batch_of_downloads(&acq, 1).await;
+        let navi = NavidromeStub::start();
+        advent(&navi, &[], &[]);
+        // prepare's read, begin's, and its read back.
+        let holy = playlist_rows(&[(1, HOLY.0, HOLY.1, false)]);
+        navi.answer(&tracks_of(ADVENT), &["[]", "[]", &holy]);
+        navi.answer("/api/song", &[&native_songs(&[(HOLY.0, false)])]);
+        let (ctx, target) = (test_ctx("alice"), PlaylistTarget::Existing(ADVENT.into()));
+        let held = prepare(&navi.client(), &ctx, &target).await.unwrap();
+        let items = ensured(&jobs[0]);
+        let written = begin(
+            &acq.ledger,
+            &navi.client(),
+            &ctx,
+            Some(&batch),
+            &target,
+            &items,
+        )
+        .await;
+        drop(held);
+        assert_eq!(written.unwrap().song_ids, ids(&[HOLY.0]));
+        assert_eq!(
+            navi.posted("/rest/updatePlaylist"),
+            vec![format!("playlistId={ADVENT}&songIdToAdd={}", HOLY.0)],
+            "the first copy only, appended"
+        );
+        let stored = store::playlist_of(&db, &batch, &alice())
+            .await
+            .unwrap()
+            .unwrap();
+        let waits = |job: &str| OrderEntry {
+            job_id: Some(job.to_string()),
+            song_ids: vec![],
+            settled: false,
+        };
+        let settled = |songs: &[&str]| OrderEntry {
+            job_id: None,
+            song_ids: ids(songs),
+            settled: true,
+        };
+        assert_eq!(
+            (stored.playlist_id.as_str(), stored.order, stored.failure),
+            (
+                ADVENT,
+                vec![
+                    settled(&[HOLY.0]),
+                    waits(&jobs[0]),
+                    waits("j-running"),
+                    settled(&[])
+                ],
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_smart_playlist_is_refused_before_any_job() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(
+                ADVENT,
+                "Fresh Picks",
+                "alice",
+                false,
+                "",
+                &[],
+            )],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[&playlist_rows(&[(1, HOLY.0, HOLY.1, false)])],
+        );
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&native_playlist(
+                ADVENT,
+                "Fresh Picks",
+                1,
+                false,
+                Some(DISCOVERY_RULES),
+            )],
+        );
+        let target = PlaylistTarget::Existing(ADVENT.into());
+        let r = prepare(&navi.client(), &test_ctx("alice"), &target)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            r,
+            PlaylistRefusal::NotEditable {
+                playlist_id: ADVENT.into(),
+                name: "Fresh Picks".into(),
+                why: NotEditable::Smart,
+                would_be: ids(&[HOLY.0]),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_playlist_the_batch_cannot_follow_says_so() {
+        let db = crate::db::test_db::migrated().await;
+        let ledger = Ledger::start(db.clone());
+        ledger.settled().await;
+        // Soulful's database went away after the playlist was written.
+        db.close().await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getPlaylists", &[&playlists_body(&[])]);
+        navi.answer("/api/song", &[&native_songs(&[(HOLY.0, false)])]);
+        let advent_body = playlist_body(ADVENT, "Advent", "alice", false, "", &[HOLY]);
+        navi.answer("/rest/createPlaylist", &[&advent_body]);
+        navi.answer("/rest/getPlaylist", &[&advent_body]);
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[&playlist_rows(&[(1, HOLY.0, HOLY.1, false)])],
+        );
+        let target = PlaylistTarget::Create(NewPlaylist {
+            name: "Advent".into(),
+            comment: None,
+            public: None,
+            song_ids: vec![],
+            allow_duplicate_name: false,
+        });
+        let ctx = test_ctx("alice");
+        let items = ensured("j-made");
+        let r = begin(&ledger, &navi.client(), &ctx, Some("b1"), &target, &items)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&r, PlaylistRefusal::Unfollowed { playlist_id, failure }
+                if playlist_id == ADVENT && failure.code == FailureCode::SettingsUnreadable),
+            "{r:?}"
+        );
+        assert!(r.after_write());
     }
 }

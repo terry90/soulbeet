@@ -269,6 +269,12 @@ pub(crate) enum PlaylistRefusal {
         failure: Failure,
         described: bool,
     },
+    /// Playlist `playlist_id` got the songs the library has, but the batch could not store the
+    /// order its jobs fill it in, so it is not filled as they finish.
+    Unfollowed {
+        playlist_id: String,
+        failure: Failure,
+    },
     /// A track edit of a playlist whose tracks Navidrome sets itself (D4). `would_be` is the list
     /// the edit would have left, its missing files left out, for a static copy.
     NotEditable {
@@ -320,7 +326,8 @@ impl PlaylistRefusal {
         match self {
             PlaylistRefusal::Failed(f)
             | PlaylistRefusal::WriteFailed(f)
-            | PlaylistRefusal::Unfinished { failure: f, .. } => f.clone(),
+            | PlaylistRefusal::Unfinished { failure: f, .. }
+            | PlaylistRefusal::Unfollowed { failure: f, .. } => f.clone(),
             PlaylistRefusal::NotOwner { .. } => refused(
                 FailureCode::PlaylistNotOwner,
                 Stage::Playlist,
@@ -401,6 +408,7 @@ impl PlaylistRefusal {
                 | PlaylistRefusal::TracksNotWritten { .. }
                 | PlaylistRefusal::NotWritten { .. }
                 | PlaylistRefusal::Unfinished { .. }
+                | PlaylistRefusal::Unfollowed { .. }
         )
     }
 }

@@ -5,14 +5,23 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, Failure, FailureCode, Stage, TEXT_MAX_CHARS};
 
+use std::sync::Arc;
+
+use soulbeet::navidrome::NavidromeClient;
+
 use super::args::{repeatable, Args};
 use super::contract::{
-    failed, invalid_value, items, items_text, too_large_to_repeat, upstream_error, ItemResult,
-    Items, NextCall, ToolError,
+    error_object, failed, invalid_value, items, items_text, too_large_to_repeat, upstream_error,
+    ItemResult, Items, NextCall, ToolError,
 };
 use super::jobs::JobTool;
 use super::keys::{keyed, request_key, Keyed};
+use super::library::navidrome_of;
 use super::paging::RESULT_MAX_CHARS;
+use super::playlists::{
+    name_arg, playlist_fields, refusal_error, ADD_PLAYLIST_TRACKS, ADD_PLAYLIST_TRACKS_ARGS,
+    A_NAME, COMMENT_MAX_CHARS, CREATE_PLAYLIST, CREATE_PLAYLIST_ARGS, GET_PLAYLIST_ARGS,
+};
 use super::refs::{
     filters, filters_schema, reference_schema, reference_value, request_key_schema, wanted,
     REFERENCE_FIELDS,
@@ -28,6 +37,8 @@ use crate::core::jobs::retry::{
 };
 use crate::core::jobs::runner::{Acquire, MCP_DOWNLOADS_PER_USER};
 use crate::core::jobs::{ensure, CallRefused, EnsureItem, Wanted};
+use crate::core::playlists::fill::{begin, order_of, prepare, PlaylistTarget};
+use crate::core::playlists::{NewPlaylist, PlaylistRefusal, Written};
 use crate::ledger::{JobOptions, JobState, Pick, MCP_UNFINISHED_JOBS_PER_USER};
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 
@@ -45,8 +56,15 @@ const ENSURE_ARGS: &[&str] = &[
     "failover",
     "max_attempts",
     "label",
+    "playlist",
     "request_key",
 ];
+
+/// The fields of `playlist`, one of them given.
+const PLAYLIST_FIELDS: &[&str] = &["playlist_id", "create"];
+
+/// The fields of `playlist.create`, read as create_playlist reads them.
+const CREATE_FIELDS: &[&str] = &["name", "comment", "public", "allow_duplicate_name"];
 
 /// The most items one call takes.
 const MAX_ITEMS: usize = 50;
@@ -56,14 +74,14 @@ pub(crate) const ENSURE_IN_LIBRARY: ToolSpec = ToolSpec {
     title: "Get music into the library",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file: a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo, then its next calls, then its cause.raw, then cuts its message, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial.")
+        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file: a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo, then its next calls, then its cause.raw, then cuts its message, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial. With playlist ({{playlist_id}} of one of this user's static playlists, or {{create: {{name, comment?, public?, allow_duplicate_name?}}}}), the playlist gets the owned tracks now in the order given and each other track at its place as its job finishes, whether or not this chat stays open; get_batch shows how far it is. Also playlist_not_found, playlist_not_owner, playlist_not_editable, playlist_name_taken.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["items"], "properties": {"items": {"type": "array", "minItems": 1, "maxItems": 50, "items": "#,
         reference_schema!(),
         r#"}, "folder_id": {"type": "string", "minLength": 1}, "pick": {"enum": ["auto", "review"]}, "min_score": {"type": "number", "minimum": 0, "maximum": 1}, "#,
         filters_schema!(),
-        r#", "failover": {"enum": ["auto", "off"]}, "max_attempts": {"type": "integer", "minimum": 1, "maximum": 10}, "label": {"type": "string", "minLength": 1}, "#,
+        r#", "failover": {"enum": ["auto", "off"]}, "max_attempts": {"type": "integer", "minimum": 1, "maximum": 10}, "label": {"type": "string", "minLength": 1}, "playlist": {"type": "object", "additionalProperties": false, "minProperties": 1, "maxProperties": 1, "properties": {"playlist_id": {"type": "string", "minLength": 1}, "create": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 255}, "comment": {"type": "string", "maxLength": 2000}, "public": {"type": "boolean"}, "allow_duplicate_name": {"type": "boolean"}}}}}, "#,
         request_key_schema!(),
         "}}"
     ),
@@ -82,6 +100,8 @@ struct Ensure {
     folder_id: Option<String>,
     label: Option<String>,
     options: JobOptions,
+    /// The playlist the batch fills.
+    playlist: Option<PlaylistTarget>,
     /// The arguments as given, without `request_key`: what a call offered again starts from.
     call: Value,
 }
@@ -97,15 +117,69 @@ pub(crate) async fn ensure_in_library(
         Ok(read) => read,
         Err(e) => return failed(e),
     };
+    // The playlist is written through the caller's own Navidrome.
+    let navi = match &read.playlist {
+        Some(_) => match navidrome_of(state, caller, Stage::Playlist, &args).await {
+            Ok(navi) => Some(navi),
+            Err(e) => return failed(e),
+        },
+        None => None,
+    };
     let call = json!({"items": read.items.iter().map(reference_value).collect::<Vec<_>>(),
-        "folder_id": read.folder_id, "label": read.label, "options": read.options});
+        "folder_id": read.folder_id, "label": read.label, "options": read.options,
+        "playlist": read.playlist.as_ref().map(target_value)});
     let (acquire, navidrome, ctx) = (
         state.acquire.clone(),
         state.navidrome.clone(),
         caller.ctx.clone(),
     );
-    let work = async move { run(&acquire, &*navidrome, &ctx, read).await };
+    let work = async move { run(&acquire, &*navidrome, &ctx, read, navi, &args).await };
     keyed(&state.acquire, caller, TOOL, key, &call, work).await
+}
+
+/// `playlist` as read: exactly one of playlist_id and create.
+fn read_playlist(args: &Args) -> Result<Option<PlaylistTarget>, ToolError> {
+    let Some(playlist) = args.opt_object("playlist", PLAYLIST_FIELDS)? else {
+        return Ok(None);
+    };
+    let playlist_id = playlist.opt_string("playlist_id")?;
+    let create = playlist.opt_object("create", CREATE_FIELDS)?;
+    let target = match (playlist_id, create) {
+        (Some(_), Some(_)) => {
+            let expected = "left out when playlist_id is given";
+            return Err(invalid_value(TOOL, "playlist.create", expected));
+        }
+        (None, None) => {
+            let expected = "given when create is not";
+            return Err(invalid_value(TOOL, "playlist.playlist_id", expected));
+        }
+        (Some(id), None) => PlaylistTarget::Existing(id),
+        (None, Some(create)) => PlaylistTarget::Create(NewPlaylist {
+            name: name_arg(&create)?.ok_or_else(|| create.refuse("name", A_NAME))?,
+            comment: create.opt_text("comment", COMMENT_MAX_CHARS)?,
+            public: create.opt_bool("public")?,
+            song_ids: vec![],
+            allow_duplicate_name: create.opt_bool("allow_duplicate_name")?.unwrap_or(false),
+        }),
+    };
+    Ok(Some(target))
+}
+
+/// `target` as the call it was read from names it, for the request key's comparison.
+fn target_value(target: &PlaylistTarget) -> Value {
+    match target {
+        PlaylistTarget::Existing(id) => json!({ "playlist_id": id }),
+        PlaylistTarget::Create(new) => json!({"create": {"name": new.name, "comment": new.comment,
+            "public": new.public, "allow_duplicate_name": new.allow_duplicate_name}}),
+    }
+}
+
+/// The id of the caller's playlist `target` names; None for one to create.
+fn target_id(target: &PlaylistTarget) -> Option<&str> {
+    match target {
+        PlaylistTarget::Existing(id) => Some(id),
+        PlaylistTarget::Create(_) => None,
+    }
 }
 
 fn read_ensure(args: &Args) -> Result<(Ensure, Option<String>), ToolError> {
@@ -127,6 +201,7 @@ fn read_ensure(args: &Args) -> Result<(Ensure, Option<String>), ToolError> {
         max_attempts.unwrap_or(MAX_SOURCES_PER_TRACK as u32)
     };
     let label = args.opt_string("label")?;
+    let playlist = read_playlist(args)?;
     let key = request_key(args)?;
     args.finish()?;
     let read = Ensure {
@@ -140,20 +215,25 @@ fn read_ensure(args: &Args) -> Result<(Ensure, Option<String>), ToolError> {
             filters,
             max_sources,
         },
+        playlist,
         call: args.as_value(),
     };
     Ok((read, key))
 }
 
 /// The call: a call-level refusal, or each item's result with the batch, whether the library
-/// was looked in, and the call that follows the batch. A request key keeps the answer of a call
-/// that made a batch or refused no item; a refusal of the call, or of an item when no batch was
-/// made, wrote nothing, and the same call can run again.
+/// was looked in, the call that follows the batch, and the playlist it fills when `args` name one
+/// (`navi` the caller's Navidrome). A playlist refused before `ensure` refuses the call. A request
+/// key keeps the answer of a call that made a batch, wrote the playlist or tried to, or refused
+/// no item; a refusal of the call, or of an item when nothing was written, and the same call can
+/// run again.
 async fn run(
-    acquire: &std::sync::Arc<Acquire>,
+    acquire: &Arc<Acquire>,
     navidrome: &dyn NavidromeOf,
     ctx: &UserCtx,
     read: Ensure,
+    navi: Option<Arc<NavidromeClient>>,
+    args: &Args,
 ) -> Keyed {
     let Ensure {
         items: wanted,
@@ -161,15 +241,40 @@ async fn run(
         folder_id,
         label,
         options,
+        playlist,
         call,
     } = read;
+    let playlist = playlist.zip(navi);
+    // Held until begin ran: no other playlist write of Soulful's comes between the checks and it.
+    let held = match &playlist {
+        Some((target, navi)) => match prepare(navi, ctx, target).await {
+            Ok(held) => held,
+            Err(r) => return Keyed::Released(failed(playlist_refused(args, target, &r))),
+        },
+        None => vec![],
+    };
     let folder_id = folder_id.as_deref();
     let ensured = match ensure(acquire, navidrome, ctx, folder_id, label, wanted, options).await {
         Ok(ensured) => ensured,
         Err(refused) => return Keyed::Released(failed(call_refused(refused, &call))),
     };
+    let written = match &playlist {
+        Some((target, navi)) => {
+            let batch = ensured.batch_id.as_deref();
+            let written = begin(&acquire.ledger, navi, ctx, batch, target, &ensured.items).await;
+            Some((target, written))
+        }
+        None => None,
+    };
+    drop(held);
     let keep = ensured.batch_id.is_some()
-        || !(ensured.items.iter()).any(|item| matches!(item, EnsureItem::Refused(..)));
+        || match &written {
+            None => !(ensured.items.iter()).any(|item| matches!(item, EnsureItem::Refused(..))),
+            Some((_, Ok(_))) => true,
+            Some((_, Err(r))) => r.after_write(),
+        };
+    let playlist_field = (written.as_ref())
+        .map(|(target, written)| playlist_answer(target, &ensured.items, written));
     let results = (ensured.items.into_iter())
         .zip(&given)
         .map(|(item, given)| item_result(item, given, &call))
@@ -182,7 +287,7 @@ async fn run(
             )
         })
         .collect();
-    let fields = Map::from_iter([
+    let mut fields = Map::from_iter([
         ("batch_id".to_string(), json!(ensured.batch_id)),
         (
             "library_checked".to_string(),
@@ -190,6 +295,9 @@ async fn run(
         ),
         ("next".to_string(), json!(next)),
     ]);
+    if let Some(playlist) = playlist_field {
+        fields.insert("playlist".to_string(), playlist);
+    }
     let mut answered = Items {
         stage: Stage::Input,
         noun: "items",
@@ -206,6 +314,69 @@ async fn run(
     } else {
         Keyed::Released(result)
     }
+}
+
+/// A playlist refused before any job was made: refusal_error of this call, a taken name offering
+/// the call with `playlist.create.allow_duplicate_name` set.
+fn playlist_refused(args: &Args, target: &PlaylistTarget, r: &PlaylistRefusal) -> ToolError {
+    let mut e = refusal_error(args, target_id(target), r);
+    if let PlaylistRefusal::NameTaken { .. } = r {
+        let mut duplicate = args.as_value();
+        duplicate["playlist"]["create"]["allow_duplicate_name"] = json!(true);
+        e.failure.message = r.failure().message;
+        e.next = repeatable(TOOL, duplicate).into_iter().collect();
+        if e.next.is_empty() {
+            e.failure.message = too_large_to_repeat(&e.failure.message);
+        }
+    }
+    e
+}
+
+/// The answer's `playlist`: the playlist as written, or, when `begin` failed, its error with the
+/// playlist call `begin` made offered on its own (the call itself would start the jobs again).
+fn playlist_answer(
+    target: &PlaylistTarget,
+    items: &[EnsureItem],
+    written: &Result<Written, PlaylistRefusal>,
+) -> Value {
+    let r = match written {
+        Ok(w) => {
+            let mut fields = Map::from_iter([("ok".to_string(), json!(true))]);
+            fields.extend(playlist_fields(w));
+            return Value::Object(fields);
+        }
+        Err(r) => r,
+    };
+    let song_ids: Vec<String> = (order_of(items).into_iter())
+        .flat_map(|entry| entry.song_ids)
+        .collect();
+    let (tool, known, made) = match target {
+        PlaylistTarget::Create(new) => {
+            let mut made = json!({"name": new.name, "song_ids": song_ids,
+                "allow_duplicate_name": new.allow_duplicate_name});
+            if let Some(comment) = &new.comment {
+                made["comment"] = json!(comment);
+            }
+            if let Some(public) = new.public {
+                made["public"] = json!(public);
+            }
+            (CREATE_PLAYLIST.name, CREATE_PLAYLIST_ARGS, made)
+        }
+        // No song was added: the playlist was only read.
+        PlaylistTarget::Existing(id) if song_ids.is_empty() => (
+            "get_playlist",
+            GET_PLAYLIST_ARGS,
+            json!({ "playlist_id": id }),
+        ),
+        PlaylistTarget::Existing(id) => (
+            ADD_PLAYLIST_TRACKS.name,
+            ADD_PLAYLIST_TRACKS_ARGS,
+            json!({"playlist_id": id, "song_ids": song_ids}),
+        ),
+    };
+    let made = Args::new(tool, made.as_object().cloned(), known);
+    let error = refusal_error(&made, target_id(target), r);
+    json!({"ok": false, "error": error_object(&error)})
 }
 
 /// The reference fields a refused item's facts echo.
@@ -484,7 +655,10 @@ mod tests {
     use crate::ledger::MCP_UNFINISHED_JOBS_PER_USER;
     use crate::ledger::{NewSearch, StoredSpec};
     use crate::server_fns::download::test_support::{group, item, search_result, track};
-    use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub};
+    use crate::test_navidrome::{
+        native_song, native_songs, playlist_body, playlist_rows, playlists_body, NavidromeFor,
+        NavidromeStub, ADVENT, SILENT,
+    };
 
     #[tokio::test]
     async fn owned_tracks_are_reported_and_the_rest_become_jobs_in_one_batch() {
@@ -1456,5 +1630,195 @@ mod tests {
             (count(&db, "batches").await, count(&db, "jobs").await),
             (1, 1)
         );
+    }
+
+    /// nginx's 502 page, as step 8's one_failed_lookup_makes_the_result_partial sends it.
+    const BAD_GATEWAY: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+
+    /// `navi` finds Silent Night in alice's library and lists it present; O Holy Night it does
+    /// not have; she has no playlist yet.
+    fn library_with_silent_night(navi: &NavidromeStub) {
+        navi.answer("/rest/getPlaylists", &[&playlists_body(&[])]);
+        let silent = native_song(SILENT.0, "Marrow Choir", SILENT.1, 222.0, None);
+        let found = format!("[{silent}]");
+        navi.answer_when("/api/song", "title=Marrow+Choir+Silent+Night", 200, &found);
+        navi.answer_when("/api/song", "title=Marrow+Choir+O+Holy+Night", 200, "[]");
+        let present = native_songs(&[(SILENT.0, false)]);
+        navi.answer_when("/api/song", &format!("id={}", SILENT.0), 200, &present);
+    }
+
+    fn christmas_items() -> Value {
+        json!([{"artist": "Marrow Choir", "title": "Silent Night"},
+            {"artist": "Marrow Choir", "title": "O Holy Night"}])
+    }
+
+    #[tokio::test]
+    async fn an_ensure_with_a_new_playlist_starts_it_with_the_owned_tracks() {
+        let navi = NavidromeStub::start();
+        library_with_silent_night(&navi);
+        let christmas = playlist_body(ADVENT, "Christmas", "alice", false, "", &[SILENT]);
+        navi.answer("/rest/createPlaylist", &[&christmas]);
+        navi.answer("/rest/getPlaylist", &[&christmas]);
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}/tracks"),
+            &[&playlist_rows(&[(1, SILENT.0, SILENT.1, false)])],
+        );
+        let (db, acq, _, token) = app_with_acquire().await;
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let doc = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "ensure_in_library",
+                json!({"playlist": {"create": {"name": "Christmas"}}, "items": christmas_items()}),
+            )
+            .await,
+        );
+        assert_eq!(
+            (
+                doc["playlist"]["ok"].as_bool(),
+                doc["playlist"]["playlist_id"].as_str(),
+                &doc["playlist"]["song_ids"]
+            ),
+            (Some(true), Some(ADVENT), &json!([SILENT.0])),
+            "{doc}"
+        );
+        assert_eq!(
+            navi.posted("/rest/createPlaylist"),
+            vec![format!("name=Christmas&songId={}", SILENT.0)]
+        );
+        let batch = document(
+            &call_tool(
+                app,
+                &token,
+                "get_batch",
+                json!({"batch_id": doc["batch_id"]}),
+            )
+            .await,
+        );
+        assert_eq!(
+            batch["playlist"],
+            json!({"playlist_id": ADVENT, "settled": 1, "waiting": 1, "failure": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_taken_playlist_name_refuses_before_any_job_is_made() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylists",
+            &[&playlists_body(&[("p-old", "Christmas", "alice", false)])],
+        );
+        let (db, acq, _, token) = app_with_acquire().await;
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let items = json!([{"artist": "Marrow Choir", "title": "O Holy Night"}]);
+        let error = document(
+            &call_tool(
+                app,
+                &token,
+                "ensure_in_library",
+                json!({"playlist": {"create": {"name": "Christmas"}}, "items": items,
+                    "request_key": "k1"}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                &error["facts"]["existing_playlist_ids"]
+            ),
+            (Some("playlist_name_taken"), &json!(["p-old"])),
+            "{error}"
+        );
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "ensure_in_library", "args": {"items": items,
+                "playlist": {"create": {"name": "Christmas", "allow_duplicate_name": true}}}}])
+        );
+        assert_eq!(count(&db, "batches").await, 0);
+        assert_eq!(count(&db, "request_keys").await, 0, "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn a_playlist_that_failed_after_the_jobs_were_made_offers_its_own_call() {
+        let navi = NavidromeStub::start();
+        library_with_silent_night(&navi);
+        navi.answer_when("/rest/createPlaylist", "", 502, BAD_GATEWAY);
+        let (db, acq, _, token) = app_with_acquire().await;
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let call = json!({"playlist": {"create": {"name": "Christmas", "public": true}},
+            "items": christmas_items(), "request_key": "k1"});
+        let result = call_tool(app.clone(), &token, "ensure_in_library", call.clone()).await;
+        let doc = document(&result);
+        let error = &doc["playlist"]["error"];
+        assert_eq!(
+            (
+                doc["playlist"]["ok"].as_bool(),
+                error["code"].as_str(),
+                doc["results"][1]["status"].as_str()
+            ),
+            (
+                Some(false),
+                Some("navidrome_unreachable"),
+                Some("job_created")
+            ),
+            "{doc}"
+        );
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "create_playlist", "args": {"name": "Christmas",
+                "song_ids": [SILENT.0], "public": true, "allow_duplicate_name": false}}])
+        );
+        // The batch exists: the key keeps the answer, and nothing runs twice.
+        let again = call_tool(app.clone(), &token, "ensure_in_library", call).await;
+        assert_eq!(again, result);
+        assert_eq!(
+            (count(&db, "batches").await, count(&db, "jobs").await),
+            (1, 1)
+        );
+        let batch = document(
+            &call_tool(
+                app,
+                &token,
+                "get_batch",
+                json!({"batch_id": doc["batch_id"]}),
+            )
+            .await,
+        );
+        assert_eq!(batch["playlist"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_playlist_names_one_of_an_id_and_a_new_playlist() {
+        let (db, acq, _, token) = app_with_acquire().await;
+        let items = json!([{"artist": "Marrow Choir", "title": "O Holy Night"}]);
+        for (playlist, message) in [
+            (
+                json!({}),
+                "ensure_in_library: playlist.playlist_id must be given when create is not",
+            ),
+            (
+                json!({"playlist_id": ADVENT, "create": {"name": "Christmas"}}),
+                "ensure_in_library: playlist.create must be left out when playlist_id is given",
+            ),
+            (
+                json!({"create": {"comment": "Carols"}}),
+                "ensure_in_library: playlist.create.name must be a name of 1 to 255 characters",
+            ),
+        ] {
+            let error = document(
+                &call_tool(
+                    app_of(&db, &acq),
+                    &token,
+                    "ensure_in_library",
+                    json!({"playlist": playlist, "items": items}),
+                )
+                .await,
+            )["error"]
+                .clone();
+            assert_eq!(error["message"], message, "{playlist}");
+        }
+        assert_eq!(count(&db, "batches").await, 0);
     }
 }

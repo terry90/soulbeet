@@ -404,7 +404,9 @@ impl Args {
         }
     }
 
-    fn refuse(&self, name: &str, expected: &str) -> ToolError {
+    /// `name` refused: it must be `expected`; an element's or object's field is named with its
+    /// place (`items[2].title`, `playlist.create.name`).
+    pub(crate) fn refuse(&self, name: &str, expected: &str) -> ToolError {
         invalid_value(self.tool, &self.field(name), expected)
     }
 

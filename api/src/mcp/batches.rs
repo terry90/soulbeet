@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
 
 use super::args::Args;
-use super::contract::{answer, invalid_value, upstream_error, NextCall, ToolError};
+use super::contract::{answer, error_object, invalid_value, upstream_error, NextCall, ToolError};
 use super::facts::{job_document, Detail, ReadNow};
 use super::jobs::{needs_action, read_now, since_call, untried_of, Since, WaitFor, MAX_JOB_IDS};
 use super::paging::{chars, fit, fit_whole, longest_fitting, Page};
@@ -19,7 +19,9 @@ use super::{wait, McpCaller};
 use crate::connection::ConnectionState;
 use crate::core::database_failure;
 use crate::core::jobs::{job_records, views_of, JobSelect, JobView, Untried};
-use crate::ledger::store::{batch_of, batches_of, BatchRecord, JobRecord};
+use crate::ledger::store::{
+    batch_of, batches_of, playlist_of, BatchPlaylist, BatchRecord, JobRecord,
+};
 use crate::ledger::JobState;
 
 const GET_BATCH_ARGS: &[&str] = &["batch_id", "since", "wait_seconds", "wait_for"];
@@ -30,7 +32,7 @@ pub(crate) const GET_BATCH: ToolSpec = ToolSpec {
     title: "Follow a batch",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Pass the last answer's cursor as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to the cursor. Work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). Failure codes: {common}, unknown_handle.")
+        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Pass the last answer's cursor as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to the cursor. Work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). For a batch ensure_in_library made with a playlist, playlist gives its playlist_id, how many items are settled in it (placed, or ended with nothing to place), how many are waiting (items whose jobs are not finished, or failed: a job failed for good keeps its place waiting until it is retried or dismissed), and the failure of the last fill that failed (null once one succeeds); a failure whose retry is not same_source_later stops the fill. Failure codes: {common}, unknown_handle.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["batch_id"], "properties": {"batch_id": {"type": "string", "minLength": 1}, "since": {"type": "integer", "minimum": 0}, "#,
@@ -164,6 +166,8 @@ async fn batch_document(
         .collect();
     changed.sort_by_key(|(v, _)| Reverse(v.job.changed_seq));
     let deletion_enabled = caller.allow_delete;
+    let playlist = (playlist_of(&acquire.db, &batch.id, &caller.ctx.id()).await)
+        .map_err(|e| database_failure(Stage::Input, e))?;
     let changed: Vec<Value> = (changed.into_iter())
         .map(|(v, untried)| {
             job_document(
@@ -183,6 +187,7 @@ async fn batch_document(
         "summary": summary,
         "cursor": cursor,
         "all_terminal": all_terminal,
+        "playlist": playlist.map(playlist_state),
     }) else {
         unreachable!("an object literal is an object");
     };
@@ -241,6 +246,23 @@ fn fit_actions(
         fields.insert("next".into(), json!(next));
     }
     fit_whole(fields, "changed", changed, "changed_more")
+}
+
+/// A batch's playlist as get_batch shows it: its items settled and waiting, and the failure of
+/// its last fill as an error with no facts or calls, its message cut to TEXT_MAX_CHARS.
+fn playlist_state(playlist: BatchPlaylist) -> Value {
+    let settled = playlist.order.iter().filter(|entry| entry.settled).count();
+    let failure = playlist.failure.map(|mut failure| {
+        failure.message = cut_json(failure.message, TEXT_MAX_CHARS);
+        error_object(&ToolError {
+            failure,
+            facts: Map::new(),
+            tried: vec![],
+            next: vec![],
+        })
+    });
+    json!({"playlist_id": playlist.playlist_id, "settled": settled,
+        "waiting": playlist.order.len() - settled, "failure": failure})
 }
 
 /// The batch's label, cut as a text from outside Soulful (an album title).

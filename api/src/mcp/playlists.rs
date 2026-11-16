@@ -24,7 +24,7 @@ use crate::core::playlists::{
     SONG_IDS_MAX,
 };
 
-const CREATE_PLAYLIST_ARGS: &[&str] = &[
+pub(crate) const CREATE_PLAYLIST_ARGS: &[&str] = &[
     "name",
     "song_ids",
     "comment",
@@ -32,6 +32,8 @@ const CREATE_PLAYLIST_ARGS: &[&str] = &[
     "allow_duplicate_name",
     "request_key",
 ];
+
+pub(crate) const GET_PLAYLIST_ARGS: &[&str] = &["playlist_id", "limit", "cursor"];
 
 const UPDATE_PLAYLIST_ARGS: &[&str] = &[
     "playlist_id",
@@ -46,7 +48,8 @@ const DELETE_PLAYLIST_ARGS: &[&str] = &["playlist_id", "request_key"];
 
 const SET_PLAYLIST_TRACKS_ARGS: &[&str] = &["playlist_id", "song_ids", "request_key"];
 
-const ADD_PLAYLIST_TRACKS_ARGS: &[&str] = &["playlist_id", "song_ids", "position", "request_key"];
+pub(crate) const ADD_PLAYLIST_TRACKS_ARGS: &[&str] =
+    &["playlist_id", "song_ids", "position", "request_key"];
 
 const REMOVE_PLAYLIST_TRACKS_ARGS: &[&str] = &["playlist_id", "entries", "request_key"];
 
@@ -55,9 +58,9 @@ const ENTRY_ARGS: &[&str] = &["position", "song_id"];
 
 /// Longest playlist name, in characters after trimming.
 const NAME_MAX_CHARS: usize = 255;
-const A_NAME: &str = "a name of 1 to 255 characters";
+pub(crate) const A_NAME: &str = "a name of 1 to 255 characters";
 /// Longest playlist comment, in characters after trimming.
-const COMMENT_MAX_CHARS: usize = 2000;
+pub(crate) const COMMENT_MAX_CHARS: usize = 2000;
 /// Most song ids a write's result lists; get_playlist pages through a longer playlist.
 const SONG_IDS_LISTED_MAX: usize = 500;
 
@@ -203,7 +206,7 @@ pub(crate) async fn get_playlist(
     caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
-    let args = Args::new("get_playlist", args, &["playlist_id", "limit", "cursor"]);
+    let args = Args::new("get_playlist", args, GET_PLAYLIST_ARGS);
     answer(
         async {
             let playlist_id = args.string("playlist_id")?;
@@ -492,8 +495,8 @@ fn object(value: Value) -> Map<String, Value> {
 }
 
 /// The `name` argument, trimmed: given, it is 1 to 255 characters.
-fn name_arg(args: &Args) -> Result<Option<String>, ToolError> {
-    let refused = || invalid_value(args.tool(), "name", A_NAME);
+pub(crate) fn name_arg(args: &Args) -> Result<Option<String>, ToolError> {
+    let refused = || args.refuse("name", A_NAME);
     match args.opt_string("name").map_err(|_| refused())? {
         Some(name) if name.chars().count() <= NAME_MAX_CHARS => Ok(Some(name)),
         None if !args.has("name") => Ok(None),
@@ -503,7 +506,7 @@ fn name_arg(args: &Args) -> Result<Option<String>, ToolError> {
 
 /// The playlist's facts, `song_ids` in Navidrome's order (null above 500 entries),
 /// `song_ids_omitted` saying so, and the entries a track rewrite dropped as hidden.
-fn playlist_fields(w: &Written) -> Map<String, Value> {
+pub(crate) fn playlist_fields(w: &Written) -> Map<String, Value> {
     let mut fields = object(json!(w.playlist));
     let listed = w.song_ids.len() <= SONG_IDS_LISTED_MAX;
     fields.insert(
@@ -534,7 +537,11 @@ fn refused(args: &Args, playlist_id: Option<&str>, r: &PlaylistRefusal) -> Keyed
 /// The tool error for a refusal of the call `args` on `playlist_id` (None for a create): its
 /// failure, facts naming the playlist and the refusal's lists, and the calls that can make
 /// progress. Names from Navidrome and the caller go into facts only.
-fn refusal_error(args: &Args, playlist_id: Option<&str>, r: &PlaylistRefusal) -> ToolError {
+pub(crate) fn refusal_error(
+    args: &Args,
+    playlist_id: Option<&str>,
+    r: &PlaylistRefusal,
+) -> ToolError {
     let failure = r.failure();
     let mut facts = Map::new();
     facts.insert("playlist_id".into(), json!(playlist_id));
@@ -612,6 +619,11 @@ fn refusal_error(args: &Args, playlist_id: Option<&str>, r: &PlaylistRefusal) ->
                 }
                 vec![Some(NextCall::new("update_playlist", asked))]
             }
+        }
+        PlaylistRefusal::Unfollowed { playlist_id, .. } => {
+            fact("playlist_id", json!(playlist_id));
+            fact("follows_batch", json!(false));
+            vec![Some(get_playlist_call(playlist_id))]
         }
         PlaylistRefusal::NotEditable {
             playlist_id,
