@@ -20,13 +20,18 @@ use crate::oauth::{now_unix, oauth_error, SCOPE};
 
 mod args;
 pub(crate) mod contract;
+mod facts;
+mod keys;
 pub(crate) mod library;
 pub(crate) mod metadata;
 mod paging;
 pub(crate) mod playlists;
+mod refs;
 pub(crate) mod server;
 pub(crate) mod settings;
+mod sources;
 pub(crate) mod status;
+mod wait;
 
 const NO_TOKEN: &str = "No access token was sent";
 const UNKNOWN_TOKEN: &str = "The access token is unknown, expired or revoked";

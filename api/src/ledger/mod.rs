@@ -261,6 +261,33 @@ pub const SEARCH_KEPT_SECS: i64 = 24 * 60 * 60;
 pub const JOB_KEPT_SECS: i64 = 30 * 24 * 60 * 60;
 const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
+/// How long a request key keeps its call's result (design 10.3).
+pub const KEY_KEPT_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// A request key as a write tool takes it: one user's, through one app (grant), for one tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestKey {
+    pub user: UserId,
+    pub grant_id: String,
+    pub tool: String,
+    pub key: String,
+}
+
+/// What `reserve_key` found for a call with a request key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum KeyReservation {
+    /// The key is this call's now: it was unused, or its first call ran in a process that
+    /// stopped before it stored its result.
+    #[default]
+    Fresh,
+    /// The first call with the key runs in this process.
+    Running,
+    /// The first call ended with this result document.
+    Done { document: String, is_error: bool },
+    /// The key belongs to a call with other arguments.
+    OtherCall,
+}
+
 /// The most unfinished MCP jobs one user may have; a request past it makes no job.
 pub const MCP_UNFINISHED_JOBS_PER_USER: u32 = 200;
 
@@ -329,8 +356,9 @@ pub struct StoredSpec {
     pub text: Option<String>,
     pub keep_below_floor: bool,
     pub filters: SourceFilters,
-    /// The reference as the caller sent it (D1's fields in their fixed order, null for a field
-    /// not given), so a call made again names the same one.
+    /// The reference as the caller sent it (`mcp::refs::reference_value`: D1's fields as read,
+    /// `kind` always named, a field not given left out), so a call made again names the same one.
+    /// Null for a job's search, which no tool call made.
     pub reference: serde_json::Value,
 }
 
@@ -757,10 +785,48 @@ impl Ledger {
         .await
     }
 
+    /// Reserves `key` for a call whose arguments hash to `args_hash`, made by the process
+    /// `instance` at `now` (D12 as ruled: a reservation belongs to its process, not to a time).
+    pub async fn reserve_key(
+        &self,
+        key: &RequestKey,
+        args_hash: &str,
+        instance: &str,
+        now: i64,
+    ) -> Result<KeyReservation, LedgerError> {
+        let (key, args_hash, instance) = (key.clone(), args_hash.to_string(), instance.to_string());
+        self.write(|reply| Write::ReserveKey {
+            key,
+            args_hash,
+            instance,
+            now,
+            reply,
+        })
+        .await
+    }
+
+    /// Stores the result `document` of the call that reserved `key`.
+    pub async fn finish_key(
+        &self,
+        key: &RequestKey,
+        document: String,
+        is_error: bool,
+    ) -> Result<(), LedgerError> {
+        let key = key.clone();
+        self.write(|reply| Write::FinishKey {
+            key,
+            document,
+            is_error,
+            reply,
+        })
+        .await
+    }
+
     /// At `now`: deletes searches with expires_at <= now, dismisses jobs
     /// waiting for a source whose search is gone or expired (D11) and stamps
     /// their updated_at with `now`, deletes terminal jobs with
-    /// updated_at < now - JOB_KEPT_SECS, then batches with no job left.
+    /// updated_at < now - JOB_KEPT_SECS, then batches with no job left, and
+    /// request keys reserved before now - KEY_KEPT_SECS.
     pub async fn prune(&self, now: i64) -> Result<Pruned, LedgerError> {
         self.write(|reply| Write::Prune { now, reply }).await
     }
@@ -2980,6 +3046,98 @@ mod tests {
                 ("picked", Some(serde_json::json!("peer_a"))),
                 ("cancelled", None),
             ]
+        );
+    }
+
+    /// The id of the grant `user` holds for `resource`, made with an access token.
+    async fn grant_of(db: &SqlitePool, user: &str, resource: &str) -> String {
+        crate::connection::test_util::grant_id_of(db, user, resource).await
+    }
+
+    #[tokio::test]
+    async fn a_request_key_answers_once_and_then_repeats_its_result() {
+        let (ledger, db, _, _) = ledger().await;
+        let other_app = "https://tunnel.example.net/mcp";
+        let (alice, alice_elsewhere, bob) = (
+            grant_of(&db, "alice", crate::connection::test_util::RESOURCE).await,
+            grant_of(&db, "alice", other_app).await,
+            grant_of(&db, "bob", crate::connection::test_util::RESOURCE).await,
+        );
+        let key = |user: &str, grant: &str, tool: &str, key: &str| RequestKey {
+            user: UserId::new(user),
+            grant_id: grant.to_string(),
+            tool: tool.to_string(),
+            key: key.to_string(),
+        };
+        let k1 = key("alice", &alice, "ensure_in_library", "k1");
+        assert_eq!(
+            ledger.reserve_key(&k1, "h1", "i1", 1_000).await,
+            Ok(KeyReservation::Fresh)
+        );
+        assert_eq!(
+            ledger.reserve_key(&k1, "h1", "i1", 1_010).await,
+            Ok(KeyReservation::Running)
+        );
+        // Keys are the user's through one app: another app of hers and another user start afresh.
+        for other in [
+            key("alice", &alice_elsewhere, "ensure_in_library", "k1"),
+            key("bob", &bob, "ensure_in_library", "k1"),
+        ] {
+            assert_eq!(
+                ledger.reserve_key(&other, "h1", "i1", 1_010).await,
+                Ok(KeyReservation::Fresh)
+            );
+        }
+        ledger
+            .finish_key(&k1, r#"{"ok":true}"#.into(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger.reserve_key(&k1, "h1", "i1", 1_020).await,
+            Ok(KeyReservation::Done {
+                document: r#"{"ok":true}"#.into(),
+                is_error: false
+            })
+        );
+        // The same key on other arguments is another call.
+        assert_eq!(
+            ledger.reserve_key(&k1, "h2", "i1", 1_020).await,
+            Ok(KeyReservation::OtherCall)
+        );
+
+        // A first call of another process never stored its result: Soulful stopped while it ran.
+        let k2 = key("alice", &alice, "retry_job", "k2");
+        assert_eq!(
+            ledger.reserve_key(&k2, "h1", "i0", 1_000).await,
+            Ok(KeyReservation::Fresh)
+        );
+        assert_eq!(
+            ledger.reserve_key(&k2, "h1", "i1", 1_000).await,
+            Ok(KeyReservation::Fresh)
+        );
+        assert_eq!(
+            ledger.reserve_key(&k2, "h1", "i1", 1_001).await,
+            Ok(KeyReservation::Running)
+        );
+        ledger
+            .finish_key(&k2, r#"{"ok":false}"#.into(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger.reserve_key(&k2, "h1", "i1", 1_002).await,
+            Ok(KeyReservation::Done {
+                document: r#"{"ok":false}"#.into(),
+                is_error: true
+            })
+        );
+
+        // A prune drops keys older than KEY_KEPT_SECS, so they are fresh again.
+        ledger.prune(1_000 + KEY_KEPT_SECS + 1).await.unwrap();
+        assert_eq!(
+            ledger
+                .reserve_key(&k1, "h1", "i1", 1_000 + KEY_KEPT_SECS + 2)
+                .await,
+            Ok(KeyReservation::Fresh)
         );
     }
 }

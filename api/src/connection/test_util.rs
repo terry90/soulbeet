@@ -23,10 +23,12 @@ use super::{router, ConnectionState};
 use crate::auth::{Role, UserCtx};
 use crate::base_url::BaseUrl;
 use crate::core::index::NavidromeOf;
+use crate::core::jobs::runner::{Acquire, TestEffects};
 use crate::db::test_db;
 use crate::mcp::status::{FolderFacts, NavidromeFacts, StatusFacts, StatusSource};
 use crate::mcp::McpCaller;
 use crate::models::folder::Folder;
+use crate::models::user_settings::{UpdateUserSettings, UserSettings};
 use crate::oauth::cimd::{
     client_id_url, parse_document, CimdError, ClientDocument, ClientDocuments,
 };
@@ -44,8 +46,10 @@ use crate::transfer_registry::RunningBatch;
 impl ConnectionState {
     /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits,
     /// `test_key()`, no client metadata documents, `sample_facts()`, no
-    /// user linked to Navidrome and no NAVIDROME_MUSIC_PATH.
+    /// user linked to Navidrome, no NAVIDROME_MUSIC_PATH and an
+    /// `Acquire::for_test` of `db`.
     pub(crate) fn for_test(db: SqlitePool) -> ConnectionState {
+        let db_for_acquire = db.clone();
         ConnectionState {
             mcp_off: None,
             public_url: None,
@@ -58,6 +62,7 @@ impl ConnectionState {
             navidrome: Arc::new(NavidromeFor(Err(|| NavidromeLookupError::NotLinked))),
             navidrome_music_path: None,
             log: Arc::new(RequestLog::default()),
+            acquire: Acquire::for_test(db_for_acquire).0,
         }
     }
 }
@@ -420,6 +425,52 @@ async fn alice_app(state: ConnectionState) -> (SqlitePool, Router, String) {
     add_user(&db, "u1", "alice").await;
     let token = access_token(&db, "u1", RESOURCE).await;
     (db, router(state), token)
+}
+
+/// `mcp_app` on an `Acquire::for_test` of the same database: u1 (alice) with folder f1 (a
+/// directory kept on disk for the test) as her default folder, the acquisition, its test effects
+/// and her access token.
+pub(crate) async fn app_with_acquire() -> (SqlitePool, Arc<Acquire>, Arc<TestEffects>, String) {
+    let db = test_db::migrated().await;
+    add_user(&db, "u1", "alice").await;
+    let dir = tempfile::tempdir().unwrap().keep();
+    sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES ('f1', 'u1', 'Music', ?)")
+        .bind(dir.to_str().unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+    UserSettings::upsert_in(
+        &db,
+        "u1",
+        UpdateUserSettings {
+            default_download_folder_id: Some("f1".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let token = access_token(&db, "u1", RESOURCE).await;
+    let (acquire, effects) = Acquire::for_test(db.clone());
+    (db, acquire, effects, token)
+}
+
+/// The router of `ConnectionState::for_test(db)` acting through `acquire`.
+pub(crate) fn app_of(db: &SqlitePool, acquire: &Arc<Acquire>) -> Router {
+    router(ConnectionState {
+        acquire: acquire.clone(),
+        ..ConnectionState::for_test(db.clone())
+    })
+}
+
+/// The id of the grant `user_id` holds for `resource`, made with an access token of theirs.
+pub(crate) async fn grant_id_of(db: &SqlitePool, user_id: &str, resource: &str) -> String {
+    access_token(db, user_id, resource).await;
+    sqlx::query_scalar("SELECT id FROM oauth_grants WHERE user_id = ? AND resource = ?")
+        .bind(user_id)
+        .bind(resource)
+        .fetch_one(db)
+        .await
+        .unwrap()
 }
 
 /// A `POST` of the JSON-RPC message `body` to `/mcp` with `headers`. The

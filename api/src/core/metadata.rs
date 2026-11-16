@@ -179,7 +179,7 @@ pub async fn hydrate_album_tracks(
 }
 
 /// Fills an album query's empty track list from `provider`.
-async fn hydrate_in(
+pub(crate) async fn hydrate_in(
     provider: &dyn MetadataProvider,
     query: &mut DownloadQuery,
 ) -> Result<(), Failure> {

@@ -16,7 +16,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
-use super::{library, metadata, playlists, settings, status, McpCaller};
+use super::{library, metadata, playlists, settings, sources, status, McpCaller};
 use crate::connection::ConnectionState;
 
 /// What the server tells a client at `initialize`.
@@ -242,6 +242,8 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         open_world: true,
         call: |state, caller, args| Box::pin(metadata::get_recording_releases(state, caller, args)),
     },
+    sources::FIND_SOURCES,
+    sources::GET_SOURCES,
 ];
 
 impl ToolSpec {
@@ -343,6 +345,7 @@ pub(crate) fn service(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -388,8 +391,8 @@ mod tests {
             );
             assert_eq!(
                 t["annotations"],
-                json!({"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true,
-                    "openWorldHint": spec.open_world}),
+                json!({"readOnlyHint": spec.read_only, "destructiveHint": spec.destructive,
+                    "idempotentHint": spec.idempotent, "openWorldHint": spec.open_world}),
                 "{}",
                 spec.name
             );
@@ -400,7 +403,8 @@ mod tests {
                 spec.name
             );
         }
-        // Only the metadata tools ask a service outside Soulful and the user's Navidrome.
+        // Only the metadata tools and the download search ask a service outside Soulful and
+        // the user's Navidrome.
         let open: Vec<&str> = tools
             .iter()
             .filter(|t| t["annotations"]["openWorldHint"] == true)
@@ -408,7 +412,12 @@ mod tests {
             .collect();
         assert_eq!(
             open,
-            ["search_music", "get_release", "get_recording_releases"]
+            [
+                "search_music",
+                "get_release",
+                "get_recording_releases",
+                "find_sources"
+            ]
         );
         assert!(tools[0]["description"]
             .as_str()
@@ -455,6 +464,10 @@ mod tests {
             "get_recording_releases" => {
                 json!({"recording_mbid": "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8"})
             }
+            "find_sources" => {
+                json!({"reference": {"artist": "Marrow Choir", "title": "O Holy Night"}})
+            }
+            "get_sources" => json!({"search_id": "3f1c0d52-8a8e-4c2b-9d61-2b7f0e5a4c19"}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -496,49 +509,79 @@ mod tests {
         assert_eq!(error["next"], json!([{"tool": "get_status", "args": {}}]));
     }
 
+    /// Each tool's (name, read_only, destructive, idempotent, open_world), in `TOOLS` order.
+    const HINTS: &[(&str, bool, bool, bool, bool)] = &[
+        ("get_status", true, false, true, false),
+        ("get_settings", true, false, true, false),
+        ("list_folders", true, false, true, false),
+        ("get_library_stats", true, false, true, false),
+        ("find_in_library", true, false, true, false),
+        ("search_library", true, false, true, false),
+        ("get_library_album", true, false, true, false),
+        ("list_starred", true, false, true, false),
+        ("list_playlists", true, false, true, false),
+        ("get_playlist", true, false, true, false),
+        ("search_music", true, false, true, true),
+        ("get_release", true, false, true, true),
+        ("get_recording_releases", true, false, true, true),
+        ("find_sources", false, false, false, true),
+        ("get_sources", true, false, true, false),
+    ];
+
     #[test]
-    fn the_registry_holds_every_read_tool_once_and_none_writes() {
-        let names: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
-        assert_eq!(
-            names,
-            [
-                "get_status",
-                "get_settings",
-                "list_folders",
-                "get_library_stats",
-                "find_in_library",
-                "search_library",
-                "get_library_album",
-                "list_starred",
-                "list_playlists",
-                "get_playlist",
-                "search_music",
-                "get_release",
-                "get_recording_releases"
-            ]
-        );
+    fn the_registry_holds_every_tool_once_with_its_hints() {
+        let registered: Vec<(&str, bool, bool, bool, bool)> = TOOLS
+            .iter()
+            .map(|t| {
+                (
+                    t.name,
+                    t.read_only,
+                    t.destructive,
+                    t.idempotent,
+                    t.open_world,
+                )
+            })
+            .collect();
+        assert_eq!(registered, HINTS);
         for t in TOOLS {
-            assert!(t.read_only && !t.destructive && t.idempotent, "{}", t.name);
             assert!(
                 t.name.len() <= 64 && (t.description)(120).contains("Failure codes:"),
                 "{}",
                 t.name
             );
             assert!(from_str::<Value>(t.input_schema).is_ok(), "{}", t.name);
-            assert_eq!(
-                t.open_world,
-                ["search_music", "get_release", "get_recording_releases"].contains(&t.name),
-                "{}",
-                t.name
-            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_schema_names_exactly_the_arguments_its_tool_reads() {
+        let (_, app, token) = mcp_app().await;
+        for spec in TOOLS {
+            // A tool reads every value, then refuses a name it does not take, naming those it
+            // takes.
+            let mut args = valid_args(spec.name);
+            args["zzz"] = json!(1);
+            let error = &document(&call_tool(app.clone(), &token, spec.name, args).await)["error"];
+            let expected = error["facts"]["expected"].as_str().unwrap();
+            let read: BTreeSet<&str> = expected
+                .strip_prefix("it takes only ")
+                .map(|l| l.split(", ").collect())
+                .unwrap_or_default();
+            let schema: Value = serde_json::from_str(spec.input_schema).unwrap();
+            let declared: BTreeSet<&str> = schema["properties"]
+                .as_object()
+                .map(|p| p.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(read, declared, "{}", spec.name);
+            assert_eq!(schema["additionalProperties"], false, "{}", spec.name);
         }
     }
 
     /// Design 10.2 and 15 ("Tool contract"): every failure result carries
-    /// every key of the error object. No read tool takes a Soulful-owned id
-    /// or needs a permission the caller can lack, so the failures every tool
-    /// reaches in a test are invalid input (all of them) and an unlinked
-    /// Navidrome (the Navidrome tools; `mcp_app`'s state has none linked).
+    /// every key of the error object. The failures every tool reaches here
+    /// are invalid input (all of them) and an unlinked Navidrome (the
+    /// Navidrome tools; `mcp_app`'s state has none linked); the source
+    /// tools' own failures are pinned in `mcp::sources`.
     #[tokio::test]
     async fn every_failure_result_carries_every_contract_key() {
         const KEYS: [&str; 9] = [

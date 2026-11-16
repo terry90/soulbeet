@@ -16,6 +16,25 @@ use crate::oauth::limits::{retry_after_seconds, try_again_in};
 pub(crate) struct NextCall {
     pub tool: &'static str,
     pub args: Value,
+    /// The deciding facts next to the call (design 10.2), flattened into it.
+    #[serde(flatten)]
+    pub facts: Map<String, Value>,
+}
+
+impl NextCall {
+    pub(crate) fn new(tool: &'static str, args: Value) -> NextCall {
+        NextCall {
+            tool,
+            args,
+            facts: Map::new(),
+        }
+    }
+
+    /// The call with the fact `key` next to it.
+    pub(crate) fn with(mut self, key: &str, value: Value) -> NextCall {
+        self.facts.insert(key.to_string(), value);
+        self
+    }
 }
 
 /// A tool's failure: what went wrong, the facts it is about and what to call
@@ -277,10 +296,7 @@ mod tests {
         let r = failed(ToolError {
             failure: f.clone(),
             facts: json!({"folder_id": null}).as_object().unwrap().clone(),
-            next: vec![NextCall {
-                tool: "get_status",
-                args: json!({}),
-            }],
+            next: vec![NextCall::new("get_status", json!({}))],
         });
         assert_eq!(r.is_error, Some(true));
         assert!(r.structured_content.is_none() && r.content.len() == 1);
@@ -441,10 +457,7 @@ mod tests {
         );
         assert_eq!(
             upstream_error(circuit().failure, Map::new(), a.same_call()).next,
-            vec![NextCall {
-                tool: "list_playlists",
-                args: json!({"limit": 10})
-            }]
+            vec![NextCall::new("list_playlists", json!({"limit": 10}))]
         );
         // getStarred2 on a database error: getStarredItems returns it and mapToSubsonicError writes
         // "Internal Server Error: {err}" (server/subsonic/album_lists.go:190-194, api.go:290-291)
@@ -459,6 +472,16 @@ mod tests {
         )
         .next
         .is_empty());
+    }
+
+    #[test]
+    fn a_next_call_carries_its_deciding_facts() {
+        let call = NextCall::new("get_sources", json!({"search_id": "s1"}))
+            .with("needs", json!(["query_text"]));
+        assert_eq!(
+            json!(call),
+            json!({"tool": "get_sources", "args": {"search_id": "s1"}, "needs": ["query_text"]})
+        );
     }
 
     #[test]
@@ -489,10 +512,7 @@ mod tests {
             "get_status",
             "verbose",
             "it takes no arguments",
-            vec![NextCall {
-                tool: "get_status",
-                args: json!({}),
-            }],
+            vec![NextCall::new("get_status", json!({}))],
         );
         assert_eq!(
             (e.failure.code, e.failure.stage, e.failure.retry),

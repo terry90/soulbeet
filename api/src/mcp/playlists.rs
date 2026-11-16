@@ -67,10 +67,7 @@ fn not_got(f: Failure, playlist_id: &str, args: &Args) -> ToolError {
     facts.insert("playlist_id".into(), json!(playlist_id));
     let mut e = upstream_error(f, facts, args.same_call());
     if not_found {
-        e.next = vec![NextCall {
-            tool: "list_playlists",
-            args: json!({}),
-        }];
+        e.next = vec![NextCall::new("list_playlists", json!({}))];
     }
     e
 }

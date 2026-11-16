@@ -11,6 +11,7 @@ use shared::download::{
     QueuedDownload, SearchResult, SearchSpec, SearchState, SearchStats, SourcePresence,
 };
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
+use shared::metadata::Track;
 use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::{DownloadBackend, ImportMode};
 use std::collections::VecDeque;
@@ -36,6 +37,21 @@ pub fn item(source: &str, title: &str, id: &str) -> DownloadableItem {
         match_score: 0.0,
         below_floor: false,
         facts: FileFacts::default(),
+    }
+}
+
+/// A wanted track with only its artist and title.
+pub fn track(artist: &str, title: &str) -> Track {
+    Track {
+        id: String::new(),
+        title: title.to_string(),
+        artist: artist.to_string(),
+        album_id: None,
+        album_title: None,
+        release_date: None,
+        duration: None,
+        mbid: None,
+        release_mbid: None,
     }
 }
 

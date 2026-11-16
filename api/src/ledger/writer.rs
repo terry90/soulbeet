@@ -3,9 +3,9 @@
 
 use super::{
     job_state, recording_keys, Admitted, BatchOrigin, ClaimedJob, ImportDone, IndexWait, JobEvent,
-    JobState, LedgerError, LiveRows, NewJob, NewJobBatch, NewSearch, Pruned, RecordingKeys,
-    SearchOutcome, SlotResult, Transition, Transitioned, JOB_KEPT_SECS,
-    MCP_UNFINISHED_JOBS_PER_USER, SEARCH_KEPT_SECS, TERMINAL_SQL,
+    JobState, KeyReservation, LedgerError, LiveRows, NewJob, NewJobBatch, NewSearch, Pruned,
+    RecordingKeys, RequestKey, SearchOutcome, SlotResult, Transition, Transitioned, JOB_KEPT_SECS,
+    KEY_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER, SEARCH_KEPT_SECS, TERMINAL_SQL,
 };
 use crate::auth::UserId;
 use crate::transfer_registry::TransferRegistry;
@@ -77,6 +77,19 @@ pub(super) enum Write {
     Prune {
         now: i64,
         reply: Reply<Pruned>,
+    },
+    ReserveKey {
+        key: RequestKey,
+        args_hash: String,
+        instance: String,
+        now: i64,
+        reply: Reply<KeyReservation>,
+    },
+    FinishKey {
+        key: RequestKey,
+        document: String,
+        is_error: bool,
+        reply: Reply<()>,
     },
     Event(JobEvent),
     /// An event whose sender waits until it is stored.
@@ -330,6 +343,25 @@ impl Writer {
             Write::Prune { now, reply } => {
                 let pruned = self.prune(now).await;
                 self.finish(reply, "remove expired rows", pruned)
+            }
+            Write::ReserveKey {
+                key,
+                args_hash,
+                instance,
+                now,
+                reply,
+            } => {
+                let reserved = reserve_key(&self.db, &key, &args_hash, &instance, now).await;
+                self.finish(reply, "reserve a request key", reserved)
+            }
+            Write::FinishKey {
+                key,
+                document,
+                is_error,
+                reply,
+            } => {
+                let stored = finish_key(&self.db, &key, &document, is_error).await;
+                self.finish(reply, "store a request key's result", stored)
             }
             Write::Event(event) => {
                 let recorded = self.event(event).await;
@@ -1329,6 +1361,10 @@ impl Writer {
         )
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM request_keys WHERE created_at < ?")
+            .bind(now - KEY_KEPT_SECS)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(Pruned {
             searches,
@@ -1336,6 +1372,81 @@ impl Writer {
             jobs,
         })
     }
+}
+
+/// D12 as ruled: `key` for the call hashing to `args_hash` in process `instance`. A key with
+/// another hash is another call's; one whose first call stored its result answers it; one whose
+/// first call runs in this process is running; an unused key, or one whose first call ran in a
+/// process that stopped before storing its result, is reserved for this call now.
+async fn reserve_key(
+    db: &SqlitePool,
+    key: &RequestKey,
+    args_hash: &str,
+    instance: &str,
+    now: i64,
+) -> Result<KeyReservation, LedgerError> {
+    let row: Option<(String, String, Option<String>, Option<bool>)> = sqlx::query_as(
+        "SELECT args_hash, instance, document, is_error FROM request_keys \
+         WHERE user_id = ? AND grant_id = ? AND tool = ? AND key = ?",
+    )
+    .bind(key.user.to_string())
+    .bind(&key.grant_id)
+    .bind(&key.tool)
+    .bind(&key.key)
+    .fetch_optional(db)
+    .await?;
+    match row {
+        Some((stored, ..)) if stored != args_hash => return Ok(KeyReservation::OtherCall),
+        Some((_, _, Some(document), is_error)) => {
+            return Ok(KeyReservation::Done {
+                document,
+                is_error: is_error.unwrap_or(false),
+            })
+        }
+        Some((_, reserved_by, None, _)) if reserved_by == instance => {
+            return Ok(KeyReservation::Running)
+        }
+        _ => {}
+    }
+    sqlx::query(
+        "INSERT INTO request_keys (user_id, grant_id, tool, key, args_hash, created_at, instance) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (user_id, grant_id, tool, key) DO UPDATE SET \
+         args_hash = excluded.args_hash, created_at = excluded.created_at, \
+         instance = excluded.instance, document = NULL, is_error = NULL",
+    )
+    .bind(key.user.to_string())
+    .bind(&key.grant_id)
+    .bind(&key.tool)
+    .bind(&key.key)
+    .bind(args_hash)
+    .bind(now)
+    .bind(instance)
+    .execute(db)
+    .await?;
+    Ok(KeyReservation::Fresh)
+}
+
+/// Stores the result of `key`'s first call.
+async fn finish_key(
+    db: &SqlitePool,
+    key: &RequestKey,
+    document: &str,
+    is_error: bool,
+) -> Result<(), LedgerError> {
+    sqlx::query(
+        "UPDATE request_keys SET document = ?, is_error = ? \
+         WHERE user_id = ? AND grant_id = ? AND tool = ? AND key = ?",
+    )
+    .bind(document)
+    .bind(is_error)
+    .bind(key.user.to_string())
+    .bind(&key.grant_id)
+    .bind(&key.tool)
+    .bind(&key.key)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// Logs a failed write and answers its sender, who may have stopped waiting.

@@ -10,6 +10,7 @@ pub mod delete_guard;
 pub mod folders;
 pub mod health;
 pub mod index;
+pub mod jobs;
 pub mod library;
 pub mod metadata;
 pub mod playlists;

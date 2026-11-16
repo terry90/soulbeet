@@ -21,6 +21,10 @@ const STRING_MAX_CHARS: usize = 500;
 const ECHO_MAX_CHARS: usize = 25_000;
 
 const A_STRING: &str = "a non-empty string of at most 500 characters";
+
+/// The argument a write tool takes to answer a repeated call once (design 10.3); never offered
+/// again in `next`.
+const REQUEST_KEY: &str = "request_key";
 const AN_MBID: &str = "a MusicBrainz id: 36 characters, 8-4-4-4-12 hexadecimal digits";
 
 /// A tool's arguments, or one element of a list argument. Each value is
@@ -66,7 +70,7 @@ impl Args {
         let taken: Map<String, Value> = self
             .map
             .iter()
-            .filter(|(name, _)| self.known.contains(&name.as_str()))
+            .filter(|(name, _)| self.known.contains(&name.as_str()) && *name != REQUEST_KEY)
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
         let next = repeatable(self.tool, Value::Object(taken));
@@ -146,6 +150,79 @@ impl Args {
             .ok_or_else(refused)
     }
 
+    /// `true` or `false`.
+    pub(crate) fn opt_bool(&self, name: &str) -> Result<Option<bool>, ToolError> {
+        let Some(value) = self.given(name) else {
+            return Ok(None);
+        };
+        value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| self.refuse(name, "true or false"))
+    }
+
+    /// A list of at most `max` texts, each trimmed and refused as `string` refuses one.
+    pub(crate) fn opt_strings(
+        &self,
+        name: &str,
+        max: usize,
+    ) -> Result<Option<Vec<String>>, ToolError> {
+        let Some(value) = self.given(name) else {
+            return Ok(None);
+        };
+        let refused = || {
+            self.refuse(
+                name,
+                &format!("a list of at most {max} non-empty strings of at most 500 characters"),
+            )
+        };
+        let list = value
+            .as_array()
+            .filter(|list| list.len() <= max)
+            .ok_or_else(refused)?;
+        list.iter()
+            .map(|text| {
+                text.as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty() && text.chars().count() <= STRING_MAX_CHARS)
+                    .map(str::to_string)
+                    .ok_or_else(refused)
+            })
+            .collect::<Result<_, _>>()
+            .map(Some)
+    }
+
+    /// A required object, read as its own `Args` taking `known`, its fields named
+    /// `{name}.{field}`. A name it does not take is refused here, as `objects` refuses one.
+    pub(crate) fn object(
+        &self,
+        name: &str,
+        known: &'static [&'static str],
+    ) -> Result<Args, ToolError> {
+        let map = self
+            .given(name)
+            .and_then(Value::as_object)
+            .ok_or_else(|| self.refuse(name, "an object"))?;
+        let object = Args {
+            tool: self.tool,
+            prefix: format!("{}.", self.field(name)),
+            map: map.clone(),
+            known,
+        };
+        if let Some(unknown) = object.unknown() {
+            return Err(object.unknown_name(unknown, vec![]));
+        }
+        Ok(object)
+    }
+
+    /// Refuses `name` when it is given: `expected` says why it must be absent.
+    pub(crate) fn absent(&self, name: &str, expected: &str) -> Result<(), ToolError> {
+        match self.given(name) {
+            Some(_) => Err(self.refuse(name, expected)),
+            None => Ok(()),
+        }
+    }
+
     /// A list of `min` to `max` objects, each read as its own `Args` taking
     /// `known`. A name an element does not take is refused here, with no
     /// call to offer: the element is the caller's to fix.
@@ -180,9 +257,12 @@ impl Args {
         Ok(elements)
     }
 
-    /// The arguments as given (an element's own object for an element).
+    /// The arguments as given (an element's own object for an element), without
+    /// `request_key`: a call offered again must not answer the first call's result.
     pub(crate) fn as_value(&self) -> Value {
-        Value::Object(self.map.clone())
+        let mut map = self.map.clone();
+        map.remove(REQUEST_KEY);
+        Value::Object(map)
     }
 
     /// This call again (D13), unless it is too large to repeat.
@@ -230,7 +310,7 @@ impl Args {
 /// A call of `tool` with `args`, unless its JSON text is longer than
 /// ECHO_MAX_CHARS characters.
 pub(crate) fn repeatable(tool: &'static str, args: Value) -> Option<NextCall> {
-    (args.to_string().chars().count() <= ECHO_MAX_CHARS).then_some(NextCall { tool, args })
+    (args.to_string().chars().count() <= ECHO_MAX_CHARS).then_some(NextCall::new(tool, args))
 }
 
 #[cfg(test)]
@@ -277,10 +357,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             e.next,
-            vec![NextCall {
-                tool: "search_library",
-                args: json!({"query": "silent night", "kind": "songs"})
-            }]
+            vec![NextCall::new(
+                "search_library",
+                json!({"query": "silent night", "kind": "songs"})
+            )]
         );
         let e = Args::new("get_status", obj(json!({"verbose": true})), &[])
             .finish()
@@ -289,13 +369,7 @@ pub(crate) mod tests {
             e.failure.message,
             "get_status takes no argument named 'verbose': it takes no arguments"
         );
-        assert_eq!(
-            e.next,
-            vec![NextCall {
-                tool: "get_status",
-                args: json!({})
-            }]
-        );
+        assert_eq!(e.next, vec![NextCall::new("get_status", json!({}))]);
         assert!(Args::new(
             "search_library",
             obj(json!({"query": "silent night"})),
@@ -378,6 +452,77 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn flags_lists_and_objects_are_read_with_their_bounds() {
+        let a = Args::new(
+            "find_sources",
+            obj(json!({"lossless_only": true, "job_ids": [" j1 ", "J2"],
+                "reference": {"artist": "Kowloon", "year": 2003}, "kept": "no"})),
+            &["lossless_only", "job_ids", "reference", "kept"],
+        );
+        assert_eq!(a.opt_bool("lossless_only").unwrap(), Some(true));
+        assert_eq!(a.opt_bool("missing").unwrap(), None);
+        assert_eq!(
+            a.opt_bool("kept").unwrap_err().failure.message,
+            "find_sources: kept must be true or false"
+        );
+        assert_eq!(
+            a.opt_strings("job_ids", 2).unwrap(),
+            Some(vec!["j1".to_string(), "J2".to_string()])
+        );
+        assert_eq!(
+            a.opt_strings("job_ids", 1).unwrap_err().failure.message,
+            "find_sources: job_ids must be a list of at most 1 non-empty strings of at most 500 characters"
+        );
+        let e = a.object("reference", &["artist", "title"]).unwrap_err();
+        assert_eq!(
+            e.failure.message,
+            "find_sources takes no argument named 'reference.year': it takes only artist, title"
+        );
+        assert!(e.next.is_empty());
+        let e = a.object("kept", &["artist"]).unwrap_err();
+        assert_eq!(e.failure.message, "find_sources: kept must be an object");
+        let a = Args::new(
+            "find_sources",
+            obj(json!({"reference": {"artist": "Kowloon", "release_mbid": null}})),
+            &["reference"],
+        );
+        let reference = a.object("reference", &["artist", "release_mbid"]).unwrap();
+        assert_eq!(reference.string("artist").unwrap(), "Kowloon");
+        assert!(reference.absent("release_mbid", "absent").is_ok());
+        assert_eq!(
+            reference
+                .absent("artist", "absent: no")
+                .unwrap_err()
+                .failure
+                .message,
+            "find_sources: reference.artist must be absent: no"
+        );
+    }
+
+    #[test]
+    fn a_request_key_is_never_offered_again() {
+        let a = Args::new(
+            "find_sources",
+            obj(json!({"query_text": "wake up", "request_key": "k1", "mood": "calm"})),
+            &["query_text", "request_key"],
+        );
+        assert_eq!(
+            a.same_call(),
+            Some(NextCall::new(
+                "find_sources",
+                json!({"query_text": "wake up", "mood": "calm"})
+            ))
+        );
+        assert_eq!(
+            a.finish().unwrap_err().next,
+            vec![NextCall::new(
+                "find_sources",
+                json!({"query_text": "wake up"})
+            )]
+        );
+    }
+
+    #[test]
     fn ids_are_checked_and_strings_trimmed() {
         let a = Args::new(
             "find_in_library",
@@ -396,11 +541,11 @@ pub(crate) mod tests {
         assert_eq!(a.string("artist").unwrap(), "Bing Crosby");
         assert_eq!(
             a.same_call(),
-            Some(NextCall {
-                tool: "find_in_library",
-                args: json!({"good": "4D04E9B5-ECD1-4EF3-BAE0-5C98492AF1C8",
+            Some(NextCall::new(
+                "find_in_library",
+                json!({"good": "4D04E9B5-ECD1-4EF3-BAE0-5C98492AF1C8",
                 "simple": "4d04e9b5ecd14ef3bae05c98492af1c8", "artist": " Bing Crosby "})
-            })
+            ))
         );
     }
 

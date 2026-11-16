@@ -541,10 +541,10 @@ mod tests {
         };
         assert_eq!(
             upstream_error(provider_failure(&busy), Map::new(), args.same_call()).next,
-            vec![NextCall {
-                tool: "get_recording_releases",
-                args: json!({"recording_mbid": "0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c"})
-            }]
+            vec![NextCall::new(
+                "get_recording_releases",
+                json!({"recording_mbid": "0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c"})
+            )]
         );
     }
 

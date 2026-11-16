@@ -335,6 +335,37 @@ fn best_first(groups: &mut [DownloadableGroup]) {
 /// D5: a source whose transfers failed this many times in the last 24 hours is flagged.
 pub const FLAGGED_FAILURES: u32 = 3;
 
+/// How far back a source's failed transfers count (D5).
+pub const RECENT_FAILURES_SECS: i64 = 24 * 60 * 60;
+
+/// How long find_sources waits for its search inside the call (design 11.4).
+pub const FIND_WAIT: Duration = Duration::from_secs(45);
+
+/// The most `find_sources` searches one user may have waiting for the turn; a call past it
+/// starts none.
+pub const FINDS_WAITING_PER_USER: usize = 3;
+
+/// A search with groups none of which `view` keeps. find_sources and the job runner both
+/// answer it.
+pub fn no_candidate_passed() -> Failure {
+    Failure::new(
+        FailureCode::SearchAllFiltered,
+        Stage::SourceSearch,
+        RetryAdvice::OtherQuery,
+        "No candidate passed the filters",
+    )
+}
+
+/// A stored search that no task runs any more: Soulful restarted while it ran.
+pub fn server_restarted_search() -> Failure {
+    Failure::new(
+        FailureCode::ServerRestarted,
+        Stage::SourceSearch,
+        RetryAdvice::SameSourceLater,
+        "Soulful restarted while this search ran",
+    )
+}
+
 /// Where a stored search is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchProgress {

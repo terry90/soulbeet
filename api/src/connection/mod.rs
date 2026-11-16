@@ -19,6 +19,7 @@ use crate::base_url::{explain_request, BaseExplanation, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
 use crate::connections::LoggedRequest;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
+use crate::core::jobs::runner::{Acquire, ACQUIRE};
 use crate::mcp::status::{LiveStatus, StatusSource};
 use crate::oauth::cimd::{CimdFetcher, ClientDocuments, UnbuiltFetcher};
 use crate::oauth::limits::Limits;
@@ -52,6 +53,8 @@ pub struct ConnectionState {
     pub(crate) navidrome_music_path: Option<PathBuf>,
     /// Where the guard records each request.
     pub(crate) log: Arc<RequestLog>,
+    /// What the acquisition tools act through.
+    pub(crate) acquire: Arc<Acquire>,
 }
 
 impl ConnectionState {
@@ -75,6 +78,7 @@ impl ConnectionState {
             navidrome: Arc::new(ServerNavidrome),
             navidrome_music_path: CONFIG.navidrome_music_path().map(Path::to_path_buf),
             log: LIVE_LOG.clone(),
+            acquire: ACQUIRE.clone(),
         }
     }
 }
