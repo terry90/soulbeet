@@ -2,8 +2,8 @@
 
 use super::writer::import_mode_named;
 use super::{
-    BatchOrigin, IndexWait, JobKind, JobOptions, JobState, SlotResult, StoredImport, StoredSpec,
-    TERMINAL_SQL,
+    BatchOrigin, IndexWait, JobKind, JobOptions, JobState, OrderEntry, SlotResult, StoredImport,
+    StoredSpec, TERMINAL_SQL,
 };
 use crate::auth::{Role, UserCtx, UserId};
 use crate::models::folder::Folder;
@@ -886,6 +886,80 @@ pub async fn running_batches(
             batch_id,
             label,
             unfinished_jobs,
+        })
+        .collect())
+}
+
+/// The playlist a batch fills as its jobs finish (D17).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchPlaylist {
+    pub playlist_id: String,
+    /// One entry per item of the batch's call, in the order given.
+    pub order: Vec<OrderEntry>,
+    /// The failure of the last fill, None once one succeeded.
+    pub failure: Option<Failure>,
+}
+
+/// The playlist `user`'s batch `batch` fills; None for a batch without one, an unknown id or
+/// another user's batch.
+pub async fn playlist_of(
+    db: &SqlitePool,
+    batch: &str,
+    user: &UserId,
+) -> Result<Option<BatchPlaylist>, sqlx::Error> {
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT playlist_id, playlist_order, playlist_failure FROM batches \
+         WHERE id = ? AND user_id = ? AND playlist_id IS NOT NULL",
+    )
+    .bind(batch)
+    .bind(user.to_string())
+    .fetch_optional(db)
+    .await?;
+    row.map(|(playlist_id, order, failure)| {
+        Ok(BatchPlaylist {
+            playlist_id,
+            order: json(&order)?,
+            failure: failure.as_deref().map(json).transpose()?,
+        })
+    })
+    .transpose()
+}
+
+/// A batch whose playlist has an item left to settle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchToFill {
+    pub batch_id: String,
+    /// The batch's user, as their row stands.
+    pub ctx: UserCtx,
+    /// Whether the last fill failed.
+    pub failed: bool,
+}
+
+/// The batches, oldest first, with a playlist, an item not settled, and no stored fill failure
+/// whose retry is other than same_source_later: one that is not stops the fill.
+pub async fn batches_to_fill(db: &SqlitePool) -> Result<Vec<BatchToFill>, sqlx::Error> {
+    let rows: Vec<(String, String, String, Role, bool)> = sqlx::query_as(
+        "SELECT b.id, b.user_id, u.username, u.role, b.playlist_failure IS NOT NULL \
+         FROM batches b JOIN users u ON u.id = b.user_id \
+         WHERE b.playlist_id IS NOT NULL \
+         AND EXISTS (SELECT 1 FROM json_each(b.playlist_order) e \
+                     WHERE json_extract(e.value, '$.settled') = 0) \
+         AND (b.playlist_failure IS NULL \
+              OR json_extract(b.playlist_failure, '$.retry') = 'same_source_later') \
+         ORDER BY b.created_at, b.rowid",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(batch_id, user_id, username, role, failed)| BatchToFill {
+            batch_id,
+            ctx: UserCtx {
+                user_id,
+                username,
+                role,
+            },
+            failed,
         })
         .collect())
 }

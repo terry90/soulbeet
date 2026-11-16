@@ -58,6 +58,7 @@ fn main() {
                 std::process::exit(1);
             }
             api::ledger::start_server_ledger();
+            api::core::playlists::fill::start();
             api::core::index::start();
             // Reads the unfinished jobs before the router below takes a request.
             api::core::reconcile::start().await;

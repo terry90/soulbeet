@@ -450,6 +450,18 @@ pub struct NewJobBatch {
     pub origin: BatchOrigin,
 }
 
+/// One item of a batch whose playlist fills as its jobs finish, in the batch's `playlist_order`
+/// at the item's index (D17).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderEntry {
+    /// The job that gets the item; None for one the library had or that was refused.
+    pub job_id: Option<String>,
+    /// The songs the item put into the playlist, once settled.
+    pub song_ids: Vec<String>,
+    /// Placed in the playlist, or ended with nothing to place.
+    pub settled: bool,
+}
+
 /// What a batch of jobs for `wanted` is called when its caller named none: the first one's
 /// "{artist} - {title}", and how many more there are. None for no job.
 pub fn items_label(wanted: &[&DownloadQuery]) -> Option<String> {
@@ -929,6 +941,54 @@ impl Ledger {
     /// request keys reserved before now - KEY_KEPT_SECS.
     pub async fn prune(&self, now: i64) -> Result<Pruned, LedgerError> {
         self.write(|reply| Write::Prune { now, reply }).await
+    }
+
+    /// `batch` fills playlist `playlist_id` in `order`, with no fill failure yet. Like the other
+    /// playlist writes, it leaves the change number as it is: the fill runner wakes on it.
+    pub async fn set_playlist(
+        &self,
+        batch: &str,
+        playlist_id: &str,
+        order: Vec<OrderEntry>,
+    ) -> Result<(), LedgerError> {
+        let (batch, playlist_id) = (batch.to_string(), playlist_id.to_string());
+        self.write(|reply| Write::SetPlaylist {
+            batch,
+            playlist_id,
+            order,
+            reply,
+        })
+        .await
+    }
+
+    /// `batch`'s playlist order is now `order`.
+    pub async fn set_playlist_order(
+        &self,
+        batch: &str,
+        order: Vec<OrderEntry>,
+    ) -> Result<(), LedgerError> {
+        let batch = batch.to_string();
+        self.write(|reply| Write::SetPlaylistOrder {
+            batch,
+            order,
+            reply,
+        })
+        .await
+    }
+
+    /// The failure of `batch`'s last fill, None once a fill succeeded.
+    pub async fn set_playlist_failure(
+        &self,
+        batch: &str,
+        failure: Option<Failure>,
+    ) -> Result<(), LedgerError> {
+        let batch = batch.to_string();
+        self.write(|reply| Write::SetPlaylistFailure {
+            batch,
+            failure,
+            reply,
+        })
+        .await
     }
 
     /// Waits until every write sent before it is applied, so a read after it sees the events

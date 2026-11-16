@@ -9,13 +9,15 @@ use serde::Serialize;
 use shared::failure::{
     cut_json, Failure, FailureCode, RetryAdvice, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS,
 };
-use soulbeet::navidrome::models::{PlaylistTrack, SubsonicPlaylist};
+use soulbeet::navidrome::models::{NativePlaylist, PlaylistTrack, SubsonicPlaylist};
 use soulbeet::navidrome::{NavidromeClient, PlaylistMeta};
 use soulbeet::NavidromeError;
 use tokio::sync::OwnedMutexGuard;
 
 use crate::auth::UserCtx;
 use crate::core::library::{navidrome_failure, SongFacts};
+
+pub mod fill;
 
 /// Most song ids one playlist write takes.
 pub(crate) const SONG_IDS_MAX: usize = 1000;
@@ -576,6 +578,15 @@ pub(crate) async fn create(
     new: &NewPlaylist,
 ) -> Result<Written, PlaylistRefusal> {
     let _names = lock(&names_key(ctx)).await;
+    create_held(navi, ctx, new).await
+}
+
+/// `create`, its caller holding `names_key`.
+async fn create_held(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    new: &NewPlaylist,
+) -> Result<Written, PlaylistRefusal> {
     let name = new.name.trim();
     name_free(navi, ctx, name, None, new.allow_duplicate_name).await?;
     present(navi, &new.song_ids).await?;
@@ -714,30 +725,7 @@ async fn write_tracks(
     let (playlist, tracks) = owned_read(navi, ctx, id).await?;
     let before = facts(&playlist, &ctx.username);
     let (write, after) = plan(&before, &tracks)?;
-    let native = (navi.get_native_playlist(id).await.map_err(failed)?)
-        .ok_or_else(|| PlaylistRefusal::Failed(playlist_not_found(id)))?;
-    let why = if native.is_smart() {
-        Some(NotEditable::Smart)
-    } else if native.sync {
-        Some(NotEditable::Synced)
-    } else {
-        None
-    };
-    if let Some(why) = why {
-        let missing: HashSet<&str> = (tracks.iter())
-            .filter(|t| t.song.missing)
-            .map(|t| t.song.id.as_str())
-            .collect();
-        return Err(PlaylistRefusal::NotEditable {
-            playlist_id: before.playlist_id,
-            name: before.name,
-            why,
-            would_be: (after.iter())
-                .filter(|id| !missing.contains(id.as_str()))
-                .cloned()
-                .collect(),
-        });
-    }
+    let native = editable(navi, &before, &tracks, &after).await?;
     present(navi, &surplus(&after, &ids_of(&tracks))).await?;
     let (answer, hidden_dropped) = match &write {
         TrackWrite::Append(ids) => (Some(navi.append_playlist_tracks(id, ids).await), 0),
@@ -764,6 +752,40 @@ async fn write_tracks(
     };
     tracks_written(&w, &after)?;
     Ok(w)
+}
+
+/// The native record of the caller's playlist `before`, read with its native rows `tracks`:
+/// NotEditable when Navidrome sets its tracks itself (D4), offering `after`, the list a track edit
+/// would leave, without its missing files.
+async fn editable(
+    navi: &NavidromeClient,
+    before: &PlaylistFacts,
+    tracks: &[PlaylistTrack],
+    after: &[String],
+) -> Result<NativePlaylist, PlaylistRefusal> {
+    let id = before.playlist_id.as_str();
+    let native = (navi.get_native_playlist(id).await.map_err(failed)?)
+        .ok_or_else(|| PlaylistRefusal::Failed(playlist_not_found(id)))?;
+    let why = if native.is_smart() {
+        NotEditable::Smart
+    } else if native.sync {
+        NotEditable::Synced
+    } else {
+        return Ok(native);
+    };
+    let missing: HashSet<&str> = (tracks.iter())
+        .filter(|t| t.song.missing)
+        .map(|t| t.song.id.as_str())
+        .collect();
+    Err(PlaylistRefusal::NotEditable {
+        playlist_id: before.playlist_id.clone(),
+        name: before.name.clone(),
+        why,
+        would_be: (after.iter())
+            .filter(|id| !missing.contains(id.as_str()))
+            .cloned()
+            .collect(),
+    })
 }
 
 /// Under `playlist_key`: the caller's playlist `id` lists `song_ids`, in order (Replace, which

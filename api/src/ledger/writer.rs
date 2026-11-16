@@ -4,9 +4,9 @@
 use super::{
     items_label, job_state, recording_keys, Admitted, BatchOrigin, ClaimedJob, ImportDone,
     IndexWait, JobEvent, JobState, KeyReservation, LedgerError, LiveRows, NewJob, NewJobBatch,
-    NewSearch, Pruned, RecordingKeys, RequestKey, SearchOutcome, SlotResult, Transition,
-    Transitioned, JOB_KEPT_SECS, KEY_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER, SEARCH_KEPT_SECS,
-    TERMINAL_SQL,
+    NewSearch, OrderEntry, Pruned, RecordingKeys, RequestKey, SearchOutcome, SlotResult,
+    Transition, Transitioned, JOB_KEPT_SECS, KEY_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER,
+    SEARCH_KEPT_SECS, TERMINAL_SQL,
 };
 use crate::auth::UserId;
 use crate::transfer_registry::TransferRegistry;
@@ -97,6 +97,22 @@ pub(super) enum Write {
     ReleaseKey {
         key: RequestKey,
         instance: String,
+        reply: Reply<()>,
+    },
+    SetPlaylist {
+        batch: String,
+        playlist_id: String,
+        order: Vec<OrderEntry>,
+        reply: Reply<()>,
+    },
+    SetPlaylistOrder {
+        batch: String,
+        order: Vec<OrderEntry>,
+        reply: Reply<()>,
+    },
+    SetPlaylistFailure {
+        batch: String,
+        failure: Option<Failure>,
         reply: Reply<()>,
     },
     Event(JobEvent),
@@ -395,6 +411,31 @@ impl Writer {
             } => {
                 let released = release_key(&self.db, &key, &instance).await;
                 self.finish(reply, "release a request key", released)
+            }
+            Write::SetPlaylist {
+                batch,
+                playlist_id,
+                order,
+                reply,
+            } => {
+                let set = set_playlist(&self.db, &batch, &playlist_id, &order).await;
+                self.finish(reply, "store a batch's playlist", set)
+            }
+            Write::SetPlaylistOrder {
+                batch,
+                order,
+                reply,
+            } => {
+                let set = set_playlist_order(&self.db, &batch, &order).await;
+                self.finish(reply, "store a batch's playlist order", set)
+            }
+            Write::SetPlaylistFailure {
+                batch,
+                failure,
+                reply,
+            } => {
+                let set = set_playlist_failure(&self.db, &batch, failure.as_ref()).await;
+                self.finish(reply, "store a batch's playlist failure", set)
             }
             Write::Event(event) => {
                 let recorded = self.event(event).await;
@@ -1614,6 +1655,51 @@ async fn release_key(db: &SqlitePool, key: &RequestKey, instance: &str) -> Resul
     .bind(instance)
     .execute(db)
     .await?;
+    Ok(())
+}
+
+/// `batch` fills `playlist_id` in `order`, with no fill failure.
+async fn set_playlist(
+    db: &SqlitePool,
+    batch: &str,
+    playlist_id: &str,
+    order: &[OrderEntry],
+) -> Result<(), LedgerError> {
+    sqlx::query(
+        "UPDATE batches SET playlist_id = ?, playlist_order = ?, playlist_failure = NULL \
+         WHERE id = ?",
+    )
+    .bind(playlist_id)
+    .bind(serde_json::to_string(order)?)
+    .bind(batch)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn set_playlist_order(
+    db: &SqlitePool,
+    batch: &str,
+    order: &[OrderEntry],
+) -> Result<(), LedgerError> {
+    sqlx::query("UPDATE batches SET playlist_order = ? WHERE id = ?")
+        .bind(serde_json::to_string(order)?)
+        .bind(batch)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn set_playlist_failure(
+    db: &SqlitePool,
+    batch: &str,
+    failure: Option<&Failure>,
+) -> Result<(), LedgerError> {
+    sqlx::query("UPDATE batches SET playlist_failure = ? WHERE id = ?")
+        .bind(failure.map(serde_json::to_string).transpose()?)
+        .bind(batch)
+        .execute(db)
+        .await?;
     Ok(())
 }
 

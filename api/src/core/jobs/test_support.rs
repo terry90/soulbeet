@@ -5,7 +5,7 @@ use super::runner::{Acquire, TestEffects, MCP_DOWNLOADS_PER_USER};
 use super::{job_records, views_of, AlbumRef, JobSelect, JobView, Wanted};
 use crate::auth::UserId;
 use crate::core::index::not_found_after_scan;
-use crate::core::library::Reference;
+use crate::core::library::{Reference, SongFacts};
 use crate::core::test_ctx;
 use crate::import_queue::test_support::{no_match, track_choices};
 use crate::import_queue::ImportJob;
@@ -18,6 +18,7 @@ use crate::ledger::{
 use crate::server_fns::download::monitor::cancelled_on_request;
 use crate::server_fns::download::process::{import_job, Downloaded};
 use crate::server_fns::download::test_support::{group, item, transfer};
+use crate::test_navidrome::native_song;
 use shared::download::{
     DownloadProgress, DownloadQuery, DownloadState, DownloadableItem, IndexState, JobSlot,
     MatchCandidate, SearchStats,
@@ -522,6 +523,52 @@ pub(crate) async fn done_track_job(acq: &Acquire) -> String {
         })));
     acq.ledger.settled().await;
     job
+}
+
+/// alice's downloading track job `job` (one slot) imported, then listed by Navidrome as
+/// `song_id`: done, as the import queue and the index runner record it.
+pub(crate) async fn settle_done(acq: &Acquire, job: &str, song_id: &str) {
+    let view = view_of(acq, job).await;
+    let title = view.job.wanted.tracks[0].title.clone();
+    let row = (view.slots[0].row.clone()).expect("a downloading slot has a row");
+    let source = Path::new("/downloads/Come Over [1f2e3d4c]").join(format!("03 - {title}.flac"));
+    let import = import_of(job, &title, &source);
+    acq.ledger
+        .record(JobEvent::ImportQueued(Box::new(import.clone())));
+    let applied = vec![applied_item(&title)];
+    let imported = |listed| SlotResult::Imported {
+        applied: applied.clone(),
+        untagged: false,
+        listed,
+    };
+    let row = row.with_state(DownloadState::Imported);
+    let wait = IndexWait {
+        import: source.display().to_string(),
+        library: std::env::temp_dir(),
+        items: applied.clone(),
+        since: 0,
+        baseline: None,
+        checked: None,
+    };
+    acq.ledger
+        .record(JobEvent::ImportDone(Box::new(crate::ledger::ImportDone {
+            import,
+            rows: vec![row.clone()],
+            next: JobState::Indexing,
+            index: Some(wait),
+            results: vec![(slot_0(job), imported(None))],
+        })));
+    let native = native_song(song_id, "Marrow Choir", &title, 263.4, None);
+    let song: soulbeet::navidrome::models::NativeSong = serde_json::from_str(&native).unwrap();
+    acq.ledger.record(JobEvent::Settled {
+        state: JobState::Done,
+        rows: vec![DownloadProgress {
+            index: Some(IndexState::Listed),
+            ..row
+        }],
+        results: vec![(slot_0(job), imported(Some(vec![SongFacts::from(&song)])))],
+    });
+    acq.ledger.settled().await;
 }
 
 /// `importing_track_job` "Away in a Manger", imported, whose wait for Navidrome failed: Navidrome
