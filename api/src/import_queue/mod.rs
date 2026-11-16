@@ -619,8 +619,8 @@ impl Shared {
             ),
         }
         let keep = keeps_retry(&outcome.result.outcome, &job.duplicates);
-        // Every owned download job has a cleanup root (`process::import_job`): a Skip job without
-        // one, which nothing makes, would neither keep nor delete a skipped duplicate's copy.
+        // Every owned download job has a cleanup root (`process::import_job`). A promote has
+        // none: with Skip, its staged file stays where it is and the track goes back to pending.
         if let Some(root) = &job.cleanup_root {
             if skipped_duplicate(&outcome.result.outcome, &job.duplicates) {
                 // No retry imports what the library has: the copy is Soulful's own download.

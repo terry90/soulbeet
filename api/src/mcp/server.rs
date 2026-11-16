@@ -17,8 +17,8 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
 use super::{
-    batches, ensure, imports, jobs, library, metadata, playlists, ratings, settings, sources,
-    status, McpCaller,
+    batches, discovery, ensure, imports, jobs, library, metadata, playlists, ratings, settings,
+    sources, status, McpCaller,
 };
 use crate::connection::ConnectionState;
 
@@ -266,6 +266,10 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ratings::SET_RATING,
     ratings::SET_STAR,
     settings::UPDATE_SETTINGS,
+    discovery::GET_DISCOVERY,
+    discovery::RUN_DISCOVERY,
+    discovery::PROMOTE_DISCOVERY_TRACK,
+    discovery::REMOVE_DISCOVERY_TRACK,
 ];
 
 impl ToolSpec {
@@ -443,7 +447,8 @@ mod tests {
                 "retry_job",
                 "cancel_job",
                 "dismiss_job",
-                "download_source"
+                "download_source",
+                "run_discovery"
             ]
         );
         assert!(tools[0]["description"]
@@ -479,7 +484,8 @@ mod tests {
     fn valid_args(tool: &str) -> Value {
         match tool {
             "get_status" | "get_settings" | "list_folders" | "get_library_stats"
-            | "list_starred" | "list_playlists" | "get_jobs" | "list_batches" => json!({}),
+            | "list_starred" | "list_playlists" | "get_jobs" | "list_batches" | "get_discovery"
+            | "run_discovery" => json!({}),
             "find_in_library" => {
                 json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
             }
@@ -524,6 +530,7 @@ mod tests {
             "set_rating" => json!({"song_id": "3sG8kPq0WmZ1xYbN4vTcDe", "rating": 3}),
             "set_star" => json!({"song_id": "3sG8kPq0WmZ1xYbN4vTcDe", "starred": true}),
             "update_settings" => json!({"discovery_promote_threshold": 3}),
+            "promote_discovery_track" | "remove_discovery_track" => json!({"track_id": "t1"}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -601,6 +608,10 @@ mod tests {
         ("set_rating", false, false, true, false),
         ("set_star", false, false, true, false),
         ("update_settings", false, false, true, false),
+        ("get_discovery", true, false, true, false),
+        ("run_discovery", false, false, false, true),
+        ("promote_discovery_track", false, false, false, false),
+        ("remove_discovery_track", false, true, true, false),
     ];
 
     #[test]

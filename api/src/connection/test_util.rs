@@ -22,6 +22,7 @@ use super::log::RequestLog;
 use super::{router, ConnectionState};
 use crate::auth::{Role, UserCtx};
 use crate::base_url::BaseUrl;
+use crate::core::discovery::test_support::TestDiscovery;
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::runner::{Acquire, TestEffects};
 use crate::db::test_db;
@@ -53,7 +54,8 @@ impl ConnectionState {
     /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits,
     /// `test_key()`, no client metadata documents, `sample_facts()`, no
     /// user linked to Navidrome, no NAVIDROME_MUSIC_PATH, acting through
-    /// `acquire`, whose ledger writer serves every state made on it.
+    /// `acquire`, whose ledger writer serves every state made on it, and
+    /// discovery on a `TestDiscovery`.
     pub(crate) fn on(db: SqlitePool, acquire: Arc<Acquire>) -> ConnectionState {
         ConnectionState {
             mcp_off: None,
@@ -68,6 +70,7 @@ impl ConnectionState {
             navidrome_music_path: None,
             log: Arc::new(RequestLog::default()),
             acquire,
+            discovery: Arc::new(TestDiscovery::default()),
         }
     }
 }

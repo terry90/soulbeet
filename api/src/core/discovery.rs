@@ -24,12 +24,15 @@ use crate::core::folders::folder_not_found;
 use crate::models::discovery_history::DiscoveryHistoryRow;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::folder::Folder;
+use crate::models::user_settings::UserSettings;
 
 /// How a promote treats an earlier copy of the song in the library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Replace {
     /// beets may replace it, through the delete guard with this origin.
     Guarded(Origin),
+    /// beets skips a song the library has: the promote ends `import_already_in_library`.
+    Never,
 }
 
 /// What discovery does outside Soulful's database, so tests run it on stand-ins.
@@ -195,8 +198,13 @@ pub(crate) fn expires_at(
                 .map(|naive| naive.and_utc())
         })
         .ok()?;
-    let days = lifetime_days.get(&track.profile).copied().unwrap_or(7);
+    let days = lifetime_of(lifetime_days, &track.profile);
     Some(created + Duration::days(days.into()))
+}
+
+/// `profile`'s lifetime in days in `lifetime_days`, 7 when it has none.
+pub(crate) fn lifetime_of(lifetime_days: &HashMap<String, u32>, profile: &str) -> u32 {
+    lifetime_days.get(profile).copied().unwrap_or(7)
 }
 
 /// Checks that `ctx` can start a run (discovery on, a discovery folder chosen), claims it on
@@ -245,6 +253,51 @@ pub(crate) async fn start_in(
     effects.claim(&ctx.id(), progress.clone()).await?;
     effects.generate(&ctx.id());
     Ok(progress)
+}
+
+/// What get_discovery shows of a user's discovery.
+pub(crate) struct Overview {
+    pub settings: UserSettings,
+    /// The discovery folder, when the settings name one of the user's own folders.
+    pub folder: Option<Folder>,
+    /// Its pending tracks, soonest to expire first; those whose expiry cannot be read last.
+    pub pending: Vec<DiscoveryTrack>,
+    /// The current run, or one that ended in the last 5 minutes.
+    pub run: Option<DiscoveryProgress>,
+}
+
+/// `ctx`'s discovery: settings, folder, pending tracks and current run.
+pub(crate) async fn overview_in(
+    db: &SqlitePool,
+    effects: &dyn DiscoveryEffects,
+    ctx: &UserCtx,
+) -> Result<Overview, Failure> {
+    let settings = crate::core::settings::get_in(db, ctx).await?;
+    let folder = match settings.discovery_folder_id.as_deref() {
+        Some(id) if !id.is_empty() => Folder::get_by_id_in(db, id)
+            .await
+            .map_err(|e| database_failure(Stage::Input, e))?
+            .filter(|f| f.user_id == ctx.user_id),
+        _ => None,
+    };
+    let mut pending = match &folder {
+        Some(folder) => DiscoveryTrackRow::get_pending_by_folder_in(db, &folder.id)
+            .await
+            .map_err(|e| database_failure(Stage::Input, e))?,
+        None => vec![],
+    };
+    let lifetimes = settings.parse_lifetime_days();
+    pending.sort_by_key(|t| {
+        let expires = expires_at(t, &lifetimes);
+        (expires.is_none(), expires)
+    });
+    let run = (effects.current(&ctx.id()).await).and_then(|p| current_progress(&p, Utc::now()));
+    Ok(Overview {
+        settings,
+        folder,
+        pending,
+        run,
+    })
 }
 
 /// The track's folder when `user_id` owns it: `folder_not_found` for none, `not_your_track`
@@ -412,13 +465,14 @@ pub(crate) mod test_support {
     use crate::auth::UserId;
 
     /// Runs kept in a map under claim_run, generations and imports recorded, imports answering
-    /// Ok, held when `hold_imports` asked for it.
+    /// Ok unless `fail_imports` gave a failure, held when `hold_imports` asked for it.
     #[derive(Default)]
     pub(crate) struct TestDiscovery {
         runs: Mutex<HashMap<String, DiscoveryProgress>>,
         generated: Mutex<Vec<String>>,
         imports: Mutex<Vec<(PathBuf, PathBuf, Replace)>>,
         hold: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        import_failure: Mutex<Option<Failure>>,
     }
 
     impl TestDiscovery {
@@ -438,6 +492,11 @@ pub(crate) mod test_support {
             let pair = (Arc::new(Notify::new()), Arc::new(Notify::new()));
             *self.hold.lock().unwrap() = Some(pair.clone());
             pair
+        }
+
+        /// From now on every import answers `failure`.
+        pub(crate) fn fail_imports(&self, failure: Failure) {
+            *self.import_failure.lock().unwrap() = Some(failure);
         }
     }
 
@@ -469,7 +528,10 @@ pub(crate) mod test_support {
                 reached.notify_one();
                 release.notified().await;
             }
-            Ok(())
+            match self.import_failure.lock().unwrap().clone() {
+                Some(failure) => Err(failure),
+                None => Ok(()),
+            }
         }
     }
 }

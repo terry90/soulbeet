@@ -239,6 +239,7 @@ impl DiscoveryEffects for LiveDiscovery {
                 actor: actor.clone(),
                 origin,
             },
+            Replace::Never => Duplicates::Skip,
         };
         crate::import_queue::import_to_library(src, target, duplicates).await
     }

@@ -18,12 +18,14 @@ use serde_json::{json, Map};
 use crate::base_url::{explain_request, BaseExplanation, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
 use crate::connections::LoggedRequest;
+use crate::core::discovery::DiscoveryEffects;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::jobs::runner::{Acquire, ACQUIRE};
 use crate::mcp::status::{LiveStatus, StatusSource};
 use crate::oauth::cimd::{CimdFetcher, ClientDocuments, UnbuiltFetcher};
 use crate::oauth::limits::Limits;
 use crate::security::GateReason;
+use crate::server_fns::discovery::LiveDiscovery;
 use log::{base_and_problem, cut, header_value, Recording, RequestLog, LIVE_LOG};
 
 #[cfg(test)]
@@ -55,6 +57,8 @@ pub struct ConnectionState {
     pub(crate) log: Arc<RequestLog>,
     /// What the acquisition tools act through.
     pub(crate) acquire: Arc<Acquire>,
+    /// What the discovery tools start runs and import through.
+    pub(crate) discovery: Arc<dyn DiscoveryEffects>,
 }
 
 impl ConnectionState {
@@ -80,6 +84,7 @@ impl ConnectionState {
             navidrome_music_path: CONFIG.navidrome_music_path().map(Path::to_path_buf),
             log: LIVE_LOG.clone(),
             acquire: ACQUIRE.clone(),
+            discovery: Arc::new(LiveDiscovery),
         }
     }
 }

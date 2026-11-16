@@ -21,6 +21,7 @@ use crate::oauth::{now_unix, oauth_error, SCOPE};
 mod args;
 mod batches;
 pub(crate) mod contract;
+mod discovery;
 mod ensure;
 mod facts;
 mod imports;
