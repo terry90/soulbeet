@@ -1,7 +1,7 @@
 //! Ratings and stars of the caller's own songs and albums, each checked to exist for the
 //! caller first, and the rating sync: what it does with each rated song, and its report.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use crate::auth::{UserCtx, UserId};
 use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
-use crate::core::delete_guard::{paths, song_not_found};
+use crate::core::delete_guard::{paths, pending_track_of, song_not_found};
 use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin, Verdict};
 use crate::core::discovery::{is_not_pending, promote, DiscoveryEffects, NotDone, Replace};
 use crate::core::folders::folder_not_found;
@@ -53,38 +53,6 @@ impl Target {
     }
 }
 
-/// What the next rating sync does with a song at its new rating.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum SyncEffect {
-    PromotesDiscoveryTrack,
-    RemovesDiscoveryTrack,
-    DeletesFile,
-}
-
-impl SyncEffect {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            SyncEffect::PromotesDiscoveryTrack => "promotes_discovery_track",
-            SyncEffect::RemovesDiscoveryTrack => "removes_discovery_track",
-            SyncEffect::DeletesFile => "deletes_file",
-        }
-    }
-
-    pub(crate) fn message(self) -> &'static str {
-        match self {
-            SyncEffect::PromotesDiscoveryTrack => {
-                "This is a pending discovery track: the next rating sync moves it into your library"
-            }
-            SyncEffect::RemovesDiscoveryTrack => {
-                "This is a pending discovery track: the next rating sync deletes it"
-            }
-            SyncEffect::DeletesFile => {
-                "Auto-delete is on: the next rating sync deletes this song's file unless the delete checks keep it"
-            }
-        }
-    }
-}
-
 /// A rated or starred song or album as Navidrome listed it for the caller before the change.
 /// `title`, `artist` and `album` are its tags, Navidrome's text.
 #[derive(Debug, Clone, PartialEq)]
@@ -96,8 +64,6 @@ pub(crate) struct Annotated {
     pub album: Option<String>,
     pub previous_rating: Option<u8>,
     pub previously_starred: bool,
-    /// What the next rating sync does with a rated song; None for an album and a star.
-    pub effect: Option<SyncEffect>,
 }
 
 /// Why a rating or star was not made.
@@ -105,11 +71,10 @@ pub(crate) struct Annotated {
 pub(crate) enum NotSet {
     /// Refused or failed before the write request was sent: nothing changed.
     Refused(Failure),
-    /// Refused before the write request was sent for what the next rating sync would do with the
-    /// song at that rating: delete its file, or promote the pending discovery track
-    /// `discovery_track_id`, which can replace an earlier library copy. Nothing changed.
+    /// Refused before the write request was sent for what a rating sync could do with the song at
+    /// that rating (rating_refusal); `discovery_track_id` is the pending discovery track the song
+    /// is. Nothing changed.
     WouldDelete {
-        effect: SyncEffect,
         discovery_track_id: Option<String>,
         failure: Failure,
     },
@@ -130,14 +95,15 @@ impl NotSet {
     }
 }
 
-/// A 1-star song rating from a connected app while the user's auto-delete is on: the next rating
-/// sync would delete the file, also of a pending discovery track that is promoted first.
+/// A 1-star song rating from a connected app: once auto-delete is on, whenever the user turns it
+/// on, a rating sync deletes the file of each song rated 1 star as Soulful's own deletion, past the
+/// app's switch, its daily room and its name in the history, and without a preview.
 fn one_star_refused() -> Failure {
     Failure::new(
         FailureCode::PermissionNotGranted,
         Stage::Input,
         RetryAdvice::NeedsUser,
-        "A 1-star rating from a connected app would have Soulful delete this song's file at the next rating sync, because auto-delete is on. Rate it 1 star yourself in Navidrome, or turn auto-delete off in Soulful.",
+        "A connected app may not rate a song 1 star: while auto-delete is on, now or once it is turned on, the rating sync deletes the files of songs rated 1 star without a preview. Rate it 1 star yourself in Navidrome, or delete it with preview_delete_tracks and delete_tracks.",
     )
     .with_user_action(UserAction::new(
         UserActionCode::RateInNavidrome,
@@ -146,16 +112,17 @@ fn one_star_refused() -> Failure {
     ))
 }
 
-/// A rating from a connected app that would have the next rating sync promote a pending discovery
-/// track: the sync promotes with the guard, which can replace an earlier library copy of the
-/// song, deleting it as Soulful's own deletion, past the app's switch, its daily room and its
-/// name in the history. promote_discovery_track replaces as the app.
-fn promote_refused() -> Failure {
+/// A rating from a connected app of a pending discovery track: a rating sync promotes it at the
+/// promote threshold, through the guard, which can replace an earlier library copy of the song, or
+/// removes it at 1 star, whatever threshold the user sets before the sync runs. Either is Soulful's
+/// own deletion, past the app's switch, its daily room and its name in the history.
+/// promote_discovery_track replaces as the app.
+fn pending_rating_refused() -> Failure {
     Failure::new(
         FailureCode::PermissionNotGranted,
         Stage::Input,
         RetryAdvice::NeedsUser,
-        "A rating from a connected app at or above the promote threshold would have the next rating sync move this pending discovery track into your library, replacing and deleting any earlier copy of the song there. Promote it with promote_discovery_track, which replaces an earlier copy only while this app may delete music, within its daily limit, or rate the song yourself in Navidrome.",
+        "A connected app may not rate a pending discovery track: the rating sync moves it into your library at the promote threshold, replacing and deleting any earlier copy of the song there, or deletes it at 1 star. Promote it with promote_discovery_track, which replaces an earlier copy only while this app may delete music, within its daily limit, remove it with remove_discovery_track, or rate the song yourself in Navidrome.",
     )
     .with_user_action(UserAction::new(
         UserActionCode::RateInNavidrome,
@@ -166,20 +133,18 @@ fn promote_refused() -> Failure {
 
 /// Sets `user`'s rating of `target` to `rating` (0 clears it) for a connected app, after
 /// reading the target as Navidrome lists it for `navi`'s account (a song or album it lists for
-/// no one, or in a library this account cannot see, is not found). For a song, `effect` says
-/// what the next rating sync does with it. Refused before anything is written, as WouldDelete:
-/// a 1-star song rating while the user's auto-delete is on, and a rating that would have the
-/// sync promote a pending discovery track; also refused when the settings cannot be read.
+/// no one, or in a library this account cannot see, is not found). A song rating rating_refusal
+/// refuses is WouldDelete or Refused, before anything is written.
 pub(crate) async fn rate(
-    db: &SqlitePool,
+    guard: &Guard<'_>,
     navi: &NavidromeClient,
     user: &UserId,
     target: &Target,
     rating: u8,
 ) -> Result<Annotated, NotSet> {
-    let (mut annotated, song) = read(navi, target).await.map_err(NotSet::Refused)?;
-    if let Some(song) = song {
-        annotated.effect = sync_effect(db, user, song, rating).await?;
+    let (annotated, song) = read(navi, target).await.map_err(NotSet::Refused)?;
+    if let Some(song) = song.filter(|_| rating > 0) {
+        rating_refusal(guard, user, &song, rating).await?;
     }
     navi.set_rating(target.id(), rating)
         .await
@@ -187,7 +152,7 @@ pub(crate) async fn rate(
     Ok(annotated)
 }
 
-/// Stars or unstars `target` after reading it as `rate` does; `effect` is None.
+/// Stars or unstars `target` after reading it as `rate` does.
 pub(crate) async fn star(
     navi: &NavidromeClient,
     target: &Target,
@@ -220,7 +185,6 @@ async fn read(
                 album: song.album.clone(),
                 previous_rating: rated(song.user_rating),
                 previously_starred: song.starred.is_some(),
-                effect: None,
             };
             Ok((annotated, Some(song)))
         }
@@ -234,7 +198,6 @@ async fn read(
                 album: None,
                 previous_rating: rated(album.user_rating),
                 previously_starred: album.starred.is_some(),
-                effect: None,
             };
             Ok((annotated, None))
         }
@@ -246,50 +209,54 @@ fn rated(rating: Option<u8>) -> Option<u8> {
     rating.filter(|r| *r > 0)
 }
 
-/// What the next rating sync does with `song` rated `rating`, as the sync decides it: the
-/// pending discovery track of the user's discovery folder it is promoted or removed, else
-/// nothing. A 1-star rating while auto-delete is on is refused, and so is a rating at which a
-/// pending track of any folder of the user would be promoted: the sync reads only the discovery
-/// folder's tracks, but the folder can be changed back later.
-async fn sync_effect(
-    db: &SqlitePool,
+/// Why a connected app may not rate `song` `rating` (1 to 5), as WouldDelete: what a rating sync
+/// could do with it later, since the settings can change before the sync runs. A pending discovery
+/// track of any folder of the user is promoted at the promote threshold or removed at 1 star (the
+/// sync reads only the discovery folder's tracks, but the folder can change), and a library song
+/// rated 1 star is deleted while auto-delete is on. The track is told as the guard tells it
+/// (pending_track_of), the discovery folder's tracks first so the one named is the one the next
+/// sync acts on. Refused too, as Refused: when the settings or tracks cannot be read, and while
+/// the user has pending tracks, when the song's file cannot be told apart from theirs.
+async fn rating_refusal(
+    guard: &Guard<'_>,
     user: &UserId,
-    song: SubsonicSong,
+    song: &SubsonicSong,
     rating: u8,
-) -> Result<Option<SyncEffect>, NotSet> {
+) -> Result<(), NotSet> {
     let unreadable = |e: String| NotSet::Refused(database_failure(Stage::Input, e));
-    let settings = UserSettings::get_in(db, &user.to_string())
+    let settings = UserSettings::get_in(guard.db, &user.to_string())
         .await
         .map_err(unreadable)?;
-    if rating == 1 && settings.auto_delete_enabled {
-        return Err(NotSet::WouldDelete {
-            effect: SyncEffect::DeletesFile,
+    let mut pending = DiscoveryTrackRow::pending_for_user_in(guard.db, &user.to_string())
+        .await
+        .map_err(unreadable)?;
+    pending.sort_by_key(|t| Some(&t.folder_id) != settings.discovery_folder_id.as_ref());
+    let by_id = pending
+        .iter()
+        .find(|t| t.song_id.as_ref() == Some(&song.id));
+    let track = match by_id {
+        Some(track) => Some(track),
+        None if pending.is_empty() => None,
+        None => {
+            let native = (guard.read_song(user, &song.id).await)
+                .map_err(NotSet::Refused)?
+                .ok_or_else(|| NotSet::Refused(song_not_found()))?;
+            pending_track_of(guard.db, guard.music_path, user, &native, &pending)
+                .await
+                .map_err(NotSet::Refused)?
+        }
+    };
+    match (track, rating) {
+        (Some(track), _) => Err(NotSet::WouldDelete {
+            discovery_track_id: Some(track.id.clone()),
+            failure: pending_rating_refused(),
+        }),
+        (None, 1) => Err(NotSet::WouldDelete {
             discovery_track_id: None,
             failure: one_star_refused(),
-        });
+        }),
+        (None, _) => Ok(()),
     }
-    let mut pending = DiscoveryTrackRow::pending_for_user_in(db, &user.to_string())
-        .await
-        .map_err(unreadable)?;
-    // The song as the sync will list it: Navidrome lists a cleared rating as none.
-    let rated = SubsonicSong {
-        user_rating: (rating > 0).then_some(rating),
-        ..song
-    };
-    let threshold = settings.discovery_promote_threshold;
-    if let Some(PendingAction::Promote(track)) = pending_action(&rated, &pending, threshold) {
-        return Err(NotSet::WouldDelete {
-            effect: SyncEffect::PromotesDiscoveryTrack,
-            discovery_track_id: Some(track.id.clone()),
-            failure: promote_refused(),
-        });
-    }
-    pending.retain(|t| Some(&t.folder_id) == settings.discovery_folder_id.as_ref());
-    Ok(match pending_action(&rated, &pending, threshold) {
-        Some(PendingAction::Remove(_)) => Some(SyncEffect::RemovesDiscoveryTrack),
-        // A promote of a track of this folder was refused above.
-        Some(PendingAction::Promote(_)) | None => None,
-    })
 }
 
 /// A failed write of `target`: Navidrome's "data not found" (Subsonic 70) is the target gone.
@@ -301,21 +268,67 @@ fn write_failure(target: &Target, e: &NavidromeError) -> Failure {
     }
 }
 
-/// The pending discovery track `song` is: the track's song id when it has one, else the file
-/// name of the song's Subsonic path, ignoring ASCII case.
-pub(crate) fn pending_track_for<'a>(
-    song: &SubsonicSong,
-    pending: &'a [DiscoveryTrack],
-) -> Option<&'a DiscoveryTrack> {
-    let file_name = |path: &str| Path::new(path).file_name().map(|f| f.to_ascii_lowercase());
-    pending.iter().find(|track| match &track.song_id {
-        Some(song_id) => *song_id == song.id,
-        None => song
-            .path
-            .as_deref()
-            .and_then(file_name)
-            .is_some_and(|name| Some(name) == file_name(&track.path)),
-    })
+/// The pending track of `pending` each song of `songs` is, for the songs whose rating the sync
+/// acts on (at `promote_threshold` or above, or 1), keyed by song id: told as the guard tells it
+/// (pending_track_of), by the track's song id, else by `actor`'s native record of the song naming
+/// the track's staged file. A song whose size no staged file has cannot be one, so its record is
+/// not read. A song whose record or file cannot be read is none: the sync leaves it.
+pub(crate) async fn pending_songs<'p>(
+    guard: &Guard<'_>,
+    actor: &UserId,
+    songs: &[SubsonicSong],
+    pending: &'p [DiscoveryTrack],
+    promote_threshold: u8,
+) -> HashMap<String, &'p DiscoveryTrack> {
+    let mut staged_sizes = HashSet::new();
+    for track in pending {
+        if let Ok(meta) = tokio::fs::metadata(&track.path).await {
+            staged_sizes.insert(meta.len());
+        }
+    }
+    let mut found = HashMap::new();
+    for song in songs {
+        let acted_on = song
+            .user_rating
+            .is_some_and(|r| r >= promote_threshold || r == 1);
+        if !acted_on {
+            continue;
+        }
+        if let Some(track) = pending
+            .iter()
+            .find(|t| t.song_id.as_ref() == Some(&song.id))
+        {
+            found.insert(song.id.clone(), track);
+            continue;
+        }
+        if song.size.is_some_and(|size| !staged_sizes.contains(&size)) {
+            continue;
+        }
+        let native = match guard.read_song(actor, &song.id).await {
+            Ok(Some(native)) => native,
+            Ok(None) => continue,
+            Err(f) => {
+                info!(
+                    "Could not tell whether {} is a pending discovery track: {}",
+                    song.title,
+                    logged(&f)
+                );
+                continue;
+            }
+        };
+        match pending_track_of(guard.db, guard.music_path, actor, &native, pending).await {
+            Ok(Some(track)) => {
+                found.insert(song.id.clone(), track);
+            }
+            Ok(None) => {}
+            Err(f) => info!(
+                "Could not tell whether {} is a pending discovery track: {}",
+                song.title,
+                logged(&f)
+            ),
+        }
+    }
+    found
 }
 
 /// What the rating sync does with a pending discovery track the user rated.
@@ -324,15 +337,15 @@ pub(crate) enum PendingAction<'a> {
     Remove(&'a DiscoveryTrack),
 }
 
-/// Promote the pending track of `song` at `promote_threshold` or above, else remove it at
-/// rating 1.
+/// Promote the pending track of `song` (pending_songs) at `promote_threshold` or above, else
+/// remove it at rating 1.
 pub(crate) fn pending_action<'a>(
     song: &SubsonicSong,
-    pending: &'a [DiscoveryTrack],
+    pending: &HashMap<String, &'a DiscoveryTrack>,
     promote_threshold: u8,
 ) -> Option<PendingAction<'a>> {
     let rating = song.user_rating?;
-    let track = pending_track_for(song, pending)?;
+    let track = *pending.get(&song.id)?;
     if rating >= promote_threshold {
         Some(PendingAction::Promote(track))
     } else if rating == 1 {
@@ -492,8 +505,9 @@ pub(crate) struct SyncDeps<'a> {
 }
 
 /// `ctx`'s rating sync, once `deps.runs` gave it the user's claim: lists the songs with the
-/// caller's ratings, removes the pending discovery tracks rated 1 (remove_disliked_pending_in),
-/// promotes those rated at the threshold or above, then runs auto-delete when the settings have
+/// caller's ratings, tells which of them are pending tracks of the discovery folder
+/// (pending_songs), removes those rated 1 (remove_disliked_pending_in), promotes those rated at
+/// the threshold or above, then runs auto-delete on the other songs rated 1 when the settings have
 /// it on and `permit` allows it, storing the tracks it kept. Promotes replace and auto-delete
 /// deletes as `permit` says: Origin::Auto for Allowed, the app's Origin::Mcp for ForApp (each
 /// file checked against its switch and the day's room); an app that may not delete promotes with
@@ -514,12 +528,13 @@ pub(crate) async fn sync_in(
     let unreadable = |e: String| database_failure(Stage::Input, e);
     let settings = (UserSettings::get_in(deps.db, &ctx.user_id).await).map_err(unreadable)?;
     let threshold = settings.discovery_promote_threshold;
-    let pending = match &settings.discovery_folder_id {
+    let tracks_of_folder = match &settings.discovery_folder_id {
         Some(fid) => {
             (DiscoveryTrackRow::get_pending_by_folder_in(deps.db, fid).await).map_err(unreadable)?
         }
         None => vec![],
     };
+    let pending = pending_songs(deps.guard, &user, &songs, &tracks_of_folder, threshold).await;
 
     let mut tracks = remove_disliked_pending_in(deps.db, &songs, &pending, threshold).await;
     let origin = match &permit {
@@ -549,16 +564,17 @@ pub(crate) async fn sync_in(
     tracks.retain(|t| !t.not_pending());
     let mut not_pending = (listed - tracks.len()) as u32;
 
-    let (auto_delete, deleting_as) = match (settings.auto_delete_enabled, &origin) {
-        (false, _) => (AutoDeleteRan::Off, None),
-        (true, None) => (AutoDeleteRan::NotAllowed, None),
-        (true, Some(origin)) => (AutoDeleteRan::On, Some(origin)),
-    };
     let (mut kept, mut kept_not_stored) = (0, None);
-    match deleting_as {
-        None if auto_delete == AutoDeleteRan::Off => info!("Auto-delete is disabled for this user"),
-        None => info!("Auto-delete is skipped: this app may not delete"),
-        Some(origin) => {
+    let auto_delete = match (settings.auto_delete_enabled, &origin) {
+        (false, _) => {
+            info!("Auto-delete is disabled for this user");
+            AutoDeleteRan::Off
+        }
+        (true, None) => {
+            info!("Auto-delete is skipped: this app may not delete");
+            AutoDeleteRan::NotAllowed
+        }
+        (true, Some(origin)) => {
             let mut run =
                 auto_delete_songs(deps.guard, &user, &songs, &pending, deps.queue, origin).await;
             let listed = run.len();
@@ -573,8 +589,9 @@ pub(crate) async fn sync_in(
             }
             kept = kept_tracks.len() as u32;
             tracks.extend(run);
+            AutoDeleteRan::On
         }
-    }
+    };
     let report = SyncReport {
         scanned: songs.len() as u32,
         auto_delete,
@@ -642,7 +659,7 @@ pub(crate) async fn sync(ctx: &UserCtx, permit: AutoDeletePermit) -> Result<Sync
 pub(crate) async fn remove_disliked_pending_in(
     db: &SqlitePool,
     songs: &[SubsonicSong],
-    pending: &[DiscoveryTrack],
+    pending: &HashMap<String, &DiscoveryTrack>,
     promote_threshold: u8,
 ) -> Vec<SyncedTrack> {
     let mut removed = Vec::new();
@@ -669,19 +686,20 @@ pub(crate) async fn remove_disliked_pending_in(
     removed
 }
 
-/// Deletes through the guard every song of `songs` that `actor` rated 1 and pending_track_for
-/// does not match in `pending`: a library file is carried out as `origin`, a pending discovery
-/// track the guard finds is removed as a staged track. Only a song the fresh record still shows at 1
+/// Deletes through the guard every song of `songs` that `actor` rated 1 and that is not in
+/// `pending` (pending_songs): a library file is carried out as `origin`, a pending discovery track
+/// the guard finds is removed as a staged track. Only a song the fresh record still shows at 1
 /// star is removed; one rated otherwise since `songs` was listed is skipped, also when the
 /// guard refuses it. A song whose file an earlier deletion of `actor` removed, which Navidrome
 /// lists until it notices, is skipped. Every other song is an entry, with the failure that kept
 /// it when one did; a discovery track no longer pending carries track_not_pending, which
-/// sync_in counts as skipped.
+/// sync_in counts as skipped. Once the day's room of an app (Origin::Mcp) is used up, each
+/// further song is kept with that refusal and Navidrome is not read for it.
 pub(crate) async fn auto_delete_songs(
     guard: &Guard<'_>,
     actor: &UserId,
     songs: &[SubsonicSong],
-    pending: &[DiscoveryTrack],
+    pending: &HashMap<String, &DiscoveryTrack>,
     queue: &ImportQueue,
     origin: &Origin,
 ) -> Vec<SyncedTrack> {
@@ -693,8 +711,9 @@ pub(crate) async fn auto_delete_songs(
             vec![]
         }
     };
+    let mut room_used_up: Option<Failure> = None;
     for song in songs {
-        if song.user_rating != Some(1) || pending_track_for(song, pending).is_some() {
+        if song.user_rating != Some(1) || pending.contains_key(&song.id) {
             continue;
         }
         let artist = song.artist.as_deref().unwrap_or_default();
@@ -704,6 +723,10 @@ pub(crate) async fn auto_delete_songs(
             continue;
         }
         let delete = SyncedTrack::of(song, SyncAction::Delete, None);
+        if let Some(limit) = &room_used_up {
+            run.push(delete.with_failure(Some(limit.clone())));
+            continue;
+        }
         let entry = match guard.check_song(actor, &song.id).await {
             Ok(Verdict::Library(checked)) if checked.song.rating == 1 => {
                 let forget = ForgetVia::Queue(queue.clone());
@@ -712,7 +735,11 @@ pub(crate) async fn auto_delete_songs(
                 let done = guard
                     .carry_out(actor, checked, reason, origin, forget)
                     .await;
-                Some(delete.with_failure(done.err().map(NotRemoved::into_failure)))
+                let failure = done.err().map(NotRemoved::into_failure);
+                if failure.as_ref().map(|f| f.code) == Some(FailureCode::DeleteDailyLimit) {
+                    room_used_up = failure.clone();
+                }
+                Some(delete.with_failure(failure))
             }
             Ok(Verdict::Library(_)) => {
                 skipped("no longer rated 1");
@@ -805,7 +832,6 @@ mod tests {
     use crate::core::discovery::promote_file_gone;
     use crate::core::discovery::test_support::TestDiscovery;
     use crate::core::test_ctx;
-    use crate::db::test_db;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use crate::models::user_settings::UpdateUserSettings;
     use crate::services::NavidromeLookupError;
@@ -813,7 +839,7 @@ mod tests {
         album_body, search3_body, song_body, subsonic_failed, subsonic_song, NavidromeFor,
         NavidromeStub, HOLY,
     };
-    use shared::navidrome::{DiscoveryStatus, SyncResult};
+    use shared::navidrome::SyncResult;
     use soulbeet::navidrome::models::NativeSong;
 
     const WINTER: &str = "7hQ2nLr5VxZ0cYbM8wTkAf";
@@ -830,15 +856,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_one_star_rating_is_refused_while_auto_delete_is_on() {
+    async fn a_one_star_song_rating_is_refused_whatever_auto_delete_says_now() {
+        // Auto-delete off: the user may turn it on before the next sync, which would then delete
+        // the file as Soulful's own deletion.
         let lib = Library::new().await;
         let navi = NavidromeStub::start();
         navi.answer(
             "/rest/getSong",
             &[&song_body(HOLY.0, HOLY.1, Some(4), false)],
         );
-        let (alice, holy) = (lib.alice(), Target::Song(HOLY.0.into()));
-        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1)
+        let (guard, alice, holy) = (lib.guard(), lib.alice(), Target::Song(HOLY.0.into()));
+        let refused = Err(NotSet::WouldDelete {
+            discovery_track_id: None,
+            failure: one_star_refused(),
+        });
+        for on in [false, true] {
+            set(&lib.db, auto_delete(on)).await;
+            assert_eq!(
+                rate(&guard, &navi.client(), &alice, &holy, 1).await,
+                refused,
+                "auto-delete {on}"
+            );
+        }
+        assert!(navi.posted("/rest/setRating").is_empty());
+        let a = rate(&guard, &navi.client(), &alice, &holy, 2)
             .await
             .unwrap();
         assert_eq!(
@@ -850,89 +891,28 @@ mod tests {
                 album: Some("Winter Songs".into()),
                 previous_rating: Some(4),
                 previously_starred: false,
-                effect: None,
             }
         );
-        // A pending discovery track of the discovery folder with that song id: the sync removes
-        // it as discovery's own cleanup.
-        let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
-        lib.pending_track("t1", "alice-music", "Explore", &staged, Some(HOLY.0))
-            .await;
-        set(
-            &lib.db,
-            UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
-                ..Default::default()
-            },
-        )
-        .await;
-        let a = rate(&lib.db, &navi.client(), &alice, &holy, 1).await;
-        assert_eq!(a.unwrap().effect, Some(SyncEffect::RemovesDiscoveryTrack));
-        let sent = format!("id={}&rating=1", HOLY.0);
-        assert_eq!(navi.posted("/rest/setRating"), [sent.clone(), sent.clone()]);
-
-        // On: refused, pending track or not (it could be promoted first, then deleted).
-        set(&lib.db, auto_delete(true)).await;
-        assert_eq!(
-            rate(&lib.db, &navi.client(), &alice, &holy, 1).await,
-            Err(NotSet::WouldDelete {
-                effect: SyncEffect::DeletesFile,
-                discovery_track_id: None,
-                failure: one_star_refused()
-            })
-        );
-        // A setting that cannot be read refuses too.
+        // A setting that cannot be read refuses too; clearing a rating reads none.
         lib.db.close().await;
-        let e = rate(&lib.db, &navi.client(), &alice, &holy, 1)
+        let e = rate(&guard, &navi.client(), &alice, &holy, 3)
             .await
             .unwrap_err();
         assert_eq!(
             (e.after_write(), e.failure().code),
             (false, FailureCode::SettingsUnreadable)
         );
-        assert_eq!(navi.posted("/rest/setRating"), [sent.clone(), sent]);
-    }
-
-    #[tokio::test]
-    async fn a_rating_that_would_promote_a_pending_track_is_refused_for_every_app() {
-        let lib = Library::new().await;
-        let navi = NavidromeStub::start();
-        navi.answer("/rest/getSong", &[&song_body(HOLY.0, HOLY.1, None, true)]);
-        // No song id yet: the sync matches it by the file name of the song's path.
-        let staged = lib
-            .root
-            .join("music/alice/Discovery/Balanced/01-03 - O Holy Night.flac");
-        lib.pending_track("t1", "alice-music", "Balanced", &staged, None)
-            .await;
-        set(
-            &lib.db,
-            UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
-                auto_delete_enabled: Some(true),
-                ..Default::default()
-            },
-        )
-        .await;
-        let holy = Target::Song(HOLY.0.into());
-        // The 6 hourly sync would promote it with the guard as Soulful's own deletion, replacing
-        // an earlier library copy past the app's switch and daily room, so nothing is written.
-        assert_eq!(
-            rate(&lib.db, &navi.client(), &lib.alice(), &holy, 3).await,
-            Err(NotSet::WouldDelete {
-                effect: SyncEffect::PromotesDiscoveryTrack,
-                discovery_track_id: Some("t1".into()),
-                failure: promote_refused()
-            })
-        );
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 2)
+        rate(&guard, &navi.client(), &alice, &holy, 0)
             .await
             .unwrap();
         assert_eq!(
-            (a.previous_rating, a.previously_starred, a.effect),
-            (None, true, None)
+            navi.posted("/rest/setRating"),
+            [
+                format!("id={}&rating=2", HOLY.0),
+                format!("id={}&rating=0", HOLY.0)
+            ]
         );
-        assert_eq!(navi.posted("/rest/setRating").len(), 1);
-        let f = promote_refused();
+        let f = one_star_refused();
         assert_eq!(
             (f.code, f.stage, f.retry, f.user_action.map(|a| a.code)),
             (
@@ -945,48 +925,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_promoting_rating_is_refused_for_a_pending_track_of_any_folder_of_the_user() {
+    async fn any_rating_of_a_pending_track_told_by_its_file_is_refused() {
+        // No song id yet: the guard tells the track by the file the song's native record names.
+        // Every rating is refused, whatever the threshold now: the user may lower it before the
+        // sync, which would then promote the track as Soulful's own deletion.
+        let lib = Library::new().await;
+        lib.song(HOLY.0, "alice/Discovery/Balanced/03.flac", b"audio");
+        let staged = lib.root.join("music/alice/Discovery/Balanced/03.flac");
+        lib.pending_track("t1", "alice-music", "Balanced", &staged, None)
+            .await;
+        // A library song whose file has the same name is not that track.
+        lib.song("s6", "alice/A/03.flac", b"audio");
+        set(
+            &lib.db,
+            UpdateUserSettings {
+                discovery_folder_id: Some("alice-music".into()),
+                discovery_promote_threshold: Some(4),
+                ..Default::default()
+            },
+        )
+        .await;
+        let navi = NavidromeStub::start();
+        navi.answer_when(
+            "/rest/getSong",
+            &format!("id={}", HOLY.0),
+            200,
+            &song_body(HOLY.0, HOLY.1, None, true),
+        );
+        navi.answer(
+            "/rest/getSong",
+            &[&song_body("s6", "Silent Night", None, false)],
+        );
+        let (guard, holy) = (lib.guard(), Target::Song(HOLY.0.into()));
+        for rating in [1, 3, 5] {
+            assert_eq!(
+                rate(&guard, &navi.client(), &lib.alice(), &holy, rating).await,
+                Err(NotSet::WouldDelete {
+                    discovery_track_id: Some("t1".into()),
+                    failure: pending_rating_refused()
+                }),
+                "rating {rating}"
+            );
+        }
+        assert!(navi.posted("/rest/setRating").is_empty());
+        let a = rate(&guard, &navi.client(), &lib.alice(), &holy, 0)
+            .await
+            .unwrap();
+        assert_eq!((a.previous_rating, a.previously_starred), (None, true));
+        let silent = Target::Song("s6".into());
+        rate(&guard, &navi.client(), &lib.alice(), &silent, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            navi.posted("/rest/setRating"),
+            [
+                format!("id={}&rating=0", HOLY.0),
+                "id=s6&rating=3".to_string()
+            ]
+        );
+        // A song whose file cannot be found here cannot be told apart from the track.
+        std::fs::remove_file(lib.root.join("music/alice/A/03.flac")).unwrap();
+        let e = rate(&guard, &navi.client(), &lib.alice(), &silent, 3)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (e.after_write(), e.failure().code),
+            (false, FailureCode::DeletePathUnresolved)
+        );
+        assert_eq!(navi.posted("/rest/setRating").len(), 2);
+        assert_eq!(lib.fake.ratings_set(), vec![], "the guard wrote no rating");
+    }
+
+    #[tokio::test]
+    async fn a_rating_is_refused_for_a_pending_track_of_any_folder_of_the_user() {
         // t1 is pending in alice-music while the discovery folder is alice-other: the sync does
-        // not read it now, but would promote it once the folder is alice-music again.
+        // not read it now, but would act on it once the folder is alice-music again.
         let lib = Library::new().await;
         lib.folder("alice", "alice-other", "music/alice-other", false)
             .await;
         let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
         lib.pending_track("t1", "alice-music", "Explore", &staged, Some(HOLY.0))
             .await;
-        // Another user's pending track of the same song is not alice's to promote.
+        // Another user's pending track of the same song is not alice's.
         let bobs = lib.root.join("music/bob/Discovery/Explore/03.flac");
         lib.pending_track("t2", "bob-music", "Explore", &bobs, Some(HOLY.0))
             .await;
-        set(
-            &lib.db,
-            UpdateUserSettings {
-                discovery_folder_id: Some("alice-other".into()),
-                ..Default::default()
-            },
-        )
-        .await;
+        let discovery_folder = |id: &str| UpdateUserSettings {
+            discovery_folder_id: Some(id.into()),
+            ..Default::default()
+        };
+        set(&lib.db, discovery_folder("alice-other")).await;
         let navi = NavidromeStub::start();
         navi.answer("/rest/getSong", &[&song_body(HOLY.0, HOLY.1, None, false)]);
-        let holy = Target::Song(HOLY.0.into());
-        assert_eq!(
-            rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5).await,
+        let (guard, holy) = (lib.guard(), Target::Song(HOLY.0.into()));
+        let refused = |track: &str| {
             Err(NotSet::WouldDelete {
-                effect: SyncEffect::PromotesDiscoveryTrack,
-                discovery_track_id: Some("t1".into()),
-                failure: promote_refused()
+                discovery_track_id: Some(track.into()),
+                failure: pending_rating_refused(),
             })
+        };
+        assert_eq!(
+            rate(&guard, &navi.client(), &lib.alice(), &holy, 5).await,
+            refused("t1")
+        );
+        // A track of the same song in the discovery folder is the one named: the next sync acts
+        // on it.
+        let other = lib.root.join("music/alice-other/Discovery/Explore/03.flac");
+        lib.pending_track("t3", "alice-other", "Explore", &other, Some(HOLY.0))
+            .await;
+        assert_eq!(
+            rate(&guard, &navi.client(), &lib.alice(), &holy, 5).await,
+            refused("t3")
+        );
+        set(&lib.db, discovery_folder("alice-music")).await;
+        assert_eq!(
+            rate(&guard, &navi.client(), &lib.alice(), &holy, 5).await,
+            refused("t1")
         );
         assert_eq!(navi.posted("/rest/setRating").len(), 0);
-        // With t1 no longer pending, bob's track is no reason to refuse.
-        sqlx::query("UPDATE discovery_tracks SET status = 'Removed' WHERE id = 't1'")
+        // With neither pending any more, bob's track is no reason to refuse.
+        sqlx::query("UPDATE discovery_tracks SET status = 'Removed' WHERE id IN ('t1', 't3')")
             .execute(&lib.db)
             .await
             .unwrap();
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5)
+        rate(&guard, &navi.client(), &lib.alice(), &holy, 5)
             .await
             .unwrap();
-        assert_eq!(a.effect, None);
         assert_eq!(navi.posted("/rest/setRating").len(), 1);
     }
 
@@ -998,7 +1062,7 @@ mod tests {
         let navi = NavidromeStub::start();
         navi.answer("/rest/getAlbum", &[&album_body(WINTER, "Winter Songs", 0)]);
         let winter = Target::Album(WINTER.into());
-        let a = rate(&lib.db, &navi.client(), &lib.alice(), &winter, 1)
+        let a = rate(&lib.guard(), &navi.client(), &lib.alice(), &winter, 1)
             .await
             .unwrap();
         assert_eq!(
@@ -1010,7 +1074,6 @@ mod tests {
                 album: None,
                 previous_rating: None,
                 previously_starred: true,
-                effect: None,
             }
         );
         assert_eq!(
@@ -1030,10 +1093,7 @@ mod tests {
         let a = star(&navi.client(), &Target::Song(HOLY.0.into()), true)
             .await
             .unwrap();
-        assert_eq!(
-            (a.previous_rating, a.previously_starred, a.effect),
-            (Some(2), true, None)
-        );
+        assert_eq!((a.previous_rating, a.previously_starred), (Some(2), true));
         let a = star(&navi.client(), &Target::Album(WINTER.into()), false)
             .await
             .unwrap();
@@ -1052,10 +1112,17 @@ mod tests {
         // this account cannot see answers.
         navi.answer("/rest/getSong", &[&subsonic_failed(70, "Song not found")]);
         navi.answer("/rest/getAlbum", &[&subsonic_failed(70, "Album not found")]);
-        let db = test_db::migrated().await;
+        let lib = Library::new().await;
         let alice = UserId::new("alice");
         assert_eq!(
-            rate(&db, &navi.client(), &alice, &Target::Song("gone".into()), 5).await,
+            rate(
+                &lib.guard(),
+                &navi.client(),
+                &alice,
+                &Target::Song("gone".into()),
+                5
+            )
+            .await,
             Err(NotSet::Refused(song_not_found()))
         );
         assert_eq!(
@@ -1074,39 +1141,63 @@ mod tests {
         navi.answer("/rest/getSong", &[&song_body(HOLY.0, HOLY.1, None, false)]);
         // server/subsonic/media_annotation.go:42-46 (model.GetEntityByID), api.go:304-305
         navi.answer("/rest/setRating", &[&subsonic_failed(70, "data not found")]);
-        let db = test_db::migrated().await;
+        let lib = Library::new().await;
         let holy = Target::Song(HOLY.0.into());
         assert_eq!(
-            rate(&db, &navi.client(), &UserId::new("alice"), &holy, 2).await,
+            rate(
+                &lib.guard(),
+                &navi.client(),
+                &UserId::new("alice"),
+                &holy,
+                2
+            )
+            .await,
             Err(NotSet::WriteFailed(song_not_found()))
         );
     }
 
-    #[test]
-    fn a_track_with_a_song_id_matches_only_that_song() {
-        let track = DiscoveryTrack {
-            id: "t1".into(),
-            song_id: Some("s5".into()),
-            title: "O Holy Night".into(),
-            artist: "Marrow Choir".into(),
-            album: "Winter Songs".into(),
-            path: "/music/alice/Discovery/Explore/03.flac".into(),
-            folder_id: "alice-music".into(),
-            profile: "Explore".into(),
-            rating: None,
-            status: DiscoveryStatus::Pending,
-            created_at: "2026-11-15 20:00:00".into(),
-        };
-        let same_name = SubsonicSong {
+    #[tokio::test]
+    async fn pending_songs_tells_tracks_by_their_file_as_the_guard_does() {
+        let lib = Library::new().await;
+        lib.song("s5", "alice/Discovery/Explore/03.flac", b"audio");
+        lib.song("s6", "alice/A/03.flac", b"audio");
+        let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
+        let track = lib
+            .pending_track("t1", "alice-music", "Explore", &staged, None)
+            .await;
+        let rated = |id: &str, rating: u8, size: u64| SubsonicSong {
+            // The Subsonic path names no file of this machine.
             path: Some("Marrow Choir/Explore/03.flac".into()),
-            ..subsonic_song("s6", "O Holy Night", Some(1))
+            size: Some(size),
+            ..subsonic_song(id, "O Holy Night", Some(rating))
         };
-        assert!(pending_track_for(&same_name, std::slice::from_ref(&track)).is_none());
-        assert!(pending_track_for(
-            &subsonic_song("s5", "O Holy Night", Some(1)),
-            std::slice::from_ref(&track)
-        )
-        .is_some());
+        let songs = [
+            rated("s5", 5, 5),
+            rated("s6", 5, 5),
+            // No staged file has its size: its record is not read.
+            rated("s7", 5, 9),
+            // Below the threshold and above 1: the sync does nothing with it.
+            rated("s8", 3, 5),
+        ];
+        let pending = std::slice::from_ref(&track);
+        let found = pending_songs(&lib.guard(), &lib.alice(), &songs, pending, 4).await;
+        assert_eq!(
+            found
+                .iter()
+                .map(|(s, t)| (s.as_str(), t.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("s5", "t1")]
+        );
+        assert_eq!(lib.fake.reads_by("alice"), 2);
+        // A track with a song id is that song's, read from nothing.
+        let by_id = DiscoveryTrack {
+            song_id: Some("s6".into()),
+            ..track.clone()
+        };
+        let tracks = [by_id];
+        let found = pending_songs(&lib.guard(), &lib.alice(), &songs[1..2], &tracks, 4).await;
+        assert_eq!(found.keys().collect::<Vec<_>>(), ["s6"]);
+        assert_eq!(lib.fake.reads_by("alice"), 2);
     }
 
     /// Each entry's song, action and failure code.
@@ -1137,7 +1228,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue(),
             &Origin::Auto,
         )
@@ -1190,7 +1281,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue(),
             &Origin::Auto,
         )
@@ -1209,7 +1300,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue,
             &Origin::Auto,
         )
@@ -1221,7 +1312,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue,
             &Origin::Auto,
         )
@@ -1245,7 +1336,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue,
             &Origin::Auto,
         )
@@ -1257,7 +1348,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue,
             &Origin::Auto,
         )
@@ -1270,7 +1361,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue,
             &Origin::Auto,
         )
@@ -1286,7 +1377,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue,
             &Origin::Auto,
         )
@@ -1306,7 +1397,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue,
             &Origin::Auto,
         )
@@ -1330,7 +1421,7 @@ mod tests {
             &lib.guard(),
             &lib.alice(),
             &songs,
-            &[],
+            &HashMap::new(),
             &queue(),
             &Origin::Auto,
         )
@@ -1359,27 +1450,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_one_star_discovery_track_is_removed_without_navidrome_placing_its_file() {
-        // Navidrome has no record of s9 for anyone, and the track has no song id yet: today's file
-        // name match on the Subsonic path still finds it, and the guard is never asked.
+    async fn a_one_star_discovery_track_told_by_its_file_is_removed_as_a_staged_track() {
+        // The track has no song id yet: the song's native record names its staged file.
         let lib = Library::new().await;
-        let staged = lib
-            .root
-            .join("music/alice/Discovery/Explore/Marrow Choir/03 - O Holy Night.flac");
-        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        std::fs::write(&staged, b"audio").unwrap();
+        let rel = "alice/Discovery/Explore/Marrow Choir/03 - O Holy Night.flac";
+        lib.song("s9", rel, b"audio");
+        let staged = lib.root.join("music").join(rel);
         let track = lib
             .pending_track("t1", "alice-music", "Explore", &staged, None)
             .await;
         let song = SubsonicSong {
-            path: Some("Marrow Choir/Explore/03 - O HOLY NIGHT.flac".into()),
+            size: Some(5),
             ..subsonic_song("s9", "O Holy Night", Some(1))
         };
-        let pending = vec![track];
+        let songs = std::slice::from_ref(&song);
+        let tracks = vec![track];
+        let pending = pending_songs(&lib.guard(), &lib.alice(), songs, &tracks, 3).await;
         assert!(
             matches!(pending_action(&song, &pending, 1), Some(PendingAction::Promote(t)) if t.id == "t1")
         );
-        let songs = std::slice::from_ref(&song);
         assert_eq!(
             remove_disliked_pending_in(&lib.db, songs, &pending, 1).await,
             vec![]
@@ -1411,10 +1500,7 @@ mod tests {
             ),
             ("Removed".into(), "removed".into())
         );
-        assert_eq!(
-            (lib.fake.reads_by("alice"), lib.fake.reads_by("bob")),
-            (0, 0)
-        );
+        assert_eq!(lib.fake.ratings_set(), vec![], "the guard never checked it");
     }
 
     fn deps<'a>(
@@ -1668,6 +1754,8 @@ mod tests {
         let lib = Library::new().await;
         lib.song("s2", "alice/B/y.flac", b"audio");
         lib.fake.rates("alice", "s2", 1);
+        lib.song("s3", "alice/C/z.flac", b"audio");
+        lib.fake.rates("alice", "s3", 1);
         lib.app("g1", "alice", true).await;
         lib.app_deletions(99, 3_600).await;
         set(&lib.db, auto_delete(true)).await;
@@ -1675,8 +1763,12 @@ mod tests {
         navi.answer(
             "/rest/search3",
             &[
-                &search3_body(&[("s1", "O Holy Night", 1), ("s2", "Silent Night", 1)]),
-                &search3_body(&[("s2", "Silent Night", 1)]),
+                &search3_body(&[
+                    ("s1", "O Holy Night", 1),
+                    ("s2", "Silent Night", 1),
+                    ("s3", "Away in a Manger", 1),
+                ]),
+                &search3_body(&[("s2", "Silent Night", 1), ("s3", "Away in a Manger", 1)]),
             ],
         );
         let (of, guard, runs, discovery, queue) = (
@@ -1697,9 +1789,21 @@ mod tests {
                 .iter()
                 .map(|t| (t.song_id.as_str(), t.failure.as_ref().map(|f| f.code)))
                 .collect::<Vec<_>>(),
-            vec![("s1", None), ("s2", Some(FailureCode::DeleteDailyLimit))]
+            vec![
+                ("s1", None),
+                ("s2", Some(FailureCode::DeleteDailyLimit)),
+                ("s3", Some(FailureCode::DeleteDailyLimit))
+            ]
         );
         assert_eq!(report.auto_delete, AutoDeleteRan::On);
+        // Once the room is used up, s3 is kept without Navidrome being read for it: rule 4 wrote
+        // the ratings of s1 and s2 only.
+        assert_eq!(
+            (lib.fake.ratings_set().iter())
+                .map(|(_, song, _)| song.as_str())
+                .collect::<Vec<_>>(),
+            ["s1", "s2"]
+        );
         assert!(
             !lib.root.join("music/alice/A/x.flac").exists()
                 && lib.root.join("music/alice/B/y.flac").exists()
@@ -1710,13 +1814,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row, ("mcp".into(), Some("claude.ai".into())));
-        // Settings lists the track the limit kept.
+        // Settings lists the tracks the limit kept, by artist and title.
         let listed = DeletionBlockRow::for_user_in(&lib.db, "alice")
             .await
             .unwrap();
         assert_eq!(
-            (listed.len(), listed[0].title.as_str()),
-            (1, "Silent Night")
+            listed.iter().map(|k| k.title.as_str()).collect::<Vec<_>>(),
+            ["Away in a Manger", "Silent Night"]
         );
         // The web UI's sync and the automation stay origin auto and are not counted.
         let report = sync_in(&deps, &test_ctx("alice"), AutoDeletePermit::Allowed)
@@ -1728,7 +1832,7 @@ mod tests {
                 .iter()
                 .map(|t| (t.song_id.as_str(), t.failure.is_none()))
                 .collect::<Vec<_>>(),
-            vec![("s2", true)]
+            vec![("s2", true), ("s3", true)]
         );
         let row: (String, Option<String>) =
             sqlx::query_as("SELECT origin, client FROM deletion_reviews WHERE song_id = 's2'")
@@ -1811,8 +1915,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_track_another_action_took_first_is_skipped_and_counted() {
-        // Two songs whose files share each pending track's file name: the first promote and the
-        // first removal take the track, the second finds it no longer pending.
+        // Two songs whose native records name each pending track's staged file: the first promote
+        // and the first removal take the track, the second finds it no longer pending.
         let lib = Library::new().await;
         set(
             &lib.db,
@@ -1822,11 +1926,16 @@ mod tests {
             },
         )
         .await;
-        for (id, name) in [("t1", "03.flac"), ("t2", "04.flac")] {
-            let staged = lib.root.join("music/alice/Discovery/Explore").join(name);
-            std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
-            std::fs::write(&staged, b"audio").unwrap();
-            lib.pending_track(id, "alice-music", "Explore", &staged, None)
+        for (track, songs, name) in [
+            ("t1", ["s5", "s6"], "03.flac"),
+            ("t2", ["s7", "s8"], "04.flac"),
+        ] {
+            let rel = format!("alice/Discovery/Explore/{name}");
+            for song in songs {
+                lib.song(song, &rel, b"audio");
+            }
+            let staged = lib.root.join("music").join(&rel);
+            lib.pending_track(track, "alice-music", "Explore", &staged, None)
                 .await;
         }
         let mut body: serde_json::Value = serde_json::from_str(&search3_body(&[
@@ -1839,13 +1948,8 @@ mod tests {
         let songs = body["subsonic-response"]["searchResult3"]["song"]
             .as_array_mut()
             .unwrap();
-        for (song, path) in songs.iter_mut().zip([
-            "Marrow Choir/Explore/03.flac",
-            "Marrow Choir/Winter/03.flac",
-            "Marrow Choir/Explore/04.flac",
-            "Marrow Choir/Winter/04.flac",
-        ]) {
-            song["path"] = serde_json::json!(path);
+        for song in songs.iter_mut() {
+            song["size"] = serde_json::json!(5);
         }
         let navi = NavidromeStub::start();
         navi.answer("/rest/search3", &[&body.to_string()]);

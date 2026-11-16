@@ -6,14 +6,15 @@ use shared::failure::{cut_json, Stage, TEXT_MAX_CHARS};
 
 use super::args::Args;
 use super::contract::{failed, invalid_value, success, upstream_error, NextCall, ToolError};
-use super::discovery::PROMOTE_DISCOVERY_TRACK;
+use super::discovery::{PROMOTE_DISCOVERY_TRACK, REMOVE_DISCOVERY_TRACK};
 use super::keys::{keyed, request_key, Keyed};
 use super::library::navidrome_of;
 use super::refs::request_key_schema;
 use super::server::{common_codes, ToolSpec, NAVIDROME_CODES};
 use super::McpCaller;
 use crate::connection::ConnectionState;
-use crate::core::ratings::{self, Annotated, NotSet, SyncEffect, Target};
+use crate::core::delete_guard::Guard;
+use crate::core::ratings::{self, Annotated, NotSet, Target};
 
 const SET_RATING_ARGS: &[&str] = &["song_id", "album_id", "rating", "request_key"];
 
@@ -24,7 +25,7 @@ pub(crate) const SET_RATING: ToolSpec = ToolSpec {
     title: "Rate a song or album",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Sets this user's own rating (0 to 5, 0 clears it) of a song or album in Navidrome; other users' ratings are theirs and are never read or changed. For a song, rating_sync says what the next rating sync will do with it: move a pending discovery track into the library, replacing an earlier copy of the song there, or delete one rated 1. While this user's auto-delete is on, a 1-star rating of a song is refused and nothing is written, since the next rating sync would delete its file: the user rates it 1 star in Navidrome instead. A rating at or above the promote threshold of a song that is a pending discovery track, in the discovery folder or another folder of this user, is refused too, whether or not deletion is switched on for this app, since a rating sync would move it into the library, which can replace and delete an earlier copy outside this app's daily limit; next offers promote_discovery_track, which replaces one only while deletion is switched on for this app, counted in its daily limit. Album ratings are never refused. Song and album ids stay valid while the files stay in the library. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome lists no such song or album for this user), permission_not_granted (a 1-star song rating while auto-delete is on, or a promoting rating), already_running.")
+        format!("Sets this user's own rating (0 to 5, 0 clears it) of a song or album in Navidrome; other users' ratings are theirs and are never read or changed. A song rating that a rating sync could act on is refused and nothing is written, whatever the settings say now, since they can change before the sync runs: a 1-star rating of a song (while auto-delete is on, now or later, the sync deletes its file: the user rates it 1 star in Navidrome, or deletes it with preview_delete_tracks), and any rating of a song that is a pending discovery track of this user (the sync promotes it at the promote threshold, which can replace and delete an earlier copy outside this app's daily limit, or deletes it at 1 star: next offers promote_discovery_track and remove_discovery_track). This holds whether or not deletion is switched on for this app. While this user has pending discovery tracks, a song whose file Soulful cannot find is refused too, since it cannot be told apart from them. Clearing a rating and album ratings are never refused. Song and album ids stay valid while the files stay in the library. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome lists no such song or album for this user), permission_not_granted (a 1-star song rating, or a rating of a pending discovery track), delete_path_unresolved and delete_not_a_track (a song whose file Soulful cannot find while this user has pending discovery tracks), already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["rating"], "properties": {"song_id": {"type": "string", "minLength": 1, "maxLength": 500}, "album_id": {"type": "string", "minLength": 1, "maxLength": 500}, "rating": {"type": "integer", "minimum": 0, "maximum": 5}, "#,
@@ -57,8 +58,7 @@ pub(crate) const SET_STAR: ToolSpec = ToolSpec {
     call: |state, caller, args| Box::pin(set_star(state, caller, args)),
 };
 
-/// `set_rating`: the caller's rating of one song or album, and for a song what the next rating
-/// sync does with it.
+/// `set_rating`: the caller's rating of one song or album.
 async fn set_rating(
     state: &ConnectionState,
     caller: &McpCaller,
@@ -80,12 +80,13 @@ async fn set_rating(
     };
     let call = args.as_value();
     let (db, user) = (state.db.clone(), caller.ctx.id());
+    let (listeners, music_path) = (state.listeners.clone(), state.navidrome_music_path.clone());
     let work = async move {
-        match ratings::rate(&db, &navi, &user, &target, rating).await {
+        let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
+        match ratings::rate(&guard, &navi, &user, &target, rating).await {
             Ok(a) => {
                 let mut fields = annotated_fields(&a);
                 fields.insert("rating".into(), json!(rating));
-                fields.insert("rating_sync".into(), rating_sync(a.effect));
                 Keyed::Kept(success(fields))
             }
             Err(r) => not_set(&args, &target, r),
@@ -178,32 +179,24 @@ fn annotated_fields(a: &Annotated) -> Map<String, Value> {
     fields
 }
 
-/// `{"effect", "message"}` of what the next rating sync does, or null.
-fn rating_sync(effect: Option<SyncEffect>) -> Value {
-    effect.map_or(
-        Value::Null,
-        |e| json!({"effect": e.as_str(), "message": e.message()}),
-    )
-}
-
 /// The answer to a rating or star not made; its key keeps it once the write request was sent,
-/// since the change may have been made. A rating refused for what the sync would do says what
-/// that is, and a refused promote offers promote_discovery_track.
+/// since the change may have been made. A rating of a pending discovery track names the track and
+/// offers promote_discovery_track, and remove_discovery_track for the user's yes.
 fn not_set(args: &Args, target: &Target, r: NotSet) -> Keyed {
     let mut facts = target_fields(target);
     let mut next = vec![];
     if let NotSet::WouldDelete {
-        effect,
-        discovery_track_id,
+        discovery_track_id: Some(track_id),
         ..
     } = &r
     {
-        facts.insert("rating_sync".into(), rating_sync(Some(*effect)));
-        if let Some(track_id) = discovery_track_id {
-            facts.insert("discovery_track_id".into(), json!(track_id));
-            let promote = json!({"track_id": track_id});
-            next.push(NextCall::new(PROMOTE_DISCOVERY_TRACK.name, promote));
-        }
+        facts.insert("discovery_track_id".into(), json!(track_id));
+        let track = json!({"track_id": track_id});
+        next.push(NextCall::new(PROMOTE_DISCOVERY_TRACK.name, track.clone()));
+        next.push(
+            NextCall::new(REMOVE_DISCOVERY_TRACK.name, track)
+                .with("requires_user_confirmation", json!(true)),
+        );
     }
     let mut error = upstream_error(r.failure().clone(), facts, args.same_call());
     error.next.extend(next);
@@ -230,7 +223,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn a_one_star_rating_is_refused_while_auto_delete_is_on_whatever_the_switch() {
+    async fn a_one_star_song_rating_is_refused_whatever_auto_delete_and_the_switch() {
         let navi = NavidromeStub::start();
         navi.answer(
             "/rest/getSong",
@@ -238,24 +231,21 @@ mod tests {
         );
         navi.answer("/rest/setRating", &[OK]);
         let (db, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
-        let auto_delete = |on: bool| {
-            let db = db.clone();
-            async move {
-                let on = UpdateUserSettings {
-                    auto_delete_enabled: Some(on),
-                    ..Default::default()
-                };
-                UserSettings::upsert_in(&db, "u1", on).await.unwrap();
-            }
-        };
-        auto_delete(true).await;
         let one_star = json!({"song_id": HOLY.0, "rating": 1, "request_key": "r1"});
-        for allow_delete in [0, 1] {
+        for (auto_delete, allow_delete) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+            let auto_delete = UpdateUserSettings {
+                auto_delete_enabled: Some(auto_delete),
+                ..Default::default()
+            };
+            UserSettings::upsert_in(&db, "u1", auto_delete)
+                .await
+                .unwrap();
             sqlx::query("UPDATE oauth_grants SET allow_delete = ?")
                 .bind(allow_delete)
                 .execute(&db)
                 .await
                 .unwrap();
+            // Nothing was written, so the key was let go and the same call is refused again.
             let result = call_tool(app.clone(), &token, "set_rating", one_star.clone()).await;
             let error = &document(&result)["error"];
             assert_eq!(
@@ -269,31 +259,21 @@ mod tests {
                     Some("input"),
                     Some("needs_user")
                 ),
-                "allow_delete {allow_delete}"
             );
             assert_eq!(
                 error["message"],
-                "A 1-star rating from a connected app would have Soulful delete this song's file at the next rating sync, because auto-delete is on. Rate it 1 star yourself in Navidrome, or turn auto-delete off in Soulful."
+                "A connected app may not rate a song 1 star: while auto-delete is on, now or once it is turned on, the rating sync deletes the files of songs rated 1 star without a preview. Rate it 1 star yourself in Navidrome, or delete it with preview_delete_tracks and delete_tracks."
             );
             assert_eq!(
                 error["user_action"],
                 json!({"code": "rate_in_navidrome", "what": "Rate the song 1 star yourself in Navidrome", "where": "Navidrome"})
             );
             assert_eq!(
-                error["facts"],
-                json!({"kind": "song", "id": HOLY.0, "rating_sync": {"effect": "deletes_file",
-                    "message": "Auto-delete is on: the next rating sync deletes this song's file unless the delete checks keep it"}})
+                (&error["facts"], &error["next"]),
+                (&json!({"kind": "song", "id": HOLY.0}), &json!([]))
             );
-            assert_eq!(error["next"], json!([]));
         }
         assert!(!navi.asked().contains(&"/rest/setRating".to_string()));
-        // Nothing was written, so the key was let go: with auto-delete off the same call rates.
-        auto_delete(false).await;
-        let doc = document(&call_tool(app.clone(), &token, "set_rating", one_star).await);
-        assert_eq!(
-            (doc["rating"].as_u64(), &doc["rating_sync"]),
-            (Some(1), &json!(null))
-        );
         let doc = document(
             &call_tool(
                 app,
@@ -307,14 +287,15 @@ mod tests {
             doc,
             json!({"ok": true, "kind": "song", "id": HOLY.0, "title": "O Holy Night",
                 "artist": "Marrow Choir", "album": "Winter Songs", "rating": 2,
-                "previous_rating": 4, "previously_starred": false, "rating_sync": null})
+                "previous_rating": 4, "previously_starred": false})
         );
     }
 
     #[tokio::test]
-    async fn a_promoting_rating_is_refused_whatever_the_switch() {
+    async fn a_rating_of_a_pending_track_is_refused_whatever_the_switch() {
         // The 6 hourly sync promotes a pending track through the guard, which replaces an
-        // earlier library copy of the song as Soulful's own deletion: no app may set that up.
+        // earlier library copy of the song as Soulful's own deletion, or deletes it at 1 star:
+        // no app may set that up, at any rating, since the threshold can change first.
         let lib = Library::new().await;
         let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
         lib.pending_track("t1", "alice-music", "Explore", &staged, Some(HOLY.0))
@@ -337,7 +318,6 @@ mod tests {
             router(state),
             access_token(&lib.db, "alice", RESOURCE).await,
         );
-        let five = json!({"song_id": HOLY.0, "rating": 5});
         let refused = |doc: serde_json::Value| {
             let error = &doc["error"];
             assert_eq!(
@@ -355,33 +335,38 @@ mod tests {
             assert_eq!(
                 (&error["facts"], &error["next"]),
                 (
-                    &json!({"kind": "song", "id": HOLY.0, "discovery_track_id": "t1",
-                        "rating_sync": {"effect": "promotes_discovery_track",
-                            "message": "This is a pending discovery track: the next rating sync moves it into your library"}}),
-                    &json!([{"tool": "promote_discovery_track", "args": {"track_id": "t1"}}])
+                    &json!({"kind": "song", "id": HOLY.0, "discovery_track_id": "t1"}),
+                    &json!([{"tool": "promote_discovery_track", "args": {"track_id": "t1"}},
+                        {"tool": "remove_discovery_track", "args": {"track_id": "t1"},
+                            "requires_user_confirmation": true}])
                 )
             );
         };
-        refused(document(
-            &call_tool(app.clone(), &token, "set_rating", five.clone()).await,
-        ));
+        for allow_delete in [0, 1] {
+            sqlx::query("UPDATE oauth_grants SET allow_delete = ?")
+                .bind(allow_delete)
+                .execute(&lib.db)
+                .await
+                .unwrap();
+            for rating in [1, 2, 5] {
+                let rate = json!({"song_id": HOLY.0, "rating": rating});
+                refused(document(
+                    &call_tool(app.clone(), &token, "set_rating", rate).await,
+                ));
+            }
+        }
         assert!(!navi.asked().contains(&"/rest/setRating".to_string()));
-        // Below the threshold nothing is promoted, so the rating is written.
+        // Clearing the rating leaves nothing for the sync to act on.
         let doc = document(
             &call_tool(
-                app.clone(),
+                app,
                 &token,
                 "set_rating",
-                json!({"song_id": HOLY.0, "rating": 2}),
+                json!({"song_id": HOLY.0, "rating": 0}),
             )
             .await,
         );
-        assert_eq!(doc["rating_sync"], json!(null));
-        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
-            .execute(&lib.db)
-            .await
-            .unwrap();
-        refused(document(&call_tool(app, &token, "set_rating", five).await));
+        assert_eq!(doc["rating"], json!(0));
         assert_eq!(navi.posted("/rest/setRating").len(), 1);
     }
 
@@ -465,12 +450,12 @@ mod tests {
             (
                 rated["error"]["code"].as_str(),
                 &rated["error"]["facts"]["discovery_track_id"],
-                &rated["error"]["next"]
+                &rated["error"]["next"][0]
             ),
             (
                 Some("permission_not_granted"),
                 &json!("t1"),
-                &json!([{"tool": "promote_discovery_track", "args": {"track_id": "t1"}}])
+                &json!({"tool": "promote_discovery_track", "args": {"track_id": "t1"}})
             )
         );
         assert!(!navi.asked().contains(&"/rest/setRating".to_string()));

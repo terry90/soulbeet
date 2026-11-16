@@ -195,7 +195,7 @@ fn auto_delete_on_refused() -> Failure {
 /// rated below the old one, and a promote can replace an earlier library copy, deleting it. The
 /// 6 hourly sync promotes as Soulful's own deletion, past the app's switch, its daily room and
 /// its name in the history, so no app changes it, whatever its switch, as no app's rating may
-/// promote (`core::ratings::sync_effect`).
+/// promote (`core::ratings::rating_refusal`).
 fn promote_threshold_refused() -> Failure {
     Failure::new(
         FailureCode::PermissionNotGranted,

@@ -154,6 +154,58 @@ impl Origin {
     }
 }
 
+/// What a song's native record is on this machine.
+enum FileOf<'p> {
+    /// A pending discovery track's staged file.
+    Staged(&'p DiscoveryTrack),
+    /// A library file: the canonical path local_file_learning gave, and its identity.
+    Library(PathBuf, unlink::FileId),
+}
+
+/// What `song`, `actor`'s native record, is (D12): the track of `pending` with its song id,
+/// before any path is resolved; else the file local_file_learning gives, which is the staged file
+/// of the track whose stored path canonicalizes to it, or a library file.
+async fn file_of<'p>(
+    db: &SqlitePool,
+    music_path: Option<&Path>,
+    actor: &UserId,
+    song: &NativeSong,
+    pending: &'p [DiscoveryTrack],
+) -> Result<FileOf<'p>, Failure> {
+    if let Some(track) = pending
+        .iter()
+        .find(|t| t.song_id.as_deref() == Some(song.id.as_str()))
+    {
+        return Ok(FileOf::Staged(track));
+    }
+    let (path, id) = paths::local_file_learning(db, song, music_path, actor).await?;
+    for track in pending {
+        if tokio::fs::canonicalize(&track.path)
+            .await
+            .is_ok_and(|staged| staged == path)
+        {
+            return Ok(FileOf::Staged(track));
+        }
+    }
+    Ok(FileOf::Library(path, id))
+}
+
+/// The track of `pending` that `song`, `actor`'s native record, is, told as the guard tells it
+/// (check_record, D12); None for a library file. Err when no track has its song id and its file
+/// cannot be found on this machine, so it cannot be told.
+pub(crate) async fn pending_track_of<'p>(
+    db: &SqlitePool,
+    music_path: Option<&Path>,
+    actor: &UserId,
+    song: &NativeSong,
+    pending: &'p [DiscoveryTrack],
+) -> Result<Option<&'p DiscoveryTrack>, Failure> {
+    Ok(match file_of(db, music_path, actor, song, pending).await? {
+        FileOf::Staged(track) => Some(track),
+        FileOf::Library(..) => None,
+    })
+}
+
 /// How a removed file leaves the library of its folder.
 pub enum ForgetVia<'a> {
     /// Queue the forget on the folder's worker in a spawned task that owns this handle, and do
@@ -198,30 +250,16 @@ impl Guard<'_> {
         let pending = DiscoveryTrackRow::pending_for_user_in(self.db, &actor.to_string())
             .await
             .map_err(|e| database_failure(Stage::Delete, e))?;
-        if let Some(track) = pending
-            .iter()
-            .find(|t| t.song_id.as_deref() == Some(song.id.as_str()))
-        {
-            return Ok(Verdict::Discovery {
+        match file_of(self.db, self.music_path, actor, &song, &pending).await? {
+            FileOf::Staged(track) => Ok(Verdict::Discovery {
                 track: track.clone(),
                 rating: song.rating,
-            });
-        }
-        let (path, id) = paths::local_file_learning(self.db, &song, self.music_path, actor).await?;
-        for track in pending {
-            if tokio::fs::canonicalize(&track.path)
+            }),
+            FileOf::Library(path, id) => self
+                .check_resolved(actor, song, path, id, &[])
                 .await
-                .is_ok_and(|staged| staged == path)
-            {
-                return Ok(Verdict::Discovery {
-                    track,
-                    rating: song.rating,
-                });
-            }
+                .map(Verdict::Library),
         }
-        self.check_resolved(actor, song, path, id, &[])
-            .await
-            .map(Verdict::Library)
     }
 
     /// Checks the library item beets reported at `library.join(&item.path)`: its song is the
