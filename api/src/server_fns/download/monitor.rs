@@ -634,7 +634,7 @@ impl DownloadMonitor {
             let ledger = ledger.clone();
             let attempt = JobEvent::Attempt {
                 slot: job.clone(),
-                candidate: Some(item.clone()),
+                candidate: Some(Box::new(item.clone())),
                 request: Some(request.to_string()),
             };
             async move {

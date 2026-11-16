@@ -7,11 +7,10 @@
 use crate::auth::UserId;
 use async_trait::async_trait;
 use shared::download::{
-    DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, EnqueueStatus,
-    QueuedDownload, SearchResult, SearchState,
+    DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, EnqueueStatus, FileFacts,
+    QueuedDownload, SearchResult, SearchSpec, SearchState, SearchStats,
 };
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
-use shared::metadata::{Album, Track};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::{DownloadBackend, ImportMode};
 use std::collections::VecDeque;
@@ -34,6 +33,9 @@ pub fn item(source: &str, title: &str, id: &str) -> DownloadableItem {
         quality: "FLAC".to_string(),
         quality_score: 1.0,
         backend_data: None,
+        match_score: 0.0,
+        below_floor: false,
+        facts: FileFacts::default(),
     }
 }
 
@@ -230,7 +232,7 @@ pub fn search_result(
         groups,
         has_more: state == SearchState::InProgress,
         state,
-        files_seen: 0,
+        stats: SearchStats::default(),
     }
 }
 
@@ -248,7 +250,7 @@ impl DownloadBackend for StubBackend {
     fn name(&self) -> &'static str {
         "Stub"
     }
-    async fn start_search(&self, _album: Option<&Album>, _tracks: &[Track]) -> SoulResult<String> {
+    async fn start_search(&self, _spec: &SearchSpec) -> SoulResult<String> {
         match self.search_start.lock().unwrap().take() {
             Some(e) => Err(e),
             None => Ok("search".to_string()),

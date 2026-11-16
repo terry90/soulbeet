@@ -400,7 +400,7 @@ mod tests {
         let two_elsewhere = item("peer_b", "Two", "b/02.flac");
         ledger.record(JobEvent::Attempt {
             slot: slot(1),
-            candidate: Some(two_elsewhere.clone()),
+            candidate: Some(Box::new(two_elsewhere.clone())),
             request: Some("r2".into()),
         });
         let import = StoredImport {

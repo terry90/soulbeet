@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use shared::{
     download::{
-        DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult, SkipKind,
+        DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult, SearchSpec,
+        SkipKind,
     },
     failure::{Failure, UserAction},
     library::DuplicateReport,
-    metadata::{Album, AlbumWithTracks, Provider, SearchResult as MetadataSearchResult, Track},
+    metadata::{AlbumWithTracks, Provider, SearchResult as MetadataSearchResult},
     recommendation::{
         ArtistPopularity, CandidateSet, Listen, ProfileConfig, RankedArtist, RankedTrack,
         SignalReport, SimilarArtist, SimilarTrack, TimePeriod, UserMusicProfile, WeightedTag,
@@ -47,7 +48,7 @@ pub trait DownloadBackend: Send + Sync {
     fn id(&self) -> &'static str;
     fn name(&self) -> &'static str;
 
-    async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String>;
+    async fn start_search(&self, spec: &SearchSpec) -> Result<String>;
     async fn poll_search(&self, search_id: &str) -> Result<SearchResult>;
     /// A fresh id for one `download` call, drawn before the call so the caller can store it
     /// first. Opaque to the caller.

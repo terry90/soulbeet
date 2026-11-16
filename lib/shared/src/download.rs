@@ -70,6 +70,72 @@ pub struct DownloadableItem {
     /// Backend-specific data (JSON serialized)
     #[serde(default)]
     pub backend_data: Option<String>,
+    /// How well the file matched what was searched, 0.0-1.0.
+    #[serde(default)]
+    pub match_score: f64,
+    /// Scored below the backend's floor, kept because the search asked to.
+    #[serde(default)]
+    pub below_floor: bool,
+    #[serde(default)]
+    pub facts: FileFacts,
+}
+
+/// One file and its source as the backend reported them; None for what it did not report.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileFacts {
+    /// Lowercase, from the remote file name.
+    pub extension: Option<String>,
+    pub bitrate_kbps: Option<u32>,
+    pub variable_bitrate: Option<bool>,
+    pub sample_rate_hz: Option<u32>,
+    pub bit_depth: Option<u32>,
+    /// Audio files in the same remote folder in the source's answer.
+    pub folder_audio_files: Option<u32>,
+    pub source_has_free_slot: Option<bool>,
+    /// Bytes per second.
+    pub source_upload_speed: Option<u64>,
+    pub source_queue_length: Option<u64>,
+    /// Facts only this backend has, by name.
+    pub backend_facts: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What a download search asks a backend for.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SearchSpec {
+    pub album: Option<Album>,
+    pub tracks: Vec<Track>,
+    /// Sent in place of the text the backend builds from `album` and `tracks`;
+    /// results are still scored against them.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Keep files scored below the backend's floor, each flagged `below_floor`.
+    #[serde(default)]
+    pub keep_below_floor: bool,
+}
+
+impl SearchSpec {
+    /// A search for `album` and `tracks` with the backend's own text, below-floor files dropped.
+    pub fn of(album: Option<Album>, tracks: Vec<Track>) -> Self {
+        Self {
+            album,
+            tracks,
+            text: None,
+            keep_below_floor: false,
+        }
+    }
+}
+
+/// What a finished search read, so an empty one says why.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchStats {
+    pub query_text: String,
+    pub response_count: u32,
+    pub file_count: u32,
+    pub locked_file_count: u32,
+    /// Files with an extension that is not audio.
+    pub not_audio: u32,
+    /// Audio files scored below the floor, kept or not.
+    pub below_floor: u32,
 }
 
 /// A group of downloadable items (e.g., album from one source)
@@ -116,9 +182,9 @@ pub struct SearchResult {
     pub groups: Vec<DownloadableGroup>,
     pub has_more: bool,
     pub state: SearchState,
-    /// Files in the responses the backend read; 0 while in progress.
+    /// What the backend read; all empty while in progress.
     #[serde(default)]
-    pub files_seen: u32,
+    pub stats: SearchStats,
 }
 
 /// State of a download operation

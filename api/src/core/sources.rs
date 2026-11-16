@@ -10,7 +10,9 @@ use crate::services::{
     available_download_backends, download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND,
 };
 use dioxus::logger::tracing::warn;
-use shared::download::{DownloadQuery, DownloadableGroup, SearchResult, SearchState};
+use shared::download::{
+    DownloadQuery, DownloadableGroup, SearchResult, SearchSpec, SearchState, SearchStats,
+};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
 use soulbeet::DownloadBackend;
@@ -88,7 +90,7 @@ pub async fn start(ctx: &UserCtx, query: DownloadQuery) -> Result<String, Failur
         .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))?;
 
     let search_id = backend
-        .start_search(query.album.as_ref(), &query.tracks)
+        .start_search(&SearchSpec::of(query.album.clone(), query.tracks.clone()))
         .await
         .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))?;
     LEDGER
@@ -126,24 +128,22 @@ pub async fn poll(ctx: &UserCtx, search_id: &str) -> Result<SearchResult, Failur
 
 /// How one backend's search ended.
 enum SearchStop {
-    /// The backend finished the search, its responses holding `files_seen`
-    /// files.
-    Finished { files_seen: u32 },
+    /// The backend finished the search, having read what `stats` says.
+    Finished { stats: SearchStats },
     /// SEARCH_TIMEOUT passed before the backend finished.
     TimedOut,
     /// Starting or polling the search failed.
     Failed(Failure),
 }
 
-/// One backend's search, `id` naming it in the logs: the groups it found and
-/// how it ended.
+/// One backend's search for `spec`, `id` naming it in the logs: the groups it
+/// found and how it ended.
 async fn search_backend(
     id: &str,
     backend: &Arc<dyn DownloadBackend>,
-    album: Option<&Album>,
-    tracks: &[Track],
+    spec: &SearchSpec,
 ) -> (Vec<DownloadableGroup>, SearchStop) {
-    let search_id = match backend.start_search(album, tracks).await {
+    let search_id = match backend.start_search(spec).await {
         Ok(sid) => sid,
         Err(e) => {
             warn!("Backend {} search start failed: {}", id, e);
@@ -172,7 +172,7 @@ async fn search_backend(
                         latest_groups = result.groups;
                     }
                     let stop = SearchStop::Finished {
-                        files_seen: result.files_seen,
+                        stats: result.stats,
                     };
                     return (latest_groups, stop);
                 }
@@ -207,13 +207,19 @@ fn no_results_failure(first: &SearchStop, rest: &[SearchStop]) -> Failure {
         .iter()
         .fold(first, |best, s| if rank(s) > rank(best) { s } else { best });
     match stop {
-        SearchStop::Finished { files_seen: 1.. } => Failure::new(
+        SearchStop::Finished {
+            stats: SearchStats {
+                file_count: 1.., ..
+            },
+        } => Failure::new(
             FailureCode::SearchAllFiltered,
             Stage::SourceSearch,
             RetryAdvice::OtherQuery,
             MESSAGE,
         ),
-        SearchStop::Finished { files_seen: 0 } => Failure::new(
+        SearchStop::Finished {
+            stats: SearchStats { file_count: 0, .. },
+        } => Failure::new(
             FailureCode::SearchNoResults,
             Stage::SourceSearch,
             RetryAdvice::OtherQuery,
@@ -271,11 +277,12 @@ pub async fn search_ranked(
     album: Option<&Album>,
     tracks: &[Track],
 ) -> Result<Vec<DownloadableGroup>, Failure> {
+    let spec = SearchSpec::of(album.cloned(), tracks.to_vec());
     let ((first_groups, first_stop), results) = futures::future::join(
-        search_backend(&first.0, &first.1, album, tracks),
+        search_backend(&first.0, &first.1, &spec),
         futures::future::join_all(
             rest.iter()
-                .map(|(id, backend)| search_backend(id, backend, album, tracks)),
+                .map(|(id, backend)| search_backend(id, backend, &spec)),
         ),
     )
     .await;
@@ -309,8 +316,15 @@ mod tests {
     /// The groups `stub`'s search found and the failure an empty one gives.
     async fn searched(stub: Arc<StubBackend>) -> (Vec<DownloadableGroup>, Failure) {
         let backend: Arc<dyn DownloadBackend> = stub;
-        let (groups, stop) = search_backend("stub", &backend, None, &[]).await;
+        let (groups, stop) = search_backend("stub", &backend, &SearchSpec::default()).await;
         (groups, no_results_failure(&stop, &[]))
+    }
+
+    /// A search the backend finished with no file in its responses.
+    fn finished_empty() -> SearchStop {
+        SearchStop::Finished {
+            stats: SearchStats::default(),
+        }
     }
 
     fn advice(f: &Failure) -> (FailureCode, Stage, RetryAdvice, &str) {
@@ -426,7 +440,7 @@ mod tests {
         ]);
         let backend: Arc<dyn DownloadBackend> = stub;
 
-        let (groups, stop) = search_backend("stub", &backend, None, &[]).await;
+        let (groups, stop) = search_backend("stub", &backend, &SearchSpec::default()).await;
 
         assert_eq!(groups, found);
         assert!(matches!(stop, SearchStop::Finished { .. }));
@@ -435,7 +449,12 @@ mod tests {
     #[test]
     fn a_search_whose_files_were_all_scored_out_is_all_filtered() {
         let f = no_results_failure(
-            &SearchStop::Finished { files_seen: 7 },
+            &SearchStop::Finished {
+                stats: SearchStats {
+                    file_count: 7,
+                    ..Default::default()
+                },
+            },
             &[SearchStop::TimedOut],
         );
         assert_eq!(
@@ -448,7 +467,7 @@ mod tests {
             )
         );
         assert_eq!(
-            no_results_failure(&SearchStop::Finished { files_seen: 0 }, &[]).code,
+            no_results_failure(&finished_empty(), &[]).code,
             FailureCode::SearchNoResults
         );
     }
@@ -457,12 +476,20 @@ mod tests {
     async fn a_finished_search_reports_the_files_it_saw() {
         let stub = StubBackend::new(vec![]);
         stub.script_polls(vec![Ok(SearchResult {
-            files_seen: 7,
+            stats: SearchStats {
+                file_count: 7,
+                ..Default::default()
+            },
             ..search_result("search", SearchState::Completed, Vec::new())
         })]);
         let backend: Arc<dyn DownloadBackend> = stub;
-        let (_, stop) = search_backend("stub", &backend, None, &[]).await;
-        assert!(matches!(stop, SearchStop::Finished { files_seen: 7 }));
+        let (_, stop) = search_backend("stub", &backend, &SearchSpec::default()).await;
+        assert!(matches!(
+            stop,
+            SearchStop::Finished {
+                stats: SearchStats { file_count: 7, .. }
+            }
+        ));
     }
 
     #[test]
@@ -483,7 +510,7 @@ mod tests {
         use FailureCode::*;
         use RetryAdvice::*;
         assert_eq!(
-            advice(SearchStop::Finished { files_seen: 0 }, vec![]),
+            advice(finished_empty(), vec![]),
             (SearchNoResults, OtherQuery)
         );
         assert_eq!(
@@ -495,7 +522,7 @@ mod tests {
             (BackendUnreachable, SameSourceLater)
         );
         assert_eq!(
-            advice(dead("down"), vec![SearchStop::Finished { files_seen: 0 }]),
+            advice(dead("down"), vec![finished_empty()]),
             (SearchNoResults, OtherQuery)
         );
         // A timeout says more than a dead backend, an empty search more than both.
@@ -504,10 +531,7 @@ mod tests {
             (SearchTimeout, SameSourceLater)
         );
         assert_eq!(
-            advice(
-                SearchStop::TimedOut,
-                vec![SearchStop::Finished { files_seen: 0 }]
-            ),
+            advice(SearchStop::TimedOut, vec![finished_empty()]),
             (SearchNoResults, OtherQuery)
         );
         let f = no_results_failure(&dead("first"), &[dead("second")]);

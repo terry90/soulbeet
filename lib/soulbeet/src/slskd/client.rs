@@ -12,7 +12,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
-    download::EnqueueStatus,
+    download::{EnqueueStatus, SearchSpec, SearchStats},
     failure::{
         Cause, Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
     },
@@ -58,19 +58,22 @@ struct SearchContext {
     artist: String,
     album: Option<String>,
     tracks: Vec<WantedTrack>,
+    /// The text slskd was sent.
+    query_text: String,
+    keep_below_floor: bool,
     start_time: DateTime<Utc>,
     timeout: Duration,
     /// slskd was told to stop the search at the deadline.
     cancelled: bool,
 }
 
-/// What one poll of a search found: the processed albums and the files in
-/// slskd's responses, both empty while the search is in progress.
+/// What one poll of a search found: the processed albums and what the search
+/// read, both empty while the search is in progress.
 #[derive(Debug)]
 pub struct SearchPoll {
     pub albums: Vec<AlbumResult>,
     pub state: SearchState,
-    pub files_seen: u32,
+    pub stats: SearchStats,
 }
 
 /// The part of slskd's search record a poll reads (`GET searches/{id}`,
@@ -363,13 +366,21 @@ impl SoulseekClient {
         Ok(())
     }
 
-    pub async fn start_search(
-        &self,
-        album: Option<Album>,
-        tracks: Vec<Track>,
-        timeout: Duration,
-    ) -> Result<String> {
-        let query = search_text(album.as_ref(), &tracks)?;
+    /// The search for `spec`: `spec.text` trimmed when given, else
+    /// `search_text` of its album and tracks, which a search needs either way
+    /// to score what it finds.
+    pub async fn start_search(&self, spec: SearchSpec, timeout: Duration) -> Result<String> {
+        let SearchSpec {
+            album,
+            tracks,
+            text,
+            keep_below_floor,
+        } = spec;
+        let built = search_text(album.as_ref(), &tracks)?;
+        let query = match text.as_deref().map(str::trim) {
+            Some(text) if !text.is_empty() => text.to_string(),
+            _ => built,
+        };
         self.wait_for_rate_limit().await?;
 
         let wanted: Vec<WantedTrack> = tracks
@@ -413,6 +424,8 @@ impl SoulseekClient {
                     .map(|a| a.artist.clone())
                     .unwrap_or_else(|| tracks[0].artist.clone()),
                 tracks: wanted,
+                query_text: query,
+                keep_below_floor,
                 start_time: Utc::now(),
                 timeout,
                 cancelled: false,
@@ -442,7 +455,7 @@ impl SoulseekClient {
         match &polled {
             Ok(poll) => info!(
                 "Search {} completed with {} files from slskd",
-                search_id, poll.files_seen
+                search_id, poll.stats.file_count
             ),
             Err(e) => warn!("Search {} failed with error, cleaning up: {}", search_id, e),
         }
@@ -478,7 +491,7 @@ impl SoulseekClient {
                         return Ok(SearchPoll {
                             albums: Vec::new(),
                             state: SearchState::InProgress,
-                            files_seen: 0,
+                            stats: SearchStats::default(),
                         });
                     }
                     tokio::time::sleep(StdDuration::from_secs(1)).await;
@@ -528,11 +541,16 @@ impl SoulseekClient {
             tokio::time::sleep(RESPONSES_REREAD_DELAY).await;
         };
 
-        let mut albums = processing::process_search_responses(
+        let processing::Processed {
+            mut albums,
+            not_audio,
+            below_floor,
+        } = processing::process_search_responses(
             &responses,
             &context.artist,
             context.album.as_deref(),
             &context.tracks,
+            context.keep_below_floor,
         );
         albums.sort_by(|a, b| {
             b.score
@@ -544,7 +562,14 @@ impl SoulseekClient {
         Ok(SearchPoll {
             albums,
             state: SearchState::Completed,
-            files_seen: responses.iter().map(|r| r.files.len() as u32).sum(),
+            stats: SearchStats {
+                query_text: context.query_text.clone(),
+                response_count: responses.len() as u32,
+                file_count: responses.iter().map(|r| r.files.len() as u32).sum(),
+                locked_file_count: responses.iter().map(|r| r.locked_file_count).sum(),
+                not_audio,
+                below_floor,
+            },
         })
     }
 
@@ -1207,10 +1232,9 @@ impl crate::DownloadBackend for SoulseekClient {
         "Soulseek"
     }
 
-    async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String> {
+    async fn start_search(&self, spec: &SearchSpec) -> Result<String> {
         let timeout = Duration::seconds(120);
-        self.start_search(album.cloned(), tracks.to_vec(), timeout)
-            .await
+        self.start_search(spec.clone(), timeout).await
     }
 
     async fn poll_search(&self, search_id: &str) -> Result<shared::download::SearchResult> {
@@ -1220,7 +1244,7 @@ impl crate::DownloadBackend for SoulseekClient {
             groups: poll.albums.into_iter().map(Into::into).collect(),
             has_more: poll.state == SearchState::InProgress,
             state: poll.state.into(),
-            files_seen: poll.files_seen,
+            stats: poll.stats,
         })
     }
 
@@ -1992,7 +2016,9 @@ mod tests {
                 title: "O Holy Night".into(),
                 duration_s: Some(263),
             }],
-        );
+            false,
+        )
+        .albums;
         let score = |user: &str| albums.iter().find(|a| a.username == user).unwrap().score;
         assert!((score("carol_shares") - score("dave_shares") - 0.3 * 3.0 / 13.0).abs() < 1e-9);
         assert!(score("dave_shares") > 0.7);
@@ -2013,9 +2039,110 @@ mod tests {
                 title: "O Holy Night".into(),
                 duration_s: None,
             }],
-        );
+            false,
+        )
+        .albums;
         assert_eq!(albums[0].queue_length, 4_294_967_295);
         assert_eq!(albums[0].tracks[0].base.queue_length, 4_294_967_295);
+    }
+
+    /// carol_shares as in one_response(), and erin_shares with a file that matches nothing
+    /// wanted, a cover image and two locked files.
+    fn mixed_responses() -> String {
+        let carol: serde_json::Value = serde_json::from_str(&one_response().body).unwrap();
+        let erin = serde_json::json!({
+            "fileCount": 2, "hasFreeUploadSlot": false, "lockedFileCount": 2,
+            "lockedFiles": [{"code": 1, "extension": "flac", "filename": "@@pq7\\Private\\a.flac", "size": 1},
+                            {"code": 1, "extension": "flac", "filename": "@@pq7\\Private\\b.flac", "size": 1}],
+            "queueLength": 12, "token": 17, "uploadSpeed": 52000, "username": "erin_shares",
+            "files": [{"bitRate": 192, "code": 1, "extension": "", "isVariableBitRate": true, "length": 181,
+                       "filename": "@@pq7\\Share\\Misc\\Jingle Bells Remix.mp3", "size": 4345000},
+                      {"code": 1, "extension": "jpg", "filename": "@@pq7\\Share\\Misc\\cover.jpg", "size": 51200}]});
+        serde_json::json!([carol[0], erin]).to_string()
+    }
+
+    #[test]
+    fn a_file_below_the_floor_is_kept_and_flagged_only_when_asked() {
+        let responses: Vec<SearchResponse> = serde_json::from_str(&mixed_responses()).unwrap();
+        let wanted = [WantedTrack {
+            title: "O Holy Night".into(),
+            duration_s: Some(263),
+        }];
+        let strict =
+            processing::process_search_responses(&responses, "Marrow Choir", None, &wanted, false);
+        assert_eq!((strict.not_audio, strict.below_floor), (1, 1));
+        assert_eq!(
+            strict
+                .albums
+                .iter()
+                .map(|a| a.username.as_str())
+                .collect::<Vec<_>>(),
+            vec!["carol_shares"]
+        );
+        let kept =
+            processing::process_search_responses(&responses, "Marrow Choir", None, &wanted, true);
+        let erin = kept
+            .albums
+            .iter()
+            .find(|a| a.username == "erin_shares")
+            .expect("kept");
+        assert!(erin.tracks[0].below_floor);
+        assert!(
+            !kept
+                .albums
+                .iter()
+                .find(|a| a.username == "carol_shares")
+                .unwrap()
+                .tracks[0]
+                .below_floor
+        );
+    }
+
+    #[test]
+    fn an_item_carries_its_file_and_source_facts() {
+        let responses: Vec<SearchResponse> = serde_json::from_str(&mixed_responses()).unwrap();
+        let wanted = [WantedTrack {
+            title: "O Holy Night".into(),
+            duration_s: Some(263),
+        }];
+        let mut albums =
+            processing::process_search_responses(&responses, "Marrow Choir", None, &wanted, true)
+                .albums;
+        albums.sort_by(|a, b| a.username.cmp(&b.username));
+        let carol: shared::download::DownloadableItem = albums[0].tracks[0].clone().into();
+        assert_eq!(
+            carol.facts,
+            shared::download::FileFacts {
+                extension: Some("flac".into()),
+                bitrate_kbps: None,
+                variable_bitrate: None,
+                sample_rate_hz: Some(44100),
+                bit_depth: Some(16),
+                folder_audio_files: Some(1),
+                source_has_free_slot: Some(true),
+                source_upload_speed: Some(1_048_576),
+                source_queue_length: Some(0),
+                backend_facts: serde_json::json!({"declared_extension": "flac"})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            }
+        );
+        assert_eq!(carol.match_score, albums[0].tracks[0].match_score);
+        let erin: shared::download::DownloadableItem = albums[1].tracks[0].clone().into();
+        assert_eq!(
+            (
+                erin.facts.extension.as_deref(),
+                erin.facts.bitrate_kbps,
+                erin.facts.variable_bitrate
+            ),
+            (Some("mp3"), Some(192), Some(true))
+        );
+        assert!(
+            erin.facts.backend_facts.is_empty(),
+            "an empty declared extension is not kept"
+        );
+        assert!(erin.below_floor);
     }
 
     #[test]
@@ -2116,10 +2243,49 @@ mod tests {
             .build()
             .unwrap();
         client
-            .start_search(None, vec![track("Marrow Choir", "O Holy Night")], deadline)
+            .start_search(
+                SearchSpec::of(None, vec![track("Marrow Choir", "O Holy Night")]),
+                deadline,
+            )
             .await
             .unwrap();
         (client, seen)
+    }
+
+    #[tokio::test]
+    async fn a_search_sends_the_callers_text_and_says_what_it_read() {
+        let mut replies = vec![ok(&format!(r#"{{"id":"{SEARCH_ID}"}}"#)), status(true, 2)];
+        replies.push(ok(&mixed_responses()));
+        replies.push(no_content());
+        let (url, seen) = serve(replies);
+        // carol's 1 file and erin's 2 (the cover included); the locked ones are counted apart.
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        let spec = SearchSpec {
+            text: Some("  Marrow Choir Holy Night choir ".into()),
+            ..SearchSpec::of(None, vec![track("Marrow Choir", "O Holy Night")])
+        };
+        client
+            .start_search(spec, Duration::seconds(120))
+            .await
+            .unwrap();
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(
+            poll.stats,
+            SearchStats {
+                query_text: "Marrow Choir Holy Night choir".into(),
+                response_count: 2,
+                file_count: 3,
+                locked_file_count: 2,
+                not_audio: 1,
+                below_floor: 1
+            }
+        );
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+        assert_eq!(body["searchText"], "Marrow Choir Holy Night choir");
     }
 
     /// Review focus 1: slskd saves the record as complete before it writes
@@ -2133,7 +2299,7 @@ mod tests {
         .await;
         let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
         assert_eq!(poll.state, SearchState::Completed);
-        assert_eq!(poll.files_seen, 1);
+        assert_eq!(poll.stats.file_count, 1);
         assert_eq!(poll.albums[0].tracks[0].base.username, "carol_shares");
         let targets: Vec<(String, String)> = seen
             .lock()
@@ -2163,7 +2329,7 @@ mod tests {
         .await;
         let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
         assert_eq!(
-            (poll.state, poll.files_seen, poll.albums.len()),
+            (poll.state, poll.stats.file_count, poll.albums.len()),
             (SearchState::Completed, 0, 0)
         );
         assert_eq!(seen.lock().unwrap().len(), 4);
@@ -2204,7 +2370,10 @@ mod tests {
         )
         .await;
         let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
-        assert_eq!((poll.state, poll.files_seen), (SearchState::Completed, 1));
+        assert_eq!(
+            (poll.state, poll.stats.file_count),
+            (SearchState::Completed, 1)
+        );
         let cancel = &seen.lock().unwrap()[2];
         assert_eq!(
             (cancel.method.as_str(), cancel.target.as_str()),

@@ -173,7 +173,7 @@ pub enum JobEvent {
     /// both None for a transfer it adopted.
     Attempt {
         slot: JobSlot,
-        candidate: Option<DownloadableItem>,
+        candidate: Option<Box<DownloadableItem>>,
         request: Option<String>,
     },
     ImportQueued(Box<StoredImport>),

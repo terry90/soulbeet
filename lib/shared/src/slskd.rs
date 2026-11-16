@@ -378,6 +378,9 @@ pub struct TrackResult {
     pub title: String,
     pub album: String,
     pub match_score: f64,
+    /// Scored below the search's floor, kept because the search asked to.
+    #[serde(default)]
+    pub below_floor: bool,
 }
 
 impl TrackResult {
@@ -388,6 +391,7 @@ impl TrackResult {
             title: matched.matched_track,
             album: matched.guessed_album,
             match_score: matched.total_score,
+            below_floor: false,
         }
     }
 }
@@ -408,6 +412,34 @@ pub struct SearchResult {
     pub upload_speed: i32,
     /// A `long` upstream (`Search/Types/Response.cs:45`).
     pub queue_length: i64,
+    #[serde(default)]
+    pub variable_bit_rate: Option<bool>,
+    /// The extension the peer's client sent, as `declared_extension` keeps it.
+    #[serde(default)]
+    pub declared_extension: Option<String>,
+    /// Audio files in this file's remote folder in the peer's answer.
+    #[serde(default)]
+    pub folder_audio_files: u32,
+}
+
+/// An extension as Soulful keeps one: 1 to 8 ASCII letters or digits, lowercased.
+fn extension_token(text: &str) -> Option<String> {
+    let fits = (1..=8).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric());
+    fits.then(|| text.to_ascii_lowercase())
+}
+
+/// The extension of a remote file name, whose folders a peer separates with
+/// `\` or `/`: the text after the last `.` of its last part.
+pub fn remote_extension(filename: &str) -> Option<String> {
+    let name = filename.rsplit(['\\', '/']).next().unwrap_or(filename);
+    extension_token(name.rsplit_once('.')?.1)
+}
+
+/// The extension a peer's client sent for a file (Soulseek.NET `File.cs`
+/// takes whatever it wrote), without a leading `.`; None when it is empty or
+/// not an extension.
+pub fn declared_extension(field: &str) -> Option<String> {
+    extension_token(field.strip_prefix('.').unwrap_or(field))
 }
 
 impl SearchResult {
@@ -530,7 +562,30 @@ impl From<TrackResult> for crate::download::DownloadableItem {
             quality: track.base.quality(),
             quality_score: track.base.quality_score(),
             backend_data: Some(serde_json::to_string(&track.base).unwrap_or_default()),
+            match_score: track.match_score,
+            below_floor: track.below_floor,
+            facts: file_facts(&track.base),
         }
+    }
+}
+
+/// The facts of one search file and its peer, a negative count read as unreported.
+fn file_facts(base: &SearchResult) -> crate::download::FileFacts {
+    let mut backend_facts = serde_json::Map::new();
+    if let Some(declared) = &base.declared_extension {
+        backend_facts.insert("declared_extension".into(), declared.clone().into());
+    }
+    crate::download::FileFacts {
+        extension: remote_extension(&base.filename),
+        bitrate_kbps: base.bitrate.and_then(|b| u32::try_from(b).ok()),
+        variable_bitrate: base.variable_bit_rate,
+        sample_rate_hz: base.sample_rate.and_then(|r| u32::try_from(r).ok()),
+        bit_depth: base.bit_depth.and_then(|d| u32::try_from(d).ok()),
+        folder_audio_files: Some(base.folder_audio_files),
+        source_has_free_slot: Some(base.has_free_upload_slot),
+        source_upload_speed: u64::try_from(base.upload_speed).ok(),
+        source_queue_length: u64::try_from(base.queue_length).ok(),
+        backend_facts,
     }
 }
 
@@ -853,7 +908,8 @@ impl crate::download::DownloadableItem {
             artist: self.artist.clone(),
             title: self.title.clone(),
             album: self.album.clone(),
-            match_score: self.quality_score,
+            match_score: self.match_score,
+            below_floor: self.below_floor,
         })
     }
 }
@@ -1037,6 +1093,54 @@ mod tests {
             "uploadSpeed": 0, "queueLength": 12}))
         .unwrap();
         assert_eq!(r.queue_length, 12);
+    }
+
+    /// An item stored before items kept their match score and file facts
+    /// still converts back for a download, with no score and no flag.
+    #[test]
+    fn an_item_stored_before_file_facts_still_converts() {
+        let base = r#"{"username":"p","filename":"a.flac","size":1,"bitrate":null,"duration":null,"hasFreeUploadSlot":false,"uploadSpeed":0,"queueLength":0}"#;
+        let item: crate::download::DownloadableItem = serde_json::from_value(json!({
+            "id": "a.flac", "source": "p", "title": "A", "artist": "B", "album": "C",
+            "size": 1, "duration": null, "quality": "flac", "quality_score": 0.9,
+            "backend_data": base}))
+        .unwrap();
+        assert_eq!(
+            (item.match_score, item.below_floor, &item.facts),
+            (0.0, false, &crate::download::FileFacts::default())
+        );
+        let track = item.to_slskd_track().expect("converts");
+        assert_eq!((track.match_score, track.below_floor), (0.0, false));
+        assert_eq!(
+            (track.base.declared_extension, track.base.folder_audio_files),
+            (None, 0)
+        );
+    }
+
+    #[test]
+    fn an_extension_is_read_from_the_last_part_of_a_remote_name() {
+        for (name, wanted) in [
+            (
+                "@@kqzbm\\Music\\Winter Songs\\03 - O Holy Night.FLAC",
+                Some("flac"),
+            ),
+            ("Music/Winter Songs/03 - O Holy Night.mp3", Some("mp3")),
+            ("x\\Album.2020\\track", None),
+            ("x\\Album\\track.", None),
+            ("x\\Album\\track.not an extension", None),
+            ("x\\Album\\track.abcdefghi", None),
+        ] {
+            assert_eq!(remote_extension(name).as_deref(), wanted, "{name}");
+        }
+        for (field, wanted) in [
+            ("flac", Some("flac")),
+            (".MP3", Some("mp3")),
+            ("", None),
+            (".", None),
+            ("fl ac", None),
+        ] {
+            assert_eq!(declared_extension(field).as_deref(), wanted, "{field:?}");
+        }
     }
 
     /// Reasons a peer gives for refusing an upload, as slskd and other
