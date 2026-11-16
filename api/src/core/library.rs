@@ -310,9 +310,15 @@ pub struct MatchHow {
     /// The song's length less the reference's, when both are known.
     pub duration_delta_s: Option<i64>,
     /// What the reference gives that the song does not say, so it was not
-    /// compared: `album` (when given and the song has none) and `duration`
-    /// (when given and Navidrome does not know the song's length). It never
-    /// counts as agreement: such a song is no exact match.
+    /// compared. Per field:
+    /// - `duration`: given, and Navidrome does not know the song's length.
+    ///   Such a song is no exact match: `exact` needs the length within
+    ///   DURATION_TOLERANCE_S when the reference gives one.
+    /// - `album`: given, and the song has none. The album never decides the
+    ///   kind, whether it agrees, differs or is unchecked: `mbid` and
+    ///   `exact` look at the MBID, artist, title and length only, and
+    ///   `fuzzy`'s score at title and artist. It is reported, in `differs`
+    ///   or here, for the caller to weigh.
     pub unchecked: Vec<&'static str>,
 }
 
@@ -367,7 +373,8 @@ fn word_dice(a: &str, b: &str) -> f64 {
 /// case, as UUIDs are. A song whose length Navidrome does not know has no
 /// duration_delta_s, so a reference with a duration matches it at best
 /// fuzzily, with `duration` in `unchecked`, not in `differs`; an album the
-/// song does not name is `unchecked` too.
+/// song does not name is `unchecked` too, and the album, given or not,
+/// never changes the kind (`MatchHow::unchecked`).
 pub(crate) fn classify(r: &Reference, song: &NativeSong) -> Option<Match> {
     let facts = SongFacts::from(song);
     let duration_delta_s = r
@@ -963,6 +970,26 @@ mod tests {
                 unchecked: vec![]
             }
         );
+    }
+
+    #[test]
+    fn the_album_is_reported_but_never_decides_the_kind() {
+        let exact = |album: &str| {
+            let r = Reference {
+                album: Some("Winter Songs".into()),
+                ..wanted("Marrow Choir", "O Holy Night")
+            };
+            let mut s = song("O Holy Night", "Marrow Choir", 263.4, None);
+            s.album = album.into();
+            let how = classify(&r, &s).unwrap().how;
+            (how.kind, how.differs, how.unchecked)
+        };
+        assert_eq!(exact("Winter Songs"), (MatchKind::Exact, vec![], vec![]));
+        assert_eq!(
+            exact("Christmas Hymns"),
+            (MatchKind::Exact, vec!["album"], vec![])
+        );
+        assert_eq!(exact(""), (MatchKind::Exact, vec![], vec!["album"]));
     }
 
     #[test]

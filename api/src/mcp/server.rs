@@ -496,6 +496,117 @@ mod tests {
         assert_eq!(error["next"], json!([{"tool": "get_status", "args": {}}]));
     }
 
+    #[test]
+    fn the_registry_holds_every_read_tool_once_and_none_writes() {
+        let names: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
+        assert_eq!(
+            names,
+            [
+                "get_status",
+                "get_settings",
+                "list_folders",
+                "get_library_stats",
+                "find_in_library",
+                "search_library",
+                "get_library_album",
+                "list_starred",
+                "list_playlists",
+                "get_playlist",
+                "search_music",
+                "get_release",
+                "get_recording_releases"
+            ]
+        );
+        for t in TOOLS {
+            assert!(t.read_only && !t.destructive && t.idempotent, "{}", t.name);
+            assert!(
+                t.name.len() <= 64 && (t.description)(120).contains("Failure codes:"),
+                "{}",
+                t.name
+            );
+            assert!(from_str::<Value>(t.input_schema).is_ok(), "{}", t.name);
+            assert_eq!(
+                t.open_world,
+                ["search_music", "get_release", "get_recording_releases"].contains(&t.name),
+                "{}",
+                t.name
+            );
+        }
+    }
+
+    /// Design 10.2 and 15 ("Tool contract"): every failure result carries
+    /// every key of the error object. No read tool takes a Soulful-owned id
+    /// or needs a permission the caller can lack, so the failures every tool
+    /// reaches in a test are invalid input (all of them) and an unlinked
+    /// Navidrome (the Navidrome tools; `mcp_app`'s state has none linked).
+    #[tokio::test]
+    async fn every_failure_result_carries_every_contract_key() {
+        const KEYS: [&str; 9] = [
+            "code",
+            "stage",
+            "message",
+            "cause",
+            "retry",
+            "retry_after_seconds",
+            "user_action",
+            "facts",
+            "next",
+        ];
+        fn keys(e: &Value) -> Vec<&str> {
+            let mut k: Vec<&str> = e.as_object().unwrap().keys().map(String::as_str).collect();
+            k.sort();
+            k
+        }
+        let mut expected = KEYS.to_vec();
+        expected.sort();
+        let (_, app, token) = mcp_app().await;
+        let within_cap = |result: &Value, name: &str| {
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.chars().count() <= crate::mcp::paging::RESULT_MAX_CHARS,
+                "{name}"
+            );
+        };
+        for t in TOOLS {
+            // limit 0 is refused as a value by every tool that takes a
+            // limit, and as an unknown name by the others.
+            let mut bad = valid_args(t.name);
+            bad["limit"] = json!(0);
+            bad["verbose"] = json!(true);
+            let result = call_tool(app.clone(), &token, t.name, bad).await;
+            within_cap(&result, t.name);
+            let doc = document(&result);
+            assert_eq!(
+                (result["isError"].as_bool(), doc["ok"].as_bool()),
+                (Some(true), Some(false)),
+                "{}",
+                t.name
+            );
+            assert_eq!(doc["error"]["code"], "invalid_input", "{}", t.name);
+            assert_eq!(keys(&doc["error"]), expected, "{}", t.name);
+        }
+        for name in [
+            "get_library_stats",
+            "find_in_library",
+            "search_library",
+            "get_library_album",
+            "list_starred",
+            "list_playlists",
+            "get_playlist",
+        ] {
+            let result = call_tool(app.clone(), &token, name, valid_args(name)).await;
+            within_cap(&result, name);
+            assert_eq!(result["isError"], true, "{name}");
+            let e = &document(&result)["error"];
+            assert_eq!(
+                (e["code"].as_str(), keys(e)),
+                (Some("navidrome_not_linked"), expected.clone()),
+                "{name}"
+            );
+            assert_eq!(e["user_action"]["code"], "relink_navidrome", "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn get_settings_and_list_folders_read_the_callers_rows() {
         let (db, app, token) = mcp_app().await;
