@@ -216,7 +216,7 @@ fn rated(rating: Option<u8>) -> Option<u8> {
 /// rated 1 star is deleted while auto-delete is on. The track is told as the guard tells it
 /// (pending_track_of), the discovery folder's tracks first so the one named is the one the next
 /// sync acts on. Refused too, as Refused: when the settings or tracks cannot be read, and while
-/// the user has pending tracks, when the song's file cannot be told apart from theirs.
+/// the user has pending tracks, when the song's file cannot be told apart from theirs (unplaced).
 async fn rating_refusal(
     guard: &Guard<'_>,
     user: &UserId,
@@ -238,12 +238,13 @@ async fn rating_refusal(
         Some(track) => Some(track),
         None if pending.is_empty() => None,
         None => {
+            let unplaced = |f| NotSet::Refused(unplaced(f));
             let native = (guard.read_song(user, &song.id).await)
-                .map_err(NotSet::Refused)?
+                .map_err(unplaced)?
                 .ok_or_else(|| NotSet::Refused(song_not_found()))?;
             pending_track_of(guard.db, guard.music_path, user, &native, &pending)
                 .await
-                .map_err(NotSet::Refused)?
+                .map_err(unplaced)?
         }
     };
     match (track, rating) {
@@ -257,6 +258,35 @@ async fn rating_refusal(
         }),
         (None, _) => Ok(()),
     }
+}
+
+/// `f`, the guard's failure to read or place the rated song's file while the user has pending
+/// discovery tracks, as a rating's failure: at the stage of set_rating's library reads. A file
+/// Soulful cannot place (delete_path_unresolved, the guard's reason kept in the message) also
+/// says what the user can fix: the music folder as Soulful sees it does not match Navidrome's
+/// library path, or Soulful finds no file there.
+fn unplaced(f: Failure) -> Failure {
+    let f = Failure {
+        stage: Stage::LibraryCheck,
+        ..f
+    };
+    if f.code != FailureCode::DeletePathUnresolved {
+        return f;
+    }
+    let message = format!(
+        "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot find the song's file in the music folder at the path Navidrome's library gives for it. {}. Make Navidrome's music folder readable by Soulful at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library, or rate the song yourself in Navidrome.",
+        f.message
+    );
+    Failure {
+        retry: RetryAdvice::NeedsUser,
+        ..f
+    }
+    .with_message(message)
+    .with_user_action(UserAction::new(
+        UserActionCode::ConfigureNavidrome,
+        "Make Navidrome's music folder readable by Soulful at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library",
+        "Soulful's environment",
+    ))
 }
 
 /// A failed write of `target`: Navidrome's "data not found" (Subsonic 70) is the target gone.
@@ -983,14 +1013,46 @@ mod tests {
                 "id=s6&rating=3".to_string()
             ]
         );
-        // A song whose file cannot be found here cannot be told apart from the track.
+        // A song whose file cannot be found here cannot be told apart from the track: refused at
+        // the stage of a rating's library reads, saying what the user can fix, with no path.
         std::fs::remove_file(lib.root.join("music/alice/A/03.flac")).unwrap();
         let e = rate(&guard, &navi.client(), &lib.alice(), &silent, 3)
             .await
             .unwrap_err();
+        let f = e.failure();
         assert_eq!(
-            (e.after_write(), e.failure().code),
-            (false, FailureCode::DeletePathUnresolved)
+            (e.after_write(), f.code, f.stage, f.retry),
+            (
+                false,
+                FailureCode::DeletePathUnresolved,
+                Stage::LibraryCheck,
+                RetryAdvice::NeedsUser
+            )
+        );
+        assert_eq!(
+            f.message,
+            "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot find the song's file in the music folder at the path Navidrome's library gives for it. No file at this song's path. Make Navidrome's music folder readable by Soulful at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library, or rate the song yourself in Navidrome."
+        );
+        assert_eq!(
+            f.user_action,
+            Some(UserAction::new(
+                UserActionCode::ConfigureNavidrome,
+                "Make Navidrome's music folder readable by Soulful at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library",
+                "Soulful's environment",
+            ))
+        );
+        let shown = serde_json::to_string(f).unwrap();
+        assert!(!shown.contains(lib.root.to_str().unwrap()), "{shown}");
+        assert!(!shown.contains("03.flac"), "{shown}");
+        // So is a record of the song that cannot be read, at the same stage.
+        lib.fake
+            .unreadable("alice", || NavidromeLookupError::NotLinked);
+        let e = rate(&guard, &navi.client(), &lib.alice(), &silent, 3)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (e.failure().code, e.failure().stage),
+            (FailureCode::NavidromeNotLinked, Stage::LibraryCheck)
         );
         assert_eq!(navi.posted("/rest/setRating").len(), 2);
         assert_eq!(lib.fake.ratings_set(), vec![], "the guard wrote no rating");
