@@ -386,12 +386,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_app_that_may_not_delete_cannot_move_the_discovery_folder_around_a_promoting_rating()
-    {
+    async fn no_app_can_move_the_discovery_folder_around_a_promoting_rating() {
         // The route: move the discovery folder away from a pending track's folder, rate the
         // track at the threshold (the sync reads the discovery folder only), move it back. The
-        // 6 hourly sync would then promote the track through the guard, replacing an earlier
-        // library copy. Each step is refused for an app that may not delete.
+        // 6 hourly sync would then promote the track through the guard as Soulful's own
+        // deletion, replacing an earlier library copy outside the app's switch and daily room.
+        // Each step is refused for every app, whatever its switch.
         let lib = Library::new().await;
         lib.folder("alice", "alice-other", "music/alice-other", false)
             .await;
@@ -436,7 +436,7 @@ mod tests {
                 (
                     Some("permission_not_granted"),
                     Some("needs_user"),
-                    Some("enable_deletion"),
+                    Some("change_discovery_settings"),
                     &json!({"field": field}),
                     &json!([])
                 )
@@ -452,7 +452,7 @@ mod tests {
             .await,
         );
         refused(&away, "discovery_folder_id");
-        assert_eq!(away["error"]["message"], "This app may not delete music, so it cannot change the discovery folder: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there");
+        assert_eq!(away["error"]["message"], "Only you can change the discovery folder, in Soulful's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there");
         assert_eq!(discovery_folder().await.as_deref(), Some("alice-music"));
 
         // The user moves it in Soulful: the rating is still refused, t1 being alice's.
@@ -460,7 +460,7 @@ mod tests {
             .await
             .unwrap();
         let five = json!({"song_id": HOLY.0, "rating": 5});
-        let rated = document(&call_tool(app.clone(), &token, "set_rating", five).await);
+        let rated = document(&call_tool(app.clone(), &token, "set_rating", five.clone()).await);
         assert_eq!(
             (
                 rated["error"]["code"].as_str(),
@@ -487,14 +487,25 @@ mod tests {
         refused(&back, "discovery_folder_id");
         assert_eq!(discovery_folder().await.as_deref(), Some("alice-other"));
 
-        // With the switch the folder moves.
+        // With the switch the folder stays, and so does the refusal of the rating.
         sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
             .execute(&lib.db)
             .await
             .unwrap();
-        let moved =
-            document(&call_tool(app, &token, "update_settings", move_to("alice-music")).await);
-        assert_eq!(moved["settings"]["discovery"]["folder_id"], "alice-music");
+        let switched = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "update_settings",
+                move_to("alice-music"),
+            )
+            .await,
+        );
+        refused(&switched, "discovery_folder_id");
+        assert_eq!(discovery_folder().await.as_deref(), Some("alice-other"));
+        let rated = document(&call_tool(app, &token, "set_rating", five).await);
+        assert_eq!(rated["error"]["code"], "permission_not_granted");
+        assert!(!navi.asked().contains(&"/rest/setRating".to_string()));
     }
 
     #[tokio::test]

@@ -16,7 +16,6 @@ use super::server::{common_codes, ToolSpec};
 use super::status::{chosen_folder, folder_fields, with_free_space};
 use super::McpCaller;
 use crate::connection::ConnectionState;
-use crate::core::delete_guard::quota::enable_deletion;
 use crate::core::discovery::parse_profiles;
 use crate::core::library::library_roots_in;
 use crate::core::settings::Setting;
@@ -162,7 +161,7 @@ pub(crate) const UPDATE_SETTINGS: ToolSpec = ToolSpec {
     title: "Change settings",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Changes this user's Soulful settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulful's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, its folder, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map, and the promote threshold 1 to 5). Only an app allowed to delete music may change the discovery folder or the promote threshold, since the rating sync promotes the folder's pending tracks rated at or above the threshold and a promote can replace an earlier library copy. Turning discovery off, changing its folder or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true, or discovery_folder_id or discovery_promote_threshold from an app that may not delete), already_running.")
+        format!("Changes this user's Soulful settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulful's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map). The discovery folder and the promote threshold are changed only by the user, in Soulful's Settings, whether or not deletion is switched on for this app: the rating sync moves the folder's pending tracks rated at or above the threshold into the library, and a promote can replace and delete an earlier library copy outside this app's daily limit. Turning discovery off or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true, discovery_folder_id or discovery_promote_threshold), already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"default_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "auto_delete": {"type": "boolean"}, "discovery_enabled": {"type": "boolean"}, "discovery_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "discovery_profiles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["Conservative", "Balanced", "Adventurous"]}}, "discovery_track_counts": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_lifetime_days": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_playlist_names": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "string"}, "Balanced": {"type": "string"}, "Adventurous": {"type": "string"}}}, "discovery_promote_threshold": {"type": "integer", "minimum": 0, "maximum": 255}, "#,
@@ -193,28 +192,39 @@ fn auto_delete_on_refused() -> Failure {
 }
 
 /// Lowering the promote threshold has the next rating sync promote pending discovery tracks
-/// rated below the old one, and a promote can replace an earlier library copy, deleting it.
+/// rated below the old one, and a promote can replace an earlier library copy, deleting it. The
+/// 6 hourly sync promotes as Soulful's own deletion, past the app's switch, its daily room and
+/// its name in the history, so no app changes it, whatever its switch, as no app's rating may
+/// promote (`core::ratings::sync_effect`).
 fn promote_threshold_refused() -> Failure {
     Failure::new(
         FailureCode::PermissionNotGranted,
         Stage::Input,
         RetryAdvice::NeedsUser,
-        "This app may not delete music, so it cannot change the discovery promote threshold: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
+        "Only you can change the discovery promote threshold, in Soulful's Settings: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
     )
-    .with_user_action(enable_deletion())
+    .with_user_action(UserAction::new(
+        UserActionCode::ChangeDiscoverySettings,
+        "Change the discovery promote threshold yourself",
+        "Soulful Settings > Library > Discovery",
+    ))
 }
 
 /// Moving the discovery folder has the next rating sync promote the pending tracks of the new
 /// one that are rated at or above the threshold, and a promote can replace an earlier library
-/// copy, deleting it.
+/// copy, deleting it. Refused from every app, as the promote threshold is.
 fn discovery_folder_refused() -> Failure {
     Failure::new(
         FailureCode::PermissionNotGranted,
         Stage::Input,
         RetryAdvice::NeedsUser,
-        "This app may not delete music, so it cannot change the discovery folder: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
+        "Only you can change the discovery folder, in Soulful's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
     )
-    .with_user_action(enable_deletion())
+    .with_user_action(UserAction::new(
+        UserActionCode::ChangeDiscoverySettings,
+        "Change the discovery folder yourself",
+        "Soulful Settings > Library > Discovery",
+    ))
 }
 
 /// The settings a call changes.
@@ -291,21 +301,20 @@ async fn update_settings(
         Err(e) => return failed(e),
     };
     let call = args.as_value();
-    let (db, navidrome, ctx, may_delete) = (
+    let (db, navidrome, ctx) = (
         state.db.clone(),
         state.navidrome.clone(),
         caller.ctx.clone(),
-        caller.allow_delete,
     );
     let work = async move {
         if changes.auto_delete_on {
             return refusal(&args, auto_delete_on_refused(), field_facts("auto_delete"));
         }
-        if changes.update.discovery_folder_id.is_some() && !may_delete {
+        if changes.update.discovery_folder_id.is_some() {
             let facts = field_facts("discovery_folder_id");
             return refusal(&args, discovery_folder_refused(), facts);
         }
-        if changes.update.discovery_promote_threshold.is_some() && !may_delete {
+        if changes.update.discovery_promote_threshold.is_some() {
             let facts = field_facts("discovery_promote_threshold");
             return refusal(&args, promote_threshold_refused(), facts);
         }
@@ -572,39 +581,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_promote_threshold_is_changed_only_by_an_app_that_may_delete() {
-        // A lower threshold has the 6 hourly sync promote pending tracks rated below the old
-        // one, and a promote can replace an earlier library copy.
+    async fn the_promote_threshold_and_the_discovery_folder_are_changed_only_in_soulfuls_settings()
+    {
+        // A lower threshold, or a folder whose pending tracks are rated at or above it, has the
+        // 6 hourly sync promote them as Soulful's own deletion, and a promote can replace an
+        // earlier library copy: outside the app's switch, its daily room and its name in the
+        // history. So no app changes either, whatever its switch.
         let (db, app, token) = mcp_app().await;
-        let lower = json!({"discovery_promote_threshold": 1, "request_key": "k"});
-        let error =
-            &document(&call_tool(app.clone(), &token, "update_settings", lower.clone()).await)
-                ["error"];
-        assert_eq!(
-            (
-                error["code"].as_str(),
-                error["retry"].as_str(),
-                error["user_action"]["code"].as_str()
-            ),
-            (
-                Some("permission_not_granted"),
-                Some("needs_user"),
-                Some("enable_deletion")
-            )
-        );
-        assert_eq!(
-            (&error["facts"], &error["next"]),
-            (&json!({"field": "discovery_promote_threshold"}), &json!([]))
-        );
-        let saved = UserSettings::get_in(&db, "u1").await.unwrap();
-        assert_eq!(saved.discovery_promote_threshold, 3);
-        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+        sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES ('f1', 'u1', 'Music', '/music/u1')")
             .execute(&db)
             .await
             .unwrap();
-        // Nothing was saved, so the key was let go.
-        let doc = document(&call_tool(app, &token, "update_settings", lower).await);
-        assert_eq!(doc["settings"]["discovery"]["promote_threshold"], 1);
+        let calls = [
+            (
+                "discovery_promote_threshold",
+                json!({"discovery_promote_threshold": 1, "request_key": "k"}),
+                "Only you can change the discovery promote threshold, in Soulful's Settings: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
+                "Change the discovery promote threshold yourself",
+            ),
+            (
+                "discovery_folder_id",
+                json!({"discovery_folder_id": "f1", "request_key": "k"}),
+                "Only you can change the discovery folder, in Soulful's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
+                "Change the discovery folder yourself",
+            ),
+        ];
+        for allow_delete in [0, 1] {
+            sqlx::query("UPDATE oauth_grants SET allow_delete = ?")
+                .bind(allow_delete)
+                .execute(&db)
+                .await
+                .unwrap();
+            // The same key each time: nothing was saved, so each refusal let it go.
+            for (field, call, message, what) in &calls {
+                let result = call_tool(app.clone(), &token, "update_settings", call.clone()).await;
+                let error = &document(&result)["error"];
+                assert_eq!(
+                    (
+                        error["code"].as_str(),
+                        error["stage"].as_str(),
+                        error["retry"].as_str(),
+                        error["message"].as_str()
+                    ),
+                    (
+                        Some("permission_not_granted"),
+                        Some("input"),
+                        Some("needs_user"),
+                        Some(*message)
+                    ),
+                    "{field}, allow_delete {allow_delete}"
+                );
+                assert_eq!(
+                    error["user_action"],
+                    json!({"code": "change_discovery_settings", "what": what, "where": "Soulful Settings > Library > Discovery"}),
+                    "{field}, allow_delete {allow_delete}"
+                );
+                assert_eq!(
+                    (&error["facts"], &error["next"]),
+                    (&json!({"field": field}), &json!([])),
+                    "{field}, allow_delete {allow_delete}"
+                );
+            }
+            let saved = UserSettings::get_in(&db, "u1").await.unwrap();
+            assert_eq!(
+                (saved.discovery_promote_threshold, saved.discovery_folder_id),
+                (3, None),
+                "allow_delete {allow_delete}"
+            );
+        }
     }
 
     #[tokio::test]

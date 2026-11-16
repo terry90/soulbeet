@@ -295,6 +295,9 @@ pub enum UserActionCode {
     RateInNavidrome,
     /// A setting only the user changes, in Soulful's own Settings.
     EnableAutoDelete,
+    /// The discovery folder or promote threshold, which only the user changes, in Soulful's own
+    /// Settings.
+    ChangeDiscoverySettings,
 }
 
 /// Defines `FailureCode` from one list of variants and wire names: `as_str`

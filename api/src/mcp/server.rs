@@ -530,7 +530,7 @@ mod tests {
                 "entries": [{"position": 0, "song_id": "3sG8kPq0WmZ1xYbN4vTcDe"}]}),
             "set_rating" => json!({"song_id": "3sG8kPq0WmZ1xYbN4vTcDe", "rating": 3}),
             "set_star" => json!({"song_id": "3sG8kPq0WmZ1xYbN4vTcDe", "starred": true}),
-            "update_settings" => json!({"discovery_promote_threshold": 3}),
+            "update_settings" => json!({"discovery_enabled": true}),
             "promote_discovery_track" | "remove_discovery_track" => json!({"track_id": "t1"}),
             other => panic!("no valid call for {other} in valid_args"),
         }
