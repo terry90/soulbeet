@@ -668,10 +668,11 @@ pub struct SongGroup {
 
 /// D11: every present song of the caller through `list_songs`, DUPLICATE_PAGE at a time until a
 /// short page, grouped by (match_key(artist), match_key(title)); the groups of two or more,
-/// ordered by that key. A page that fails fails the search, since a part would miss copies.
+/// ordered by that key. A song id seen again on a later page is skipped. A page that fails fails the search, since a part would miss copies.
 pub async fn duplicates(navi: &NavidromeClient) -> Result<Vec<SongGroup>, Failure> {
     let failure = |e: NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
     let mut by_key: BTreeMap<(String, String), Vec<SongFacts>> = BTreeMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut start = 0;
     loop {
         let page = navi
@@ -680,6 +681,10 @@ pub async fn duplicates(navi: &NavidromeClient) -> Result<Vec<SongGroup>, Failur
             .map_err(failure)?;
         let last = page.len() < DUPLICATE_PAGE as usize;
         for song in &page {
+            // A song added mid-search shifts the offsets, so a page can repeat a row.
+            if !seen.insert(song.id.clone()) {
+                continue;
+            }
             by_key
                 .entry((match_key(&song.artist), match_key(&song.title)))
                 .or_default()
@@ -1420,6 +1425,30 @@ mod tests {
         assert!(song_requests(&navi)
             .iter()
             .any(|t| t.contains("_start=1000&_end=2000")));
+    }
+
+    #[tokio::test]
+    async fn a_song_a_later_page_repeats_is_not_its_own_duplicate() {
+        let navi = NavidromeStub::start();
+        let mut first: Vec<String> = (0..999)
+            .map(|i| {
+                native_song(
+                    &format!("f{i:04}"),
+                    "Filler",
+                    &format!("Track {i}"),
+                    200.0,
+                    None,
+                )
+            })
+            .collect();
+        let last = native_song("a1", "Marrow Choir", "O Holy Night", 263.4, None);
+        first.push(last.clone());
+        navi.answer(
+            "/api/song",
+            &[&format!("[{}]", first.join(",")), &format!("[{last}]")],
+        );
+        let groups = duplicates(&navi.client()).await.unwrap();
+        assert!(groups.is_empty());
     }
 
     #[tokio::test]
