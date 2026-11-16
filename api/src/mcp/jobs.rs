@@ -1269,6 +1269,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_wait_condition_holds_for_what_it_names_and_an_empty_selection_has_ended() {
+        use super::{Since, WaitFor};
+        use crate::core::jobs::runner::Acquire;
+        use crate::core::jobs::{job_records, JobSelect};
+        let (acq, _) = Acquire::for_alice().await;
+        let running = downloading_track_job(&acq).await;
+        // slskd's text for a peer whose upload queue is full (Application.cs:763-766).
+        let busy = Failure::new(
+            FailureCode::TransferRejectedPeerBusy,
+            Stage::Transfer,
+            RetryAdvice::SameSourceLater,
+            "Transfer rejected: Too many files",
+        );
+        let failed = failed_track_job_with(&acq, "Silent Night", busy).await;
+        let ctx = test_ctx("alice");
+        let records = |ids: Vec<String>| {
+            let (db, ctx) = (acq.db.clone(), ctx.clone());
+            async move { job_records(&db, &ctx, &JobSelect::Ids(ids)).await.unwrap() }
+        };
+        let now = Since::Now(0);
+        // Nothing selected: nothing changes, and every job of none has ended.
+        assert!(!WaitFor::AnyChange.holds(&[], now));
+        assert!(WaitFor::NeedsAction.holds(&[], now) && WaitFor::AllTerminal.holds(&[], now));
+        let one = records(vec![running.clone()]).await;
+        let seen = Since::Given(one[0].changed_seq);
+        assert!(!WaitFor::AnyChange.holds(&one, seen) && WaitFor::AnyChange.holds(&one, now));
+        assert!(!WaitFor::NeedsAction.holds(&one, now) && !WaitFor::AllTerminal.holds(&one, now));
+        let both = records(vec![running, failed]).await;
+        assert!(WaitFor::NeedsAction.holds(&both, now));
+        let failure_seen = Since::Given(both.iter().map(|j| j.changed_seq).max().unwrap());
+        assert!(!WaitFor::NeedsAction.holds(&both, failure_seen));
+        assert!(!WaitFor::AllTerminal.holds(&both, now));
+    }
+
+    #[tokio::test]
     async fn job_ids_and_a_batch_are_not_both_taken() {
         let (db, acq, _, token) = jobs_app().await;
         let error = document(

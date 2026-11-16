@@ -244,7 +244,7 @@ struct Waiting {
 
 /// What a target's worker runs, one at a time.
 enum Work {
-    Import(Waiting),
+    Import(Box<Waiting>),
     /// Drops `file` from the target's library.
     Forget {
         file: PathBuf,
@@ -321,7 +321,7 @@ impl ImportQueue {
 
         let owner = job.owner.clone();
         let (state, rx) = watch::channel(JobState::Queued { position: 0 });
-        self.enqueue(key, Work::Import(Waiting { job, state }));
+        self.enqueue(key, Work::Import(Box::new(Waiting { job, state })));
 
         if let Some(owner) = owner {
             let _emit = self.shared.emit_lock.lock().await;
@@ -444,7 +444,8 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
             }
         }
         match item {
-            Work::Import(Waiting { job, state }) => {
+            Work::Import(waiting) => {
+                let Waiting { job, state } = *waiting;
                 let outcome = AssertUnwindSafe(shared.execute(&key, &job))
                     .catch_unwind()
                     .await

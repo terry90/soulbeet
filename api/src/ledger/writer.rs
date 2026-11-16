@@ -207,7 +207,7 @@ struct Pending {
 
 /// A change to the live rows.
 enum LiveChange {
-    Set(JobSlot, DownloadProgress),
+    Set(JobSlot, Box<DownloadProgress>),
     Remove(JobSlot),
     /// Every live row of this job goes.
     Forget(String),
@@ -436,7 +436,7 @@ impl Writer {
         for change in live {
             match change {
                 LiveChange::Set(slot, row) => {
-                    rows.insert(slot, row);
+                    rows.insert(slot, *row);
                 }
                 LiveChange::Remove(slot) => {
                     rows.remove(&slot);
@@ -838,7 +838,8 @@ impl Writer {
         if state.is_terminal() {
             self.slot_ended(tx, slot, row.failure.as_ref()).await?;
         } else {
-            (self.pending.live).push(LiveChange::Set(slot.clone(), row.clone()));
+            let row = Box::new(row.clone());
+            self.pending.live.push(LiveChange::Set(slot.clone(), row));
         }
         Ok(true)
     }

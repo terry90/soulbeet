@@ -869,6 +869,128 @@ mod tests {
     use shared::download::FileFacts;
 
     #[tokio::test]
+    async fn the_timeline_and_earlier_attempts_show_their_newest_and_count_the_rest() {
+        use crate::core::jobs::test_support::{downloading_track_job_with, in_progress};
+        use crate::ledger::JobEvent;
+        use shared::download::{DownloadState, JobSlot};
+        let (acq, _) = Acquire::for_alice().await;
+        let title = "Silent Night";
+        let job = downloading_track_job_with(&acq, title, auto_options()).await;
+        let slot = JobSlot {
+            job: job.clone(),
+            slot: 0,
+        };
+        // Thirty sources tried one after another, each refused by its peer
+        // (Soulseek.NET src/SoulseekClient.cs:3790).
+        let offline = |peer: &str| {
+            Failure::new(
+                FailureCode::PeerOffline,
+                Stage::Transfer,
+                RetryAdvice::OtherSource,
+                format!("User {peer} appears to be offline"),
+            )
+        };
+        acq.ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![in_progress(&job, title).failed_with(offline("peer_a"))],
+        });
+        for n in 0..30 {
+            let peer = format!("peer_{n:02}");
+            let file = item(&peer, title, &format!("{peer}/03.flac"));
+            acq.ledger.record(JobEvent::Attempt {
+                slot: slot.clone(),
+                candidate: Some(Box::new(file.clone())),
+                request: Some(format!("r{n}")),
+            });
+            for state in [DownloadState::InProgress, DownloadState::Cancelled] {
+                let row = crate::server_fns::download::test_support::transfer(
+                    &peer,
+                    &file.id,
+                    &format!("t-{n}"),
+                    state.clone(),
+                )
+                .with_job(slot.clone());
+                let row = match state {
+                    DownloadState::Cancelled => row.failed_with(offline(&peer)),
+                    _ => row,
+                };
+                acq.ledger.record(JobEvent::Slots {
+                    state: JobState::Downloading,
+                    rows: vec![row],
+                });
+            }
+        }
+        acq.ledger.settled().await;
+        let view = view_of(&acq, &job).await;
+        let doc = job_document(
+            &view,
+            &Untried::default(),
+            Detail::Full,
+            &ReadNow::default(),
+            false,
+        );
+        let timeline = doc["timeline"].as_array().unwrap();
+        assert_eq!(timeline.len(), TIMELINE_SHOWN, "{doc}");
+        assert_eq!(
+            timeline.len() as u64 + doc["timeline_omitted"].as_u64().unwrap(),
+            view.timeline.len() as u64
+        );
+        assert_eq!(
+            timeline.last().unwrap()["seq"],
+            json!(view.timeline.last().unwrap().seq)
+        );
+        let tried = doc["tried"].as_array().unwrap();
+        assert_eq!(tried.len(), TRIED_PER_SLOT);
+        // The 30 that ended (peer_a's and the first 29 alternates'): the newest 10 shown, oldest
+        // first, the current one apart.
+        assert_eq!(doc["tried_omitted"], 20);
+        assert_eq!(tried.last().unwrap()["source"], "peer_28");
+        // The slot still downloads: its row's failure is a warning, not the job's failure.
+        assert_eq!(
+            (&doc["failure"], doc["slots"][0]["warning"]["code"].as_str()),
+            (&Value::Null, Some("peer_offline"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_that_failed_waiting_for_navidrome_says_what_its_wait_knew() {
+        use crate::core::jobs::test_support::index_failed_track_job;
+        let (acq, _) = Acquire::for_alice().await;
+        let job = index_failed_track_job(&acq).await;
+        let view = view_of(&acq, &job).await;
+        let doc = job_document(
+            &view,
+            &Untried::default(),
+            Detail::Full,
+            &ReadNow::default(),
+            false,
+        );
+        let index = &doc["slots"][0]["index"];
+        assert_eq!(
+            (
+                index["import_finished_at"].as_i64(),
+                index["scan_requested"].as_bool(),
+                &index["last_scan_seen"]
+            ),
+            (Some(0), Some(false), &Value::Null),
+            "{doc}"
+        );
+        assert!(index["library_path"].is_string());
+        assert_eq!(doc["failure"]["code"], "index_not_found_after_scan");
+        // A slot that did not wait shows no wait.
+        let done = done_track_job(&acq).await;
+        let view = view_of(&acq, &done).await;
+        let doc = job_document(
+            &view,
+            &Untried::default(),
+            Detail::Full,
+            &ReadNow::default(),
+            false,
+        );
+        assert_eq!(doc["slots"][0]["index"], Value::Null);
+    }
+
+    #[tokio::test]
     async fn a_failed_job_carries_its_failure_its_facts_and_what_was_tried() {
         let (acq, _) = Acquire::for_alice().await;
         let job = failed_track_job(&acq).await;
