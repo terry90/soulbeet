@@ -147,6 +147,12 @@ impl Args {
             .ok_or_else(|| self.refuse(name, &format!("an integer from {min} to {max}")))
     }
 
+    /// A required JSON integer from `min` to `max`.
+    pub(crate) fn u32(&self, name: &str, min: u32, max: u32) -> Result<u32, ToolError> {
+        self.opt_u32(name, min, max)?
+            .ok_or_else(|| self.refuse(name, &format!("an integer from {min} to {max}")))
+    }
+
     /// A JSON number from 0 to 1.
     pub(crate) fn opt_unit(&self, name: &str) -> Result<Option<f64>, ToolError> {
         let Some(value) = self.given(name) else {
@@ -193,18 +199,40 @@ impl Args {
         name: &str,
         max: usize,
     ) -> Result<Option<Vec<String>>, ToolError> {
+        let expected =
+            format!("a list of at most {max} non-empty strings of at most 500 characters");
+        self.texts(name, 0, max, &expected)
+    }
+
+    /// A required list of `min` to `max` texts, each trimmed and refused as `string` refuses one.
+    pub(crate) fn strings(
+        &self,
+        name: &str,
+        min: usize,
+        max: usize,
+    ) -> Result<Vec<String>, ToolError> {
+        let expected =
+            format!("a list of {min} to {max} non-empty strings of at most 500 characters");
+        self.texts(name, min, max, &expected)?
+            .ok_or_else(|| self.refuse(name, &expected))
+    }
+
+    /// The list `name` of `min` to `max` texts, None when it is not given; `expected` names the
+    /// list in a refusal.
+    fn texts(
+        &self,
+        name: &str,
+        min: usize,
+        max: usize,
+        expected: &str,
+    ) -> Result<Option<Vec<String>>, ToolError> {
         let Some(value) = self.given(name) else {
             return Ok(None);
         };
-        let refused = || {
-            self.refuse(
-                name,
-                &format!("a list of at most {max} non-empty strings of at most 500 characters"),
-            )
-        };
+        let refused = || self.refuse(name, expected);
         let list = value
             .as_array()
-            .filter(|list| list.len() <= max)
+            .filter(|list| (min..=max).contains(&list.len()))
             .ok_or_else(refused)?;
         list.iter()
             .map(|text| {
@@ -611,6 +639,42 @@ pub(crate) mod tests {
             long.opt_text("longer", 2000).unwrap_err().failure.message,
             "create_playlist: longer must be a text of at most 2000 characters"
         );
+    }
+
+    #[test]
+    fn required_lists_and_integers_are_read_with_their_bounds() {
+        let a = Args::new(
+            "add_playlist_tracks",
+            obj(
+                json!({"song_ids": [" s1 ", "s2"], "empty": [], "blank": ["s1", " "],
+                "position": 3, "negative": -1, "text": "3"}),
+            ),
+            &["song_ids", "empty", "blank", "position", "negative", "text"],
+        );
+        assert_eq!(
+            a.strings("song_ids", 1, 2).unwrap(),
+            vec!["s1".to_string(), "s2".to_string()]
+        );
+        assert_eq!(a.strings("empty", 0, 2).unwrap(), Vec::<String>::new());
+        let a_list = "a list of 1 to 1000 non-empty strings of at most 500 characters";
+        for name in ["empty", "blank", "missing", "position"] {
+            assert_eq!(
+                a.strings(name, 1, 1000).unwrap_err().failure.message,
+                format!("add_playlist_tracks: {name} must be {a_list}")
+            );
+        }
+        assert_eq!(
+            a.strings("song_ids", 0, 1).unwrap_err().failure.message,
+            "add_playlist_tracks: song_ids must be a list of 0 to 1 non-empty strings of at most 500 characters"
+        );
+        assert_eq!(a.u32("position", 0, 3).unwrap(), 3);
+        for name in ["negative", "text", "missing"] {
+            assert_eq!(
+                a.u32(name, 0, 100_000).unwrap_err().failure.message,
+                format!("add_playlist_tracks: {name} must be an integer from 0 to 100000")
+            );
+        }
+        assert!(a.u32("position", 0, 2).is_err());
     }
 
     #[test]

@@ -260,6 +260,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     playlists::CREATE_PLAYLIST,
     playlists::UPDATE_PLAYLIST,
     playlists::DELETE_PLAYLIST,
+    playlists::SET_PLAYLIST_TRACKS,
+    playlists::ADD_PLAYLIST_TRACKS,
+    playlists::REMOVE_PLAYLIST_TRACKS,
 ];
 
 impl ToolSpec {
@@ -508,6 +511,13 @@ mod tests {
             "create_playlist" => json!({"name": "Advent"}),
             "update_playlist" => json!({"playlist_id": "6vN2bQ8rT4yH1kL9mX3zPa", "name": "Advent"}),
             "delete_playlist" => json!({"playlist_id": "6vN2bQ8rT4yH1kL9mX3zPa"}),
+            "set_playlist_tracks" => {
+                json!({"playlist_id": "6vN2bQ8rT4yH1kL9mX3zPa", "song_ids": []})
+            }
+            "add_playlist_tracks" => json!({"playlist_id": "6vN2bQ8rT4yH1kL9mX3zPa",
+                "song_ids": ["3sG8kPq0WmZ1xYbN4vTcDe"]}),
+            "remove_playlist_tracks" => json!({"playlist_id": "6vN2bQ8rT4yH1kL9mX3zPa",
+                "entries": [{"position": 0, "song_id": "3sG8kPq0WmZ1xYbN4vTcDe"}]}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -579,6 +589,9 @@ mod tests {
         ("create_playlist", false, false, false, false),
         ("update_playlist", false, false, true, false),
         ("delete_playlist", false, true, true, false),
+        ("set_playlist_tracks", false, false, true, false),
+        ("add_playlist_tracks", false, false, false, false),
+        ("remove_playlist_tracks", false, false, false, false),
     ];
 
     #[test]
@@ -692,6 +705,9 @@ mod tests {
             "create_playlist",
             "update_playlist",
             "delete_playlist",
+            "set_playlist_tracks",
+            "add_playlist_tracks",
+            "remove_playlist_tracks",
         ] {
             let result = call_tool(app.clone(), &token, name, valid_args(name)).await;
             within_cap(&result, name);

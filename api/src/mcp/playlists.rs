@@ -1,11 +1,13 @@
 //! The playlist tools: the caller's Navidrome playlists and other users'
 //! public ones, and the writes to the caller's own.
 
+use std::collections::HashSet;
+
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, Failure, FailureCode, Stage, TEXT_MAX_CHARS};
 
-use super::args::Args;
+use super::args::{repeatable, Args};
 use super::contract::{
     answer, error_object, failed, invalid_value, success, too_large_to_repeat, upstream_error,
     NextCall, ToolError,
@@ -18,7 +20,8 @@ use super::server::{common_codes, ToolSpec, NAVIDROME_CODES};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::playlists::{
-    self, MetaChange, NewPlaylist, PlaylistRefusal, Written, SONG_IDS_MAX,
+    self, MetaChange, NewPlaylist, NotEditable, PlaylistRefusal, Written, POSITION_MAX,
+    SONG_IDS_MAX,
 };
 
 const CREATE_PLAYLIST_ARGS: &[&str] = &[
@@ -40,6 +43,15 @@ const UPDATE_PLAYLIST_ARGS: &[&str] = &[
 ];
 
 const DELETE_PLAYLIST_ARGS: &[&str] = &["playlist_id", "request_key"];
+
+const SET_PLAYLIST_TRACKS_ARGS: &[&str] = &["playlist_id", "song_ids", "request_key"];
+
+const ADD_PLAYLIST_TRACKS_ARGS: &[&str] = &["playlist_id", "song_ids", "position", "request_key"];
+
+const REMOVE_PLAYLIST_TRACKS_ARGS: &[&str] = &["playlist_id", "entries", "request_key"];
+
+/// The fields of each of remove_playlist_tracks' entries.
+const ENTRY_ARGS: &[&str] = &["position", "song_id"];
 
 /// Longest playlist name, in characters after trimming.
 const NAME_MAX_CHARS: usize = 255;
@@ -104,6 +116,63 @@ pub(crate) const DELETE_PLAYLIST: ToolSpec = ToolSpec {
     idempotent: true,
     open_world: false,
     call: |state, caller, args| Box::pin(delete_playlist(state, caller, args)),
+};
+
+pub(crate) const SET_PLAYLIST_TRACKS: ToolSpec = ToolSpec {
+    name: "set_playlist_tracks",
+    title: "Set a playlist's tracks",
+    description: |calls_a_minute| {
+        let common = common_codes(calls_a_minute);
+        format!("Replaces every entry of one of this user's playlists with the given songs in the given order; this is also how to reorder. Navidrome rewrites the whole list, so entries of libraries this user cannot see, which get_playlist leaves out, are dropped; hidden_entries_dropped counts them. An empty list removes every entry get_playlist lists. Songs the playlist does not hold yet must be in the library with their files present. The result is read back from Navidrome. Playlist ids stay valid until the playlist is deleted; song ids while the file stays in the library. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle, playlist_not_found, playlist_not_owner, playlist_not_editable (smart or file-synced playlist; next offers a static copy), playlist_tracks_not_written, already_running.")
+    },
+    input_schema: concat!(
+        r#"{"type": "object", "additionalProperties": false, "required": ["playlist_id", "song_ids"], "properties": {"playlist_id": {"type": "string", "minLength": 1}, "song_ids": {"type": "array", "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 500}}, "#,
+        request_key_schema!(),
+        "}}"
+    ),
+    read_only: false,
+    destructive: false,
+    idempotent: true,
+    open_world: false,
+    call: |state, caller, args| Box::pin(set_playlist_tracks(state, caller, args)),
+};
+
+pub(crate) const ADD_PLAYLIST_TRACKS: ToolSpec = ToolSpec {
+    name: "add_playlist_tracks",
+    title: "Add tracks to a playlist",
+    description: |calls_a_minute| {
+        let common = common_codes(calls_a_minute);
+        format!("Adds songs to one of this user's playlists, at the end or before position (an entry's position as get_playlist lists it; the position after the last entry also adds at the end). Appending keeps the entries of libraries this user cannot see; inserting rewrites the list like set_playlist_tracks and drops them (hidden_entries_dropped). The result is read back. A repeat with the same request_key returns the first result. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle, playlist_not_found, playlist_not_owner, playlist_not_editable, playlist_tracks_not_written, already_running, and invalid_input for a position get_playlist does not list.")
+    },
+    input_schema: concat!(
+        r#"{"type": "object", "additionalProperties": false, "required": ["playlist_id", "song_ids"], "properties": {"playlist_id": {"type": "string", "minLength": 1}, "song_ids": {"type": "array", "minItems": 1, "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 500}}, "position": {"type": "integer", "minimum": 0, "maximum": 100000}, "#,
+        request_key_schema!(),
+        "}}"
+    ),
+    read_only: false,
+    destructive: false,
+    idempotent: false,
+    open_world: false,
+    call: |state, caller, args| Box::pin(add_playlist_tracks(state, caller, args)),
+};
+
+pub(crate) const REMOVE_PLAYLIST_TRACKS: ToolSpec = ToolSpec {
+    name: "remove_playlist_tracks",
+    title: "Remove tracks from a playlist",
+    description: |calls_a_minute| {
+        let common = common_codes(calls_a_minute);
+        format!("Removes entries from one of this user's playlists. Each entry names its position (as get_playlist lists it) and the song id there; if the playlist changed and a position holds another song, nothing is removed (playlist_changed; call get_playlist again). The result is read back. A repeat with the same request_key returns the first result. Failure codes: {common}, {NAVIDROME_CODES}, playlist_not_found, playlist_not_owner, playlist_not_editable, playlist_changed, playlist_tracks_not_written, already_running.")
+    },
+    input_schema: concat!(
+        r#"{"type": "object", "additionalProperties": false, "required": ["playlist_id", "entries"], "properties": {"playlist_id": {"type": "string", "minLength": 1}, "entries": {"type": "array", "minItems": 1, "maxItems": 1000, "items": {"type": "object", "additionalProperties": false, "required": ["position", "song_id"], "properties": {"position": {"type": "integer", "minimum": 0, "maximum": 100000}, "song_id": {"type": "string", "minLength": 1, "maxLength": 500}}}}, "#,
+        request_key_schema!(),
+        "}}"
+    ),
+    read_only: false,
+    destructive: false,
+    idempotent: false,
+    open_world: false,
+    call: |state, caller, args| Box::pin(remove_playlist_tracks(state, caller, args)),
 };
 
 /// `list_playlists`: a page of the playlists the caller may see.
@@ -281,6 +350,139 @@ pub(crate) async fn delete_playlist(
     keyed(&state.acquire, caller, "delete_playlist", key, &call, work).await
 }
 
+/// `set_playlist_tracks`: the entries of one of the caller's playlists replaced.
+pub(crate) async fn set_playlist_tracks(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new("set_playlist_tracks", args, SET_PLAYLIST_TRACKS_ARGS);
+    let read = async {
+        let playlist_id = args.string("playlist_id")?;
+        let song_ids = args.strings("song_ids", 0, SONG_IDS_MAX)?;
+        let key = request_key(&args)?;
+        args.finish()?;
+        let navi = navidrome_of(state, caller, Stage::Playlist, &args).await?;
+        Ok::<_, ToolError>((playlist_id, song_ids, key, navi))
+    };
+    let (playlist_id, song_ids, key, navi) = match read.await {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let call = args.as_value();
+    let ctx = caller.ctx.clone();
+    let work = async move {
+        match playlists::set_tracks(&navi, &ctx, &playlist_id, &song_ids).await {
+            Ok(w) => Keyed::Kept(success(playlist_fields(&w))),
+            Err(r) => refused(&args, Some(&playlist_id), &r),
+        }
+    };
+    keyed(
+        &state.acquire,
+        caller,
+        "set_playlist_tracks",
+        key,
+        &call,
+        work,
+    )
+    .await
+}
+
+/// `add_playlist_tracks`: songs appended to one of the caller's playlists, or inserted.
+pub(crate) async fn add_playlist_tracks(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new("add_playlist_tracks", args, ADD_PLAYLIST_TRACKS_ARGS);
+    let read = async {
+        let playlist_id = args.string("playlist_id")?;
+        let song_ids = args.strings("song_ids", 1, SONG_IDS_MAX)?;
+        let before = args.opt_u32("position", 0, POSITION_MAX)?;
+        let key = request_key(&args)?;
+        args.finish()?;
+        let navi = navidrome_of(state, caller, Stage::Playlist, &args).await?;
+        Ok::<_, ToolError>((playlist_id, song_ids, before, key, navi))
+    };
+    let (playlist_id, song_ids, before, key, navi) = match read.await {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let call = args.as_value();
+    let ctx = caller.ctx.clone();
+    let work = async move {
+        let before = before.map(|position| position as usize);
+        match playlists::add_tracks(&navi, &ctx, &playlist_id, &song_ids, before).await {
+            Ok(w) => Keyed::Kept(success(playlist_fields(&w))),
+            Err(r) => refused(&args, Some(&playlist_id), &r),
+        }
+    };
+    keyed(
+        &state.acquire,
+        caller,
+        "add_playlist_tracks",
+        key,
+        &call,
+        work,
+    )
+    .await
+}
+
+/// `remove_playlist_tracks`: entries of one of the caller's playlists removed, each named by its
+/// position and song.
+pub(crate) async fn remove_playlist_tracks(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new("remove_playlist_tracks", args, REMOVE_PLAYLIST_TRACKS_ARGS);
+    let read = async {
+        let playlist_id = args.string("playlist_id")?;
+        let entries = (args.objects("entries", 1, SONG_IDS_MAX, ENTRY_ARGS)?.iter())
+            .map(|entry| {
+                let position = entry.u32("position", 0, POSITION_MAX)? as usize;
+                Ok((position, entry.string("song_id")?))
+            })
+            .collect::<Result<Vec<_>, ToolError>>()?;
+        let key = request_key(&args)?;
+        args.finish()?;
+        let mut positions = HashSet::new();
+        if !entries
+            .iter()
+            .all(|(position, _)| positions.insert(*position))
+        {
+            return Err(invalid_value(
+                args.tool(),
+                "entries",
+                "a list of 1 to 1000 objects with distinct positions",
+            ));
+        }
+        let navi = navidrome_of(state, caller, Stage::Playlist, &args).await?;
+        Ok::<_, ToolError>((playlist_id, entries, key, navi))
+    };
+    let (playlist_id, entries, key, navi) = match read.await {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let call = args.as_value();
+    let ctx = caller.ctx.clone();
+    let work = async move {
+        match playlists::remove_tracks(&navi, &ctx, &playlist_id, &entries).await {
+            Ok(w) => Keyed::Kept(success(playlist_fields(&w))),
+            Err(r) => refused(&args, Some(&playlist_id), &r),
+        }
+    };
+    keyed(
+        &state.acquire,
+        caller,
+        "remove_playlist_tracks",
+        key,
+        &call,
+        work,
+    )
+    .await
+}
+
 /// `value`'s fields; it is a serialized struct.
 fn object(value: Value) -> Map<String, Value> {
     match value {
@@ -299,8 +501,8 @@ fn name_arg(args: &Args) -> Result<Option<String>, ToolError> {
     }
 }
 
-/// The playlist's facts, `song_ids` in Navidrome's order (null above 500 entries) and
-/// `song_ids_omitted` saying so.
+/// The playlist's facts, `song_ids` in Navidrome's order (null above 500 entries),
+/// `song_ids_omitted` saying so, and the entries a track rewrite dropped as hidden.
 fn playlist_fields(w: &Written) -> Map<String, Value> {
     let mut fields = object(json!(w.playlist));
     let listed = w.song_ids.len() <= SONG_IDS_LISTED_MAX;
@@ -314,6 +516,7 @@ fn playlist_fields(w: &Written) -> Map<String, Value> {
     );
     let omitted = (!listed).then_some("more than 500 entries: get_playlist pages through them");
     fields.insert("song_ids_omitted".into(), json!(omitted));
+    fields.insert("hidden_entries_dropped".into(), json!(w.hidden_dropped));
     fields
 }
 
@@ -336,8 +539,8 @@ fn refusal_error(args: &Args, playlist_id: Option<&str>, r: &PlaylistRefusal) ->
     let mut facts = Map::new();
     facts.insert("playlist_id".into(), json!(playlist_id));
     let mut fact = |key: &str, value: Value| facts.insert(key.into(), value);
-    // The call to offer, None when it is too large to repeat.
-    let next: Option<NextCall> = match r {
+    // The calls to offer, None for one too large to repeat.
+    let next: Vec<Option<NextCall>> = match r {
         PlaylistRefusal::Failed(f) | PlaylistRefusal::WriteFailed(f)
             if f.code != FailureCode::PlaylistNotFound =>
         {
@@ -345,11 +548,11 @@ fn refusal_error(args: &Args, playlist_id: Option<&str>, r: &PlaylistRefusal) ->
         }
         PlaylistRefusal::Failed(_)
         | PlaylistRefusal::WriteFailed(_)
-        | PlaylistRefusal::NotOwner { .. } => Some(list_playlists_call()),
+        | PlaylistRefusal::NotOwner { .. } => vec![Some(list_playlists_call())],
         PlaylistRefusal::NameTaken { name, existing } => {
             fact("name", json!(cut_json(name.clone(), TEXT_MAX_CHARS)));
             fact("existing_playlist_ids", json!(existing));
-            args.call_with(json!({"allow_duplicate_name": true}))
+            vec![args.call_with(json!({"allow_duplicate_name": true}))]
         }
         PlaylistRefusal::SongsNotPresent {
             unknown,
@@ -361,7 +564,12 @@ fn refusal_error(args: &Args, playlist_id: Option<&str>, r: &PlaylistRefusal) ->
             let kept: Vec<String> = (asked.unwrap_or_default().into_iter())
                 .filter(|id| !unknown.contains(id) && !missing_file.contains(id))
                 .collect();
-            args.call_with(json!({"song_ids": kept}))
+            // An add takes at least one song.
+            if kept.is_empty() && args.tool() == ADD_PLAYLIST_TRACKS.name {
+                vec![]
+            } else {
+                vec![args.call_with(json!({"song_ids": kept}))]
+            }
         }
         PlaylistRefusal::TracksNotWritten {
             playlist_id,
@@ -375,14 +583,14 @@ fn refusal_error(args: &Args, playlist_id: Option<&str>, r: &PlaylistRefusal) ->
             fact("missing_song_ids", json!(missing));
             fact("unexpected_song_ids", json!(unexpected));
             fact("order_kept", json!(order_kept));
-            Some(get_playlist_call(playlist_id))
+            vec![Some(get_playlist_call(playlist_id))]
         }
         PlaylistRefusal::NotWritten {
             playlist_id, name, ..
         } => {
             fact("playlist_id", json!(playlist_id));
             fact("name", json!(name));
-            Some(get_playlist_call(playlist_id))
+            vec![Some(get_playlist_call(playlist_id))]
         }
         PlaylistRefusal::Unfinished {
             playlist_id: id,
@@ -392,7 +600,7 @@ fn refusal_error(args: &Args, playlist_id: Option<&str>, r: &PlaylistRefusal) ->
             fact("playlist_id", json!(id));
             fact("created", json!(true));
             if *described {
-                Some(get_playlist_call(id))
+                vec![Some(get_playlist_call(id))]
             } else {
                 // The comment and public flag the call asked for, still to be written.
                 let mut asked = json!({"playlist_id": id});
@@ -402,17 +610,74 @@ fn refusal_error(args: &Args, playlist_id: Option<&str>, r: &PlaylistRefusal) ->
                 if let Ok(Some(public)) = args.opt_bool("public") {
                     asked["public"] = json!(public);
                 }
-                Some(NextCall::new("update_playlist", asked))
+                vec![Some(NextCall::new("update_playlist", asked))]
             }
         }
+        PlaylistRefusal::NotEditable {
+            playlist_id,
+            name,
+            why,
+            would_be,
+        } => {
+            fact("playlist_id", json!(playlist_id));
+            fact("name", json!(name));
+            let why = match why {
+                NotEditable::Smart => "smart",
+                NotEditable::Synced => "synced",
+            };
+            fact("why", json!(why));
+            // A static copy, when create_playlist takes this name and list.
+            let copy = (would_be.len() <= SONG_IDS_MAX
+                && (1..=NAME_MAX_CHARS).contains(&name.trim().chars().count()))
+            .then(|| {
+                let args =
+                    json!({"name": name, "song_ids": would_be, "allow_duplicate_name": true});
+                repeatable(CREATE_PLAYLIST.name, args)
+            })
+            .flatten();
+            if copy.is_none() {
+                fact("would_be_count", json!(would_be.len()));
+            }
+            vec![Some(copy.unwrap_or_else(|| get_playlist_call(playlist_id)))]
+        }
+        PlaylistRefusal::Changed {
+            playlist_id,
+            name,
+            position,
+            expected,
+            found,
+        } => {
+            fact("playlist_id", json!(playlist_id));
+            fact("name", json!(name));
+            fact("position", json!(position));
+            fact("expected_song_id", json!(expected));
+            fact("found_song_id", json!(found));
+            vec![Some(get_playlist_call(playlist_id))]
+        }
+        PlaylistRefusal::NoEntryAt {
+            playlist_id,
+            position,
+        } => {
+            fact("playlist_id", json!(playlist_id));
+            fact("position", json!(position));
+            let mut at_end = args.as_value();
+            if let Some(args) = at_end.as_object_mut() {
+                args.remove("position");
+            }
+            vec![
+                Some(get_playlist_call(playlist_id)),
+                repeatable(args.tool(), at_end),
+            ]
+        }
     };
+    let too_large = next.iter().any(Option::is_none);
     let mut e = ToolError {
         failure,
         facts,
         tried: vec![],
-        next: Vec::from_iter(next.clone()),
+        next: next.into_iter().flatten().collect(),
     };
-    if next.is_none() {
+    if too_large {
         e.failure.message = too_large_to_repeat(&e.failure.message);
     }
     within_cap(e)
@@ -448,13 +713,14 @@ mod tests {
 
     use super::*;
     use crate::connection::test_util::{call_tool, document, mcp_app, mcp_app_with, text_of};
-    use crate::core::playlists::PlaylistRefusal;
+    use crate::core::playlists::{NotEditable, PlaylistRefusal};
     use crate::mcp::args::tests::obj;
     use crate::mcp::contract::failed;
     use crate::mcp::paging::RESULT_MAX_CHARS;
     use crate::test_navidrome::{
-        native_songs, playlist_body, playlist_row, playlist_rows, playlists_body, subsonic_failed,
-        subsonic_ok, NavidromeFor, NavidromeStub, ADVENT, AWAY, HOLY,
+        native_playlist, native_songs, playlist_body, playlist_row, playlist_rows, playlists_body,
+        subsonic_failed, subsonic_ok, NavidromeFor, NavidromeStub, ADVENT, AWAY, DISCOVERY_RULES,
+        HOLY, SILENT,
     };
 
     #[tokio::test]
@@ -662,7 +928,7 @@ mod tests {
             json!({"ok": true, "playlist_id": ADVENT, "name": "Advent", "comment": null, "owner": "alice",
                 "owned": true, "public": false, "song_count": 1, "duration_s": 263,
                 "created": "2026-11-15T09:00:00.123456Z", "changed": "2026-11-15T09:00:04.5Z",
-                "song_ids": [HOLY.0], "song_ids_omitted": null})
+                "song_ids": [HOLY.0], "song_ids_omitted": null, "hidden_entries_dropped": 0})
         );
     }
 
@@ -674,6 +940,7 @@ mod tests {
         let w = playlists::Written {
             playlist: playlists::facts(&serde_json::from_str(&playlist).unwrap(), "alice"),
             song_ids: vec![HOLY.0.to_string(); 501],
+            hidden_dropped: 0,
         };
         let fields = playlist_fields(&w);
         assert_eq!(
@@ -990,6 +1257,305 @@ mod tests {
             (&doc["name"], &doc["comment"], &doc["song_ids"]),
             (&json!("Advent 2026"), &json!("Carols"), &json!([HOLY.0]))
         );
+    }
+
+    #[tokio::test]
+    async fn a_moved_position_or_a_smart_playlist_comes_back_with_what_to_do() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[
+                &playlist_body(ADVENT, "Advent", "alice", false, "", &[]),
+                &playlist_body(ADVENT, "Fresh Picks", "alice", false, "", &[]),
+            ],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(1, SILENT.0, SILENT.1, false), (2, HOLY.0, HOLY.1, false)]),
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false)]),
+            ],
+        );
+        // read only by the add: the removal is refused before the native record is read
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&native_playlist(
+                ADVENT,
+                "Fresh Picks",
+                1,
+                false,
+                Some(DISCOVERY_RULES),
+            )],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let error = &document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "remove_playlist_tracks",
+                json!({"playlist_id": ADVENT, "entries": [{"position": 0, "song_id": HOLY.0}]}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(error["code"], "playlist_changed");
+        assert_eq!(
+            error["facts"],
+            json!({"playlist_id": ADVENT, "name": "Advent", "position": 0, "expected_song_id": HOLY.0,
+                "found_song_id": SILENT.0})
+        );
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "get_playlist", "args": {"playlist_id": ADVENT}}])
+        );
+        // Refused before any write, so the key is released: the same call runs again.
+        let add = json!({"playlist_id": ADVENT, "song_ids": [SILENT.0], "request_key": "k3"});
+        for _ in 0..2 {
+            let error = &document(
+                &call_tool(app.clone(), &token, "add_playlist_tracks", add.clone()).await,
+            )["error"];
+            assert_eq!(
+                (error["code"].as_str(), &error["facts"]),
+                (
+                    Some("playlist_not_editable"),
+                    &json!({"playlist_id": ADVENT, "name": "Fresh Picks", "why": "smart"})
+                )
+            );
+            assert_eq!(
+                error["next"],
+                json!([{"tool": "create_playlist", "args": {"name": "Fresh Picks",
+                    "song_ids": [HOLY.0, SILENT.0], "allow_duplicate_name": true}}])
+            );
+        }
+        let native = format!("/api/playlist/{ADVENT}");
+        assert_eq!(navi.asked().iter().filter(|p| **p == native).count(), 2);
+        let error = &document(
+            &call_tool(
+                app,
+                &token,
+                "remove_playlist_tracks",
+                json!({"playlist_id": ADVENT, "entries": [{"position": -1, "song_id": HOLY.0}]}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (error["message"].as_str(), error["facts"]["field"].as_str()),
+            (
+                Some("remove_playlist_tracks: entries[0].position must be an integer from 0 to 100000"),
+                Some("entries[0].position")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn another_users_playlist_reads_as_not_found_through_the_tools() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "bob", false, "", &[HOLY])],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let error = &document(
+            &call_tool(
+                app,
+                &token,
+                "set_playlist_tracks",
+                json!({"playlist_id": ADVENT, "song_ids": []}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (error["code"].as_str(), error["message"].as_str()),
+            (
+                Some("playlist_not_found"),
+                Some("Playlist 6vN2bQ8rT4yH1kL9mX3zPa not found")
+            )
+        );
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "list_playlists", "args": {}}])
+        );
+        assert!(!navi.asked().iter().any(|p| p.starts_with("/api/")));
+    }
+
+    #[tokio::test]
+    async fn set_playlist_tracks_answers_the_playlist_and_the_hidden_entries_it_dropped() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(2, HOLY.0, HOLY.1, false)]),
+                &playlist_rows(&[(1, SILENT.0, SILENT.1, false), (2, HOLY.0, HOLY.1, false)]),
+            ],
+        );
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&native_playlist(ADVENT, "Advent", 2, false, None)],
+        );
+        navi.answer("/api/song", &[&native_songs(&[(SILENT.0, false)])]);
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let args =
+            json!({"playlist_id": ADVENT, "song_ids": [SILENT.0, HOLY.0], "request_key": "k4"});
+        let first = call_tool(app.clone(), &token, "set_playlist_tracks", args.clone()).await;
+        let doc = document(&first);
+        assert_eq!(
+            (&doc["ok"], &doc["song_ids"], &doc["hidden_entries_dropped"]),
+            (&json!(true), &json!([SILENT.0, HOLY.0]), &json!(1))
+        );
+        // Written, so the key keeps the answer.
+        assert_eq!(
+            call_tool(app, &token, "set_playlist_tracks", args).await,
+            first
+        );
+        assert_eq!(
+            navi.asked()
+                .iter()
+                .filter(|p| *p == "/rest/createPlaylist")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_position_given_twice_or_holding_no_entry_is_refused() {
+        let (_, app, token) = mcp_app().await;
+        let entries =
+            json!([{"position": 1, "song_id": HOLY.0}, {"position": 1, "song_id": SILENT.0}]);
+        let error = &document(
+            &call_tool(
+                app,
+                &token,
+                "remove_playlist_tracks",
+                json!({"playlist_id": ADVENT, "entries": entries}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (error["message"].as_str(), error["facts"]["field"].as_str()),
+            (
+                Some("remove_playlist_tracks: entries must be a list of 1 to 1000 objects with distinct positions"),
+                Some("entries")
+            )
+        );
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[&playlist_rows(&[
+                (1, HOLY.0, HOLY.1, false),
+                (3, SILENT.0, SILENT.1, false),
+            ])],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let error = &document(
+            &call_tool(
+                app,
+                &token,
+                "add_playlist_tracks",
+                json!({"playlist_id": ADVENT, "song_ids": [AWAY.0], "position": 1}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["stage"].as_str(),
+                &error["facts"]
+            ),
+            (
+                Some("invalid_input"),
+                Some("input"),
+                &json!({"playlist_id": ADVENT, "position": 1})
+            )
+        );
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "get_playlist", "args": {"playlist_id": ADVENT}},
+                {"tool": "add_playlist_tracks", "args": {"playlist_id": ADVENT, "song_ids": [AWAY.0]}}])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_add_of_songs_navidrome_does_not_list_offers_the_others_or_nothing() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        navi.answer(&tracks_of(ADVENT), &["[]"]);
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&native_playlist(ADVENT, "Advent", 0, false, None)],
+        );
+        navi.answer("/api/song", &[&native_songs(&[(HOLY.0, false)]), "[]"]);
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let error = &document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "add_playlist_tracks",
+                json!({"playlist_id": ADVENT, "song_ids": [HOLY.0, AWAY.0]}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (error["code"].as_str(), &error["next"]),
+            (
+                Some("unknown_handle"),
+                &json!([{"tool": "add_playlist_tracks", "args": {"playlist_id": ADVENT, "song_ids": [HOLY.0]}}])
+            )
+        );
+        // None left to add: an add of no songs would be refused, so nothing is offered.
+        let error = &document(
+            &call_tool(
+                app,
+                &token,
+                "add_playlist_tracks",
+                json!({"playlist_id": ADVENT, "song_ids": [AWAY.0]}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["message"].as_str(),
+                &error["next"]
+            ),
+            (
+                Some("unknown_handle"),
+                Some("Navidrome does not list 1 of these songs for you and has 0 with a missing file"),
+                &json!([])
+            )
+        );
+    }
+
+    #[test]
+    fn a_static_copy_is_offered_only_when_create_playlist_can_make_it() {
+        let args = Args::new(
+            "set_playlist_tracks",
+            obj(json!({"playlist_id": ADVENT, "song_ids": []})),
+            SET_PLAYLIST_TRACKS_ARGS,
+        );
+        let refusal = |name: &str, n: usize| PlaylistRefusal::NotEditable {
+            playlist_id: ADVENT.into(),
+            name: name.into(),
+            why: NotEditable::Synced,
+            would_be: vec!["s1".to_string(); n],
+        };
+        let e = refusal_error(&args, Some(ADVENT), &refusal("Advent", 1000));
+        assert_eq!(e.next[0].tool, "create_playlist");
+        assert_eq!(e.facts["why"], "synced");
+        for (name, n) in [("Advent", 1001), (&*"x".repeat(256), 3), ("  ", 3)] {
+            let e = refusal_error(&args, Some(ADVENT), &refusal(name, n));
+            assert_eq!(e.next, vec![get_playlist_call(ADVENT)], "{name} {n}");
+            assert_eq!(e.facts["would_be_count"], json!(n));
+        }
     }
 
     #[test]

@@ -41,12 +41,16 @@ struct When {
 
 /// A Navidrome stand-in on 127.0.0.1: answers each endpoint path from the bodies set for it, in
 /// order, the last one repeating; an endpoint with none answers `{"subsonic-response":{"status":"ok","version":"1.16.1"}}`.
-/// `/auth/login` answers `{"token":"jwt"}` unless set. Records each request's path and query.
+/// `/auth/login` answers `{"token":"jwt"}` unless set. Records each request's path and query, and
+/// its body.
 pub(crate) struct NavidromeStub {
     pub url: String,
     answers: Answers,
-    asked: Arc<Mutex<Vec<String>>>,
+    asked: Arc<Mutex<Vec<Asked>>>,
 }
+
+/// A request's path and query, and its body.
+type Asked = (String, String);
 
 impl NavidromeStub {
     pub fn start() -> NavidromeStub {
@@ -98,13 +102,32 @@ impl NavidromeStub {
             .lock()
             .unwrap()
             .iter()
-            .map(|target| target.split('?').next().unwrap_or_default().to_string())
+            .map(|(target, _)| target.split('?').next().unwrap_or_default().to_string())
             .collect()
     }
 
     /// The path and query of each request, in order.
     pub fn asked_with_queries(&self) -> Vec<String> {
-        self.asked.lock().unwrap().clone()
+        let asked = self.asked.lock().unwrap();
+        asked.iter().map(|(target, _)| target.clone()).collect()
+    }
+
+    /// The form of each request to `endpoint`, in order, without the sign-in and format fields
+    /// every Subsonic request carries (u, t, s, v, c, f).
+    pub fn posted(&self, endpoint: &str) -> Vec<String> {
+        let asked = self.asked.lock().unwrap();
+        (asked.iter())
+            .filter(|(target, _)| target.split('?').next() == Some(endpoint))
+            .map(|(_, body)| {
+                let fields: Vec<&str> = (body.split('&'))
+                    .filter(|field| {
+                        let key = field.split('=').next().unwrap_or_default();
+                        !["u", "t", "s", "v", "c", "f"].contains(&key)
+                    })
+                    .collect();
+                fields.join("&")
+            })
+            .collect()
     }
 
     /// A client signed in as alice / secret.
@@ -121,7 +144,7 @@ impl NavidromeStub {
 }
 
 /// Reads one request and answers it with the next body set for its path.
-fn serve(stream: TcpStream, answers: &Answers, asked: &Mutex<Vec<String>>) -> std::io::Result<()> {
+fn serve(stream: TcpStream, answers: &Answers, asked: &Mutex<Vec<Asked>>) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -140,9 +163,11 @@ fn serve(stream: TcpStream, answers: &Answers, asked: &Mutex<Vec<String>>) -> st
             }
         }
     }
-    reader.read_exact(&mut vec![0; length])?;
+    let mut posted = vec![0; length];
+    reader.read_exact(&mut posted)?;
     let (status, body) = answers.lock().unwrap().answer(&endpoint, target);
-    asked.lock().unwrap().push(target.to_string());
+    let posted = String::from_utf8_lossy(&posted).into_owned();
+    asked.lock().unwrap().push((target.to_string(), posted));
     let status = StatusCode::from_u16(status).expect("a test sets a valid status");
     let response = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n\
@@ -278,6 +303,38 @@ pub(crate) fn native_songs(songs: &[(&str, bool)]) -> String {
         })
         .collect();
     json!(songs).to_string()
+}
+
+/// The rules of Soulful's discovery playlist for the Balanced profile, as Navidrome writes them
+/// back (`create_smart_playlist`, lib/soulbeet/src/navidrome/client.rs).
+pub(crate) const DISCOVERY_RULES: &str = r#"{"all":[{"contains":{"filepath":"Discovery/Balanced"}}],"sort":"-dateAdded","order":"desc"}"#;
+
+/// alice's native `GET /api/playlist/{id}` record as Navidrome 0.64.2 writes model.Playlist
+/// (model/playlist.go:18-41): `song_count` rows, synced from a playlist file when `sync`, smart
+/// with `rules` (a JSON object) when given.
+pub(crate) fn native_playlist(
+    id: &str,
+    name: &str,
+    song_count: u32,
+    sync: bool,
+    rules: Option<&str>,
+) -> String {
+    let rules: serde_json::Value = rules.map_or(serde_json::Value::Null, |r| {
+        serde_json::from_str(r).expect("rules are JSON")
+    });
+    let path = if sync {
+        "/music/Playlists/Advent.m3u"
+    } else {
+        ""
+    };
+    json!({
+        "id": id, "name": name, "comment": "", "duration": song_count * 263,
+        "size": u64::from(song_count) * 28734112, "songCount": song_count, "ownerName": "alice",
+        "ownerId": "8uY3tR6eW9qA2sD5fG8hJ1", "public": false, "path": path, "sync": sync,
+        "uploadedImage": "", "createdAt": "2026-11-15T09:00:00.123456Z",
+        "updatedAt": "2026-11-15T09:00:04.5Z", "rules": rules, "evaluatedAt": null,
+    })
+    .to_string()
 }
 
 /// A playlist as getPlaylists lists it and getPlaylist answers it, in responses.Playlist's key

@@ -20,6 +20,9 @@ use crate::core::library::{navidrome_failure, SongFacts};
 /// Most song ids one playlist write takes.
 pub(crate) const SONG_IDS_MAX: usize = 1000;
 
+/// Highest entry position a track write takes.
+pub(crate) const POSITION_MAX: u32 = 100_000;
+
 /// The lock of each playlist and of each user's playlist names that a call holds or waits for.
 /// An entry whose lock nobody holds is dead and pruned at the next `lock`.
 static LOCKS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
@@ -173,13 +176,23 @@ async fn read(
     Ok((playlist, tracks))
 }
 
-/// A native track row as an entry: its 1-based place less one.
+/// A native track row as an entry.
 fn entry(track: &PlaylistTrack) -> PlaylistEntry {
     PlaylistEntry {
-        position: track.position.get() as usize - 1,
+        position: position_of(track),
         missing: track.song.missing,
         song: SongFacts::from(&track.song),
     }
+}
+
+/// A native track row's 0-based position: its 1-based place less one.
+fn position_of(track: &PlaylistTrack) -> usize {
+    track.position.get() as usize - 1
+}
+
+/// The song ids of native track rows, in order.
+fn ids_of(tracks: &[PlaylistTrack]) -> Vec<String> {
+    tracks.iter().map(|t| t.song.id.clone()).collect()
 }
 
 /// No playlist with this id, or another user's private one. It carries no
@@ -199,12 +212,16 @@ pub(crate) fn playlist_not_found(id: &str) -> Failure {
 pub(crate) struct Written {
     pub playlist: PlaylistFacts,
     pub song_ids: Vec<String>,
+    /// The entries a rewrite of the track list dropped because Navidrome does not list them to
+    /// this account (tracks of other libraries); 0 for any other write.
+    pub hidden_dropped: u32,
 }
 
 fn written(p: &SubsonicPlaylist, tracks: &[PlaylistTrack], ctx: &UserCtx) -> Written {
     Written {
         playlist: facts(p, &ctx.username),
-        song_ids: tracks.iter().map(|t| t.song.id.clone()).collect(),
+        song_ids: ids_of(tracks),
+        hidden_dropped: 0,
     }
 }
 
@@ -250,6 +267,36 @@ pub(crate) enum PlaylistRefusal {
         failure: Failure,
         described: bool,
     },
+    /// A track edit of a playlist whose tracks Navidrome sets itself (D4). `would_be` is the list
+    /// the edit would have left, its missing files left out, for a static copy.
+    NotEditable {
+        playlist_id: String,
+        name: String,
+        why: NotEditable,
+        would_be: Vec<String>,
+    },
+    /// A removal's `position` holds `found` (None: no entry there), not the song `expected` (D3).
+    Changed {
+        playlist_id: String,
+        name: String,
+        position: usize,
+        expected: String,
+        found: Option<String>,
+    },
+    /// An insert before `position`, which no entry holds and which is not right after the last.
+    NoEntryAt {
+        playlist_id: String,
+        position: usize,
+    },
+}
+
+/// Why Navidrome sets a playlist's tracks itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum NotEditable {
+    /// A smart playlist: its rules pick its tracks.
+    Smart,
+    /// Synced from a playlist file: Navidrome replaces its tracks when the file changes.
+    Synced,
 }
 
 /// The part of a playlist a write changed that Navidrome does not show changed.
@@ -322,6 +369,25 @@ impl PlaylistRefusal {
                     message.into(),
                 )
             }
+            PlaylistRefusal::NotEditable { why, .. } => refused(
+                FailureCode::PlaylistNotEditable,
+                Stage::Playlist,
+                match why {
+                    NotEditable::Smart => "This is a smart playlist: Navidrome fills its tracks from its rules",
+                    NotEditable::Synced => "This playlist is synced from a playlist file: Navidrome replaces its tracks from that file when the file changes",
+                }
+                .into(),
+            ),
+            PlaylistRefusal::Changed { position, .. } => refused(
+                FailureCode::PlaylistChanged,
+                Stage::Playlist,
+                format!("Position {position} of this playlist no longer holds the song given: the playlist changed since it was read"),
+            ),
+            PlaylistRefusal::NoEntryAt { position, .. } => refused(
+                FailureCode::InvalidInput,
+                Stage::Input,
+                format!("This playlist has no entry at position {position}: use a position get_playlist lists, or leave position out to add at the end"),
+            ),
         }
     }
 
@@ -375,13 +441,23 @@ pub(crate) async fn owned(
     ctx: &UserCtx,
     id: &str,
 ) -> Result<Written, PlaylistRefusal> {
+    let (playlist, tracks) = owned_read(navi, ctx, id).await?;
+    Ok(written(&playlist, &tracks, ctx))
+}
+
+/// `owned` as Navidrome answers it: the playlist and its native track rows.
+async fn owned_read(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    id: &str,
+) -> Result<(SubsonicPlaylist, Vec<PlaylistTrack>), PlaylistRefusal> {
     let (playlist, tracks) = read(navi, ctx, id).await.map_err(PlaylistRefusal::Failed)?;
     if !owns(&playlist, &ctx.username) {
         return Err(PlaylistRefusal::NotOwner {
             playlist_id: id.to_string(),
         });
     }
-    Ok(written(&playlist, &tracks, ctx))
+    Ok((playlist, tracks))
 }
 
 /// SongsNotPresent unless Navidrome lists every id for the caller, none with a missing file.
@@ -610,6 +686,176 @@ pub(crate) async fn delete(
     }
 }
 
+/// How a track write reaches Navidrome. Append adds after the last row and keeps every row;
+/// Remove deletes the rows at these positions and keeps the others, hidden ones included; Replace
+/// rewrites the list, so the rows this account cannot see are dropped. Replace never takes an
+/// empty list, which Navidrome ignores.
+pub(crate) enum TrackWrite {
+    Append(Vec<String>),
+    Replace(Vec<String>),
+    Remove(Vec<usize>),
+}
+
+/// The caller holds `playlist_key(id)`. Reads the caller's playlist as `owned` does; `plan`, on
+/// its facts and native rows, gives the write and the song ids the playlist must list after it, or
+/// a refusal. Then the native record: a smart or synced playlist is NotEditable (D4), offering
+/// that list without its missing files; `present` on the songs the list gains; the write (none
+/// for a Remove of nothing); and the read back, which must list exactly that list. Nothing is
+/// written before `present`, so every refusal up to there leaves the playlist as it was.
+async fn write_tracks(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    id: &str,
+    plan: impl FnOnce(
+        &PlaylistFacts,
+        &[PlaylistTrack],
+    ) -> Result<(TrackWrite, Vec<String>), PlaylistRefusal>,
+) -> Result<Written, PlaylistRefusal> {
+    let (playlist, tracks) = owned_read(navi, ctx, id).await?;
+    let before = facts(&playlist, &ctx.username);
+    let (write, after) = plan(&before, &tracks)?;
+    let native = (navi.get_native_playlist(id).await.map_err(failed)?)
+        .ok_or_else(|| PlaylistRefusal::Failed(playlist_not_found(id)))?;
+    let why = if native.is_smart() {
+        Some(NotEditable::Smart)
+    } else if native.sync {
+        Some(NotEditable::Synced)
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        let missing: HashSet<&str> = (tracks.iter())
+            .filter(|t| t.song.missing)
+            .map(|t| t.song.id.as_str())
+            .collect();
+        return Err(PlaylistRefusal::NotEditable {
+            playlist_id: before.playlist_id,
+            name: before.name,
+            why,
+            would_be: (after.iter())
+                .filter(|id| !missing.contains(id.as_str()))
+                .cloned()
+                .collect(),
+        });
+    }
+    present(navi, &surplus(&after, &ids_of(&tracks))).await?;
+    let (answer, hidden_dropped) = match &write {
+        TrackWrite::Append(ids) => (Some(navi.append_playlist_tracks(id, ids).await), 0),
+        TrackWrite::Replace(ids) => (
+            Some(navi.replace_playlist_tracks(id, ids).await),
+            native.song_count.saturating_sub(tracks.len() as u32),
+        ),
+        TrackWrite::Remove(positions) if positions.is_empty() => (None, 0),
+        TrackWrite::Remove(positions) => {
+            (Some(navi.remove_playlist_tracks(id, positions).await), 0)
+        }
+    };
+    let sent = answer.is_some();
+    if let Some(answer) = answer {
+        wrote(answer, id).map_err(PlaylistRefusal::WriteFailed)?;
+    }
+    let (playlist, tracks) = read(navi, ctx, id).await.map_err(|f| match sent {
+        true => PlaylistRefusal::WriteFailed(f),
+        false => PlaylistRefusal::Failed(f),
+    })?;
+    let w = Written {
+        hidden_dropped,
+        ..written(&playlist, &tracks, ctx)
+    };
+    tracks_written(&w, &after)?;
+    Ok(w)
+}
+
+/// Under `playlist_key`: the caller's playlist `id` lists `song_ids`, in order (Replace, which
+/// drops the entries Navidrome hides from the caller), or, for an empty list, none of the entries
+/// it listed (Remove; the hidden ones stay, as Navidrome ignores a Replace with no songs).
+pub(crate) async fn set_tracks(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    id: &str,
+    song_ids: &[String],
+) -> Result<Written, PlaylistRefusal> {
+    let _playlist = lock(&playlist_key(id)).await;
+    write_tracks(navi, ctx, id, |_, tracks| {
+        Ok(if song_ids.is_empty() {
+            let every = tracks.iter().map(position_of).collect();
+            (TrackWrite::Remove(every), vec![])
+        } else {
+            (TrackWrite::Replace(song_ids.to_vec()), song_ids.to_vec())
+        })
+    })
+    .await
+}
+
+/// Under `playlist_key`: `song_ids` appended to the caller's playlist `id` when `before` is None
+/// or the position right after the last entry (0 for a playlist listing none), or inserted before
+/// the entry at position `before` (Replace). Any other `before` is NoEntryAt: positions skip the
+/// tracks Navidrome hides from the caller, so only a listed one names a place.
+pub(crate) async fn add_tracks(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    id: &str,
+    song_ids: &[String],
+    before: Option<usize>,
+) -> Result<Written, PlaylistRefusal> {
+    let _playlist = lock(&playlist_key(id)).await;
+    write_tracks(navi, ctx, id, |playlist, tracks| {
+        let mut after = ids_of(tracks);
+        let end = tracks.last().map_or(0, |t| position_of(t) + 1);
+        let Some(before) = before.filter(|&before| before != end) else {
+            after.extend_from_slice(song_ids);
+            return Ok((TrackWrite::Append(song_ids.to_vec()), after));
+        };
+        let at = (tracks.iter())
+            .position(|t| position_of(t) == before)
+            .ok_or_else(|| PlaylistRefusal::NoEntryAt {
+                playlist_id: playlist.playlist_id.clone(),
+                position: before,
+            })?;
+        after.splice(at..at, song_ids.iter().cloned());
+        Ok((TrackWrite::Replace(after.clone()), after))
+    })
+    .await
+}
+
+/// Under `playlist_key`: removes from the caller's playlist `id` the entries `entries` name, each
+/// by its 0-based position and the song that must be there; Changed for the first that does not
+/// hold it, nothing removed (D3). The positions are distinct. Entries Navidrome hides from the
+/// caller stay.
+pub(crate) async fn remove_tracks(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    id: &str,
+    entries: &[(usize, String)],
+) -> Result<Written, PlaylistRefusal> {
+    let _playlist = lock(&playlist_key(id)).await;
+    write_tracks(navi, ctx, id, |playlist, tracks| {
+        let at: HashMap<usize, &String> = (tracks.iter())
+            .map(|t| (position_of(t), &t.song.id))
+            .collect();
+        for (position, expected) in entries {
+            let found = at.get(position).copied();
+            if found != Some(expected) {
+                return Err(PlaylistRefusal::Changed {
+                    playlist_id: playlist.playlist_id.clone(),
+                    name: playlist.name.clone(),
+                    position: *position,
+                    expected: expected.clone(),
+                    found: found.cloned(),
+                });
+            }
+        }
+        let removed: HashSet<usize> = entries.iter().map(|(position, _)| *position).collect();
+        let after = (tracks.iter())
+            .filter(|t| !removed.contains(&position_of(t)))
+            .map(|t| t.song.id.clone())
+            .collect();
+        let positions = entries.iter().map(|(position, _)| *position).collect();
+        Ok((TrackWrite::Remove(positions), after))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
@@ -618,8 +864,9 @@ mod tests {
     use crate::auth::Role;
     use crate::core::test_ctx;
     use crate::test_navidrome::{
-        child, native_songs, playlist_body, playlist_row, playlist_rows, playlists_body,
-        subsonic_failed, subsonic_ok, NavidromeStub, ADVENT, AWAY, HOLY, SILENT,
+        child, native_playlist, native_songs, playlist_body, playlist_row, playlist_rows,
+        playlists_body, subsonic_failed, subsonic_ok, NavidromeStub, ADVENT, AWAY, DISCOVERY_RULES,
+        HOLY, SILENT,
     };
 
     /// A playlist as getPlaylists and getPlaylist send it, `public` left out
@@ -1300,6 +1547,7 @@ mod tests {
                 "alice",
             ),
             song_ids: ids(&[SILENT.0, HOLY.0]),
+            hidden_dropped: 0,
         };
         let Err(PlaylistRefusal::TracksNotWritten {
             order_kept,
@@ -1310,6 +1558,528 @@ mod tests {
             panic!()
         };
         assert_eq!((order_kept, missing), (false, vec![]));
+    }
+
+    /// The paths `navi` was asked, its sign-in and native reads left out.
+    fn rest(navi: &NavidromeStub) -> Vec<String> {
+        (navi.asked().into_iter())
+            .filter(|p| p.starts_with("/rest/"))
+            .collect()
+    }
+
+    fn native_of(id: &str) -> String {
+        format!("/api/playlist/{id}")
+    }
+
+    #[tokio::test]
+    async fn setting_the_tracks_replaces_them_and_an_empty_list_removes_every_entry() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        // The second set reads what the first wrote, removes the three entries and reads it back
+        // empty; the third finds no entry and writes nothing.
+        let three = playlist_rows(&[
+            (1, SILENT.0, SILENT.1, false),
+            (2, HOLY.0, HOLY.1, false),
+            (3, AWAY.0, AWAY.1, false),
+        ]);
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false), (2, SILENT.0, SILENT.1, false)]),
+                &three,
+                &three,
+                "[]",
+            ],
+        );
+        navi.answer(
+            &native_of(ADVENT),
+            &[
+                &native_playlist(ADVENT, "Advent", 2, false, None),
+                &native_playlist(ADVENT, "Advent", 3, false, None),
+                &native_playlist(ADVENT, "Advent", 0, false, None),
+            ],
+        );
+        // Only the song the playlist does not hold yet is looked up.
+        navi.answer("/api/song", &[&native_songs(&[(AWAY.0, false)])]);
+        let ctx = test_ctx("alice");
+        let w = set_tracks(
+            &navi.client(),
+            &ctx,
+            ADVENT,
+            &ids(&[SILENT.0, HOLY.0, AWAY.0]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (w.song_ids, w.hidden_dropped),
+            (ids(&[SILENT.0, HOLY.0, AWAY.0]), 0)
+        );
+        let w = set_tracks(&navi.client(), &ctx, ADVENT, &[]).await.unwrap();
+        assert!(w.song_ids.is_empty());
+        let w = set_tracks(&navi.client(), &ctx, ADVENT, &[]).await.unwrap();
+        assert!(w.song_ids.is_empty());
+        let (read, native) = ("/rest/getPlaylist".to_string(), native_of(ADVENT));
+        assert_eq!(
+            asked(&navi),
+            vec![
+                read.clone(),
+                tracks_of(ADVENT),
+                native.clone(),
+                "/api/song".into(),
+                "/rest/createPlaylist".into(),
+                read.clone(),
+                tracks_of(ADVENT),
+                read.clone(),
+                tracks_of(ADVENT),
+                native.clone(),
+                "/rest/updatePlaylist".into(),
+                read.clone(),
+                tracks_of(ADVENT),
+                read.clone(),
+                tracks_of(ADVENT),
+                native,
+                read,
+                tracks_of(ADVENT),
+            ]
+        );
+        assert_eq!(
+            navi.posted("/rest/updatePlaylist"),
+            vec![format!(
+                "playlistId={ADVENT}&songIndexToRemove=0&songIndexToRemove=1&songIndexToRemove=2"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn smart_and_synced_playlists_refuse_track_edits_but_take_a_new_name() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[
+                &playlist_body(ADVENT, "Fresh Picks", "alice", false, "", &[]),
+                &playlist_body(ADVENT, "Fresh Picks", "alice", false, "", &[]),
+                &playlist_body(ADVENT, "Fresh Picks", "alice", false, "", &[]),
+                &playlist_body(ADVENT, "Fresh Picks 2", "alice", false, "", &[]),
+            ],
+        );
+        // AWAY's file is gone: a static copy could not take it.
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[&playlist_rows(&[
+                (1, HOLY.0, HOLY.1, false),
+                (2, AWAY.0, AWAY.1, true),
+            ])],
+        );
+        navi.answer(
+            &native_of(ADVENT),
+            &[
+                &native_playlist(ADVENT, "Fresh Picks", 2, false, Some(DISCOVERY_RULES)),
+                &native_playlist(ADVENT, "Fresh Picks", 2, true, None),
+            ],
+        );
+        let ctx = test_ctx("alice");
+        let r = add_tracks(&navi.client(), &ctx, ADVENT, &ids(&[SILENT.0]), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            r,
+            PlaylistRefusal::NotEditable {
+                playlist_id: ADVENT.into(),
+                name: "Fresh Picks".into(),
+                why: NotEditable::Smart,
+                would_be: ids(&[HOLY.0, SILENT.0])
+            }
+        );
+        let f = r.failure();
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::PlaylistNotEditable,
+                Stage::Playlist,
+                RetryAdvice::NotRetryable,
+                "This is a smart playlist: Navidrome fills its tracks from its rules"
+            )
+        );
+        assert!(!r.after_write());
+        let r = set_tracks(&navi.client(), &ctx, ADVENT, &ids(&[SILENT.0]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(r, PlaylistRefusal::NotEditable { why: NotEditable::Synced, ref would_be, .. } if *would_be == ids(&[SILENT.0])),
+            "{r:?}"
+        );
+        assert_eq!(
+            r.failure().message,
+            "This playlist is synced from a playlist file: Navidrome replaces its tracks from that file when the file changes"
+        );
+        let rename = MetaChange {
+            name: Some("Fresh Picks 2".into()),
+            comment: None,
+            public: None,
+            allow_duplicate_name: true,
+        };
+        assert_eq!(
+            update(&navi.client(), &ctx, ADVENT, &rename)
+                .await
+                .unwrap()
+                .playlist
+                .name,
+            "Fresh Picks 2"
+        );
+        let asked = asked(&navi);
+        assert!(
+            !asked
+                .iter()
+                .any(|p| p == "/rest/createPlaylist" || p == "/api/song"),
+            "{asked:?}"
+        );
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|p| *p == "/rest/updatePlaylist")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn songs_are_inserted_before_a_position_or_appended() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        // Place 2 is a track of a library alice cannot see: positions 0 and 2, then 3.
+        let appended = playlist_rows(&[
+            (1, HOLY.0, HOLY.1, false),
+            (3, SILENT.0, SILENT.1, false),
+            (4, AWAY.0, AWAY.1, false),
+        ]);
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false), (3, SILENT.0, SILENT.1, false)]),
+                &appended,
+                &appended,
+                &appended,
+                &appended,
+                &playlist_rows(&[
+                    (1, HOLY.0, HOLY.1, false),
+                    (2, AWAY.0, AWAY.1, false),
+                    (3, SILENT.0, SILENT.1, false),
+                    (4, AWAY.0, AWAY.1, false),
+                ]),
+            ],
+        );
+        navi.answer(
+            &native_of(ADVENT),
+            &[
+                &native_playlist(ADVENT, "Advent", 3, false, None),
+                &native_playlist(ADVENT, "Advent", 4, false, None),
+            ],
+        );
+        navi.answer("/api/song", &[&native_songs(&[(AWAY.0, false)])]);
+        let ctx = test_ctx("alice");
+        let add = |before: Option<usize>| {
+            let (navi, ctx) = (navi.client(), ctx.clone());
+            async move { add_tracks(&navi, &ctx, ADVENT, &ids(&[AWAY.0]), before).await }
+        };
+        // Right after the last entry, as after no position: appended, the hidden track kept.
+        let w = add(Some(3)).await.unwrap();
+        assert_eq!(
+            (w.song_ids, w.hidden_dropped),
+            (ids(&[HOLY.0, SILENT.0, AWAY.0]), 0)
+        );
+        for gap in [1, 9] {
+            let r = add(Some(gap)).await.unwrap_err();
+            assert_eq!(
+                r,
+                PlaylistRefusal::NoEntryAt {
+                    playlist_id: ADVENT.into(),
+                    position: gap
+                }
+            );
+            let f = r.failure();
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message),
+                (
+                    FailureCode::InvalidInput,
+                    Stage::Input,
+                    RetryAdvice::NotRetryable,
+                    format!("This playlist has no entry at position {gap}: use a position get_playlist lists, or leave position out to add at the end")
+                )
+            );
+        }
+        // Before SILENT, at position 2: the list is rewritten and the hidden track dropped.
+        let w = add(Some(2)).await.unwrap();
+        assert_eq!(
+            (w.song_ids, w.hidden_dropped),
+            (ids(&[HOLY.0, AWAY.0, SILENT.0, AWAY.0]), 1)
+        );
+        assert_eq!(
+            rest(&navi),
+            vec![
+                "/rest/getPlaylist",
+                "/rest/updatePlaylist",
+                "/rest/getPlaylist",
+                "/rest/getPlaylist",
+                "/rest/getPlaylist",
+                "/rest/getPlaylist",
+                "/rest/createPlaylist",
+                "/rest/getPlaylist"
+            ]
+        );
+        assert_eq!(
+            navi.posted("/rest/updatePlaylist"),
+            vec![format!("playlistId={ADVENT}&songIdToAdd={}", AWAY.0)]
+        );
+        assert_eq!(
+            navi.posted("/rest/createPlaylist"),
+            vec![format!(
+                "playlistId={ADVENT}&songId={}&songId={}&songId={}&songId={}",
+                HOLY.0, AWAY.0, SILENT.0, AWAY.0
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_position_that_moved_is_refused_and_nothing_is_removed() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[&playlist_rows(&[
+                (1, SILENT.0, SILENT.1, false),
+                (2, HOLY.0, HOLY.1, false),
+            ])],
+        );
+        let ctx = test_ctx("alice");
+        let r = remove_tracks(&navi.client(), &ctx, ADVENT, &[(0, HOLY.0.into())])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            r,
+            PlaylistRefusal::Changed {
+                playlist_id: ADVENT.into(),
+                name: "Advent".into(),
+                position: 0,
+                expected: HOLY.0.into(),
+                found: Some(SILENT.0.into())
+            }
+        );
+        let f = r.failure();
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::PlaylistChanged,
+                Stage::Playlist,
+                RetryAdvice::NotRetryable,
+                "Position 0 of this playlist no longer holds the song given: the playlist changed since it was read"
+            )
+        );
+        assert!(!r.after_write());
+        // The first entry is right, the second past the end.
+        let r = remove_tracks(
+            &navi.client(),
+            &ctx,
+            ADVENT,
+            &[(0, SILENT.0.into()), (2, HOLY.0.into())],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                r,
+                PlaylistRefusal::Changed {
+                    position: 2,
+                    found: None,
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+        let asked = asked(&navi);
+        assert!(
+            !asked
+                .iter()
+                .any(|p| p == "/rest/updatePlaylist" || *p == native_of(ADVENT)),
+            "{asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_says_how_many_hidden_entries_navidrome_dropped() {
+        // The native songCount counts every row of the playlist, tracks of libraries the account
+        // cannot see included (refreshCounters, persistence/playlist_repository.go:333-371); the
+        // native rows are the ones it sees. createPlaylist with playlistId deletes every row
+        // (playlist_repository.go:272-331).
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false), (3, SILENT.0, SILENT.1, false)]),
+                &playlist_rows(&[(1, SILENT.0, SILENT.1, false), (2, HOLY.0, HOLY.1, false)]),
+            ],
+        );
+        navi.answer(
+            &native_of(ADVENT),
+            &[&native_playlist(ADVENT, "Advent", 3, false, None)],
+        );
+        let w = set_tracks(
+            &navi.client(),
+            &test_ctx("alice"),
+            ADVENT,
+            &ids(&[SILENT.0, HOLY.0]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (w.song_ids, w.hidden_dropped),
+            (ids(&[SILENT.0, HOLY.0]), 1)
+        );
+        // A removal deletes only the rows it names (persistence/playlist_track_repository.go:262-270).
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false), (3, SILENT.0, SILENT.1, false)]),
+                &playlist_rows(&[(2, SILENT.0, SILENT.1, false)]),
+            ],
+        );
+        navi.answer(
+            &native_of(ADVENT),
+            &[&native_playlist(ADVENT, "Advent", 3, false, None)],
+        );
+        let w = remove_tracks(
+            &navi.client(),
+            &test_ctx("alice"),
+            ADVENT,
+            &[(0, HOLY.0.into())],
+        )
+        .await
+        .unwrap();
+        assert_eq!((w.song_ids, w.hidden_dropped), (ids(&[SILENT.0]), 0));
+        // The position as given: songIndexToRemove 0 deletes row 1 (core/playlists/playlists.go:186-197).
+        assert_eq!(
+            navi.posted("/rest/updatePlaylist"),
+            vec![format!("playlistId={ADVENT}&songIndexToRemove=0")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_track_write_navidrome_did_not_keep_is_reported_with_the_differences() {
+        // A client changed the playlist between the write and the read back.
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false)]),
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false), (2, SILENT.0, SILENT.1, false)]),
+            ],
+        );
+        navi.answer(
+            &native_of(ADVENT),
+            &[&native_playlist(ADVENT, "Advent", 1, false, None)],
+        );
+        navi.answer(
+            "/api/song",
+            &[&native_songs(&[(SILENT.0, false), (AWAY.0, false)])],
+        );
+        let r = set_tracks(
+            &navi.client(),
+            &test_ctx("alice"),
+            ADVENT,
+            &ids(&[SILENT.0, AWAY.0]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            r,
+            PlaylistRefusal::TracksNotWritten {
+                playlist_id: ADVENT.into(),
+                name: "Advent".into(),
+                missing: ids(&[AWAY.0]),
+                unexpected: ids(&[HOLY.0]),
+                order_kept: true
+            }
+        );
+        assert_eq!(
+            r.failure().message,
+            "Navidrome does not list this playlist as written: 1 song(s) missing, 1 not asked for, order kept"
+        );
+        assert!(r.after_write());
+    }
+
+    #[tokio::test]
+    async fn two_adds_to_one_playlist_run_one_after_the_other() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        let two = playlist_rows(&[(1, HOLY.0, HOLY.1, false), (2, SILENT.0, SILENT.1, false)]);
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false)]),
+                &two,
+                &two,
+                &playlist_rows(&[
+                    (1, HOLY.0, HOLY.1, false),
+                    (2, SILENT.0, SILENT.1, false),
+                    (3, AWAY.0, AWAY.1, false),
+                ]),
+            ],
+        );
+        navi.answer(
+            &native_of(ADVENT),
+            &[&native_playlist(ADVENT, "Advent", 1, false, None)],
+        );
+        navi.answer(
+            "/api/song",
+            &[
+                &native_songs(&[(SILENT.0, false)]),
+                &native_songs(&[(AWAY.0, false)]),
+            ],
+        );
+        let (client, ctx) = (navi.client(), test_ctx("alice"));
+        let (silent, away) = (ids(&[SILENT.0]), ids(&[AWAY.0]));
+        let (a, b) = tokio::join!(
+            add_tracks(&client, &ctx, ADVENT, &silent, None),
+            add_tracks(&client, &ctx, ADVENT, &away, None)
+        );
+        assert_eq!(
+            (a.unwrap().song_ids.len(), b.unwrap().song_ids.len()),
+            (2, 3)
+        );
+        let per_add = vec![
+            "/rest/getPlaylist".to_string(),
+            tracks_of(ADVENT),
+            native_of(ADVENT),
+            "/api/song".into(),
+            "/rest/updatePlaylist".into(),
+            "/rest/getPlaylist".into(),
+            tracks_of(ADVENT),
+        ];
+        assert_eq!(asked(&navi), [per_add.clone(), per_add].concat());
     }
 
     #[tokio::test]
