@@ -631,6 +631,35 @@ mod tests {
         ("get_deletion_history", true, false, true, false),
     ];
 
+    /// Without the switch an app is refused exactly the delete tools. The others that can lead to
+    /// a deletion refuse that part for every app, or skip it, and their own tests pin it:
+    /// update_settings refuses auto_delete true, the discovery folder and the promote threshold;
+    /// set_rating a 1-star song rating and any rating of a pending discovery track;
+    /// ensure_in_library replace_existing; promote_discovery_track replaces no earlier copy and
+    /// sync_ratings skips auto-delete. A read-only tool (its hints, which the registry test pins)
+    /// deletes nothing and is not called: some read MusicBrainz, which the test state does not
+    /// stand in for.
+    #[tokio::test]
+    async fn every_tool_that_deletes_needs_the_switch_and_no_other_tool_does() {
+        let (_, app, token) = mcp_app().await; // u1's grant has allow_delete 0
+        for spec in TOOLS.iter().filter(|t| !t.read_only) {
+            let call = call_tool(app.clone(), &token, spec.name, valid_args(spec.name));
+            // The switch is checked before anything is waited for: a call still running after a
+            // second was not refused for it (find_sources waits for its search).
+            let refused = match tokio::time::timeout(std::time::Duration::from_secs(1), call).await
+            {
+                Ok(result) => document(&result)["error"]["code"] == "permission_not_granted",
+                Err(_) => false,
+            };
+            assert_eq!(
+                refused,
+                ["preview_delete_tracks", "delete_tracks"].contains(&spec.name),
+                "{}",
+                spec.name
+            );
+        }
+    }
+
     #[test]
     fn the_registry_holds_every_tool_once_with_its_hints() {
         let registered: Vec<(&str, bool, bool, bool, bool)> = TOOLS
