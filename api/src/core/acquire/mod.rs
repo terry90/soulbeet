@@ -9,7 +9,7 @@ mod manual;
 mod test_support;
 
 pub use auto::auto_download;
-pub(crate) use auto::{fail_job, run_search, AutoRun};
+pub(crate) use auto::{fail_job, run_search, AutoRun, AUTO_SELECT_SCORE_THRESHOLD};
 pub use cancel::cancel;
 pub use manual::download;
 

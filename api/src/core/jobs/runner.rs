@@ -12,6 +12,7 @@ use crate::core::sources::{
     Searches, RECENT_FAILURES_SECS,
 };
 use crate::core::{backend_unavailable, database_failure, metadata};
+use crate::importer_health::blocking_failure;
 use crate::ledger::store::{self, JobRecord, StoredSearch};
 use crate::ledger::{
     DuplicateRule, JobKind, JobOptions, JobState, Ledger, Pick, StoredSpec, Transition,
@@ -31,6 +32,9 @@ use tracing::{info, warn};
 pub(crate) trait Effects: Send + Sync {
     /// The default download backend.
     async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure>;
+    /// The failure an import would end with because the importer is broken; None when nothing
+    /// blocks imports.
+    async fn importer_blocked(&self) -> Option<Failure>;
     /// Fills an album query's empty tracklist from its metadata provider.
     async fn hydrate(&self, ctx: &UserCtx, query: &mut DownloadQuery) -> Result<(), Failure>;
     /// Enqueues `acquisition`'s files into `fresh` for `ctx` on `backend` and watches them,
@@ -73,6 +77,10 @@ impl Effects for LiveEffects {
         download_backend(None)
             .await
             .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))
+    }
+
+    async fn importer_blocked(&self) -> Option<Failure> {
+        blocking_failure().await
     }
 
     async fn hydrate(&self, ctx: &UserCtx, query: &mut DownloadQuery) -> Result<(), Failure> {
@@ -444,6 +452,8 @@ pub(crate) use test_effects::TestEffects;
 #[cfg(test)]
 mod test_effects {
     use super::*;
+    use crate::import_queue::test_support::StubImporter;
+    use crate::importer_health::blocking_failure_of;
     use crate::server_fns::download::test_support::StubBackend;
     use shared::download::EnqueueStatus;
     use shared::metadata::{AlbumWithTracks, Provider, SearchResult, Track};
@@ -458,6 +468,7 @@ mod test_effects {
         pub(crate) fn for_test(db: SqlitePool) -> (Arc<Acquire>, Arc<TestEffects>) {
             let effects = Arc::new(TestEffects {
                 stub: StubBackend::new(vec![]),
+                importer: StubImporter::new(),
                 tracks: Mutex::default(),
                 hydrate_error: Mutex::default(),
                 backend_held: watch::Sender::new(false),
@@ -474,12 +485,14 @@ mod test_effects {
         }
     }
 
-    /// Answers the `StubBackend` it holds, and hydrates through step 3's `hydrate_in` on a
+    /// Answers the `StubBackend` it holds, blocks imports as its `StubImporter`'s health says
+    /// (ready until `importer().set_health`), and hydrates through step 3's `hydrate_in` on a
     /// provider whose album has the tracks `set_tracks` gave (none until then), or whose
     /// `get_album` answers the error `fail_hydrate` gave. Keeps every enqueue and answers it
     /// with each item enqueued, recording nothing.
     pub(crate) struct TestEffects {
         stub: Arc<StubBackend>,
+        importer: StubImporter,
         tracks: Mutex<Vec<Track>>,
         hydrate_error: Mutex<Option<MetadataError>>,
         /// While true, `backend` calls wait for it to turn false.
@@ -491,6 +504,10 @@ mod test_effects {
     impl TestEffects {
         pub(crate) fn stub(&self) -> &StubBackend {
             &self.stub
+        }
+
+        pub(crate) fn importer(&self) -> &StubImporter {
+            &self.importer
         }
 
         pub(crate) fn set_tracks(&self, tracks: Vec<Track>) {
@@ -531,6 +548,10 @@ mod test_effects {
                 self.backend_calls_held.fetch_sub(1, Ordering::SeqCst);
             }
             Ok(self.stub.clone())
+        }
+
+        async fn importer_blocked(&self) -> Option<Failure> {
+            blocking_failure_of(&self.importer)
         }
 
         async fn hydrate(&self, _ctx: &UserCtx, query: &mut DownloadQuery) -> Result<(), Failure> {

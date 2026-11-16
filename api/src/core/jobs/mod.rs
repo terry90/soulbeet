@@ -3,14 +3,26 @@
 
 use crate::auth::UserCtx;
 use crate::core::database_failure;
-use crate::core::library::Reference;
+use crate::core::folders::owned_in;
+use crate::core::index::NavidromeOf;
+use crate::core::library::{find, MatchKind, Reference};
 use crate::ledger::store::{self, AttemptRecord, JobRecord, StoredSearch, TimelineEntry};
-use crate::ledger::{IndexWait, JobKind, JobState, Ledger, SlotResult};
+use crate::ledger::{
+    Admitted, BatchOrigin, IndexWait, JobKind, JobOptions, JobState, Ledger, NewJob, NewJobBatch,
+    SlotResult, MCP_UNFINISHED_JOBS_PER_USER,
+};
+use crate::models::folder::Folder;
+use crate::models::user_settings::UserSettings;
+use crate::services::NavidromeLookupError;
+use runner::{spawn_drive, Acquire};
+use serde_json::{json, Map, Value};
 use shared::download::{DownloadProgress, DownloadQuery, IndexState, JobSlot};
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::metadata::{Album, Track};
+use soulbeet::ImportMode;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub mod runner;
 #[cfg(test)]
@@ -74,6 +86,261 @@ impl Wanted {
         };
         format!("{artist} - {title}")
     }
+
+    /// The reference as a refused item's facts: `kind`, and a track's five fields (`null` when
+    /// not given) or an album's three.
+    pub(crate) fn facts(&self) -> Map<String, Value> {
+        let facts = match self {
+            Wanted::Track(r) => json!({"kind": "track", "artist": r.artist, "title": r.title,
+                "album": r.album, "recording_mbid": r.recording_mbid, "duration_s": r.duration_s}),
+            Wanted::Album(a) => json!({"kind": "album", "artist": a.artist, "title": a.title,
+                "release_mbid": a.release_mbid}),
+        };
+        let Value::Object(facts) = facts else {
+            unreachable!("an object literal is an object");
+        };
+        facts
+    }
+}
+
+/// What `ensure` did with one item.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum EnsureItem {
+    InLibrary {
+        song_ids: Vec<String>,
+    },
+    /// A job was made; `fuzzy` are the song ids that only fuzzily match, for Claude to judge.
+    Created {
+        job_id: String,
+        fuzzy: Vec<String>,
+    },
+    Refused(Failure, Map<String, Value>),
+}
+
+/// What `ensure` did, its items in input order.
+#[derive(Debug)]
+pub(crate) struct Ensured {
+    /// The batch holding the jobs made; None when no job was made, and no batch was written.
+    pub batch_id: Option<String>,
+    pub items: Vec<EnsureItem>,
+    /// False when the user has no Navidrome link: nothing was looked up (step 5 D9).
+    pub library_checked: bool,
+}
+
+/// Why `ensure` wrote nothing: the failure and, for folder_required with folders, the folders the
+/// call may name.
+#[derive(Debug)]
+pub(crate) struct CallRefused {
+    pub failure: Failure,
+    pub folders: Vec<Folder>,
+}
+
+impl From<Failure> for CallRefused {
+    fn from(failure: Failure) -> CallRefused {
+        CallRefused {
+            failure,
+            folders: vec![],
+        }
+    }
+}
+
+/// The folder: `folder_id` when ctx owns it (else `folder_not_found`), else the default one,
+/// else folder_required: with the user's folders to choose from when they have some.
+pub(crate) async fn folder_for(
+    db: &SqlitePool,
+    ctx: &UserCtx,
+    folder_id: Option<&str>,
+) -> Result<Folder, CallRefused> {
+    if let Some(id) = folder_id {
+        return Ok(owned_in(db, ctx, id).await?);
+    }
+    let failed = |e| database_failure(Stage::Input, e);
+    let folders = Folder::get_all_by_user_in(db, &ctx.user_id)
+        .await
+        .map_err(failed)?;
+    let settings = UserSettings::get_in(db, &ctx.user_id)
+        .await
+        .map_err(failed)?;
+    // An empty stored id is no choice: Settings clears the default so.
+    let default = (settings.default_download_folder_id)
+        .filter(|id| !id.is_empty())
+        .and_then(|id| folders.iter().find(|f| f.id == id));
+    if let Some(folder) = default {
+        return Ok(folder.clone());
+    }
+    if folders.is_empty() {
+        let failure = Failure::new(
+            FailureCode::FolderRequired,
+            Stage::Input,
+            RetryAdvice::NeedsUser,
+            "This user has no library folder",
+        )
+        .with_user_action(UserAction::new(
+            UserActionCode::AddFolder,
+            "Add a library folder",
+            "Settings > Library",
+        ));
+        return Err(failure.into());
+    }
+    Err(CallRefused {
+        failure: Failure::new(
+            FailureCode::FolderRequired,
+            Stage::Input,
+            RetryAdvice::NeedsDecision,
+            "No folder_id was given and no default folder is set",
+        ),
+        folders,
+    })
+}
+
+/// Design 11.5. Refuses before anything is looked up or written when the importer is broken, the
+/// download backend is not configured, there is no folder, or the user's Navidrome cannot be
+/// reached (no link at all is no lookup: every item gets a job). Then looks each track up with
+/// `find`, one at a time in input order: one the library holds by MBID or exactly is
+/// `InLibrary`, one whose lookup failed is refused with that failure. Makes one batch, labelled
+/// `label`, else after its items, with a job for each other item (an album always gets one),
+/// each with a new search id, and starts the runner on each new job.
+pub(crate) async fn ensure(
+    acquire: &Arc<Acquire>,
+    navidrome: &dyn NavidromeOf,
+    ctx: &UserCtx,
+    folder_id: Option<&str>,
+    label: Option<String>,
+    items: Vec<Wanted>,
+    options: JobOptions,
+) -> Result<Ensured, CallRefused> {
+    if let Some(failure) = acquire.effects.importer_blocked().await {
+        return Err(failure.into());
+    }
+    acquire.effects.backend().await?;
+    let folder = folder_for(&acquire.db, ctx, folder_id).await?;
+    let navi = match navidrome.navidrome_of(&ctx.id()).await {
+        Ok(navi) => Some(navi),
+        Err(NavidromeLookupError::NotLinked | NavidromeLookupError::NoServer) => None,
+        Err(e) => return Err(e.failure(Stage::LibraryCheck, e.to_string()).into()),
+    };
+    // Each item's result, None while it waits for its job; and the items that get one, with
+    // their fuzzy matches.
+    let mut results: Vec<Option<EnsureItem>> = Vec::with_capacity(items.len());
+    let mut wanting: Vec<(usize, Vec<String>)> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let (Some(navi), Wanted::Track(reference)) = (&navi, item) else {
+            results.push(None);
+            wanting.push((i, vec![]));
+            continue;
+        };
+        match find(navi, reference).await {
+            Ok(found) => {
+                let (owned, fuzzy): (Vec<_>, Vec<_>) =
+                    (found.matches.into_iter()).partition(|m| m.how.kind != MatchKind::Fuzzy);
+                if owned.is_empty() {
+                    results.push(None);
+                    wanting.push((i, fuzzy.into_iter().map(|m| m.song.song_id).collect()));
+                } else {
+                    let song_ids = owned.into_iter().map(|m| m.song.song_id).collect();
+                    results.push(Some(EnsureItem::InLibrary { song_ids }));
+                }
+            }
+            Err(failure) => results.push(Some(EnsureItem::Refused(failure, item.facts()))),
+        }
+    }
+    let library_checked = navi.is_some();
+    let mut batch_id = None;
+    if !wanting.is_empty() {
+        let label = label.unwrap_or_else(|| {
+            let first = items[wanting[0].0].label();
+            match wanting.len() {
+                1 => first,
+                n => format!("{first} and {} more", n - 1),
+            }
+        });
+        let batch = NewJobBatch {
+            id: uuid::Uuid::new_v4().to_string(),
+            user: ctx.id(),
+            label: Some(label),
+            origin: BatchOrigin::Mcp,
+        };
+        let id = batch.id.clone();
+        let jobs: Vec<NewJob> = (wanting.iter())
+            .map(|(i, _)| new_job(ctx, &folder, &items[*i], &options))
+            .collect();
+        let ids: Vec<String> = jobs.iter().map(|job| job.id.clone()).collect();
+        let admitted = (acquire.ledger.create_batch(batch, jobs).await)
+            .map_err(|e| database_failure(Stage::Input, e))?;
+        for (((i, fuzzy), job_id), admitted) in wanting.into_iter().zip(ids).zip(admitted) {
+            let refused = |(failure, facts): (Failure, Map<String, Value>)| {
+                let mut all = items[i].facts();
+                all.extend(facts);
+                EnsureItem::Refused(failure, all)
+            };
+            results[i] = Some(match admitted {
+                Admitted::Created => {
+                    spawn_drive(acquire.clone(), ctx.clone(), job_id.clone());
+                    batch_id = Some(id.clone());
+                    EnsureItem::Created { job_id, fuzzy }
+                }
+                Admitted::AlreadyRunning { job, state } => {
+                    refused(job_already_running(&job, state))
+                }
+                Admitted::OverLimit { unfinished } => refused(over_limit(unfinished)),
+            });
+        }
+    }
+    Ok(Ensured {
+        batch_id,
+        items: results.into_iter().flatten().collect(),
+        library_checked,
+    })
+}
+
+/// A searching MCP job of `ctx` for `item` into `folder`, under a new search id: a track imports
+/// as a singleton, an album whole (step 5 D1).
+fn new_job(ctx: &UserCtx, folder: &Folder, item: &Wanted, options: &JobOptions) -> NewJob {
+    NewJob {
+        id: uuid::Uuid::new_v4().to_string(),
+        user: ctx.id(),
+        folder_id: folder.id.clone(),
+        wanted: item.query(),
+        import_mode: match item.kind() {
+            JobKind::Track => ImportMode::Singleton,
+            JobKind::Album => ImportMode::Album,
+        },
+        state: JobState::Searching,
+        search_id: Some(uuid::Uuid::new_v4().to_string()),
+        picked: vec![],
+        kind: item.kind(),
+        options: Some(options.clone()),
+    }
+}
+
+/// The user's unfinished job `job`, in `state`, wants the same recording.
+pub(crate) fn job_already_running(job: &str, state: JobState) -> (Failure, Map<String, Value>) {
+    let failure = Failure::new(
+        FailureCode::AlreadyRunning,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "A job for this recording is already running",
+    );
+    let facts = Map::from_iter([
+        ("job_id".to_string(), json!(job)),
+        ("state".to_string(), json!(state.as_str())),
+    ]);
+    (failure, facts)
+}
+
+/// The user has `unfinished` MCP jobs, MCP_UNFINISHED_JOBS_PER_USER or more.
+fn over_limit(unfinished: u32) -> (Failure, Map<String, Value>) {
+    let failure = Failure::new(
+        FailureCode::RateLimited,
+        Stage::Input,
+        RetryAdvice::SameSourceLater,
+        format!("This user has {unfinished} unfinished downloads from connected apps, the most allowed; follow them with get_batch or list_batches before asking for more"),
+    );
+    let facts = Map::from_iter([
+        ("unfinished_jobs".to_string(), json!(unfinished)),
+        ("limit".to_string(), json!(MCP_UNFINISHED_JOBS_PER_USER)),
+    ]);
+    (failure, facts)
 }
 
 /// One slot of a job as the job tools show it.

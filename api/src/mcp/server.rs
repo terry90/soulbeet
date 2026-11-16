@@ -16,7 +16,9 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
-use super::{batches, jobs, library, metadata, playlists, settings, sources, status, McpCaller};
+use super::{
+    batches, ensure, jobs, library, metadata, playlists, settings, sources, status, McpCaller,
+};
 use crate::connection::ConnectionState;
 
 /// What the server tells a client at `initialize`.
@@ -247,6 +249,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     jobs::GET_JOBS,
     batches::GET_BATCH,
     batches::LIST_BATCHES,
+    ensure::ENSURE_IN_LIBRARY,
 ];
 
 impl ToolSpec {
@@ -406,8 +409,8 @@ mod tests {
                 spec.name
             );
         }
-        // Only the metadata tools and the download search ask a service outside Soulful and
-        // the user's Navidrome.
+        // Only the metadata tools and the tools that search the download network ask a service
+        // outside Soulful and the user's Navidrome.
         let open: Vec<&str> = tools
             .iter()
             .filter(|t| t["annotations"]["openWorldHint"] == true)
@@ -419,7 +422,8 @@ mod tests {
                 "search_music",
                 "get_release",
                 "get_recording_releases",
-                "find_sources"
+                "find_sources",
+                "ensure_in_library"
             ]
         );
         assert!(tools[0]["description"]
@@ -472,6 +476,9 @@ mod tests {
             }
             "get_sources" => json!({"search_id": "3f1c0d52-8a8e-4c2b-9d61-2b7f0e5a4c19"}),
             "get_batch" => json!({"batch_id": "8c2d6f1e-4b7a-4e39-a0d5-71f3b9e2c648"}),
+            "ensure_in_library" => {
+                json!({"items": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
+            }
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -533,6 +540,7 @@ mod tests {
         ("get_jobs", true, false, true, false),
         ("get_batch", true, false, true, false),
         ("list_batches", true, false, true, false),
+        ("ensure_in_library", false, false, false, true),
     ];
 
     #[test]

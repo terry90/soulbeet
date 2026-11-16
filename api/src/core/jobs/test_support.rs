@@ -128,6 +128,17 @@ pub(crate) async fn batch_of_downloads(acq: &Acquire, n: usize) -> (String, Vec<
     (batch, jobs)
 }
 
+/// alice's MCP batch "Winter Songs" of `n` searching track jobs ("Song Number 1" and on): the
+/// batch's id.
+pub(crate) async fn batch_of_searches(acq: &Acquire, n: usize) -> String {
+    let wanted = (1..=n)
+        .map(|i| track("Marrow Choir", &format!("Song Number {i}")))
+        .collect();
+    mcp_batch(acq, ALICE, "Winter Songs", wanted, auto_options())
+        .await
+        .0
+}
+
 /// The transfer of alice's downloading `job` failed with `failure` and no source is left: its
 /// slot's row, failed, as the monitor reports it.
 pub(crate) async fn fail_slot(acq: &Acquire, job: &str, failure: Failure) {

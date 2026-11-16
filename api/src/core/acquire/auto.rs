@@ -38,9 +38,9 @@ fn auto_batch_label(group: &DownloadableGroup) -> String {
     }
 }
 
-/// Score threshold for automatic source selection (per D-04).
-/// Below this, the client gets FallbackToManual with results attached.
-const AUTO_SELECT_SCORE_THRESHOLD: f64 = 0.7;
+/// Score threshold for automatic source selection (per D-04), and an MCP job's default
+/// `min_score`. Below this, the client gets FallbackToManual with results attached.
+pub(crate) const AUTO_SELECT_SCORE_THRESHOLD: f64 = 0.7;
 
 /// Why no file of a request was queued, shown as the request's failure.
 fn queue_failure(results: &[QueuedDownload]) -> Failure {

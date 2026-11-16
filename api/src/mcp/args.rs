@@ -133,6 +133,18 @@ impl Args {
             .ok_or_else(|| self.refuse(name, &format!("an integer from {min} to {max}")))
     }
 
+    /// A JSON number from 0 to 1.
+    pub(crate) fn opt_unit(&self, name: &str) -> Result<Option<f64>, ToolError> {
+        let Some(value) = self.given(name) else {
+            return Ok(None);
+        };
+        value
+            .as_f64()
+            .filter(|n| (0.0..=1.0).contains(n))
+            .map(Some)
+            .ok_or_else(|| self.refuse(name, "a number from 0 to 1"))
+    }
+
     /// One of `choices`, as written there.
     pub(crate) fn opt_choice(
         &self,
@@ -411,6 +423,24 @@ pub(crate) mod tests {
                 .message,
             "search_library: kind must be one of songs, albums, artists"
         );
+        let scores = Args::new(
+            "ensure_in_library",
+            obj(json!({"low": 0, "high": 1.0, "over": 1.01, "text": "0.5"})),
+            &["low", "high", "over", "text"],
+        );
+        assert_eq!(
+            (
+                scores.opt_unit("low").unwrap(),
+                scores.opt_unit("high").unwrap(),
+                scores.opt_unit("missing").unwrap()
+            ),
+            (Some(0.0), Some(1.0), None)
+        );
+        assert_eq!(
+            scores.opt_unit("over").unwrap_err().failure.message,
+            "ensure_in_library: over must be a number from 0 to 1"
+        );
+        assert!(scores.opt_unit("text").is_err());
         let none = Args::new("search_library", None, SEARCH);
         assert_eq!(
             none.string("query").unwrap_err().failure.message,

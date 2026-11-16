@@ -189,6 +189,9 @@ pub(crate) struct Items {
     pub pending: usize,
     /// Where that later call starts, when items are pending.
     pub cursor: Option<String>,
+    /// Top-level fields written next to `summary` and `results` (ensure_in_library's
+    /// `batch_id`, `library_checked` and `next`); empty for a call that has none.
+    pub fields: Map<String, Value>,
 }
 
 /// D2: the document `items` sends, as text, so a caller measures exactly
@@ -228,6 +231,7 @@ pub(crate) fn items_text(items: &Items) -> String {
     );
     document.insert("results".into(), Value::Array(results));
     document.insert("cursor".into(), json!(items.cursor));
+    document.extend(items.fields.clone());
     if failed > 0 {
         let partial = ToolError {
             failure: Failure::new(
@@ -405,6 +409,7 @@ mod tests {
             start: 0,
             pending: 0,
             cursor: None,
+            fields: Map::new(),
             results: vec![
                 ItemResult::Done(json!({"matches": []}).as_object().unwrap().clone()),
                 ItemResult::Done(json!({"matches": []}).as_object().unwrap().clone()),
@@ -427,6 +432,7 @@ mod tests {
             start: 3,
             pending: 0,
             cursor: None,
+            fields: Map::new(),
             results: vec![
                 ItemResult::Done(json!({"matches": []}).as_object().unwrap().clone()),
                 ItemResult::Failed(circuit()),
@@ -466,6 +472,7 @@ mod tests {
             start: 0,
             pending: 5,
             cursor: Some("c".into()),
+            fields: Map::new(),
             results: vec![ItemResult::Done(Map::new())],
         };
         let text = items_text(&pending);

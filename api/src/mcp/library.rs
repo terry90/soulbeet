@@ -114,6 +114,7 @@ async fn find_items(
         results: Vec::new(),
         pending: refs.len() - start,
         cursor: None,
+        fields: Map::new(),
     };
     // By index: a closure taking each `&Reference` from the stream must
     // hold for any lifetime, which the boxed handler cannot show.

@@ -434,25 +434,38 @@ async fn alice_app(state: ConnectionState) -> (SqlitePool, Router, String) {
 pub(crate) async fn app_with_acquire() -> (SqlitePool, Arc<Acquire>, Arc<TestEffects>, String) {
     let db = test_db::migrated().await;
     add_user(&db, "u1", "alice").await;
+    add_folder(&db, "u1", "f1", "Music").await;
+    set_default_folder(&db, "u1", Some("f1")).await;
+    let token = access_token(&db, "u1", RESOURCE).await;
+    let (acquire, effects) = Acquire::for_test(db.clone());
+    (db, acquire, effects, token)
+}
+
+/// `user_id`'s folder `folder_id` named `name`, at a directory kept on disk for the test.
+pub(crate) async fn add_folder(db: &SqlitePool, user_id: &str, folder_id: &str, name: &str) {
     let dir = tempfile::tempdir().unwrap().keep();
-    sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES ('f1', 'u1', 'Music', ?)")
+    sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES (?, ?, ?, ?)")
+        .bind(folder_id)
+        .bind(user_id)
+        .bind(name)
         .bind(dir.to_str().unwrap())
-        .execute(&db)
+        .execute(db)
         .await
         .unwrap();
+}
+
+/// Makes `folder_id` `user_id`'s default folder; None clears the choice, as Settings does.
+pub(crate) async fn set_default_folder(db: &SqlitePool, user_id: &str, folder_id: Option<&str>) {
     UserSettings::upsert_in(
-        &db,
-        "u1",
+        db,
+        user_id,
         UpdateUserSettings {
-            default_download_folder_id: Some("f1".into()),
+            default_download_folder_id: Some(folder_id.unwrap_or_default().to_string()),
             ..Default::default()
         },
     )
     .await
     .unwrap();
-    let token = access_token(&db, "u1", RESOURCE).await;
-    let (acquire, effects) = Acquire::for_test(db.clone());
-    (db, acquire, effects, token)
 }
 
 /// The jobs of `core::jobs::test_support` are alice's (user id `alice`): a database with her,
@@ -468,6 +481,19 @@ pub(crate) async fn jobs_app() -> (SqlitePool, Arc<Acquire>, Arc<TestEffects>, S
 pub(crate) fn app_of(db: &SqlitePool, acquire: &Arc<Acquire>) -> Router {
     router(ConnectionState {
         acquire: acquire.clone(),
+        ..ConnectionState::for_test(db.clone())
+    })
+}
+
+/// `app_of(db, acquire)` with `navidrome` as the caller's Navidrome.
+pub(crate) fn app_with_navidrome(
+    db: &SqlitePool,
+    acquire: &Arc<Acquire>,
+    navidrome: Arc<dyn NavidromeOf>,
+) -> Router {
+    router(ConnectionState {
+        acquire: acquire.clone(),
+        navidrome,
         ..ConnectionState::for_test(db.clone())
     })
 }
