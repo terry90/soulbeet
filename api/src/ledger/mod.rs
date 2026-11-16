@@ -1585,6 +1585,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_import_keeps_the_failure_of_its_row() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![(0, item("peer_a", "One", "01.flac"))],
+        });
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        let import = StoredImport {
+            sources: vec![PathBuf::from("/downloads/b/01.flac")],
+            target: "/music".into(),
+            album: false,
+            cleanup_root: None,
+            choices: None,
+            choice: DriverChoice::Auto,
+            duplicates: DuplicateRule::Skip,
+            rows: vec![(
+                slot.clone(),
+                row_of("j1", 0, "01.flac", DownloadState::ImportQueued(1), 100),
+            )],
+        };
+        ledger.record(JobEvent::ImportQueued(Box::new(import.clone())));
+        // Soulful's text for an import beets skipped as a duplicate (ImportOutcome's Display).
+        let failure = Failure::new(
+            FailureCode::ImportAlreadyInLibrary,
+            Stage::Import,
+            RetryAdvice::NotRetryable,
+            "Already in library",
+        );
+        let skipped = row_of("j1", 0, "01.flac", DownloadState::ImportSkipped, 100)
+            .with_failure(failure.clone());
+        ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
+            import,
+            rows: vec![skipped.clone()],
+            next: JobState::Failed,
+            index: None,
+            results: vec![],
+        })));
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
+        let row: String = sqlx::query_scalar("SELECT last_row FROM job_tracks WHERE job_id = 'j1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let row: DownloadProgress = serde_json::from_str(&row).unwrap();
+        assert_eq!(
+            (row.state, row.failure),
+            (DownloadState::ImportSkipped, Some(failure))
+        );
+    }
+
+    #[tokio::test]
     async fn an_import_is_kept_only_for_a_decision_and_an_indexed_one_keeps_its_wait() {
         let (ledger, db, alice, _) = ledger().await;
         ledger

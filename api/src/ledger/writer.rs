@@ -591,6 +591,15 @@ impl Writer {
                     .execute(&mut *tx)
                     .await?;
                 }
+                // Before the slots move too: a slot `next` ends would not store its row, and
+                // with it the failure of a failed import.
+                for row in &rows {
+                    if let Some(slot) = &row.job {
+                        if self.store_row(&mut tx, slot, next, row).await? {
+                            jobs.insert(slot.job.clone());
+                        }
+                    }
+                }
                 for (slot, _) in &import.rows {
                     self.set_slot(&mut tx, slot, next).await?;
                     sqlx::query(&format!(
@@ -604,13 +613,6 @@ impl Writer {
                     .execute(&mut *tx)
                     .await?;
                     jobs.insert(slot.job.clone());
-                }
-                for row in &rows {
-                    if let Some(slot) = &row.job {
-                        if self.store_row(&mut tx, slot, next, row).await? {
-                            jobs.insert(slot.job.clone());
-                        }
-                    }
                 }
             }
             JobEvent::Indexing { slots, wait } => {
