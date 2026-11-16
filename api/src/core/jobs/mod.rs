@@ -136,6 +136,9 @@ pub(crate) struct Ensured {
     pub library_checked: bool,
     /// The songs of a replace_existing token that no created job replaces, in token order.
     pub replace_unmatched: Vec<String>,
+    /// True when the replace_existing token was taken: it is used up whatever the batch
+    /// writer then answered each job.
+    pub token_taken: bool,
 }
 
 /// The one thing ensure_in_library hands `ensure` for a replacement (D9): the app and the
@@ -449,6 +452,7 @@ pub(crate) async fn ensure(
         items,
         library_checked,
         replace_unmatched,
+        token_taken: taken.is_some(),
     })
 }
 

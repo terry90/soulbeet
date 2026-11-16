@@ -315,7 +315,9 @@ async fn run(
         None => None,
     };
     drop(held);
-    let keep = ensured.batch_id.is_some()
+    // A taken token is used up: the same call can only be answered as it was.
+    let keep = ensured.token_taken
+        || ensured.batch_id.is_some()
         || match &written {
             None => !(ensured.items.iter()).any(|item| matches!(item, EnsureItem::Refused(..))),
             Some((_, Ok(_))) => true,
@@ -766,7 +768,7 @@ mod tests {
     use crate::core::acquire::{Acquisition, NewBatch};
     use crate::core::delete_guard::test_support::previewed_file;
     use crate::core::delete_guard::PreviewedFile;
-    use crate::core::deletion::tokens::{issue_in, take_in};
+    use crate::core::deletion::tokens::{issue_in, take_in, TokenRefusalKind};
     use crate::core::deletion::App;
     use crate::core::folder_of;
     use crate::core::jobs::runner::{Acquire, TestEffects};
@@ -1709,6 +1711,57 @@ mod tests {
         take_in(&db, &app_id, &issued.secret, None, now_unix())
             .await
             .expect("the token is still unused");
+    }
+
+    #[tokio::test]
+    async fn a_taken_token_keeps_the_answer_when_the_replacing_item_is_over_the_limit() {
+        let (db, acq, effects, token) = jobs_app().await;
+        batch_of_searches(&acq, MCP_UNFINISHED_JOBS_PER_USER as usize).await;
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer_when(
+            "/api/song",
+            "title=Marrow+Choir+O+Holy+Night",
+            200,
+            &format!(
+                "[{}]",
+                native_song(HOLY.0, "Marrow Choir", "O Holy Night", 263.4, None)
+            ),
+        );
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let alice = App {
+            user: UserId::new("alice"),
+            grant_id: grant_of(&db, "alice").await,
+        };
+        let file = previewed_in(effects.library(), HOLY.0, "Marrow Choir/x.flac");
+        let issued = issue_in(&db, &alice, DeletionReason::Replaced, &[file], now_unix())
+            .await
+            .unwrap();
+        let call = json!({"items": [{"artist": "Marrow Choir", "title": "O Holy Night"}],
+            "folder_id": "alice-folder", "request_key": "k1",
+            "replace_existing": {"confirmation_token": issued.secret}});
+        let doc =
+            document(&call_tool(app.clone(), &token, "ensure_in_library", call.clone()).await);
+        assert_eq!(
+            (
+                doc["results"][0]["error"]["code"].as_str(),
+                &doc["batch_id"],
+                &doc["replace_unmatched"]
+            ),
+            (Some("rate_limited"), &Value::Null, &json!([HOLY.0])),
+            "{doc}"
+        );
+        let refused = take_in(&db, &alice, &issued.secret, None, now_unix())
+            .await
+            .expect_err("the token was taken");
+        assert_eq!(refused.kind, TokenRefusalKind::Used);
+        // The key keeps the answer: the same call does not run again on a used token.
+        assert_eq!(count(&db, "request_keys").await, 1);
+        let again = document(&call_tool(app, &token, "ensure_in_library", call).await);
+        assert_eq!(again, doc);
     }
 
     /// The id of `source`'s candidate in the search of alice's job `job`.
