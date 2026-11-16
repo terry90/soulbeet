@@ -413,6 +413,14 @@ failure_codes! {
     ServerRestarted => "server_restarted",
     /// Some items of a call failed and the others were done (design 10.1).
     Partial => "partial",
+    /// The job's state does not allow the change asked for.
+    WrongJobState => "wrong_job_state",
+    /// The job's search has no source left that it has not tried.
+    SourcesExhausted => "sources_exhausted",
+    /// The user rejected the result of a done job.
+    ResultRejected => "result_rejected",
+    /// A search Soulful stopped before it ran, because the job it served was cancelled.
+    SearchStopped => "search_stopped",
 }
 
 #[cfg(test)]
@@ -422,10 +430,11 @@ mod tests {
     /// Design section 7 and 13 codes, by stage, with `settings_unreadable`,
     /// `backend_response_unreadable`, `search_query_rejected`,
     /// `search_already_running`, `search_lost`, `import_disk_full`,
-    /// `delete_failed` and `partial` (design 10.1), and
+    /// `delete_failed`, `partial` (design 10.1), `wrong_job_state`,
+    /// `sources_exhausted`, `result_rejected` and `search_stopped`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 79] = [
+    const NAMES: [&str; 83] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -505,6 +514,10 @@ mod tests {
         "delete_daily_limit",
         "server_restarted",
         "partial",
+        "wrong_job_state",
+        "sources_exhausted",
+        "result_rejected",
+        "search_stopped",
     ];
 
     #[test]

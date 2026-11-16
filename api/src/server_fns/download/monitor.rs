@@ -2108,6 +2108,8 @@ mod tests {
                     state: JobState::Queued,
                     search_id: None,
                     picked: vec![(0, item("peer_a", "Wake Up", "dirA/aaa.flac"))],
+                    kind: crate::ledger::JobKind::Track,
+                    options: None,
                 },
                 None,
             )

@@ -7,7 +7,7 @@ use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
 use crate::core::sources::{self, Searched};
 use crate::core::{backend_unavailable, database_failure};
 use crate::globals::get_or_create_user_channel;
-use crate::ledger::{JobEvent, JobState, Ledger, NewJob, NewSearch, LEDGER};
+use crate::ledger::{JobEvent, JobKind, JobState, Ledger, NewJob, NewSearch, LEDGER};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::not_enqueued_failure;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
@@ -138,6 +138,8 @@ pub async fn auto_download(
                     state: JobState::Searching,
                     search_id: Some(run.search_id.clone()),
                     picked: vec![],
+                    kind: JobKind::of(&query),
+                    options: None,
                 },
                 Some(NewSearch {
                     id: run.search_id.clone(),

@@ -52,6 +52,7 @@ pub(crate) mod test_db {
     pub const USERNAME_CASE: i64 = 20261115000001;
     pub const FOREIGN_FOLDER_CHOICES: i64 = 20261115000002;
     pub const DELETION_AUDIT: i64 = 20261116000004;
+    pub const MCP_JOBS: i64 = 20261117000000;
 
     async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
@@ -416,6 +417,59 @@ mod tests {
             held.push(db.acquire().await.unwrap());
         }
         assert_eq!(db.size(), 4);
+    }
+
+    #[tokio::test]
+    async fn the_migration_gives_existing_jobs_a_batch_and_a_kind() {
+        let db = test_db::migrated_before(test_db::MCP_JOBS).await;
+        insert_user(&db, "u1", "bob").await;
+        insert_folder(&db, "u1", "/music/bob").await;
+        let album = r#"{"album":{"id":"r1","title":"Winter Songs","artist":"Marrow Choir","release_date":null},"tracks":[]}"#;
+        let track = r#"{"album":null,"tracks":[]}"#;
+        for (id, wanted, label) in [
+            ("j-album", album, "Winter Songs"),
+            ("j-track", track, "O Holy Night"),
+        ] {
+            sqlx::query(
+                "INSERT INTO jobs (id, user_id, folder_id, created_at, updated_at, wanted, \
+                 import_mode, state, batch_label) VALUES (?, 'u1', '/music/bob', 7, 7, ?, 'album', 'done', ?)",
+            )
+            .bind(id)
+            .bind(wanted)
+            .bind(label)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        test_db::apply(&db, test_db::MCP_JOBS).await;
+        let jobs: Vec<(String, String, i64, Option<String>, String, String)> = sqlx::query_as(
+            "SELECT j.id, b.id, b.created_at, b.label, b.origin, j.kind \
+             FROM jobs j JOIN batches b ON b.id = j.batch_id ORDER BY j.id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            jobs,
+            vec![
+                (
+                    "j-album".into(),
+                    "j-album".into(),
+                    7,
+                    Some("Winter Songs".into()),
+                    "ui".into(),
+                    "album".into()
+                ),
+                (
+                    "j-track".into(),
+                    "j-track".into(),
+                    7,
+                    Some("O Holy Night".into()),
+                    "ui".into(),
+                    "track".into()
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

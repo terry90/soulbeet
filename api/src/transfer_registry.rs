@@ -105,6 +105,9 @@ struct Held {
     /// Held keys their user asked to cancel. A mark lives only as long as
     /// its key's claim.
     cancelled: HashSet<TransferKey>,
+    /// Jobs whose user asked to cancel them while they may have transfers
+    /// (design D9). The ledger's writer sets and clears these marks.
+    cancelled_jobs: HashSet<String>,
 }
 
 impl Held {
@@ -213,7 +216,9 @@ impl TransferRegistry {
 
     /// Releases every key the batch still holds, with their cancel marks.
     pub fn release_batch(&self, owner: &TransferOwner) {
-        let Held { owners, cancelled } = &mut *self.held();
+        let Held {
+            owners, cancelled, ..
+        } = &mut *self.held();
         owners.retain(|_, batch| batch.owner != *owner);
         cancelled.retain(|key| owners.contains_key(key));
     }
@@ -272,6 +277,21 @@ impl TransferRegistry {
     pub fn is_cancelled(&self, key: &TransferKey, owner: &TransferOwner) -> bool {
         let held = self.held();
         held.held_by(key, owner) && held.cancelled.contains(key)
+    }
+
+    /// Marks `job` cancelled: every monitor stops each of its slots.
+    pub fn cancel_job(&self, job: &str) {
+        self.held().cancelled_jobs.insert(job.to_string());
+    }
+
+    /// Whether `job` is marked cancelled.
+    pub fn job_cancelled(&self, job: &str) -> bool {
+        self.held().cancelled_jobs.contains(job)
+    }
+
+    /// Drops `job`'s cancel mark: it ended, or it downloads again.
+    pub fn reopen_job(&self, job: &str) {
+        self.held().cancelled_jobs.remove(job);
     }
 
     /// `user`'s batches holding a transfer now, each with how many it holds,

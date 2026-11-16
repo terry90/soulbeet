@@ -418,7 +418,7 @@ mod tests {
     use super::test_support::{ctx_of, own_ctx};
     use super::*;
     use crate::auth::UserId;
-    use crate::ledger::NewJob;
+    use crate::ledger::{JobKind, NewJob};
     use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
     use crate::server_fns::download::test_support::{
         batch, group, item, key, ScriptedOutcome, StubBackend,
@@ -802,6 +802,8 @@ mod tests {
                     state: JobState::Queued,
                     search_id: None,
                     picked: vec![],
+                    kind: JobKind::Track,
+                    options: None,
                 },
                 None,
             )
@@ -974,6 +976,8 @@ mod tests {
                     state: JobState::Queued,
                     search_id: None,
                     picked: picked.clone(),
+                    kind: JobKind::Track,
+                    options: None,
                 },
                 None,
             )
@@ -1036,6 +1040,8 @@ mod tests {
                         item("p", "Zero", "slow/0.flac"),
                         item("p", "One", "slow/1.flac"),
                     ]),
+                    kind: JobKind::Track,
+                    options: None,
                 },
                 None,
             )

@@ -723,7 +723,9 @@ mod tests {
     use super::*;
     use crate::auth::UserId;
     use crate::core::delete_guard::test_support::{mtime, set_mtime};
-    use crate::ledger::{store, IndexWait, JobEvent, JobState, Ledger, NewJob, ScanBaseline};
+    use crate::ledger::{
+        store, IndexWait, JobEvent, JobKind, JobState, Ledger, NewJob, ScanBaseline,
+    };
     use crate::models::navidrome_library::NavidromeLibraryRow;
     use crate::server_fns::download::test_support::item;
     use crate::services::NavidromeLookupError;
@@ -1197,6 +1199,8 @@ mod tests {
                     state: JobState::Queued,
                     search_id: None,
                     picked: vec![],
+                    kind: JobKind::Track,
+                    options: None,
                 },
                 None,
             )

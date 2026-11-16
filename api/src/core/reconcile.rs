@@ -1021,7 +1021,7 @@ mod tests {
     use super::*;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use crate::ledger::{
-        store, ImportDone, IndexWait, NewJob, NewSearch, StoredImport, SEARCH_KEPT_SECS,
+        store, ImportDone, IndexWait, JobKind, NewJob, NewSearch, StoredImport, SEARCH_KEPT_SECS,
     };
     use crate::server_fns::download::test_support::{batch, group, item, transfer, StubBackend};
     use shared::download::{DownloadQuery, DownloadState, DownloadableItem, JobSlot};
@@ -1385,6 +1385,8 @@ mod tests {
                     state,
                     search_id: search.map(str::to_string),
                     picked: vec![],
+                    kind: JobKind::Track,
+                    options: None,
                 },
                 None,
             )
@@ -2319,6 +2321,8 @@ mod tests {
                     state: JobState::Queued,
                     search_id: None,
                     picked: slots,
+                    kind: JobKind::Album,
+                    options: None,
                 },
                 None,
             )

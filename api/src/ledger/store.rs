@@ -351,7 +351,7 @@ pub async fn job_state(db: &SqlitePool, job: &str) -> Option<JobState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::{JobEvent, Ledger, NewJob};
+    use crate::ledger::{JobEvent, JobKind, Ledger, NewJob};
     use crate::server_fns::download::test_support::item;
     use shared::download::DownloadState;
     use soulbeet::DriverChoice;
@@ -372,6 +372,8 @@ mod tests {
                     state: JobState::Queued,
                     search_id: None,
                     picked: vec![],
+                    kind: JobKind::Track,
+                    options: None,
                 },
                 None,
             )

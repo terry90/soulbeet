@@ -5,7 +5,7 @@ use crate::config::CONFIG;
 use crate::core::sources;
 use crate::core::{backend_unavailable, database_failure};
 use crate::ledger::store::StoredSearch;
-use crate::ledger::{JobState, Ledger, NewJob, LEDGER};
+use crate::ledger::{JobKind, JobState, Ledger, NewJob, LEDGER};
 use crate::models::folder::Folder;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 use crate::services::{download_backend, BackendLookupError};
@@ -121,11 +121,13 @@ async fn start_manual(
                         id: id.clone(),
                         user: ctx.id(),
                         folder_id,
+                        kind: JobKind::of(&search.query),
                         wanted: search.query,
                         import_mode,
                         state: JobState::Queued,
                         search_id: Some(search.id),
                         picked: picked.clone(),
+                        options: None,
                     },
                     None,
                 )
@@ -318,6 +320,8 @@ mod tests {
                     state: JobState::NeedsSourceChoice,
                     search_id: Some("s1".into()),
                     picked: vec![],
+                    kind: JobKind::Track,
+                    options: None,
                 },
                 Some(NewSearch {
                     id: "s1".into(),
