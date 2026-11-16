@@ -138,7 +138,7 @@ fn located(path: &Path) -> Result<(OwnedFd, &OsStr, FileId), Located> {
     let (true, Some(parent), Some(name)) = (canonical, path.parent(), path.file_name()) else {
         return Err(Located::NotCanonical(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{} is not a canonical path to a file", path.display()),
+            "Not a canonical path to a file",
         )));
     };
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;

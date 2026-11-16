@@ -1,7 +1,7 @@
 //! Where each Navidrome library is on this machine, and the file behind a song.
 
 use super::unlink::FileId;
-use super::{not_a_track, path_unresolved};
+use super::{not_a_track, path_unresolved, NOT_A_FILE};
 use crate::auth::UserId;
 use crate::core::database_failure;
 use crate::folder_policy::PolicyRows;
@@ -106,7 +106,7 @@ async fn file_under_root(
     let root = root_in(db, song, music_path).await?;
     let local = root.join(relative);
     let no_file = |e: std::io::Error| {
-        path_unresolved(format!("No file at {}", local.display())).with_cause(
+        path_unresolved("No file at this song's path").with_cause(
             Service::Filesystem,
             None,
             e.to_string(),
@@ -121,25 +121,20 @@ async fn file_under_root(
         Err(e) => return Ok(Err(no_file(e))),
     };
     if canonical != canonical_root.join(relative) {
-        return Err(path_unresolved(format!(
-            "Navidrome's path for this song passes through a symbolic link: {}",
-            song.path
-        )));
+        return Err(path_unresolved(
+            "Navidrome's path for this song passes through a symbolic link",
+        ));
     }
     let meta = match tokio::fs::symlink_metadata(&canonical).await {
         Ok(meta) => meta,
         Err(e) => return Ok(Err(no_file(e))),
     };
     if !meta.is_file() {
-        return Err(not_a_track(format!(
-            "{} is not a regular file",
-            canonical.display()
-        )));
+        return Err(not_a_track(NOT_A_FILE));
     }
     if meta.len() != song.size {
         return Err(path_unresolved(format!(
-            "{} has {} bytes, Navidrome's song has {}",
-            canonical.display(),
+            "The file has {} bytes, Navidrome's song has {}",
             meta.len(),
             song.size
         )));
@@ -224,12 +219,8 @@ pub(super) async fn other_in(
 
 /// `song.path` when it is relative without `..`.
 fn relative_path(song: &NativeSong) -> Result<&Path, Failure> {
-    inside(&song.path).ok_or_else(|| {
-        path_unresolved(format!(
-            "Navidrome's path for this song is not inside its library: {}",
-            song.path
-        ))
-    })
+    inside(&song.path)
+        .ok_or_else(|| path_unresolved("Navidrome's path for this song is not inside its library"))
 }
 
 /// What is at a path on this machine, as a library root.
@@ -677,10 +668,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(moved.code, FailureCode::DeletePathUnresolved);
-        assert_eq!(
-            moved.message,
-            "No file at /srv/other/Marrow Choir/Winter Songs/04.flac"
-        );
+        assert_eq!(moved.message, "No file at this song's path");
     }
 
     #[tokio::test]
@@ -720,7 +708,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .message,
-            "No file at /srv/navidrome/music/A/03.flac"
+            "No file at this song's path"
         );
     }
 
@@ -732,12 +720,11 @@ mod tests {
         for (song, message) in [
             (
                 native(&music, "../bob/B/y.flac", 5),
-                "Navidrome's path for this song is not inside its library: ../bob/B/y.flac"
-                    .to_string(),
+                "Navidrome's path for this song is not inside its library".to_string(),
             ),
             (
                 native(&music, "/etc/passwd", 5),
-                "Navidrome's path for this song is not inside its library: /etc/passwd".to_string(),
+                "Navidrome's path for this song is not inside its library".to_string(),
             ),
             (
                 NativeSong {
@@ -748,12 +735,7 @@ mod tests {
             ),
             (
                 native(&music, "A/03.flac", 9),
-                format!(
-                    "{} has 5 bytes, Navidrome's song has 9",
-                    std::fs::canonicalize(music.join("A/03.flac"))
-                        .unwrap()
-                        .display()
-                ),
+                "The file has 5 bytes, Navidrome's song has 9".to_string(),
             ),
         ] {
             let f = local_file_in(&db, &song, None).await.unwrap_err();
@@ -782,7 +764,7 @@ mod tests {
             (f.code, f.message.as_str()),
             (
                 FailureCode::DeletePathUnresolved,
-                "Navidrome's path for this song passes through a symbolic link: A/03.flac"
+                "Navidrome's path for this song passes through a symbolic link"
             )
         );
         // A library root that is itself a link resolves on both sides.
@@ -808,15 +790,11 @@ mod tests {
         let f = local_file_in(&db, &native(&music, "B/dir.flac", size), None)
             .await
             .unwrap_err();
-        let canonical = std::fs::canonicalize(&music).unwrap();
         assert_eq!(
-            (f.code, f.message),
+            (f.code, f.message.as_str()),
             (
                 FailureCode::DeleteNotATrack,
-                format!(
-                    "{} is not a regular file",
-                    canonical.join("B/dir.flac").display()
-                )
+                "The file is not a regular file"
             )
         );
         let (path, id) = local_file_in(&db, &native(&music, "A/03.flac", 5), None)

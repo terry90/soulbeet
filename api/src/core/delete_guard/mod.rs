@@ -177,7 +177,7 @@ impl Guard<'_> {
     ) -> Result<Checked, Failure> {
         let reported = library.join(&item.path);
         let no_file = |e: std::io::Error| {
-            path_unresolved(format!("No file at {}", reported.display())).with_cause(
+            path_unresolved("No file at the path beets reported").with_cause(
                 Service::Filesystem,
                 None,
                 e.to_string(),
@@ -190,12 +190,7 @@ impl Guard<'_> {
             .songs_for_item(actor, item)
             .await
             .map_err(|e| e.failure(Stage::Delete, e.to_string()))?
-            .ok_or_else(|| {
-                path_unresolved(format!(
-                    "Navidrome cannot be searched for the tags of {}",
-                    path.display()
-                ))
-            })?;
+            .ok_or_else(|| path_unresolved(UNSEARCHABLE))?;
         let taken: Vec<NativeSong> = candidates
             .iter()
             .filter(|song| crate::core::index::is_imported_file(song, &item.path, size))
@@ -227,10 +222,7 @@ impl Guard<'_> {
         for song in &taken {
             paths::local_file_in(self.db, song, self.music_path).await?;
         }
-        Err(path_unresolved(format!(
-            "Navidrome has no song for {}",
-            path.display()
-        )))
+        Err(path_unresolved("Navidrome has no song for this file"))
     }
 
     /// The first of `candidates` whose path on this machine names the canonical file `path`
@@ -352,7 +344,8 @@ impl Guard<'_> {
                         return Err(NotRemoved::Kept(changed_since_check()))
                     }
                     Ok(Err(UnlinkError::Io(e))) => {
-                        return Err(NotRemoved::Kept(delete_failed(&target, &e)))
+                        warn!("Could not delete {}: {e}", target.display());
+                        return Err(NotRemoved::Kept(delete_failed(&e)));
                     }
                     Err(e) => {
                         drop(tx);
@@ -402,12 +395,7 @@ impl Guard<'_> {
         song: &NativeSong,
         path: &Path,
     ) -> Result<(), Failure> {
-        let unsearchable = || {
-            path_unresolved(format!(
-                "Navidrome cannot be searched for the tags of {}",
-                path.display()
-            ))
-        };
+        let unsearchable = || path_unresolved(UNSEARCHABLE);
         let candidates = self
             .listeners
             .songs_for_item(actor, &listeners::item_of(song))
@@ -419,14 +407,12 @@ impl Guard<'_> {
         }
         match self.another_record(song, path, &candidates).await? {
             paths::Other::Different => Ok(()),
-            paths::Other::Same => Err(path_unresolved(format!(
-                "Navidrome lists {} as more than one song",
-                path.display()
-            ))),
-            paths::Other::Unknown => Err(path_unresolved(format!(
-                "Navidrome may list {} as more than one song",
-                path.display()
-            ))),
+            paths::Other::Same => Err(path_unresolved(
+                "Navidrome lists this file as more than one song",
+            )),
+            paths::Other::Unknown => Err(path_unresolved(
+                "Navidrome may list this file as more than one song",
+            )),
         }
     }
 
@@ -526,10 +512,9 @@ async fn lost_removal(
     );
     let left = match unlink::look(path, id) {
         unlink::Look::There => {
-            return Err(NotRemoved::Kept(delete_failed(
-                path,
-                &std::io::Error::other(error),
-            )))
+            return Err(NotRemoved::Kept(delete_failed(&std::io::Error::other(
+                error,
+            ))))
         }
         unlink::Look::Gone => Left::Nothing,
         unlink::Look::Replaced => {
@@ -541,7 +526,7 @@ async fn lost_removal(
         }
         unlink::Look::Unreadable(e) => {
             warn!("Could not look at {} after that: {e}", path.display());
-            return Err(NotRemoved::Unconfirmed(removal_unconfirmed(path, error)));
+            return Err(NotRemoved::Unconfirmed(removal_unconfirmed(error)));
         }
     };
     let recorded = match db.acquire().await {
@@ -628,7 +613,14 @@ pub(crate) fn forget_note(outcome: &ForgetOutcome, path: &Path, library: &Path) 
     }
 }
 
-/// The song's file on this machine cannot be told: `message` says why.
+/// Why the songs Navidrome lists for a file cannot be told.
+const UNSEARCHABLE: &str = "Navidrome cannot be searched for this file's tags";
+
+/// What is at the path is a directory or another thing that is not a regular file.
+const NOT_A_FILE: &str = "The file is not a regular file";
+
+/// The song's file on this machine cannot be told: `message` says why. No guard message names
+/// a path: callers name the file in a field of their own, and the logs name it.
 pub(crate) fn path_unresolved(message: impl Into<String>) -> Failure {
     Failure::new(
         FailureCode::DeletePathUnresolved,
@@ -708,26 +700,24 @@ pub(crate) fn changed_since_check() -> Failure {
     )
 }
 
-/// A removal of `path` stopped (`error`) and the file is not where it was checked.
-fn removal_unconfirmed(path: &Path, error: &str) -> Failure {
+/// A removal stopped (`error`, Soulful's own words) and the file is not where it was checked.
+fn removal_unconfirmed(error: &str) -> Failure {
     Failure::new(
         FailureCode::DeleteFailed,
         Stage::Delete,
         RetryAdvice::SameSourceLater,
-        format!(
-            "{} may have been deleted: the removal stopped before it reported ({error})",
-            path.display()
-        ),
+        "The file may have been deleted: the removal stopped before it reported",
     )
+    .with_cause(Service::Soulful, None, error)
 }
 
-/// The OS refused to remove `path`.
-pub(crate) fn delete_failed(path: &Path, e: &std::io::Error) -> Failure {
+/// The OS refused to remove the file, with error `e`.
+pub(crate) fn delete_failed(e: &std::io::Error) -> Failure {
     Failure::new(
         FailureCode::DeleteFailed,
         Stage::Delete,
         RetryAdvice::SameSourceLater,
-        format!("Could not delete {}: {e}", path.display()),
+        "Could not delete the file",
     )
     .with_cause(Service::Filesystem, None, e.to_string())
 }
@@ -1146,8 +1136,7 @@ mod tests {
             refusal(lib.guard().check_song(&lib.alice(), "s2").await),
             (
                 FailureCode::DeletePathUnresolved,
-                "Navidrome's path for this song passes through a symbolic link: alice/link.flac"
-                    .into()
+                "Navidrome's path for this song passes through a symbolic link".into()
             )
         );
         assert!(lib.root.join("outside/z.flac").exists());
@@ -1161,10 +1150,7 @@ mod tests {
             refusal(lib.guard().check_song(&lib.alice(), "s2").await),
             (
                 FailureCode::DeleteOutsideLibrary,
-                format!(
-                    "{} is not inside one of your library folders",
-                    canonical(&lib, "music/carol/z.flac").display()
-                )
+                "The file is not inside one of your library folders".to_string()
             )
         );
         assert_eq!(lib.fake.ratings_set(), vec![]);
@@ -1193,10 +1179,7 @@ mod tests {
             refusal(lib.guard().check_song(&lib.alice(), "s4").await),
             (
                 FailureCode::DeleteNotATrack,
-                format!(
-                    "{} is not an audio file",
-                    canonical(&lib, "music/alice/A/cover.jpg").display()
-                )
+                "The file is not an audio file".to_string()
             )
         );
         // A directory whose size Navidrome's record happens to give.
@@ -1218,10 +1201,7 @@ mod tests {
             refusal(lib.guard().check_song(&lib.alice(), "s5").await),
             (
                 FailureCode::DeleteNotATrack,
-                format!(
-                    "{} is not a regular file",
-                    canonical(&lib, "music/alice/B/dir.flac").display()
-                )
+                "The file is not a regular file".to_string()
             )
         );
     }
@@ -1468,7 +1448,7 @@ mod tests {
                 refusal(lib.guard().check_song(&lib.alice(), id).await),
                 (
                     FailureCode::DeletePathUnresolved,
-                    format!("Navidrome's path for this song is not inside its library: {path}")
+                    "Navidrome's path for this song is not inside its library".to_string()
                 )
             );
         }
@@ -1492,10 +1472,7 @@ mod tests {
             (f.code, f.message, f.cause),
             (
                 FailureCode::DeleteOutsideLibrary,
-                format!(
-                    "{} may be inside a folder of another user",
-                    canonical(&lib, "music/alice/A/x.flac").display()
-                ),
+                "The file may be inside a folder of another user".to_string(),
                 None
             )
         );
@@ -1523,10 +1500,7 @@ mod tests {
                 "bob" => (FailureCode::DeleteVetoUnknown, VETO.to_string()),
                 _ => (
                     FailureCode::DeletePathUnresolved,
-                    format!(
-                        "Navidrome lists {} as more than one song",
-                        canonical(&lib, "music/alice/A/x.flac").display()
-                    ),
+                    "Navidrome lists this file as more than one song".to_string(),
                 ),
             };
             assert_eq!(
@@ -1558,10 +1532,7 @@ mod tests {
                 "bob" => (FailureCode::DeleteVetoUnknown, VETO.to_string()),
                 _ => (
                     FailureCode::DeletePathUnresolved,
-                    format!(
-                        "Navidrome may list {} as more than one song",
-                        canonical(&lib, "music/alice/A/x.flac").display()
-                    ),
+                    "Navidrome may list this file as more than one song".to_string(),
                 ),
             };
             assert_eq!(
@@ -1620,10 +1591,7 @@ mod tests {
             refusal(lib.guard().check_song(&lib.alice(), "t").await),
             (
                 FailureCode::DeletePathUnresolved,
-                format!(
-                    "Navidrome may list {} as more than one song",
-                    canonical(&lib, "music/alice/A/x.flac").display()
-                )
+                "Navidrome may list this file as more than one song".to_string()
             )
         );
         let item = ImportedItem {
@@ -1692,10 +1660,7 @@ mod tests {
             refusal(lib.guard().check_song(&lib.alice(), "t").await),
             (
                 FailureCode::DeleteOutsideLibrary,
-                format!(
-                    "{} is not inside one of your library folders",
-                    canonical(&lib, "music/A/x.flac").display()
-                )
+                "The file is not inside one of your library folders".to_string()
             )
         );
         assert!(imported.exists() && lib.root.join("music/A/x.flac").exists());
@@ -1770,7 +1735,7 @@ mod tests {
     async fn a_root_the_file_cannot_prove_is_not_learned_and_the_check_refuses() {
         let no_file = (
             FailureCode::DeletePathUnresolved,
-            format!("No file at {NAVIDROME_MOUNT}/alice/A/x.flac"),
+            "No file at this song's path".to_string(),
         );
         // Navidrome read an earlier write of the file: another modification time.
         let earlier: chrono::DateTime<chrono::Utc> =
@@ -1853,10 +1818,7 @@ mod tests {
     async fn only_the_gone_file_is_refused(lib: &Library) {
         let no_file = (
             FailureCode::DeletePathUnresolved,
-            format!(
-                "No file at {}",
-                lib.root.join("music/alice/A/x.flac").display()
-            ),
+            "No file at this song's path".to_string(),
         );
         assert_eq!(
             refusal(lib.guard().check_song(&lib.alice(), "s1").await),
@@ -1954,7 +1916,7 @@ mod tests {
             (f.code, f.message.as_str()),
             (
                 FailureCode::DeletePathUnresolved,
-                format!("No file at {NAVIDROME_MOUNT}/alice/A/x.flac").as_str()
+                "No file at this song's path"
             )
         );
         assert_eq!(
@@ -2014,10 +1976,7 @@ mod tests {
             refusal(lib.guard().check_song(&lib.alice(), "s1").await),
             (
                 FailureCode::DeletePathUnresolved,
-                format!(
-                    "Navidrome cannot be searched for the tags of {}",
-                    canonical(&lib, "music/alice/A/x.flac").display()
-                )
+                "Navidrome cannot be searched for this file's tags".to_string()
             )
         );
         assert_eq!(lib.fake.ratings_set(), vec![]);
@@ -2383,10 +2342,11 @@ mod tests {
         std::fs::write(&path, b"other audio").unwrap();
         match lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await {
             Err(NotRemoved::Kept(f)) => assert_eq!(
-                (f.code, f.message),
+                (f.code, f.message.as_str(), f.cause),
                 (
                     FailureCode::DeleteFailed,
-                    format!("Could not delete {}: task 7 panicked", path.display())
+                    "Could not delete the file",
+                    Some(Cause::new(Service::Filesystem, None, "task 7 panicked"))
                 )
             ),
             other => panic!("{other:?}"),
@@ -2401,13 +2361,11 @@ mod tests {
         std::os::unix::fs::symlink(&moved, &album).unwrap();
         match lost_removal(&lib.db, &record, &path, id, "task 7 panicked").await {
             Err(NotRemoved::Unconfirmed(f)) => assert_eq!(
-                (f.code, f.message),
+                (f.code, f.message.as_str(), f.cause),
                 (
                     FailureCode::DeleteFailed,
-                    format!(
-                        "{} may have been deleted: the removal stopped before it reported (task 7 panicked)",
-                        path.display()
-                    )
+                    "The file may have been deleted: the removal stopped before it reported",
+                    Some(Cause::new(Service::Soulful, None, "task 7 panicked"))
                 )
             ),
             other => panic!("{other:?}"),
@@ -2515,13 +2473,15 @@ mod tests {
     fn guard_refusals_keep_their_text() {
         use FailureCode::*;
         use RetryAdvice::*;
-        for (f, code, stage, retry, message) in [
+        let cause = |service, raw: &str| Some(Cause::new(service, None, raw));
+        for (f, code, stage, retry, message, cause) in [
             (
                 song_not_found(),
                 UnknownHandle,
                 Stage::Input,
                 NotRetryable,
                 "Song not found",
+                None,
             ),
             (
                 blocked_by_other_user(),
@@ -2529,6 +2489,7 @@ mod tests {
                 Stage::Delete,
                 NotRetryable,
                 "Another listener rated or starred this track",
+                None,
             ),
             (
                 veto_unknown(),
@@ -2536,6 +2497,7 @@ mod tests {
                 Stage::Delete,
                 SameSourceLater,
                 VETO,
+                None,
             ),
             (
                 in_use(),
@@ -2543,6 +2505,7 @@ mod tests {
                 Stage::Delete,
                 SameSourceLater,
                 "A download or import that is not finished wants this track",
+                None,
             ),
             (
                 changed_since_check(),
@@ -2550,29 +2513,29 @@ mod tests {
                 Stage::Delete,
                 SameSourceLater,
                 "The file changed after it was checked",
+                None,
             ),
             (
                 // EACCES
-                delete_failed(
-                    Path::new("/music/alice/A/x.flac"),
-                    &std::io::Error::from_raw_os_error(13),
-                ),
+                delete_failed(&std::io::Error::from_raw_os_error(13)),
                 DeleteFailed,
                 Stage::Delete,
                 SameSourceLater,
-                "Could not delete /music/alice/A/x.flac: Permission denied (os error 13)",
+                "Could not delete the file",
+                cause(Service::Filesystem, "Permission denied (os error 13)"),
             ),
             (
-                removal_unconfirmed(Path::new("/music/alice/A/x.flac"), "task 7 panicked"),
+                removal_unconfirmed("task 7 panicked"),
                 DeleteFailed,
                 Stage::Delete,
                 SameSourceLater,
-                "/music/alice/A/x.flac may have been deleted: the removal stopped before it reported (task 7 panicked)",
+                "The file may have been deleted: the removal stopped before it reported",
+                cause(Service::Soulful, "task 7 panicked"),
             ),
         ] {
             assert_eq!(
-                (f.code, f.stage, f.retry, f.message.as_str()),
-                (code, stage, retry, message)
+                (f.code, f.stage, f.retry, f.message.as_str(), f.cause),
+                (code, stage, retry, message, cause)
             );
             assert_eq!(f.user_action, None);
         }
@@ -2616,7 +2579,7 @@ mod tests {
             ),
             (
                 FailureCode::DeletePathUnresolved,
-                format!("No file at {}", library.join("A/gone.flac").display())
+                "No file at the path beets reported".to_string()
             )
         );
         std::fs::write(library.join("A/z.flac"), b"audio").unwrap();
@@ -2628,10 +2591,7 @@ mod tests {
             ),
             (
                 FailureCode::DeletePathUnresolved,
-                format!(
-                    "Navidrome has no song for {}",
-                    canonical(&lib, "music/alice/A/z.flac").display()
-                )
+                "Navidrome has no song for this file".to_string()
             )
         );
     }
@@ -2658,7 +2618,7 @@ mod tests {
                     size: 9,
                     ..s1.clone()
                 },
-                format!("{} has 5 bytes, Navidrome's song has 9", x.display()),
+                "The file has 5 bytes, Navidrome's song has 9".to_string(),
             ),
             (
                 NativeSong {
@@ -2694,13 +2654,7 @@ mod tests {
             .check_file(&lib.alice(), &item, &library, &[])
             .await
             .unwrap_err();
-        assert_eq!(
-            f.message,
-            format!(
-                "No file at {}",
-                lib.root.join("elsewhere/alice/A/x.flac").display()
-            )
-        );
+        assert_eq!(f.message, "No file at this song's path");
         assert!(x.exists());
     }
 }

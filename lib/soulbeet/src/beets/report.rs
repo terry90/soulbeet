@@ -118,6 +118,8 @@ pub enum DuplicateNote<'a> {
     Removed,
     /// Kept because its removal was refused, for this reason.
     Blocked(&'a str),
+    /// Its removal stopped before it reported whether it deleted the file.
+    Unconfirmed,
 }
 
 /// The note an imported row gets about the library's earlier copy
@@ -135,6 +137,9 @@ pub fn duplicate_note(existing: &[PathBuf], target: &Path, note: DuplicateNote<'
         DuplicateNote::Blocked(reason) => {
             format!("kept the library's earlier copy {files}: {reason}")
         }
+        DuplicateNote::Unconfirmed => format!(
+            "may have removed the library's earlier copy {files}: its removal stopped before it reported"
+        ),
     }
 }
 
@@ -754,6 +759,10 @@ mod tests {
                 "Another listener rated or starred this track"
             )),
             "kept the library's earlier copy A/x.flac, /elsewhere/y.flac: Another listener rated or starred this track"
+        );
+        assert_eq!(
+            note(DuplicateNote::Unconfirmed),
+            "may have removed the library's earlier copy A/x.flac, /elsewhere/y.flac: its removal stopped before it reported"
         );
     }
 

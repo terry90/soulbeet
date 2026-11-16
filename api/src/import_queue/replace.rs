@@ -17,6 +17,9 @@ use tracing::warn;
 /// files or moved a new file there, or one of its files is a file this run imported.
 const OVERLAPS: &str = "this import already replaced or added one of these files";
 
+/// Why the files after one whose removal did not report are kept.
+const AFTER_UNCONFIRMED: &str = "an earlier removal of this import stopped before it reported";
+
 /// Settles the removals beets wanted in `result`, an import into `target` (the canonical
 /// library folder beets ran on), as one run, and appends what became of each earlier copy to
 /// the outcome's warnings, and the first new copy that could not be moved into place to its
@@ -212,8 +215,8 @@ impl Run<'_> {
 
 /// The notes of a removal whose deletions stopped at `earlier[deleted]`: the files deleted before
 /// it, removed; that file and the rest, kept with its reason when `stop` kept it; when its
-/// removal is unconfirmed, its own message, which says it may have been deleted, and the rest
-/// kept with that reason.
+/// removal is unconfirmed, that file as one that may have been removed, and the rest kept
+/// because of it.
 fn stopped_notes(
     earlier: &[PathBuf],
     deleted: usize,
@@ -229,10 +232,14 @@ fn stopped_notes(
         ));
     }
     let (kept, reason) = match stop {
-        NotRemoved::Kept(f) => (&earlier[deleted..], &f.message),
-        NotRemoved::Unconfirmed(f) => {
-            notes.push(f.message.clone());
-            (&earlier[deleted + 1..], &f.message)
+        NotRemoved::Kept(f) => (&earlier[deleted..], f.message.as_str()),
+        NotRemoved::Unconfirmed(_) => {
+            notes.push(duplicate_note(
+                &earlier[deleted..=deleted],
+                target,
+                DuplicateNote::Unconfirmed,
+            ));
+            (&earlier[deleted + 1..], AFTER_UNCONFIRMED)
         }
     };
     if !kept.is_empty() {
@@ -466,10 +473,7 @@ mod tests {
             notes(&done),
             vec![
                 "removed the library's earlier copy A/x.flac".to_string(),
-                format!(
-                    "kept the library's earlier copy B/y.flac: Could not delete {}: Permission denied (os error 13)",
-                    y.display()
-                ),
+                "kept the library's earlier copy B/y.flac: Could not delete the file".to_string(),
             ]
         );
         assert!(!x.exists() && y.exists());
@@ -594,19 +598,22 @@ mod tests {
                 shared::failure::RetryAdvice::SameSourceLater,
                 message,
             )
+            .with_cause(shared::failure::Service::Soulful, None, "task 7 panicked")
         };
-        let unconfirmed = "/music/alice/A/y.flac may have been deleted: the removal stopped before it reported (task 7 panicked)";
+        let unconfirmed =
+            failed("The file may have been deleted: the removal stopped before it reported");
+        let may_be_gone = "may have removed the library's earlier copy A/y.flac: its removal stopped before it reported";
         assert_eq!(
             stopped_notes(
                 &earlier,
                 1,
                 target,
-                &NotRemoved::Unconfirmed(failed(unconfirmed))
+                &NotRemoved::Unconfirmed(unconfirmed.clone())
             ),
             vec![
                 "removed the library's earlier copy A/x.flac".to_string(),
-                unconfirmed.to_string(),
-                format!("kept the library's earlier copy A/z.flac: {unconfirmed}"),
+                may_be_gone.to_string(),
+                "kept the library's earlier copy A/z.flac: an earlier removal of this import stopped before it reported".to_string(),
             ]
         );
         assert_eq!(
@@ -614,15 +621,15 @@ mod tests {
                 &earlier[..2],
                 1,
                 target,
-                &NotRemoved::Unconfirmed(failed(unconfirmed))
+                &NotRemoved::Unconfirmed(unconfirmed)
             ),
             vec![
                 "removed the library's earlier copy A/x.flac".to_string(),
-                unconfirmed.to_string(),
+                may_be_gone.to_string(),
             ]
         );
         // A stopped removal that left its file keeps it, as a refusal does.
-        let kept = "Could not delete /music/alice/A/y.flac: task 7 panicked";
+        let kept = "Could not delete the file";
         assert_eq!(
             stopped_notes(&earlier, 1, target, &NotRemoved::Kept(failed(kept))),
             vec![

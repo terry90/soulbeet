@@ -2,7 +2,9 @@
 //! plus the path containment of rule 1 (design section 13).
 
 use super::unlink::{unlink_if_same, FileId, UnlinkError};
-use super::{changed_since_check, delete_failed, not_a_track, outside_library, prune, rules};
+use super::{
+    changed_since_check, delete_failed, not_a_track, outside_library, prune, rules, NOT_A_FILE,
+};
 use crate::auth::UserId;
 use crate::core::database_failure;
 use crate::core::discovery::track_not_pending;
@@ -80,7 +82,7 @@ pub(crate) async fn remove_claimed_in(
     let removed = match tokio::fs::canonicalize(stored).await {
         Ok(path) => remove_contained(db, &path, track, folder).await,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(delete_failed(stored, &e)),
+        Err(e) => Err(delete_failed(&e)),
     };
     if let Err(failure) = removed {
         if let Err(e) =
@@ -127,12 +129,13 @@ async fn remove_contained(
     folder: &Folder,
 ) -> Result<(), Failure> {
     let outside = || {
-        outside_library(format!(
+        info!(
             "{} is not inside the folder Discovery/{} of {}",
             path.display(),
             track.profile,
             folder.path
-        ))
+        );
+        outside_library("The file is not inside its discovery profile's folder")
     };
     let profile = canonical_folder_path(Path::new(&folder.discovery_profile_path(&track.profile)))
         .map_err(|e| outside().with_cause(Service::Filesystem, None, e.to_string()))?;
@@ -146,19 +149,16 @@ async fn remove_contained(
     rules::owning_folders(path, &folders, &UserId::new(&folder.user_id))?;
     let meta = tokio::fs::symlink_metadata(path)
         .await
-        .map_err(|e| delete_failed(path, &e))?;
+        .map_err(|e| delete_failed(&e))?;
     if !meta.is_file() {
-        return Err(not_a_track(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
+        return Err(not_a_track(NOT_A_FILE));
     }
     let (target, id) = (path.to_path_buf(), FileId::of(&meta));
     match tokio::task::spawn_blocking(move || unlink_if_same(&target, id)).await {
         Ok(Ok(())) => {}
         Ok(Err(UnlinkError::Changed)) => return Err(changed_since_check()),
-        Ok(Err(UnlinkError::Io(e))) => return Err(delete_failed(path, &e)),
-        Err(e) => return Err(delete_failed(path, &std::io::Error::other(e))),
+        Ok(Err(UnlinkError::Io(e))) => return Err(delete_failed(&e)),
+        Err(e) => return Err(delete_failed(&std::io::Error::other(e))),
     }
     prune(path, &profile).await;
     Ok(())
@@ -216,14 +216,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(
-            (f.code, f.message),
+            (f.code, f.message.as_str()),
             (
                 FailureCode::DeleteOutsideLibrary,
-                format!(
-                    "{} is not inside the folder Discovery/Explore of {}",
-                    std::fs::canonicalize(&library_file).unwrap().display(),
-                    folder.path
-                )
+                "The file is not inside its discovery profile's folder"
             )
         );
         assert!(library_file.exists());
@@ -283,13 +279,10 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(
-            (f.code, f.message),
+            (f.code, f.message.as_str()),
             (
                 FailureCode::DeleteOutsideLibrary,
-                format!(
-                    "{} is not inside one of your library folders",
-                    std::fs::canonicalize(&staged).unwrap().display()
-                )
+                "The file is not inside one of your library folders"
             )
         );
         assert!(staged.exists());

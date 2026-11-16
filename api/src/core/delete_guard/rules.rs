@@ -34,10 +34,9 @@ pub(super) fn owning_folders<'a>(
                     folder.stored_path.display(),
                     folder.user_id
                 );
-                return Err(outside_library(format!(
-                    "{} may be inside a folder of another user",
-                    path.display()
-                )));
+                return Err(outside_library(
+                    "The file may be inside a folder of another user",
+                ));
             }
         }
     }
@@ -56,12 +55,7 @@ pub(super) fn owning_folders<'a>(
         .into_iter()
         .find(|(f, folder)| Some(folder.components().count()) == deepest && f.user_id == actor)
         .map(|(_, folder)| folder)
-        .ok_or_else(|| {
-            outside_library(format!(
-                "{} is not inside one of your library folders",
-                path.display()
-            ))
-        })
+        .ok_or_else(|| outside_library("The file is not inside one of your library folders"))
 }
 
 /// The ids of every registered folder, of any user, that holds the canonical file `path`
@@ -89,10 +83,7 @@ fn lexically_outside(file: &Path, stored: &Path) -> bool {
 /// Rule 2: the canonical `path`, a regular file (local_file_in), has an audio extension.
 pub(super) fn audio_file(path: &Path) -> Result<(), Failure> {
     if !soulbeet::audio::is_audio_path(path) {
-        return Err(not_a_track(format!(
-            "{} is not an audio file",
-            path.display()
-        )));
+        return Err(not_a_track("The file is not an audio file"));
     }
     Ok(())
 }
@@ -178,18 +169,12 @@ mod tests {
             })
     }
 
-    fn not_yours(path: &Path) -> Result<PathBuf, String> {
-        Err(format!(
-            "{} is not inside one of your library folders",
-            path.display()
-        ))
+    fn not_yours() -> Result<PathBuf, String> {
+        Err("The file is not inside one of your library folders".to_string())
     }
 
-    fn may_be_others(path: &Path) -> Result<PathBuf, String> {
-        Err(format!(
-            "{} may be inside a folder of another user",
-            path.display()
-        ))
+    fn may_be_others() -> Result<PathBuf, String> {
+        Err("The file may be inside a folder of another user".to_string())
     }
 
     #[test]
@@ -202,7 +187,7 @@ mod tests {
         ];
         let bobs_file = tmp.join("music/bob/B/y.flac");
         let alices_file = tmp.join("music/alice/A/x.flac");
-        assert_eq!(owner(&bobs_file, &folders, "alice"), not_yours(&bobs_file));
+        assert_eq!(owner(&bobs_file, &folders, "alice"), not_yours());
         assert_eq!(
             owner(&bobs_file, &folders, "bob"),
             Ok(tmp.join("music/bob"))
@@ -211,15 +196,12 @@ mod tests {
             owner(&alices_file, &folders, "alice"),
             Ok(tmp.join("music"))
         );
-        assert_eq!(
-            owner(&alices_file, &folders, "bob"),
-            not_yours(&alices_file)
-        );
+        assert_eq!(owner(&alices_file, &folders, "bob"), not_yours());
         let elsewhere = tmp.join("elsewhere/z.flac");
-        assert_eq!(owner(&elsewhere, &folders, "alice"), not_yours(&elsewhere));
+        assert_eq!(owner(&elsewhere, &folders, "alice"), not_yours());
         // A folder never holds itself.
         let music = tmp.join("music");
-        assert_eq!(owner(&music, &folders, "alice"), not_yours(&music));
+        assert_eq!(owner(&music, &folders, "alice"), not_yours());
     }
 
     #[test]
@@ -232,7 +214,7 @@ mod tests {
         let file = tmp.join("music/x.flac");
         assert_eq!(owner(&file, &folders, "alice"), Ok(tmp.join("music")));
         assert_eq!(owner(&file, &folders, "bob"), Ok(tmp.join("music")));
-        assert_eq!(owner(&file, &folders, "carol"), not_yours(&file));
+        assert_eq!(owner(&file, &folders, "carol"), not_yours());
     }
 
     #[test]
@@ -245,10 +227,7 @@ mod tests {
             unresolved("bob", bobs.to_str().unwrap()),
         ];
         let bobs_file = bobs.join("B/y.flac");
-        assert_eq!(
-            owner(&bobs_file, &folders, "alice"),
-            may_be_others(&bobs_file)
-        );
+        assert_eq!(owner(&bobs_file, &folders, "alice"), may_be_others());
         // Outside Bob's stored path, as written: still Alice's.
         assert_eq!(
             owner(&tmp.join("music/alice/A/x.flac"), &folders, "alice"),
@@ -256,7 +235,7 @@ mod tests {
         );
         // Bob's unresolvable folder is no reason to keep a file from Bob;
         // this one sits in Alice's folder.
-        assert_eq!(owner(&bobs_file, &folders, "bob"), not_yours(&bobs_file));
+        assert_eq!(owner(&bobs_file, &folders, "bob"), not_yours());
     }
 
     #[test]
@@ -273,7 +252,7 @@ mod tests {
             ];
             assert_eq!(
                 owner(&alices_file, &folders, "alice"),
-                may_be_others(&alices_file),
+                may_be_others(),
                 "{stored}"
             );
         }
