@@ -9,8 +9,10 @@ pub enum SoulseekError {
     #[error("{0}")]
     NotConfigured(MissingSetting),
 
+    /// A request that got no answer, or whose answer could not be read; never with its URL
+    /// (`From<reqwest::Error>`).
     #[error("Request error: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(reqwest::Error),
 
     #[error("URL parsing error: {0}")]
     UrlParse(#[from] url::ParseError),
@@ -96,6 +98,15 @@ impl std::fmt::Display for MissingSetting {
             MissingSetting::ApiKey => "slskd API key not configured",
             MissingSetting::Empty => "slskd not configured",
         })
+    }
+}
+
+/// reqwest's text for an error of `send` ends with the request's URL (reqwest 0.12.28
+/// `src/error.rs:266-268`), which names the slskd host and the peer or file asked about. A
+/// failure never holds a request URL (design 10), so every request error is kept without it.
+impl From<reqwest::Error> for SoulseekError {
+    fn from(e: reqwest::Error) -> Self {
+        SoulseekError::Request(e.without_url())
     }
 }
 

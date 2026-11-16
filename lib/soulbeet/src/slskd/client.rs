@@ -1517,6 +1517,34 @@ mod tests {
         )
     }
 
+    /// A client of the slskd at `url`.
+    fn client_at(url: &str) -> SoulseekClient {
+        SoulseekClientBuilder::new()
+            .base_url(url)
+            .api_key("k")
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_got_no_answer_does_not_name_its_url() {
+        // Port 1 on loopback refuses the connection at once.
+        let url = "http://127.0.0.1:1";
+        let file = DownloadRequestFile {
+            filename: "Kowloon\\Come Over\\07 - Wake Up.flac".into(),
+            size: 27_213_250,
+        };
+        let batches = plan_batches(vec![("carol_shares".into(), file)], "Come Over", 50, "r1");
+        let e = (client_at(url).send_download_batch(&batches[0]).await).unwrap_err();
+        let text = e.to_string();
+        assert!(
+            !text.contains("127.0.0.1") && !text.contains(" for url "),
+            "{text}"
+        );
+        // reqwest's text for a refused connection, without " for url (...)".
+        assert_eq!(text, "Request error: error sending request");
+    }
+
     async fn checked(replies: Vec<Reply>) -> std::result::Result<(), Failure> {
         let (url, _) = serve(replies);
         SoulseekClientBuilder::new()

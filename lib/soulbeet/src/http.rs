@@ -159,6 +159,8 @@ pub async fn resilient_send(
 
         match build_request().send().await {
             Err(e) => {
+                // Without the URL: a Last.fm request's query holds its API key.
+                let e = e.without_url();
                 warn!("{}: attempt {} network error: {}", context, attempt + 1, e);
                 // Timeouts indicate the server is hanging, not a transient blip.
                 // Retry once in case it was a one-off, but don't keep waiting.
