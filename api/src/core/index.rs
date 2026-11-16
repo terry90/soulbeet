@@ -953,6 +953,15 @@ mod tests {
             rating: 0,
             average_rating: None,
             mbz_recording_id: None,
+            album_id: String::new(),
+            track_number: 0,
+            year: 0,
+            duration: 0.0,
+            suffix: "mp3".into(),
+            bit_rate: 0,
+            starred: false,
+            starred_at: None,
+            play_count: 0,
         };
         let item = Path::new("Zzqx Artist/Qzz Album/01 Song Number 1.mp3");
         assert!(is_imported_file(
@@ -1461,6 +1470,15 @@ mod tests {
             rating: 0,
             average_rating: None,
             mbz_recording_id: None,
+            album_id: String::new(),
+            track_number: 0,
+            year: 0,
+            duration: 0.0,
+            suffix: "mp3".into(),
+            bit_rate: 0,
+            starred: false,
+            starred_at: None,
+            play_count: 0,
         };
         let item = Path::new("Zzqx Artist/Qzz Album/01 Song Number 1.mp3");
         assert!(!is_imported_file(&song(""), item, 4));

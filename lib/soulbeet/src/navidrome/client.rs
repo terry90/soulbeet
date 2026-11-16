@@ -170,6 +170,7 @@ impl NavidromeClient {
                 action: "Navidrome request",
                 status: response.status().as_u16(),
                 body: None,
+                raw: None,
             });
         }
 
@@ -237,7 +238,7 @@ impl NavidromeClient {
         Ok(Some(song))
     }
 
-    /// getAlbum without its songs, as this user sees the album; Ok(None) on DATA_NOT_FOUND.
+    /// getAlbum with its songs, as this user sees the album; Ok(None) on DATA_NOT_FOUND.
     pub async fn get_album(&self, id: &str) -> Result<Option<SubsonicAlbum>> {
         let Some(body) = found(self.get::<AlbumBody>("getAlbum", &[("id", id)]).await)? else {
             return Ok(None);
@@ -251,6 +252,109 @@ impl NavidromeClient {
             )));
         }
         Ok(Some(album))
+    }
+
+    /// search3 for one kind: `{kind}Count=count` and `{kind}Offset=offset`, the other counts 0
+    /// (server/subsonic/searching.go:33-44).
+    pub async fn search3(
+        &self,
+        query: &str,
+        kind: LibraryKind,
+        offset: u32,
+        count: u32,
+    ) -> Result<SearchResult3> {
+        let (count, offset) = (count.to_string(), offset.to_string());
+        let asked = |k: LibraryKind| if k == kind { count.as_str() } else { "0" };
+        let offset_name = match kind {
+            LibraryKind::Songs => "songOffset",
+            LibraryKind::Albums => "albumOffset",
+            LibraryKind::Artists => "artistOffset",
+        };
+        let body: SearchResult3Body = self
+            .get(
+                "search3",
+                &[
+                    ("query", query),
+                    ("songCount", asked(LibraryKind::Songs)),
+                    ("albumCount", asked(LibraryKind::Albums)),
+                    ("artistCount", asked(LibraryKind::Artists)),
+                    (offset_name, &offset),
+                ],
+            )
+            .await?;
+        body.search_result
+            .ok_or_else(|| NavidromeError::Parse("search3 answered without searchResult3".into()))
+    }
+
+    /// getStarred2: the artists, albums and songs this user starred.
+    pub async fn get_starred(&self) -> Result<Starred2> {
+        let body: Starred2Body = self.get("getStarred2", &[]).await?;
+        body.starred
+            .ok_or_else(|| NavidromeError::Parse("getStarred2 answered without starred2".into()))
+    }
+
+    /// getPlaylists: every playlist Navidrome lists to this user, by name. An admin is listed
+    /// every user's playlists, private ones included (persistence/playlist_repository.go:84-93).
+    pub async fn get_playlists(&self) -> Result<Vec<SubsonicPlaylist>> {
+        let body: PlaylistsBody = self.get("getPlaylists", &[]).await?;
+        body.playlists
+            .map(|p| p.playlist)
+            .ok_or_else(|| NavidromeError::Parse("getPlaylists answered without playlists".into()))
+    }
+
+    /// getPlaylist without its entries; Ok(None) on DATA_NOT_FOUND ("playlist not found",
+    /// server/subsonic/playlists.go:46).
+    pub async fn get_playlist(&self, id: &str) -> Result<Option<SubsonicPlaylist>> {
+        let Some(body) = found(self.get::<PlaylistBody>("getPlaylist", &[("id", id)]).await)?
+        else {
+            return Ok(None);
+        };
+        let playlist = body.playlist.ok_or_else(|| {
+            NavidromeError::Parse("getPlaylist answered without a playlist".into())
+        })?;
+        if playlist.id != id {
+            return Err(NavidromeError::Parse(format!(
+                "Navidrome answered another playlist for {id}"
+            )));
+        }
+        Ok(Some(playlist))
+    }
+
+    /// Every track of playlist `id` with its place, missing files included, from the native API
+    /// (server/nativeapi/native_api.go:156-160), which reads the playlist with the same own,
+    /// public or admin filter as getPlaylist; Ok(None) on HTTP 404
+    /// (server/nativeapi/playlists.go:38-48). No `_end` is sent, so the list is not cut short.
+    /// An id that is empty, "." or ".." names no playlist and is not a path segment the URL can
+    /// carry, so it is Ok(None) with no request.
+    pub async fn playlist_tracks(&self, id: &str) -> Result<Option<Vec<PlaylistTrack>>> {
+        if matches!(id, "" | "." | "..") {
+            return Ok(None);
+        }
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|()| NavidromeError::Config("base URL cannot hold a path".into()))?
+            .pop_if_empty()
+            .extend(["api", "playlist", id, "tracks"]);
+        let resp = self
+            .native_request(
+                self.client
+                    .get(url)
+                    .query(&[("_sort", "id"), ("_order", "ASC")]),
+            )
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(native_failure("Get playlist tracks", resp).await);
+        }
+        let bytes = resp.bytes().await.map_err(parse)?;
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_slice(&bytes).map_err(undecodable)?;
+        rows.into_iter()
+            .map(playlist_track)
+            .collect::<Result<_>>()
+            .map(Some)
     }
 
     /// setRating as a form post. Navidrome then recomputes the song's average
@@ -381,6 +485,7 @@ impl NavidromeClient {
                 action: "Navidrome native login",
                 status: resp.status().as_u16(),
                 body: None,
+                raw: None,
             });
         }
 
@@ -443,6 +548,7 @@ impl NavidromeClient {
                 action: "Create smart playlist",
                 status,
                 body: Some(body),
+                raw: None,
             });
         }
 
@@ -464,11 +570,7 @@ impl NavidromeClient {
         let resp = self.native_request(self.client.delete(url)).await?;
 
         if !resp.status().is_success() {
-            return Err(NavidromeError::Http {
-                action: "Delete smart playlist",
-                status: resp.status().as_u16(),
-                body: None,
-            });
+            return Err(native_failure("Delete smart playlist", resp).await);
         }
 
         Ok(())
@@ -494,11 +596,7 @@ impl NavidromeClient {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(NavidromeError::Http {
-                action: "Get songs",
-                status: resp.status().as_u16(),
-                body: None,
-            });
+            return Err(native_failure("Get songs", resp).await);
         }
 
         let songs: Vec<NativeSong> = resp.json().await.map_err(parse)?;
@@ -595,11 +693,7 @@ impl NavidromeClient {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(NavidromeError::Http {
-                action: "List users",
-                status: resp.status().as_u16(),
-                body: None,
-            });
+            return Err(native_failure("List users", resp).await);
         }
         let users: Vec<NavidromeUser> = resp.json().await.map_err(parse)?;
         Ok(Some(users.into_iter().map(|u| u.user_name).collect()))
@@ -618,11 +712,7 @@ impl NavidromeClient {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(NavidromeError::Http {
-                action,
-                status: resp.status().as_u16(),
-                body: None,
-            });
+            return Err(native_failure(action, resp).await);
         }
 
         resp.json().await.map_err(parse)
@@ -636,14 +726,47 @@ impl NavidromeClient {
         let resp = self.native_request(self.client.get(url)).await?;
 
         if !resp.status().is_success() {
-            return Err(NavidromeError::Http {
-                action: "Get players",
-                status: resp.status().as_u16(),
-                body: None,
-            });
+            return Err(native_failure("Get players", resp).await);
         }
 
         resp.json().await.map_err(parse)
+    }
+}
+
+/// A native track row (model.PlaylistTrack, model/playlist.go:224-229) as its place and song: the
+/// row's own `id` is the place and hides the media file's, which is `mediaFileId`.
+fn playlist_track(mut row: serde_json::Map<String, serde_json::Value>) -> Result<PlaylistTrack> {
+    let unplaced = || {
+        NavidromeError::Parse(
+            "Navidrome answered a playlist track without its place or song id".into(),
+        )
+    };
+    let position = match row.remove("id") {
+        Some(serde_json::Value::String(place))
+            if !place.is_empty() && place.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            place.parse().map_err(|_| unplaced())?
+        }
+        _ => return Err(unplaced()),
+    };
+    let Some(song_id @ serde_json::Value::String(_)) = row.remove("mediaFileId") else {
+        return Err(unplaced());
+    };
+    row.insert("id".into(), song_id);
+    let song = serde_json::from_value(serde_json::Value::Object(row)).map_err(undecodable)?;
+    Ok(PlaylistTrack { position, song })
+}
+
+/// A native API answer that is not a success, as an Http error of `action` whose cause keeps the
+/// answer's text; an empty one explains nothing and is not kept.
+async fn native_failure(action: &'static str, resp: reqwest::Response) -> NavidromeError {
+    let status = resp.status().as_u16();
+    let raw = resp.text().await.ok().filter(|text| !text.is_empty());
+    NavidromeError::Http {
+        action,
+        status,
+        body: None,
+        raw,
     }
 }
 
@@ -933,7 +1056,7 @@ mod tests {
     const ALBUM: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"album":{"id":"7hQ2nLr5VxZ0cYbM8wTkAf","name":"Winter Songs","artist":"Marrow Choir","artistId":"2kD9pWq4ZxC1vBnM6yTjLs","songCount":12,"duration":2841,"starred":"2026-11-03T09:12:40.004Z","year":2019,"userRating":0,"genres":[],"musicBrainzId":"","isCompilation":false,"sortName":"","discTitles":[],"song":[]}}}"#;
     /// What a legacy client gets: no OpenSubsonic part, so no userRating (helpers.go:427-431).
     const LEGACY_ALBUM: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"album":{"id":"7hQ2nLr5VxZ0cYbM8wTkAf","name":"Winter Songs","artist":"Marrow Choir","songCount":12,"duration":2841,"year":2019,"song":[]}}}"#;
-    const NATIVE_SONG: &str = r#"[{"id":"3sG8kPq0WmZ1xYbN4vTcDe","libraryId":1,"libraryPath":"/music","libraryName":"Music Library","folderId":"5tR1yUi8OpA3sDf6GhJ9kL","path":"Marrow Choir/Winter Songs/03 - O Holy Night.flac","title":"O Holy Night","album":"Winter Songs","artist":"Marrow Choir","albumArtist":"Marrow Choir","albumId":"7hQ2nLr5VxZ0cYbM8wTkAf","size":28734112,"suffix":"flac","duration":263.4,"bitRate":912,"mbzRecordingID":"0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c","missing":false,"birthTime":"2026-11-01T18:20:03.114208655+01:00","createdAt":"2026-11-01T18:20:07.551902337+01:00","updatedAt":"2026-11-01T18:20:03.114208655+01:00","rating":1,"playCount":3}]"#;
+    const NATIVE_SONG: &str = r#"[{"id":"3sG8kPq0WmZ1xYbN4vTcDe","libraryId":1,"libraryPath":"/music","libraryName":"Music Library","folderId":"5tR1yUi8OpA3sDf6GhJ9kL","path":"Marrow Choir/Winter Songs/03 - O Holy Night.flac","title":"O Holy Night","album":"Winter Songs","artist":"Marrow Choir","albumArtist":"Marrow Choir","albumId":"7hQ2nLr5VxZ0cYbM8wTkAf","trackNumber":3,"discNumber":1,"year":2019,"size":28734112,"suffix":"flac","duration":263.4,"bitRate":912,"mbzRecordingID":"0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c","missing":false,"birthTime":"2026-11-01T18:20:03.114208655+01:00","createdAt":"2026-11-01T18:20:07.551902337+01:00","updatedAt":"2026-11-01T18:20:03.114208655+01:00","rating":1,"playCount":3}]"#;
     const LOGIN: &str = r#"{"id":"8uY3tR6eW9qA2sD5fG8hJ1","name":"Alice","username":"alice","isAdmin":false,"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.c2ln"}"#;
 
     fn failed(code: u32, message: &str) -> String {
@@ -1242,6 +1365,367 @@ mod tests {
             c.set_rating("gone", 1).await,
             Err(NavidromeError::Subsonic { code: 70, .. })
         ));
+    }
+
+    // getPlaylists as alice sees it (server/subsonic/playlists.go:18-30, buildPlaylist :128-149,
+    // responses.Playlist responses.go:305-327): `comment` and `public` are omitted when empty or
+    // false, `owner` is the owner's name (:143), and `readonly` is always sent to a client that is
+    // not legacy (responses.go:325), true for a playlist alice does not own.
+    const PLAYLISTS: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true,"playlists":{"playlist":[{"id":"9fR2kLm4NpQ7sT1vW3xY5z","name":"Christmas","comment":"traditional","songCount":1,"duration":263,"public":true,"owner":"alice","created":"2026-11-15T09:12:03.418Z","changed":"2026-11-15T09:14:47.002Z","coverArt":"pl-9fR2kLm4NpQ7sT1vW3xY5z_6737f1d3","readonly":false},{"id":"3hJ8gFd2SaZ6xC4vB1nM7q","name":"Bob's mix","songCount":0,"duration":0,"owner":"bob","created":"2026-11-10T18:00:00Z","changed":"2026-11-10T18:00:00Z","coverArt":"pl-3hJ8gFd2SaZ6xC4vB1nM7q_6730f0a0","readonly":true}]}}}"#;
+    // getStarred2 (server/subsonic/album_lists.go:190-202, responses.Starred2 responses.go:356-360,
+    // ArtistID3 :231-248): empty lists are omitted.
+    const STARRED: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true,"starred2":{"artist":[{"id":"2kD9pWq4ZxC1vBnM6yTjLs","name":"Marrow Choir","albumCount":1,"starred":"2026-11-03T09:10:00.000Z","musicBrainzId":"","sortName":"","roles":[]}]}}}"#;
+
+    /// The song object inside SONG (it ends `"samplingRate":44100}}}`: song, body, envelope).
+    fn song_child() -> &'static str {
+        &SONG[SONG.find(r#""song":"#).unwrap() + 7..SONG.len() - 2]
+    }
+
+    /// getPlaylist of the first playlist of PLAYLISTS, with that song as its one entry
+    /// (server/subsonic/playlists.go:41-57).
+    fn playlist() -> String {
+        format!(
+            r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true,"playlist":{{"id":"9fR2kLm4NpQ7sT1vW3xY5z","name":"Christmas","comment":"traditional","songCount":1,"duration":263,"public":true,"owner":"alice","created":"2026-11-15T09:12:03.418Z","changed":"2026-11-15T09:14:47.002Z","readonly":false,"entry":[{}]}}}}}}"#,
+            song_child()
+        )
+    }
+
+    #[tokio::test]
+    async fn search3_asks_for_one_kind_from_an_offset() {
+        let body = format!(
+            r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true,"searchResult3":{{"song":[{}]}}}}}}"#,
+            song_child()
+        );
+        let (url, seen) = serve(vec![
+            Reply { status: 200, body },
+            Reply {
+                status: 200,
+                body: r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true}}"#.into(),
+            },
+        ]);
+        let c = client(&url);
+        let found = c
+            .search3("o holy night", LibraryKind::Songs, 25, 26)
+            .await
+            .unwrap();
+        let s = &found.song[0];
+        assert_eq!(
+            (
+                s.suffix.as_deref(),
+                s.bit_rate,
+                s.size,
+                s.music_brainz_id.as_deref(),
+                s.track
+            ),
+            (
+                Some("flac"),
+                Some(912),
+                Some(28734112),
+                Some("0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c"),
+                Some(3)
+            )
+        );
+        let target = seen.lock().unwrap()[0].target.clone();
+        for part in [
+            "query=o+holy+night",
+            "songCount=26",
+            "songOffset=25",
+            "albumCount=0",
+            "artistCount=0",
+        ] {
+            assert!(
+                target.split(['?', '&']).any(|p| p == part),
+                "{part} in {target}"
+            );
+        }
+        let err = c
+            .search3("marrow", LibraryKind::Artists, 0, 26)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Parse(m) if m == "search3 answered without searchResult3"),
+            "{err:?}"
+        );
+        let target = seen.lock().unwrap()[1].target.clone();
+        for part in [
+            "artistCount=26",
+            "artistOffset=0",
+            "songCount=0",
+            "albumCount=0",
+        ] {
+            assert!(
+                target.split(['?', '&']).any(|p| p == part),
+                "{part} in {target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn starred_items_and_playlists_are_read() {
+        let (url, _) = serve(vec![
+            Reply {
+                status: 200,
+                body: STARRED.into(),
+            },
+            Reply {
+                status: 200,
+                body: PLAYLISTS.into(),
+            },
+            Reply {
+                status: 200,
+                body: playlist(),
+            },
+            Reply {
+                status: 200,
+                body: failed(70, "playlist not found"),
+            },
+            Reply {
+                status: 200,
+                body: playlist(),
+            },
+        ]);
+        let c = client(&url);
+        let starred = c.get_starred().await.unwrap();
+        assert_eq!(
+            (
+                starred.artist[0].name.as_str(),
+                starred.artist[0].album_count,
+                starred.album.len(),
+                starred.song.len()
+            ),
+            ("Marrow Choir", Some(1), 0, 0)
+        );
+        let lists = c.get_playlists().await.unwrap();
+        assert_eq!(
+            lists
+                .iter()
+                .map(|p| (
+                    p.name.as_str(),
+                    p.owner.as_str(),
+                    p.public,
+                    p.comment.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Christmas", "alice", true, "traditional"),
+                ("Bob's mix", "bob", false, "")
+            ]
+        );
+        let pl = c
+            .get_playlist("9fR2kLm4NpQ7sT1vW3xY5z")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                pl.name.as_str(),
+                pl.song_count,
+                pl.owner.as_str(),
+                pl.public,
+                pl.comment.as_str()
+            ),
+            ("Christmas", 1, "alice", true, "traditional")
+        );
+        assert!(c.get_playlist("gone").await.unwrap().is_none());
+        let err = c.get_playlist("3hJ8gFd2SaZ6xC4vB1nM7q").await.unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Parse(m) if m == "Navidrome answered another playlist for 3hJ8gFd2SaZ6xC4vB1nM7q"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ok_answer_without_its_body_is_unreadable() {
+        let empty = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true}}"#;
+        let (url, _) = serve(
+            (0..3)
+                .map(|_| Reply {
+                    status: 200,
+                    body: empty.into(),
+                })
+                .collect(),
+        );
+        let c = client(&url);
+        let unreadable = |e: NavidromeError| match e {
+            NavidromeError::Parse(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            unreadable(c.get_starred().await.unwrap_err()),
+            "getStarred2 answered without starred2"
+        );
+        assert_eq!(
+            unreadable(c.get_playlists().await.unwrap_err()),
+            "getPlaylists answered without playlists"
+        );
+        assert_eq!(
+            unreadable(c.get_playlist("9fR2kLm4NpQ7sT1vW3xY5z").await.unwrap_err()),
+            "getPlaylist answered without a playlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_tracks_carry_their_place_and_song() {
+        // GET /api/playlist/{id}/tracks rows are model.PlaylistTrack (model/playlist.go:224-229):
+        // its own `id` is the track's place and hides the media file's, which is `mediaFileId`.
+        // Place 3 is a track of a library alice cannot see (persistence/playlist_repository.go
+        // tracksQuery, :378-400).
+        let record = &NATIVE_SONG[1..NATIVE_SONG.len() - 1];
+        let row = |place: &str, song: &str, missing: bool| {
+            record
+                .replace(
+                    r#""id":"3sG8kPq0WmZ1xYbN4vTcDe""#,
+                    &format!(
+                        r#""id":"{place}","mediaFileId":"{song}","playlistId":"9fR2kLm4NpQ7sT1vW3xY5z""#
+                    ),
+                )
+                .replace(r#""missing":false"#, &format!(r#""missing":{missing}"#))
+        };
+        let rows = format!(
+            "[{},{},{}]",
+            row("1", "s9", false),
+            row("2", "s1", false),
+            row("4", "s7", true)
+        );
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: LOGIN.into(),
+            },
+            Reply {
+                status: 200,
+                body: rows,
+            },
+            // http.Error(w, "not found", 404) when the playlist is not one alice may read
+            // (server/nativeapi/playlists.go:38-48).
+            Reply {
+                status: 404,
+                body: "not found\n".into(),
+            },
+            Reply {
+                status: 200,
+                body: format!("[{}]", row("x", "s9", false)),
+            },
+            Reply {
+                status: 200,
+                body: format!("[{record}]"),
+            },
+        ]);
+        let c = client(&url);
+        let tracks = c
+            .playlist_tracks("9fR2kLm4NpQ7sT1vW3xY5z")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|t| (t.position, t.song.id.as_str(), t.song.missing))
+                .collect::<Vec<_>>(),
+            vec![(1, "s9", false), (2, "s1", false), (4, "s7", true)]
+        );
+        assert_eq!(tracks[0].song.title, "O Holy Night");
+        assert_eq!(
+            seen.lock().unwrap()[1].target,
+            "/api/playlist/9fR2kLm4NpQ7sT1vW3xY5z/tracks?_sort=id&_order=ASC"
+        );
+        assert!(c.playlist_tracks("gone").await.unwrap().is_none());
+        for _ in 0..2 {
+            let err = c
+                .playlist_tracks("9fR2kLm4NpQ7sT1vW3xY5z")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, NavidromeError::Parse(m) if m == "Navidrome answered a playlist track without its place or song id"),
+                "{err:?}"
+            );
+        }
+        // No playlist has an id that is not a path segment, so nothing is asked.
+        for id in ["", ".", ".."] {
+            assert!(c.playlist_tracks(id).await.unwrap().is_none(), "{id}");
+        }
+        assert_eq!(seen.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_failed_native_answer_keeps_its_body_for_the_cause() {
+        // deluan/rest's GetAll on a repository error (controller.go:58-65): RespondWithError's
+        // JSON (render.go:9-23) with SQLite's text for SQLITE_BUSY, then, as GetAll does not
+        // return there, the null list it goes on to write.
+        let body = r#"{"error":"database is locked"}null"#;
+        let (url, _) = serve(vec![
+            Reply {
+                status: 200,
+                body: LOGIN.into(),
+            },
+            Reply {
+                status: 500,
+                body: body.into(),
+            },
+            Reply {
+                status: 500,
+                body: "".into(),
+            },
+        ]);
+        let c = client(&url);
+        let err = c
+            .playlist_tracks("9fR2kLm4NpQ7sT1vW3xY5z")
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Get playlist tracks failed: HTTP 500");
+        let cause = err
+            .failure(shared::failure::Stage::LibraryCheck, err.to_string())
+            .cause
+            .unwrap();
+        assert_eq!((cause.status, cause.raw.as_str()), (Some(500), body));
+        // An empty body explains nothing, so the cause is the message.
+        let err = c.find_songs("o holy night", 0, 100).await.unwrap_err();
+        let cause = err
+            .failure(shared::failure::Stage::LibraryCheck, "m")
+            .cause
+            .unwrap();
+        assert_eq!(
+            (cause.status, cause.raw.as_str()),
+            (Some(500), "Find songs failed: HTTP 500")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_album_carries_its_songs_and_year() {
+        let (url, _) = serve(vec![Reply {
+            status: 200,
+            body: ALBUM.replace(r#""song":[]"#, &format!(r#""song":[{}]"#, song_child())),
+        }]);
+        let album = client(&url)
+            .get_album("7hQ2nLr5VxZ0cYbM8wTkAf")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (album.year, album.song.len(), album.song[0].id.as_str()),
+            (Some(2019), 1, "3sG8kPq0WmZ1xYbN4vTcDe")
+        );
+    }
+
+    #[test]
+    fn a_native_record_carries_its_file_facts_and_annotations() {
+        let song: NativeSong =
+            serde_json::from_str(&NATIVE_SONG[1..NATIVE_SONG.len() - 1]).unwrap();
+        assert_eq!(
+            (
+                song.suffix.as_str(),
+                song.bit_rate,
+                song.duration,
+                song.album_id.as_str(),
+                song.play_count,
+                song.starred
+            ),
+            ("flac", 912, 263.4, "7hQ2nLr5VxZ0cYbM8wTkAf", 3, false)
+        );
+        assert_eq!(
+            (song.track_number, song.year, song.starred_at),
+            (3, 2019, None)
+        );
     }
 
     #[tokio::test]

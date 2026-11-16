@@ -141,10 +141,61 @@ pub struct SearchResult3Body {
     pub search_result: Option<SearchResult3>,
 }
 
+/// One search3 answer (responses.SearchResult3, server/subsonic/responses/responses.go:344-348):
+/// an empty list is omitted.
 #[derive(Debug, Deserialize)]
 pub struct SearchResult3 {
     #[serde(default)]
     pub song: Vec<SubsonicSong>,
+    #[serde(default)]
+    pub album: Vec<SubsonicAlbum>,
+    #[serde(default)]
+    pub artist: Vec<SubsonicArtist>,
+}
+
+/// What search3 searches for in one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryKind {
+    Songs,
+    Albums,
+    Artists,
+}
+
+/// getStarred2's body. Option so that an ok answer without it is reported as such.
+#[derive(Debug, Deserialize)]
+pub struct Starred2Body {
+    #[serde(rename = "starred2")]
+    pub starred: Option<Starred2>,
+}
+
+/// What this user starred (responses.Starred2, responses.go:356-360): an empty list is omitted.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Starred2 {
+    pub artist: Vec<SubsonicArtist>,
+    pub album: Vec<SubsonicAlbum>,
+    pub song: Vec<SubsonicSong>,
+}
+
+/// getPlaylists' body. Option so that an ok answer without it is reported as such.
+#[derive(Debug, Deserialize)]
+pub struct PlaylistsBody {
+    pub playlists: Option<Playlists>,
+}
+
+/// responses.Playlists (responses.go:329-331): an empty list is omitted.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Playlists {
+    pub playlist: Vec<SubsonicPlaylist>,
+}
+
+/// getPlaylist's body. Option so that an ok answer without its playlist is reported as such.
+/// Its `entry` list is not read: it leaves out missing files and tracks of libraries the user
+/// cannot see, so an entry's index is not its place in the playlist.
+#[derive(Debug, Deserialize)]
+pub struct PlaylistBody {
+    pub playlist: Option<SubsonicPlaylist>,
 }
 
 /// getSong's body. Option so that an ok answer without its song is reported as such.
@@ -185,6 +236,21 @@ pub struct SubsonicSong {
     /// When this user starred the song; absent when not starred.
     #[serde(default)]
     pub starred: Option<String>,
+    /// The recording MBID (OpenSubsonic, sent empty when unknown).
+    #[serde(default, rename = "musicBrainzId")]
+    pub music_brainz_id: Option<String>,
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// kbps
+    #[serde(default)]
+    pub bit_rate: Option<u32>,
+    /// bytes
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub year: Option<u32>,
+    #[serde(default)]
+    pub track: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,6 +274,63 @@ pub struct SubsonicAlbum {
     /// When this user starred the album; absent when not starred.
     #[serde(default)]
     pub starred: Option<String>,
+    #[serde(default)]
+    pub year: Option<u32>,
+    #[serde(default)]
+    pub play_count: Option<u64>,
+    /// getAlbum's songs; empty in album lists.
+    #[serde(default)]
+    pub song: Vec<SubsonicSong>,
+}
+
+/// responses.ArtistID3 (responses.go:231-248), as search3 and getStarred2 send it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubsonicArtist {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub album_count: Option<u32>,
+    /// When this user starred the artist; absent when not starred.
+    #[serde(default)]
+    pub starred: Option<String>,
+    #[serde(default)]
+    pub user_rating: Option<u8>,
+    /// OpenSubsonic, sent empty when unknown.
+    #[serde(default, rename = "musicBrainzId")]
+    pub music_brainz_id: Option<String>,
+}
+
+/// responses.Playlist (responses.go:305-327), as buildPlaylist fills it
+/// (server/subsonic/playlists.go:128-149): `comment` and `public` are omitted when empty or false.
+/// Navidrome leaves `owner` out only for a player it treats as a minimal client (:137-140); such
+/// an answer fails to parse, since ownership cannot be told without it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubsonicPlaylist {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub comment: String,
+    pub song_count: u32,
+    /// seconds
+    pub duration: u32,
+    #[serde(default)]
+    pub public: bool,
+    /// The owner's user name (:143).
+    pub owner: String,
+    pub created: String,
+    pub changed: String,
+}
+
+/// A row of a playlist's native track list (GET /api/playlist/{id}/tracks).
+#[derive(Debug, Clone)]
+pub struct PlaylistTrack {
+    /// The track's 1-based place among all of the playlist's tracks, the row's own `id`, which
+    /// Navidrome renumbers 1 to n after a removal (persistence/playlist_repository.go:487-488).
+    /// Tracks Navidrome does not list to this user leave gaps.
+    pub position: u32,
+    pub song: NativeSong,
 }
 
 impl SubsonicAlbum {
@@ -262,6 +385,30 @@ pub struct NativeSong {
     pub average_rating: Option<f64>,
     #[serde(default, rename = "mbzRecordingID")]
     pub mbz_recording_id: Option<String>,
+    // The fields below are 0 or empty when Navidrome does not know them (model/mediafile.go:49-63),
+    // and the annotations are `omitempty` (model/annotation.go:6-12).
+    #[serde(default)]
+    pub album_id: String,
+    #[serde(default)]
+    pub track_number: u32,
+    #[serde(default)]
+    pub year: u32,
+    /// seconds
+    #[serde(default)]
+    pub duration: f64,
+    #[serde(default)]
+    pub suffix: String,
+    /// kbps
+    #[serde(default)]
+    pub bit_rate: u32,
+    /// Whether this user starred the song.
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
+    pub starred_at: Option<String>,
+    /// This user's plays.
+    #[serde(default)]
+    pub play_count: u64,
 }
 
 #[cfg(test)]

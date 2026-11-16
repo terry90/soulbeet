@@ -295,6 +295,12 @@ impl Listeners for FakeNavidrome {
                     .stars
                     .contains(&pair)
                     .then(|| "2026-11-14T20:11:05Z".to_string()),
+                music_brainz_id: song.mbz_recording_id,
+                suffix: None,
+                bit_rate: None,
+                size: Some(song.size),
+                year: None,
+                track: None,
             }))
         })
     }
@@ -325,6 +331,9 @@ impl Listeners for FakeNavidrome {
                     .album_stars
                     .contains(&pair)
                     .then(|| "2026-11-14T20:11:05Z".to_string()),
+                year: None,
+                play_count: None,
+                song: Vec::new(),
             }))
         })
     }
@@ -448,6 +457,15 @@ impl Library {
                 rating: 0,
                 average_rating: None,
                 mbz_recording_id: None,
+                album_id: "al1".into(),
+                track_number: 0,
+                year: 0,
+                duration: 0.0,
+                suffix: "flac".into(),
+                bit_rate: 0,
+                starred: false,
+                starred_at: None,
+                play_count: 0,
             },
             "al1",
         );

@@ -76,8 +76,9 @@ pub enum Verdict {
 /// A library file every rule allows removing.
 #[derive(Debug)]
 pub struct Checked {
-    /// The caller's native record of the song, as read after the rating was re-sent.
-    pub song: NativeSong,
+    /// The caller's native record of the song, as read after the rating was re-sent. Boxed so
+    /// that a Verdict holding it stays near the size of its discovery variant.
+    pub song: Box<NativeSong>,
     /// The canonical file.
     pub path: PathBuf,
     /// The canonical deepest registered folder holding it, the prune root.
@@ -275,7 +276,7 @@ impl Guard<'_> {
         let others = self.others_permit(actor, &song, &path).await?;
         let song = self.no_unknown_rater(actor, &song, &others).await?;
         Ok(Checked {
-            song,
+            song: Box::new(song),
             path,
             folder,
             id,
@@ -309,7 +310,7 @@ impl Guard<'_> {
             folder,
             id,
         } = checked;
-        let record = record_of(actor, song, &path, reason, origin);
+        let record = record_of(actor, *song, &path, reason, origin);
         let mut tx = self
             .db
             .begin()
@@ -2354,7 +2355,7 @@ mod tests {
         let Checked { song, path, id, .. } = checked(&lib).await;
         let record = record_of(
             &lib.alice(),
-            song,
+            *song,
             &path,
             DeletionReason::Disliked,
             Origin::Auto,

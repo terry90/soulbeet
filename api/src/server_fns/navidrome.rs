@@ -752,6 +752,12 @@ mod tests {
             user_rating: rating,
             play_count: None,
             starred: None,
+            music_brainz_id: None,
+            suffix: None,
+            bit_rate: None,
+            size: None,
+            year: None,
+            track: None,
         }
     }
 

@@ -600,6 +600,15 @@ mod tests {
             rating: 0,
             average_rating: None,
             mbz_recording_id: None,
+            album_id: "7hQ2nLr5VxZ0cYbM8wTkAf".into(),
+            track_number: 0,
+            year: 0,
+            duration: 0.0,
+            suffix: "flac".into(),
+            bit_rate: 0,
+            starred: false,
+            starred_at: None,
+            play_count: 0,
         }
     }
 

@@ -32,12 +32,15 @@ pub enum NavidromeError {
     Transport(String),
 
     /// An HTTP answer that is not a success, from Navidrome or from a proxy
-    /// in front of it. `body` is the answer's text where it explains the failure.
+    /// in front of it. `body` is the answer's text where it explains the failure,
+    /// shown in the message. `raw` is the text of a native API answer, kept for
+    /// the failure's cause only.
     #[error("{action} failed: HTTP {status}{}", body_suffix(.body))]
     Http {
         action: &'static str,
         status: u16,
         body: Option<String>,
+        raw: Option<String>,
     },
 
     /// Navidrome answered with a Subsonic error.
@@ -91,10 +94,15 @@ impl NavidromeError {
         };
         let failure = Failure::new(code, stage, retry, message);
         let failure = match self {
-            NavidromeError::Http { status, body, .. } => failure.with_cause(
+            NavidromeError::Http {
+                status, body, raw, ..
+            } => failure.with_cause(
                 Service::Navidrome,
                 Some(i32::from(*status)),
-                body.clone().unwrap_or_else(|| self.to_string()),
+                raw.as_ref()
+                    .or(body.as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| self.to_string()),
             ),
             NavidromeError::Subsonic { code, message } => {
                 failure.with_cause(Service::Navidrome, Some(*code as i32), message.clone())
@@ -170,6 +178,7 @@ mod tests {
                     action: "Navidrome request",
                     status: 502,
                     body: None,
+                    raw: None,
                 },
                 NavidromeUnreachable,
                 SameSourceLater,
