@@ -1133,6 +1133,7 @@ mod tests {
         store, ImportDone, IndexWait, JobKind, JobOptions, NewJob, NewSearch, StoredImport,
         StoredSpec, Transition, SEARCH_KEPT_SECS,
     };
+    use crate::server_fns::download::enqueue::file_taken_by_another_download;
     use crate::server_fns::download::test_support::{batch, group, item, transfer, StubBackend};
     use shared::download::{DownloadQuery, DownloadState, DownloadableItem, JobSlot};
     use shared::failure::{FailureCode, RetryAdvice, Stage};
@@ -3041,6 +3042,58 @@ mod tests {
         assert_eq!(
             store::job_state(db, &indexing).await,
             Some(JobState::Indexing)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mcp_job_whose_transfer_another_batch_holds_fails_and_is_not_dismissed() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (ledger, db) = (&acq.ledger, &acq.db);
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let job = downloading_track_job_with(&acq, "In the Bleak Midwinter", auto_options()).await;
+        let listed = in_progress(&job, "In the Bleak Midwinter");
+        stub.set_listing(vec![transfer(
+            "peer_a",
+            &listed.item,
+            &listed.id,
+            DownloadState::InProgress,
+        )]);
+        // A request since startup: another of alice's batches downloads the file into her folder.
+        let record = store::job_record(db, &job, &UserId::new("alice"))
+            .await
+            .unwrap()
+            .unwrap();
+        TransferRegistry::global().claim(
+            &[transfer_key(backend.id(), "peer_a", &listed.item)],
+            &BatchRef::new(
+                TransferOwner {
+                    user_id: UserId::new("alice"),
+                    batch_id: uuid::Uuid::new_v4().to_string(),
+                },
+                "Winter Songs".into(),
+                PathBuf::from(&record.folder.path),
+                ImportMode::Singleton,
+            ),
+        );
+        let started = Started::on(backend);
+
+        reconcile_in(db, ledger, &queue(), &started, tmp.path()).await;
+        ledger.settled().await;
+
+        assert!(started.watched.lock().unwrap().is_empty());
+        let slot: String =
+            sqlx::query_scalar("SELECT state FROM job_tracks WHERE job_id = ? AND slot = 0")
+                .bind(&job)
+                .fetch_one(db)
+                .await
+                .unwrap();
+        assert_eq!(slot, "failed");
+        assert_eq!(store::job_state(db, &job).await, Some(JobState::Failed));
+        assert_eq!(
+            stored_row(db, &job, 0).await.failure,
+            Some(file_taken_by_another_download())
         );
     }
 
