@@ -12,11 +12,6 @@ const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const API_VERSION: &str = "1.16.1";
 const CLIENT_NAME: &str = "Soulbeet";
-/// Subsonic error code for an id Navidrome has no record of, or one in a library this
-/// user cannot access (Navidrome 0.64.2 server/subsonic/responses/errors.go:11,
-/// browsing.go:197,253, the library filter persistence/sql_base_repository.go:246).
-const DATA_NOT_FOUND: u32 = 70;
-
 pub struct NavidromeClient {
     base_url: Url,
     username: String,
@@ -373,6 +368,150 @@ impl NavidromeClient {
             .post_form("setRating", &[("id", id), ("rating", &rating)])
             .await?;
         Ok(())
+    }
+
+    /// createPlaylist with `name` and one `songId` per id, in order. Navidrome answers with the
+    /// playlist it wrote, as getPlaylist (server/subsonic/playlists.go). Ids this account cannot
+    /// read are dropped without an error (persistence/playlist_repository.go keepAccessible), so
+    /// the caller compares the playlist's tracks with what it sent.
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+        song_ids: &[String],
+    ) -> Result<SubsonicPlaylist> {
+        let mut params = vec![("name", name)];
+        params.extend(song_ids.iter().map(|id| ("songId", id.as_str())));
+        let body: PlaylistBody = self.post_form("createPlaylist", &params).await?;
+        body.playlist.ok_or_else(|| {
+            NavidromeError::Parse("createPlaylist answered without a playlist".into())
+        })
+    }
+
+    /// createPlaylist with `playlistId` and one `songId` per id: Navidrome replaces every entry of
+    /// the playlist in one transaction (core/playlists/playlists.go Create), rows of libraries
+    /// this account cannot see included, and drops ids it cannot read without an error. It checks
+    /// the owner and refuses a smart or file-synced playlist (Subsonic error 50). Ok(false) when
+    /// Navidrome has no such playlist for this user. Navidrome keeps the old entries when the
+    /// list is empty (persistence/playlist_repository.go Put rewrites rows only for a non-empty
+    /// list), so core empties a playlist with `remove_playlist_tracks` and never calls this with
+    /// an empty list.
+    pub async fn replace_playlist_tracks(&self, id: &str, song_ids: &[String]) -> Result<bool> {
+        let mut params = vec![("playlistId", id)];
+        params.extend(song_ids.iter().map(|id| ("songId", id.as_str())));
+        written(self.post_form("createPlaylist", &params).await)
+    }
+
+    /// updatePlaylist with one `songIndexToRemove` per index. Navidrome turns index i into the
+    /// native row id i+1 and deletes those rows, then renumbers 1..n (core/playlists/playlists.go
+    /// Update, persistence/playlist_track_repository.go), so `indexes` are `PlaylistTrack.position`
+    /// less one (the native row id, which counts every row), not indexes into the entries
+    /// getPlaylist lists, which leaves out missing files and other libraries. Ok(false) on 70.
+    pub async fn remove_playlist_tracks(&self, id: &str, indexes: &[usize]) -> Result<bool> {
+        let indexes: Vec<String> = indexes.iter().map(usize::to_string).collect();
+        let mut params = vec![("playlistId", id)];
+        params.extend(indexes.iter().map(|i| ("songIndexToRemove", i.as_str())));
+        written(self.post_form("updatePlaylist", &params).await)
+    }
+
+    /// updatePlaylist with one `songIdToAdd` per id, appended after the playlist's highest row id
+    /// (persistence/playlist_track_repository.go). Ids this account cannot read are dropped
+    /// without an error. Ok(false) on 70.
+    pub async fn append_playlist_tracks(&self, id: &str, song_ids: &[String]) -> Result<bool> {
+        let mut params = vec![("playlistId", id)];
+        params.extend(song_ids.iter().map(|id| ("songIdToAdd", id.as_str())));
+        written(self.post_form("updatePlaylist", &params).await)
+    }
+
+    /// updatePlaylist with `name`, `comment` (an empty one clears it) and `public`
+    /// ("true" or "false"), each only when Some. Ok(false) on 70.
+    pub async fn update_playlist_meta(&self, id: &str, meta: &PlaylistMeta<'_>) -> Result<bool> {
+        let mut params = vec![("playlistId", id)];
+        if let Some(name) = meta.name {
+            params.push(("name", name));
+        }
+        if let Some(comment) = meta.comment {
+            params.push(("comment", comment));
+        }
+        if let Some(public) = meta.public {
+            params.push(("public", if public { "true" } else { "false" }));
+        }
+        written(self.post_form("updatePlaylist", &params).await)
+    }
+
+    /// deletePlaylist. Ok(false) on 70. Navidrome answers a playlist this user does not own with
+    /// Subsonic error 50, which passes through as an error.
+    pub async fn delete_playlist(&self, id: &str) -> Result<bool> {
+        written(self.post_form("deletePlaylist", &[("id", id)]).await)
+    }
+
+    /// star or unstar of a song (`id`) or an album (`albumId`). Navidrome skips an id it does not
+    /// know with a warning and answers ok (server/subsonic/media_annotation.go setStar), so a
+    /// caller checks that the target exists first.
+    pub async fn set_star(&self, target: StarTarget<'_>, starred: bool) -> Result<()> {
+        let endpoint = if starred { "star" } else { "unstar" };
+        let param = match target {
+            StarTarget::Song(id) => ("id", id),
+            StarTarget::Album(id) => ("albumId", id),
+        };
+        let _: PingBody = self.post_form(endpoint, &[param]).await?;
+        Ok(())
+    }
+
+    /// The native playlist record of `id`, as this user may read it. Ok(None) only for Navidrome's
+    /// own 404, `{"error":"playlist(id:<id>) not found"}` (deluan/rest controller.go Get); any
+    /// other non-success, a proxy's 404 included, is an Http error with its body. An id that is
+    /// empty, "." or ".." names no playlist and is not a path segment the URL can carry, so it is
+    /// Ok(None) with no request.
+    pub async fn get_native_playlist(&self, id: &str) -> Result<Option<NativePlaylist>> {
+        if matches!(id, "" | "." | "..") {
+            return Ok(None);
+        }
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|()| NavidromeError::Config("base URL cannot hold a path".into()))?
+            .pop_if_empty()
+            .extend(["api", "playlist", id]);
+        let resp = self.native_request(self.client.get(url)).await?;
+        if !resp.status().is_success() {
+            let e = native_failure("Get playlist", resp).await;
+            let none = format!("playlist(id:{id}) not found");
+            return match &e {
+                NavidromeError::Http {
+                    status: 404,
+                    raw: Some(raw),
+                    ..
+                } if serde_json::from_str::<NotFoundBody>(raw).is_ok_and(|b| b.error == none) => {
+                    Ok(None)
+                }
+                _ => Err(e),
+            };
+        }
+        let playlist: NativePlaylist = resp.json().await.map_err(parse)?;
+        if playlist.id != id {
+            return Err(NavidromeError::Parse(format!(
+                "Navidrome answered another playlist for {id}"
+            )));
+        }
+        Ok(Some(playlist))
+    }
+
+    /// The native records of the songs `ids` this user can see, a hundred ids to a request, in
+    /// any order; an id Navidrome does not list is absent, one in a missing file has
+    /// `missing: true`. Empty ids are dropped, since Navidrome drops an empty filter and would
+    /// answer the first songs of the library (persistence/sql_restful.go), and an empty list sends
+    /// no request.
+    pub async fn get_native_songs(&self, ids: &[String]) -> Result<Vec<NativeSong>> {
+        let ids: Vec<&String> = ids.iter().filter(|id| !id.is_empty()).collect();
+        let mut found = Vec::new();
+        for chunk in ids.chunks(100) {
+            let mut query = vec![
+                ("_start", "0".to_string()),
+                ("_end", chunk.len().to_string()),
+            ];
+            query.extend(chunk.iter().map(|id| ("id", (*id).clone())));
+            found.extend(self.native_songs("Get songs", &query).await?);
+        }
+        Ok(found)
     }
 
     pub async fn get_all_albums(&self) -> Result<Vec<SubsonicAlbum>> {
@@ -779,16 +918,39 @@ async fn native_failure(action: &'static str, resp: reqwest::Response) -> Navidr
     }
 }
 
+/// The body deluan/rest answers a record it has none of with.
+#[derive(serde::Deserialize)]
+struct NotFoundBody {
+    error: String,
+}
+
+/// What a star or unstar acts on.
+#[derive(Debug, Clone, Copy)]
+pub enum StarTarget<'a> {
+    Song(&'a str),
+    Album(&'a str),
+}
+
+/// The playlist fields updatePlaylist changes; a field left None is not sent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlaylistMeta<'a> {
+    pub name: Option<&'a str>,
+    pub comment: Option<&'a str>,
+    pub public: Option<bool>,
+}
+
 /// A read's answer, None when Navidrome has no record the user can see (DATA_NOT_FOUND).
 fn found<T>(answer: Result<T>) -> Result<Option<T>> {
     match answer {
         Ok(body) => Ok(Some(body)),
-        Err(NavidromeError::Subsonic {
-            code: DATA_NOT_FOUND,
-            ..
-        }) => Ok(None),
+        Err(e) if e.is_not_found() => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// A write's answer, false when Navidrome has no record of the id for this user (DATA_NOT_FOUND).
+fn written(answer: Result<PingBody>) -> Result<bool> {
+    found(answer).map(|body| body.is_some())
 }
 
 /// A request that got no HTTP answer, without the URL it was sent to.
@@ -1778,5 +1940,311 @@ mod tests {
         for leak in ["u=alice", "t=", "s=", "rest/ping"] {
             assert!(!message.contains(leak), "{leak} in {message}");
         }
+    }
+
+    const ADVENT: &str = "6vN2bQ8rT4yH1kL9mX3zPa";
+    const OK: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true}}"#;
+    const PLAYLIST: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","serverVersion":"0.64.2","openSubsonic":true,"playlist":{"id":"6vN2bQ8rT4yH1kL9mX3zPa","name":"Advent","songCount":1,"duration":263,"owner":"alice","created":"2026-11-15T09:00:00.123456Z","changed":"2026-11-15T09:00:04.5Z","coverArt":"pl-6vN2bQ8rT4yH1kL9mX3zPa_6737a3d4","entry":[{"id":"3sG8kPq0WmZ1xYbN4vTcDe","parent":"7hQ2nLr5VxZ0cYbM8wTkAf","isDir":false,"title":"O Holy Night","album":"Winter Songs","artist":"Marrow Choir","track":3,"duration":263,"albumId":"7hQ2nLr5VxZ0cYbM8wTkAf","type":"music","mediaType":"song"}]}}}"#;
+    /// model.Playlist as 0.64.2 marshals it (model/playlist.go:18-41).
+    const NATIVE_PLAYLIST: &str = r#"{"id":"6vN2bQ8rT4yH1kL9mX3zPa","name":"Advent","comment":"","duration":263,"size":28734112,"songCount":1,"ownerName":"alice","ownerId":"8uY3tR6eW9qA2sD5fG8hJ1","public":false,"path":"","sync":false,"uploadedImage":"","createdAt":"2026-11-15T09:00:00.123456Z","updatedAt":"2026-11-15T09:00:04.5Z","rules":null,"evaluatedAt":null}"#;
+    /// The rules create_smart_playlist sends, as Navidrome writes them back.
+    const SMART_RULES: &str = r#"{"all":[{"contains":{"filepath":"Discovery/Explore"}}],"sort":"-dateAdded","order":"desc"}"#;
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn form_values<'a>(body: &'a str, key: &str) -> Vec<&'a str> {
+        body.split('&')
+            .filter_map(|p| p.strip_prefix(&format!("{key}=")))
+            .collect()
+    }
+
+    fn reply(body: impl Into<String>) -> Reply {
+        Reply {
+            status: 200,
+            body: body.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_playlist_is_created_with_its_songs_in_order() {
+        let (url, seen) = serve(vec![reply(PLAYLIST)]);
+        let made = client(&url)
+            .create_playlist(
+                "Advent",
+                &ids(&["3sG8kPq0WmZ1xYbN4vTcDe", "0bF4hJ7kL2zX9cV5nM1qWe"]),
+            )
+            .await
+            .unwrap();
+        assert_eq!((made.id.as_str(), made.owner.as_str()), (ADVENT, "alice"));
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            (sent.method.as_str(), sent.target.as_str()),
+            ("POST", "/rest/createPlaylist")
+        );
+        assert_eq!(form_values(&sent.body, "name"), vec!["Advent"]);
+        assert_eq!(
+            form_values(&sent.body, "songId"),
+            vec!["3sG8kPq0WmZ1xYbN4vTcDe", "0bF4hJ7kL2zX9cV5nM1qWe"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_create_answered_without_a_playlist_is_unreadable() {
+        let (url, _) = serve(vec![reply(OK)]);
+        let err = client(&url)
+            .create_playlist("Advent", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unreadable Navidrome response: createPlaylist answered without a playlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_tracks_names_the_playlist_and_a_missing_one_is_false() {
+        let (url, seen) = serve(vec![reply(PLAYLIST), reply(failed(70, "data not found"))]);
+        let c = client(&url);
+        assert!(c
+            .replace_playlist_tracks(ADVENT, &ids(&["3sG8kPq0WmZ1xYbN4vTcDe"]))
+            .await
+            .unwrap());
+        assert!(!c
+            .replace_playlist_tracks("gone", &ids(&["3sG8kPq0WmZ1xYbN4vTcDe"]))
+            .await
+            .unwrap());
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            (
+                form_values(&sent.body, "playlistId"),
+                form_values(&sent.body, "name")
+            ),
+            (vec![ADVENT], vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn entries_are_removed_by_index_and_appended_with_update_playlist() {
+        let (url, seen) = serve(vec![
+            reply(OK),
+            reply(OK),
+            reply(failed(70, "data not found")),
+        ]);
+        let c = client(&url);
+        assert!(c.remove_playlist_tracks(ADVENT, &[0, 2]).await.unwrap());
+        assert!(c
+            .append_playlist_tracks(ADVENT, &ids(&["0bF4hJ7kL2zX9cV5nM1qWe"]))
+            .await
+            .unwrap());
+        assert!(!c.remove_playlist_tracks("gone", &[0]).await.unwrap());
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            (
+                seen[0].target.as_str(),
+                form_values(&seen[0].body, "songIndexToRemove")
+            ),
+            ("/rest/updatePlaylist", vec!["0", "2"])
+        );
+        assert_eq!(
+            form_values(&seen[1].body, "songIdToAdd"),
+            vec!["0bF4hJ7kL2zX9cV5nM1qWe"]
+        );
+    }
+
+    #[tokio::test]
+    async fn meta_sends_only_what_changes() {
+        let (url, seen) = serve(vec![reply(OK), reply(OK)]);
+        let c = client(&url);
+        c.update_playlist_meta(
+            ADVENT,
+            &PlaylistMeta {
+                name: Some("Advent 2026"),
+                comment: Some(""),
+                public: None,
+            },
+        )
+        .await
+        .unwrap();
+        c.update_playlist_meta(
+            ADVENT,
+            &PlaylistMeta {
+                name: None,
+                comment: None,
+                public: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            (
+                form_values(&seen[0].body, "name"),
+                form_values(&seen[0].body, "comment"),
+                form_values(&seen[0].body, "public")
+            ),
+            (vec!["Advent+2026"], vec![""], vec![])
+        );
+        assert_eq!(
+            (
+                form_values(&seen[1].body, "name"),
+                form_values(&seen[1].body, "public")
+            ),
+            (vec![], vec!["true"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_is_confirmed_or_keeps_navidromes_refusal() {
+        // A non-owner's delete: DeletePlaylist answers ErrNotAuthorized with
+        // ErrorAuthorizationFail (server/subsonic/playlists.go, responses/errors.go).
+        let refusal = failed(50, "User is not authorized for the given operation");
+        let (url, _) = serve(vec![
+            reply(OK),
+            reply(refusal),
+            reply(failed(70, "data not found")),
+        ]);
+        let c = client(&url);
+        assert!(c.delete_playlist(ADVENT).await.unwrap());
+        let err = c.delete_playlist(ADVENT).await.unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Subsonic { code: 50, message } if message == "User is not authorized for the given operation"),
+            "{err:?}"
+        );
+        assert!(!err.is_not_found());
+        assert!(!c.delete_playlist("gone").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_native_playlist_says_whether_it_is_smart_or_synced() {
+        let smart =
+            NATIVE_PLAYLIST.replace(r#""rules":null"#, &format!(r#""rules":{SMART_RULES}"#));
+        let synced = NATIVE_PLAYLIST.replace(
+            r#""path":"","sync":false"#,
+            r#""path":"/music/Playlists/Advent.m3u","sync":true"#,
+        );
+        let (url, seen) = serve(vec![
+            reply(LOGIN),
+            reply(NATIVE_PLAYLIST),
+            reply(smart),
+            reply(synced),
+        ]);
+        let c = client(&url);
+        let p = c.get_native_playlist(ADVENT).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                p.owner_name.as_str(),
+                p.public,
+                p.is_smart(),
+                p.sync,
+                p.song_count
+            ),
+            ("alice", false, false, false, 1)
+        );
+        assert!(c
+            .get_native_playlist(ADVENT)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_smart());
+        assert!(c.get_native_playlist(ADVENT).await.unwrap().unwrap().sync);
+        assert_eq!(
+            seen.lock().unwrap()[1].target,
+            "/api/playlist/6vN2bQ8rT4yH1kL9mX3zPa"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_navidromes_own_404_is_a_missing_native_playlist() {
+        let (url, seen) = serve(vec![
+            reply(LOGIN),
+            Reply {
+                status: 404,
+                body: r#"{"error":"playlist(id:gone) not found"}"#.into(),
+            },
+            Reply {
+                status: 404,
+                body: "<html><title>404 Not Found</title></html>".into(),
+            },
+            Reply {
+                status: 404,
+                body: r#"{"error":"playlist(id:other) not found"}"#.into(),
+            },
+        ]);
+        let c = client(&url);
+        assert!(c.get_native_playlist("gone").await.unwrap().is_none());
+        for _ in 0..2 {
+            let err = c.get_native_playlist("gone").await.unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    NavidromeError::Http {
+                        action: "Get playlist",
+                        status: 404,
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+        for id in ["", ".", ".."] {
+            assert!(c.get_native_playlist(id).await.unwrap().is_none());
+        }
+        assert_eq!(seen.lock().unwrap().len(), 4, "those ids send nothing");
+    }
+
+    #[tokio::test]
+    async fn native_songs_are_read_by_id_a_hundred_at_a_time() {
+        let (url, seen) = serve(vec![reply(LOGIN), reply(NATIVE_SONG), reply("[]")]);
+        let c = client(&url);
+        let mut wanted: Vec<String> = (0..101).map(|i| format!("{i:022}")).collect();
+        wanted.push(String::new());
+        let found = c.get_native_songs(&wanted).await.unwrap();
+        assert_eq!(
+            found.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["3sG8kPq0WmZ1xYbN4vTcDe"]
+        );
+        assert!(c.get_native_songs(&[]).await.unwrap().is_empty());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "an empty list sends nothing");
+        assert!(
+            seen[1]
+                .target
+                .starts_with("/api/song?_start=0&_end=100&id="),
+            "{}",
+            seen[1].target
+        );
+        assert_eq!(
+            (
+                seen[1].target.matches("id=").count(),
+                seen[2].target.matches("id=").count()
+            ),
+            (100, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_song_or_album_is_starred_and_unstarred() {
+        let (url, seen) = serve(vec![reply(OK), reply(OK)]);
+        let c = client(&url);
+        c.set_star(StarTarget::Song("3sG8kPq0WmZ1xYbN4vTcDe"), true)
+            .await
+            .unwrap();
+        c.set_star(StarTarget::Album("7hQ2nLr5VxZ0cYbM8wTkAf"), false)
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            (seen[0].target.as_str(), form_values(&seen[0].body, "id")),
+            ("/rest/star", vec!["3sG8kPq0WmZ1xYbN4vTcDe"])
+        );
+        assert_eq!(
+            (
+                seen[1].target.as_str(),
+                form_values(&seen[1].body, "albumId")
+            ),
+            ("/rest/unstar", vec!["7hQ2nLr5VxZ0cYbM8wTkAf"])
+        );
     }
 }

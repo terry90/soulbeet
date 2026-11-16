@@ -323,6 +323,33 @@ pub struct SubsonicPlaylist {
     pub changed: String,
 }
 
+/// The native playlist record (model.Playlist, model/playlist.go:18-41), as far as a write needs it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePlaylist {
+    pub id: String,
+    pub name: String,
+    pub owner_name: String,
+    pub public: bool,
+    /// Replaced from its playlist file when the file changes (core/playlists/playlists.go).
+    #[serde(default)]
+    pub sync: bool,
+    /// The stored count of every row, rows the account cannot see included
+    /// (persistence/playlist_repository.go refreshCounters).
+    #[serde(default)]
+    pub song_count: u32,
+    /// Smart playlist rules, an object; `null` for a static playlist (model/criteria/criteria.go).
+    #[serde(default)]
+    pub rules: Option<serde_json::Value>,
+}
+
+impl NativePlaylist {
+    /// Its tracks come from `rules`, not from rows.
+    pub fn is_smart(&self) -> bool {
+        self.rules.as_ref().is_some_and(|r| !r.is_null())
+    }
+}
+
 /// A row of a playlist's native track list (GET /api/playlist/{id}/tracks).
 #[derive(Debug, Clone)]
 pub struct PlaylistTrack {

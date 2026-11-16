@@ -12,6 +12,10 @@ pub const WRONG_CREDENTIALS: u32 = 40;
 /// non-admin account (server/subsonic/library_scanning.go:43-44).
 pub const NOT_AUTHORIZED: u32 = 50;
 
+/// Subsonic error code for an id Navidrome has no record of for this user
+/// (`responses.ErrorDataNotFound`, server/subsonic/responses/errors.go).
+pub const DATA_NOT_FOUND: u32 = 70;
+
 /// What went wrong talking to Navidrome. None of these carries the request
 /// URL: its query holds the Subsonic token and salt, a working credential.
 #[derive(Error, Debug)]
@@ -67,6 +71,17 @@ impl NavidromeError {
             self,
             NavidromeError::Subsonic {
                 code: WRONG_CREDENTIALS,
+                ..
+            }
+        )
+    }
+
+    /// Navidrome has no record of the id for this user: a Subsonic error 70 and nothing else.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            NavidromeError::Subsonic {
+                code: DATA_NOT_FOUND,
                 ..
             }
         )
@@ -246,5 +261,29 @@ mod tests {
             NavidromeError::NativeLoginRefused.to_string(),
             "Navidrome native login failed: HTTP 401"
         );
+    }
+
+    #[test]
+    fn only_a_subsonic_70_is_not_found() {
+        assert!(NavidromeError::Subsonic {
+            code: 70,
+            message: "data not found".into()
+        }
+        .is_not_found());
+        for code in [0, 40, 50] {
+            let e = NavidromeError::Subsonic {
+                code,
+                message: "x".into(),
+            };
+            assert!(!e.is_not_found(), "{code}");
+        }
+        assert!(!NavidromeError::CircuitOpen.is_not_found());
+        assert!(!NavidromeError::Http {
+            action: "Get playlist",
+            status: 404,
+            body: None,
+            raw: None
+        }
+        .is_not_found());
     }
 }
