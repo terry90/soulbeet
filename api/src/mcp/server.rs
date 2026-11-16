@@ -16,7 +16,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
-use super::{library, metadata, playlists, settings, sources, status, McpCaller};
+use super::{jobs, library, metadata, playlists, settings, sources, status, McpCaller};
 use crate::connection::ConnectionState;
 
 /// What the server tells a client at `initialize`.
@@ -244,6 +244,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     },
     sources::FIND_SOURCES,
     sources::GET_SOURCES,
+    jobs::GET_JOBS,
 ];
 
 impl ToolSpec {
@@ -452,7 +453,7 @@ mod tests {
     fn valid_args(tool: &str) -> Value {
         match tool {
             "get_status" | "get_settings" | "list_folders" | "get_library_stats"
-            | "list_starred" | "list_playlists" => json!({}),
+            | "list_starred" | "list_playlists" | "get_jobs" => json!({}),
             "find_in_library" => {
                 json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
             }
@@ -526,6 +527,7 @@ mod tests {
         ("get_recording_releases", true, false, true, true),
         ("find_sources", false, false, false, true),
         ("get_sources", true, false, true, false),
+        ("get_jobs", true, false, true, false),
     ];
 
     #[test]

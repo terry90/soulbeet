@@ -37,12 +37,13 @@ impl NextCall {
     }
 }
 
-/// A tool's failure: what went wrong, the facts it is about and what to call
-/// next.
+/// A tool's failure: what went wrong, the facts it is about, the earlier attempts of a job
+/// (design 10.2) and what to call next.
 #[derive(Debug)]
 pub(crate) struct ToolError {
     pub failure: Failure,
     pub facts: Map<String, Value>,
+    pub tried: Vec<Value>,
     pub next: Vec<NextCall>,
 }
 
@@ -72,12 +73,15 @@ pub(crate) fn failed(error: ToolError) -> CallToolResult {
 }
 
 /// The error a failed result carries: the failure's own fields with
-/// `facts` and `next`.
+/// `facts`, `tried` when the failure has earlier attempts, and `next`.
 pub(crate) fn error_object(error: &ToolError) -> Value {
     let Value::Object(mut fields) = json!(error.failure) else {
         unreachable!("a Failure serializes as a JSON object");
     };
     fields.insert("facts".into(), Value::Object(error.facts.clone()));
+    if !error.tried.is_empty() {
+        fields.insert("tried".into(), json!(error.tried));
+    }
     fields.insert("next".into(), json!(error.next));
     Value::Object(fields)
 }
@@ -125,6 +129,7 @@ fn refused_input(message: String, field: &str, expected: &str, next: Vec<NextCal
     ToolError {
         failure,
         facts,
+        tried: vec![],
         next,
     }
 }
@@ -159,6 +164,7 @@ pub(crate) fn upstream_error(
     ToolError {
         failure,
         facts,
+        tried: vec![],
         next,
     }
 }
@@ -234,6 +240,7 @@ pub(crate) fn items_text(items: &Items) -> String {
                 ),
             ),
             facts: Map::from_iter([("failed_indexes".to_string(), json!(failed_indexes))]),
+            tried: vec![],
             next: vec![],
         };
         document.insert("error".into(), error_object(&partial));
@@ -274,6 +281,7 @@ pub(crate) fn rate_limited(per_minute: u32, wait: Duration) -> ToolError {
     ToolError {
         failure,
         facts: Map::new(),
+        tried: vec![],
         next: vec![],
     }
 }
@@ -296,6 +304,7 @@ mod tests {
         let r = failed(ToolError {
             failure: f.clone(),
             facts: json!({"folder_id": null}).as_object().unwrap().clone(),
+            tried: vec![],
             next: vec![NextCall::new("get_status", json!({}))],
         });
         assert_eq!(r.is_error, Some(true));
@@ -305,6 +314,31 @@ mod tests {
         want["facts"] = json!({"folder_id": null});
         want["next"] = json!([{"tool": "get_status", "args": {}}]);
         assert_eq!(doc, json!({"ok": false, "error": want}));
+    }
+
+    #[test]
+    fn a_failure_lists_the_earlier_attempts_only_when_it_has_some() {
+        let f = Failure::new(
+            FailureCode::PeerOffline,
+            Stage::Transfer,
+            RetryAdvice::OtherSource,
+            "User carol_shares appears to be offline",
+        );
+        let tried = vec![json!({"attempt": 1, "source": "peer_a"})];
+        let error = error_object(&ToolError {
+            failure: f.clone(),
+            facts: Map::new(),
+            tried: tried.clone(),
+            next: vec![],
+        });
+        assert_eq!(error["tried"], json!(tried));
+        let none = error_object(&ToolError {
+            failure: f,
+            facts: Map::new(),
+            tried: vec![],
+            next: vec![],
+        });
+        assert!(none.get("tried").is_none());
     }
 
     #[test]
@@ -358,6 +392,7 @@ mod tests {
         ToolError {
             failure: e.failure(Stage::LibraryCheck, e.to_string()),
             facts: Map::new(),
+            tried: vec![],
             next: vec![],
         }
     }

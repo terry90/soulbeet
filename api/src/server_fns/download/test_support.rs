@@ -145,6 +145,7 @@ pub struct StubBackend {
     specs: Mutex<Vec<SearchSpec>>,
     search_hold: Mutex<Option<Hold>>,
     stopped_searches: Mutex<Vec<String>>,
+    queue_position: Mutex<Option<u32>>,
 }
 
 /// Holds every `download` (or `start_search`) call until released, after announcing it.
@@ -171,6 +172,7 @@ impl StubBackend {
             specs: Mutex::new(Vec::new()),
             search_hold: Mutex::new(None),
             stopped_searches: Mutex::new(Vec::new()),
+            queue_position: Mutex::new(None),
         })
     }
 
@@ -229,6 +231,11 @@ impl StubBackend {
     /// What `poll_search` answers, in order.
     pub fn script_polls(&self, polls: Vec<SoulResult<SearchResult>>) {
         *self.polls.lock().unwrap() = polls.into();
+    }
+
+    /// What `queue_position` answers for every transfer; None until set.
+    pub fn set_queue_position(&self, position: Option<u32>) {
+        *self.queue_position.lock().unwrap() = position;
     }
 
     /// What `get_downloads_for` (filtered by peer) and `get_downloads` return.
@@ -416,7 +423,7 @@ impl DownloadBackend for StubBackend {
         Ok(())
     }
     async fn queue_position(&self, _source: &str, _id: &str) -> SoulResult<Option<u32>> {
-        Ok(None)
+        Ok(*self.queue_position.lock().unwrap())
     }
     async fn source_status(&self, _source: &str) -> SoulResult<SourcePresence> {
         Ok(SourcePresence::Online)

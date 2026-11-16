@@ -50,6 +50,7 @@ pub(crate) fn key_running() -> ToolError {
         )
         .with_retry_after(5),
         facts: Map::new(),
+        tried: vec![],
         next: vec![],
     }
 }
@@ -88,6 +89,7 @@ where
         Err(e) => failed(ToolError {
             failure: database_failure(Stage::Input, e),
             facts: Map::new(),
+            tried: vec![],
             next: vec![],
         }),
         Ok(KeyReservation::Done { document, is_error }) => {

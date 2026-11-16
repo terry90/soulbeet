@@ -359,6 +359,7 @@ fn too_many_waiting(waiting: Vec<String>) -> ToolError {
             RetryAdvice::SameSourceLater,
             format!("This user already has {FINDS_WAITING_PER_USER} source searches waiting for their turn; read them with get_sources first"),
         ),
+        tried: vec![],
         next: waiting.iter().map(|id| read_later(id)).collect(),
         facts: Map::from_iter([("search_ids".to_string(), json!(waiting))]),
     }
@@ -448,6 +449,7 @@ fn failure_of(
     ToolError {
         failure: f,
         facts,
+        tried: vec![],
         next,
     }
 }

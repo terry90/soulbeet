@@ -257,6 +257,7 @@ pub(crate) async fn call(
         Err(failure) => failed(ToolError {
             failure,
             facts: Map::new(),
+            tried: vec![],
             next: vec![],
         }),
     }

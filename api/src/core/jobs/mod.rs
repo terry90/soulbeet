@@ -1,10 +1,16 @@
 //! MCP acquisition: what a request asks for, and the seam the tools and the job runner act
 //! through.
 
+use crate::auth::UserCtx;
+use crate::core::database_failure;
 use crate::core::library::Reference;
-use crate::ledger::JobKind;
-use shared::download::DownloadQuery;
+use crate::ledger::store::{self, AttemptRecord, JobRecord, StoredSearch, TimelineEntry};
+use crate::ledger::{IndexWait, JobKind, JobState, Ledger, SlotResult};
+use shared::download::{DownloadProgress, DownloadQuery, IndexState, JobSlot};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
+use sqlx::SqlitePool;
+use std::collections::HashMap;
 
 pub mod runner;
 #[cfg(test)]
@@ -68,6 +74,132 @@ impl Wanted {
         };
         format!("{artist} - {title}")
     }
+}
+
+/// One slot of a job as the job tools show it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SlotView {
+    pub slot: u32,
+    pub state: JobState,
+    /// The last row the ledger stored, its `job` set.
+    pub row: Option<DownloadProgress>,
+    /// The last row sent while the slot is not terminal, kept in memory only.
+    pub live: Option<DownloadProgress>,
+    /// Oldest first.
+    pub attempts: Vec<AttemptRecord>,
+    pub result: Option<SlotResult>,
+    /// Its import's wait for Navidrome, kept once the wait ended.
+    pub index_wait: Option<IndexWait>,
+}
+
+/// A job with everything the ledger keeps of it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JobView {
+    pub job: JobRecord,
+    pub slots: Vec<SlotView>,
+    pub timeline: Vec<TimelineEntry>,
+    /// The search the job reads its sources from, while it is kept.
+    pub search: Option<StoredSearch>,
+}
+
+/// Which jobs a tool shows.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum JobSelect {
+    Ids(Vec<String>),
+    /// The user's jobs of `batch_id` when given, else all of them; with `states` not empty only
+    /// those in one of them.
+    Filter {
+        batch_id: Option<String>,
+        states: Vec<JobState>,
+    },
+}
+
+/// `ctx`'s jobs as `select` says, in creation order; an id that is not one of `ctx`'s jobs is
+/// left out (get_jobs reports it).
+pub(crate) async fn jobs_view(
+    db: &SqlitePool,
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    select: &JobSelect,
+) -> Result<Vec<JobView>, Failure> {
+    let failed = |e| database_failure(Stage::Input, e);
+    let (ids, batch_id, states) = match select {
+        JobSelect::Ids(ids) => (Some(ids.as_slice()), None, &[][..]),
+        JobSelect::Filter { batch_id, states } => (None, batch_id.as_deref(), states.as_slice()),
+    };
+    let jobs = store::jobs_of(db, &ctx.id(), ids, batch_id, states)
+        .await
+        .map_err(failed)?;
+    let mut views = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let mut attempts: HashMap<u32, Vec<AttemptRecord>> = store::attempts_of(db, &job.id)
+            .await
+            .map_err(failed)?
+            .into_iter()
+            .collect();
+        let slots = store::tracks_of(db, &job.id)
+            .await
+            .map_err(failed)?
+            .into_iter()
+            .map(|track| SlotView {
+                live: ledger.live_row(&JobSlot {
+                    job: job.id.clone(),
+                    slot: track.slot,
+                }),
+                attempts: attempts.remove(&track.slot).unwrap_or_default(),
+                slot: track.slot,
+                state: track.state,
+                row: track.row,
+                result: track.result,
+                index_wait: track.index_wait,
+            })
+            .collect();
+        let timeline = store::timeline_of(db, &job.id).await.map_err(failed)?;
+        let search = match &job.search_id {
+            Some(id) => store::search_of(db, id, &ctx.id()).await.map_err(failed)?,
+            None => None,
+        };
+        views.push(JobView {
+            job,
+            slots,
+            timeline,
+            search,
+        });
+    }
+    Ok(views)
+}
+
+/// What a failed slot failed with: its index failure, else its row's failure.
+pub(crate) fn slot_failure(slot: &SlotView) -> Option<&Failure> {
+    let row = slot.row.as_ref()?;
+    match &row.index {
+        Some(IndexState::Failed(f)) => Some(f),
+        _ => row.failure.as_ref(),
+    }
+}
+
+/// The failed slot whose failure is the job's: the first in slot order that carries one.
+pub(crate) fn failed_slot(view: &JobView) -> Option<&SlotView> {
+    (view.slots.iter()).find(|slot| slot.state == JobState::Failed && slot_failure(slot).is_some())
+}
+
+/// The job's failure: `failed_slot`'s, else the failure of a job that failed before it had a
+/// slot.
+pub(crate) fn job_failure(view: &JobView) -> Option<Failure> {
+    match failed_slot(view) {
+        Some(slot) => slot_failure(slot).cloned(),
+        None => view.job.failure.clone(),
+    }
+}
+
+/// The job does not exist or is another user's.
+pub(crate) fn job_not_found() -> Failure {
+    Failure::new(
+        FailureCode::UnknownHandle,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        "Job not found",
+    )
 }
 
 #[cfg(test)]

@@ -96,10 +96,13 @@ pub struct JobRecord {
     pub created_at: i64,
     pub updated_at: i64,
     pub changed_seq: i64,
+    /// The failure of a job that failed before it had a slot (its tracklist or its search).
+    pub failure: Option<Failure>,
 }
 
 #[derive(sqlx::FromRow)]
 struct JobRow {
+    id: String,
     user_id: String,
     username: String,
     role: Role,
@@ -119,7 +122,17 @@ struct JobRow {
     created_at: i64,
     updated_at: i64,
     changed_seq: i64,
+    failure: Option<String>,
 }
+
+/// The query of a JobRow, from `jobs j` joined with its user `u`, folder `f` and batch `b`.
+const JOB_SELECT: &str = "SELECT j.id, j.user_id, u.username, u.role, j.folder_id, \
+            f.user_id AS folder_owner, f.name AS folder_name, f.path AS folder_path, \
+            f.shared AS folder_shared, j.batch_id, b.origin, j.kind, j.wanted, j.options, \
+            j.state, j.search_id, j.excluded_sources, j.created_at, j.updated_at, \
+            j.changed_seq, j.failure \
+     FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
+     JOIN batches b ON b.id = j.batch_id";
 
 /// `user`'s job `id`, or None for an unknown id or another user's.
 pub async fn job_record(
@@ -127,48 +140,79 @@ pub async fn job_record(
     id: &str,
     user: &UserId,
 ) -> Result<Option<JobRecord>, sqlx::Error> {
-    let row: Option<JobRow> = sqlx::query_as(
-        "SELECT j.user_id, u.username, u.role, j.folder_id, f.user_id AS folder_owner, \
-                f.name AS folder_name, f.path AS folder_path, f.shared AS folder_shared, \
-                j.batch_id, b.origin, j.kind, j.wanted, j.options, j.state, j.search_id, \
-                j.excluded_sources, j.created_at, j.updated_at, j.changed_seq \
-         FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
-         JOIN batches b ON b.id = j.batch_id \
-         WHERE j.id = ? AND j.user_id = ?",
-    )
-    .bind(id)
-    .bind(user.to_string())
-    .fetch_optional(db)
-    .await?;
-    row.map(|row| {
-        Ok(JobRecord {
-            id: id.to_string(),
-            ctx: UserCtx {
-                user_id: row.user_id,
-                username: row.username,
-                role: row.role,
-            },
-            folder: Folder {
-                id: row.folder_id,
-                user_id: row.folder_owner,
-                name: row.folder_name,
-                path: row.folder_path,
-                shared: row.folder_shared,
-            },
-            batch_id: row.batch_id,
-            origin: origin_named(Some(&row.origin))?,
-            kind: kind_named(&row.kind)?,
-            wanted: json(&row.wanted)?,
-            options: row.options.as_deref().map(json).transpose()?,
-            state: state_named(&row.state)?,
-            search_id: row.search_id,
-            excluded_sources: json(&row.excluded_sources)?,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            changed_seq: row.changed_seq,
-        })
+    let row: Option<JobRow> =
+        sqlx::query_as(&format!("{JOB_SELECT} WHERE j.id = ? AND j.user_id = ?"))
+            .bind(id)
+            .bind(user.to_string())
+            .fetch_optional(db)
+            .await?;
+    row.map(job_of).transpose()
+}
+
+/// `user`'s jobs in creation order: those of `ids` when given (an id that is not one of the
+/// user's is left out), else those of batch `batch_id` when given, else all of them; with
+/// `states` not empty, only those in one of `states`.
+pub async fn jobs_of(
+    db: &SqlitePool,
+    user: &UserId,
+    ids: Option<&[String]>,
+    batch_id: Option<&str>,
+    states: &[JobState],
+) -> Result<Vec<JobRecord>, sqlx::Error> {
+    let marks = |n: usize| vec!["?"; n].join(", ");
+    let mut sql = format!("{JOB_SELECT} WHERE j.user_id = ?");
+    if let Some(ids) = ids {
+        sql += &format!(" AND j.id IN ({})", marks(ids.len()));
+    }
+    if batch_id.is_some() {
+        sql += " AND j.batch_id = ?";
+    }
+    if !states.is_empty() {
+        sql += &format!(" AND j.state IN ({})", marks(states.len()));
+    }
+    // created_at has one-second resolution: insertion order breaks its ties.
+    sql += " ORDER BY j.created_at, j.rowid";
+    let mut query = sqlx::query_as::<_, JobRow>(&sql).bind(user.to_string());
+    for id in ids.unwrap_or_default() {
+        query = query.bind(id);
+    }
+    if let Some(batch_id) = batch_id {
+        query = query.bind(batch_id);
+    }
+    for state in states {
+        query = query.bind(state.as_str());
+    }
+    query.fetch_all(db).await?.into_iter().map(job_of).collect()
+}
+
+fn job_of(row: JobRow) -> Result<JobRecord, sqlx::Error> {
+    Ok(JobRecord {
+        id: row.id,
+        ctx: UserCtx {
+            user_id: row.user_id,
+            username: row.username,
+            role: row.role,
+        },
+        folder: Folder {
+            id: row.folder_id,
+            user_id: row.folder_owner,
+            name: row.folder_name,
+            path: row.folder_path,
+            shared: row.folder_shared,
+        },
+        batch_id: row.batch_id,
+        origin: origin_named(Some(&row.origin))?,
+        kind: kind_named(&row.kind)?,
+        wanted: json(&row.wanted)?,
+        options: row.options.as_deref().map(json).transpose()?,
+        state: state_named(&row.state)?,
+        search_id: row.search_id,
+        excluded_sources: json(&row.excluded_sources)?,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        changed_seq: row.changed_seq,
+        failure: row.failure.as_deref().map(json).transpose()?,
     })
-    .transpose()
 }
 
 fn kind_named(name: &str) -> Result<JobKind, sqlx::Error> {
@@ -612,6 +656,47 @@ pub async fn attempts_of(
         }
     }
     Ok(slots)
+}
+
+/// One slot of a job as stored, whatever its state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobTrack {
+    pub slot: u32,
+    pub state: JobState,
+    /// Its `job` set.
+    pub row: Option<DownloadProgress>,
+    /// Kept after the wait ends, so a slot failed at the index stage still has it.
+    pub index_wait: Option<IndexWait>,
+    pub result: Option<SlotResult>,
+}
+
+/// `job`'s slots, in order.
+pub async fn tracks_of(db: &SqlitePool, job: &str) -> Result<Vec<JobTrack>, sqlx::Error> {
+    type Row = (u32, String, Option<String>, Option<String>, Option<String>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT slot, state, last_row, index_wait, result FROM job_tracks \
+         WHERE job_id = ? ORDER BY slot",
+    )
+    .bind(job)
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|(slot, state, row, index_wait, result)| {
+            let row: Option<DownloadProgress> = row.as_deref().map(json).transpose()?;
+            Ok(JobTrack {
+                slot,
+                state: state_named(&state)?,
+                row: row.map(|row| {
+                    row.with_job(JobSlot {
+                        job: job.to_string(),
+                        slot,
+                    })
+                }),
+                index_wait: index_wait.as_deref().map(json).transpose()?,
+                result: result.as_deref().map(json).transpose()?,
+            })
+        })
+        .collect()
 }
 
 /// `job`'s timeline, in order.

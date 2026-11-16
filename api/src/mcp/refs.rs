@@ -130,7 +130,14 @@ macro_rules! page_schema {
     };
 }
 
-pub(crate) use {filters_schema, page_schema, reference_schema, request_key_schema};
+/// The properties of a call that waits for running work to change (design 10.4).
+macro_rules! wait_schema {
+    () => {
+        r#""wait_seconds": {"type": "integer", "minimum": 0, "maximum": 180}, "wait_for": {"enum": ["any_change", "needs_action", "all_terminal"]}"#
+    };
+}
+
+pub(crate) use {filters_schema, page_schema, reference_schema, request_key_schema, wait_schema};
 
 #[cfg(test)]
 mod tests {

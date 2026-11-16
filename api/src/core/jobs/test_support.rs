@@ -2,18 +2,19 @@
 //! `Ledger::{create_batch, record, transition, ..}` only. Every job id is a new uuid.
 
 use super::runner::{Acquire, MCP_DOWNLOADS_PER_USER};
-use super::{AlbumRef, Wanted};
+use super::{jobs_view, AlbumRef, JobSelect, JobView, Wanted};
 use crate::auth::UserId;
 use crate::core::library::Reference;
+use crate::core::test_ctx;
 use crate::ledger::store;
 use crate::ledger::{
     Admitted, BatchOrigin, DuplicateRule, JobEvent, JobOptions, JobState, NewJob, NewJobBatch,
-    NewSearch, Pick, SourceFilters, StoredImport, StoredSpec, Transition, Transitioned,
+    NewSearch, Pick, SlotResult, SourceFilters, StoredImport, StoredSpec, Transition, Transitioned,
 };
 use crate::server_fns::download::test_support::{group, item, transfer};
 use shared::download::{DownloadProgress, DownloadState, JobSlot, SearchStats};
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::{DriverChoice, ImportMode};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
+use soulbeet::{DriverChoice, ImportMode, ImportOutcome, ImportedItem, SkipReason};
 use sqlx::SqlitePool;
 use std::path::Path;
 
@@ -58,17 +59,23 @@ fn alice() -> UserId {
 /// alice's MCP job for `wanted` in a batch of its own, searching under a new search id, as
 /// `ensure` makes one.
 async fn mcp_job(acq: &Acquire, wanted: Wanted, options: JobOptions) -> String {
+    mcp_job_of(acq, ALICE, wanted, options).await
+}
+
+/// `user`'s MCP job for `wanted` into their folder `{user}-folder` (`core::folder_of`'s), in a
+/// batch of its own, searching under a new search id.
+async fn mcp_job_of(acq: &Acquire, user: &str, wanted: Wanted, options: JobOptions) -> String {
     let id = uuid::Uuid::new_v4().to_string();
     let batch = NewJobBatch {
         id: uuid::Uuid::new_v4().to_string(),
-        user: alice(),
+        user: UserId::new(user),
         label: Some(wanted.label()),
         origin: BatchOrigin::Mcp,
     };
     let job = NewJob {
         id: id.clone(),
-        user: alice(),
-        folder_id: ALICE_FOLDER.into(),
+        user: UserId::new(user),
+        folder_id: format!("{user}-folder"),
         wanted: wanted.query(),
         import_mode: match wanted.kind() {
             crate::ledger::JobKind::Track => ImportMode::Singleton,
@@ -85,6 +92,16 @@ async fn mcp_job(acq: &Acquire, wanted: Wanted, options: JobOptions) -> String {
     id
 }
 
+fn track(artist: &str, title: &str) -> Wanted {
+    Wanted::Track(Reference {
+        artist: artist.into(),
+        title: title.into(),
+        album: None,
+        recording_mbid: None,
+        duration_s: None,
+    })
+}
+
 /// alice's MCP job for the track `artist` - `title`, searching.
 pub(crate) async fn mcp_track_job(
     acq: &Acquire,
@@ -92,14 +109,24 @@ pub(crate) async fn mcp_track_job(
     title: &str,
     options: JobOptions,
 ) -> String {
-    let wanted = Wanted::Track(Reference {
-        artist: artist.into(),
-        title: title.into(),
-        album: None,
-        recording_mbid: None,
-        duration_s: None,
-    });
-    mcp_job(acq, wanted, options).await
+    mcp_job(acq, track(artist, title), options).await
+}
+
+/// `user`'s MCP job for Marrow Choir - O Holy Night with `auto_options`, searching; `user` and
+/// their folder made with `core::folder_of`.
+pub(crate) async fn track_job_of(acq: &Acquire, user: &str) -> String {
+    let wanted = track("Marrow Choir", "O Holy Night");
+    mcp_job_of(acq, user, wanted, auto_options()).await
+}
+
+/// alice's job `job` as the job tools read it.
+pub(crate) async fn view_of(acq: &Acquire, job: &str) -> JobView {
+    let select = JobSelect::Ids(vec![job.to_string()]);
+    let mut views = jobs_view(&acq.db, &acq.ledger, &test_ctx(ALICE), &select)
+        .await
+        .unwrap();
+    assert_eq!(views.len(), 1, "alice has job {job}");
+    views.remove(0)
 }
 
 /// alice's MCP job for the album `artist` - `title`, release `release_mbid`, searching with
@@ -252,6 +279,56 @@ pub(crate) async fn downloading_track_job_with(
     job
 }
 
+/// `downloading_track_job`, whose transfer from peer_a the peer rejected for a file it does not
+/// share, and whose next source, carol_shares, was offline: the slot failed after two attempts.
+pub(crate) async fn failed_track_job(acq: &Acquire) -> String {
+    let job = downloading_track_job(acq).await;
+    let title = "O Holy Night";
+    // Soulseek.NET's text for a refused upload (src/SoulseekClient.cs:3310) with slskd's reason
+    // for a file it does not share (src/slskd/Application.cs:580).
+    let not_shared = "Transfer rejected: File not shared.";
+    let rejected = Failure::new(
+        FailureCode::TransferRejectedNotShared,
+        Stage::Transfer,
+        RetryAdvice::OtherSource,
+        not_shared,
+    )
+    .with_cause(Service::Slskd, None, not_shared);
+    acq.ledger.record(JobEvent::Slots {
+        state: JobState::Downloading,
+        rows: vec![in_progress(&job, title).failed_with(rejected)],
+    });
+    let next = item("carol_shares", title, &file_of("c", title));
+    acq.ledger.record(JobEvent::Attempt {
+        slot: slot_0(&job),
+        candidate: Some(Box::new(next.clone())),
+        request: Some(uuid::Uuid::new_v4().to_string()),
+    });
+    // Soulseek.NET's text for a peer that is not logged in (src/SoulseekClient.cs:3790).
+    let not_online = "User carol_shares appears to be offline";
+    let offline = Failure::new(
+        FailureCode::PeerOffline,
+        Stage::Transfer,
+        RetryAdvice::OtherSource,
+        not_online,
+    )
+    .with_cause(Service::Slskd, None, not_online);
+    let row = transfer(
+        "carol_shares",
+        &next.id,
+        &format!("t-{}", next.id),
+        DownloadState::Queued,
+    )
+    .failed_with(offline)
+    .with_job(slot_0(&job));
+    acq.ledger.record(JobEvent::Slots {
+        state: JobState::Failed,
+        rows: vec![row],
+    });
+    acq.ledger.settled().await;
+    job
+}
+
 /// A peer's file of `title`, in its folder `dir`.
 pub(crate) fn file_of(dir: &str, title: &str) -> String {
     format!("{dir}/03 - {title}.flac")
@@ -297,6 +374,40 @@ pub(crate) async fn importing_track_job(acq: &Acquire, title: &str, source: &Pat
     let job = downloading_track_job_with(acq, title, auto_options()).await;
     let import = import_of(&job, title, source);
     acq.ledger.record(JobEvent::ImportQueued(Box::new(import)));
+    acq.ledger.settled().await;
+    job
+}
+
+/// `importing_track_job` whose import beets skipped because the library has `existing`: the slot
+/// fails with them as its result, as the import queue's finish records a skipped duplicate.
+pub(crate) async fn duplicate_track_job(
+    acq: &Acquire,
+    title: &str,
+    source: &Path,
+    existing: Vec<ImportedItem>,
+) -> String {
+    let job = importing_track_job(acq, title, source).await;
+    let import = import_of(&job, title, source);
+    let skipped = ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+        existing: existing.clone(),
+    });
+    let failure = Failure::new(
+        FailureCode::ImportAlreadyInLibrary,
+        Stage::Import,
+        RetryAdvice::NotRetryable,
+        skipped.to_string(),
+    );
+    let row = in_progress(&job, title)
+        .with_state(DownloadState::ImportSkipped)
+        .with_failure(failure);
+    acq.ledger
+        .record(JobEvent::ImportDone(Box::new(crate::ledger::ImportDone {
+            import,
+            rows: vec![row],
+            next: JobState::Failed,
+            index: None,
+            results: vec![(slot_0(&job), SlotResult::AlreadyInLibrary { existing })],
+        })));
     acq.ledger.settled().await;
     job
 }
