@@ -2,13 +2,13 @@
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{cut_chars, TEXT_MAX_CHARS};
+use shared::failure::{cut_json, TEXT_MAX_CHARS};
 use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
 use soulbeet::musicbrainz::{ArtistMatch, RecordingReleases};
 
 use super::args::Args;
-use super::contract::{failed, invalid_value, success, upstream_error, ToolError};
-use super::paging::{fit, Cursor, Page};
+use super::contract::{answer, invalid_value, upstream_error, ToolError};
+use super::paging::{fit, fit_whole, Listing, Page};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::metadata::{self, SearchKind};
@@ -25,9 +25,11 @@ const PROVIDERS: &[&str] = &[providers::MUSICBRAINZ, providers::LASTFM];
 
 const RELEASE_ID: &str = "a MusicBrainz release id or a lastfm: id from search_music";
 
-/// A text from MusicBrainz or Last.fm, cut as any outside text is.
+/// A text from MusicBrainz or Last.fm, cut as any outside text is. An id
+/// is cut too: an MBID is far shorter, and a lastfm: id holds Last.fm's
+/// artist and name, which can be as long as any text.
 fn cut(text: String) -> String {
-    cut_chars(text, TEXT_MAX_CHARS)
+    cut_json(text, TEXT_MAX_CHARS)
 }
 
 fn cut_opt(text: Option<String>) -> Option<String> {
@@ -42,7 +44,8 @@ fn object(value: Value) -> Map<String, Value> {
 }
 
 /// D6: the search echoed, the provider asked for and the one that
-/// answered, and the entries under the kind's key.
+/// answered, and the entries under the kind's key, as many as keep the
+/// result within RESULT_MAX_CHARS, `left_out` counting the rest.
 fn search_fields(
     kind: &str,
     query: &str,
@@ -50,10 +53,9 @@ fn search_fields(
     used: Provider,
     entries: Vec<Value>,
 ) -> Map<String, Value> {
-    let mut fields = object(json!({"kind": kind, "query": query,
+    let fields = object(json!({"kind": kind, "query": query,
         "provider_requested": requested, "provider_used": used}));
-    fields.insert(format!("{kind}s"), Value::Array(entries));
-    fields
+    fit_whole(fields, &format!("{kind}s"), entries, "left_out")
 }
 
 /// D6: `{"kind", "query", "provider_requested", "provider_used", kind's key: [..]}`
@@ -79,17 +81,18 @@ pub(crate) fn music_fields(
 /// when it named none.
 fn recording_entry(t: &Track) -> Value {
     let release = t.album_id.as_ref().map(|id| {
-        json!({"id": id, "mbid": t.release_mbid, "title": cut_opt(t.album_title.clone()),
-            "date": t.release_date})
+        json!({"id": cut(id.clone()), "mbid": cut_opt(t.release_mbid.clone()),
+            "title": cut_opt(t.album_title.clone()), "date": cut_opt(t.release_date.clone())})
     });
-    json!({"id": t.id, "recording_mbid": t.mbid, "title": cut(t.title.clone()),
+    json!({"id": cut(t.id.clone()), "recording_mbid": cut_opt(t.mbid.clone()), "title": cut(t.title.clone()),
         "artist": cut(t.artist.clone()), "duration_s": t.duration_secs(), "release": release})
 }
 
 /// A found release; `release_types` is null when the provider gave none (D15).
 fn release_entry(a: &Album) -> Value {
-    json!({"id": a.id, "release_mbid": a.mbid, "title": cut(a.title.clone()),
-        "artist": cut(a.artist.clone()), "date": a.release_date, "release_types": a.release_types})
+    json!({"id": cut(a.id.clone()), "release_mbid": cut_opt(a.mbid.clone()), "title": cut(a.title.clone()),
+        "artist": cut(a.artist.clone()), "date": cut_opt(a.release_date.clone()),
+        "release_types": a.release_types})
 }
 
 /// D6 for an artist search, which reads MusicBrainz only.
@@ -124,16 +127,16 @@ pub(crate) fn release_fields(
 ) -> (Map<String, Value>, Vec<Value>) {
     let a = &release.album;
     let fields = object(
-        json!({"provider_used": used, "release": {"id": a.id, "mbid": a.mbid,
-        "title": cut(a.title.clone()), "artist": cut(a.artist.clone()), "date": a.release_date,
-        "release_types": a.release_types}}),
+        json!({"provider_used": used, "release": {"id": cut(a.id.clone()), "mbid": cut_opt(a.mbid.clone()),
+        "title": cut(a.title.clone()), "artist": cut(a.artist.clone()),
+        "date": cut_opt(a.release_date.clone()), "release_types": a.release_types}}),
     );
     let tracks = release
         .tracks
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            json!({"position": i + 1, "recording_mbid": t.mbid, "title": cut(t.title.clone()),
+            json!({"position": i + 1, "recording_mbid": cut_opt(t.mbid.clone()), "title": cut(t.title.clone()),
                 "artist": cut(t.artist.clone()), "duration_s": t.duration_secs()})
         })
         .collect();
@@ -177,72 +180,67 @@ pub(crate) async fn search_music(
         args,
         &["kind", "query", "artist", "provider", "limit"],
     );
-    let read = || -> Result<_, ToolError> {
-        let kind = args.opt_choice("kind", KINDS)?.ok_or_else(|| {
-            invalid_value(SEARCH, "kind", &format!("one of {}", KINDS.join(", ")))
-        })?;
-        let query = args.string("query")?;
-        let artist = args.opt_string("artist")?;
-        let provider = args
-            .opt_choice("provider", PROVIDERS)?
-            .unwrap_or(providers::MUSICBRAINZ);
-        let limit = args.opt_u32("limit", 1, 25)?.unwrap_or(10);
-        if kind == "artist" {
-            if artist.is_some() {
-                return Err(invalid_value(
-                    SEARCH,
-                    "artist",
-                    "absent for kind artist: put the name in query",
-                ));
+    answer(
+        async {
+            let kind = args.opt_choice("kind", KINDS)?.ok_or_else(|| {
+                invalid_value(SEARCH, "kind", &format!("one of {}", KINDS.join(", ")))
+            })?;
+            let query = args.string("query")?;
+            let artist = args.opt_string("artist")?;
+            let provider = args
+                .opt_choice("provider", PROVIDERS)?
+                .unwrap_or(providers::MUSICBRAINZ);
+            let limit = args.opt_u32("limit", 1, 25)?.unwrap_or(10);
+            if kind == "artist" {
+                if artist.is_some() {
+                    return Err(invalid_value(
+                        SEARCH,
+                        "artist",
+                        "absent for kind artist: put the name in query",
+                    ));
+                }
+                if provider != providers::MUSICBRAINZ {
+                    return Err(invalid_value(
+                        SEARCH,
+                        "provider",
+                        "musicbrainz for kind artist: artist search reads MusicBrainz only",
+                    ));
+                }
             }
-            if provider != providers::MUSICBRAINZ {
-                return Err(invalid_value(
-                    SEARCH,
-                    "provider",
-                    "musicbrainz for kind artist: artist search reads MusicBrainz only",
-                ));
-            }
-        }
-        args.finish()?;
-        Ok((kind, query, artist, provider, limit))
-    };
-    let (kind, query, artist, provider, limit) = match read() {
-        Ok(read) => read,
-        Err(e) => return failed(e),
-    };
-    let requested: Provider = provider.parse().expect("PROVIDERS are provider names");
-    let search_kind = match kind {
-        "recording" => Some(SearchKind::Tracks),
-        "release" => Some(SearchKind::Albums),
-        "artist" => None,
-        other => unreachable!("opt_choice answers one of KINDS, not {other}"),
-    };
-    let found = match search_kind {
-        Some(search_kind) => metadata::search(
-            &caller.ctx,
-            search_kind,
-            artist.as_deref(),
-            &query,
-            Some(provider),
-            limit as usize,
-        )
-        .await
-        .map(|results| music_fields(kind, &query, requested, &results)),
-        None => {
-            let limit = u8::try_from(limit).expect("limit is at most 25");
-            metadata::artists(&query, limit)
+            args.finish()?;
+            let requested: Provider = provider.parse().expect("PROVIDERS are provider names");
+            let search_kind = match kind {
+                "recording" => Some(SearchKind::Tracks),
+                "release" => Some(SearchKind::Albums),
+                "artist" => None,
+                other => unreachable!("opt_choice answers one of KINDS, not {other}"),
+            };
+            let found = match search_kind {
+                Some(search_kind) => metadata::search(
+                    &caller.ctx,
+                    search_kind,
+                    artist.as_deref(),
+                    &query,
+                    Some(provider),
+                    limit as usize,
+                )
                 .await
-                .map(|found| artist_fields(&query, &found))
+                .map(|results| music_fields(kind, &query, requested, &results)),
+                None => {
+                    let limit = u8::try_from(limit).expect("limit is at most 25");
+                    metadata::artists(&query, limit)
+                        .await
+                        .map(|found| artist_fields(&query, &found))
+                }
+            };
+            found.map_err(|f| {
+                let facts = object(json!({"kind": kind, "query": query, "artist": artist,
+                    "provider_requested": requested}));
+                upstream_error(f, facts, args.same_call())
+            })
         }
-    };
-    match found {
-        Ok(fields) => success(fields),
-        Err(f) => {
-            let facts = object(json!({"kind": kind, "query": query, "artist": artist,
-                "provider_requested": requested}));
-            failed(upstream_error(f, facts, args.same_call()))
-        }
-    }
+        .await,
+    )
 }
 
 /// An MBID by `Args::mbid`'s rule, lowercase, or a `lastfm:` id as given.
@@ -262,28 +260,26 @@ pub(crate) async fn get_release(
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new(RELEASE, args, &["release_id", "limit", "cursor"]);
-    let read = || -> Result<_, ToolError> {
-        let release_id = read_release_id(&args)?;
-        let page = Page::read(&args, json!({"release_id": release_id}))?;
-        args.finish()?;
-        Ok((release_id, page))
-    };
-    let (release_id, page) = match read() {
-        Ok(read) => read,
-        Err(e) => return failed(e),
-    };
-    match metadata::release(&caller.ctx, &release_id).await {
-        Ok((release, used)) => {
+    answer(
+        async {
+            let release_id = read_release_id(&args)?;
+            let page = Page::read(&args, json!({"release_id": release_id}))?;
+            args.finish()?;
+            let (release, used) =
+                metadata::release(&caller.ctx, &release_id)
+                    .await
+                    .map_err(|f| {
+                        upstream_error(
+                            f,
+                            object(json!({"release_id": release_id})),
+                            args.same_call(),
+                        )
+                    })?;
             let (fields, tracks) = release_fields(&release, used);
-            let items = tracks.get(page.offset..).unwrap_or_default().to_vec();
-            success(fit(fields, "tracks", items, &page, false))
+            Ok(fit(fields, "tracks", page.of(&tracks), &page, false))
         }
-        Err(f) => failed(upstream_error(
-            f,
-            object(json!({"release_id": release_id})),
-            args.same_call(),
-        )),
-    }
+        .await,
+    )
 }
 
 /// `get_recording_releases`: the recording and a page of the releases it
@@ -295,26 +291,23 @@ pub(crate) async fn get_recording_releases(
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new(RECORDING, args, RECORDING_ARGS);
-    let read = || -> Result<_, ToolError> {
-        let mbid = args.mbid("recording_mbid")?;
-        let page = Page::read(&args, json!({"recording_mbid": mbid}))?;
-        let offset = u16::try_from(page.offset).map_err(|_| Cursor::refused(RECORDING))?;
-        args.finish()?;
-        Ok((mbid, page, offset))
-    };
-    let (mbid, page, offset) = match read() {
-        Ok(read) => read,
-        Err(e) => return failed(e),
-    };
-    let limit = u8::try_from(page.limit).expect("Page::read keeps a limit within MAX_LIMIT");
-    match metadata::recording_releases(&mbid, offset, limit).await {
-        Ok(found) => success(recording_releases_fields(&found, &page)),
-        Err(f) => failed(upstream_error(
-            f,
-            object(json!({"recording_mbid": mbid})),
-            args.same_call(),
-        )),
-    }
+    answer(
+        async {
+            let mbid = args.mbid("recording_mbid")?;
+            let page = Page::read(&args, json!({"recording_mbid": mbid}))?;
+            let offset = u16::try_from(page.offset).map_err(|_| Listing::refused(RECORDING))?;
+            args.finish()?;
+            let limit =
+                u8::try_from(page.limit).expect("Page::read keeps a limit within MAX_LIMIT");
+            let found = metadata::recording_releases(&mbid, offset, limit)
+                .await
+                .map_err(|f| {
+                    upstream_error(f, object(json!({"recording_mbid": mbid})), args.same_call())
+                })?;
+            Ok(recording_releases_fields(&found, &page))
+        }
+        .await,
+    )
 }
 
 #[cfg(test)]
@@ -364,7 +357,8 @@ mod tests {
             "recordings": [{"id": "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8", "recording_mbid": "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8",
                 "title": "Silent Night", "artist": "Bing Crosby", "duration_s": 149,
                 "release": {"id": "317d1e85-3f9e-463e-939b-bebf47aa2178", "mbid": "317d1e85-3f9e-463e-939b-bebf47aa2178",
-                            "title": "White Christmas", "date": "1995"}}]})
+                            "title": "White Christmas", "date": "1995"}}],
+            "left_out": 0})
         );
     }
 
@@ -450,8 +444,12 @@ mod tests {
         }
     }
 
+    /// What `upstream_error` makes of `provider_failure` for the two
+    /// MusicBrainz failures get_recording_releases meets most: nothing to
+    /// offer for a recording it does not have, the same call for one that
+    /// did not answer.
     #[test]
-    fn a_recording_musicbrainz_does_not_have_says_to_search_instead() {
+    fn a_provider_that_has_nothing_offers_no_call_and_a_slow_one_the_same_call() {
         let url = "http://musicbrainz.org/ws/2/recording/0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c?fmt=json&inc=artists";
         // MetadataError::from(musicbrainz_rs::Error::NotFound(url)) (lib/soulbeet/src/musicbrainz.rs:76-83, musicbrainz_rs src/error.rs:17)
         let e = MetadataError::NotFound {
@@ -520,7 +518,6 @@ mod tests {
                 first_release_date: Some("1995".into()),
             },
             release_count,
-            offset: 0,
             releases: vec![RecordingRelease {
                 mbid: "317d1e85-3f9e-463e-939b-bebf47aa2178".into(),
                 title: "White Christmas".into(),
@@ -570,11 +567,8 @@ mod tests {
     async fn a_cursor_past_what_musicbrainz_can_offset_is_refused() {
         let (_, app, token) = mcp_app().await;
         let mbid = "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8";
-        let cursor = Cursor::make(
-            RECORDING,
-            &json!({"recording_mbid": mbid}),
-            usize::from(u16::MAX) + 1,
-        );
+        let cursor = Listing::new(RECORDING, &json!({"recording_mbid": mbid}))
+            .cursor(usize::from(u16::MAX) + 1);
         let e = &document(
             &call_tool(
                 app,
@@ -629,14 +623,55 @@ mod tests {
             json!({"kind": "artist", "query": "Bing Crosby", "provider_requested": "musicbrainz",
                 "provider_used": "musicbrainz", "artists": [{"mbid": "2437980f-513a-44fc-80f1-b90d9d7fcf8f",
                 "name": "Bing Crosby", "sort_name": "Crosby, Bing", "disambiguation": null, "artist_type": "Person",
-                "country": "US", "begin": "1903-05-03", "end": "1977-10-14"}]})
+                "country": "US", "begin": "1903-05-03", "end": "1977-10-14"}], "left_out": 0})
+        );
+    }
+
+    #[test]
+    fn a_search_keeps_the_entries_that_fit_and_counts_the_rest() {
+        // 25 recordings whose texts are long and full of quotes, each escaped to 2 characters:
+        // every text is cut to 500 characters as sent, and 25 entries of 8 such texts still pass
+        // 60,000.
+        let text = "\"".repeat(2_000);
+        let tracks: Vec<SearchResult> = (0..25)
+            .map(|i| {
+                SearchResult::Track(Track {
+                    id: format!("lastfm:{text}:{text}{i}"),
+                    title: format!("{text}{i}"),
+                    artist: text.clone(),
+                    album_id: Some(text.clone()),
+                    album_title: Some(text.clone()),
+                    release_date: Some(text.clone()),
+                    duration: None,
+                    mbid: Some(text.clone()),
+                    release_mbid: Some(text.clone()),
+                })
+            })
+            .collect();
+        let mut doc = music_fields(
+            "recording",
+            "Silent Night",
+            Provider::LastFm,
+            &SearchResults {
+                provider: Provider::LastFm,
+                results: tracks,
+            },
+        );
+        let kept = doc["recordings"].as_array().unwrap().len();
+        assert!(kept > 0 && kept < 25, "{kept}");
+        assert_eq!(doc["left_out"], json!(25 - kept));
+        let id = doc["recordings"][0]["id"].as_str().unwrap();
+        assert!(shared::failure::json_chars(id) <= TEXT_MAX_CHARS, "{id}");
+        doc.insert("ok".into(), json!(true));
+        assert!(
+            Value::Object(doc).to_string().chars().count() <= crate::mcp::paging::RESULT_MAX_CHARS
         );
     }
 
     #[test]
     fn provider_text_is_cut_and_ids_are_not() {
         let long = "x".repeat(TEXT_MAX_CHARS + 1);
-        let cut_long = cut_chars(long.clone(), TEXT_MAX_CHARS);
+        let cut_long = cut_json(long.clone(), TEXT_MAX_CHARS);
         let track = Track {
             title: long.clone(),
             artist: long.clone(),

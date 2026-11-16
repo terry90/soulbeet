@@ -3,6 +3,7 @@
 //! switched off, the instance is unsafe to expose, or the request's address
 //! is not https.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -46,6 +47,9 @@ pub struct ConnectionState {
     pub(crate) status: Arc<dyn StatusSource>,
     /// Where the tools get the caller's Navidrome client.
     pub(crate) navidrome: Arc<dyn NavidromeOf>,
+    /// NAVIDROME_MUSIC_PATH, the default Navidrome library's root on this
+    /// machine, when it is set.
+    pub(crate) navidrome_music_path: Option<PathBuf>,
     /// Where the guard records each request.
     pub(crate) log: Arc<RequestLog>,
 }
@@ -69,6 +73,7 @@ impl ConnectionState {
             },
             status: Arc::new(LiveStatus),
             navidrome: Arc::new(ServerNavidrome),
+            navidrome_music_path: CONFIG.navidrome_music_path().map(Path::to_path_buf),
             log: LIVE_LOG.clone(),
         }
     }

@@ -130,6 +130,69 @@ pub fn cut_chars(text: String, max_chars: usize) -> String {
     )
 }
 
+/// How many characters `c` takes in JSON text as serde_json writes it: `"`,
+/// `\` and the control characters with a short escape (`\n`, `\t`, `\r`,
+/// `\b`, `\f`) take 2, the other control characters 6 (`\u0001`), any other
+/// character 1.
+fn json_width(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\t' | '\r' | '\u{8}' | '\u{c}' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => 1,
+    }
+}
+
+/// How many characters `text` takes inside a JSON string, quotes not counted.
+pub fn json_chars(text: &str) -> usize {
+    text.chars().map(json_width).sum()
+}
+
+/// `text` when it takes at most `max_chars` characters inside a JSON string
+/// (`json_chars`). A longer one keeps its start and its end around a line
+/// saying how many characters were left out, at most `max_chars` characters
+/// of JSON in all, so a bound on a field holds as the field is sent whatever
+/// the field holds. Cuts fall on char boundaries. `max_chars` must hold that
+/// line; every caller passes a constant of hundreds.
+pub fn cut_json(text: String, max_chars: usize) -> String {
+    if json_chars(&text) <= max_chars {
+        return text;
+    }
+    let count = text.chars().count();
+    let marker = |left_out: usize| format!("\n[{left_out} characters left out]\n");
+    // No more characters are left out than the text has, so the line takes
+    // at most this much.
+    let marker_room = json_chars(&marker(count));
+    debug_assert!(
+        max_chars >= marker_room,
+        "cut_json: {max_chars} characters cannot hold the line saying what was left out"
+    );
+    let room = max_chars - marker_room;
+    let (mut head_end, mut head_chars, mut used) = (0, 0, 0);
+    for (at, c) in text.char_indices() {
+        if used + json_width(c) > room / 2 {
+            break;
+        }
+        used += json_width(c);
+        head_end = at + c.len_utf8();
+        head_chars += 1;
+    }
+    let (mut tail_start, mut tail_chars) = (text.len(), 0);
+    for (at, c) in text.char_indices().rev() {
+        if used + json_width(c) > room {
+            break;
+        }
+        used += json_width(c);
+        tail_start = at;
+        tail_chars += 1;
+    }
+    format!(
+        "{}{}{}",
+        &text[..head_end],
+        marker(count - head_chars - tail_chars),
+        &text[tail_start..]
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserAction {
     pub code: UserActionCode,
@@ -586,6 +649,43 @@ mod tests {
         let cut = cut_chars("x".repeat(10_000), TEXT_MAX_CHARS);
         assert_eq!(cut.chars().count(), TEXT_MAX_CHARS);
         assert!(cut.contains(" characters left out]"), "{cut}");
+    }
+
+    #[test]
+    fn a_character_takes_in_json_what_serde_json_writes() {
+        for c in (0..0x80u8).map(char::from).chain(['é', '日', '\u{2028}']) {
+            let written = serde_json::to_string(&c.to_string()).unwrap();
+            assert_eq!(
+                json_chars(&c.to_string()),
+                written.chars().count() - 2,
+                "{c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_cut_for_json_holds_its_bound_once_escaped() {
+        for text in [
+            "x".repeat(10_000),
+            "\u{1}".repeat(10_000),
+            format!("Silent Night{}", "\u{1}".repeat(488)),
+            "\"\\".repeat(3_000),
+            "é".repeat(700),
+        ] {
+            let cut = cut_json(text.clone(), TEXT_MAX_CHARS);
+            let sent = serde_json::to_string(&cut).unwrap().chars().count() - 2;
+            assert!(sent <= TEXT_MAX_CHARS, "{sent} for {:?}", &text[..12]);
+            let (head, rest) = cut.split_once("\n[").unwrap();
+            let (marker, tail) = rest.split_once("]\n").unwrap();
+            let left_out = text.chars().count() - head.chars().count() - tail.chars().count();
+            assert_eq!(marker, format!("{left_out} characters left out"));
+            assert!(text.starts_with(head) && text.ends_with(tail));
+        }
+        let plain = "x".repeat(TEXT_MAX_CHARS);
+        assert_eq!(cut_json(plain.clone(), TEXT_MAX_CHARS), plain);
+        // 250 quotes take 500 characters once escaped, 251 take 502.
+        assert_eq!(cut_json("\"".repeat(250), TEXT_MAX_CHARS), "\"".repeat(250));
+        assert_ne!(cut_json("\"".repeat(251), TEXT_MAX_CHARS), "\"".repeat(251));
     }
 
     #[test]

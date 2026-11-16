@@ -329,7 +329,7 @@ pub struct PlaylistTrack {
     /// The track's 1-based place among all of the playlist's tracks, the row's own `id`, which
     /// Navidrome renumbers 1 to n after a removal (persistence/playlist_repository.go:487-488).
     /// Tracks Navidrome does not list to this user leave gaps.
-    pub position: u32,
+    pub position: std::num::NonZeroU32,
     pub song: NativeSong,
 }
 

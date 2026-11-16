@@ -219,6 +219,14 @@ pub(crate) fn native_song(
     song.to_string()
 }
 
+/// The native song reads `navi` was asked, with their queries, in order.
+pub(crate) fn song_requests(navi: &NavidromeStub) -> Vec<String> {
+    navi.asked_with_queries()
+        .into_iter()
+        .filter(|t| t.starts_with("/api/song"))
+        .collect()
+}
+
 /// A native `GET /api/playlist/{id}/tracks` row (model.PlaylistTrack, model/playlist.go:224-229):
 /// `native_song`'s record whose own `id` is the track's 1-based `place`, the song's id being
 /// `mediaFileId`, and `missing` as given.

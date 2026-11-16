@@ -16,12 +16,17 @@ pub(crate) const DEFAULT_LIMIT: u32 = 25;
 /// Most items a call can ask for in a page (design 10.1).
 pub(crate) const MAX_LIMIT: u32 = 100;
 
-/// Where the next page of a listing starts (D3): unpadded base64url of
-/// `{"t": tool, "k": key, "o": offset}`, `key` naming the listing. It is not
-/// signed and holds nothing else: every page is read again with the
-/// caller's own rows and Navidrome account, so a forged cursor can only
-/// move inside the caller's own listing.
-pub(crate) struct Cursor;
+/// A listing a tool pages through, named once by `key`, the first 16 hex
+/// digits of the SHA-256 of the JSON text of the value that defines it
+/// (D3). Its cursors are unpadded base64url of `{"t": tool, "k": key, "o":
+/// offset}`. A cursor is not signed and holds nothing else: every page is
+/// read again with the caller's own rows and Navidrome account, so a forged
+/// cursor can only move inside the caller's own listing.
+#[derive(Debug)]
+pub(crate) struct Listing {
+    tool: &'static str,
+    key: String,
+}
 
 #[derive(Serialize, Deserialize)]
 struct CursorBody {
@@ -30,14 +35,20 @@ struct CursorBody {
     o: u64,
 }
 
-impl Cursor {
-    /// The cursor at `offset` of `tool`'s listing `list`: a value the tool
-    /// builds from the arguments that define the listing, its field names
-    /// in a fixed order.
-    pub(crate) fn make(tool: &'static str, list: &Value, offset: usize) -> String {
+impl Listing {
+    /// `tool`'s listing `list`: a value the tool builds from the arguments
+    /// that define the listing, its field names in a fixed order.
+    pub(crate) fn new(tool: &'static str, list: &Value) -> Listing {
+        let mut key = hash(&list.to_string());
+        key.truncate(16);
+        Listing { tool, key }
+    }
+
+    /// The cursor at `offset` of the listing.
+    pub(crate) fn cursor(&self, offset: usize) -> String {
         let body = CursorBody {
-            t: tool.to_string(),
-            k: key(list),
+            t: self.tool.to_string(),
+            k: self.key.clone(),
             o: offset as u64,
         };
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&body).expect("a cursor body serializes"))
@@ -46,9 +57,8 @@ impl Cursor {
     /// The offset in `args`' "cursor", 0 without one. A cursor of another
     /// tool or listing, one that does not decode, or one past what a
     /// Navidrome offset holds is refused.
-    pub(crate) fn read(args: &Args, list: &Value) -> Result<usize, ToolError> {
-        let tool = args.tool();
-        let refused = || Cursor::refused(tool);
+    pub(crate) fn read(&self, args: &Args) -> Result<usize, ToolError> {
+        let refused = || Listing::refused(self.tool);
         let Some(cursor) = args.opt_string("cursor").map_err(|_| refused())? else {
             return Ok(0);
         };
@@ -57,7 +67,7 @@ impl Cursor {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .ok_or_else(refused)?;
-        if body.t != tool || body.k != key(list) || body.o > u64::from(u32::MAX) {
+        if body.t != self.tool || body.k != self.key || body.o > u64::from(u32::MAX) {
             return Err(refused());
         }
         Ok(body.o as usize)
@@ -73,49 +83,85 @@ impl Cursor {
     }
 }
 
-/// The first 16 hex digits of the SHA-256 of `list`'s JSON text.
-fn key(list: &Value) -> String {
-    let mut digest = hash(&list.to_string());
-    digest.truncate(16);
-    digest
-}
-
 /// The page a call asks for.
 #[derive(Debug)]
 pub(crate) struct Page {
     pub offset: usize,
     pub limit: usize,
-    tool: &'static str,
-    list: Value,
+    listing: Listing,
 }
 
 impl Page {
     /// `limit` from 1 to MAX_LIMIT, DEFAULT_LIMIT without one, and the
-    /// offset of `cursor` (`Cursor::read`) in the listing `list`.
+    /// offset of `cursor` (`Listing::read`) in the listing `list`.
     pub(crate) fn read(args: &Args, list: Value) -> Result<Page, ToolError> {
         let limit = args
             .opt_u32("limit", 1, MAX_LIMIT)?
             .unwrap_or(DEFAULT_LIMIT);
-        let offset = Cursor::read(args, &list)?;
+        let listing = Listing::new(args.tool(), &list);
+        let offset = listing.read(args)?;
         Ok(Page {
             offset,
             limit: limit as usize,
-            tool: args.tool(),
-            list,
+            listing,
         })
+    }
+
+    /// The page's items of a listing read whole: from the page's offset on,
+    /// none when the offset is past the end.
+    pub(crate) fn of<T: Serialize>(&self, all: &[T]) -> Vec<Value> {
+        all.get(self.offset..)
+            .unwrap_or_default()
+            .iter()
+            .map(|item| json!(item))
+            .collect()
     }
 
     /// The cursor that follows the page's first `k` items.
     fn cursor_after(&self, k: usize) -> String {
-        Cursor::make(self.tool, &self.list, self.offset + k)
+        self.listing.cursor(self.offset + k)
     }
+}
+
+/// `fields` as a document: with "ok" and `key: []`, every other field as given.
+fn empty_document(fields: &Map<String, Value>, key: &str) -> Map<String, Value> {
+    let mut empty = fields.clone();
+    empty.insert("ok".into(), true.into());
+    empty.insert(key.into(), json!([]));
+    empty
+}
+
+/// The most k up to `candidates` such that `base` characters, `items[..k]`
+/// with a comma between items, and `tail(k)` characters stay within
+/// RESULT_MAX_CHARS.
+fn longest_fitting(
+    base: usize,
+    items: &[Value],
+    candidates: usize,
+    tail: impl Fn(usize) -> usize,
+) -> usize {
+    let mut listed = 0;
+    let mut kept = 0;
+    for (i, item) in items[..candidates].iter().enumerate() {
+        listed += chars(item) + usize::from(i > 0);
+        // Not a stop: the last items can fit with a shorter tail.
+        if base + listed + tail(i + 1) <= RESULT_MAX_CHARS {
+            kept = i + 1;
+        }
+    }
+    kept
 }
 
 /// How many leading `items` go in the page (D4): at most `page.limit`, and
 /// the most k such that `fields` with `key: items[..k]` and its cursor
 /// stays within RESULT_MAX_CHARS once "ok" is added, though never fewer
-/// than one so a cursor always advances. The cursor is null when k takes
-/// every item and none follow upstream.
+/// than one so a cursor always advances. One item always fits: every text
+/// an item holds from outside Soulful or from the user is cut to
+/// TEXT_MAX_CHARS of JSON (`cut_json`), and a folder path is a canonical
+/// path the kernel bounds at PATH_MAX (4,096 bytes), so the largest item,
+/// a folder whose path is all control characters, is under 30,000
+/// characters. The cursor is null when k takes every item and none follow
+/// upstream.
 fn fitting(
     fields: &Map<String, Value>,
     key: &str,
@@ -123,9 +169,7 @@ fn fitting(
     page: &Page,
     more_upstream: bool,
 ) -> usize {
-    let mut empty = fields.clone();
-    empty.insert("ok".into(), true.into());
-    empty.insert(key.into(), json!([]));
+    let mut empty = empty_document(fields, key);
     empty.insert("cursor".into(), Value::Null);
     // The compact text is the empty document's with each item and a comma
     // between items spliced into the list, and "null" replaced by the
@@ -139,15 +183,7 @@ fn fitting(
         }
     };
     let candidates = items.len().min(page.limit);
-    let mut listed = 0;
-    let mut kept = candidates.min(1);
-    for (i, item) in items[..candidates].iter().enumerate() {
-        listed += chars(item) + usize::from(i > 0);
-        if base + listed + cursor(i + 1) <= RESULT_MAX_CHARS {
-            kept = i + 1;
-        }
-    }
-    kept
+    longest_fitting(base, items, candidates, cursor).max(candidates.min(1))
 }
 
 fn chars(value: &Value) -> usize {
@@ -156,7 +192,8 @@ fn chars(value: &Value) -> usize {
 
 /// `fields` with `key: items[..k]`, k from `fitting`, and "cursor": the
 /// cursor at page.offset + k when items are left or `more_upstream`, else
-/// null. `items` start at the page's offset.
+/// null. An empty page ends the listing, so a cursor always advances.
+/// `items` start at the page's offset.
 pub(crate) fn fit(
     mut fields: Map<String, Value>,
     key: &str,
@@ -165,10 +202,30 @@ pub(crate) fn fit(
     more_upstream: bool,
 ) -> Map<String, Value> {
     let k = fitting(&fields, key, &items, page, more_upstream);
-    let cursor = (k < items.len() || more_upstream).then(|| page.cursor_after(k));
+    let cursor = (k > 0 && (k < items.len() || more_upstream)).then(|| page.cursor_after(k));
     items.truncate(k);
     fields.insert(key.into(), Value::Array(items));
     fields.insert("cursor".into(), json!(cursor));
+    fields
+}
+
+/// `fields` with `key: items[..k]` and `left_out_key: items.len() - k`, k
+/// the most leading items that keep the document within RESULT_MAX_CHARS
+/// once "ok" is added: for a list sent whole, with no cursor to page it.
+pub(crate) fn fit_whole(
+    mut fields: Map<String, Value>,
+    key: &str,
+    mut items: Vec<Value>,
+    left_out_key: &str,
+) -> Map<String, Value> {
+    let mut empty = empty_document(&fields, key);
+    // The count at its longest.
+    empty.insert(left_out_key.into(), json!(items.len()));
+    let base = chars(&Value::Object(empty));
+    let k = longest_fitting(base, &items, items.len(), |_| 0);
+    fields.insert(left_out_key.into(), json!(items.len() - k));
+    items.truncate(k);
+    fields.insert(key.into(), Value::Array(items));
     fields
 }
 
@@ -190,7 +247,7 @@ mod tests {
         );
         let page = Page::read(&a, list.clone()).unwrap();
         assert_eq!((page.offset, page.limit), (0, 2));
-        let cursor = Cursor::make("search_library", &list, 2);
+        let cursor = Listing::new("search_library", &list).cursor(2);
         let a = Args::new(
             "search_library",
             obj(json!({"query": "silent night", "kind": "songs", "cursor": cursor})),
@@ -210,11 +267,11 @@ mod tests {
             e.failure.message,
             "search_library: cursor must be a cursor search_library returned for the same arguments"
         );
-        let other = Cursor::make(
+        let other = Listing::new(
             "list_starred",
             &json!({"query": "silent night", "kind": "songs"}),
-            2,
-        );
+        )
+        .cursor(2);
         for bad in [other, "not a cursor".to_string()] {
             let a = Args::new(
                 "search_library",
@@ -232,15 +289,17 @@ mod tests {
             Args::new(
                 "search_library",
                 obj(
-                    json!({"query": "silent night", "cursor": Cursor::make("search_library", &list, offset)}),
+                    json!({"query": "silent night", "cursor": Listing::new("search_library", &list).cursor(offset)}),
                 ),
                 SEARCH,
             )
         };
         let last = u32::MAX as usize;
-        assert_eq!(Cursor::read(&at(last), &list).unwrap(), last);
+        let listing = Listing::new("search_library", &list);
+        assert_eq!(listing.read(&at(last)).unwrap(), last);
         assert_eq!(
-            Cursor::read(&at(last + 1), &list)
+            listing
+                .read(&at(last + 1))
                 .unwrap_err()
                 .failure
                 .message,
@@ -276,7 +335,9 @@ mod tests {
             SEARCH,
         );
         assert_eq!(
-            Cursor::read(&next, &json!({"query": "silent night"})).unwrap(),
+            Listing::new("search_library", &json!({"query": "silent night"}))
+                .read(&next)
+                .unwrap(),
             kept
         );
         let small = fit(Map::new(), "songs", items[..3].to_vec(), &page, false);
@@ -303,7 +364,7 @@ mod tests {
         assert_eq!(doc["songs"], json!([{"song_id": "s0"}, {"song_id": "s1"}]));
         assert_eq!(
             doc["cursor"],
-            json!(Cursor::make("search_library", &list, 2))
+            json!(Listing::new("search_library", &list).cursor(2))
         );
     }
 
@@ -331,11 +392,62 @@ mod tests {
             false,
         ));
         let items = vec![big(RESULT_MAX_CHARS - empty), json!(1)];
-        let doc = fit(Map::new(), "songs", items, &page, false);
+        let doc = fit(Map::new(), "songs", items.clone(), &page, false);
         assert_eq!(
             (doc["songs"].as_array().unwrap().len(), &doc["cursor"]),
             (2, &Value::Null)
         );
         assert_eq!(text(&doc), RESULT_MAX_CHARS);
+        // The premise: the same two items with a cursor in place of null are
+        // over the cap, so with more upstream only the first is sent.
+        let mut with_cursor = doc.clone();
+        with_cursor["cursor"] = json!(page.cursor_after(2));
+        assert!(text(&with_cursor) > RESULT_MAX_CHARS);
+        let more = fit(Map::new(), "songs", items, &page, true);
+        assert_eq!(
+            (more["songs"].as_array().unwrap().len(), &more["cursor"]),
+            (1, &json!(page.cursor_after(1)))
+        );
+    }
+
+    #[test]
+    fn an_empty_page_ends_the_listing_even_when_more_was_announced() {
+        let a = Args::new(
+            "search_library",
+            obj(json!({"query": "silent night"})),
+            SEARCH,
+        );
+        let page = Page::read(&a, json!({"query": "silent night"})).unwrap();
+        // A count above what the service then lists (MusicBrainz's
+        // release-count against an empty page) must not give a cursor that
+        // reads the same page again.
+        let doc = fit(Map::new(), "releases", vec![], &page, true);
+        assert_eq!(
+            (&doc["releases"], &doc["cursor"]),
+            (&json!([]), &Value::Null)
+        );
+    }
+
+    #[test]
+    fn a_list_sent_whole_keeps_what_fits_and_counts_the_rest() {
+        let items: Vec<Value> = (0..40)
+            .map(|i| json!({"title": format!("{i}{}", "\u{1}".repeat(400))}))
+            .collect();
+        let doc = fit_whole(Map::new(), "recordings", items.clone(), "left_out");
+        let kept = doc["recordings"].as_array().unwrap().len();
+        let mut sent = doc.clone();
+        sent.insert("ok".into(), json!(true));
+        assert!(Value::Object(sent).to_string().chars().count() <= RESULT_MAX_CHARS);
+        assert!(kept > 0 && kept < 40, "{kept}");
+        assert_eq!(doc["left_out"], json!(40 - kept));
+        assert_eq!(doc["recordings"], json!(items[..kept]));
+        let small = fit_whole(Map::new(), "recordings", items[..2].to_vec(), "left_out");
+        assert_eq!(
+            (
+                small["recordings"].as_array().unwrap().len(),
+                &small["left_out"]
+            ),
+            (2, &json!(0))
+        );
     }
 }

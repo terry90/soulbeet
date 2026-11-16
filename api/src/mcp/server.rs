@@ -45,8 +45,11 @@ pub(crate) struct ToolSpec {
 }
 
 /// The failure codes every tool can answer, written once for the
-/// descriptions.
-pub(crate) const COMMON_CODES: &str = "invalid_input, rate_limited, settings_unreadable";
+/// descriptions, with the tool-call limit the limiter enforces (design
+/// 10.5): `calls_a_minute`.
+pub(crate) fn common_codes(calls_a_minute: u32) -> String {
+    format!("invalid_input, rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable")
+}
 
 /// The failure codes of every tool that reads the caller's Navidrome.
 pub(crate) const NAVIDROME_CODES: &str = "navidrome_not_linked, navidrome_auth_failed, navidrome_unreachable, navidrome_circuit_open, navidrome_refused";
@@ -61,7 +64,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         name: "get_status",
         title: "Soulful status",
         description: |calls_a_minute| {
-            format!("Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work, and why not when they do not, with the importer issues that stand; the user's Navidrome link (connected, admin or not, whether this account can start a scan, and the scan status: songs is the library's song count while no scan runs, files_scanned the files read so far while one does); the user's folders with free space, which one is the default, and in_navidrome (listed when a Navidrome library Soulful has located on this machine holds the folder, so imports into it show up in Navidrome; unknown when Soulful has not located one that does); the batches downloading now; whether this app may delete music; and the address Soulful is reached at. A folder_id holds until the folder is removed; a batch_id while its batch runs. Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.")
+            format!("Shows what Soulful can do for this user right now: whether the download backend (slskd) and the importer (beets) work, and why not when they do not, with the importer issues that stand; the user's Navidrome link (connected, admin or not, whether this account can start a scan, and the scan status: songs is the library's song count while no scan runs, files_scanned the files read so far while one does); the user's folders with free space, which one is the default, and in_navidrome (listed when a Navidrome library Soulful has located on this machine holds the folder, so imports into it show up in Navidrome; unknown when Soulful has not located one that does), as many as fit in one answer, folders_left_out counting the rest, which list_folders pages through; the batches downloading now; whether this app may delete music; and the address Soulful is reached at. A folder_id holds until the folder is removed; a batch_id while its batch runs. Takes no arguments. Failure codes: invalid_input (an argument was given), rate_limited (more than {calls_a_minute} tool calls in a minute; retry_after_seconds says when), settings_unreadable (Soulful's database could not be read). Answers in well under a second; a slow slskd or Navidrome can take up to 30 seconds.")
         },
         // The schema for a tool without arguments (`server/tools.mdx`, "Tool").
         input_schema: r#"{"type": "object", "additionalProperties": false}"#,
@@ -74,8 +77,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "get_settings",
         title: "Soulful settings",
-        description: |_| {
-            format!("Shows the user's Soulful settings: default download folder and whether it still exists, auto-delete on a 1 star rating, the default metadata provider, the Last.fm and ListenBrainz user names and whether a key or token is saved (never the key or token), and the discovery settings. Takes no arguments. Failure codes: {COMMON_CODES}.")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Shows the user's Soulful settings: default download folder and whether it still exists, auto-delete on a 1 star rating, the default metadata provider, the Last.fm and ListenBrainz user names and whether a key or token is saved (never the key or token), and the discovery settings. Takes no arguments. Failure codes: {common}.")
         },
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         read_only: true,
@@ -87,8 +91,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "list_folders",
         title: "Library folders",
-        description: |_| {
-            format!("Lists the user's library folders with their ids, paths, free space, whether each is shared and which is the default. Folder ids stay valid until the folder is deleted in Settings. Pages of 25 by default (limit up to 100); pass back cursor for the next page. Failure codes: {COMMON_CODES}.")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Lists the user's library folders with their ids, paths, free space, whether each is shared, whether Navidrome lists it (in_navidrome, as get_status says) and which is the default. Folder ids stay valid until the folder is deleted in Settings. Pages of 25 by default (limit up to 100); pass back cursor for the next page. Failure codes: {common}.")
         },
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"additionalProperties":false}"#,
         read_only: true,
@@ -100,8 +105,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "get_library_stats",
         title: "Library statistics",
-        description: |_| {
-            format!("Counts the tracks, albums and artists in the user's Navidrome library, how many tracks the user rated and how (average and per star), and the 20 most common genres. Takes no arguments. Reads the whole library, so it can take several seconds on a large one. Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}.")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Counts the tracks, albums and artists in the user's Navidrome library, how many tracks the user rated and how (average and per star), and the 20 most common genres. Takes no arguments. Reads the whole library, so it can take several seconds on a large one. Failure codes: {common}, {NAVIDROME_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         read_only: true,
@@ -113,8 +119,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "find_in_library",
         title: "Find in library",
-        description: |_| {
-            format!("Looks up to 100 tracks in the user's Navidrome library. For each reference, in order: by recording_mbid when given, then by artist and title. Each match has the Navidrome song id, artist, title, album, year, duration, format, bitrate, size, path in the library, recording MBID, the user's rating, star and play count, and match: kind mbid, exact (same normalized artist and title, and duration within 5 s when given) or fuzzy (score 0.5 to 1 and the fields that differ). Fuzzy matches are never accepted for you: decide whether each is the track you want. At most 5 matches per reference (more_matches counts the rest). A result too large for one answer stops at a reference: summary.pending counts the rest and calling again with the same references and cursor continues. Song ids stay valid while the file stays in the library. About a second per ten references. Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}, partial (some references failed; each failed entry has its own error).")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Looks up to 100 tracks in the user's Navidrome library. For each reference, in order: by recording_mbid when given, then by artist and title. Each match has the Navidrome song id, artist, title, album, year, duration, format, bitrate, size, path in the library, recording MBID, the user's rating, star and play count, and match: kind mbid, exact (same normalized artist and title, and duration within 5 s when given) or fuzzy (score 0.5 to 1 and the fields that differ). A match's unchecked lists what the reference gives that the song does not say (an unknown length or album), which never counts as agreement. Fuzzy matches are never accepted for you: decide whether each is the track you want. At most 5 matches per reference (more_matches counts the rest). A result too large for one answer stops at a reference: summary.pending counts the rest and calling again with the same references and cursor continues. Song ids stay valid while the file stays in the library. About a second per ten references. Failure codes: {common}, {NAVIDROME_CODES}, partial (some references failed; each failed entry has its own error).")
         },
         input_schema: r#"{"type":"object","properties":{"references":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","properties":{"artist":{"type":"string"},"title":{"type":"string"},"album":{"type":"string"},"recording_mbid":{"type":"string","description":"A MusicBrainz recording id"},"duration_s":{"type":"integer","minimum":1,"maximum":36000}},"required":["artist","title"],"additionalProperties":false}},"cursor":{"type":"string"}},"required":["references"],"additionalProperties":false}"#,
         read_only: true,
@@ -126,8 +133,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "search_library",
         title: "Search library",
-        description: |_| {
-            format!("Searches the user's Navidrome library by free text for songs, albums or artists (kind, default songs). Each word must start a word of the title, album, artist or another credited name; results come most relevant first. At least 2 characters, or 1 character outside the Latin alphabet, and not only quotes, brackets, commas or slashes. Songs have the facts find_in_library gives without the path; albums their year, song count, the user's rating and star; artists their album count, rating and star. Ids stay valid while the item stays in the library. Pages of 25 by default (limit up to 100); pass back cursor for the next page. Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}.")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Searches the user's Navidrome library by free text for songs, albums or artists (kind, default songs). Each word must start a word of the title, album, artist or another credited name; results come most relevant first. At least 2 characters, or 1 character other than an ASCII character or a letter Navidrome reads as one ASCII letter (such as é), and not only quotes, brackets, commas or slashes. Songs have the facts find_in_library gives without the path; albums their year, song count, the user's rating and star; artists their album count, rating and star. Ids stay valid while the item stays in the library. Pages of 25 by default (limit up to 100); pass back cursor for the next page. Failure codes: {common}, {NAVIDROME_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string"},"kind":{"type":"string","enum":["songs","albums","artists"]},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["query"],"additionalProperties":false}"#,
         read_only: true,
@@ -139,8 +147,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "get_library_album",
         title: "Library album",
-        description: |_| {
-            format!("Shows one album of the user's Navidrome library with its songs in album order, from an album id that search_library, list_starred or a song's album_id gave. Pages of 25 songs by default (limit up to 100). Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}, unknown_handle (no album with this id that this account can see).")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Shows one album of the user's Navidrome library with its songs in album order, from an album id that search_library, list_starred or a song's album_id gave. Ids stay valid while the item stays in the library. Pages of 25 songs by default (limit up to 100). Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (no album with this id that this account can see).")
         },
         input_schema: r#"{"type":"object","properties":{"album_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["album_id"],"additionalProperties":false}"#,
         read_only: true,
@@ -152,8 +161,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "list_starred",
         title: "Starred items",
-        description: |_| {
-            format!("Lists what the user starred in Navidrome: songs, albums or artists (kind, default songs), most recently starred first. Pages of 25 by default (limit up to 100). Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}.")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Lists what the user starred in Navidrome: songs, albums or artists (kind, default songs), most recently starred first. Ids stay valid while the item stays in the library. Pages of 25 by default (limit up to 100). Failure codes: {common}, {NAVIDROME_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["songs","albums","artists"]},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"additionalProperties":false}"#,
         read_only: true,
@@ -165,8 +175,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "list_playlists",
         title: "Playlists",
-        description: |_| {
-            format!("Lists the user's Navidrome playlists and other users' public ones (owned false), by name, with id, comment, owner, whether public, song count, duration and when it was created and changed. Playlist ids stay valid until the playlist is deleted. Pages of 25 by default (limit up to 100). Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}.")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Lists the user's Navidrome playlists and other users' public ones (owned false), by name, with id, comment, owner, whether public, song count, duration and when it was created and changed. Playlist ids stay valid until the playlist is deleted. Pages of 25 by default (limit up to 100). Failure codes: {common}, {NAVIDROME_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"additionalProperties":false}"#,
         read_only: true,
@@ -178,8 +189,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "get_playlist",
         title: "Playlist",
-        description: |_| {
-            format!("Shows one playlist with its entries in order. position is the entry's 0-based place in Navidrome's list, the number the playlist write tools take; songs of libraries this account cannot see are left out, so positions can skip numbers. Each entry has the song facts of find_in_library and missing, true when its file is gone. Pages of 25 entries by default (limit up to 100). Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}, playlist_not_found (no playlist with this id, or another user's private one).")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Shows one playlist with its entries in order. position is the entry's 0-based place in Navidrome's list, the number the playlist write tools take; songs of libraries this account cannot see are left out, so positions can skip numbers. Each entry has the song facts of find_in_library and missing, true when its file is gone. Song ids stay valid while the file stays in the library. Pages of 25 entries by default (limit up to 100). Failure codes: {common}, {NAVIDROME_CODES}, playlist_not_found (no playlist with this id, or another user's private one).")
         },
         input_schema: r#"{"type":"object","properties":{"playlist_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["playlist_id"],"additionalProperties":false}"#,
         read_only: true,
@@ -191,8 +203,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "search_music",
         title: "Search music",
-        description: |_| {
-            format!("Searches MusicBrainz (default) or Last.fm for recordings, releases (albums and EPs) or artists, to check that a recording exists and get its ids. Returns MBIDs where the provider has them, titles, artists, dates, release types and durations, and provider_used, which is musicbrainz when Last.fm was asked for and no Last.fm key is saved. Artist search reads MusicBrainz only. Up to 25 results (limit, default 10). MusicBrainz allows one request a second, so a search takes one to a few seconds. Failure codes: {COMMON_CODES}, {METADATA_CODES}.")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Searches MusicBrainz (default) or Last.fm for recordings, releases (albums and EPs) or artists, to check that a recording exists and get its ids. Returns MBIDs where the provider has them, titles, artists, dates, release types and durations, and provider_used, which is musicbrainz when Last.fm was asked for and no Last.fm key is saved. Artist search reads MusicBrainz only. Up to 25 results (limit, default 10); left_out counts results left out to keep the answer under 60,000 characters. MBIDs never change; a lastfm: id names a Last.fm entry by its artist and name. MusicBrainz allows one request a second, so a search takes one to a few seconds. Failure codes: {common}, {METADATA_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["recording","release","artist"]},"query":{"type":"string"},"artist":{"type":"string","description":"A credit to narrow a recording or release search"},"provider":{"type":"string","enum":["musicbrainz","lastfm"]},"limit":{"type":"integer","minimum":1,"maximum":25}},"required":["kind","query"],"additionalProperties":false}"#,
         read_only: true,
@@ -204,8 +217,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "get_release",
         title: "Release",
-        description: |_| {
-            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id or a lastfm: id that search_music gave. MBIDs never change. Pages of 25 tracks by default (limit up to 100). Failure codes: {COMMON_CODES}, {METADATA_CODES}.")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id or a lastfm: id that search_music gave. MBIDs never change. Pages of 25 tracks by default (limit up to 100). Failure codes: {common}, {METADATA_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"release_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["release_id"],"additionalProperties":false}"#,
         read_only: true,
@@ -217,8 +231,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "get_recording_releases",
         title: "Recording releases",
-        description: |_| {
-            format!("Shows a MusicBrainz recording (title, artist, length) and the releases it appears on, each with date, country, status and its release group's types, so you can tell a studio album from a compilation or a live record. Pages of 25 releases by default (limit up to 100, release_count gives the total). Takes two MusicBrainz requests, about two seconds. Failure codes: {COMMON_CODES}, {METADATA_CODES}.")
+        description: |calls_a_minute| {
+            let common = common_codes(calls_a_minute);
+            format!("Shows a MusicBrainz recording (title, artist, length) and the releases it appears on, each with date, country, status and its release group's types, so you can tell a studio album from a compilation or a live record. MBIDs never change. Pages of 25 releases by default (limit up to 100, release_count gives the total). Takes two MusicBrainz requests, about two seconds. Failure codes: {common}, {METADATA_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"recording_mbid":{"type":"string","description":"A MusicBrainz recording id"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["recording_mbid"],"additionalProperties":false}"#,
         read_only: true,
@@ -363,6 +378,14 @@ mod tests {
         for (t, spec) in tools.iter().zip(TOOLS) {
             assert_eq!(t["title"], spec.title, "{}", spec.name);
             assert_eq!(t["description"], (spec.description)(120), "{}", spec.name);
+            assert!(
+                t["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("rate_limited (more than 120 tool calls in a minute; retry_after_seconds says when)"),
+                "{}",
+                spec.name
+            );
             assert_eq!(
                 t["annotations"],
                 json!({"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true,
@@ -597,10 +620,16 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
         )
         .await;
-        assert!(body["result"]["tools"][0]["description"]
-            .as_str()
-            .unwrap()
-            .contains("more than 7 tool calls in a minute"));
+        for tool in body["result"]["tools"].as_array().unwrap() {
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("more than 7 tool calls in a minute"),
+                "{}",
+                tool["name"]
+            );
+        }
     }
 
     #[tokio::test]

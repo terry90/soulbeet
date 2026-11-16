@@ -2,9 +2,9 @@
 
 use rmcp::model::JsonObject;
 use serde_json::{Map, Value};
-use shared::failure::{cut_chars, TEXT_MAX_CHARS};
+use shared::failure::{cut_json, TEXT_MAX_CHARS};
 
-use super::contract::{invalid_input, invalid_value, NextCall, ToolError, TOO_LARGE_TO_REPEAT};
+use super::contract::{invalid_input, invalid_value, too_large_to_repeat, NextCall, ToolError};
 
 /// Longest text argument, in characters after trimming: a reference or
 /// query is echoed in `facts` and `next`, so it stays far below the result
@@ -13,10 +13,11 @@ const STRING_MAX_CHARS: usize = 500;
 
 /// Longest call a result offers again in `next`, in characters of its JSON
 /// text. The rest of an error result is bounded by its cuts: a name in the
-/// message and in `facts.field` at TEXT_MAX_CHARS, `cause.raw` at
-/// RAW_MAX_CHARS and a few facts of at most STRING_MAX_CHARS, each character
-/// at most six once escaped, so under 35,000 characters, and with this the
-/// whole result stays under RESULT_MAX_CHARS (design 10.1).
+/// message and in `facts.field` at TEXT_MAX_CHARS of JSON, `cause.raw` and a
+/// provider's answer in a metadata failure's message at RAW_MAX_CHARS, and
+/// a few facts of at most STRING_MAX_CHARS, each character at most six once
+/// escaped, so under 35,000 characters, and with this the whole result
+/// stays under RESULT_MAX_CHARS (design 10.1).
 const ECHO_MAX_CHARS: usize = 25_000;
 
 const A_STRING: &str = "a non-empty string of at most 500 characters";
@@ -71,7 +72,7 @@ impl Args {
         let next = repeatable(self.tool, Value::Object(taken));
         let mut e = self.unknown_name(name, Vec::from_iter(next.clone()));
         if next.is_none() {
-            e.failure.message = format!("{} {TOO_LARGE_TO_REPEAT}", e.failure.message);
+            e.failure.message = too_large_to_repeat(&e.failure.message);
         }
         Err(e)
     }
@@ -221,7 +222,7 @@ impl Args {
     /// `name` is not taken here; the caller chose the name, so it is cut
     /// wherever it is echoed.
     fn unknown_name(&self, name: &str, next: Vec<NextCall>) -> ToolError {
-        let field = cut_chars(self.field(name), TEXT_MAX_CHARS);
+        let field = cut_json(self.field(name), TEXT_MAX_CHARS);
         invalid_input(self.tool, &field, &self.takes(), next)
     }
 }
@@ -452,14 +453,19 @@ pub(crate) mod tests {
         );
     }
 
-    /// 100 references of three 500-character fields: about 155,000
-    /// characters of arguments.
-    fn large_call(extra: Value) -> Args {
+    /// find_in_library's arguments with 100 references of three
+    /// 500-character fields: about 155,000 characters.
+    pub(crate) fn large_references() -> Value {
         let field = "x".repeat(500);
         let refs: Vec<Value> = (0..100)
             .map(|_| json!({"artist": field, "title": field, "album": field}))
             .collect();
-        let mut args = json!({"references": refs});
+        json!({"references": refs})
+    }
+
+    /// `large_references` with the arguments of `extra` added.
+    fn large_call(extra: Value) -> Args {
+        let mut args = large_references();
         args.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
@@ -476,10 +482,10 @@ pub(crate) mod tests {
         let a = large_call(json!({long.clone(): 1}));
         let e = a.finish().unwrap_err();
         let field = e.facts["field"].as_str().unwrap().to_string();
-        assert_eq!(field, cut_chars(long, TEXT_MAX_CHARS));
+        assert_eq!(field, cut_json(long, TEXT_MAX_CHARS));
         assert_eq!(
             e.failure.message,
-            format!("find_in_library takes no argument named '{field}': it takes only references, cursor The call is too large to offer again in next.")
+            format!("find_in_library takes no argument named '{field}': it takes only references, cursor. The call is too large to offer again in next.")
         );
         assert!(e.next.is_empty());
         assert!(result_chars(e) <= RESULT_MAX_CHARS);
@@ -500,7 +506,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             e.failure.message,
-            "error returned from database: (code: 5) database is locked The call is too large to offer again in next."
+            "error returned from database: (code: 5) database is locked. The call is too large to offer again in next."
         );
         assert!(e.next.is_empty());
         assert!(result_chars(e) <= RESULT_MAX_CHARS);

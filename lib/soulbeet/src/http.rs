@@ -96,8 +96,8 @@ fn is_retryable(status: u16) -> bool {
 }
 
 /// Why `resilient_send` got no successful answer: `status` and `body` are the
-/// last answer's, or no status and the transport error's text when the last
-/// attempt got no answer.
+/// last answer's, or no status and the transport error's text, without the
+/// URL, when the last attempt got no answer.
 #[derive(Debug)]
 pub struct SendError {
     pub context: String,
@@ -110,6 +110,20 @@ impl std::fmt::Display for SendError {
         match self.status {
             None => write!(f, "{}: {}", self.context, self.body),
             Some(status) => write!(f, "{} ({}): {}", self.context, status, self.body),
+        }
+    }
+}
+
+impl SendError {
+    /// A request of `context` that got no answer, or whose answer could not
+    /// be read whole. reqwest's text ends with the URL (reqwest 0.12.28
+    /// `src/error.rs:266-268`), whose query can hold an API key, so it is
+    /// left out.
+    pub fn unanswered(context: &str, e: reqwest::Error) -> SendError {
+        SendError {
+            context: context.to_string(),
+            status: None,
+            body: e.without_url().to_string(),
         }
     }
 }
@@ -149,7 +163,7 @@ pub async fn resilient_send(
                 // Timeouts indicate the server is hanging, not a transient blip.
                 // Retry once in case it was a one-off, but don't keep waiting.
                 if attempt == MAX_RETRIES || (e.is_timeout() && attempt >= 1) {
-                    return Err(failed(None, e.to_string()));
+                    return Err(SendError::unanswered(context, e));
                 }
             }
             Ok(resp) => {
@@ -520,6 +534,21 @@ pub async fn cached_recording_lookup(client: &Client, mbid: &str) -> Result<Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_request_that_got_no_answer_does_not_name_its_url() {
+        // Port 1 on loopback refuses the connection at once.
+        let url =
+            "http://127.0.0.1:1/2.0/?method=track.search&api_key=3f2b9c1e8d7a6b5c&format=json";
+        let client = build_client("Soulful test");
+        let e = resilient_send(|| client.get(url), "Last.fm API")
+            .await
+            .unwrap_err();
+        assert_eq!((e.status, e.context.as_str()), (None, "Last.fm API"));
+        assert!(!e.body.contains("3f2b9c1e8d7a6b5c"), "{}", e.body);
+        // reqwest's text for a refused connection, without " for url (...)".
+        assert_eq!(e.body, "error sending request");
+    }
 
     #[test]
     fn send_errors_read_as_before() {

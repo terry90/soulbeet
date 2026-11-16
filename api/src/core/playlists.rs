@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 use shared::failure::{
-    cut_chars, Failure, FailureCode, RetryAdvice, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS,
+    cut_json, Failure, FailureCode, RetryAdvice, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS,
 };
 use soulbeet::navidrome::models::{PlaylistTrack, SubsonicPlaylist};
 use soulbeet::navidrome::NavidromeClient;
@@ -48,9 +48,9 @@ pub struct PlaylistEntry {
 pub(crate) fn facts(p: &SubsonicPlaylist, username: &str) -> PlaylistFacts {
     PlaylistFacts {
         playlist_id: p.id.clone(),
-        name: cut_chars(p.name.clone(), TEXT_MAX_CHARS),
-        comment: (!p.comment.is_empty()).then(|| cut_chars(p.comment.clone(), RAW_MAX_CHARS)),
-        owner: cut_chars(p.owner.clone(), TEXT_MAX_CHARS),
+        name: cut_json(p.name.clone(), TEXT_MAX_CHARS),
+        comment: (!p.comment.is_empty()).then(|| cut_json(p.comment.clone(), RAW_MAX_CHARS)),
+        owner: cut_json(p.owner.clone(), TEXT_MAX_CHARS),
         owned: p.owner.eq_ignore_ascii_case(username),
         public: p.public,
         song_count: p.song_count,
@@ -93,31 +93,23 @@ pub async fn get(
         .map(|p| facts(&p, &ctx.username))
         .filter(|p| p.owned || p.public)
         .ok_or_else(|| playlist_not_found(id))?;
+    // None here is Navidrome's own 404 for a playlist it no longer lists
+    // to this account: it was deleted, or made private, since getPlaylist.
     let tracks = navi
         .playlist_tracks(id)
         .await
         .map_err(failure)?
         .ok_or_else(|| playlist_not_found(id))?;
-    let entries = tracks
-        .iter()
-        .map(entry)
-        .collect::<Result<_, _>>()
-        .map_err(failure)?;
-    Ok((playlist, entries))
+    Ok((playlist, tracks.iter().map(entry).collect()))
 }
 
-/// A native track row as an entry. Navidrome numbers a playlist's tracks
-/// from 1 (persistence/playlist_repository.go:485-500), so a place 0 is an
-/// answer Soulful cannot read.
-fn entry(track: &PlaylistTrack) -> Result<PlaylistEntry, NavidromeError> {
-    let place = track.position.checked_sub(1).ok_or_else(|| {
-        NavidromeError::Parse("Navidrome answered a playlist track at place 0".into())
-    })?;
-    Ok(PlaylistEntry {
-        position: place as usize,
+/// A native track row as an entry: its 1-based place less one.
+fn entry(track: &PlaylistTrack) -> PlaylistEntry {
+    PlaylistEntry {
+        position: track.position.get() as usize - 1,
         missing: track.song.missing,
         song: SongFacts::from(&track.song),
-    })
+    }
 }
 
 /// No playlist with this id, or another user's private one. It carries no
@@ -291,7 +283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_track_at_place_0_is_an_unreadable_answer() {
+    async fn a_proxy_404_after_the_playlist_was_found_is_its_failure() {
         let navi = NavidromeStub::start();
         navi.answer(
             "/rest/getPlaylist",
@@ -300,13 +292,10 @@ mod tests {
                 &[],
             )],
         );
-        navi.answer(
-            "/api/playlist/p1/tracks",
-            &[&format!(
-                "[{}]",
-                playlist_row(0, "s9", "Marrow Choir", "Silent Night", false)
-            )],
-        );
+        // nginx's 404 page (src/http/ngx_http_special_response.c) from a proxy that forwards
+        // /rest but not /api.
+        let page = "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+        navi.answer_when("/api/playlist/p1/tracks", "", 404, page);
         let f = get(&navi.client(), &alice(Role::User), "p1")
             .await
             .unwrap_err();
@@ -315,8 +304,34 @@ mod tests {
             (
                 FailureCode::NavidromeUnreachable,
                 Stage::Playlist,
-                "Unreadable Navidrome response: Navidrome answered a playlist track at place 0"
+                "Get playlist tracks failed: HTTP 404"
             )
         );
+        assert_eq!(
+            f.cause,
+            Some(shared::failure::Cause::new(
+                shared::failure::Service::Navidrome,
+                Some(404),
+                page
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_gone_between_the_two_reads_is_not_found() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_answer(
+                &pl("p1", "Christmas", "alice", false),
+                &[],
+            )],
+        );
+        // http.Error(w, "not found", 404), server/nativeapi/playlists.go:42-44
+        navi.answer_when("/api/playlist/p1/tracks", "", 404, "not found\n");
+        let f = get(&navi.client(), &alice(Role::User), "p1")
+            .await
+            .unwrap_err();
+        assert_eq!(f, playlist_not_found("p1"));
     }
 }

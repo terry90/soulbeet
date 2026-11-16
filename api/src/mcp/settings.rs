@@ -2,14 +2,14 @@
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::Failure;
 
 use super::args::Args;
-use super::contract::{failed, success, upstream_error, ToolError};
+use super::contract::{answer, upstream_error, ToolError};
 use super::paging::{fit, Page};
 use super::status::{chosen_folder, folder_fields, with_free_space};
 use super::McpCaller;
 use crate::connection::ConnectionState;
+use crate::core::library::library_roots_in;
 use crate::core::{folders, settings};
 use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
@@ -52,7 +52,7 @@ pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<Strin
         "listenbrainz": {"username": s.listenbrainz_username, "token_saved": saved(&s.listenbrainz_token)},
         "discovery": {
             "enabled": s.discovery_enabled,
-            "folder_id": s.discovery_folder_id,
+            "folder_id": chosen_folder(s.discovery_folder_id.clone()),
             "profiles": profiles,
             "track_count": s.parse_track_counts(),
             "lifetime_days": s.parse_lifetime_days(),
@@ -67,9 +67,20 @@ pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<Strin
     fields
 }
 
-/// A failed read of the caller's rows: the same call can be tried again.
-fn unreadable(failure: Failure, args: &Args) -> CallToolResult {
-    failed(upstream_error(failure, Map::new(), args.same_call()))
+/// The caller's settings and folders, read at once. A failed read can be
+/// tried again with the same call.
+async fn read_rows(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: &Args,
+) -> Result<(UserSettings, Vec<Folder>), ToolError> {
+    let (settings, folders) = tokio::join!(
+        settings::get_in(&state.db, &caller.ctx),
+        folders::list_in(&state.db, &caller.ctx),
+    );
+    settings
+        .and_then(|settings| Ok((settings, folders?)))
+        .map_err(|failure| upstream_error(failure, Map::new(), args.same_call()))
 }
 
 /// `get_settings`, which takes no arguments.
@@ -79,67 +90,58 @@ pub(crate) async fn get_settings(
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new("get_settings", args, &[]);
-    if let Err(e) = args.finish() {
-        return failed(e);
-    }
-    let (settings, folders) = tokio::join!(
-        settings::get_in(&state.db, &caller.ctx),
-        folders::list_in(&state.db, &caller.ctx),
-    );
-    match (settings, folders) {
-        (Ok(settings), Ok(folders)) => success(settings_fields(&settings, &folders)),
-        (Err(failure), _) | (_, Err(failure)) => unreadable(failure, &args),
-    }
+    answer(
+        async {
+            args.finish()?;
+            let (settings, folders) = read_rows(state, caller, &args).await?;
+            Ok(settings_fields(&settings, &folders))
+        }
+        .await,
+    )
 }
 
-/// `list_folders`, a page of the caller's folders.
+/// `list_folders`, a page of the caller's folders. Free space is read for
+/// the folders of the page only.
 pub(crate) async fn list_folders(
     state: &ConnectionState,
     caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new("list_folders", args, &["limit", "cursor"]);
-    match read_page(&args) {
-        Ok(page) => list_page(state, caller, &args, page).await,
-        Err(e) => failed(e),
-    }
-}
-
-fn read_page(args: &Args) -> Result<Page, ToolError> {
-    let page = Page::read(args, json!({}))?;
-    args.finish()?;
-    Ok(page)
-}
-
-async fn list_page(
-    state: &ConnectionState,
-    caller: &McpCaller,
-    args: &Args,
-    page: Page,
-) -> CallToolResult {
-    let (settings, folders) = tokio::join!(
-        settings::get_in(&state.db, &caller.ctx),
-        folders::list_in(&state.db, &caller.ctx),
-    );
-    let (settings, folders) = match (settings, folders) {
-        (Ok(settings), Ok(folders)) => (settings, folders),
-        (Err(failure), _) | (_, Err(failure)) => return unreadable(failure, args),
-    };
-    let default = chosen_folder(settings.default_download_folder_id);
-    let rest: Vec<Folder> = folders.into_iter().skip(page.offset).collect();
-    let items: Vec<Value> = with_free_space(rest)
-        .await
-        .iter()
-        .map(|f| folder_fields(f, default.as_deref()))
-        .collect();
-    let mut fields = Map::new();
-    fields.insert("default_folder_id".into(), json!(default));
-    success(fit(fields, "folders", items, &page, false))
+    answer(
+        async {
+            let page = Page::read(&args, json!({}))?;
+            args.finish()?;
+            let ((settings, folders), roots) =
+                tokio::try_join!(read_rows(state, caller, &args), async {
+                    library_roots_in(&state.db, state.navidrome_music_path.as_deref())
+                        .await
+                        .map_err(|f| upstream_error(f, Map::new(), args.same_call()))
+                },)?;
+            let default = chosen_folder(settings.default_download_folder_id);
+            let more = folders.len() > page.offset.saturating_add(page.limit);
+            let shown: Vec<Folder> = folders
+                .into_iter()
+                .skip(page.offset)
+                .take(page.limit)
+                .collect();
+            let items: Vec<Value> = with_free_space(shown)
+                .await
+                .iter()
+                .map(|f| folder_fields(f, default.as_deref(), &roots))
+                .collect();
+            let mut fields = Map::new();
+            fields.insert("default_folder_id".into(), json!(default));
+            Ok(fit(fields, "folders", items, &page, more))
+        }
+        .await,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::test_util::{alice_caller, text_of};
     use crate::db::test_db;
 
     #[tokio::test]
@@ -181,6 +183,76 @@ mod tests {
             (&doc["default_folder_id"], &doc["default_folder_found"]),
             (&Value::Null, &Value::Null)
         );
+    }
+
+    #[tokio::test]
+    async fn a_cleared_discovery_folder_is_no_folder() {
+        let db = test_db::migrated().await;
+        let mut s = UserSettings::get_in(&db, "u1").await.unwrap();
+        // How Settings clears a folder choice (core/settings.rs, check_folder_choices).
+        s.discovery_folder_id = Some(String::new());
+        assert_eq!(
+            settings_fields(&s, &[])["discovery"]["folder_id"],
+            Value::Null
+        );
+        s.discovery_folder_id = Some("f1".into());
+        assert_eq!(settings_fields(&s, &[])["discovery"]["folder_id"], "f1");
+    }
+
+    /// The tool's document when the caller's rows cannot be read: the
+    /// folders table is gone, so sqlx fails as SQLite does on any missing
+    /// table.
+    async fn unreadable_rows(tool: &str) -> Value {
+        let db = test_db::migrated().await;
+        sqlx::query("DROP TABLE folders")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = ConnectionState::for_test(db);
+        let caller = alice_caller(false);
+        let args = json!({"limit": 5}).as_object().cloned();
+        let result = match tool {
+            "get_settings" => get_settings(&state, &caller, None).await,
+            _ => list_folders(&state, &caller, args).await,
+        };
+        assert_eq!(result.is_error, Some(true), "{tool}");
+        serde_json::from_str(text_of(&result)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settings_and_folders_that_cannot_be_read_offer_the_same_call_again() {
+        for (tool, call) in [
+            ("get_settings", json!({"tool": "get_settings", "args": {}})),
+            (
+                "list_folders",
+                json!({"tool": "list_folders", "args": {"limit": 5}}),
+            ),
+        ] {
+            let e = &unreadable_rows(tool).await["error"];
+            assert_eq!(
+                (
+                    e["code"].as_str(),
+                    e["stage"].as_str(),
+                    e["retry"].as_str(),
+                    e["message"].as_str()
+                ),
+                (
+                    Some("settings_unreadable"),
+                    Some("input"),
+                    Some("same_source_later"),
+                    Some("Soulful's database is unavailable")
+                ),
+                "{tool}"
+            );
+            // sqlx's text for SQLite's "no such table" (sqlx-core 0.8.6 src/error.rs:44)
+            assert_eq!(
+                e["cause"],
+                json!({"service": "database", "status": null,
+                    "raw": "error returned from database: (code: 1) no such table: folders"}),
+                "{tool}"
+            );
+            assert_eq!(e["next"], json!([call]), "{tool}");
+        }
     }
 
     #[tokio::test]

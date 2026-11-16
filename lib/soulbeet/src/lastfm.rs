@@ -1,6 +1,6 @@
 use reqwest::Client;
 use serde::Deserialize;
-use shared::failure::{Service, UserAction, UserActionCode};
+use shared::failure::{cut_chars, Service, UserAction, UserActionCode, RAW_MAX_CHARS};
 use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, Track};
 use shared::recommendation::{
     ArtistPopularity, Listen, RankedArtist, RankedTrack, SimilarArtist, SimilarTrack, TimePeriod,
@@ -87,11 +87,17 @@ impl From<LastFmFailure> for SoulseekError {
 /// answers for an album it does not have. The code is the error's status,
 /// as a Subsonic code is for Navidrome, since it is what Last.fm says went
 /// wrong; the HTTP status does not decide it.
+///
+/// What Last.fm answered is cut to RAW_MAX_CHARS where it enters `raw`, as a
+/// cause's text is: the error's text holds it, and a proxy's error page can
+/// be tens of thousands of characters.
 impl From<LastFmFailure> for MetadataError {
     fn from(f: LastFmFailure) -> Self {
         let service = Service::Lastfm;
+        let cut = |raw: String| cut_chars(raw, RAW_MAX_CHARS);
         match f {
-            LastFmFailure::Api { code, message: raw } => {
+            LastFmFailure::Api { code, message } => {
+                let raw = cut(message);
                 let status = Some(code);
                 match code {
                     4 | 10 | 26 => MetadataError::NotConfigured {
@@ -121,27 +127,30 @@ impl From<LastFmFailure> for MetadataError {
                     },
                 }
             }
-            LastFmFailure::Send(SendError { status, body, .. }) => match status {
-                Some(429) => MetadataError::RateLimited {
-                    service,
-                    status,
-                    raw: body,
-                },
-                None | Some(500..=599) => MetadataError::Unavailable {
-                    service,
-                    status,
-                    raw: body,
-                },
-                Some(_) => MetadataError::Rejected {
-                    service,
-                    status,
-                    raw: body,
-                },
-            },
+            LastFmFailure::Send(SendError { status, body, .. }) => {
+                let raw = cut(body);
+                match status {
+                    Some(429) => MetadataError::RateLimited {
+                        service,
+                        status,
+                        raw,
+                    },
+                    None | Some(500..=599) => MetadataError::Unavailable {
+                        service,
+                        status,
+                        raw,
+                    },
+                    Some(_) => MetadataError::Rejected {
+                        service,
+                        status,
+                        raw,
+                    },
+                }
+            }
             LastFmFailure::Parse(raw) => MetadataError::Unreadable {
                 service,
                 status: None,
-                raw,
+                raw: cut(raw),
             },
         }
     }
@@ -363,13 +372,10 @@ impl LastFmProvider {
         let url_str = url.to_string();
         let response = crate::http::resilient_send(|| client.get(&url_str), LASTFM_CONTEXT).await?;
         // The connection failed while the body was read.
-        let body = response.bytes().await.map_err(|e| {
-            LastFmFailure::Send(SendError {
-                context: LASTFM_CONTEXT.to_string(),
-                status: None,
-                body: e.to_string(),
-            })
-        })?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| LastFmFailure::Send(SendError::unanswered(LASTFM_CONTEXT, e)))?;
 
         if let Ok(error) = serde_json::from_slice::<LastFmErrorBody>(&body) {
             return Err(error.into());
@@ -1207,6 +1213,27 @@ mod tests {
     use super::*;
     use crate::MetadataProvider;
     use shared::failure::{FailureCode, Stage};
+
+    #[test]
+    fn a_long_answer_is_cut_where_it_enters_the_error() {
+        // A proxy's 503 page in front of Last.fm, far longer than a cause keeps.
+        let page = format!(
+            "<!DOCTYPE html><html><body>{}</body></html>",
+            "<p>Service Unavailable</p>".repeat(3_000)
+        );
+        let e = MetadataError::from(LastFmFailure::Send(SendError {
+            context: LASTFM_CONTEXT.into(),
+            status: Some(503),
+            body: page.clone(),
+        }));
+        let MetadataError::Unavailable { raw, .. } = &e else {
+            panic!("{e:?}");
+        };
+        assert_eq!(raw, &cut_chars(page, RAW_MAX_CHARS));
+        assert!(e.to_string().chars().count() <= RAW_MAX_CHARS + "Last.fm is unavailable: ".len());
+        let f = e.failure(Stage::Metadata, e.to_string());
+        assert_eq!(&f.cause.unwrap().raw, raw);
+    }
 
     #[test]
     fn only_lastfms_own_album_ids_name_an_album() {

@@ -2,11 +2,11 @@
 //! public ones.
 
 use rmcp::model::{CallToolResult, JsonObject};
-use serde_json::{json, Map, Value};
-use shared::failure::{FailureCode, Stage};
+use serde_json::{json, Map};
+use shared::failure::{Failure, FailureCode, Stage};
 
 use super::args::Args;
-use super::contract::{failed, success, upstream_error, NextCall, ToolError};
+use super::contract::{answer, upstream_error, NextCall, ToolError};
 use super::library::navidrome_of;
 use super::paging::{fit, Page};
 use super::McpCaller;
@@ -20,31 +20,18 @@ pub(crate) async fn list_playlists(
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new("list_playlists", args, &["limit", "cursor"]);
-    let read = || -> Result<_, ToolError> {
-        let page = Page::read(&args, json!({}))?;
-        args.finish()?;
-        Ok(page)
-    };
-    let page = match read() {
-        Ok(page) => page,
-        Err(e) => return failed(e),
-    };
-    let navi = match navidrome_of(state, caller, Stage::Playlist, &args).await {
-        Ok(navi) => navi,
-        Err(e) => return failed(e),
-    };
-    match playlists::list(&navi, &caller.ctx).await {
-        Ok(listed) => {
-            let items: Vec<Value> = listed
-                .get(page.offset..)
-                .unwrap_or_default()
-                .iter()
-                .map(|p| json!(p))
-                .collect();
-            success(fit(Map::new(), "playlists", items, &page, false))
+    answer(
+        async {
+            let page = Page::read(&args, json!({}))?;
+            args.finish()?;
+            let navi = navidrome_of(state, caller, Stage::Playlist, &args).await?;
+            let listed = playlists::list(&navi, &caller.ctx)
+                .await
+                .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
+            Ok(fit(Map::new(), "playlists", page.of(&listed), &page, false))
         }
-        Err(f) => failed(upstream_error(f, Map::new(), args.same_call())),
-    }
+        .await,
+    )
 }
 
 /// `get_playlist`: the playlist and a page of its entries. An id with no
@@ -55,46 +42,37 @@ pub(crate) async fn get_playlist(
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new("get_playlist", args, &["playlist_id", "limit", "cursor"]);
-    let read = || -> Result<_, ToolError> {
-        let playlist_id = args.string("playlist_id")?;
-        let page = Page::read(&args, json!({"playlist_id": playlist_id}))?;
-        args.finish()?;
-        Ok((playlist_id, page))
-    };
-    let (playlist_id, page) = match read() {
-        Ok(read) => read,
-        Err(e) => return failed(e),
-    };
-    let navi = match navidrome_of(state, caller, Stage::Playlist, &args).await {
-        Ok(navi) => navi,
-        Err(e) => return failed(e),
-    };
-    match playlists::get(&navi, &caller.ctx, &playlist_id).await {
-        Ok((playlist, entries)) => {
-            let items: Vec<Value> = entries
-                .get(page.offset..)
-                .unwrap_or_default()
-                .iter()
-                .map(|e| json!(e))
-                .collect();
+    answer(
+        async {
+            let playlist_id = args.string("playlist_id")?;
+            let page = Page::read(&args, json!({"playlist_id": playlist_id}))?;
+            args.finish()?;
+            let navi = navidrome_of(state, caller, Stage::Playlist, &args).await?;
+            let (playlist, entries) = playlists::get(&navi, &caller.ctx, &playlist_id)
+                .await
+                .map_err(|f| not_got(f, &playlist_id, &args))?;
             let mut fields = Map::new();
             fields.insert("playlist".into(), json!(playlist));
-            success(fit(fields, "entries", items, &page, false))
+            Ok(fit(fields, "entries", page.of(&entries), &page, false))
         }
-        Err(f) => {
-            let not_found = f.code == FailureCode::PlaylistNotFound;
-            let mut facts = Map::new();
-            facts.insert("playlist_id".into(), json!(playlist_id));
-            let mut e = upstream_error(f, facts, args.same_call());
-            if not_found {
-                e.next = vec![NextCall {
-                    tool: "list_playlists",
-                    args: json!({}),
-                }];
-            }
-            failed(e)
-        }
+        .await,
+    )
+}
+
+/// get_playlist's failure: `playlist_not_found` offers the list instead of
+/// the same call.
+fn not_got(f: Failure, playlist_id: &str, args: &Args) -> ToolError {
+    let not_found = f.code == FailureCode::PlaylistNotFound;
+    let mut facts = Map::new();
+    facts.insert("playlist_id".into(), json!(playlist_id));
+    let mut e = upstream_error(f, facts, args.same_call());
+    if not_found {
+        e.next = vec![NextCall {
+            tool: "list_playlists",
+            args: json!({}),
+        }];
     }
+    e
 }
 
 #[cfg(test)]
@@ -205,5 +183,61 @@ mod tests {
             e["next"],
             json!([{"tool": "list_playlists", "args": {"limit": 10}}])
         );
+    }
+
+    #[tokio::test]
+    async fn list_playlists_pages_through_what_the_caller_may_see() {
+        let navi = NavidromeStub::start();
+        // getPlaylists by name (server/subsonic/playlists.go:18-30); bob's private one is left out.
+        let pl = |id: &str, name: &str, owner: &str, public: bool| {
+            json!({"id": id, "name": name, "songCount": 1, "duration": 263, "public": public,
+                "owner": owner, "created": "2026-11-10T18:00:00Z", "changed": "2026-11-10T18:00:00Z"})
+        };
+        navi.answer(
+            "/rest/getPlaylists",
+            &[&subsonic_ok(&format!(
+                r#""playlists":{{"playlist":{}}}"#,
+                json!([
+                    pl("p1", "Advent", "bob", true),
+                    pl("p2", "Bob's mix", "bob", false),
+                    pl("p3", "Christmas", "alice", false),
+                    pl("p4", "Epiphany", "alice", true)
+                ])
+            ))],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let first =
+            document(&call_tool(app.clone(), &token, "list_playlists", json!({"limit": 2})).await);
+        let names = |doc: &Value| {
+            doc["playlists"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    (
+                        p["name"].as_str().unwrap().to_string(),
+                        p["owned"].as_bool().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&first),
+            [
+                ("Advent".to_string(), false),
+                ("Christmas".to_string(), true)
+            ]
+        );
+        let second = document(
+            &call_tool(
+                app,
+                &token,
+                "list_playlists",
+                json!({"limit": 2, "cursor": first["cursor"]}),
+            )
+            .await,
+        );
+        assert_eq!(names(&second), [("Epiphany".to_string(), true)]);
+        assert_eq!(second["cursor"], Value::Null);
     }
 }

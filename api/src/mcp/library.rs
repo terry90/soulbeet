@@ -5,15 +5,15 @@ use std::sync::Arc;
 use futures::StreamExt;
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{cut_chars, Failure, Stage, TEXT_MAX_CHARS};
+use shared::failure::{cut_json, Failure, Stage, TEXT_MAX_CHARS};
 use shared::navidrome::LibraryStats;
 use soulbeet::navidrome::{LibraryKind, NavidromeClient};
 
 use super::args::{repeatable, Args};
 use super::contract::{
-    failed, invalid_value, items, items_text, success, upstream_error, ItemResult, Items, ToolError,
+    answer, failed, invalid_value, items, items_text, upstream_error, ItemResult, Items, ToolError,
 };
-use super::paging::{fit, Cursor, Page, RESULT_MAX_CHARS};
+use super::paging::{fit, Listing, Page, RESULT_MAX_CHARS};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::index::navidrome_keeps;
@@ -40,17 +40,17 @@ pub(crate) async fn get_library_stats(
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new("get_library_stats", args, &[]);
-    if let Err(e) = args.finish() {
-        return failed(e);
-    }
-    let navi = match navidrome_of(state, caller, Stage::LibraryCheck, &args).await {
-        Ok(navi) => navi,
-        Err(e) => return failed(e),
-    };
-    match library::stats(&navi).await {
-        Ok(stats) => success(stats_fields(stats)),
-        Err(f) => failed(upstream_error(f, Map::new(), args.same_call())),
-    }
+    answer(
+        async {
+            args.finish()?;
+            let navi = navidrome_of(state, caller, Stage::LibraryCheck, &args).await?;
+            let stats = library::stats(&navi)
+                .await
+                .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
+            Ok(stats_fields(stats))
+        }
+        .await,
+    )
 }
 
 /// The stats document: `LibraryStats`' fields, each genre as
@@ -61,7 +61,7 @@ fn stats_fields(stats: LibraryStats) -> Map<String, Value> {
     let genres: Vec<Value> = stats
         .genres
         .into_iter()
-        .map(|(genre, tracks)| json!({"genre": cut_chars(genre, TEXT_MAX_CHARS), "tracks": tracks}))
+        .map(|(genre, tracks)| json!({"genre": cut_json(genre, TEXT_MAX_CHARS), "tracks": tracks}))
         .collect();
     let Value::Object(fields) = json!({
         "total_tracks": stats.total_tracks,
@@ -86,21 +86,27 @@ const SEARCHABLE: &str = "an artist or title with a character other than spaces,
 /// `find_in_library`: each reference from the cursor on looked up
 /// LOOKUPS_AT_ONCE at a time, answered in input order, and cut at a
 /// reference when the next entry would take the result over
-/// RESULT_MAX_CHARS (D4).
+/// RESULT_MAX_CHARS (D4). One entry always fits: it holds at most
+/// MATCHES_KEPT matches whose texts are each cut to TEXT_MAX_CHARS of JSON.
 pub(crate) async fn find_in_library(
     state: &ConnectionState,
     caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new(FIND, args, &["references", "cursor"]);
-    let (elements, refs, list, start) = match read_references(&args) {
-        Ok(read) => read,
-        Err(e) => return failed(e),
-    };
-    let navi = match navidrome_of(state, caller, Stage::LibraryCheck, &args).await {
-        Ok(navi) => navi,
-        Err(e) => return failed(e),
-    };
+    match find_items(state, caller, &args).await {
+        Ok(result) => result,
+        Err(e) => failed(e),
+    }
+}
+
+async fn find_items(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: &Args,
+) -> Result<CallToolResult, ToolError> {
+    let (elements, refs, listing, start) = read_references(args)?;
+    let navi = navidrome_of(state, caller, Stage::LibraryCheck, args).await?;
     let mut it = Items {
         stage: Stage::LibraryCheck,
         noun: "references",
@@ -118,24 +124,24 @@ pub(crate) async fn find_in_library(
         let i = start + it.results.len();
         it.results.push(entry(found, &elements[i], &refs[i]));
         it.pending = refs.len() - i - 1;
-        it.cursor = (it.pending > 0).then(|| Cursor::make(FIND, &list, i + 1));
+        it.cursor = (it.pending > 0).then(|| listing.cursor(i + 1));
         if it.results.len() > 1 && items_text(&it).chars().count() > RESULT_MAX_CHARS {
             it.results.pop();
             it.pending = refs.len() - i;
-            it.cursor = Some(Cursor::make(FIND, &list, i));
+            it.cursor = Some(listing.cursor(i));
             break;
         }
     }
     // No lookup starts once the stream is no longer polled; this drops the
     // ones in flight.
     drop(lookups);
-    items(it)
+    Ok(items(it))
 }
 
 /// The references, each as read, the listing they define, and the cursor's
 /// offset: every reference is read before the cursor and `finish`. A cursor
 /// past the last reference is refused; one at it answers nothing.
-fn read_references(args: &Args) -> Result<(Vec<Args>, Vec<Reference>, Value, usize), ToolError> {
+fn read_references(args: &Args) -> Result<(Vec<Args>, Vec<Reference>, Listing, usize), ToolError> {
     let elements = args.objects(
         "references",
         1,
@@ -148,12 +154,13 @@ fn read_references(args: &Args) -> Result<(Vec<Args>, Vec<Reference>, Value, usi
         .map(|(i, element)| read_reference(i, element))
         .collect::<Result<Vec<_>, _>>()?;
     let list = json!({"references": refs.iter().map(reference_fields).collect::<Vec<_>>()});
-    let start = Cursor::read(args, &list)?;
+    let listing = Listing::new(FIND, &list);
+    let start = listing.read(args)?;
     if start > refs.len() {
-        return Err(Cursor::refused(FIND));
+        return Err(Listing::refused(FIND));
     }
     args.finish()?;
-    Ok((elements, refs, list, start))
+    Ok((elements, refs, listing, start))
 }
 
 /// Reference `i`, refused when Navidrome would drop its lookup text and
@@ -216,17 +223,17 @@ fn read_kind(args: &Args) -> Result<(&'static str, LibraryKind), ToolError> {
 }
 
 /// A listing's fields: echoed in the answer and the facts of a failure.
-fn listing_fields(list: Value) -> Map<String, Value> {
+fn listing_fields(list: &Value) -> Map<String, Value> {
     let Value::Object(fields) = list else {
         unreachable!("a listing is an object literal");
     };
-    fields
+    fields.clone()
 }
 
 const SEARCH: &str = "search_library";
 
 /// The query refusals of `search_library` (D11).
-const SEARCH_TOO_SHORT: &str = "text of at least 2 characters, or 1 character outside the Latin alphabet, besides surrounding spaces and a trailing *";
+const SEARCH_TOO_SHORT: &str = "text of at least 2 characters, or 1 character other than an ASCII character or a letter Navidrome reads as one ASCII letter (such as é), besides surrounding spaces and a trailing *";
 const SEARCH_DROPPED: &str =
     "text with a character other than spaces, quotes, brackets, parentheses, braces, commas and slashes";
 
@@ -238,20 +245,35 @@ fn searched(query: &str) -> &str {
     q.strip_suffix('*').unwrap_or(q)
 }
 
-/// Whether search3 answers nothing for `q` as searched: it does for a text
-/// under 2 bytes (persistence/sql_search.go:75-77) once sanitize.Accents
-/// has turned each accented Latin letter into ASCII (searching.go:67), so
-/// one ASCII or Latin letter is too short. One character outside the Latin
-/// alphabet is searched, as Navidrome means a CJK one to be
-/// (persistence/sql_search_like.go:39-41).
+/// The lowercase letters deluan/sanitize's Accents turns into one ASCII
+/// letter (sanitize.go:218-303 at fdfd8fdfaa55, the commit Navidrome
+/// 0.64.2's go.mod pins). Æ, Œ, Þ and ß become two letters ("ae", "oe",
+/// "th", "ss"), and every letter it does not list stays as it is.
+const ONE_ASCII_LETTER: &str = "àáâãäåăçèéêëìíîïðłñńòóôõōöøřśșşšțùúûūüýÿż";
+
+/// Whether search3 answers nothing for `q` as searched. searchAll lowercases
+/// the query and runs sanitize.Accents on it (server/subsonic/searching.go:
+/// 67), and doSearch answers nothing for a query under 2 bytes
+/// (persistence/sql_search.go:75-77). So one character is too short when it
+/// is ASCII or its lowercase is a letter Accents turns into one ASCII
+/// letter; any other single character is 2 bytes or more and is searched,
+/// as Navidrome means a CJK one to be (persistence/sql_search_like.go:39-41).
 fn too_short(q: &str) -> bool {
     let mut chars = q.chars();
     match (chars.next(), chars.next()) {
         (None, _) => true,
         (Some(c), None) => {
-            c.is_ascii()
-                || ('\u{c0}'..='\u{24f}').contains(&c)
-                || ('\u{1e00}'..='\u{1eff}').contains(&c)
+            // Go's unicode.ToLower maps İ to i; Rust's to_lowercase gives
+            // "i" and a combining dot.
+            let lower: Vec<char> = if c == 'İ' {
+                vec!['i']
+            } else {
+                c.to_lowercase().collect()
+            };
+            match lower.as_slice() {
+                [l] => l.is_ascii() || ONE_ASCII_LETTER.contains(*l),
+                _ => false,
+            }
         }
         _ => false,
     }
@@ -280,34 +302,28 @@ pub(crate) async fn search_library(
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new(SEARCH, args, &["query", "kind", "limit", "cursor"]);
-    let read = || -> Result<_, ToolError> {
-        let query = read_query(&args)?;
-        let (name, kind) = read_kind(&args)?;
-        let list = json!({"query": query, "kind": name});
-        let page = Page::read(&args, list.clone())?;
-        args.finish()?;
-        Ok((query, name, kind, list, page))
-    };
-    let (query, name, kind, list, page) = match read() {
-        Ok(read) => read,
-        Err(e) => return failed(e),
-    };
-    let navi = match navidrome_of(state, caller, Stage::LibraryCheck, &args).await {
-        Ok(navi) => navi,
-        Err(e) => return failed(e),
-    };
-    let fields = listing_fields(list);
-    let offset = u32::try_from(page.offset).expect("Cursor::read keeps an offset within u32");
-    let limit = page.limit as u32;
-    match library::search(&navi, &query, kind, offset, limit + 1).await {
-        Ok(found) => {
+    answer(
+        async {
+            let query = read_query(&args)?;
+            let (name, kind) = read_kind(&args)?;
+            let list = json!({"query": query, "kind": name});
+            let page = Page::read(&args, list.clone())?;
+            args.finish()?;
+            let navi = navidrome_of(state, caller, Stage::LibraryCheck, &args).await?;
+            let fields = listing_fields(&list);
+            let offset =
+                u32::try_from(page.offset).expect("Listing::read keeps an offset within u32");
+            let limit = page.limit as u32;
+            let found = library::search(&navi, &query, kind, offset, limit + 1)
+                .await
+                .map_err(|f| upstream_error(f, fields.clone(), args.same_call()))?;
             let mut items = found.into_values();
             let more = items.len() > page.limit;
             items.truncate(page.limit);
-            success(fit(fields, name, items, &page, more))
+            Ok(fit(fields, name, items, &page, more))
         }
-        Err(f) => failed(upstream_error(f, fields, args.same_call())),
-    }
+        .await,
+    )
 }
 
 /// `get_library_album`: the album and a page of its songs.
@@ -317,35 +333,22 @@ pub(crate) async fn get_library_album(
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new("get_library_album", args, &["album_id", "limit", "cursor"]);
-    let read = || -> Result<_, ToolError> {
-        let album_id = args.string("album_id")?;
-        let list = json!({"album_id": album_id});
-        let page = Page::read(&args, list.clone())?;
-        args.finish()?;
-        Ok((album_id, list, page))
-    };
-    let (album_id, list, page) = match read() {
-        Ok(read) => read,
-        Err(e) => return failed(e),
-    };
-    let navi = match navidrome_of(state, caller, Stage::LibraryCheck, &args).await {
-        Ok(navi) => navi,
-        Err(e) => return failed(e),
-    };
-    match library::album(&navi, &album_id).await {
-        Ok((album, songs)) => {
-            let items: Vec<Value> = songs
-                .get(page.offset..)
-                .unwrap_or_default()
-                .iter()
-                .map(|song| json!(song))
-                .collect();
+    answer(
+        async {
+            let album_id = args.string("album_id")?;
+            let list = json!({"album_id": album_id});
+            let page = Page::read(&args, list.clone())?;
+            args.finish()?;
+            let navi = navidrome_of(state, caller, Stage::LibraryCheck, &args).await?;
+            let (album, songs) = library::album(&navi, &album_id)
+                .await
+                .map_err(|f| upstream_error(f, listing_fields(&list), args.same_call()))?;
             let mut fields = Map::new();
             fields.insert("album".into(), json!(album));
-            success(fit(fields, "songs", items, &page, false))
+            Ok(fit(fields, "songs", page.of(&songs), &page, false))
         }
-        Err(f) => failed(upstream_error(f, listing_fields(list), args.same_call())),
-    }
+        .await,
+    )
 }
 
 /// `list_starred`: a page of what the caller starred of one kind.
@@ -355,30 +358,27 @@ pub(crate) async fn list_starred(
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new("list_starred", args, &["kind", "limit", "cursor"]);
-    let read = || -> Result<_, ToolError> {
-        let (name, kind) = read_kind(&args)?;
-        let list = json!({"kind": name});
-        let page = Page::read(&args, list.clone())?;
-        args.finish()?;
-        Ok((name, kind, list, page))
-    };
-    let (name, kind, list, page) = match read() {
-        Ok(read) => read,
-        Err(e) => return failed(e),
-    };
-    let navi = match navidrome_of(state, caller, Stage::LibraryCheck, &args).await {
-        Ok(navi) => navi,
-        Err(e) => return failed(e),
-    };
-    let fields = listing_fields(list);
-    match library::starred(&navi, kind).await {
-        Ok(starred) => {
-            let items = starred.into_values();
-            let items = items.get(page.offset..).unwrap_or_default().to_vec();
-            success(fit(fields, name, items, &page, false))
+    answer(
+        async {
+            let (name, kind) = read_kind(&args)?;
+            let list = json!({"kind": name});
+            let page = Page::read(&args, list.clone())?;
+            args.finish()?;
+            let navi = navidrome_of(state, caller, Stage::LibraryCheck, &args).await?;
+            let fields = listing_fields(&list);
+            let starred = library::starred(&navi, kind)
+                .await
+                .map_err(|f| upstream_error(f, fields.clone(), args.same_call()))?;
+            Ok(fit(
+                fields,
+                name,
+                page.of(&starred.into_values()),
+                &page,
+                false,
+            ))
         }
-        Err(f) => failed(upstream_error(f, fields, args.same_call())),
-    }
+        .await,
+    )
 }
 
 #[cfg(test)]
@@ -390,10 +390,11 @@ mod tests {
     use super::*;
     use crate::connection::test_util::{call_tool, document, mcp_app, mcp_app_with};
     use crate::core::library::LOOKUPS_AT_ONCE;
-    use crate::mcp::paging::Cursor;
+    use crate::mcp::args::tests::large_references;
     use crate::services::NavidromeLookupError;
     use crate::test_navidrome::{
-        child, native_song, subsonic_failed, subsonic_ok, NavidromeFor, NavidromeStub,
+        child, native_song, song_requests, subsonic_failed, subsonic_ok, NavidromeFor,
+        NavidromeStub,
     };
 
     #[tokio::test]
@@ -525,13 +526,6 @@ mod tests {
         json!({"artist": "Marrow Choir", "title": title})
     }
 
-    fn song_requests(navi: &NavidromeStub) -> Vec<String> {
-        navi.asked_with_queries()
-            .into_iter()
-            .filter(|t| t.starts_with("/api/song"))
-            .collect()
-    }
-
     /// nginx's 502 page (src/http/ngx_http_special_response.c), which the native client keeps
     /// as the cause (client.rs, `native_failure`).
     const NGINX_502: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
@@ -624,7 +618,8 @@ mod tests {
                         "size_bytes": 28734112, "path": "Marrow Choir/Winter Songs/03 - O Holy Night.flac",
                         "recording_mbid": null, "rating": 4, "starred": true,
                         "starred_at": "2026-11-02T18:04:51.112Z", "play_count": 3,
-                        "match": {"kind": "exact", "score": null, "differs": [], "duration_delta_s": 0}}]}],
+                        "match": {"kind": "exact", "score": null, "differs": [], "duration_delta_s": 0,
+                            "unchecked": []}}]}],
                 "cursor": null})
         );
     }
@@ -799,7 +794,7 @@ mod tests {
             "album": null, "recording_mbid": null, "duration_s": null}]});
         let at = |offset: usize| {
             json!({"references": [reference("O Holy Night")],
-                "cursor": Cursor::make("find_in_library", &list, offset)})
+                "cursor": Listing::new("find_in_library", &list).cursor(offset)})
         };
         let end = document(&call_tool(app.clone(), &token, "find_in_library", at(1)).await);
         assert_eq!(
@@ -817,15 +812,6 @@ mod tests {
             "find_in_library: cursor must be a cursor find_in_library returned for the same arguments"
         );
         assert!(song_requests(&navi).is_empty());
-    }
-
-    /// 100 references of three 500-character fields: about 155,000 characters of arguments.
-    fn large_references() -> Value {
-        let field = "x".repeat(500);
-        let refs: Vec<Value> = (0..100)
-            .map(|_| json!({"artist": field, "title": field, "album": field}))
-            .collect();
-        json!({"references": refs})
     }
 
     #[tokio::test]
@@ -879,7 +865,7 @@ mod tests {
         );
         assert_eq!(
             e["message"],
-            "error returned from database: (code: 5) database is locked The call is too large to offer again in next."
+            "error returned from database: (code: 5) database is locked. The call is too large to offer again in next."
         );
     }
 
@@ -925,11 +911,13 @@ mod tests {
         let navi = NavidromeStub::start();
         navi.answer("/rest/search3", &[&subsonic_ok(r#""searchResult3":{}"#)]);
         let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
-        let short = "text of at least 2 characters, or 1 character outside the Latin alphabet, besides surrounding spaces and a trailing *";
+        let short = "text of at least 2 characters, or 1 character other than an ASCII character or a letter Navidrome reads as one ASCII letter (such as é), besides surrounding spaces and a trailing *";
         for (query, expected) in [
             (" n* ", short),
             // sanitize.Accents turns it into "e", one byte (server/subsonic/searching.go:67)
             ("é", short),
+            // lowercased to ō first, then "o"
+            ("Ō", short),
             ("()", "text with a character other than spaces, quotes, brackets, parentheses, braces, commas and slashes"),
         ] {
             let e = &document(
@@ -1064,5 +1052,173 @@ mod tests {
             (e["code"].as_str(), &e["next"]),
             (Some("navidrome_refused"), &json!([]))
         );
+    }
+
+    #[test]
+    fn one_letter_is_searched_when_navidrome_reads_it_as_two_bytes() {
+        // sanitize.Accents (sanitize.go:218-303 at fdfd8fdfaa55): ß to "ss", æ to "ae", Œ (lowercased
+        // to œ) to "oe", þ to "th"; × and ÷ and Cyrillic, Greek and CJK letters are not in the table
+        // and stay 2 or more bytes.
+        for q in ["ß", "æ", "Œ", "þ", "ẞ", "×", "÷", "я", "λ", "日"] {
+            assert!(!too_short(q), "{q}");
+        }
+        for q in ["", "n", "7", "é", "Ø", "ł", "ż", "Ÿ", "İ"] {
+            assert!(too_short(q), "{q}");
+        }
+        assert!(!too_short("no"));
+    }
+
+    #[tokio::test]
+    async fn search_library_follows_its_cursor() {
+        let navi = NavidromeStub::start();
+        let songs = |ids: &[&str]| {
+            subsonic_ok(&format!(
+                r#""searchResult3":{{"song":[{}]}}"#,
+                ids.iter()
+                    .map(|id| child(id, "Marrow Choir", "Silent Night"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+        };
+        navi.answer(
+            "/rest/search3",
+            &[&songs(&["s0", "s1", "s2"]), &songs(&["s2", "s3"])],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let args = json!({"query": "night", "limit": 2});
+        let first = document(&call_tool(app.clone(), &token, "search_library", args.clone()).await);
+        let mut next = args;
+        next["cursor"] = first["cursor"].clone();
+        let second = document(&call_tool(app, &token, "search_library", next).await);
+        let ids = |doc: &Value| {
+            doc["songs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["song_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (ids(&first), ids(&second)),
+            (
+                vec!["s0".to_string(), "s1".to_string()],
+                vec!["s2".to_string(), "s3".to_string()]
+            )
+        );
+        assert_eq!(second["cursor"], Value::Null);
+        let asked: Vec<String> = navi
+            .asked_with_queries()
+            .into_iter()
+            .filter(|t| t.starts_with("/rest/search3"))
+            .collect();
+        assert!(
+            asked[1].contains("songCount=3") && asked[1].contains("songOffset=2"),
+            "{asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_album_page_at_or_past_its_last_song_is_empty_and_ends() {
+        let navi = NavidromeStub::start();
+        let album = subsonic_ok(&format!(
+            r#""album":{{"id":"7hQ2nLr5VxZ0cYbM8wTkAf","name":"Winter Songs","artist":"Marrow Choir","songCount":2,"duration":526,"year":2019,"genres":[],"song":[{},{}]}}"#,
+            child("s1", "Marrow Choir", "O Holy Night"),
+            child("s2", "Marrow Choir", "Silent Night")
+        ));
+        navi.answer("/rest/getAlbum", &[&album]);
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let list = json!({"album_id": "7hQ2nLr5VxZ0cYbM8wTkAf"});
+        let at = |offset: usize| {
+            json!({"album_id": "7hQ2nLr5VxZ0cYbM8wTkAf", "limit": 1,
+                "cursor": Listing::new("get_library_album", &list).cursor(offset)})
+        };
+        let last = document(&call_tool(app.clone(), &token, "get_library_album", at(1)).await);
+        assert_eq!(
+            (last["songs"][0]["song_id"].as_str(), &last["cursor"]),
+            (Some("s2"), &Value::Null)
+        );
+        for offset in [2, 7] {
+            let doc =
+                document(&call_tool(app.clone(), &token, "get_library_album", at(offset)).await);
+            assert_eq!(
+                (&doc["album"]["name"], &doc["songs"], &doc["cursor"]),
+                (&json!("Winter Songs"), &json!([]), &Value::Null),
+                "{offset}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn starred_songs_page_to_their_end() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getStarred2",
+            &[&subsonic_ok(&format!(
+                r#""starred2":{{"song":[{},{}]}}"#,
+                child("s1", "Marrow Choir", "O Holy Night"),
+                child("s2", "Marrow Choir", "Silent Night")
+            ))],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let list = json!({"kind": "songs"});
+        let at = |offset: usize| json!({"limit": 1, "cursor": Listing::new("list_starred", &list).cursor(offset)});
+        let first =
+            document(&call_tool(app.clone(), &token, "list_starred", json!({"limit": 1})).await);
+        assert_eq!(
+            first["cursor"],
+            json!(Listing::new("list_starred", &list).cursor(1))
+        );
+        let last = document(&call_tool(app.clone(), &token, "list_starred", at(1)).await);
+        assert_eq!(
+            (last["songs"][0]["song_id"].as_str(), &last["cursor"]),
+            (Some("s2"), &Value::Null)
+        );
+        for offset in [2, 9] {
+            let doc = document(&call_tool(app.clone(), &token, "list_starred", at(offset)).await);
+            assert_eq!(
+                (&doc["songs"], &doc["cursor"]),
+                (&json!([]), &Value::Null),
+                "{offset}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_entry_of_control_characters_stays_under_the_cap() {
+        // Five files from a Soulseek peer whose tags and paths are padded with U+0001, which
+        // Navidrome keeps (model/metadata/metadata.go:366-380) and serde_json writes as \u0001.
+        let navi = NavidromeStub::start();
+        let pad = "\u{1}".repeat(488);
+        let five: Vec<String> = (0..5)
+            .map(|i| {
+                let mut song: Value = serde_json::from_str(&native_song(
+                    &format!("s{i}"),
+                    &format!("Bing Crosby{pad}"),
+                    &format!("Silent Night{pad}"),
+                    149.0,
+                    None,
+                ))
+                .unwrap();
+                song["album"] = json!("\u{1}".repeat(500));
+                song["path"] = json!("\u{1}".repeat(500));
+                song["suffix"] = json!("\u{1}".repeat(500));
+                song.to_string()
+            })
+            .collect();
+        navi.answer("/api/song", &[&format!("[{}]", five.join(","))]);
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let result = call_tool(
+            app,
+            &token,
+            "find_in_library",
+            json!({"references": [{"artist": "Bing Crosby", "title": "Silent Night"}]}),
+        )
+        .await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.chars().count() <= 20_000, "{}", text.chars().count());
+        let doc = document(&result);
+        let matches = doc["results"][0]["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 5);
+        assert!(matches.iter().all(|m| m["match"]["kind"] == "exact"));
     }
 }

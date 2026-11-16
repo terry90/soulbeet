@@ -35,6 +35,14 @@ pub(crate) fn success(fields: Map<String, Value>) -> CallToolResult {
     CallToolResult::success(vec![text(document)])
 }
 
+/// A tool's answer: its fields as a success, or its failure.
+pub(crate) fn answer(result: Result<Map<String, Value>, ToolError>) -> CallToolResult {
+    match result {
+        Ok(fields) => success(fields),
+        Err(e) => failed(e),
+    }
+}
+
 /// `{"ok": false, "error": {...}}` as one text block, the error being
 /// `error_object`; marked as an error, with no structured content.
 pub(crate) fn failed(error: ToolError) -> CallToolResult {
@@ -104,7 +112,14 @@ fn refused_input(message: String, field: &str, expected: &str, next: Vec<NextCal
 
 /// What a failure's message adds when the call it would offer again is too
 /// large to repeat in `next`.
-pub(crate) const TOO_LARGE_TO_REPEAT: &str = "The call is too large to offer again in next.";
+const TOO_LARGE_TO_REPEAT: &str = "The call is too large to offer again in next.";
+
+/// `message` followed by the sentence saying the call is too large to offer
+/// again, as a sentence of its own.
+pub(crate) fn too_large_to_repeat(message: &str) -> String {
+    let stop = if message.ends_with('.') { " " } else { ". " };
+    format!("{message}{stop}{TOO_LARGE_TO_REPEAT}")
+}
 
 /// A service's failure (D13): `retry`, the call that failed, is offered
 /// when the failure says the same source can answer later, and when that
@@ -119,7 +134,7 @@ pub(crate) fn upstream_error(
     if failure.retry == RetryAdvice::SameSourceLater {
         match retry {
             Some(call) => next.push(call),
-            None => failure.message = format!("{} {TOO_LARGE_TO_REPEAT}", failure.message),
+            None => failure.message = too_large_to_repeat(&failure.message),
         }
     }
     ToolError {

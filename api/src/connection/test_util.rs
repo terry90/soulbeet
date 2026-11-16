@@ -43,8 +43,8 @@ use crate::transfer_registry::RunningBatch;
 
 impl ConnectionState {
     /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits,
-    /// `test_key()`, no client metadata documents, `sample_facts()`, and no
-    /// user linked to Navidrome.
+    /// `test_key()`, no client metadata documents, `sample_facts()`, no
+    /// user linked to Navidrome and no NAVIDROME_MUSIC_PATH.
     pub(crate) fn for_test(db: SqlitePool) -> ConnectionState {
         ConnectionState {
             mcp_off: None,
@@ -56,6 +56,7 @@ impl ConnectionState {
             documents: FixedDocuments::new(vec![]),
             status: Arc::new(FixedStatus(Ok(sample_facts()))),
             navidrome: Arc::new(NavidromeFor(Err(|| NavidromeLookupError::NotLinked))),
+            navidrome_music_path: None,
             log: Arc::new(RequestLog::default()),
         }
     }

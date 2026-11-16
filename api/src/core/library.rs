@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use shared::failure::{cut_chars, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
+use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
 use shared::navidrome::LibraryStats;
 use shared::recommendation::normalize_for_matching;
 use soulbeet::navidrome::models::{NativeSong, SubsonicAlbum, SubsonicArtist, SubsonicSong};
@@ -48,9 +48,14 @@ pub struct SongFacts {
     pub play_count: u64,
 }
 
-/// A text field taken from Navidrome, cut to TEXT_MAX_CHARS; empty is unknown.
+/// A text taken from Navidrome, cut to TEXT_MAX_CHARS of JSON (`cut_json`).
+fn cut(value: String) -> String {
+    cut_json(value, TEXT_MAX_CHARS)
+}
+
+/// A text field taken from Navidrome, cut as `cut` does; empty is unknown.
 fn text(value: &str) -> Option<String> {
-    (!value.is_empty()).then(|| cut_chars(value.to_string(), TEXT_MAX_CHARS))
+    (!value.is_empty()).then(|| cut(value.to_string()))
 }
 
 /// An id or time taken from Navidrome, never cut; empty is unknown.
@@ -67,7 +72,7 @@ impl From<&NativeSong> for SongFacts {
     fn from(song: &NativeSong) -> SongFacts {
         SongFacts {
             song_id: song.id.clone(),
-            title: cut_chars(song.title.clone(), TEXT_MAX_CHARS),
+            title: cut(song.title.clone()),
             artist: text(&song.artist),
             album: text(&song.album),
             album_id: given(Some(&song.album_id)),
@@ -76,7 +81,7 @@ impl From<&NativeSong> for SongFacts {
             duration_s: (song.duration > 0.0).then(|| song.duration.round() as u32),
             format: text(&song.suffix),
             bitrate_kbps: known(song.bit_rate),
-            size_bytes: Some(song.size),
+            size_bytes: (song.size != 0).then_some(song.size),
             path: text(&song.path),
             recording_mbid: given(song.mbz_recording_id.as_deref()),
             rating: song.rating,
@@ -91,7 +96,7 @@ impl From<&SubsonicSong> for SongFacts {
     fn from(song: &SubsonicSong) -> SongFacts {
         SongFacts {
             song_id: song.id.clone(),
-            title: cut_chars(song.title.clone(), TEXT_MAX_CHARS),
+            title: cut(song.title.clone()),
             artist: song.artist.as_deref().and_then(text),
             album: song.album.as_deref().and_then(text),
             album_id: given(song.album_id.as_deref()),
@@ -132,7 +137,7 @@ impl From<&SubsonicAlbum> for AlbumFacts {
     fn from(album: &SubsonicAlbum) -> AlbumFacts {
         AlbumFacts {
             album_id: album.id.clone(),
-            name: cut_chars(album.display_name().to_string(), TEXT_MAX_CHARS),
+            name: cut(album.display_name().to_string()),
             artist: album.artist.as_deref().and_then(text),
             year: album.year.and_then(known),
             song_count: album.song_count,
@@ -162,7 +167,7 @@ impl From<&SubsonicArtist> for ArtistFacts {
     fn from(artist: &SubsonicArtist) -> ArtistFacts {
         ArtistFacts {
             artist_id: artist.id.clone(),
-            name: cut_chars(artist.name.clone(), TEXT_MAX_CHARS),
+            name: cut(artist.name.clone()),
             album_count: artist.album_count,
             rating: artist.user_rating.unwrap_or(0),
             starred: artist.starred.is_some(),
@@ -304,6 +309,11 @@ pub struct MatchHow {
     pub differs: Vec<&'static str>,
     /// The song's length less the reference's, when both are known.
     pub duration_delta_s: Option<i64>,
+    /// What the reference gives that the song does not say, so it was not
+    /// compared: `album` (when given and the song has none) and `duration`
+    /// (when given and Navidrome does not know the song's length). It never
+    /// counts as agreement: such a song is no exact match.
+    pub unchecked: Vec<&'static str>,
 }
 
 /// What the library holds for a reference.
@@ -313,8 +323,9 @@ pub struct Found {
     pub matches: Vec<Match>,
     /// Matches left out of `matches`.
     pub more_matches: usize,
-    /// The text lookup read TEXT_LOOKUP_PAGES full pages, so Navidrome may
-    /// hold more candidates than were compared.
+    /// The MBID lookup read a full page, or the text lookup read
+    /// TEXT_LOOKUP_PAGES full pages, so Navidrome may hold more candidates
+    /// than were compared.
     pub candidates_truncated: bool,
 }
 
@@ -355,7 +366,8 @@ fn word_dice(a: &str, b: &str) -> f64 {
 /// D8. None when `song` is not a match. An MBID is compared ignoring ASCII
 /// case, as UUIDs are. A song whose length Navidrome does not know has no
 /// duration_delta_s, so a reference with a duration matches it at best
-/// fuzzily, with no `duration` in `differs`.
+/// fuzzily, with `duration` in `unchecked`, not in `differs`; an album the
+/// song does not name is `unchecked` too.
 pub(crate) fn classify(r: &Reference, song: &NativeSong) -> Option<Match> {
     let facts = SongFacts::from(song);
     let duration_delta_s = r
@@ -373,7 +385,11 @@ pub(crate) fn classify(r: &Reference, song: &NativeSong) -> Option<Match> {
     if !title_same {
         differs.push("title");
     }
-    if r.album
+    let mut unchecked = Vec::new();
+    if r.album.is_some() && song.album.is_empty() {
+        unchecked.push("album");
+    } else if r
+        .album
         .as_deref()
         .is_some_and(|album| !same(album, &song.album))
     {
@@ -381,6 +397,9 @@ pub(crate) fn classify(r: &Reference, song: &NativeSong) -> Option<Match> {
     }
     if length_off {
         differs.push("duration");
+    }
+    if r.duration_s.is_some() && duration_delta_s.is_none() {
+        unchecked.push("duration");
     }
     let mbid = r
         .recording_mbid
@@ -412,6 +431,7 @@ pub(crate) fn classify(r: &Reference, song: &NativeSong) -> Option<Match> {
             score,
             differs,
             duration_delta_s,
+            unchecked,
         },
     })
 }
@@ -433,14 +453,15 @@ pub async fn find(navi: &NavidromeClient, r: &Reference) -> Result<Found, Failur
             }
         }
     };
+    let mut candidates_truncated = false;
     if let Some(mbid) = &r.recording_mbid {
         let songs = navi
             .find_songs(mbid, 0, LOOKUP_PAGE)
             .await
             .map_err(failure)?;
+        candidates_truncated = songs.len() == LOOKUP_PAGE as usize;
         take(songs, &mut matches);
     }
-    let mut candidates_truncated = false;
     if !matches.iter().any(|m| m.how.kind == MatchKind::Mbid) {
         let text = format!("{} {}", r.artist, r.title);
         for page in 0..TEXT_LOOKUP_PAGES {
@@ -454,7 +475,7 @@ pub async fn find(navi: &NavidromeClient, r: &Reference) -> Result<Found, Failur
             if short {
                 break;
             }
-            candidates_truncated = page + 1 == TEXT_LOOKUP_PAGES;
+            candidates_truncated |= page + 1 == TEXT_LOOKUP_PAGES;
         }
     }
     matches.sort_by(|a, b| {
@@ -627,7 +648,10 @@ mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::models::navidrome_library::NavidromeLibraryRow;
-    use crate::test_navidrome::{child, native_song, subsonic_failed, subsonic_ok, NavidromeStub};
+    use crate::test_navidrome::{
+        child, native_song, song_requests, subsonic_failed, subsonic_ok, NavidromeStub,
+    };
+    use serde_json::json;
     use shared::failure::{Cause, FailureCode, RetryAdvice, Service};
     use soulbeet::navidrome::models::{NativeSong, SubsonicSong};
 
@@ -713,7 +737,8 @@ mod tests {
         ))
         .unwrap();
         let f = SongFacts::from(&song);
-        assert_eq!(f.title.chars().count(), 500);
+        assert!((495..=500).contains(&shared::failure::json_chars(&f.title)));
+        assert!(f.title.contains(" characters left out]\n"), "{}", f.title);
         assert_eq!(f.recording_mbid, None);
         assert_eq!(f.song_id, "3sG8kPq0WmZ1xYbN4vTcDe");
     }
@@ -868,7 +893,8 @@ mod tests {
                 kind: MatchKind::Mbid,
                 score: None,
                 differs: vec!["artist", "title"],
-                duration_delta_s: None
+                duration_delta_s: None,
+                unchecked: vec![]
             }
         );
     }
@@ -886,7 +912,8 @@ mod tests {
                 kind: MatchKind::Exact,
                 score: None,
                 differs: vec![],
-                duration_delta_s: Some(-5)
+                duration_delta_s: Some(-5),
+                unchecked: vec![]
             }
         );
         let r = Reference {
@@ -916,7 +943,8 @@ mod tests {
                 kind: MatchKind::Fuzzy,
                 score: Some(0.83),
                 differs: vec!["title"],
-                duration_delta_s: None
+                duration_delta_s: None,
+                unchecked: vec![]
             }
         );
         let r = Reference {
@@ -931,8 +959,76 @@ mod tests {
                 kind: MatchKind::Fuzzy,
                 score: Some(1.0),
                 differs: vec!["duration"],
-                duration_delta_s: Some(-12)
+                duration_delta_s: Some(-12),
+                unchecked: vec![]
             }
+        );
+    }
+
+    #[test]
+    fn a_length_navidrome_does_not_know_is_unchecked_not_agreed() {
+        let r = Reference {
+            duration_s: Some(263),
+            album: Some("Winter Songs".into()),
+            ..wanted("Marrow Choir", "O Holy Night")
+        };
+        let mut unknown = song("O Holy Night", "Marrow Choir", 0.0, None);
+        unknown.album = String::new();
+        assert_eq!(
+            classify(&r, &unknown).unwrap().how,
+            MatchHow {
+                kind: MatchKind::Fuzzy,
+                score: Some(1.0),
+                differs: vec![],
+                duration_delta_s: None,
+                unchecked: vec!["album", "duration"]
+            }
+        );
+    }
+
+    #[test]
+    fn zero_and_empty_navidrome_values_are_unknown() {
+        // Navidrome sends 0 or "" for what it does not know (model/mediafile.go:49-63), and an
+        // empty MBID for an untagged file.
+        let mut record: serde_json::Value = serde_json::from_str(&native_song(
+            "3sG8kPq0WmZ1xYbN4vTcDe",
+            "Marrow Choir",
+            "O Holy Night",
+            0.0,
+            Some(""),
+        ))
+        .unwrap();
+        for (key, zero) in [
+            ("year", json!(0)),
+            ("bitRate", json!(0)),
+            ("suffix", json!("")),
+            ("size", json!(0)),
+            ("trackNumber", json!(0)),
+            ("albumId", json!("")),
+        ] {
+            record[key] = zero;
+        }
+        let f = SongFacts::from(&serde_json::from_value::<NativeSong>(record).unwrap());
+        assert_eq!(
+            (f.year, f.duration_s, f.bitrate_kbps, f.format, f.size_bytes),
+            (None, None, None, None, None)
+        );
+        assert_eq!((f.track, f.album_id, f.recording_mbid), (None, None, None));
+        let child: SubsonicSong = serde_json::from_str(
+            r#"{"id":"x1","title":"Silent Night","year":0,"bitRate":0,"suffix":"","duration":0,"size":0,"musicBrainzId":""}"#,
+        )
+        .unwrap();
+        let f = SongFacts::from(&child);
+        assert_eq!(
+            (
+                f.year,
+                f.duration_s,
+                f.bitrate_kbps,
+                f.format,
+                f.size_bytes,
+                f.recording_mbid
+            ),
+            (None, None, None, None, None, None)
         );
     }
 
@@ -968,13 +1064,6 @@ mod tests {
             .map(|m| m.how.kind),
             None
         );
-    }
-
-    fn song_requests(navi: &NavidromeStub) -> Vec<String> {
-        navi.asked_with_queries()
-            .into_iter()
-            .filter(|t| t.starts_with("/api/song"))
-            .collect()
     }
 
     #[tokio::test]
@@ -1082,6 +1171,41 @@ mod tests {
                 found.more_matches
             ),
             (1, MatchKind::Exact, 0)
+        );
+        assert_eq!(song_requests(&navi).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_full_page_of_the_mbid_lookup_is_truncated() {
+        let navi = NavidromeStub::start();
+        // 100 songs tagged with another recording that a release track id ties to MBID
+        // (persistence/mediafile_repository.go:97), then nothing for the text lookup.
+        let other = "5b1e9d3c-2f4a-4c6e-8d7b-9a0c1e2f3b4d";
+        let full = (0..100)
+            .map(|i| {
+                native_song(
+                    &format!("s{i:03}"),
+                    "Marrow Choir",
+                    "O Holy Night",
+                    263.4,
+                    Some(other),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        navi.answer("/api/song", &[&format!("[{full}]"), "[]"]);
+        let r = Reference {
+            recording_mbid: Some(MBID.into()),
+            ..wanted("Marrow Choir", "O Holy Night")
+        };
+        let found = find(&navi.client(), &r).await.unwrap();
+        assert_eq!(
+            (
+                found.matches.len(),
+                found.more_matches,
+                found.candidates_truncated
+            ),
+            (5, 95, true)
         );
         assert_eq!(song_requests(&navi).len(), 2);
     }

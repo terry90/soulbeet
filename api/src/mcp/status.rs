@@ -12,12 +12,13 @@ use futures::future::{join_all, BoxFuture, Shared};
 use futures::FutureExt;
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{Failure, Stage};
+use shared::failure::{cut_json, Failure, Stage, TEXT_MAX_CHARS};
 use shared::system::{HealthLevel, SystemHealth};
 use soulbeet::navidrome::ScanStatus;
 
 use super::args::Args;
 use super::contract::{failed, success, ToolError};
+use super::paging::fit_whole;
 use super::McpCaller;
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
@@ -31,9 +32,16 @@ use crate::transfer_registry::{RunningBatch, TransferRegistry};
 /// How long a folder's free space is waited for.
 const FREE_SPACE_WAIT: Duration = Duration::from_secs(2);
 
-/// What `FreeSpaceReads::read` answers when the read takes longer than its
-/// wait.
-const NO_ANSWER: &str = "no answer within 2 seconds";
+/// What `FreeSpaceReads::read` answers when the read takes longer than
+/// `wait`: "no answer within 2 seconds", or in milliseconds for a wait
+/// that is not whole seconds.
+fn no_answer(wait: Duration) -> String {
+    match (wait.as_secs(), wait.subsec_millis()) {
+        (1, 0) => "no answer within 1 second".to_string(),
+        (secs, 0) => format!("no answer within {secs} seconds"),
+        _ => format!("no answer within {} ms", wait.as_millis()),
+    }
+}
 
 /// What the user's Navidrome account says, each read on its own.
 #[derive(Clone)]
@@ -121,20 +129,28 @@ pub(crate) async fn with_free_space(folders: Vec<Folder>) -> Vec<FolderFacts> {
     .await
 }
 
-/// One folder as `get_status` and `list_folders` report it.
-pub(crate) fn folder_fields(f: &FolderFacts, default_folder_id: Option<&str>) -> Value {
+/// One folder as `get_status` and `list_folders` report it, `in_navidrome`
+/// read against `library_roots`. Its name is the user's own text, cut to
+/// TEXT_MAX_CHARS of JSON; its path is canonical, so the kernel bounds it at
+/// PATH_MAX.
+pub(crate) fn folder_fields(
+    f: &FolderFacts,
+    default_folder_id: Option<&str>,
+    library_roots: &[PathBuf],
+) -> Value {
     let (free_bytes, free_space_failure) = match &f.free {
         Ok(bytes) => (json!(bytes), Value::Null),
         Err(e) => (Value::Null, json!(e)),
     };
     json!({
         "folder_id": f.folder.id,
-        "name": f.folder.name,
+        "name": cut_json(f.folder.name.clone(), TEXT_MAX_CHARS),
         "path": f.folder.path,
         "shared": f.folder.shared,
         "default": Some(f.folder.id.as_str()) == default_folder_id,
         "free_bytes": free_bytes,
         "free_space_failure": free_space_failure,
+        "in_navidrome": listing(Path::new(&f.folder.path), library_roots),
     })
 }
 
@@ -164,7 +180,7 @@ impl FreeSpaceReads {
         })
     }
 
-    /// The free space at `path`, or `NO_ANSWER` when the read, started now
+    /// The free space at `path`, or `no_answer` when the read, started now
     /// or by an earlier call, gives none within the wait.
     pub(crate) async fn read(self: &Arc<Self>, path: PathBuf) -> Result<u64, String> {
         let read = {
@@ -180,27 +196,40 @@ impl FreeSpaceReads {
         };
         tokio::time::timeout(self.wait, read)
             .await
-            .unwrap_or_else(|_| Err(NO_ANSWER.into()))
+            .unwrap_or_else(|_| Err(no_answer(self.wait)))
     }
 
     /// A blocking read of `path` that takes itself out of `running` once it
-    /// returns. The caller inserts it while it holds the lock, and the
-    /// read's thread takes the same lock to remove it, so the entry it
+    /// returns or panics. The caller inserts it while it holds the lock, and
+    /// the read's thread takes the same lock to remove it, so the entry it
     /// removes is its own.
     fn start(self: &Arc<Self>, path: PathBuf) -> FreeSpaceRead {
-        let reads = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let free = (reads.reader)(&path);
-            reads
-                .running
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&path);
-            free
-        })
-        .map(|joined| joined.unwrap_or_else(|join| Err(join.to_string())))
-        .boxed()
-        .shared()
+        let leaving = Leaving {
+            reads: self.clone(),
+            path,
+        };
+        tokio::task::spawn_blocking(move || (leaving.reads.reader)(&leaving.path))
+            .map(|joined| joined.unwrap_or_else(|join| Err(join.to_string())))
+            .boxed()
+            .shared()
+    }
+}
+
+/// Takes a read's entry out of `running` when the read's thread lets go of
+/// it, after the read returned or while a panic in it unwinds, so a later
+/// call starts a new read instead of waiting on one that ended.
+struct Leaving {
+    reads: Arc<FreeSpaceReads>,
+    path: PathBuf,
+}
+
+impl Drop for Leaving {
+    fn drop(&mut self) {
+        self.reads
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.path);
     }
 }
 
@@ -232,7 +261,9 @@ pub(crate) async fn call(
 }
 
 /// The status document's fields; a fact that could not be read is `null`,
-/// next to its failure.
+/// next to its failure. The folders are listed while the document stays
+/// within RESULT_MAX_CHARS; `folders_left_out` counts the rest, which
+/// list_folders pages through.
 pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<String, Value> {
     let health = &facts.health;
     let navidrome = facts.navidrome.as_ref();
@@ -254,12 +285,7 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
     let folders: Vec<Value> = facts
         .folders
         .iter()
-        .map(|f| {
-            let mut fields = folder_fields(f, default);
-            let listed = listing(Path::new(&f.folder.path), &facts.library_roots);
-            fields["in_navidrome"] = json!(listed);
-            fields
-        })
+        .map(|f| folder_fields(f, default, &facts.library_roots))
         .collect();
     let running_batches: Vec<Value> = facts
         .running_batches
@@ -286,14 +312,13 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
             "scan": scan,
             "scan_failure": scan_failure,
         },
-        "folders": folders,
         "default_folder_id": facts.default_folder_id,
         "running_batches": running_batches,
         "deletion_enabled": caller.allow_delete,
     }) else {
         unreachable!("an object literal is an object");
     };
-    fields
+    fit_whole(fields, "folders", folders, "folders_left_out")
 }
 
 /// A fact as `(value, failure)`: one of them is `null`, both when the fact
@@ -344,6 +369,7 @@ fn level_name(level: HealthLevel) -> &'static str {
 mod tests {
     use super::*;
     use crate::connection::test_util::{alice_caller, sample_facts};
+    use crate::mcp::paging::RESULT_MAX_CHARS;
     use crate::services::BackendLookupError;
 
     #[test]
@@ -363,6 +389,7 @@ mod tests {
                               "scan_failure": null},
                 "folders": [{"folder_id": "f1", "name": "Music", "path": "/music/alice", "shared": false, "default": true, "free_bytes": 1000,
                              "free_space_failure": null, "in_navidrome": "listed"}],
+                "folders_left_out": 0,
                 "default_folder_id": "f1",
                 "running_batches": [{"batch_id": "b1", "label": "Come Over", "transfers": 2}],
                 "deletion_enabled": false
@@ -515,12 +542,13 @@ mod tests {
     async fn a_hung_read_holds_one_blocking_thread_however_often_it_is_asked() {
         let reads = FreeSpaceReads::new(hung_read, Duration::from_millis(50));
         let path = PathBuf::from("/mnt/hung");
+        let no_answer = Err("no answer within 50 ms".to_string());
         for _ in 0..5 {
-            assert_eq!(reads.read(path.clone()).await, Err(NO_ANSWER.to_string()));
+            assert_eq!(reads.read(path.clone()).await, no_answer);
         }
         // Calls at once share the read too.
         let at_once = join_all((0..5).map(|_| reads.read(path.clone()))).await;
-        assert!(at_once.iter().all(|r| r == &Err(NO_ANSWER.to_string())));
+        assert!(at_once.iter().all(|r| r == &no_answer));
         assert_eq!(STARTED.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(reads.running.lock().unwrap().len(), 1);
         {
@@ -538,6 +566,64 @@ mod tests {
         assert!(reads.running.lock().unwrap().is_empty());
         assert_eq!(reads.read(path).await, Ok(7));
         assert_eq!(STARTED.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_timeout_text_names_the_wait() {
+        assert_eq!(no_answer(FREE_SPACE_WAIT), "no answer within 2 seconds");
+        assert_eq!(
+            no_answer(Duration::from_secs(1)),
+            "no answer within 1 second"
+        );
+        assert_eq!(
+            no_answer(Duration::from_millis(1500)),
+            "no answer within 1500 ms"
+        );
+    }
+
+    fn panicking_read(_: &Path) -> Result<u64, String> {
+        panic!("statvfs wrapper panicked");
+    }
+
+    #[tokio::test]
+    async fn a_read_that_panics_leaves_no_entry_behind() {
+        let reads = FreeSpaceReads::new(panicking_read, Duration::from_secs(5));
+        let path = PathBuf::from("/mnt/broken");
+        let first = reads.read(path.clone()).await.unwrap_err();
+        assert!(first.contains("panicked"), "{first}");
+        assert!(reads.running.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn folders_that_would_pass_the_cap_are_left_out_and_counted() {
+        let mut facts = sample_facts();
+        // A canonical path of 4,000 control characters, about 24,000 characters once escaped:
+        // three such folders do not fit in 60,000.
+        let path = format!("/music/{}", "\u{1}".repeat(4_000));
+        let folder = facts.folders[0].clone();
+        facts.folders = (0..3)
+            .map(|i| FolderFacts {
+                folder: Folder {
+                    id: format!("f{i}"),
+                    name: "\u{1}".repeat(10_000),
+                    path: path.clone(),
+                    ..folder.folder.clone()
+                },
+                free: Ok(1000),
+            })
+            .collect();
+        let mut doc = status_fields(&facts, &alice_caller(false));
+        assert_eq!(
+            (
+                doc["folders"].as_array().unwrap().len(),
+                &doc["folders_left_out"]
+            ),
+            (2, &json!(1))
+        );
+        let name = doc["folders"][0]["name"].as_str().unwrap();
+        assert!(shared::failure::json_chars(name) <= TEXT_MAX_CHARS);
+        doc.insert("ok".into(), json!(true));
+        assert!(Value::Object(doc).to_string().chars().count() <= RESULT_MAX_CHARS);
     }
 
     #[test]

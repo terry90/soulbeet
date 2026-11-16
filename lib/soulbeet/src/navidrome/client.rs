@@ -322,8 +322,10 @@ impl NavidromeClient {
 
     /// Every track of playlist `id` with its place, missing files included, from the native API
     /// (server/nativeapi/native_api.go:156-160), which reads the playlist with the same own,
-    /// public or admin filter as getPlaylist; Ok(None) on HTTP 404
-    /// (server/nativeapi/playlists.go:38-48). No `_end` is sent, so the list is not cut short.
+    /// public or admin filter as getPlaylist; Ok(None) on Navidrome's own 404, whose body is
+    /// http.Error's "not found\n" (server/nativeapi/playlists.go:38-48). Any other 404, such as a
+    /// proxy's for a path it does not forward, is an Http error with its body, since it says
+    /// nothing about the playlist. No `_end` is sent, so the list is not cut short.
     /// An id that is empty, "." or ".." names no playlist and is not a path segment the URL can
     /// carry, so it is Ok(None) with no request.
     pub async fn playlist_tracks(&self, id: &str) -> Result<Option<Vec<PlaylistTrack>>> {
@@ -342,11 +344,16 @@ impl NavidromeClient {
                     .query(&[("_sort", "id"), ("_order", "ASC")]),
             )
             .await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
         if !resp.status().is_success() {
-            return Err(native_failure("Get playlist tracks", resp).await);
+            let e = native_failure("Get playlist tracks", resp).await;
+            return match &e {
+                NavidromeError::Http {
+                    status: 404,
+                    raw: Some(raw),
+                    ..
+                } if raw == "not found\n" => Ok(None),
+                _ => Err(e),
+            };
         }
         let bytes = resp.bytes().await.map_err(parse)?;
         let rows: Vec<serde_json::Map<String, serde_json::Value>> =
@@ -735,6 +742,8 @@ impl NavidromeClient {
 
 /// A native track row (model.PlaylistTrack, model/playlist.go:224-229) as its place and song: the
 /// row's own `id` is the place and hides the media file's, which is `mediaFileId`.
+/// Navidrome numbers a playlist's tracks from 1 (persistence/playlist_repository.go:485-500), so a
+/// place 0 is refused with the rest of what is no place.
 fn playlist_track(mut row: serde_json::Map<String, serde_json::Value>) -> Result<PlaylistTrack> {
     let unplaced = || {
         NavidromeError::Parse(
@@ -1606,9 +1615,22 @@ mod tests {
                 status: 200,
                 body: format!("[{}]", row("x", "s9", false)),
             },
+            // A row with its place and no mediaFileId.
             Reply {
                 status: 200,
-                body: format!("[{record}]"),
+                body: format!(
+                    "[{}]",
+                    record.replace(r#""id":"3sG8kPq0WmZ1xYbN4vTcDe""#, r#""id":"1""#)
+                ),
+            },
+            Reply {
+                status: 200,
+                body: format!("[{}]", row("0", "s9", false)),
+            },
+            // nginx in front of Navidrome forwarding /rest but not /api.
+            Reply {
+                status: 404,
+                body: "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n".into(),
             },
         ]);
         let c = client(&url);
@@ -1620,7 +1642,7 @@ mod tests {
         assert_eq!(
             tracks
                 .iter()
-                .map(|t| (t.position, t.song.id.as_str(), t.song.missing))
+                .map(|t| (t.position.get(), t.song.id.as_str(), t.song.missing))
                 .collect::<Vec<_>>(),
             vec![(1, "s9", false), (2, "s1", false), (4, "s7", true)]
         );
@@ -1630,7 +1652,8 @@ mod tests {
             "/api/playlist/9fR2kLm4NpQ7sT1vW3xY5z/tracks?_sort=id&_order=ASC"
         );
         assert!(c.playlist_tracks("gone").await.unwrap().is_none());
-        for _ in 0..2 {
+        // A place that is no number, a row without mediaFileId, and place 0.
+        for _ in 0..3 {
             let err = c
                 .playlist_tracks("9fR2kLm4NpQ7sT1vW3xY5z")
                 .await
@@ -1640,11 +1663,19 @@ mod tests {
                 "{err:?}"
             );
         }
+        let err = c
+            .playlist_tracks("9fR2kLm4NpQ7sT1vW3xY5z")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Http { status: 404, raw: Some(raw), .. } if raw.contains("nginx")),
+            "{err:?}"
+        );
         // No playlist has an id that is not a path segment, so nothing is asked.
         for id in ["", ".", ".."] {
             assert!(c.playlist_tracks(id).await.unwrap().is_none(), "{id}");
         }
-        assert_eq!(seen.lock().unwrap().len(), 5);
+        assert_eq!(seen.lock().unwrap().len(), 7);
     }
 
     #[tokio::test]

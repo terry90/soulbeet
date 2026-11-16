@@ -1,19 +1,16 @@
 use musicbrainz_rs::{
     entity::{
-        artist::{Artist, ArtistSearchQuery, ArtistType},
+        artist::{Artist, ArtistType},
         artist_credit::ArtistCredit,
-        recording::{Recording, RecordingSearchQuery},
+        recording::Recording,
         release::{Release, ReleaseStatus},
-        release_group::{
-            ReleaseGroup, ReleaseGroupPrimaryType, ReleaseGroupSearchQuery,
-            ReleaseGroupSecondaryType,
-        },
+        release_group::{ReleaseGroup, ReleaseGroupPrimaryType, ReleaseGroupSecondaryType},
         BrowseResult,
     },
     Browse, Fetch, MusicBrainzClient, Search,
 };
 use serde::Serialize;
-use shared::failure::Service;
+use shared::failure::{cut_chars, Service, RAW_MAX_CHARS};
 use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, Track};
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
@@ -79,25 +76,29 @@ fn format_duration(duration_ms: &Option<u32>) -> Option<String> {
     })
 }
 
+/// What MusicBrainz answered is cut to RAW_MAX_CHARS where it enters `raw`,
+/// as a cause's text is: the error's text holds it, and serde's text quotes
+/// the value it could not read in full.
 impl From<musicbrainz_rs::Error> for MetadataError {
     fn from(e: musicbrainz_rs::Error) -> Self {
         use musicbrainz_rs::Error;
         let service = Service::Musicbrainz;
+        let cut = |raw: String| cut_chars(raw, RAW_MAX_CHARS);
         match e {
             Error::NotFound(_) => MetadataError::NotFound {
                 service,
                 status: None,
-                raw: e.to_string(),
+                raw: cut(e.to_string()),
             },
             // MusicBrainz's own `{error, help}` body, other than "Not Found"
             // (musicbrainz_rs `src/entity/api.rs:8-24`).
             Error::MusicbrainzError(query, body) => MetadataError::Rejected {
                 service,
                 status: None,
-                raw: format!(
+                raw: cut(format!(
                     "{query}: {}",
                     serde_json::to_string(&body).expect("two strings serialize")
-                ),
+                )),
             },
             // musicbrainz_rs retries MusicBrainz's 503 rate-limit answer
             // (`src/config.rs:9`, `src/fetching.rs:33-59`) until it gives up.
@@ -109,12 +110,12 @@ impl From<musicbrainz_rs::Error> for MetadataError {
             Error::ReqwestError(e) => MetadataError::Unavailable {
                 service,
                 status: e.status().map(|s| s.as_u16()),
-                raw: e.to_string(),
+                raw: cut(e.to_string()),
             },
             Error::SerdeJsonError(e) => MetadataError::Unreadable {
                 service,
                 status: None,
-                raw: e.to_string(),
+                raw: cut(e.to_string()),
             },
             Error::MissingRetryToken | Error::InvalidUserAgent(_) => unreachable!(
                 "musicbrainz_rs 44c25c8 never constructs MissingRetryToken, and gives \
@@ -166,6 +167,28 @@ where
     }
 }
 
+/// The `query=` parameter of a MusicBrainz search for `fields`, each
+/// `field:"value"`, joined by AND. Inside a quoted phrase only `"` and `\`
+/// mean anything to Lucene, so they are escaped; the whole query is then
+/// form-encoded, so `&`, `#`, `+` and `%` reach MusicBrainz as text.
+/// lucene_query_builder 0.3.0 quotes only a value holding a space and escapes
+/// nothing (`QueryString`'s Display), and musicbrainz_rs appends the
+/// parameter to the URL as it is (src/api/search_query.rs:114-127).
+fn lucene_query(fields: &[(&str, &str)]) -> String {
+    let lucene = fields
+        .iter()
+        .map(|(field, value)| {
+            let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("{field}:\"{value}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "query={}",
+        url::form_urlencoded::byte_serialize(lucene.as_bytes()).collect::<String>()
+    )
+}
+
 /// An enumeration to specify the type of search.
 #[derive(Debug)]
 pub enum SearchType {
@@ -191,11 +214,12 @@ pub async fn search(
     match search_type {
         SearchType::Track => {
             let search_results = with_retry("MusicBrainz track search", || {
-                let mut recording_query = RecordingSearchQuery::query_builder();
-                if let Some(ref artist) = artist {
-                    recording_query.artist_name(artist).and();
-                }
-                let search_query = recording_query.recording(query).build();
+                let mut fields: Vec<(&str, &str)> = artist
+                    .iter()
+                    .map(|artist| ("artistname", artist.as_str()))
+                    .collect();
+                fields.push(("recording", query));
+                let search_query = lucene_query(&fields);
                 async move {
                     Recording::search(search_query)
                         .limit(limit)
@@ -255,11 +279,12 @@ pub async fn search(
         }
         SearchType::Album => {
             let search_results = with_retry("MusicBrainz album search", || {
-                let mut album_query = ReleaseGroupSearchQuery::query_builder();
-                if let Some(ref artist) = artist {
-                    album_query.artist(artist).and();
-                }
-                let search_query = album_query.release_group(query).build();
+                let mut fields: Vec<(&str, &str)> = artist
+                    .iter()
+                    .map(|artist| ("artist", artist.as_str()))
+                    .collect();
+                fields.push(("releasegroup", query));
+                let search_query = lucene_query(&fields);
                 async move {
                     ReleaseGroup::search(search_query)
                         .limit(limit)
@@ -430,7 +455,6 @@ pub struct RecordingReleases {
     pub recording: RecordingInfo,
     /// Every release the recording is on, not only this page's.
     pub release_count: u32,
-    pub offset: u32,
     pub releases: Vec<RecordingRelease>,
 }
 
@@ -438,7 +462,7 @@ pub struct RecordingReleases {
 pub async fn search_artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, MetadataError> {
     let client = musicbrainz_client();
     let found = with_retry("MusicBrainz artist search", || {
-        let search_query = ArtistSearchQuery::query_builder().artist(query).build();
+        let search_query = lucene_query(&[("artist", query)]);
         async move {
             Artist::search(search_query)
                 .limit(limit)
@@ -501,12 +525,11 @@ fn recording_releases_from(
     recording: Recording,
     page: BrowseResult<Release>,
 ) -> Result<RecordingReleases, MetadataError> {
-    let (Ok(release_count), Ok(offset)) = (u32::try_from(page.count), u32::try_from(page.offset))
-    else {
+    let Ok(release_count) = u32::try_from(page.count) else {
         return Err(MetadataError::Unreadable {
             service: Service::Musicbrainz,
             status: None,
-            raw: "MusicBrainz answered a negative release count or offset".into(),
+            raw: "MusicBrainz answered a negative release count".into(),
         });
     };
     Ok(RecordingReleases {
@@ -519,7 +542,6 @@ fn recording_releases_from(
             first_release_date: given(recording.first_release_date.map(|d| d.0)),
         },
         release_count,
-        offset,
         releases: page
             .entities
             .into_iter()
@@ -700,7 +722,6 @@ mod tests {
                     first_release_date: Some("1995".into())
                 },
                 release_count: 1,
-                offset: 0,
                 releases: vec![RecordingRelease {
                     mbid: "317d1e85-3f9e-463e-939b-bebf47aa2178".into(),
                     title: "White Christmas".into(),
@@ -719,6 +740,37 @@ mod tests {
     }
 
     #[test]
+    fn a_search_sends_its_text_as_text() {
+        // Each of these is URL or Lucene syntax when sent as it is.
+        let name = r##"Simon & Garfunkel + "#1" \ (live): a/b"##;
+        let url = Artist::search(lucene_query(&[("artist", name)]))
+            .limit(10)
+            .as_api_request(musicbrainz_client())
+            .url;
+        let url = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(url.fragment(), None);
+        let query: Vec<(String, String)> = url
+            .query_pairs()
+            .into_owned()
+            .filter(|(key, _)| key != "fmt")
+            .collect();
+        assert_eq!(
+            query,
+            [
+                (
+                    "query".to_string(),
+                    r##"artist:"Simon & Garfunkel + \"#1\" \\ (live): a/b""##.to_string()
+                ),
+                ("limit".to_string(), "10".to_string())
+            ]
+        );
+        assert_eq!(
+            lucene_query(&[("artistname", "Bing Crosby"), ("recording", "Silent Night")]),
+            "query=artistname%3A%22Bing+Crosby%22+AND+recording%3A%22Silent+Night%22"
+        );
+    }
+
+    #[test]
     fn a_negative_release_count_is_unreadable() {
         let mut page: serde_json::Value = serde_json::from_str(RELEASES).unwrap();
         page["release-count"] = (-1).into();
@@ -729,7 +781,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             e.to_string(),
-            "Unreadable MusicBrainz answer: MusicBrainz answered a negative release count or offset"
+            "Unreadable MusicBrainz answer: MusicBrainz answered a negative release count"
         );
     }
 
