@@ -12,7 +12,7 @@ use shared::download::DownloadEvent;
 #[cfg(feature = "server")]
 use tokio::sync::{broadcast, RwLock};
 #[cfg(feature = "server")]
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Interval for cleaning up stale user channels (5 minutes).
 #[cfg(feature = "server")]
@@ -411,19 +411,10 @@ async fn run_automation() {
                 };
             let mut expired_count = 0u32;
             for track in &pending {
-                let lifetime_days = lifetime_map.get(&track.profile).copied().unwrap_or(7) as i64;
-                let created =
-                    match chrono::DateTime::parse_from_rfc3339(&track.created_at).or_else(|_| {
-                        chrono::NaiveDateTime::parse_from_str(
-                            &track.created_at,
-                            "%Y-%m-%d %H:%M:%S",
-                        )
-                        .map(|naive| naive.and_utc().fixed_offset())
-                    }) {
-                        Ok(dt) => dt,
-                        Err(_) => continue,
-                    };
-                if now.signed_duration_since(created).num_days() < lifetime_days {
+                let Some(expires) = crate::core::discovery::expires_at(track, &lifetime_map) else {
+                    continue;
+                };
+                if now < expires {
                     continue;
                 }
                 match crate::core::delete_guard::staging::remove_staged_in(
@@ -435,6 +426,10 @@ async fn run_automation() {
                 .await
                 {
                     Ok(()) => expired_count += 1,
+                    Err(f) if f == crate::core::discovery::track_not_pending() => debug!(
+                        "Automation: {} of user {} is no longer pending, so it does not expire",
+                        track.title, user.username
+                    ),
                     Err(f) => warn!(
                         "Automation: could not expire {} for user {}: {}",
                         track.title,

@@ -61,52 +61,17 @@ use crate::AuthSession;
 #[cfg(feature = "server")]
 use super::{failure_error, server_error};
 #[cfg(feature = "server")]
+use crate::core::discovery::{
+    choose_discovery_folder, claim_run, current_progress, discovery_disabled,
+    discovery_folder_required, generation_running, parse_profiles, promote, remove_in, start_in,
+    DiscoveryEffects, Replace,
+};
+#[cfg(feature = "server")]
 use crate::core::{database_failure, target_unwritable};
 #[cfg(feature = "server")]
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 #[cfg(feature = "server")]
 use shared::navidrome::DiscoveryProgress;
-
-#[cfg(feature = "server")]
-fn generation_running() -> Failure {
-    Failure::new(
-        FailureCode::AlreadyRunning,
-        Stage::Input,
-        RetryAdvice::NotRetryable,
-        "Discovery generation already in progress",
-    )
-}
-
-#[cfg(feature = "server")]
-fn discovery_disabled() -> Failure {
-    Failure::new(
-        FailureCode::InvalidInput,
-        Stage::Input,
-        RetryAdvice::NotRetryable,
-        "Discovery is not enabled",
-    )
-}
-
-#[cfg(feature = "server")]
-fn choose_discovery_folder() -> UserAction {
-    UserAction::new(
-        UserActionCode::AddFolder,
-        "Choose a discovery folder",
-        "Settings > Library > Discovery",
-    )
-}
-
-/// The user's settings name no discovery folder.
-#[cfg(feature = "server")]
-fn discovery_folder_required() -> Failure {
-    Failure::new(
-        FailureCode::FolderRequired,
-        Stage::Input,
-        RetryAdvice::NeedsUser,
-        "No download folder configured for discovery",
-    )
-    .with_user_action(choose_discovery_folder())
-}
 
 /// The discovery folder the user's settings name no longer exists.
 #[cfg(feature = "server")]
@@ -124,22 +89,6 @@ fn discovery_folder_not_found() -> Failure {
 #[cfg(feature = "server")]
 fn run_database_failure(stage: Stage, e: String) -> Failure {
     database_failure(stage, &e).with_message(e)
-}
-
-/// Records `progress` as `user_id`'s run unless one is still running, in
-/// which case nothing changes. The caller holds the `DISCOVERY_PROGRESS`
-/// write lock, so two starts cannot both pass.
-#[cfg(feature = "server")]
-fn claim_run(
-    runs: &mut HashMap<String, DiscoveryProgress>,
-    user_id: &str,
-    progress: DiscoveryProgress,
-) -> Result<(), Failure> {
-    if runs.get(user_id).is_some_and(|p| !p.is_terminal()) {
-        return Err(generation_running());
-    }
-    runs.insert(user_id.to_string(), progress);
-    Ok(())
 }
 
 /// Get the current user's discovery configuration
@@ -191,139 +140,107 @@ pub struct TrackActionRequest {
 
 #[post("/api/discovery/promote", auth: AuthSession)]
 pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    super::navidrome::promote_discovery_track_internal(
+    let effects: Arc<dyn DiscoveryEffects> = Arc::new(LiveDiscovery);
+    let replace = Replace::Guarded(crate::core::delete_guard::Origin::Ui);
+    promote(
+        &crate::db::DB,
+        &effects,
+        &auth.0.id(),
         &req.track_id,
-        &auth.0.user_id,
-        crate::core::delete_guard::Origin::Ui,
+        replace,
     )
     .await
+    .map(|_| ())
     .map_err(failure_error)
 }
 
 #[post("/api/discovery/remove", auth: AuthSession)]
 pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
-
-    let (track, folder) =
-        super::navidrome::owned_discovery_track(&req.track_id, &auth.0.user_id, Stage::Delete)
-            .await
-            .map_err(failure_error)?;
-    remove_staged_in(&crate::db::DB, &track, &folder, StagedOutcome::Removed)
+    remove_in(&crate::db::DB, &auth.0.id(), &req.track_id)
         .await
+        .map(|_| ())
         .map_err(failure_error)
 }
 
 #[post("/api/discovery/start-generation", auth: AuthSession)]
 pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
-    use shared::navidrome::{GenerationStatus, ProfilePhase, ProfileProgress};
-
-    let user_id = auth.0.user_id.clone();
-
-    // Read settings to get profile list for initial progress state
-    let settings = UserSettings::get(&user_id)
+    start_in(&crate::db::DB, &LiveDiscovery, &auth.0)
         .await
-        .map_err(|e| failure_error(database_failure(Stage::Input, e)))?;
-    if !settings.discovery_enabled {
-        return Err(failure_error(discovery_disabled()));
-    }
-    let selected_profiles = parse_profiles(&settings.discovery_profiles);
-    let track_counts = settings.parse_track_counts();
-    let folder_id = settings
-        .discovery_folder_id
-        .as_ref()
-        .ok_or_else(|| failure_error(discovery_folder_required()))?;
-
-    // Determine which profiles need tracks (skip those already at target)
-    let mut profile_entries = Vec::new();
-    for profile in &selected_profiles {
-        let profile_name = profile.to_string();
-        let target = track_counts.get(&profile_name).copied().unwrap_or(10) as usize;
-        let existing =
-            DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name)
-                .await
-                .map(|v| v.len())
-                .unwrap_or(0);
-        let phase = if target.saturating_sub(existing) == 0 {
-            ProfilePhase::Skipped
-        } else {
-            ProfilePhase::Waiting
-        };
-        profile_entries.push(ProfileProgress {
-            profile: profile_name,
-            phase,
-            current: 0,
-            total: 0,
-        });
-    }
-
-    // Claim the run and write its initial progress BEFORE spawn (prevents
-    // race with first poll)
-    {
-        let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
-        claim_run(
-            &mut map,
-            &user_id,
-            DiscoveryProgress {
-                status: GenerationStatus::Running,
-                profiles: profile_entries,
-                started_at: Some(chrono::Utc::now().to_rfc3339()),
-                ..Default::default()
-            },
-        )
-        .map_err(failure_error)?;
-    }
-
-    // Spawn background task
-    let uid = user_id.clone();
-    tokio::spawn(async move {
-        match generate_discovery_playlist_internal(&uid).await {
-            Ok(result) => {
-                let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
-                if let Some(p) = map.get_mut(&uid) {
-                    p.status = GenerationStatus::Complete;
-                    p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    for pp in &mut p.profiles {
-                        if pp.phase != ProfilePhase::Skipped {
-                            pp.phase = ProfilePhase::Done;
-                            pp.current = pp.total;
-                        }
-                    }
-                    p.result = Some(result);
-                }
-            }
-            Err(e) => {
-                let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
-                if let Some(p) = map.get_mut(&uid) {
-                    p.status = GenerationStatus::Error;
-                    p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    p.failure = Some(e);
-                }
-            }
-        }
-    });
-
-    Ok(())
+        .map(|_| ())
+        .map_err(failure_error)
 }
 
 #[get("/api/discovery/progress", auth: AuthSession)]
 pub async fn get_discovery_progress(
 ) -> Result<Option<shared::navidrome::DiscoveryProgress>, ServerFnError> {
-    let progress = crate::globals::DISCOVERY_PROGRESS.read().await;
-    match progress.get(&auth.0.user_id) {
-        Some(p) => {
-            // Return None for terminal states older than 5 minutes
-            if p.is_terminal() {
-                if let Some(ref completed_at) = p.completed_at {
-                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(completed_at) {
-                        if chrono::Utc::now().signed_duration_since(ts).num_minutes() > 5 {
-                            return Ok(None);
+    let progress = LiveDiscovery.current(&auth.0.id()).await;
+    Ok(progress.and_then(|p| current_progress(&p, chrono::Utc::now())))
+}
+
+/// Discovery as the running server does it: runs in `DISCOVERY_PROGRESS`, the generation in
+/// its own task, imports through the library's import queue.
+#[cfg(feature = "server")]
+pub(crate) struct LiveDiscovery;
+
+#[cfg(feature = "server")]
+#[async_trait::async_trait]
+impl DiscoveryEffects for LiveDiscovery {
+    async fn claim(&self, user: &UserId, progress: DiscoveryProgress) -> Result<(), Failure> {
+        let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+        claim_run(&mut map, &user.to_string(), progress)
+    }
+
+    async fn current(&self, user: &UserId) -> Option<DiscoveryProgress> {
+        let map = crate::globals::DISCOVERY_PROGRESS.read().await;
+        map.get(&user.to_string()).cloned()
+    }
+
+    fn generate(&self, user: &UserId) {
+        use shared::navidrome::{GenerationStatus, ProfilePhase};
+
+        let uid = user.to_string();
+        tokio::spawn(async move {
+            match generate_discovery_playlist_internal(&uid).await {
+                Ok(result) => {
+                    let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+                    if let Some(p) = map.get_mut(&uid) {
+                        p.status = GenerationStatus::Complete;
+                        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        for pp in &mut p.profiles {
+                            if pp.phase != ProfilePhase::Skipped {
+                                pp.phase = ProfilePhase::Done;
+                                pp.current = pp.total;
+                            }
                         }
+                        p.result = Some(result);
+                    }
+                }
+                Err(e) => {
+                    let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+                    if let Some(p) = map.get_mut(&uid) {
+                        p.status = GenerationStatus::Error;
+                        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        p.failure = Some(e);
                     }
                 }
             }
-            Ok(Some(p.clone()))
-        }
-        None => Ok(None),
+        });
+    }
+
+    async fn import(
+        &self,
+        src: &std::path::Path,
+        target: &std::path::Path,
+        actor: &UserId,
+        replace: Replace,
+    ) -> Result<(), Failure> {
+        let duplicates = match replace {
+            Replace::Guarded(origin) => Duplicates::Guarded {
+                actor: actor.clone(),
+                origin,
+            },
+        };
+        crate::import_queue::import_to_library(src, target, duplicates).await
     }
 }
 
@@ -1374,20 +1291,6 @@ async fn discard_download(src: &std::path::Path, download_base: &std::path::Path
 }
 
 #[cfg(feature = "server")]
-pub(crate) fn parse_profiles(s: &str) -> Vec<shared::recommendation::DiscoveryProfile> {
-    let mut profiles = Vec::new();
-    for part in s.split(',') {
-        if let Ok(p) = part.trim().parse() {
-            profiles.push(p);
-        }
-    }
-    if profiles.is_empty() {
-        profiles.push(shared::recommendation::DiscoveryProfile::default());
-    }
-    profiles
-}
-
-#[cfg(feature = "server")]
 pub async fn generate_recommendations_internal(user_id: &str) -> Result<u32, String> {
     use shared::recommendation::DiscoveryProfile;
 
@@ -1611,9 +1514,11 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::{
-        claim_run, discovery_disabled, discovery_folder_not_found, discovery_folder_required,
-        generation_running, run_database_failure, scan_imports, settle_poll, QueuedTrack,
+        discovery_folder_not_found, run_database_failure, scan_imports, settle_poll, QueuedTrack,
         FAILED_STATE_CONFIRM,
+    };
+    use crate::core::discovery::{
+        discovery_disabled, discovery_folder_required, generation_running,
     };
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
@@ -1624,9 +1529,8 @@ mod tests {
     use crate::transfer_registry::TransferRegistry;
     use shared::download::{DownloadProgress, DownloadState, DownloadableItem};
     use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserActionCode};
-    use shared::navidrome::{DiscoveryProgress, GenerationStatus};
     use soulbeet::DownloadBackend;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     #[test]
@@ -1692,23 +1596,6 @@ mod tests {
             )
         );
         assert_eq!(f.cause, Some(Cause::new(Service::Database, None, raw)));
-    }
-
-    #[test]
-    fn a_second_start_is_refused_while_the_first_runs() {
-        let running = || DiscoveryProgress {
-            status: GenerationStatus::Running,
-            ..Default::default()
-        };
-        let mut runs = HashMap::new();
-        assert_eq!(claim_run(&mut runs, "user-a", running()), Ok(()));
-        assert_eq!(
-            claim_run(&mut runs, "user-a", running()),
-            Err(generation_running())
-        );
-        assert_eq!(claim_run(&mut runs, "user-b", running()), Ok(()));
-        runs.get_mut("user-a").unwrap().status = GenerationStatus::Complete;
-        assert_eq!(claim_run(&mut runs, "user-a", running()), Ok(()));
     }
 
     #[test]

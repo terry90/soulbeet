@@ -122,13 +122,22 @@ impl DiscoveryTrackRow {
         folder_id: &str,
         profile: &str,
     ) -> Result<Vec<DiscoveryTrack>, String> {
+        Self::get_pending_by_folder_and_profile_in(&DB, folder_id, profile).await
+    }
+
+    /// The Pending tracks of `profile` in `folder_id`, oldest first.
+    pub(crate) async fn get_pending_by_folder_and_profile_in(
+        db: &sqlx::SqlitePool,
+        folder_id: &str,
+        profile: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
         let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
             "SELECT * FROM discovery_tracks WHERE folder_id = ? AND profile = ? AND status = ? ORDER BY created_at",
         )
         .bind(folder_id)
         .bind(profile)
         .bind(DiscoveryStatus::Pending.to_string())
-        .fetch_all(&*DB)
+        .fetch_all(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -217,6 +226,22 @@ impl DiscoveryTrackRow {
     ) -> Result<bool, String> {
         let result = sqlx::query(
             "UPDATE discovery_tracks SET status = 'Promoting' WHERE id = ? AND status = 'Pending'",
+        )
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Marks the track Removed if it is Pending (D16): true when this call changed it, false
+    /// when another call holds or ended it.
+    pub(crate) async fn try_set_removed_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+    ) -> Result<bool, String> {
+        let result = sqlx::query(
+            "UPDATE discovery_tracks SET status = 'Removed' WHERE id = ? AND status = 'Pending'",
         )
         .bind(id)
         .execute(db)

@@ -15,11 +15,11 @@ use super::server::{common_codes, ToolSpec};
 use super::status::{chosen_folder, folder_fields, with_free_space};
 use super::McpCaller;
 use crate::connection::ConnectionState;
+use crate::core::discovery::parse_profiles;
 use crate::core::library::library_roots_in;
 use crate::core::{folders, settings};
 use crate::models::folder::Folder;
 use crate::models::user_settings::{UpdateUserSettings, UserSettings};
-use crate::server_fns::discovery::parse_profiles;
 
 /// The discovery profiles, as `UserSettings` names them in its maps.
 const PROFILES: [&str; 3] = ["Conservative", "Balanced", "Adventurous"];

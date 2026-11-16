@@ -5,6 +5,7 @@ use super::unlink::{unlink_if_same, FileId, UnlinkError};
 use super::{changed_since_check, delete_failed, not_a_track, outside_library, prune, rules};
 use crate::auth::UserId;
 use crate::core::database_failure;
+use crate::core::discovery::track_not_pending;
 use crate::folder_policy::{canonical_folder_path, PolicyRows};
 use crate::models::discovery_history::DiscoveryHistoryRow;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
@@ -35,25 +36,38 @@ impl StagedOutcome {
 
 /// Removes a pending discovery track's file, marks the track Removed and sets the outcome of
 /// the folder owner's discovery history for its artist and title (a history write that fails
-/// is logged and does not fail the removal). The stored path must canonicalize to a regular
-/// file strictly inside the canonical `Discovery/<profile>` of `folder`, in no deeper folder
-/// of another user; a file already gone is only marked. The file goes through unlink_if_same
-/// with the identity read just before; empty parents are pruned up to the profile folder.
+/// is logged and does not fail the removal). The track is claimed first, Pending to Removed
+/// (D16): `track_not_pending` when another call holds or ended it, and Pending again when the
+/// removal then fails. The stored path must canonicalize to a regular file strictly inside the
+/// canonical `Discovery/<profile>` of `folder`, in no deeper folder of another user; a file
+/// already gone is only marked. The file goes through unlink_if_same with the identity read
+/// just before; empty parents are pruned up to the profile folder.
 pub(crate) async fn remove_staged_in(
     db: &SqlitePool,
     track: &DiscoveryTrack,
     folder: &Folder,
     outcome: StagedOutcome,
 ) -> Result<(), Failure> {
-    let stored = Path::new(&track.path);
-    match tokio::fs::canonicalize(stored).await {
-        Ok(path) => remove_contained(db, &path, track, folder).await?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(delete_failed(stored, &e)),
-    }
-    DiscoveryTrackRow::update_status_in(db, &track.id, &DiscoveryStatus::Removed)
+    let claimed = DiscoveryTrackRow::try_set_removed_in(db, &track.id)
         .await
         .map_err(|e| database_failure(Stage::Delete, e))?;
+    if !claimed {
+        return Err(track_not_pending());
+    }
+    let stored = Path::new(&track.path);
+    let removed = match tokio::fs::canonicalize(stored).await {
+        Ok(path) => remove_contained(db, &path, track, folder).await,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(delete_failed(stored, &e)),
+    };
+    if let Err(failure) = removed {
+        if let Err(e) =
+            DiscoveryTrackRow::update_status_in(db, &track.id, &DiscoveryStatus::Pending).await
+        {
+            warn!("Could not set '{}' back to pending: {e}", track.title);
+        }
+        return Err(failure);
+    }
     if let Err(e) = DiscoveryHistoryRow::update_outcome_in(
         db,
         &folder.user_id,

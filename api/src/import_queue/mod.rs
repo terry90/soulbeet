@@ -788,14 +788,13 @@ pub async fn canonical_target(target: &Path) -> std::io::Result<PathBuf> {
     tokio::fs::canonicalize(target).await
 }
 
-/// Imports one file into a library folder for `actor` and waits for it (promote),
-/// replacing an earlier copy through the guard with `origin`. Ok when the file
-/// imported, its warnings logged since no row shows them, else the outcome's failure.
+/// Imports one file into a library folder and waits for it (promote), treating an earlier
+/// copy by `duplicates`. Ok when the file imported, its warnings logged since no row shows
+/// them, else the outcome's failure.
 pub async fn import_to_library(
     src: &Path,
     target: &Path,
-    actor: &UserId,
-    origin: Origin,
+    duplicates: Duplicates,
 ) -> Result<(), Failure> {
     let outcome = IMPORT_QUEUE
         .submit(ImportJob {
@@ -808,10 +807,7 @@ pub async fn import_to_library(
             cleanup_root: None,
             choice: DriverChoice::Auto,
             choices: None,
-            duplicates: Duplicates::Guarded {
-                actor: actor.clone(),
-                origin,
-            },
+            duplicates,
             last_run: None,
         })
         .await
