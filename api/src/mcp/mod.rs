@@ -21,6 +21,7 @@ use crate::oauth::{now_unix, oauth_error, SCOPE};
 mod args;
 pub(crate) mod contract;
 pub(crate) mod library;
+pub(crate) mod metadata;
 mod paging;
 pub(crate) mod playlists;
 pub(crate) mod server;

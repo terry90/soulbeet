@@ -16,7 +16,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
-use super::{library, playlists, settings, status, McpCaller};
+use super::{library, metadata, playlists, settings, status, McpCaller};
 use crate::connection::ConnectionState;
 
 /// What the server tells a client at `initialize`.
@@ -50,6 +50,9 @@ pub(crate) const COMMON_CODES: &str = "invalid_input, rate_limited, settings_unr
 
 /// The failure codes of every tool that reads the caller's Navidrome.
 pub(crate) const NAVIDROME_CODES: &str = "navidrome_not_linked, navidrome_auth_failed, navidrome_unreachable, navidrome_circuit_open, navidrome_refused";
+
+/// The failure codes of every tool that asks MusicBrainz or Last.fm.
+pub(crate) const METADATA_CODES: &str = "metadata_unavailable, metadata_not_found, metadata_rate_limited, provider_not_configured, backend_response_unreadable";
 
 /// Every tool, in the fixed order `tools/list` answers (MCP 2026-07-28
 /// `server/tools.mdx`, "deterministic order").
@@ -184,6 +187,45 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         idempotent: true,
         open_world: false,
         call: |state, caller, args| Box::pin(playlists::get_playlist(state, caller, args)),
+    },
+    ToolSpec {
+        name: "search_music",
+        title: "Search music",
+        description: |_| {
+            format!("Searches MusicBrainz (default) or Last.fm for recordings, releases (albums and EPs) or artists, to check that a recording exists and get its ids. Returns MBIDs where the provider has them, titles, artists, dates, release types and durations, and provider_used, which is musicbrainz when Last.fm was asked for and no Last.fm key is saved. Artist search reads MusicBrainz only. Up to 25 results (limit, default 10). MusicBrainz allows one request a second, so a search takes one to a few seconds. Failure codes: {COMMON_CODES}, {METADATA_CODES}.")
+        },
+        input_schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["recording","release","artist"]},"query":{"type":"string"},"artist":{"type":"string","description":"A credit to narrow a recording or release search"},"provider":{"type":"string","enum":["musicbrainz","lastfm"]},"limit":{"type":"integer","minimum":1,"maximum":25}},"required":["kind","query"],"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: true,
+        call: |state, caller, args| Box::pin(metadata::search_music(state, caller, args)),
+    },
+    ToolSpec {
+        name: "get_release",
+        title: "Release",
+        description: |_| {
+            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id or a lastfm: id that search_music gave. MBIDs never change. Pages of 25 tracks by default (limit up to 100). Failure codes: {COMMON_CODES}, {METADATA_CODES}.")
+        },
+        input_schema: r#"{"type":"object","properties":{"release_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["release_id"],"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: true,
+        call: |state, caller, args| Box::pin(metadata::get_release(state, caller, args)),
+    },
+    ToolSpec {
+        name: "get_recording_releases",
+        title: "Recording releases",
+        description: |_| {
+            format!("Shows a MusicBrainz recording (title, artist, length) and the releases it appears on, each with date, country, status and its release group's types, so you can tell a studio album from a compilation or a live record. Pages of 25 releases by default (limit up to 100, release_count gives the total). Takes two MusicBrainz requests, about two seconds. Failure codes: {COMMON_CODES}, {METADATA_CODES}.")
+        },
+        input_schema: r#"{"type":"object","properties":{"recording_mbid":{"type":"string","description":"A MusicBrainz recording id"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["recording_mbid"],"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: true,
+        call: |state, caller, args| Box::pin(metadata::get_recording_releases(state, caller, args)),
     },
 ];
 
@@ -323,7 +365,8 @@ mod tests {
             assert_eq!(t["description"], (spec.description)(120), "{}", spec.name);
             assert_eq!(
                 t["annotations"],
-                json!({"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}),
+                json!({"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true,
+                    "openWorldHint": spec.open_world}),
                 "{}",
                 spec.name
             );
@@ -334,6 +377,16 @@ mod tests {
                 spec.name
             );
         }
+        // Only the metadata tools ask a service outside Soulful and the user's Navidrome.
+        let open: Vec<&str> = tools
+            .iter()
+            .filter(|t| t["annotations"]["openWorldHint"] == true)
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            open,
+            ["search_music", "get_release", "get_recording_releases"]
+        );
         assert!(tools[0]["description"]
             .as_str()
             .unwrap()
@@ -374,6 +427,11 @@ mod tests {
             "search_library" => json!({"query": "night"}),
             "get_library_album" => json!({"album_id": "7hQ2nLr5VxZ0cYbM8wTkAf"}),
             "get_playlist" => json!({"playlist_id": "9fR2kLm4NpQ7sT1vW3xY5z"}),
+            "search_music" => json!({"kind": "recording", "query": "Silent Night"}),
+            "get_release" => json!({"release_id": "317d1e85-3f9e-463e-939b-bebf47aa2178"}),
+            "get_recording_releases" => {
+                json!({"recording_mbid": "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8"})
+            }
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
