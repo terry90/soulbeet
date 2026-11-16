@@ -1053,12 +1053,39 @@ mod tests {
     #[tokio::test]
     async fn a_public_playlist_of_someone_without_soulful_keeps_the_track() {
         let lib = Library::new().await;
-        // dave has a Navidrome account and no Soulful one; alice's own read shows his public playlist.
+        // dave has a Navidrome account and no Soulful one; bob's read shows his public playlist.
         lib.fake.playlist("dave", "p-dave", &["s1"], true, false);
         assert_eq!(
             refusal(lib.guard().check_song(&lib.alice(), "s1").await),
             (FailureCode::DeleteBlockedByOtherUser, KEPT.into())
         );
+    }
+
+    #[tokio::test]
+    async fn the_callers_own_read_keeps_a_track_no_other_linked_listener_can_check() {
+        // alice is the only linked listener, so only her own read shows dave's public playlist.
+        let lib = Library::new().await;
+        sqlx::query("UPDATE users SET navidrome_token = NULL WHERE id = 'bob'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        lib.fake.playlist("dave", "p-dave", &["s1"], true, false);
+        let f = lib
+            .guard()
+            .check_song(&lib.alice(), "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.message.as_str(), f.cause),
+            (FailureCode::DeleteBlockedByOtherUser, KEPT, None)
+        );
+        assert_eq!(lib.fake.reads_by("bob"), 0);
+        assert_eq!(
+            lib.fake.ratings_set(),
+            vec![],
+            "the own read runs before rule 4's write"
+        );
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
     }
 
     #[tokio::test]
@@ -1091,19 +1118,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_playlist_read_that_fails_keeps_the_track() {
-        // bob's song and album reads answer; his playlist read fails.
+        // Only bob's playlist read fails; his song and album reads answer.
         let lib = Library::new().await;
-        lib.fake.fails_after("bob", 2, || {
+        lib.fake.playlists_unreadable("bob", || {
             NavidromeLookupError::Client(NavidromeError::CircuitOpen)
         });
         assert_eq!(
-            refusal(lib.guard().check_song(&lib.alice(), "s1").await).0,
-            FailureCode::DeleteVetoUnknown
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
+            (FailureCode::DeleteVetoUnknown, VETO.into())
         );
-        assert_eq!(lib.fake.reads_by("bob"), 3);
-        // alice's record read and her one-song search answer; her own playlist read fails.
+        assert_eq!(lib.fake.ratings_set(), vec![]);
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        // Only alice's own playlist read fails, and it fails before rule 4's write.
         let lib = Library::new().await;
-        lib.fake.fails_after("alice", 2, || {
+        lib.fake.playlists_unreadable("alice", || {
             NavidromeLookupError::Client(NavidromeError::CircuitOpen)
         });
         let f = lib
@@ -1115,8 +1143,8 @@ mod tests {
             (f.code, f.stage),
             (FailureCode::NavidromeCircuitOpen, Stage::Delete)
         );
-        assert_eq!(lib.fake.reads_by("alice"), 3);
         assert_eq!(lib.fake.ratings_set(), vec![]);
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
     }
 
     #[tokio::test]

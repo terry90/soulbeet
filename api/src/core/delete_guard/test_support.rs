@@ -47,8 +47,8 @@ struct State {
     /// The average stored per song, as the last setRating left it.
     averages: HashMap<String, f64>,
     unreadable: HashMap<String, fn() -> NavidromeLookupError>,
-    /// Reads as a user past this count fail with the error.
-    fails_after: HashMap<String, (usize, Fails)>,
+    /// song_playlists as a user fails with the error; their other reads answer.
+    playlists_unreadable: HashMap<String, Fails>,
     playlists: Vec<Playlist>,
     minimal: HashSet<String>,
     legacy: HashSet<String>,
@@ -94,17 +94,10 @@ impl State {
             .insert(song.to_string(), (mean * 100.0).round() / 100.0);
     }
 
-    /// Counts a read as `user` and fails it when `user` is unreadable, or past the reads
-    /// fails_after allows.
+    /// Counts a read as `user` and fails it when `user` is unreadable.
     fn read(&mut self, user: &UserId) -> Result<String, NavidromeLookupError> {
         let user = user.to_string();
-        let reads = self.reads.entry(user.clone()).or_default();
-        *reads += 1;
-        if let Some((allowed, error)) = self.fails_after.get(&user) {
-            if *reads > *allowed {
-                return Err(error());
-            }
-        }
+        *self.reads.entry(user.clone()).or_default() += 1;
         match self.unreadable.get(&user) {
             Some(error) => Err(error()),
             None => Ok(user),
@@ -205,12 +198,10 @@ impl FakeNavidrome {
         self.with(|s| s.unreadable.insert(user.into(), error));
     }
 
-    /// The next `calls` reads as `user` (any method) answer; every later one fails with `error`.
-    pub fn fails_after(&self, user: &str, calls: usize, error: Fails) {
-        self.with(|s| {
-            let done = s.reads.get(user).copied().unwrap_or(0);
-            s.fails_after.insert(user.into(), (done + calls, error));
-        })
+    /// Reading the playlists that hold a song as `user` fails with `error`; their other reads
+    /// answer.
+    pub fn playlists_unreadable(&self, user: &str, error: Fails) {
+        self.with(|s| s.playlists_unreadable.insert(user.into(), error));
     }
 
     /// `owner`'s playlist `name` (also its id) holding `songs`, public or not, smart (with
@@ -406,6 +397,9 @@ impl Listeners for FakeNavidrome {
     ) -> Result<Vec<NativePlaylist>, NavidromeLookupError> {
         self.with(|s| {
             let user = s.read(user)?;
+            if let Some(error) = s.playlists_unreadable.get(&user) {
+                return Err(error());
+            }
             let admin = s.admins.contains(&user);
             let mut lists: Vec<NativePlaylist> = s
                 .playlists
