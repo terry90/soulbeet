@@ -753,6 +753,7 @@ mod tests {
             EnsureItem::Created {
                 job_id: job.to_string(),
                 fuzzy: vec![],
+                replacing: vec![],
             },
             EnsureItem::AlreadyRunning {
                 job_id: "j-running".into(),

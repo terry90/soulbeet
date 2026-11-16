@@ -1,9 +1,14 @@
-//! The library's earlier copy of an import, replaced only through the delete guard (D2).
+//! The library's earlier copy of an import, replaced only through the delete guard (D2), and for
+//! a replacing job only the copies its confirmed preview named (D9).
 
 use crate::auth::UserId;
-use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin};
+use crate::core::delete_guard::{
+    Checked, ForgetVia, Guard, NotRemoved, Origin, PreviewedFile, ReplaceSet,
+};
+use crate::core::deletion::replace_consent_expired;
 use crate::core::logged;
-use shared::failure::Failure;
+use crate::ledger::{Replacement, ReplacementOutcome};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::navidrome::DeletionReason;
 use soulbeet::{
     duplicate_note, DuplicateNote, ImportOutcome, ImportResult, ImportedItem, MusicImporter,
@@ -20,6 +25,38 @@ const OVERLAPS: &str = "this import already replaced or added one of these files
 /// Why the files after one whose removal did not report are kept.
 const AFTER_UNCONFIRMED: &str = "an earlier removal of this import stopped before it reported";
 
+/// A removal refused because it overlaps an earlier one of its run (OVERLAPS): the run itself
+/// holds one of its files.
+fn overlapping() -> Failure {
+    Failure::new(
+        FailureCode::DeleteInUse,
+        Stage::Delete,
+        RetryAdvice::NotRetryable,
+        OVERLAPS,
+    )
+}
+
+/// Which earlier copies settle_removals may delete.
+pub(super) enum Removals<'a> {
+    /// Step 6's rule: the guard alone decides, as `origin`.
+    Guarded(&'a Origin),
+    /// A replacing job (D9): before `set.expires_at`, only an earlier item whose Checked passes
+    /// `is_in(&set.files)` counts as allowed (its refusal is the note's reason like any other),
+    /// deleted as `Origin::Mcp { grant_id: set.grant_id }`; from `expires_at` on, every removal
+    /// is kept with replace_consent_expired(set.expires_at) and nothing is checked.
+    Previewed { set: &'a ReplaceSet, now: i64 },
+}
+
+/// A run's result with what became of each removal it wanted.
+pub(super) struct Settled {
+    pub result: ImportResult,
+    /// One per removal settled, in order.
+    pub replaced: Vec<Replacement>,
+    /// Previewed: the song ids of `set.files` whose path no deletion of this call removed, in set
+    /// order. Guarded: empty.
+    pub not_replaced: Vec<String>,
+}
+
 /// Settles the removals beets wanted in `result`, an import into `target` (the canonical
 /// library folder beets ran on), as one run, and appends what became of each earlier copy to
 /// the outcome's warnings, and the first new copy that could not be moved into place to its
@@ -30,88 +67,161 @@ pub(super) async fn settle_removals(
     guard: &Guard<'_>,
     importer: &dyn MusicImporter,
     actor: &UserId,
-    origin: &Origin,
+    removals: Removals<'_>,
     exempt_jobs: &[String],
     target: &Path,
     mut result: ImportResult,
-) -> ImportResult {
-    let removals = std::mem::take(&mut result.removals);
-    let ImportOutcome::Imported {
+) -> Settled {
+    let (origin, previewed) = match removals {
+        Removals::Guarded(origin) => (origin.clone(), None),
+        Removals::Previewed { set, now } => (
+            Origin::Mcp {
+                grant_id: set.grant_id.clone(),
+            },
+            Some((set, now)),
+        ),
+    };
+    let wanted = std::mem::take(&mut result.removals);
+    let mut run = Run {
+        remover: Remover {
+            guard,
+            importer,
+            actor,
+            origin: &origin,
+            previewed: previewed.map(|(set, _)| set.files.as_slice()),
+            expired: previewed
+                .filter(|(set, now)| *now >= set.expires_at)
+                .map(|(set, _)| replace_consent_expired(set.expires_at)),
+            exempt_jobs,
+            target,
+        },
+        taken: HashSet::new(),
+        removed: Vec::new(),
+        unmoved: None,
+    };
+    let mut replaced = Vec::new();
+    if let ImportOutcome::Imported {
         warnings,
         items,
         failure,
         ..
     } = &mut result.outcome
-    else {
-        return result;
-    };
-    let mut run = Run {
-        replace: Replacement {
-            guard,
-            importer,
-            actor,
-            origin,
-            exempt_jobs,
-            target,
-        },
-        taken: items
+    {
+        run.taken = items
             .iter()
             .map(|item| item.path.clone())
             .chain(
-                removals
+                wanted
                     .iter()
                     .flat_map(|r| r.imported.iter().map(|(_, p)| p.clone())),
             )
-            .collect(),
-        unmoved: None,
-    };
-    for removal in &removals {
-        warnings.extend(run.settle(removal, items).await);
+            .collect();
+        for removal in &wanted {
+            let (notes, outcome) = run.settle(removal, items).await;
+            warnings.extend(notes);
+            replaced.extend(outcome.map(|outcome| Replacement {
+                existing: removal.existing.clone(),
+                outcome,
+            }));
+        }
+        if failure.is_none() {
+            *failure = run.unmoved;
+        }
     }
-    if failure.is_none() {
-        *failure = run.unmoved;
+    Settled {
+        result,
+        replaced,
+        not_replaced: not_replaced(previewed.map(|(set, _)| set), &run.removed),
     }
-    result
 }
 
-struct Replacement<'a> {
+/// The song ids of `set`'s files whose path is not one of `removed`, in set order; none without
+/// a set.
+pub(super) fn not_replaced(set: Option<&ReplaceSet>, removed: &[PathBuf]) -> Vec<String> {
+    (set.into_iter())
+        .flat_map(|set| &set.files)
+        .filter(|file| !removed.contains(&file.path))
+        .map(|file| file.song_id.clone())
+        .collect()
+}
+
+struct Remover<'a> {
     guard: &'a Guard<'a>,
     importer: &'a dyn MusicImporter,
     actor: &'a UserId,
     origin: &'a Origin,
+    /// For a replacing job, the previewed files, the only ones it may delete.
+    previewed: Option<&'a [PreviewedFile]>,
+    /// For a replacing job whose consent ran out, why every removal is kept.
+    expired: Option<Failure>,
     exempt_jobs: &'a [String],
     target: &'a Path,
 }
 
+impl Remover<'_> {
+    /// `item`, an earlier copy in the target, checked by the guard and, for a replacing job,
+    /// against the preview.
+    async fn check(&self, item: &ImportedItem) -> Result<Checked, Failure> {
+        let checked = (self.guard)
+            .check_file(self.actor, item, self.target, self.exempt_jobs)
+            .await?;
+        if let Some(previewed) = self.previewed {
+            checked.is_in(previewed)?;
+        }
+        Ok(checked)
+    }
+}
+
 /// One run's removals, settled in turn.
 struct Run<'a> {
-    replace: Replacement<'a>,
+    remover: Remover<'a>,
     /// Paths, relative to the target as beets names items, that a removal of this run must not
     /// touch: every file the run imported, and each file an earlier removal deleted or moved a
     /// new file to.
     taken: HashSet<PathBuf>,
+    /// The canonical files this run deleted.
+    removed: Vec<PathBuf>,
     /// The failure of the first new copy that could not be moved into place.
     unmoved: Option<Failure>,
 }
 
 impl Run<'_> {
-    /// The notes of one removal. One whose task imported nothing is skipped: its new items never
-    /// reached the library (D2). One that names no earlier item is skipped too: there is
-    /// nothing it may replace. One that names a path `taken` holds is refused (OVERLAPS). Every
-    /// earlier item is checked before any is deleted; the new items are moved into place only
-    /// once all are deleted and forgotten cleanly, and `items` then names them where the
-    /// importer has them after the move, failed or not.
-    async fn settle(&mut self, removal: &WantedRemoval, items: &mut [ImportedItem]) -> Vec<String> {
+    /// The notes of one removal and what became of it. One whose task imported nothing is
+    /// skipped (no outcome): its new items never reached the library (D2). One that names no
+    /// earlier item is skipped too: there is nothing it may replace. For a replacing job whose
+    /// consent ran out every one is kept, checked for nothing. One that names a path `taken`
+    /// holds is refused (OVERLAPS). Every earlier item is checked before any is deleted; the new
+    /// items are moved into place only once all are deleted and forgotten cleanly, and `items`
+    /// then names them where the importer has them after the move, failed or not.
+    async fn settle(
+        &mut self,
+        removal: &WantedRemoval,
+        items: &mut [ImportedItem],
+    ) -> (Vec<String>, Option<ReplacementOutcome>) {
         if removal.imported.is_empty() || removal.existing.is_empty() {
-            return vec![];
+            return (vec![], None);
         }
-        let replace = &self.replace;
-        let target = replace.target;
+        let remover = &self.remover;
+        let target = remover.target;
         let earlier: Vec<PathBuf> = removal
             .existing
             .iter()
             .map(|item| target.join(&item.path))
             .collect();
+        let kept = |f: &Failure| {
+            let note = duplicate_note(&earlier, target, DuplicateNote::Blocked(&f.message));
+            let outcome = ReplacementOutcome::Kept { failure: f.clone() };
+            (vec![note], Some(outcome))
+        };
+        if let Some(f) = &remover.expired {
+            warn!(
+                "Kept the earlier copy {} of an import into {}: {}",
+                earlier[0].display(),
+                target.display(),
+                logged(f)
+            );
+            return kept(f);
+        }
         if removal
             .existing
             .iter()
@@ -122,19 +232,11 @@ impl Run<'_> {
                 earlier[0].display(),
                 target.display()
             );
-            return vec![duplicate_note(
-                &earlier,
-                target,
-                DuplicateNote::Blocked(OVERLAPS),
-            )];
+            return kept(&overlapping());
         }
         let mut checked = Vec::with_capacity(removal.existing.len());
         for (item, file) in removal.existing.iter().zip(&earlier) {
-            match replace
-                .guard
-                .check_file(replace.actor, item, target, replace.exempt_jobs)
-                .await
-            {
+            match remover.check(item).await {
                 Ok(c) => checked.push(c),
                 Err(f) => {
                     warn!(
@@ -143,33 +245,33 @@ impl Run<'_> {
                         target.display(),
                         logged(&f)
                     );
-                    return vec![duplicate_note(
-                        &earlier,
-                        target,
-                        DuplicateNote::Blocked(&f.message),
-                    )];
+                    return kept(&f);
                 }
             }
         }
         let mut warnings = Vec::new();
+        let mut removed = Vec::new();
         for (deleted, c) in checked.into_iter().enumerate() {
             let forget = ForgetVia::Worker {
-                importer: replace.importer,
+                importer: remover.importer,
                 library: target,
             };
-            let outcome = replace
+            let path = c.path.clone();
+            let outcome = remover
                 .guard
                 .carry_out(
-                    replace.actor,
+                    remover.actor,
                     c,
                     DeletionReason::Replaced,
-                    replace.origin,
+                    remover.origin,
                     forget,
                 )
                 .await;
             match outcome {
                 Ok(done) => {
                     self.taken.insert(removal.existing[deleted].path.clone());
+                    self.removed.push(path.clone());
+                    removed.push(path);
                     warnings.extend(done);
                 }
                 Err(stop) => {
@@ -185,7 +287,15 @@ impl Run<'_> {
                     );
                     let mut notes = stopped_notes(&earlier, deleted, target, &stop);
                     notes.extend(warnings);
-                    return notes;
+                    let outcome = match stop {
+                        NotRemoved::Kept(failure) if removed.is_empty() => {
+                            ReplacementOutcome::Kept { failure }
+                        }
+                        NotRemoved::Kept(failure) | NotRemoved::Unconfirmed(failure) => {
+                            ReplacementOutcome::PartlyRemoved { removed, failure }
+                        }
+                    };
+                    return (notes, Some(outcome));
                 }
             }
         }
@@ -194,7 +304,7 @@ impl Run<'_> {
         // items stay where beets put them.
         if warnings.is_empty() {
             let ids: Vec<u64> = removal.imported.iter().map(|(id, _)| *id).collect();
-            let moved = replace.importer.relocate(target, &ids).await;
+            let moved = remover.importer.relocate(target, &ids).await;
             self.taken
                 .extend(moved.now.iter().map(|(_, now)| now.clone()));
             renamed(items, &removal.imported, &moved.now);
@@ -209,7 +319,7 @@ impl Run<'_> {
             }
         }
         notes.extend(warnings);
-        notes
+        (notes, Some(ReplacementOutcome::Replaced))
     }
 }
 
@@ -265,7 +375,10 @@ fn renamed(items: &mut [ImportedItem], imported: &[(u64, PathBuf)], moved: &[(u6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::delete_guard::test_support::{wanted, Library};
+    use crate::core::delete_guard::not_previewed;
+    use crate::core::delete_guard::quota::permission_not_granted;
+    use crate::core::delete_guard::test_support::{library_verdict, wanted, Library};
+    use crate::core::deletion::REPLACE_CONSENT_SECS;
     use crate::import_queue::test_support::{imported, StubImporter};
     use soulbeet::{FailKind, ForgetOutcome, Relocation};
 
@@ -346,12 +459,13 @@ mod tests {
             &lib.guard(),
             stub,
             &lib.alice(),
-            &Origin::Ui,
+            Removals::Guarded(&Origin::Ui),
             exempt_jobs,
             target,
             result,
         )
         .await
+        .result
     }
 
     #[tokio::test]
@@ -759,5 +873,250 @@ mod tests {
             notes(&done),
             vec!["replaced the library's earlier copy A/x.flac".to_string()]
         );
+    }
+
+    /// The files of `songs` as a preview would store them, confirmed by g1 until `expires_at`.
+    async fn replace_set(lib: &Library, songs: &[&str], expires_at: i64) -> ReplaceSet {
+        let mut files = vec![];
+        for id in songs {
+            let checked = library_verdict(lib.guard().check_song(&lib.alice(), id).await);
+            files.push(checked.previewed());
+        }
+        ReplaceSet {
+            grant_id: "g1".into(),
+            files,
+            expires_at,
+        }
+    }
+
+    fn later() -> i64 {
+        chrono::Utc::now().timestamp() + REPLACE_CONSENT_SECS
+    }
+
+    async fn replace(
+        lib: &Library,
+        stub: &StubImporter,
+        set: &ReplaceSet,
+        now: i64,
+        result: ImportResult,
+    ) -> Settled {
+        let target = lib.root.join("music/alice");
+        settle_removals(
+            &lib.guard(),
+            stub,
+            &lib.alice(),
+            Removals::Previewed { set, now },
+            &[],
+            &target,
+            result,
+        )
+        .await
+    }
+
+    fn outcomes(s: &Settled) -> Vec<&ReplacementOutcome> {
+        s.replaced.iter().map(|r| &r.outcome).collect()
+    }
+
+    #[tokio::test]
+    async fn a_previewed_copy_is_replaced_for_the_app_that_confirmed_it() {
+        let lib = Library::new().await;
+        lib.app("g1", "alice", true).await;
+        let set = replace_set(&lib, &["s1"], later()).await;
+        let stub = StubImporter::new();
+        let now = chrono::Utc::now().timestamp();
+        let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
+        let s = replace(&lib, &stub, &set, now, result).await;
+        assert_eq!(
+            notes(&s.result),
+            vec!["replaced the library's earlier copy A/x.flac".to_string()]
+        );
+        assert_eq!(
+            (outcomes(&s), s.not_replaced.len()),
+            (vec![&ReplacementOutcome::Replaced], 0)
+        );
+        assert_eq!(
+            s.replaced[0].existing,
+            vec![earlier("A/x.flac", "O Holy Night")]
+        );
+        assert!(!lib.root.join("music/alice/A/x.flac").exists());
+        let row: (String, String, Option<String>) =
+            sqlx::query_as("SELECT origin, reason, client FROM deletion_reviews")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            row,
+            ("mcp".into(), "replaced".into(), Some("claude.ai".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_outside_the_confirmed_preview_stays() {
+        let lib = Library::new().await;
+        lib.song("s2", "alice/B/y.flac", b"audio");
+        lib.fake.rates("alice", "s2", 1);
+        lib.app("g1", "alice", true).await;
+        let only_s2 = replace_set(&lib, &["s2"], later()).await;
+        let stub = StubImporter::new();
+        let now = chrono::Utc::now().timestamp();
+        let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
+        let s = replace(&lib, &stub, &only_s2, now, result).await;
+        assert_eq!(
+            notes(&s.result),
+            vec!["kept the library's earlier copy A/x.flac: This file was not in the preview this deletion was confirmed with".to_string()]
+        );
+        assert_eq!(
+            s.replaced[0].outcome,
+            ReplacementOutcome::Kept {
+                failure: not_previewed()
+            }
+        );
+        assert_eq!(s.not_replaced, vec!["s2".to_string()]);
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        assert!(lib.root.join("music/alice/B/y.flac").exists());
+        assert!(stub.relocations().is_empty() && stub.forgets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_removal_holding_an_unpreviewed_copy_keeps_every_copy_it_names() {
+        let lib = Library::new().await;
+        lib.song("s2", "alice/B/y.flac", b"audio");
+        lib.fake.rates("alice", "s2", 1);
+        lib.app("g1", "alice", true).await;
+        let only_s1 = replace_set(&lib, &["s1"], later()).await;
+        let mut both = removal("A/x.flac", vec![new_copy(7, 3), new_copy(8, 4)]);
+        both.existing.push(earlier("B/y.flac", "Silent Night"));
+        let stub = StubImporter::new();
+        let now = chrono::Utc::now().timestamp();
+        let s = replace(&lib, &stub, &only_s1, now, imported_with(vec![both])).await;
+        assert_eq!(
+            s.replaced[0].outcome,
+            ReplacementOutcome::Kept {
+                failure: not_previewed()
+            }
+        );
+        assert_eq!(s.not_replaced, vec!["s1".to_string()]);
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        assert!(lib.root.join("music/alice/B/y.flac").exists());
+    }
+
+    #[tokio::test]
+    async fn a_previewed_copy_beets_saw_no_duplicate_of_is_reported_not_replaced() {
+        // beets compares artist and title (duplicate_keys, beets/config_default.yaml:50-52): a
+        // cover with another title is never reported, so its previewed copy has no removal.
+        let lib = Library::new().await;
+        lib.song("s2", "alice/B/y.flac", b"audio");
+        lib.fake.rates("alice", "s2", 1);
+        lib.app("g1", "alice", true).await;
+        let set = replace_set(&lib, &["s1", "s2"], later()).await;
+        let stub = StubImporter::new();
+        let now = chrono::Utc::now().timestamp();
+        let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
+        let s = replace(&lib, &stub, &set, now, result).await;
+        assert_eq!(outcomes(&s), vec![&ReplacementOutcome::Replaced]);
+        assert_eq!(s.not_replaced, vec!["s2".to_string()]);
+        assert!(lib.root.join("music/alice/B/y.flac").exists());
+        // A run with no removal at all replaces nothing and lists every previewed song.
+        let s = replace(&lib, &stub, &set, now, imported_with(vec![])).await;
+        assert!(s.replaced.is_empty());
+        assert_eq!(s.not_replaced, vec!["s1".to_string(), "s2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_whose_app_lost_the_switch_keeps_the_copy() {
+        let lib = Library::new().await;
+        lib.app("g1", "alice", true).await;
+        let set = replace_set(&lib, &["s1"], later()).await;
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 0")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        let stub = StubImporter::new();
+        let now = chrono::Utc::now().timestamp();
+        let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
+        let s = replace(&lib, &stub, &set, now, result).await;
+        assert_eq!(
+            (s.replaced[0].outcome.clone(), s.not_replaced),
+            (
+                ReplacementOutcome::Kept {
+                    failure: permission_not_granted()
+                },
+                vec!["s1".to_string()]
+            )
+        );
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deletion_reviews")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replacement_imported_after_its_consent_ran_out_keeps_the_copy() {
+        let lib = Library::new().await;
+        lib.app("g1", "alice", true).await;
+        let now = 1_800_000_000;
+        let set = replace_set(&lib, &["s1"], now).await;
+        let rated = lib.fake.ratings_set();
+        let stub = StubImporter::new();
+        let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
+        let s = replace(&lib, &stub, &set, now, result).await;
+        assert_eq!(
+            s.replaced[0].outcome,
+            ReplacementOutcome::Kept {
+                failure: replace_consent_expired(now)
+            }
+        );
+        assert_eq!(
+            replace_consent_expired(now).message,
+            "The confirmation to replace this copy ran out at 2027-01-15 08:00:00 UTC; preview it again with reason replaced"
+        );
+        assert_eq!(
+            notes(&s.result),
+            vec![format!(
+                "kept the library's earlier copy A/x.flac: {}",
+                replace_consent_expired(now).message
+            )]
+        );
+        assert_eq!(lib.fake.ratings_set(), rated, "nothing was checked");
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM deletion_reviews")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replacement_that_fails_part_way_says_what_went() {
+        use std::os::unix::fs::PermissionsExt;
+        let lib = Library::new().await;
+        lib.song("s2", "alice/B/y.flac", b"audio");
+        lib.fake.rates("alice", "s2", 1);
+        lib.app("g1", "alice", true).await;
+        let set = replace_set(&lib, &["s1", "s2"], later()).await;
+        let target = lib.root.join("music/alice");
+        let x = std::fs::canonicalize(target.join("A/x.flac")).unwrap();
+        let mut both = removal("A/x.flac", vec![new_copy(7, 3), new_copy(8, 4)]);
+        both.existing.push(earlier("B/y.flac", "Silent Night"));
+        // Both pass the checks; only the second unlink is refused (step 6's part way test).
+        std::fs::set_permissions(target.join("B"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let stub = StubImporter::new();
+        let now = chrono::Utc::now().timestamp();
+        let s = replace(&lib, &stub, &set, now, imported_with(vec![both])).await;
+        std::fs::set_permissions(target.join("B"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(&s.replaced[0].outcome, ReplacementOutcome::PartlyRemoved { removed, failure }
+                if *removed == vec![x.clone()] && failure.code == FailureCode::DeleteFailed),
+            "{:?}",
+            s.replaced
+        );
+        assert_eq!(s.not_replaced, vec!["s2".to_string()]);
+        assert!(!x.exists() && target.join("B/y.flac").exists());
     }
 }

@@ -4,6 +4,7 @@
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, Failure, FailureCode, Stage, TEXT_MAX_CHARS};
+use shared::navidrome::DeletionReason;
 
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use super::contract::{
     error_object, failed, invalid_value, items, items_text, too_large_to_repeat, upstream_error,
     ItemResult, Items, NextCall, ToolError,
 };
+use super::deletion::{app_of, deletion_off, token_refused};
 use super::jobs::JobTool;
 use super::keys::{keyed, request_key, Keyed};
 use super::library::navidrome_of;
@@ -31,15 +33,17 @@ use super::McpCaller;
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
 use crate::core::acquire::AUTO_SELECT_SCORE_THRESHOLD;
+use crate::core::deletion::{App, REPLACE_CONSENT_SECS};
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::retry::{
     download_source as core_download_source, RetryAnswer, SourceTarget,
 };
 use crate::core::jobs::runner::{Acquire, MCP_DOWNLOADS_PER_USER};
-use crate::core::jobs::{ensure, CallRefused, EnsureItem, Wanted};
+use crate::core::jobs::{ensure, CallRefused, EnsureItem, EnsureRefusal, ReplaceConsent, Wanted};
 use crate::core::playlists::fill::{begin, order_of, prepare, PlaylistTarget};
 use crate::core::playlists::{NewPlaylist, PlaylistRefusal, Written};
 use crate::ledger::{JobOptions, JobState, Pick, MCP_UNFINISHED_JOBS_PER_USER};
+use crate::oauth::secrets::hash;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 
 const TOOL: &str = "ensure_in_library";
@@ -57,8 +61,12 @@ const ENSURE_ARGS: &[&str] = &[
     "max_attempts",
     "label",
     "playlist",
+    "replace_existing",
     "request_key",
 ];
+
+/// The fields of `replace_existing`.
+const REPLACE_FIELDS: &[&str] = &["confirmation_token"];
 
 /// The fields of `playlist`, one of them given.
 const PLAYLIST_FIELDS: &[&str] = &["playlist_id", "create"];
@@ -74,14 +82,15 @@ pub(crate) const ENSURE_IN_LIBRARY: ToolSpec = ToolSpec {
     title: "Get music into the library",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file: a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo, then its next calls, then its cause.raw, then cuts its message, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial. With playlist ({{playlist_id}} of one of this user's static playlists, or {{create: {{name, comment?, public?, allow_duplicate_name?}}}}), the playlist gets the owned tracks now in the order given and each other track at its place as its job finishes, whether or not this chat stays open; get_batch shows how far it is. A playlist refused before any job is made fails the call with playlist_not_found, playlist_not_owner, playlist_not_editable or playlist_name_taken; once the jobs are made, playlist.error says what stopped the playlist: those codes, unknown_handle (an owned song whose file is missing), playlist_tracks_not_written, playlist_not_written (a comment or public flag not shown) or one of the Navidrome codes.")
+        let replace_hours = REPLACE_CONSENT_SECS / 3600;
+        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file unless replace_existing carries the confirmation_token of a preview_delete_tracks call with reason replaced: then the previewed copies, and only they, are deleted once the new copy is imported, within {replace_hours} hours and if every check still allows it, and the token is used up; a previewed copy beets saw no duplicate of stays and is listed in the job's not_replaced. Show the user that preview and get their explicit yes before passing its token. Each previewed song goes to the first track item the library holds it for, which then gets a job; replace_unmatched lists the songs no item took, whose copies stay. Without replace_existing a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo, then its next calls, then its cause.raw, then cuts its message, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id, or replace_existing's token), expired_handle (replace_existing's token used or expired), permission_not_granted (replace_existing while deletion is off for this app), delete_daily_limit (replace_existing past the day's deletions), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial. With playlist ({{playlist_id}} of one of this user's static playlists, or {{create: {{name, comment?, public?, allow_duplicate_name?}}}}), the playlist gets the owned tracks now in the order given and each other track at its place as its job finishes, whether or not this chat stays open; get_batch shows how far it is. A playlist refused before any job is made fails the call with playlist_not_found, playlist_not_owner, playlist_not_editable or playlist_name_taken; once the jobs are made, playlist.error says what stopped the playlist: those codes, unknown_handle (an owned song whose file is missing), playlist_tracks_not_written, playlist_not_written (a comment or public flag not shown) or one of the Navidrome codes.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["items"], "properties": {"items": {"type": "array", "minItems": 1, "maxItems": 50, "items": "#,
         reference_schema!(),
         r#"}, "folder_id": {"type": "string", "minLength": 1}, "pick": {"enum": ["auto", "review"]}, "min_score": {"type": "number", "minimum": 0, "maximum": 1}, "#,
         filters_schema!(),
-        r#", "failover": {"enum": ["auto", "off"]}, "max_attempts": {"type": "integer", "minimum": 1, "maximum": 10}, "label": {"type": "string", "minLength": 1}, "playlist": {"type": "object", "additionalProperties": false, "minProperties": 1, "maxProperties": 1, "properties": {"playlist_id": {"type": "string", "minLength": 1}, "create": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 255}, "comment": {"type": "string", "maxLength": 2000}, "public": {"type": "boolean"}, "allow_duplicate_name": {"type": "boolean"}}}}}, "#,
+        r#", "failover": {"enum": ["auto", "off"]}, "max_attempts": {"type": "integer", "minimum": 1, "maximum": 10}, "label": {"type": "string", "minLength": 1}, "playlist": {"type": "object", "additionalProperties": false, "minProperties": 1, "maxProperties": 1, "properties": {"playlist_id": {"type": "string", "minLength": 1}, "create": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 255}, "comment": {"type": "string", "maxLength": 2000}, "public": {"type": "boolean"}, "allow_duplicate_name": {"type": "boolean"}}}}}, "replace_existing": {"type": "object", "additionalProperties": false, "required": ["confirmation_token"], "properties": {"confirmation_token": {"type": "string", "minLength": 1}}}, "#,
         request_key_schema!(),
         "}}"
     ),
@@ -102,6 +111,8 @@ struct Ensure {
     options: JobOptions,
     /// The playlist the batch fills.
     playlist: Option<PlaylistTarget>,
+    /// replace_existing's confirmation token.
+    replace: Option<String>,
     /// The arguments as given, without `request_key`: what a call offered again starts from.
     call: Value,
 }
@@ -117,6 +128,9 @@ pub(crate) async fn ensure_in_library(
         Ok(read) => read,
         Err(e) => return failed(e),
     };
+    if read.replace.is_some() && !caller.allow_delete {
+        return failed(deletion_off());
+    }
     // The playlist is written through the caller's own Navidrome.
     let navi = match &read.playlist {
         Some(_) => match navidrome_of(state, caller, Stage::Playlist, &args).await {
@@ -125,15 +139,18 @@ pub(crate) async fn ensure_in_library(
         },
         None => None,
     };
+    // The token only as its hash: the key's ledger row holds the call's hash, never the token.
     let call = json!({"items": read.items.iter().map(reference_value).collect::<Vec<_>>(),
         "folder_id": read.folder_id, "label": read.label, "options": read.options,
-        "playlist": read.playlist.as_ref().map(target_value)});
-    let (acquire, navidrome, ctx) = (
+        "playlist": read.playlist.as_ref().map(target_value),
+        "replace_existing": read.replace.as_deref().map(hash)});
+    let (acquire, navidrome, ctx, app) = (
         state.acquire.clone(),
         state.navidrome.clone(),
         caller.ctx.clone(),
+        app_of(caller),
     );
-    let work = async move { run(&acquire, &*navidrome, &ctx, read, navi, &args).await };
+    let work = async move { run(&acquire, &*navidrome, &ctx, app, read, navi, &args).await };
     keyed(&state.acquire, caller, TOOL, key, &call, work).await
 }
 
@@ -202,6 +219,10 @@ fn read_ensure(args: &Args) -> Result<(Ensure, Option<String>), ToolError> {
     };
     let label = args.opt_string("label")?;
     let playlist = read_playlist(args)?;
+    let replace = match args.opt_object("replace_existing", REPLACE_FIELDS)? {
+        Some(replace) => Some(replace.string("confirmation_token")?),
+        None => None,
+    };
     let key = request_key(args)?;
     args.finish()?;
     let read = Ensure {
@@ -214,8 +235,11 @@ fn read_ensure(args: &Args) -> Result<(Ensure, Option<String>), ToolError> {
             min_score,
             filters,
             max_sources,
+            // Only ensure sets it, from the token it takes.
+            replace: None,
         },
         playlist,
+        replace,
         call: args.as_value(),
     };
     Ok((read, key))
@@ -224,13 +248,16 @@ fn read_ensure(args: &Args) -> Result<(Ensure, Option<String>), ToolError> {
 /// The call: a call-level refusal, or each item's result with the batch, whether the library
 /// was looked in, the call that follows the batch, and the playlist it fills when `args` name one
 /// (`navi` the caller's Navidrome). A playlist refused before `ensure` refuses the call. A request
-/// key keeps the answer of a call that made a batch, wrote the playlist or tried to, or refused
-/// no item; a refusal of the call, or of an item when nothing was written, and the same call can
-/// run again.
+/// key keeps the answer of a call that made a batch, wrote the playlist or tried to, refused
+/// no item, or took replace_existing's token; a refusal of the call or of the token before it
+/// was taken, or of an item when nothing was written, and the same call can run again. `app`
+/// takes the token. No answer a key keeps carries the token: an item's call alone leaves
+/// replace_existing out.
 async fn run(
     acquire: &Arc<Acquire>,
     navidrome: &dyn NavidromeOf,
     ctx: &UserCtx,
+    app: App,
     read: Ensure,
     navi: Option<Arc<NavidromeClient>>,
     args: &Args,
@@ -242,6 +269,7 @@ async fn run(
         label,
         options,
         playlist,
+        replace,
         call,
     } = read;
     let playlist = playlist.zip(navi);
@@ -255,6 +283,7 @@ async fn run(
     };
     let folder_id = folder_id.as_deref();
     let for_playlist = playlist.is_some();
+    let replace = replace.map(|secret| ReplaceConsent { app, secret });
     let mut ensured = match ensure(
         acquire,
         navidrome,
@@ -264,11 +293,18 @@ async fn run(
         wanted,
         options,
         for_playlist,
+        replace,
     )
     .await
     {
         Ok(ensured) => ensured,
-        Err(refused) => return Keyed::Released(failed(call_refused(refused, &call))),
+        Err(EnsureRefusal::Call(refused)) => {
+            return Keyed::Released(failed(call_refused(refused, &call)))
+        }
+        Err(EnsureRefusal::Token(r)) => return Keyed::Released(failed(token_refused(TOOL, r))),
+        Err(EnsureRefusal::Taken { failure, song_ids }) => {
+            return Keyed::Kept(failed(token_taken(failure, song_ids)))
+        }
     };
     let written = match &playlist {
         Some((target, navi)) => {
@@ -292,9 +328,13 @@ async fn run(
         Some(Err(e)) => (None, Some(e)),
         None => (None, None),
     };
+    let mut alone = call;
+    if let Value::Object(fields) = &mut alone {
+        fields.remove("replace_existing");
+    }
     let results = (ensured.items.into_iter())
         .zip(&given)
-        .map(|(item, given)| item_result(item, given, &call))
+        .map(|(item, given)| item_result(item, given, &alone))
         .collect();
     let next: Vec<NextCall> = (ensured.batch_id.iter())
         .map(|batch_id| {
@@ -309,6 +349,10 @@ async fn run(
         (
             "library_checked".to_string(),
             json!(ensured.library_checked),
+        ),
+        (
+            "replace_unmatched".to_string(),
+            json!(ensured.replace_unmatched),
         ),
         ("next".to_string(), json!(next)),
     ]);
@@ -495,8 +539,12 @@ fn leave_out(error: &mut ToolError, step: &'static str) -> bool {
 fn item_result(item: EnsureItem, given: &Value, call: &Value) -> ItemResult {
     let fields = match item {
         EnsureItem::InLibrary { song_ids } => json!({"status": "in_library", "song_ids": song_ids}),
-        EnsureItem::Created { job_id, fuzzy } => json!({"status": "job_created", "job_id": job_id,
-            "state": JobState::Searching.as_str(), "fuzzy_matches": fuzzy}),
+        EnsureItem::Created {
+            job_id,
+            fuzzy,
+            replacing,
+        } => json!({"status": "job_created", "job_id": job_id,
+            "state": JobState::Searching.as_str(), "fuzzy_matches": fuzzy, "replacing": replacing}),
         EnsureItem::AlreadyRunning {
             job_id,
             failure,
@@ -538,6 +586,21 @@ fn item_result(item: EnsureItem, given: &Value, call: &Value) -> ItemResult {
         unreachable!("an object literal is an object");
     };
     ItemResult::Done(fields)
+}
+
+/// The batch could not be written after replace_existing's token was taken: the token is used
+/// up, so the call is not offered again; a new preview of its songs with reason replaced is.
+fn token_taken(failure: Failure, song_ids: Vec<String>) -> ToolError {
+    let next = vec![NextCall::new(
+        "preview_delete_tracks",
+        json!({"song_ids": song_ids, "reason": DeletionReason::Replaced.as_str()}),
+    )];
+    ToolError {
+        failure,
+        facts: Map::from_iter([("song_ids".to_string(), json!(song_ids))]),
+        tried: vec![],
+        next,
+    }
 }
 
 /// A refusal of the whole call. folder_required with folders lists them and offers the call with
@@ -698,9 +761,13 @@ mod tests {
     use crate::auth::UserId;
     use crate::connection::test_util::{
         add_folder, app_of, app_with_acquire, app_with_navidrome, call_tool, count, document,
-        jobs_app, set_default_folder,
+        grant_of, jobs_app, set_default_folder,
     };
     use crate::core::acquire::{Acquisition, NewBatch};
+    use crate::core::delete_guard::test_support::previewed_file;
+    use crate::core::delete_guard::PreviewedFile;
+    use crate::core::deletion::tokens::{issue_in, take_in};
+    use crate::core::deletion::App;
     use crate::core::folder_of;
     use crate::core::jobs::runner::{Acquire, TestEffects};
     use crate::core::jobs::test_support::{
@@ -708,13 +775,16 @@ mod tests {
     };
     use crate::core::playlists::fill::round;
     use crate::import_queue::test_support::{broken, ready};
+    use crate::ledger::store;
     use crate::ledger::MCP_UNFINISHED_JOBS_PER_USER;
     use crate::ledger::{NewSearch, StoredSpec};
+    use crate::oauth::now_unix;
     use crate::server_fns::download::test_support::{group, item, search_result, track};
     use crate::test_navidrome::{
         native_playlist, native_song, native_songs, playlist_body, playlist_rows, playlists_body,
         NavidromeFor, NavidromeStub, ADVENT, BAD_GATEWAY, HOLY, SILENT,
     };
+    use shared::navidrome::DeletionReason;
 
     #[tokio::test]
     async fn owned_tracks_are_reported_and_the_rest_become_jobs_in_one_batch() {
@@ -1457,25 +1527,188 @@ mod tests {
         );
     }
 
+    /// `song_id`'s file `rel` written in `library`, as a preview stores it: its canonical path
+    /// and identity.
+    fn previewed_in(library: &Path, song_id: &str, rel: &str) -> PreviewedFile {
+        let path = library.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"audio").unwrap();
+        previewed_file(song_id, &std::fs::canonicalize(&path).unwrap())
+    }
+
+    /// u1's app, its grant read as it is.
+    async fn u1_app(db: &sqlx::SqlitePool) -> App {
+        App {
+            user: UserId::new("u1"),
+            grant_id: grant_of(db, "u1").await,
+        }
+    }
+
     #[tokio::test]
-    async fn replace_existing_is_not_an_argument_yet() {
-        let (db, acq, _, token) = app_with_acquire().await;
-        let error = document(
+    async fn a_replacement_needs_the_switch_and_a_replaced_preview() {
+        let (db, acq, effects, token) = app_with_acquire().await;
+        let navi = NavidromeStub::start();
+        navi.answer_when(
+            "/api/song",
+            "title=Marrow+Choir+O+Holy+Night",
+            200,
+            &format!(
+                "[{}]",
+                native_song(HOLY.0, "Marrow Choir", "O Holy Night", 263.4, None)
+            ),
+        );
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let call = |key: Value| {
+            json!({"items": [{"artist": "Marrow Choir", "title": "O Holy Night"}],
+                "replace_existing": key})
+        };
+        let off = document(
             &call_tool(
-                app_of(&db, &acq),
+                app.clone(),
                 &token,
                 "ensure_in_library",
-                json!({"replace_existing": true,
-                    "items": [{"artist": "Marrow Choir", "title": "O Holy Night"}]}),
+                call(json!({"confirmation_token": "x"})),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(off["code"], "permission_not_granted", "{off}");
+        assert_eq!(navi.asked(), Vec::<String>::new(), "nothing was looked up");
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        let app_id = u1_app(&db).await;
+        let file = previewed_in(effects.library(), HOLY.0, "Marrow Choir/x.flac");
+        let cleanup = issue_in(
+            &db,
+            &app_id,
+            DeletionReason::Cleanup,
+            std::slice::from_ref(&file),
+            now_unix(),
+        )
+        .await
+        .unwrap();
+        let wrong = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "ensure_in_library",
+                call(json!({"confirmation_token": cleanup.secret})),
             )
             .await,
         )["error"]
             .clone();
         assert_eq!(
-            (error["code"].as_str(), error["facts"]["field"].as_str()),
-            (Some("invalid_input"), Some("replace_existing"))
+            (wrong["code"].as_str(), wrong["facts"]["field"].as_str()),
+            (
+                Some("invalid_input"),
+                Some("replace_existing.confirmation_token")
+            ),
+            "{wrong}"
+        );
+        assert_eq!(
+            wrong["next"],
+            json!([{"tool": "preview_delete_tracks", "args": {"song_ids": [HOLY.0], "reason": "replaced"}}])
         );
         assert_eq!(count(&db, "jobs").await, 0);
+        let replaced = issue_in(
+            &db,
+            &app_id,
+            DeletionReason::Replaced,
+            std::slice::from_ref(&file),
+            now_unix(),
+        )
+        .await
+        .unwrap();
+        let doc = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "ensure_in_library",
+                call(json!({"confirmation_token": replaced.secret})),
+            )
+            .await,
+        );
+        assert_eq!(
+            (
+                doc["results"][0]["status"].as_str(),
+                &doc["results"][0]["replacing"],
+                &doc["replace_unmatched"]
+            ),
+            (Some("job_created"), &json!([HOLY.0]), &json!([])),
+            "{doc}"
+        );
+        assert!(
+            !doc.to_string().contains(&replaced.secret),
+            "the answer never repeats the token"
+        );
+        let job_id = doc["results"][0]["job_id"].as_str().unwrap();
+        let job = store::job_record(&db, job_id, &UserId::new("u1"))
+            .await
+            .unwrap();
+        let set = job.unwrap().options.unwrap().replace.unwrap();
+        assert_eq!(
+            (set.grant_id, set.files),
+            (app_id.grant_id.clone(), vec![file])
+        );
+        let again = document(
+            &call_tool(
+                app,
+                &token,
+                "ensure_in_library",
+                call(json!({"confirmation_token": replaced.secret})),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(again["message"], "This confirmation token was already used");
+        assert_eq!(again["next"], json!([]));
+        assert_eq!(count(&db, "jobs").await, 1);
+    }
+
+    #[tokio::test]
+    async fn token_songs_no_item_takes_are_listed() {
+        let (db, acq, effects, token) = app_with_acquire().await;
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer_when("/api/song", "title=Marrow+Choir+O+Holy+Night", 200, "[]");
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let app_id = u1_app(&db).await;
+        let file = previewed_in(effects.library(), "s9", "Marrow Choir/x.flac");
+        let issued = issue_in(&db, &app_id, DeletionReason::Replaced, &[file], now_unix())
+            .await
+            .unwrap();
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "ensure_in_library",
+                json!({"items": [{"artist": "Marrow Choir", "title": "O Holy Night"}],
+                    "replace_existing": {"confirmation_token": issued.secret}}),
+            )
+            .await,
+        );
+        assert_eq!(
+            (
+                doc["results"][0]["status"].as_str(),
+                &doc["results"][0]["replacing"],
+                &doc["replace_unmatched"]
+            ),
+            (Some("job_created"), &json!([]), &json!(["s9"])),
+            "{doc}"
+        );
+        let job_id = doc["results"][0]["job_id"].as_str().unwrap();
+        let job = store::job_record(&db, job_id, &UserId::new("u1"))
+            .await
+            .unwrap();
+        assert_eq!(job.unwrap().options.unwrap().replace, None);
+        take_in(&db, &app_id, &issued.secret, None, now_unix())
+            .await
+            .expect("the token is still unused");
     }
 
     /// The id of `source`'s candidate in the search of alice's job `job`.

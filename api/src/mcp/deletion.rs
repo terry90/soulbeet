@@ -118,7 +118,7 @@ pub(crate) const GET_DELETION_HISTORY: ToolSpec = ToolSpec {
 };
 
 /// The caller as deletion needs it.
-fn app_of(caller: &McpCaller) -> App {
+pub(crate) fn app_of(caller: &McpCaller) -> App {
     App {
         user: caller.ctx.id(),
         grant_id: caller.grant_id.clone(),
@@ -135,7 +135,7 @@ fn guard_of(state: &ConnectionState) -> Guard<'_> {
 }
 
 /// An app without the deletion switch, refused before any argument value is used.
-fn deletion_off() -> ToolError {
+pub(crate) fn deletion_off() -> ToolError {
     ToolError {
         failure: permission_not_granted(),
         facts: Map::new(),
@@ -478,11 +478,41 @@ fn confirmed_answer(done: Confirmed) -> CallToolResult {
 /// when the token is the caller's, and the call that can still help: get_deletion_history when
 /// delete_tracks finds the token used (nothing when ensure_in_library does), a new preview of the
 /// same songs for an expired one or one the day's room cannot hold yet (after
-/// retry_after_seconds); nothing else, and never this call again.
+/// retry_after_seconds), a preview of them with reason replaced for a token of another reason
+/// (only ensure_in_library's replace_existing expects one, so the facts name that field);
+/// nothing else, and never this call again.
 pub(crate) fn token_refused(tool: &str, r: DeleteTokenRefusal) -> ToolError {
     let known = r
         .reason
         .map(|reason| json!({"song_ids": r.song_ids, "reason": reason.as_str()}));
+    if r.kind == TokenRefusalKind::WrongReason {
+        let replaced = DeletionReason::Replaced.as_str();
+        let mut facts = Map::from_iter([
+            (
+                "field".to_string(),
+                json!("replace_existing.confirmation_token"),
+            ),
+            (
+                "expected".to_string(),
+                json!(format!(
+                    "the confirmation_token of a preview_delete_tracks call with reason {replaced}"
+                )),
+            ),
+        ]);
+        if let Some(Value::Object(known)) = known {
+            facts.extend(known);
+        }
+        let next = vec![NextCall::new(
+            "preview_delete_tracks",
+            json!({"song_ids": r.song_ids, "reason": replaced}),
+        )];
+        return ToolError {
+            failure: r.failure,
+            facts,
+            tried: vec![],
+            next,
+        };
+    }
     let next = match r.kind {
         TokenRefusalKind::Used if tool == DELETE_TRACKS.name => {
             vec![NextCall::new(GET_DELETION_HISTORY.name, json!({}))]
@@ -492,9 +522,10 @@ pub(crate) fn token_refused(tool: &str, r: DeleteTokenRefusal) -> ToolError {
             .map(|args| NextCall::new("preview_delete_tracks", args))
             .into_iter()
             .collect(),
-        TokenRefusalKind::NotFound | TokenRefusalKind::Permission | TokenRefusalKind::Database => {
-            vec![]
-        }
+        TokenRefusalKind::NotFound
+        | TokenRefusalKind::Permission
+        | TokenRefusalKind::Database
+        | TokenRefusalKind::WrongReason => vec![],
     };
     let facts = match known {
         Some(Value::Object(facts)) => facts,

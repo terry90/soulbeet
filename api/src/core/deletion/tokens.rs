@@ -6,7 +6,7 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::navidrome::DeletionReason;
 use sqlx::{SqliteConnection, SqlitePool};
 
-use super::{App, IssuedToken, TOKEN_SECS};
+use super::{utc_text, App, IssuedToken, TOKEN_SECS};
 use crate::core::database_failure;
 use crate::core::delete_guard::quota::{deleting_app_in, room_in, DAY_SECS};
 use crate::core::delete_guard::PreviewedFile;
@@ -19,6 +19,8 @@ pub(crate) enum TokenRefusalKind {
     NotFound,
     Used,
     Expired,
+    /// The token is for another reason than the call needs.
+    WrongReason,
     /// The app may not delete now.
     Permission,
     /// The day's room cannot hold the token's files.
@@ -27,7 +29,8 @@ pub(crate) enum TokenRefusalKind {
 }
 
 /// Why a token could not be taken. `song_ids` and `reason` are the token's, only when it is the
-/// caller's (Used, Expired, Permission, Room); empty and None for NotFound and Database.
+/// caller's (Used, Expired, WrongReason, Permission, Room); empty and None for NotFound and
+/// Database.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DeleteTokenRefusal {
     pub kind: TokenRefusalKind,
@@ -97,26 +100,29 @@ pub(crate) async fn issue_in(
     })
 }
 
-/// Takes the token `secret` for `app`: D7's checks (classify), then `used_at = now`, in one
-/// BEGIN IMMEDIATE transaction, so of two takes of one token only one passes. A refused take
-/// leaves the token as it was.
+/// A database error as a refusal that says nothing of the token.
+fn unavailable(e: sqlx::Error) -> DeleteTokenRefusal {
+    DeleteTokenRefusal::bare(
+        TokenRefusalKind::Database,
+        database_failure(Stage::Delete, e),
+    )
+}
+
+/// Takes the token `secret` for `app`: D7's checks (classify, with `expect` the reason the call
+/// needs, None for any), then `used_at = now`, in one BEGIN IMMEDIATE transaction, so of two
+/// takes of one token only one passes. A refused take leaves the token as it was.
 pub(crate) async fn take_in(
     db: &SqlitePool,
     app: &App,
     secret: &str,
+    expect: Option<DeletionReason>,
     now: i64,
 ) -> Result<Taken, DeleteTokenRefusal> {
-    let unavailable = |e: sqlx::Error| {
-        DeleteTokenRefusal::bare(
-            TokenRefusalKind::Database,
-            database_failure(Stage::Delete, e),
-        )
-    };
     let mut tx = db
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(unavailable)?;
-    let taken = classify(&mut tx, app, secret, now).await?;
+    let taken = classify(&mut tx, app, secret, expect, now).await?;
     sqlx::query("UPDATE delete_tokens SET used_at = ? WHERE token_hash = ?")
         .bind(now)
         .bind(hash(secret))
@@ -127,14 +133,29 @@ pub(crate) async fn take_in(
     Ok(taken)
 }
 
+/// D7's checks of the token `secret` for `app` (classify, with `expect`) without marking it
+/// used: what a token allows, before the call that takes it looks anything up.
+pub(crate) async fn peek_in(
+    db: &SqlitePool,
+    app: &App,
+    secret: &str,
+    expect: Option<DeletionReason>,
+    now: i64,
+) -> Result<Taken, DeleteTokenRefusal> {
+    let mut conn = db.acquire().await.map_err(unavailable)?;
+    classify(&mut conn, app, secret, expect, now).await
+}
+
 /// D7's checks of the token `secret` for `app` at `now`, in this order: a token that is not
 /// stored, or is another user's or another app's, is NotFound (one answer, so a foreign token
-/// tells nothing); then Used, Expired (`expires_at <= now`), Permission (the grant may not
-/// delete, deleting_app_in) and Room (the day's room cannot hold its files, room_in).
+/// tells nothing); then Used, Expired (`expires_at <= now`), WrongReason (a reason other than
+/// `expect`, when given), Permission (the grant may not delete, deleting_app_in) and Room (the
+/// day's room cannot hold its files, room_in).
 async fn classify(
     conn: &mut SqliteConnection,
     app: &App,
     secret: &str,
+    expect: Option<DeletionReason>,
     now: i64,
 ) -> Result<Taken, DeleteTokenRefusal> {
     let database = |e: String| {
@@ -177,6 +198,12 @@ async fn classify(
         return Err(refused(
             TokenRefusalKind::Expired,
             token_expired(expires_at),
+        ));
+    }
+    if let Some(expected) = expect.filter(|expected| *expected != reason) {
+        return Err(refused(
+            TokenRefusalKind::WrongReason,
+            token_for_another_reason(reason, expected),
         ));
     }
     if let Err(f) = deleting_app_in(conn, &app.user, &app.grant_id).await {
@@ -226,15 +253,31 @@ pub(crate) fn token_used() -> Failure {
 
 /// The token's time ran out at `at`.
 pub(crate) fn token_expired(at: i64) -> Failure {
-    let at = chrono::DateTime::from_timestamp(at, 0).map_or_else(
-        || format!("{at} seconds after 1970-01-01 00:00:00 UTC"),
-        |at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-    );
     Failure::new(
         FailureCode::ExpiredHandle,
         Stage::Input,
         RetryAdvice::NotRetryable,
-        format!("This confirmation token expired at {at}; preview the songs again"),
+        format!(
+            "This confirmation token expired at {}; preview the songs again",
+            utc_text(at)
+        ),
+    )
+}
+
+/// The token is for deleting with `reason`, and the call needs one for `expected`.
+pub(crate) fn token_for_another_reason(
+    reason: DeletionReason,
+    expected: DeletionReason,
+) -> Failure {
+    Failure::new(
+        FailureCode::InvalidInput,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        format!(
+            "This confirmation token is for deleting with reason {}; this needs one with reason {}",
+            reason.as_str(),
+            expected.as_str()
+        ),
     )
 }
 
@@ -279,6 +322,72 @@ mod tests {
             .unwrap_err();
         assert_eq!(f, permission_not_granted());
         assert_eq!(tokens(&lib).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_peek_leaves_the_token_unused_and_a_wrong_reason_is_refused() {
+        let lib = Library::new().await;
+        lib.app("g1", "alice", true).await;
+        let files = previewed(&lib).await;
+        let now = chrono::Utc::now().timestamp();
+        let issued = issue_in(&lib.db, &alice_app(), DeletionReason::Cleanup, &files, now)
+            .await
+            .unwrap();
+        let peeked = peek_in(
+            &lib.db,
+            &alice_app(),
+            &issued.secret,
+            Some(DeletionReason::Cleanup),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (peeked.reason, peeked.files),
+            (DeletionReason::Cleanup, files.clone())
+        );
+        let wrong = peek_in(
+            &lib.db,
+            &alice_app(),
+            &issued.secret,
+            Some(DeletionReason::Replaced),
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            wrong,
+            DeleteTokenRefusal {
+                kind: TokenRefusalKind::WrongReason,
+                failure: token_for_another_reason(
+                    DeletionReason::Cleanup,
+                    DeletionReason::Replaced
+                ),
+                song_ids: vec!["s1".into()],
+                reason: Some(DeletionReason::Cleanup),
+            }
+        );
+        assert_eq!(
+            wrong.failure.message,
+            "This confirmation token is for deleting with reason cleanup; this needs one with reason replaced"
+        );
+        let taken_wrong = take_in(
+            &lib.db,
+            &alice_app(),
+            &issued.secret,
+            Some(DeletionReason::Replaced),
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(taken_wrong.kind, TokenRefusalKind::WrongReason);
+        let taken = take_in(&lib.db, &alice_app(), &issued.secret, None, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            taken.files, files,
+            "neither the peek nor the refused take used it"
+        );
     }
 
     #[tokio::test]

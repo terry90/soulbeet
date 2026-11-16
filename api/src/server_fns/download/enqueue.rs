@@ -155,7 +155,11 @@ pub fn held_failure(claim: &Claim, batch: &BatchRef) -> Failure {
         other_user()
     } else if claim.mine[0].1.target != batch.target {
         another_folder(RetryAdvice::OtherSource)
-    } else if batch.duplicates == DuplicateRule::Skip {
+    } else if matches!(
+        batch.duplicates,
+        DuplicateRule::Skip | DuplicateRule::Replace(_)
+    ) {
+        // An MCP job's batch does not join another one's download.
         file_taken_by_another_download()
     } else {
         already_running()
@@ -392,7 +396,9 @@ fn sort_claim(
         .partition(|(_, running)| running.target == batch.target);
     let held = match batch.duplicates {
         DuplicateRule::Guarded => EnqueueStatus::AlreadyRunning,
-        DuplicateRule::Skip => EnqueueStatus::Failed(file_taken_by_another_download()),
+        DuplicateRule::Skip | DuplicateRule::Replace(_) => {
+            EnqueueStatus::Failed(file_taken_by_another_download())
+        }
     };
     let results: Vec<QueuedDownload> = here
         .iter()

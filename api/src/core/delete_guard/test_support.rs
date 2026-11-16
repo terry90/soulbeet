@@ -1,6 +1,6 @@
 //! Navidrome as the guard sees it, and a temp library to check files in.
 
-use super::{Guard, Listeners, Origin};
+use super::{unlink, Checked, Guard, Listeners, Origin, PreviewedFile, Verdict};
 use crate::auth::UserId;
 use crate::connection::test_util::{CLAUDE_CALLBACK, RESOURCE};
 use crate::models::discovery_playlist::DiscoveryTrackRow;
@@ -745,6 +745,25 @@ pub(crate) fn set_mtime(path: &Path, at: chrono::DateTime<chrono::Utc>) {
         .unwrap()
         .set_modified(at.into())
         .unwrap();
+}
+
+/// The library file a check allowed; panics on anything else.
+pub(crate) fn library_verdict(v: Result<Verdict, shared::failure::Failure>) -> Checked {
+    match v {
+        Ok(Verdict::Library(c)) => c,
+        Ok(Verdict::Discovery { track, .. }) => panic!("discovery {track:?}"),
+        Err(f) => panic!("{f:?}"),
+    }
+}
+
+/// `song_id`'s file at `path` as a preview stores it, its identity read from the file there now
+/// (which must exist).
+pub(crate) fn previewed_file(song_id: &str, path: &Path) -> PreviewedFile {
+    PreviewedFile {
+        song_id: song_id.into(),
+        path: path.to_path_buf(),
+        file: unlink::FileId::of(&std::fs::symlink_metadata(path).unwrap()),
+    }
 }
 
 /// A job's `wanted` for one track (Track.id "lastfm-track-1", no album fields).

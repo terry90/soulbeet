@@ -106,7 +106,8 @@ pub enum DriverChoice {
 }
 
 /// How a run handles the duplicates beets finds in the library: as beets' config says, with a
-/// `remove` reported instead of made, or skipped whatever the config says.
+/// `remove` reported instead of made, skipped whatever the config says, or each reported as a
+/// removal whatever the config says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DuplicateRun {
     /// beets acts as configured.
@@ -115,6 +116,9 @@ pub enum DuplicateRun {
     ReportRemovals,
     /// beets skips a task whose music the library already has, whatever its config says.
     Skip,
+    /// beets keeps every earlier copy and reports each as a wanted removal, whatever its config
+    /// says.
+    Replace,
 }
 
 /// One beets task's wanted removal: the earlier items beets would have deleted, and the items
@@ -270,7 +274,7 @@ pub struct ImportResult {
     /// person can fix what went wrong. The importer words it, since it names
     /// the importer's own setup.
     pub user_action: Option<UserAction>,
-    /// The removals beets wanted in a `DuplicateRun::ReportRemovals` run, one per task.
+    /// The removals beets wanted in a `DuplicateRun::ReportRemovals` or `Replace` run, one per task.
     pub removals: Vec<WantedRemoval>,
     /// The files of every task an automatic run recorded, in task order, each tag cut to
     /// `shared::failure::TEXT_MAX_CHARS` characters, since a peer chose them.

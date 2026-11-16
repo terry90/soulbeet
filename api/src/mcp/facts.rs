@@ -28,7 +28,7 @@ use crate::core::jobs::{
 use crate::core::library::SongFacts;
 use crate::core::sources::{self, Candidate, DroppedByFilter, SearchProgress};
 use crate::ledger::store::AttemptRecord;
-use crate::ledger::{JobKind, JobState, SlotResult, StoredSpec};
+use crate::ledger::{JobKind, JobState, Replacement, ReplacementOutcome, SlotResult, StoredSpec};
 use crate::services::DEFAULT_DOWNLOAD_BACKEND;
 
 /// Peer or provider text as a result shows it: at most TEXT_MAX_CHARS characters as sent in JSON.
@@ -796,6 +796,8 @@ fn result_document(
             applied,
             untagged,
             listed,
+            replaced,
+            not_replaced,
         } => {
             let job = &view.job;
             let matches_wanted = match (job.kind, &job.wanted.album, job.wanted.tracks.first()) {
@@ -818,6 +820,8 @@ fn result_document(
                 "untagged": untagged,
                 "listed": listed,
                 "matches_wanted": matches_wanted,
+                "replaced": replaced.iter().map(replacement_document).collect::<Vec<_>>(),
+                "not_replaced": not_replaced,
             })
         }
         SlotResult::AlreadyInLibrary { existing } => {
@@ -836,6 +840,25 @@ fn result_document(
                 "library_songs_failure": failure,
             })
         }
+    }
+}
+
+/// One removal of earlier copies the import wanted: their paths in the library, and whether they
+/// were replaced, kept (with why) or partly removed (with the files that went and why the rest
+/// stayed).
+fn replacement_document(r: &Replacement) -> Value {
+    let files: Vec<String> = (r.existing.iter())
+        .map(|item| cut(&item.path.display().to_string()))
+        .collect();
+    match &r.outcome {
+        ReplacementOutcome::Replaced => json!({"files": files, "status": "replaced"}),
+        ReplacementOutcome::Kept { failure } => {
+            json!({"files": files, "status": "kept", "failure": error_value(failure)})
+        }
+        ReplacementOutcome::PartlyRemoved { removed, failure } => json!({"files": files,
+            "status": "partly_removed",
+            "removed": removed.iter().map(|p| cut(&p.display().to_string())).collect::<Vec<_>>(),
+            "failure": error_value(failure)}),
     }
 }
 
@@ -1384,6 +1407,71 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_slot_shows_what_it_replaced_and_what_it_did_not() {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = done_track_job(&acq).await;
+        let mut view = view_of(&acq, &job).await;
+        let earlier = ImportedItem {
+            path: "Marrow Choir/Winter Songs/03 - O Holy Night.flac".into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+            beets_id: Some(12),
+            release_mbid: None,
+            match_per_mille: None,
+        };
+        let Some(SlotResult::Imported {
+            replaced,
+            not_replaced,
+            ..
+        }) = &mut view.slots[0].result
+        else {
+            panic!("{:?}", view.slots[0].result)
+        };
+        *replaced = vec![
+            Replacement {
+                existing: vec![earlier.clone()],
+                outcome: ReplacementOutcome::Replaced,
+            },
+            Replacement {
+                existing: vec![earlier],
+                outcome: ReplacementOutcome::Kept {
+                    failure: crate::core::delete_guard::not_previewed(),
+                },
+            },
+        ];
+        *not_replaced = vec!["s2".into()];
+        let doc = job_document(
+            &view,
+            &Untried::default(),
+            Detail::Full,
+            &ReadNow::default(),
+            true,
+        );
+        let result = &doc["results"][0];
+        assert_eq!(
+            result["replaced"][0],
+            json!({"files": ["Marrow Choir/Winter Songs/03 - O Holy Night.flac"], "status": "replaced"}),
+            "{doc}"
+        );
+        let kept = &result["replaced"][1];
+        assert_eq!(
+            (
+                &kept["status"],
+                &kept["failure"]["code"],
+                &kept["failure"]["message"]
+            ),
+            (
+                &json!("kept"),
+                &json!("delete_changed_since_preview"),
+                &json!("This file was not in the preview this deletion was confirmed with")
+            )
+        );
+        assert_eq!(result["not_replaced"], json!(["s2"]));
     }
 
     #[tokio::test]

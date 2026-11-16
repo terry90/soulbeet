@@ -493,6 +493,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replacing_requests_with_other_sets_never_share_a_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.flac");
+        std::fs::write(&file, b"audio").unwrap();
+        let set = |song_id: &str, expires_at: i64| {
+            DuplicateRule::Replace(crate::core::delete_guard::ReplaceSet {
+                grant_id: "g1".into(),
+                files: vec![crate::core::delete_guard::test_support::previewed_file(
+                    song_id, &file,
+                )],
+                expires_at,
+            })
+        };
+        let registry = TransferRegistry::default();
+        let running = batch("user-a", "b1", ImportMode::Singleton).with_duplicates(set("s1", 100));
+        registry.claim(&[key("01.flac")], &running);
+        let fresh = |batch_id: &str, rule: DuplicateRule| {
+            batch("user-a", batch_id, ImportMode::Singleton).with_duplicates(rule)
+        };
+        // Another song, or the same one until another time: each request gets its own batch.
+        for (free, other) in [("02.flac", set("s2", 100)), ("03.flac", set("s1", 101))] {
+            let claim =
+                registry.claim_for_request(&[key("01.flac"), key(free)], &fresh("b2", other));
+            assert_eq!(
+                (
+                    claim.batch.owner.batch_id.as_str(),
+                    claim.reservation.is_none()
+                ),
+                ("b2", true)
+            );
+        }
+        let same = registry.claim_for_request(
+            &[key("01.flac"), key("04.flac")],
+            &fresh("b3", set("s1", 100)),
+        );
+        assert_eq!(same.batch.owner.batch_id, "b1", "the same set shares it");
+    }
+
     fn slot(filename: &str) -> AddedSlot {
         AddedSlot {
             source: "peer_a".to_string(),

@@ -138,7 +138,7 @@ pub fn import_job(
     rows: Vec<DownloadProgress>,
     target: &Path,
     user: &UserId,
-    duplicates: DuplicateRule,
+    duplicates: &DuplicateRule,
     base: &Path,
 ) -> ImportJob {
     let (sources, files, mode) = match downloaded {
@@ -170,7 +170,7 @@ pub fn album_jobs(
     resolved: Vec<ResolvedSlot>,
     target: &Path,
     user: &UserId,
-    duplicates: DuplicateRule,
+    duplicates: &DuplicateRule,
     base: &Path,
 ) -> Vec<ImportJob> {
     // Each folder, its rows and their files.
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn import_job_takes_the_batchs_duplicates_rule() {
         let user = UserId::new("u");
-        let job_for = |rule| {
+        let job_for = |rule: &DuplicateRule| {
             import_job(
                 Downloaded::File(PathBuf::from("/dl/X [12345678]/a.flac")),
                 vec![row("a")],
@@ -274,11 +274,11 @@ mod tests {
             )
         };
         assert!(matches!(
-            job_for(DuplicateRule::Skip).duplicates,
+            job_for(&DuplicateRule::Skip).duplicates,
             Duplicates::Skip
         ));
         assert!(matches!(
-            job_for(DuplicateRule::Guarded).duplicates,
+            job_for(&DuplicateRule::Guarded).duplicates,
             Duplicates::Guarded { actor, origin: Origin::Ui } if actor == user
         ));
         let resolved = |destination: Option<&str>| ResolvedSlot {
@@ -290,7 +290,7 @@ mod tests {
             vec![resolved(Some("X [12345678]")), resolved(None)],
             Path::new("/music"),
             &user,
-            DuplicateRule::Skip,
+            &DuplicateRule::Skip,
             Path::new("/dl"),
         );
         assert_eq!(albums.len(), 2);
@@ -325,7 +325,7 @@ mod tests {
             resolved,
             Path::new("/music"),
             &UserId::new("u"),
-            DuplicateRule::Guarded,
+            &DuplicateRule::Guarded,
             Path::new("/dl"),
         )
         .into_iter()

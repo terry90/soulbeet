@@ -501,7 +501,7 @@ mod tests {
         let ctx = ctx_of(&running);
         for rule in [DuplicateRule::Guarded, DuplicateRule::Skip] {
             let fresh = NewBatch {
-                duplicates: rule,
+                duplicates: rule.clone(),
                 ..new_batch("Come Over")
             };
             assert_eq!(fresh.owned_by(&ctx).duplicates, rule);

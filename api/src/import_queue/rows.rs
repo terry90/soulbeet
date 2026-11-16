@@ -238,6 +238,8 @@ mod tests {
             result,
             new_files: vec![],
             ran: true,
+            replaced: vec![],
+            not_replaced: vec![],
         }
     }
 

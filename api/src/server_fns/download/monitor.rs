@@ -1418,7 +1418,7 @@ impl DownloadMonitor {
             destination: self.tracked_files[slot].destination.clone(),
             key: self.slot_key(slot, backend.id()),
             owner: self.batch.owner.clone(),
-            duplicates: self.batch.duplicates,
+            duplicates: self.batch.duplicates.clone(),
             target: self.target_path.clone(),
             download_base: self.download_base.clone(),
             claimed: Arc::clone(&self.claimed),
@@ -1684,7 +1684,7 @@ impl DownloadMonitor {
             resolved,
             &self.target_path,
             &self.batch.owner.user_id,
-            self.batch.duplicates,
+            &self.batch.duplicates,
             &self.download_base,
         );
         info!(
@@ -1768,7 +1768,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
         vec![h.row],
         &h.target,
         &h.owner.user_id,
-        h.duplicates,
+        &h.duplicates,
         &h.download_base,
     );
     IMPORT_QUEUE.submit(job).await.wait().await;

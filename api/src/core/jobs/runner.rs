@@ -654,7 +654,7 @@ impl Runner<'_> {
                 JobKind::Track => ImportMode::Singleton,
                 JobKind::Album => ImportMode::Album,
             },
-            duplicates: DuplicateRule::of(BatchOrigin::Mcp),
+            duplicates: DuplicateRule::for_job(BatchOrigin::Mcp, Some(self.options)),
         };
         let acquisition = Acquisition {
             job: self.job.id.clone(),
@@ -956,6 +956,7 @@ mod tests {
             min_score,
             filters: SourceFilters::default(),
             max_sources: 4,
+            replace: None,
         }
     }
 
@@ -1041,7 +1042,11 @@ mod tests {
             vec!["peer_c"]
         );
         assert_eq!(
-            (fresh.import_mode, fresh.duplicates, acquisition.max_sources),
+            (
+                fresh.import_mode,
+                fresh.duplicates.clone(),
+                acquisition.max_sources
+            ),
             (ImportMode::Singleton, DuplicateRule::Skip, 4)
         );
         assert_eq!(acquisition.job, job);
@@ -1049,6 +1054,36 @@ mod tests {
             store::job_state(&acq.db, &job).await,
             Some(JobState::Queued)
         );
+    }
+
+    #[tokio::test]
+    async fn a_replacing_job_downloads_into_a_replacing_batch() {
+        let (acq, effects) = Acquire::for_alice().await;
+        effects.stub().script_polls(found(vec![group(
+            "peer_a",
+            vec![item("peer_a", "O Holy Night", "a/03.flac")],
+            0.95,
+        )]));
+        let earlier = effects.library().join("x.flac");
+        std::fs::write(&earlier, b"audio").unwrap();
+        let set = crate::core::delete_guard::ReplaceSet {
+            grant_id: "g1".into(),
+            files: vec![crate::core::delete_guard::test_support::previewed_file(
+                "s1", &earlier,
+            )],
+            expires_at: 1_800_000_000,
+        };
+        let replacing = JobOptions {
+            replace: Some(set.clone()),
+            ..auto(0.7)
+        };
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", replacing).await;
+        drive(&acq, &alice(), &job).await;
+        let enqueued = effects.enqueued();
+        let [(fresh, _)] = &enqueued[..] else {
+            panic!("{} enqueues", enqueued.len())
+        };
+        assert_eq!(fresh.duplicates, DuplicateRule::Replace(set));
     }
 
     #[tokio::test]
@@ -1485,7 +1520,7 @@ mod tests {
             panic!("{} enqueues", enqueued.len())
         };
         assert_eq!(
-            (fresh.import_mode, fresh.duplicates),
+            (fresh.import_mode, fresh.duplicates.clone()),
             (ImportMode::Album, DuplicateRule::Skip)
         );
         assert_eq!(

@@ -293,6 +293,31 @@ def test_library_items_outside_the_library_folder_are_not_reported_for_removal(b
     assert [line.split(" ", 1)[0] for line in run.runlog_lines] == ["duplicate-keep"]
 
 
+@pytest.mark.parametrize("action", ["skip", "keep", "remove", "merge"])
+@pytest.mark.parametrize("singleton", [False, True], ids=["album", "singleton"])
+def test_a_replace_run_reports_every_duplicate_and_keeps_the_earlier_copy(
+    beets_env, singleton, action
+):
+    cfg = yaml.safe_load(beets_env.config.read_text())
+    cfg["import"]["duplicate_action"] = action
+    beets_env.config.write_text(yaml.safe_dump(cfg))
+    beets_env.album(beets_env.src)
+    beets_env.driver("auto", singleton=singleton, env={"FAKESRC_MODE": "strong"})
+    old = sorted(str(beets_env.music / f) for f in beets_env.music_files())
+
+    beets_env.album(beets_env.src)
+    run = beets_env.driver(
+        "auto", singleton=singleton, duplicates="replace", env={"FAKESRC_MODE": "strong"}
+    )
+
+    wanted = run.report["duplicates"]
+    assert [d["action"] for d in wanted] == ["removal_wanted"] * (2 if singleton else 1), run
+    assert sum(len(d["imported"]) for d in wanted) == 2, run
+    assert sorted(i["path"] for d in wanted for i in d["existing"]) == old
+    assert all(Path(p).exists() for p in old)
+    assert len(beets_env.music_files()) == 4
+
+
 @pytest.mark.parametrize("action,reported", [("skip", ["skipped"]), ("keep", ["kept"])])
 def test_reporting_removals_leaves_other_duplicate_actions_alone(beets_env, action, reported):
     cfg = yaml.safe_load(beets_env.config.read_text())
@@ -344,7 +369,11 @@ class ResetDuplicates(BeetsPlugin):
 
 @pytest.mark.parametrize(
     "duplicates, run_kind",
-    [("report-removals", "reports removals"), ("skip", "skips duplicates")],
+    [
+        ("report-removals", "reports removals"),
+        ("skip", "skips duplicates"),
+        ("replace", "reports removals"),
+    ],
 )
 @pytest.mark.parametrize("singleton", [False, True], ids=["album", "singleton"])
 def test_beets_stops_before_deleting_in_a_run_that_keeps_the_library(

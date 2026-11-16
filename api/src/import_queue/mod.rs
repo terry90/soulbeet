@@ -14,9 +14,9 @@ pub use retry::{forget_retries, import_choices_for, retry_import_for, Discarded,
 pub(crate) use rows::import_failure;
 
 use crate::auth::UserId;
-use crate::core::delete_guard::{Guard, Origin};
+use crate::core::delete_guard::{Guard, Origin, ReplaceSet};
 use crate::ledger::{
-    self, DuplicateRule, ImportDone, IndexWait, JobEvent, SlotResult, StoredImport,
+    self, DuplicateRule, ImportDone, IndexWait, JobEvent, Replacement, SlotResult, StoredImport,
 };
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -36,6 +36,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
+use replace::{Removals, Settled};
 use retry::{keeps_retry, skipped_duplicate, RetryStore};
 use rows::{row_with_state, rows_for_done, rows_with_state};
 
@@ -98,17 +99,32 @@ pub enum Duplicates {
     Guarded { actor: UserId, origin: Origin },
     /// beets skips what the library already has (MCP jobs); a skip is not kept for a retry.
     Skip,
+    /// beets reports every duplicate; the guard deletes only previewed copies, for the app that
+    /// confirmed them (D9).
+    Replace { actor: UserId, set: ReplaceSet },
 }
 
 impl Duplicates {
+    /// The previewed copies a replacing import may delete.
+    fn replace_set(&self) -> Option<&ReplaceSet> {
+        match self {
+            Duplicates::Replace { set, .. } => Some(set),
+            _ => None,
+        }
+    }
+
     /// How the imports of a batch of `user` with `rule` treat earlier copies.
-    pub fn of(rule: DuplicateRule, user: &UserId) -> Duplicates {
+    pub fn of(rule: &DuplicateRule, user: &UserId) -> Duplicates {
         match rule {
             DuplicateRule::Guarded => Duplicates::Guarded {
                 actor: user.clone(),
                 origin: Origin::Ui,
             },
             DuplicateRule::Skip => Duplicates::Skip,
+            DuplicateRule::Replace(set) => Duplicates::Replace {
+                actor: user.clone(),
+                set: set.clone(),
+            },
         }
     }
 }
@@ -132,8 +148,9 @@ impl ImportJob {
                 .filter_map(|row| Some((row.job.clone()?, row.clone())))
                 .collect(),
             // A job with rows is a download or a retry of one, never AsConfigured.
-            duplicates: match self.duplicates {
+            duplicates: match &self.duplicates {
                 Duplicates::Skip => DuplicateRule::Skip,
+                Duplicates::Replace { set, .. } => DuplicateRule::Replace(set.clone()),
                 Duplicates::Guarded { .. } | Duplicates::AsConfigured => DuplicateRule::Guarded,
             },
             last_run: self.last_run.as_deref().cloned(),
@@ -145,7 +162,7 @@ impl ImportJob {
     /// for `user`.
     pub fn from_stored(stored: StoredImport, user: UserId) -> ImportJob {
         ImportJob {
-            duplicates: Duplicates::of(stored.duplicates, &user),
+            duplicates: Duplicates::of(&stored.duplicates, &user),
             sources: stored.sources,
             files: stored.files,
             target: stored.target,
@@ -185,6 +202,10 @@ pub struct JobOutcome {
     /// The importer ran. Only then does an automatic run's result say what
     /// can be picked.
     ran: bool,
+    /// What became of each earlier copy the run wanted removed (replace::Settled).
+    replaced: Vec<Replacement>,
+    /// A replacing run's previewed songs whose copy it did not delete (replace::Settled).
+    not_replaced: Vec<String>,
 }
 
 impl JobOutcome {
@@ -194,6 +215,8 @@ impl JobOutcome {
             result,
             new_files: vec![],
             ran: false,
+            replaced: vec![],
+            not_replaced: vec![],
         }
     }
 }
@@ -539,12 +562,28 @@ impl Shared {
             Duplicates::AsConfigured => DuplicateRun::AsConfigured,
             Duplicates::Guarded { .. } => DuplicateRun::ReportRemovals,
             Duplicates::Skip => DuplicateRun::Skip,
+            Duplicates::Replace { .. } => DuplicateRun::Replace,
         };
-        let mut result = importer
+        let result = importer
             .import(&sources, target, job.mode, &job.choice, duplicates)
             .await;
-        if let Duplicates::Guarded { actor, origin } = &job.duplicates {
-            if !result.removals.is_empty() {
+        let removals = match &job.duplicates {
+            Duplicates::Guarded { actor, origin } => Some((actor, Removals::Guarded(origin))),
+            Duplicates::Replace { actor, set } => Some((
+                actor,
+                Removals::Previewed {
+                    set,
+                    now: crate::oauth::now_unix(),
+                },
+            )),
+            Duplicates::AsConfigured | Duplicates::Skip => None,
+        };
+        let Settled {
+            result,
+            replaced,
+            not_replaced,
+        } = match removals {
+            Some((actor, removals)) if !result.removals.is_empty() => {
                 // The import's own jobs want what it replaces.
                 let mut exempt: Vec<String> = job
                     .owner
@@ -554,18 +593,24 @@ impl Shared {
                     .collect();
                 exempt.sort();
                 exempt.dedup();
-                result = replace::settle_removals(
+                replace::settle_removals(
                     &self.deps.guard(),
                     importer.as_ref(),
                     actor,
-                    origin,
+                    removals,
                     &exempt,
                     target,
                     result,
                 )
-                .await;
+                .await
             }
-        }
+            // Nothing to settle: a replacing job's previewed copies all stay.
+            _ => Settled {
+                result,
+                replaced: vec![],
+                not_replaced: replace::not_replaced(job.duplicates.replace_set(), &[]),
+            },
+        };
         let new_files = match before {
             Some(before) => {
                 let mut new: Vec<PathBuf> = audio_files_under(target)
@@ -582,6 +627,8 @@ impl Shared {
             result,
             new_files,
             ran: true,
+            replaced,
+            not_replaced,
         }
     }
 
@@ -664,7 +711,7 @@ impl Shared {
         if let Some(owner) = &job.owner {
             let rows = rows_for_done(&owner.rows, &job, &outcome);
             if let Some(import) = job.stored() {
-                let done = ledger_end(library, import, rows.clone(), &outcome.result.outcome, keep);
+                let done = ledger_end(library, import, rows.clone(), &outcome, keep);
                 self.deps.record(JobEvent::ImportDone(Box::new(done)));
             }
             self.deps
@@ -697,15 +744,17 @@ fn last_run(job: &ImportJob, result: &ImportResult) -> KeptRun {
 }
 
 /// How `import` ended for the ledger, its `rows` sent: the state its slots go
-/// to after `outcome`, kept for a retry when `keep`, the index wait of an
-/// import into `library`, and each slot's result.
+/// to after `done`'s outcome, kept for a retry when `keep`, the index wait of an
+/// import into `library`, and each slot's result, an imported one with what the run
+/// replaced.
 fn ledger_end(
     library: &Path,
     import: StoredImport,
     rows: Vec<DownloadProgress>,
-    outcome: &ImportOutcome,
+    done: &JobOutcome,
     keep: bool,
 ) -> ImportDone {
+    let outcome = &done.result.outcome;
     let (next, index) = match (outcome, import.sources.first()) {
         // An import that ran had a source.
         (ImportOutcome::Imported { items, .. }, Some(first)) if !items.is_empty() => (
@@ -735,6 +784,8 @@ fn ledger_end(
                     applied: items.clone(),
                     untagged: *untagged,
                     listed: None,
+                    replaced: done.replaced.clone(),
+                    not_replaced: done.not_replaced.clone(),
                 };
                 (slot.clone(), result)
             })
@@ -860,7 +911,9 @@ mod tests {
         StubImporter,
     };
     use super::*;
-    use crate::core::delete_guard::test_support::{wanted, Library};
+    use crate::core::delete_guard::test_support::{library_verdict, wanted, Library};
+    use crate::core::deletion::REPLACE_CONSENT_SECS;
+    use crate::ledger::ReplacementOutcome;
     use shared::download::{DownloadState, ImportChoice, JobSlot};
     use soulbeet::{ForgetOutcome, ImportOutcome, ImportedItem, SkipReason, SourceFile, TaskCount};
     use std::time::Duration;
@@ -1039,6 +1092,100 @@ mod tests {
         assert_eq!(
             stub.relocations(),
             vec![(std::fs::canonicalize(&target).unwrap(), vec![7])]
+        );
+    }
+
+    /// The earlier item `A/x.flac` the library holds of "O Holy Night", as beets reports it.
+    fn holy_night() -> ImportedItem {
+        ImportedItem {
+            path: "A/x.flac".into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replacing_job_runs_beets_with_replace_and_survives_a_restart() {
+        let stub = Arc::new(StubImporter::new());
+        let lib = Library::new().await;
+        lib.app("g1", "alice", true).await;
+        let checked = library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+        let set = ReplaceSet {
+            grant_id: "g1".into(),
+            files: vec![checked.previewed()],
+            expires_at: crate::oauth::now_unix() + REPLACE_CONSENT_SECS,
+        };
+        let deps = RecordingDeps::with_guard(stub.clone(), lib.db.clone(), lib.fake.clone());
+        let queue = ImportQueue::new(deps.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let target = lib.root.join("music/alice");
+        let replacing = |item: &str| ImportJob {
+            duplicates: Duplicates::Replace {
+                actor: lib.alice(),
+                set: set.clone(),
+            },
+            ..owned(
+                job(file(dir.path(), &format!("in/{item}.flac")), &target),
+                &lib.alice(),
+                &[item],
+            )
+        };
+        let stored = replacing("a").stored().unwrap();
+        assert_eq!(stored.duplicates, DuplicateRule::Replace(set.clone()));
+        // What the restore after a restart does with the stored row.
+        let rebuilt = ImportJob::from_stored(stored, lib.alice());
+        assert!(
+            matches!(&rebuilt.duplicates, Duplicates::Replace { actor, set: kept } if *actor == lib.alice() && *kept == set),
+            "{:?}",
+            rebuilt.duplicates
+        );
+        stub.script(ImportResult {
+            removals: vec![soulbeet::WantedRemoval {
+                existing: vec![holy_night()],
+                imported: vec![(7, "Zzqx Artist/a.flac".into())],
+            }],
+            ..imported()
+        });
+        finish(queue.submit(rebuilt).await).await;
+        assert_eq!(stub.duplicate_runs(), vec![DuplicateRun::Replace]);
+        assert!(!target.join("A/x.flac").exists());
+        let Some(JobEvent::ImportDone(done)) = deps.ledger_events().pop() else {
+            panic!("{:?}", deps.ledger_events())
+        };
+        assert!(
+            matches!(&done.results[..], [(_, SlotResult::Imported { replaced, not_replaced, .. })]
+                if *replaced == vec![Replacement { existing: vec![holy_night()], outcome: ReplacementOutcome::Replaced }]
+                    && not_replaced.is_empty()),
+            "{:?}",
+            done.results
+        );
+        // An import beets found no duplicate for replaces nothing and lists the previewed song.
+        stub.script(imported());
+        finish(queue.submit(replacing("b")).await).await;
+        let Some(JobEvent::ImportDone(done)) = deps.ledger_events().pop() else {
+            panic!("{:?}", deps.ledger_events())
+        };
+        assert!(
+            matches!(&done.results[..], [(_, SlotResult::Imported { replaced, not_replaced, .. })]
+                if replaced.is_empty() && *not_replaced == vec!["s1".to_string()]),
+            "{:?}",
+            done.results
+        );
+        let old: StoredImport = serde_json::from_value(serde_json::json!({
+            "sources": ["/dl/a.flac"], "target": "/music", "album": false,
+            "cleanup_root": null, "choices": null, "choice": "auto", "rows": [],
+            "duplicates": "skip"
+        }))
+        .unwrap();
+        assert_eq!(
+            old.duplicates,
+            DuplicateRule::Skip,
+            "a row of step 9's shape"
         );
     }
 
@@ -1330,6 +1477,8 @@ mod tests {
                     applied,
                     untagged: false,
                     listed: None,
+                    replaced: vec![],
+                    not_replaced: vec![],
                 },
             )]
         };
@@ -1594,7 +1743,7 @@ mod tests {
             &alice(),
             &["a"],
         );
-        job.duplicates = Duplicates::of(DuplicateRule::Guarded, &alice());
+        job.duplicates = Duplicates::of(&DuplicateRule::Guarded, &alice());
         job.cleanup_root = Some(tmp.path().join("dl"));
         finish(queue.submit(job).await).await;
 

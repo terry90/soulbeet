@@ -4,6 +4,7 @@
 //! order they were made; reads go to the pool (`store`).
 
 use crate::auth::UserId;
+use crate::core::delete_guard::ReplaceSet;
 use crate::core::library::SongFacts;
 use crate::import_queue::KeptRun;
 use crate::transfer_registry::TransferRegistry;
@@ -141,7 +142,7 @@ pub struct StoredImport {
 }
 
 /// How a batch's imports treat what the library already has.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DuplicateRule {
     /// The web UI's: beets as configured, removals through the delete guard.
@@ -149,14 +150,19 @@ pub enum DuplicateRule {
     Guarded,
     /// MCP jobs': beets skips what the library has.
     Skip,
+    /// A replacing MCP job's (D9): beets reports every duplicate, and only the previewed copies
+    /// of `set` are deleted, for the app that confirmed them, until it runs out.
+    Replace(ReplaceSet),
 }
 
 impl DuplicateRule {
-    /// The rule of the batches of jobs from `origin`, wherever such a batch is made again.
-    pub fn of(origin: BatchOrigin) -> DuplicateRule {
-        match origin {
-            BatchOrigin::Ui => DuplicateRule::Guarded,
-            BatchOrigin::Mcp => DuplicateRule::Skip,
+    /// The rule of the batches of a job from `origin` with `options`, wherever such a batch is
+    /// made again: a replacing job's set, else the origin's rule.
+    pub fn for_job(origin: BatchOrigin, options: Option<&JobOptions>) -> DuplicateRule {
+        match (origin, options.and_then(|o| o.replace.clone())) {
+            (_, Some(set)) => DuplicateRule::Replace(set),
+            (BatchOrigin::Ui, None) => DuplicateRule::Guarded,
+            (BatchOrigin::Mcp, None) => DuplicateRule::Skip,
         }
     }
 }
@@ -197,9 +203,38 @@ pub enum SlotResult {
         applied: Vec<ImportedItem>,
         untagged: bool,
         listed: Option<Vec<SongFacts>>,
+        /// What became of each earlier copy beets wanted removed, in the import's order.
+        #[serde(default)]
+        replaced: Vec<Replacement>,
+        /// A replacing import's previewed songs whose copy it did not delete (D9).
+        #[serde(default)]
+        not_replaced: Vec<String>,
     },
     /// beets skipped the slot's files as `existing`, the library's own copies.
     AlreadyInLibrary { existing: Vec<ImportedItem> },
+}
+
+/// One removal of earlier copies an import wanted, and what became of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Replacement {
+    /// The earlier items, their paths relative to the library folder as beets names them.
+    pub existing: Vec<ImportedItem>,
+    pub outcome: ReplacementOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReplacementOutcome {
+    /// Every earlier copy deleted.
+    Replaced,
+    /// None deleted; why.
+    Kept { failure: Failure },
+    /// `removed` (canonical paths) deleted before `failure` stopped the rest; a removal that
+    /// stopped before it reported is not in `removed`, and its failure says the file may be gone.
+    PartlyRemoved {
+        removed: Vec<PathBuf>,
+        failure: Failure,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -390,6 +425,10 @@ pub struct JobOptions {
     pub min_score: f64,
     pub filters: SourceFilters,
     pub max_sources: u32,
+    /// The previewed copies a replacing job deletes once its new copy is imported (D9). Only
+    /// `ensure` sets it, from a token it took; no rewrite of the options changes it.
+    #[serde(default)]
+    pub replace: Option<ReplaceSet>,
 }
 
 /// D2. What makes two jobs the same recording: equal `mbid`s when both have one, else equal
@@ -1941,6 +1980,8 @@ mod tests {
             applied: wait.items.clone(),
             untagged: true,
             listed: None,
+            replaced: vec![],
+            not_replaced: vec![],
         };
         ledger.record(JobEvent::ImportDone(Box::new(ImportDone {
             import: import(0, "01.flac"),
@@ -2120,6 +2161,7 @@ mod tests {
                 min_score: 0.7,
                 filters: SourceFilters::default(),
                 max_sources: 4,
+                replace: None,
             }),
             ..job(id, "alice", folder, JobState::Searching, None)
         }
@@ -2471,6 +2513,72 @@ mod tests {
             store::job_state(&db, "j1").await,
             Some(JobState::Searching | JobState::Dismissed)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_new_search_with_filters_keeps_the_jobs_replace_set() {
+        let (ledger, db, alice, _) = ledger().await;
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = dir.path().join("x.flac");
+        std::fs::write(&earlier, b"audio").unwrap();
+        let set = ReplaceSet {
+            grant_id: "g1".into(),
+            files: vec![crate::core::delete_guard::test_support::previewed_file(
+                "s1", &earlier,
+            )],
+            expires_at: 1_800_000_000,
+        };
+        let mut job = mcp_job(
+            "j1",
+            &alice,
+            wanted_track("Marrow Choir", "O Holy Night", None),
+        );
+        if let Some(options) = job.options.as_mut() {
+            options.replace = Some(set.clone());
+        }
+        ledger
+            .create_batch(batch_of("b1"), vec![job])
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Ended {
+            job: "j1".into(),
+            state: JobState::Failed,
+            failure: None,
+        });
+        // retry_job with new filters, as it searches again.
+        let filters = SourceFilters {
+            formats: vec!["flac".into()],
+            ..SourceFilters::default()
+        };
+        ledger
+            .transition(
+                &UserId::new("alice"),
+                "j1",
+                Transition::Search {
+                    search_id: "s2".into(),
+                    filters: Some(filters.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let options: String = sqlx::query_scalar("SELECT options FROM jobs WHERE id = 'j1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let options: JobOptions = serde_json::from_str(&options).unwrap();
+        assert_eq!(
+            (&options.filters, &options.replace),
+            (&filters, &Some(set.clone()))
+        );
+        // A restart rebuilds the job's batch with the same set.
+        assert_eq!(
+            DuplicateRule::for_job(BatchOrigin::Mcp, Some(&options)),
+            DuplicateRule::Replace(set)
+        );
+        assert_eq!(
+            DuplicateRule::for_job(BatchOrigin::Mcp, None),
+            DuplicateRule::Skip
+        );
     }
 
     #[tokio::test]
@@ -3130,6 +3238,8 @@ mod tests {
                     applied: wait.items.clone(),
                     untagged: false,
                     listed: None,
+                    replaced: vec![],
+                    not_replaced: vec![],
                 },
             )],
         })));

@@ -234,6 +234,7 @@ fn driver_args(
         DuplicateRun::AsConfigured => "as-configured".into(),
         DuplicateRun::ReportRemovals => "report-removals".into(),
         DuplicateRun::Skip => "skip".into(),
+        DuplicateRun::Replace => "replace".into(),
     });
     match choice {
         DriverChoice::Auto => args.push("auto".into()),
@@ -629,6 +630,7 @@ mod tests {
                     "report-removals",
                 ),
                 (ImportMode::Singleton, DuplicateRun::Skip, "skip"),
+                (ImportMode::Singleton, DuplicateRun::Replace, "replace"),
             ] {
                 stage(d, SKIPPED);
                 let result = importer

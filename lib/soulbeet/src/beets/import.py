@@ -9,6 +9,8 @@
 #                    earlier copy and the report names the removal it wanted
 #   skip             beets skips a task whose music the library already has,
 #                    whatever its config says
+#   replace          beets keeps every earlier copy and the report names each
+#                    as a removal it wanted, whatever its config says
 #
 # CHOICE is one of
 #   auto            decide as `beet import -q` does, recording each task's candidates
@@ -20,9 +22,10 @@
 # recorded in auto mode only, each with its files' own tags. "duplicates" holds
 # each duplicate decision beets logs as replace, keep or skip, with the library
 # files it is about (a skip with the library items); in a report-removals run a
-# removal beets wanted is a "removal_wanted" entry with the library items it
-# would have deleted and, once the task's files are in place, the id and path
-# of each item it imported. "items" holds each file beets imported, as it
+# removal beets wanted, and in a replace run every duplicate, is a
+# "removal_wanted" entry with the library items it would have deleted and,
+# once the task's files are in place, the id and path of each item it
+# imported. "items" holds each file beets imported, as it
 # stored it. stdout carries nothing but beets' own output.
 import json
 import os
@@ -73,7 +76,7 @@ from beets.importer.tasks import ImportTask, ImportTaskFactory, SingletonImportT
 from beets.plugins import BeetsPlugin
 from beets.ui.commands import import_ as import_cmd
 
-DUPLICATES = ("as-configured", "report-removals", "skip")
+DUPLICATES = ("as-configured", "report-removals", "skip", "replace")
 
 USAGE = (
     f"usage: import.py REPORT ({' | '.join(DUPLICATES)})"
@@ -142,7 +145,11 @@ remember_duplicates(SingletonImportTask, lambda items: items)
 
 
 # The runs that must not delete library files, as refuse_removal names them.
-KEEPS_LIBRARY = {"report-removals": "reports removals", "skip": "skips duplicates"}
+KEEPS_LIBRARY = {
+    "report-removals": "reports removals",
+    "skip": "skips duplicates",
+    "replace": "reports removals",
+}
 
 
 def refuse_removal(task, lib):
@@ -222,13 +229,15 @@ class Reporting(Session):
     """Reports each duplicate decision as beets logs it, with the library
     files its duplicate check found. When it reports removals and beets is
     configured to remove, beets keeps the earlier copy instead, and each keep
-    is reported as the removal beets wanted. When it skips, beets skips every
-    duplicate, whatever its config says."""
+    is reported as the removal beets wanted. When it replaces, beets keeps
+    every duplicate's earlier copy and reports it as a wanted removal, and
+    when it skips, beets skips every duplicate, whatever its config says."""
 
     deciding = None
     # The DUPLICATES argument.
     duplicates = "as-configured"
-    # Whether this run turned the configured remove into keep.
+    # Whether this run turned the configured action into keep, so each keep
+    # is a wanted removal.
     kept_for_removal = False
 
     def run(self):
@@ -241,6 +250,9 @@ class Reporting(Session):
         if self.duplicates == "skip":
             # beets reads it for each task (importer/stages.py _resolve_duplicates).
             config["import"]["duplicate_action"] = "skip"
+        elif self.duplicates == "replace":
+            config["import"]["duplicate_action"] = "keep"
+            self.kept_for_removal = True
         elif (
             self.duplicates == "report-removals"
             and config["import"]["duplicate_action"].as_str() == "remove"

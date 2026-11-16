@@ -7,7 +7,7 @@ pub(crate) mod tokens;
 
 use std::path::PathBuf;
 
-use shared::failure::{Failure, Stage};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::navidrome::{DeletionReason, DiscoveryTrack};
 use soulbeet::navidrome::models::NativeSong;
 
@@ -25,6 +25,31 @@ pub(crate) const SONGS_PER_TOKEN: usize = 25;
 
 /// How long a token is valid after its preview, in seconds.
 pub(crate) const TOKEN_SECS: i64 = 600;
+
+/// How long the yes a replace_existing token carried holds for its job's import, from the take
+/// (D9).
+pub(crate) const REPLACE_CONSENT_SECS: i64 = 24 * 60 * 60;
+
+/// The yes to replace a copy, given by a replace_existing token, ran out at `at` (D9).
+pub(crate) fn replace_consent_expired(at: i64) -> Failure {
+    Failure::new(
+        FailureCode::ExpiredHandle,
+        Stage::Delete,
+        RetryAdvice::NotRetryable,
+        format!(
+            "The confirmation to replace this copy ran out at {}; preview it again with reason replaced",
+            utc_text(at)
+        ),
+    )
+}
+
+/// Unix time `at` as a message says it: `%Y-%m-%d %H:%M:%S UTC`.
+fn utc_text(at: i64) -> String {
+    chrono::DateTime::from_timestamp(at, 0).map_or_else(
+        || format!("{at} seconds after 1970-01-01 00:00:00 UTC"),
+        |at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+    )
+}
 
 /// The caller as deletion needs it: the user and the app (OAuth grant) it acts through.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,7 +194,7 @@ pub(crate) async fn confirm(
     secret: &str,
     now: i64,
 ) -> Result<Confirmed, DeleteTokenRefusal> {
-    let taken = take_in(guard.db, app, secret, now).await?;
+    let taken = take_in(guard.db, app, secret, None, now).await?;
     let origin = Origin::Mcp {
         grant_id: app.grant_id.clone(),
     };

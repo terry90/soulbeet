@@ -730,6 +730,7 @@ pub(crate) async fn download_source(
             min_score: AUTO_SELECT_SCORE_THRESHOLD,
             filters: search.spec.map(|s| s.filters).unwrap_or_default(),
             max_sources: MAX_SOURCES_PER_TRACK as u32,
+            replace: None,
         }),
     };
     let id = job.id.clone();

@@ -123,6 +123,15 @@ pub struct PreviewedFile {
     pub file: unlink::FileId,
 }
 
+/// The previewed copies a replacing job may delete, the app that confirmed them, and until when
+/// (D9).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplaceSet {
+    pub grant_id: String,
+    pub files: Vec<PreviewedFile>,
+    pub expires_at: i64,
+}
+
 /// What started a removal, as the audit records it (D13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
@@ -823,7 +832,7 @@ pub(crate) fn delete_failed(e: &std::io::Error) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::quota::{permission_not_granted, room_in, DAY_SECS};
-    use super::test_support::{wanted, FakeNavidrome, Library};
+    use super::test_support::{library_verdict, wanted, FakeNavidrome, Library};
     use super::*;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use crate::models::navidrome_read_failure::NavidromeReadFailureRow;
@@ -834,14 +843,6 @@ mod tests {
     use soulbeet::NavidromeError;
     use std::sync::Arc;
     use std::time::Duration;
-
-    fn library_verdict(v: Result<Verdict, Failure>) -> Checked {
-        match v {
-            Ok(Verdict::Library(c)) => c,
-            Ok(Verdict::Discovery { track, .. }) => panic!("discovery {track:?}"),
-            Err(f) => panic!("{f:?}"),
-        }
-    }
 
     async fn checked(lib: &Library) -> Checked {
         library_verdict(lib.guard().check_song(&lib.alice(), "s1").await)
@@ -1504,6 +1505,42 @@ mod tests {
         );
         lib.set_job_state("j1", "done").await;
         library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+    }
+
+    #[tokio::test]
+    async fn a_running_replacing_job_keeps_the_file_it_will_replace() {
+        // D12: no separate rule 5 clause; a replacing job wants the recording of the copy it
+        // replaces, so rule 5 keeps that copy from any other deletion until the job ends.
+        let lib = Library::new().await;
+        let set = ReplaceSet {
+            grant_id: "g1".into(),
+            files: vec![checked(&lib).await.previewed()],
+            expires_at: 1_800_000_000,
+        };
+        lib.job(
+            "j1",
+            "alice-music",
+            "downloading",
+            wanted("Marrow Choir", "O Holy Night", None),
+        )
+        .await;
+        let options = serde_json::to_string(&crate::ledger::JobOptions {
+            pick: crate::ledger::Pick::Auto,
+            min_score: 0.7,
+            filters: crate::ledger::SourceFilters::default(),
+            max_sources: 4,
+            replace: Some(set),
+        })
+        .unwrap();
+        sqlx::query("UPDATE jobs SET options = ? WHERE id = 'j1'")
+            .bind(options)
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await).0,
+            FailureCode::DeleteInUse
+        );
     }
 
     #[tokio::test]

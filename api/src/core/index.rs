@@ -774,11 +774,17 @@ async fn end(
 fn listing(result: SlotResult, songs: &[SongFacts]) -> SlotResult {
     match result {
         SlotResult::Imported {
-            applied, untagged, ..
+            applied,
+            untagged,
+            replaced,
+            not_replaced,
+            ..
         } => SlotResult::Imported {
             applied,
             untagged,
             listed: Some(songs.to_vec()),
+            replaced,
+            not_replaced,
         },
         // Never waits for Navidrome.
         other @ SlotResult::AlreadyInLibrary { .. } => other,
@@ -1283,6 +1289,8 @@ mod tests {
                     applied: wait.items.clone(),
                     untagged: false,
                     listed: None,
+                    replaced: vec![],
+                    not_replaced: vec![],
                 },
             )],
             index: Some(wait),
@@ -1364,6 +1372,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn a_listed_import_keeps_what_it_replaced() {
+        let library = tempfile::tempdir().unwrap();
+        let applied = imported_in(library.path()).items;
+        let replaced = vec![crate::ledger::Replacement {
+            existing: applied.clone(),
+            outcome: crate::ledger::ReplacementOutcome::Replaced,
+        }];
+        let imported = SlotResult::Imported {
+            applied: applied.clone(),
+            untagged: false,
+            listed: None,
+            replaced: replaced.clone(),
+            not_replaced: vec!["s2".into()],
+        };
+        assert_eq!(
+            listing(imported, &[]),
+            SlotResult::Imported {
+                applied,
+                untagged: false,
+                listed: Some(vec![]),
+                replaced,
+                not_replaced: vec!["s2".into()],
+            }
+        );
+    }
+
     #[tokio::test]
     async fn a_listed_import_stores_the_file_navidrome_lists_and_what_beets_applied() {
         let library = tempfile::tempdir().unwrap();
@@ -1387,6 +1422,7 @@ mod tests {
             applied: got,
             untagged: false,
             listed: Some(songs),
+            ..
         } = result_of(&db).await
         else {
             panic!()

@@ -3,6 +3,9 @@
 
 use crate::auth::UserCtx;
 use crate::core::database_failure;
+use crate::core::delete_guard::{PreviewedFile, ReplaceSet};
+use crate::core::deletion::tokens::{peek_in, take_in, DeleteTokenRefusal};
+use crate::core::deletion::{App, REPLACE_CONSENT_SECS};
 use crate::core::folders::owned_in;
 use crate::core::index::NavidromeOf;
 use crate::core::library::{find, MatchKind, Reference};
@@ -20,10 +23,12 @@ use serde_json::{json, Map, Value};
 use shared::download::{DownloadProgress, DownloadQuery, DownloadableItem, IndexState, JobSlot};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::metadata::{Album, Track};
+use shared::navidrome::DeletionReason;
 use soulbeet::ImportMode;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::warn;
 
 pub(crate) mod decide;
 pub(crate) mod retry;
@@ -103,10 +108,12 @@ pub(crate) enum EnsureItem {
     InLibrary {
         song_ids: Vec<String>,
     },
-    /// A job was made; `fuzzy` are the song ids that only fuzzily match, for Claude to judge.
+    /// A job was made; `fuzzy` are the song ids that only fuzzily match, for Claude to judge;
+    /// `replacing` the token songs whose previewed copies it replaces (D9).
     Created {
         job_id: String,
         fuzzy: Vec<String>,
+        replacing: Vec<String>,
     },
     /// The user's unfinished job `job_id` already wants this recording: already_running with
     /// `facts` (the reference, the job and its state).
@@ -127,6 +134,42 @@ pub(crate) struct Ensured {
     pub items: Vec<EnsureItem>,
     /// False when the user has no Navidrome link: nothing was looked up (step 5 D9).
     pub library_checked: bool,
+    /// The songs of a replace_existing token that no created job replaces, in token order.
+    pub replace_unmatched: Vec<String>,
+}
+
+/// The one thing ensure_in_library hands `ensure` for a replacement (D9): the app and the
+/// secret of a confirmation token of a preview with reason replaced.
+pub(crate) struct ReplaceConsent {
+    pub app: App,
+    pub secret: String,
+}
+
+/// Why `ensure` wrote no batch.
+#[derive(Debug)]
+pub(crate) enum EnsureRefusal {
+    /// Refused before the token, if any, was taken: nothing is written and the token is unused.
+    Call(CallRefused),
+    /// The token was refused (peek_in or take_in): nothing is written.
+    Token(DeleteTokenRefusal),
+    /// The token was taken, then the batch could not be written: the token is used up, so the
+    /// call cannot be made again with it. `song_ids` are the token's.
+    Taken {
+        failure: Failure,
+        song_ids: Vec<String>,
+    },
+}
+
+impl From<CallRefused> for EnsureRefusal {
+    fn from(refused: CallRefused) -> EnsureRefusal {
+        EnsureRefusal::Call(refused)
+    }
+}
+
+impl From<Failure> for EnsureRefusal {
+    fn from(failure: Failure) -> EnsureRefusal {
+        EnsureRefusal::Call(failure.into())
+    }
 }
 
 /// Why `ensure` wrote nothing: the failure and, for folder_required with folders, the folders the
@@ -204,6 +247,15 @@ pub(crate) async fn folder_for(
 /// album always gets one), each with a new search id, and starts the runner on each new job.
 /// With `for_playlist`, the batch is made also when every item's job is already running for an
 /// earlier call, so it can hold the order a playlist fills them in.
+///
+/// With `replace` (D9), the token is checked first (peek_in, reason replaced) and refused
+/// before anything is looked up. Each of its songs whose previewed file is inside the folder
+/// goes to the first track item, in input order, whose MBID or exact matches include it: that
+/// item gets a job instead of being `InLibrary`. When some item replaces, the token is taken
+/// right before the batch is written, and each replacing job's options hold a ReplaceSet of only
+/// its songs' files, until REPLACE_CONSENT_SECS after the take; every other job's `replace` is
+/// None, whatever `options` held. The token's songs no created job replaces are
+/// `replace_unmatched`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ensure(
     acquire: &Arc<Acquire>,
@@ -214,34 +266,68 @@ pub(crate) async fn ensure(
     items: Vec<Wanted>,
     options: JobOptions,
     for_playlist: bool,
-) -> Result<Ensured, CallRefused> {
+    replace: Option<ReplaceConsent>,
+) -> Result<Ensured, EnsureRefusal> {
     if let Some(failure) = acquire.effects.importer_blocked().await {
         return Err(failure.into());
     }
     acquire.effects.backend().await?;
+    let now = crate::oauth::now_unix();
+    let previewed = match &replace {
+        Some(ReplaceConsent { app, secret }) => {
+            let expect = Some(DeletionReason::Replaced);
+            let peeked = (peek_in(&acquire.db, app, secret, expect, now).await)
+                .map_err(EnsureRefusal::Token)?;
+            peeked.files
+        }
+        None => vec![],
+    };
     let folder = folder_for(&acquire.db, ctx, folder_id).await?;
     let navi = match navidrome.navidrome_of(&ctx.id()).await {
         Ok(navi) => Some(navi),
         Err(NavidromeLookupError::NotLinked | NavidromeLookupError::NoServer) => None,
         Err(e) => return Err(e.failure(Stage::LibraryCheck, e.to_string()).into()),
     };
+    // The token songs an item may still take: only a file in the folder the jobs import into
+    // can be a duplicate beets reports there.
+    let mut unclaimed: Vec<&PreviewedFile> = match previewed.is_empty() {
+        true => vec![],
+        false => match tokio::fs::canonicalize(&folder.path).await {
+            Ok(root) => (previewed.iter())
+                .filter(|f| f.path.starts_with(&root))
+                .collect(),
+            Err(e) => {
+                warn!("Could not resolve folder {}: {e}", folder.path);
+                vec![]
+            }
+        },
+    };
     // Each item's result, None while it waits for its job; and the items that get one, with
-    // their fuzzy matches.
+    // their fuzzy matches and the token songs they replace.
     let mut results: Vec<Option<EnsureItem>> = Vec::with_capacity(items.len());
-    let mut wanting: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut wanting: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let (Some(navi), Wanted::Track(reference)) = (&navi, item) else {
             results.push(None);
-            wanting.push((i, vec![]));
+            wanting.push((i, vec![], vec![]));
             continue;
         };
         match find(navi, reference).await {
             Ok(found) => {
                 let (owned, fuzzy): (Vec<_>, Vec<_>) =
                     (found.matches.into_iter()).partition(|m| m.how.kind != MatchKind::Fuzzy);
-                if owned.is_empty() {
+                let fuzzy: Vec<String> = fuzzy.into_iter().map(|m| m.song.song_id).collect();
+                let (replacing, rest): (Vec<&PreviewedFile>, Vec<&PreviewedFile>) = (unclaimed
+                    .into_iter())
+                .partition(|f| owned.iter().any(|m| m.song.song_id == f.song_id));
+                unclaimed = rest;
+                if !replacing.is_empty() {
+                    let replacing = replacing.iter().map(|f| f.song_id.clone()).collect();
                     results.push(None);
-                    wanting.push((i, fuzzy.into_iter().map(|m| m.song.song_id).collect()));
+                    wanting.push((i, fuzzy, replacing));
+                } else if owned.is_empty() {
+                    results.push(None);
+                    wanting.push((i, fuzzy, vec![]));
                 } else {
                     let song_ids = owned.into_iter().map(|m| m.song.song_id).collect();
                     results.push(Some(EnsureItem::InLibrary { song_ids }));
@@ -251,7 +337,30 @@ pub(crate) async fn ensure(
         }
     }
     let library_checked = navi.is_some();
+    // Taken only when some job will replace, right before the batch is written: two calls with
+    // one token make one batch.
+    let taken = match &replace {
+        Some(ReplaceConsent { app, secret })
+            if wanting
+                .iter()
+                .any(|(_, _, replacing)| !replacing.is_empty()) =>
+        {
+            let expect = Some(DeletionReason::Replaced);
+            let taken = (take_in(&acquire.db, app, secret, expect, now).await)
+                .map_err(EnsureRefusal::Token)?;
+            Some((app.grant_id.clone(), taken.files))
+        }
+        _ => None,
+    };
+    let after_take = |failure: Failure| match &taken {
+        Some((_, files)) => EnsureRefusal::Taken {
+            failure,
+            song_ids: files.iter().map(|f| f.song_id.clone()).collect(),
+        },
+        None => failure.into(),
+    };
     let mut batch_id = None;
+    let mut replaced: Vec<String> = Vec::new();
     if !wanting.is_empty() {
         // Without a label given, the writer names the batch after the jobs it takes.
         let batch = NewJobBatch {
@@ -263,17 +372,36 @@ pub(crate) async fn ensure(
         };
         let id = batch.id.clone();
         let jobs: Vec<NewJob> = (wanting.iter())
-            .map(|(i, _)| new_job(ctx, &folder, &items[*i], &options))
+            .map(|(i, _, replacing)| {
+                let set =
+                    (taken.as_ref())
+                        .filter(|_| !replacing.is_empty())
+                        .map(|(grant_id, files)| ReplaceSet {
+                            grant_id: grant_id.clone(),
+                            files: (files.iter())
+                                .filter(|f| replacing.contains(&f.song_id))
+                                .cloned()
+                                .collect(),
+                            expires_at: now + REPLACE_CONSENT_SECS,
+                        });
+                let options = JobOptions {
+                    replace: set,
+                    ..options.clone()
+                };
+                new_job(ctx, &folder, &items[*i], &options)
+            })
             .collect();
         let ids: Vec<String> = jobs.iter().map(|job| job.id.clone()).collect();
         let admitted = (acquire.ledger.create_batch(batch, jobs).await)
-            .map_err(|e| database_failure(Stage::Input, e))?;
+            .map_err(|e| after_take(database_failure(Stage::Input, e)))?;
         if admitted.len() != ids.len() {
             // The writer answers each job it is given, in order.
             let e = format!("{} jobs written, {} answered", ids.len(), admitted.len());
-            return Err(database_failure(Stage::Input, e).into());
+            return Err(after_take(database_failure(Stage::Input, e)));
         }
-        for (((i, fuzzy), job_id), admitted) in wanting.into_iter().zip(ids).zip(admitted) {
+        for (((i, fuzzy, replacing), job_id), admitted) in
+            wanting.into_iter().zip(ids).zip(admitted)
+        {
             let with_reference = |more: Map<String, Value>| {
                 let mut all = items[i].facts();
                 all.extend(more);
@@ -283,7 +411,12 @@ pub(crate) async fn ensure(
                 Admitted::Created => {
                     spawn_drive(acquire.clone(), ctx.clone(), job_id.clone());
                     batch_id = Some(id.clone());
-                    EnsureItem::Created { job_id, fuzzy }
+                    replaced.extend(replacing.iter().cloned());
+                    EnsureItem::Created {
+                        job_id,
+                        fuzzy,
+                        replacing,
+                    }
                 }
                 Admitted::AlreadyRunning { job, state } => {
                     if for_playlist {
@@ -307,10 +440,15 @@ pub(crate) async fn ensure(
     let items = (results.into_iter())
         .map(|item| item.expect("each item is answered"))
         .collect();
+    let replace_unmatched = (previewed.iter())
+        .filter(|f| !replaced.contains(&f.song_id))
+        .map(|f| f.song_id.clone())
+        .collect();
     Ok(Ensured {
         batch_id,
         items,
         library_checked,
+        replace_unmatched,
     })
 }
 
@@ -734,7 +872,136 @@ pub(crate) fn job_not_found() -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::UserId;
+    use crate::connection::test_util::{app_with_acquire, grant_of};
+    use crate::core::delete_guard::test_support::previewed_file;
+    use crate::core::deletion::tokens::issue_in;
+    use crate::core::jobs::test_support::auto_options;
+    use crate::core::test_ctx;
     use crate::ledger::items_label;
+    use crate::ledger::store;
+    use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub, HOLY, SILENT};
+
+    fn track(title: &str) -> Wanted {
+        Wanted::Track(Reference {
+            artist: "Marrow Choir".into(),
+            title: title.into(),
+            album: None,
+            recording_mbid: None,
+            duration_s: None,
+        })
+    }
+
+    /// The options of u1's jobs of `batch_id` as stored, in creation order.
+    async fn stored_options(acquire: &Acquire, batch_id: &str) -> Vec<JobOptions> {
+        let jobs = store::jobs_of(&acquire.db, &UserId::new("u1"), None, Some(batch_id), &[])
+            .await
+            .unwrap();
+        jobs.into_iter().map(|job| job.options.unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_caller_cannot_hand_ensure_a_set_without_a_token() {
+        let (_, acquire, effects, _) = app_with_acquire().await;
+        let earlier = effects.library().join("x.flac");
+        std::fs::write(&earlier, b"audio").unwrap();
+        let handed = JobOptions {
+            replace: Some(ReplaceSet {
+                grant_id: "g1".into(),
+                files: vec![previewed_file("s1", &earlier)],
+                expires_at: 1_800_000_000,
+            }),
+            ..auto_options()
+        };
+        let ensured = ensure(
+            &acquire,
+            &NavidromeFor(Err(|| NavidromeLookupError::NotLinked)),
+            &test_ctx("u1"),
+            None,
+            None,
+            vec![track("O Holy Night")],
+            handed,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let batch_id = ensured.batch_id.unwrap();
+        let options = stored_options(&acquire, &batch_id).await;
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].replace, None);
+    }
+
+    #[tokio::test]
+    async fn a_replacing_job_holds_only_its_own_songs_for_a_day() {
+        let (db, acquire, effects, _) = app_with_acquire().await;
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        for (id, title) in [HOLY, SILENT] {
+            let query = format!("title=Marrow+Choir+{}", title.replace(' ', "+"));
+            let found = format!("[{}]", native_song(id, "Marrow Choir", title, 263.4, None));
+            navi.answer_when("/api/song", &query, 200, &found);
+        }
+        let library = std::fs::canonicalize(effects.library()).unwrap();
+        let file = |id: &str, name: &str| {
+            let path = library.join(name);
+            std::fs::write(&path, b"audio").unwrap();
+            previewed_file(id, &path)
+        };
+        let files = vec![file(SILENT.0, "silent.flac"), file(HOLY.0, "holy.flac")];
+        let app = App {
+            user: UserId::new("u1"),
+            grant_id: grant_of(&db, "u1").await,
+        };
+        let now = crate::oauth::now_unix();
+        let issued = issue_in(&db, &app, DeletionReason::Replaced, &files, now)
+            .await
+            .unwrap();
+        let ensured = ensure(
+            &acquire,
+            &NavidromeFor(Ok(navi.client())),
+            &test_ctx("u1"),
+            None,
+            None,
+            vec![track("O Holy Night"), track("Silent Night")],
+            auto_options(),
+            false,
+            Some(ReplaceConsent {
+                app: app.clone(),
+                secret: issued.secret,
+            }),
+        )
+        .await
+        .unwrap();
+        let replacing: Vec<Vec<String>> = (ensured.items.iter())
+            .map(|item| match item {
+                EnsureItem::Created { replacing, .. } => replacing.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            replacing,
+            vec![vec![HOLY.0.to_string()], vec![SILENT.0.to_string()]]
+        );
+        assert!(ensured.replace_unmatched.is_empty());
+        let options = stored_options(&acquire, &ensured.batch_id.unwrap()).await;
+        let sets: Vec<ReplaceSet> = options.into_iter().map(|o| o.replace.unwrap()).collect();
+        assert_eq!(
+            sets.iter().map(|s| s.files.clone()).collect::<Vec<_>>(),
+            vec![vec![files[1].clone()], vec![files[0].clone()]]
+        );
+        for set in &sets {
+            assert_eq!(set.grant_id, app.grant_id);
+            assert!(
+                (set.expires_at - (now + REPLACE_CONSENT_SECS)).abs() <= 1,
+                "{}",
+                set.expires_at
+            );
+        }
+    }
 
     #[test]
     fn a_reference_becomes_the_query_a_search_scores_against() {

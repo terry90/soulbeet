@@ -59,6 +59,7 @@ pub(crate) fn auto_options() -> JobOptions {
         min_score: 0.7,
         filters: SourceFilters::default(),
         max_sources: 4,
+        replace: None,
     }
 }
 
@@ -538,6 +539,8 @@ pub(crate) async fn done_track_job(acq: &Acquire) -> String {
                     applied: vec![applied_item(title)],
                     untagged: false,
                     listed: None,
+                    replaced: vec![],
+                    not_replaced: vec![],
                 },
             )],
         })));
@@ -560,6 +563,8 @@ pub(crate) async fn settle_done(acq: &Acquire, job: &str, song_id: &str) {
         applied: applied.clone(),
         untagged: false,
         listed,
+        replaced: vec![],
+        not_replaced: vec![],
     };
     let row = row.with_state(DownloadState::Imported);
     let wait = IndexWait {
@@ -618,6 +623,8 @@ pub(crate) async fn index_failed_track_job(acq: &Acquire) -> String {
                     applied: vec![applied_item(title)],
                     untagged: false,
                     listed: None,
+                    replaced: vec![],
+                    not_replaced: vec![],
                 },
             )],
         })));
@@ -844,7 +851,7 @@ pub(crate) async fn kept_track_job_with(
         vec![row],
         &acq.download_base.join("library"),
         &alice(),
-        DuplicateRule::Skip,
+        &DuplicateRule::Skip,
         &acq.download_base,
     );
     acq.queue.submit(import).await.wait().await;
@@ -1020,6 +1027,8 @@ pub(crate) async fn imported_album_job(acq: &Acquire) -> String {
         applied,
         untagged: false,
         listed: None,
+        replaced: vec![],
+        not_replaced: vec![],
     };
     acq.ledger
         .record(JobEvent::ImportDone(Box::new(crate::ledger::ImportDone {

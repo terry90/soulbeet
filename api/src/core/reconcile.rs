@@ -482,7 +482,8 @@ fn batch_of<'a>(
             downloads.push(Downloads {
                 ctx: job.ctx.clone(),
                 queued: Vec::new(),
-                batch: batch.with_duplicates(DuplicateRule::of(job.origin)),
+                batch: batch
+                    .with_duplicates(DuplicateRule::for_job(job.origin, job.options.as_ref())),
                 slots: Vec::new(),
                 pools: HashMap::new(),
             });
@@ -1001,7 +1002,7 @@ async fn resume_batch(
                     vec![f.row],
                     &batch.target,
                     &user,
-                    batch.duplicates,
+                    &batch.duplicates,
                     download_base,
                 );
                 queue.submit(import).await;
@@ -1126,7 +1127,7 @@ async fn enqueue_anew(resume: &dyn Resume, backend: &Arc<dyn DownloadBackend>, q
         label: manual_batch_label(&picked),
         target: PathBuf::from(&job.folder.path),
         import_mode: job.import_mode,
-        duplicates: DuplicateRule::of(job.origin),
+        duplicates: DuplicateRule::for_job(job.origin, job.options.as_ref()),
     };
     resume
         .enqueue(&job.ctx, backend.clone(), fresh.into(), acquisition)
