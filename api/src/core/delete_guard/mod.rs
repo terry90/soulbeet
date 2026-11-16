@@ -1632,6 +1632,9 @@ mod tests {
             artist: "Marrow Choir".into(),
             title: "O Holy Night".into(),
             album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
         };
         assert_eq!(
             lib.guard()
@@ -1747,6 +1750,9 @@ mod tests {
             artist: "Marrow Choir".into(),
             title: "O Holy Night".into(),
             album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
         };
         let checked = lib
             .guard()
@@ -1781,6 +1787,9 @@ mod tests {
             artist: "Marrow Choir".into(),
             title: "O Holy Night".into(),
             album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
         };
         let f = lib
             .guard()
@@ -1816,6 +1825,9 @@ mod tests {
             artist: "Marrow Choir".into(),
             title: "O Holy Night".into(),
             album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
         }
     }
 
@@ -2578,6 +2590,9 @@ mod tests {
             artist: "Marrow Choir".into(),
             title: "O Holy Night".into(),
             album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
         };
         let checked = lib
             .guard()
@@ -2629,6 +2644,9 @@ mod tests {
             artist: "Marrow Choir".into(),
             title: "O Holy Night".into(),
             album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
         };
         let lib = Library::new().await;
         let library = lib.root.join("music/alice");

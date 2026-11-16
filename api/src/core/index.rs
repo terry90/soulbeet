@@ -783,6 +783,9 @@ mod tests {
                 artist: "Kowloon".into(),
                 title: "Wake Up".into(),
                 album: "Come Over".into(),
+                beets_id: None,
+                release_mbid: None,
+                match_per_mille: None,
             }],
             since,
             baseline: None,
@@ -1040,6 +1043,9 @@ mod tests {
                 artist: "Zzqx Artist".into(),
                 title: "Song Number 1".into(),
                 album: "Qzz Album".into(),
+                beets_id: None,
+                release_mbid: None,
+                match_per_mille: None,
             }],
             ..waiting(1_000)
         }
@@ -1124,6 +1130,9 @@ mod tests {
             artist: "Marrow Choir".into(),
             title: "O Holy Night".into(),
             album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
         };
         let found = candidates(&navi.client(), &item).await.unwrap().unwrap();
         assert_eq!(

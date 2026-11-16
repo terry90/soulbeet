@@ -254,6 +254,7 @@ mod tests {
             choices: None,
             user_action: None,
             removals: vec![],
+            files: vec![],
         };
 
         let album = rows_for_done(
@@ -350,6 +351,7 @@ mod tests {
             choices: None,
             user_action: None,
             removals: vec![],
+            files: vec![],
         };
         let cases = [
             (

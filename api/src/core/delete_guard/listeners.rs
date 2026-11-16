@@ -170,6 +170,9 @@ pub(super) fn item_of(song: &NativeSong) -> ImportedItem {
         artist: song.artist.clone(),
         title: song.title.clone(),
         album: song.album.clone(),
+        beets_id: None,
+        release_mbid: None,
+        match_per_mille: None,
     }
 }
 

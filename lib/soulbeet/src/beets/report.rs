@@ -1,20 +1,27 @@
 //! The report import.py writes after every run: the candidates beets weighed
-//! for each task, what kept a pick or an as-is import from running, what
-//! beets did with each duplicate it found or the removal it wanted instead,
-//! and each file it imported.
+//! for each task and the files it read, what kept a pick or an as-is import
+//! from running, what beets did with each duplicate it found or the removal it
+//! wanted instead, and each file it imported.
 
 use crate::{
     DriverChoice, FailKind, ImportMode, ImportOutcome, ImportResult, ImportedItem, SkipReason,
-    WantedRemoval,
+    SourceFile, WantedRemoval,
 };
 use serde::Deserialize;
 use shared::download::{MatchCandidate, MatchChoices, MatchKind, TrackFit};
+use shared::failure::{cut_chars, TEXT_MAX_CHARS};
 use std::path::{Path, PathBuf};
+
+/// How many source files a result keeps: their tags are a peer's text, and an album folder
+/// rarely holds more.
+const SOURCE_FILES_MAX: usize = 200;
 
 #[derive(Debug)]
 pub(crate) struct Report {
     /// One entry per task, in the order beets ran them.
     tasks: Vec<MatchChoices>,
+    /// The files of every task, in the same order.
+    files: Vec<SourceFile>,
     /// The picked source returned no single match.
     pick_missing: bool,
     /// Why an as-is import was not run.
@@ -46,7 +53,7 @@ enum RawDuplicate {
         existing: Vec<PathBuf>,
     },
     Skipped {
-        existing: Vec<PathBuf>,
+        existing: Vec<RawItem>,
     },
     /// beets kept the earlier items it would have removed.
     RemovalWanted {
@@ -63,7 +70,10 @@ struct RawItem {
     recording_mbid: Option<String>,
     artist: String,
     title: String,
+    beets_id: u64,
+    release_mbid: Option<String>,
     album: String,
+    match_per_mille: Option<u16>,
 }
 
 impl RawItem {
@@ -73,8 +83,22 @@ impl RawItem {
             recording_mbid: self.recording_mbid,
             artist: self.artist,
             title: self.title,
+            beets_id: Some(self.beets_id),
+            release_mbid: self.release_mbid,
             album: self.album,
+            match_per_mille: self.match_per_mille,
         }
+    }
+}
+
+/// `file` with each tag cut to `TEXT_MAX_CHARS`.
+fn bounded(file: SourceFile) -> SourceFile {
+    let cut = |text| cut_chars(text, TEXT_MAX_CHARS);
+    SourceFile {
+        artist: cut(file.artist),
+        title: cut(file.title),
+        album: cut(file.album),
+        ..file
     }
 }
 
@@ -123,6 +147,9 @@ struct RawTask {
     album: bool,
     /// Read once the task's kind is known.
     candidates: Vec<serde_json::Value>,
+    /// The task's files with the tags beets read; a report may leave them out.
+    #[serde(default)]
+    files: Vec<SourceFile>,
 }
 
 #[derive(Deserialize)]
@@ -202,10 +229,12 @@ fn candidate(kind: MatchKind, value: serde_json::Value) -> serde_json::Result<Ma
 impl Report {
     pub(crate) fn parse(text: &str) -> serde_json::Result<Report> {
         let raw: RawReport = serde_json::from_str(text)?;
+        let mut files = Vec::new();
         let tasks = raw
             .tasks
             .into_iter()
             .map(|task| {
+                files.extend(task.files);
                 let kind = match task.album {
                     true => MatchKind::Album,
                     false => MatchKind::Track,
@@ -220,6 +249,7 @@ impl Report {
             .collect::<serde_json::Result<_>>()?;
         Ok(Report {
             tasks,
+            files,
             pick_missing: raw.pick_missing,
             refused: raw.refused,
             duplicates: raw.duplicates,
@@ -236,6 +266,12 @@ impl Report {
         choice: &DriverChoice,
         target: &Path,
     ) -> ImportResult {
+        result.files = self
+            .files
+            .into_iter()
+            .take(SOURCE_FILES_MAX)
+            .map(bounded)
+            .collect();
         let mut decisions = Vec::new();
         for d in self.duplicates {
             match d {
@@ -286,12 +322,13 @@ impl Report {
         }
         if let ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { .. }) = result.outcome {
             let existing = decisions
-                .iter()
+                .into_iter()
                 .filter_map(|d| match d {
                     RawDuplicate::Skipped { existing } => Some(existing),
                     _ => None,
                 })
-                .flat_map(|existing| existing.iter().map(|p| in_library(p, target)))
+                .flatten()
+                .map(|i| i.imported_item(target))
                 .collect();
             result.outcome = ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing });
             return result;
@@ -329,7 +366,7 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ImportedItem, TaskCount, WantedRemoval};
+    use crate::TaskCount;
 
     const ALBUM_TASK: &str = r#"{"paths": ["/src/a"], "album": true, "candidates": [
         {"data_source": "MusicBrainz", "id": "6a09041b-0f79-3278-88d9-0552dd28d37f",
@@ -371,6 +408,7 @@ mod tests {
             choices: None,
             user_action: None,
             removals: vec![],
+            files: vec![],
         }
     }
 
@@ -583,7 +621,9 @@ mod tests {
     fn an_imported_result_names_the_library_files_its_duplicates_touched() {
         let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "items": [], "duplicates": [
             {"action": "replaced", "existing": ["/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3", "/elsewhere/02.mp3"]},
-            {"action": "skipped", "existing": ["/music/Zzqx Artist/Qzz Album/03 Song Number 3.mp3"]},
+            {"action": "skipped", "existing": [{"path": "/music/Zzqx Artist/Qzz Album/03 Song Number 3.mp3",
+              "recording_mbid": null, "artist": "Zzqx Artist", "title": "Song Number 3", "beets_id": 3,
+              "release_mbid": null, "album": "Qzz Album", "match_per_mille": null}]},
             {"action": "kept", "existing": ["/music/Zzqx Artist/Qzz Album/04 Song Number 4.mp3"]}]}"#;
         let imported = result(ImportOutcome::Imported {
             untagged: false,
@@ -617,7 +657,8 @@ mod tests {
         let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "items": [], "duplicates": [
             {"action": "removal_wanted", "existing": [{"path": "/music/Marrow Choir/Winter Songs/03 O Holy Night.flac",
               "recording_mbid": "0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c", "artist": "Marrow Choir", "title": "O Holy Night",
-              "album": "Winter Songs"}],
+              "beets_id": 4, "release_mbid": "6a09041b-0f79-3278-88d9-0552dd28d37f", "album": "Winter Songs",
+              "match_per_mille": null}],
              "imported": [{"id": 7, "path": "/music/Marrow Choir/Winter Songs [1]/03 O Holy Night.flac"}]},
             {"action": "kept", "existing": ["/music/Marrow Choir/Winter Songs/04 Silent Night.flac"]}]}"#;
         let imported = result(ImportOutcome::Imported {
@@ -640,7 +681,10 @@ mod tests {
                     recording_mbid: Some("0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c".into()),
                     artist: "Marrow Choir".into(),
                     title: "O Holy Night".into(),
+                    beets_id: Some(4),
+                    release_mbid: Some("6a09041b-0f79-3278-88d9-0552dd28d37f".into()),
                     album: "Winter Songs".into(),
+                    match_per_mille: None,
                 }],
                 imported: vec![(
                     7,
@@ -664,7 +708,8 @@ mod tests {
     fn a_wanted_removal_is_carried_whatever_the_outcome() {
         let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "items": [], "duplicates": [
             {"action": "removal_wanted", "existing": [{"path": "/music/A/x.flac", "recording_mbid": null,
-              "artist": "A", "title": "x", "album": "B"}], "imported": []}]}"#;
+              "artist": "A", "title": "x", "beets_id": 2, "release_mbid": null, "album": "B",
+              "match_per_mille": null}], "imported": []}]}"#;
         let failed = result(ImportOutcome::Failed {
             kind: FailKind::Beets,
             message: "beets exited with code 1".into(),
@@ -684,7 +729,10 @@ mod tests {
                     recording_mbid: None,
                     artist: "A".into(),
                     title: "x".into(),
+                    beets_id: Some(2),
+                    release_mbid: None,
                     album: "B".into(),
+                    match_per_mille: None,
                 }],
                 imported: vec![],
             }]
@@ -762,7 +810,9 @@ mod tests {
     #[test]
     fn a_skipped_duplicate_names_the_library_files_it_kept() {
         let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "items": [], "duplicates": [
-            {"action": "skipped", "existing": ["/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3"]}]}"#;
+            {"action": "skipped", "existing": [{"path": "/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3",
+              "recording_mbid": null, "artist": "Zzqx Artist", "title": "Song Number 1", "beets_id": 1,
+              "release_mbid": null, "album": "Qzz Album", "match_per_mille": null}]}]}"#;
         let skipped = result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
             existing: vec![],
         }));
@@ -775,7 +825,16 @@ mod tests {
         assert_eq!(
             applied.outcome,
             ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
-                existing: vec![PathBuf::from("Zzqx Artist/Qzz Album/01 Song Number 1.mp3")],
+                existing: vec![ImportedItem {
+                    path: "Zzqx Artist/Qzz Album/01 Song Number 1.mp3".into(),
+                    recording_mbid: None,
+                    artist: "Zzqx Artist".into(),
+                    title: "Song Number 1".into(),
+                    beets_id: Some(1),
+                    release_mbid: None,
+                    album: "Qzz Album".into(),
+                    match_per_mille: None,
+                }],
             })
         );
         assert_eq!(
@@ -792,12 +851,100 @@ mod tests {
     }
 
     #[test]
+    fn a_skipped_duplicate_and_the_task_files_come_back_typed() {
+        let text = r#"{"tasks": [{"paths": ["/dl/X [1f2e3d4c]/one.mp3"], "album": false, "candidates": [],
+            "files": [{"path": "/dl/X [1f2e3d4c]/one.mp3", "artist": "Zzqx Artist", "title": "Song Number 1",
+                       "album": "", "track": null, "length_secs": 2}]}],
+            "pick_missing": false, "refused": null, "items": [], "duplicates": [
+            {"action": "skipped", "existing": [{"path": "/music/Zzqx Artist/Qzz Album/01 Song Number 1.mp3",
+              "recording_mbid": "dfeb96a7-f78a-4b04-93ce-c39e28c9a173", "artist": "Zzqx Artist", "title": "Song Number 1",
+              "beets_id": 7, "release_mbid": "6a09041b-0f79-3278-88d9-0552dd28d37f", "album": "Qzz Album",
+              "match_per_mille": null}]}]}"#;
+        let skipped = result(ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+            existing: vec![],
+        }));
+        let applied = Report::parse(text).unwrap().apply(
+            skipped,
+            ImportMode::Singleton,
+            &DriverChoice::Auto,
+            Path::new("/music"),
+        );
+        assert_eq!(
+            applied.outcome,
+            ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+                existing: vec![ImportedItem {
+                    path: "Zzqx Artist/Qzz Album/01 Song Number 1.mp3".into(),
+                    recording_mbid: Some("dfeb96a7-f78a-4b04-93ce-c39e28c9a173".into()),
+                    artist: "Zzqx Artist".into(),
+                    title: "Song Number 1".into(),
+                    beets_id: Some(7),
+                    release_mbid: Some("6a09041b-0f79-3278-88d9-0552dd28d37f".into()),
+                    album: "Qzz Album".into(),
+                    match_per_mille: None,
+                }]
+            })
+        );
+        assert_eq!(
+            applied.to_string(),
+            "Already in library: Zzqx Artist/Qzz Album/01 Song Number 1.mp3"
+        );
+        assert_eq!(
+            applied.files,
+            vec![SourceFile {
+                path: "/dl/X [1f2e3d4c]/one.mp3".into(),
+                artist: "Zzqx Artist".into(),
+                title: "Song Number 1".into(),
+                album: String::new(),
+                track: None,
+                length_secs: Some(2),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_task_files_are_kept_bounded_whatever_the_outcome() {
+        let long = "x".repeat(TEXT_MAX_CHARS + 1);
+        let file = |n: usize| {
+            serde_json::json!({"path": format!("/dl/X/{n:03}.mp3"), "artist": long, "title": "t",
+                               "album": "a", "track": n, "length_secs": null})
+        };
+        let task = |range: std::ops::Range<usize>| {
+            serde_json::json!({"paths": [], "album": true, "candidates": [],
+                               "files": range.map(file).collect::<Vec<_>>()})
+        };
+        let text = serde_json::json!({"tasks": [task(0..150), task(150..210)], "pick_missing": false,
+                                      "refused": null, "duplicates": [], "items": []});
+        let imported = result(ImportOutcome::Imported {
+            untagged: false,
+            warnings: vec![],
+            items: vec![],
+            failure: None,
+        });
+        let applied = Report::parse(&text.to_string()).unwrap().apply(
+            imported,
+            ImportMode::Album,
+            &DriverChoice::Auto,
+            Path::new("/music"),
+        );
+        assert_eq!(applied.files.len(), SOURCE_FILES_MAX);
+        assert_eq!(
+            applied.files.last().unwrap().path,
+            PathBuf::from(format!("/dl/X/{:03}.mp3", SOURCE_FILES_MAX - 1))
+        );
+        assert!(applied
+            .files
+            .iter()
+            .all(|f| f.artist.chars().count() == TEXT_MAX_CHARS && f.track.is_some()));
+    }
+
+    #[test]
     fn an_imported_result_lists_its_items_relative_to_the_library() {
         let text = r#"{"tasks": [], "pick_missing": false, "refused": null, "duplicates": [], "items": [
             {"path": "/music/Zzqx Artist/Song Number 1.mp3", "recording_mbid": "dfeb96a7-f78a-4b04-93ce-c39e28c9a173",
-             "artist": "Zzqx Artist", "title": "Song Number 1", "album": "Qzz Album"},
+             "artist": "Zzqx Artist", "title": "Song Number 1", "beets_id": 5,
+             "release_mbid": "6a09041b-0f79-3278-88d9-0552dd28d37f", "album": "Qzz Album", "match_per_mille": 962},
             {"path": "/elsewhere/02.mp3", "recording_mbid": null, "artist": "Zzqx Artist", "title": "Song Number 2",
-             "album": ""}]}"#;
+             "beets_id": 6, "release_mbid": null, "album": "", "match_per_mille": null}]}"#;
         let imported = result(ImportOutcome::Imported {
             untagged: false,
             warnings: vec![],
@@ -821,14 +968,20 @@ mod tests {
                     recording_mbid: Some("dfeb96a7-f78a-4b04-93ce-c39e28c9a173".into()),
                     artist: "Zzqx Artist".into(),
                     title: "Song Number 1".into(),
+                    beets_id: Some(5),
+                    release_mbid: Some("6a09041b-0f79-3278-88d9-0552dd28d37f".into()),
                     album: "Qzz Album".into(),
+                    match_per_mille: Some(962),
                 },
                 ImportedItem {
                     path: "/elsewhere/02.mp3".into(),
                     recording_mbid: None,
                     artist: "Zzqx Artist".into(),
                     title: "Song Number 2".into(),
+                    beets_id: Some(6),
+                    release_mbid: None,
                     album: String::new(),
+                    match_per_mille: None,
                 },
             ]
         );

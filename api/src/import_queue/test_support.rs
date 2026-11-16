@@ -34,6 +34,9 @@ pub fn imported() -> ImportResult {
                 artist: "Zzqx Artist".into(),
                 title: "a".into(),
                 album: "Qzz Album".into(),
+                beets_id: None,
+                release_mbid: None,
+                match_per_mille: None,
             }],
             failure: None,
         },
@@ -45,6 +48,7 @@ pub fn imported() -> ImportResult {
         choices: None,
         user_action: None,
         removals: vec![],
+        files: vec![],
     }
 }
 
@@ -62,6 +66,7 @@ pub fn no_match(candidates: u32) -> ImportResult {
         choices: None,
         user_action: None,
         removals: vec![],
+        files: vec![],
     }
 }
 

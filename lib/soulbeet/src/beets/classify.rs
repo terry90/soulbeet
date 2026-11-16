@@ -343,6 +343,7 @@ impl Classifier {
             choices: None,
             user_action: None,
             removals: vec![],
+            files: vec![],
         }
     }
 

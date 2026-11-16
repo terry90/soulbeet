@@ -271,6 +271,9 @@ mod tests {
             artist: "Marrow Choir".into(),
             title: title.into(),
             album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
         }
     }
 

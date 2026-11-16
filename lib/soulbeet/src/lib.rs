@@ -23,5 +23,5 @@ pub use services::{Services, ServicesBuilder};
 pub use traits::{
     CandidateGenerator, DownloadBackend, DriverChoice, DuplicateRun, FailKind, ForgetOutcome,
     ImportMode, ImportOutcome, ImportResult, ImportedItem, MetadataProvider, MusicImporter,
-    Relocation, ScrobbleProvider, SkipReason, TaskCount, TimeoutKind, WantedRemoval,
+    Relocation, ScrobbleProvider, SkipReason, SourceFile, TaskCount, TimeoutKind, WantedRemoval,
 };

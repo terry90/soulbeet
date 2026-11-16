@@ -113,6 +113,8 @@ pub enum DuplicateRun {
     AsConfigured,
     /// beets keeps the earlier copy and reports the removal it wanted.
     ReportRemovals,
+    /// beets skips a task whose music the library already has, whatever its config says.
+    Skip,
 }
 
 /// One beets task's wanted removal: the earlier items beets would have deleted, and the items
@@ -137,7 +139,7 @@ pub struct Relocation {
     pub failure: Option<Failure>,
 }
 
-/// One file beets imported, as it stored it.
+/// One library item, as beets stored it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportedItem {
     /// Relative to the library folder when inside it, else absolute.
@@ -146,9 +148,31 @@ pub struct ImportedItem {
     pub recording_mbid: Option<String>,
     pub artist: String,
     pub title: String,
+    /// beets' item id; None for an item not read from beets.
+    #[serde(default)]
+    pub beets_id: Option<u64>,
+    /// The MusicBrainz release beets stored (mb_albumid); None when it stored none.
+    #[serde(default)]
+    pub release_mbid: Option<String>,
     /// Empty for a waiting import stored before the album was reported.
     #[serde(default)]
     pub album: String,
+    /// How close the match beets applied was to the files, in thousandths, as a candidate's
+    /// `per_mille`; None when beets applied none (an as-is import, an item already in the
+    /// library) or the item was not read from beets.
+    #[serde(default)]
+    pub match_per_mille: Option<u16>,
+}
+
+/// One file of an import, with the tags beets read from it before matching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFile {
+    pub path: PathBuf,
+    pub artist: String,
+    pub title: String,
+    pub album: String,
+    pub track: Option<u32>,
+    pub length_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,10 +220,10 @@ pub enum FailKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// The library has it. `existing` names its files, relative to the library
-    /// folder, when beets reported the skip with them; empty when only the run log said so.
+    /// The library has it. `existing` holds the items beets found, when it reported the skip
+    /// with them; empty when only the run log said so.
     AlreadyInLibrary {
-        existing: Vec<PathBuf>,
+        existing: Vec<ImportedItem>,
     },
     /// No candidate was close enough. The count is the number of candidates
     /// beets weighed, when every task in the run saw the same number.
@@ -248,6 +272,9 @@ pub struct ImportResult {
     pub user_action: Option<UserAction>,
     /// The removals beets wanted in a `DuplicateRun::ReportRemovals` run, one per task.
     pub removals: Vec<WantedRemoval>,
+    /// The files of every task an automatic run recorded, in task order: the first 200, each
+    /// tag cut to `shared::failure::TEXT_MAX_CHARS` characters, since a peer chose them.
+    pub files: Vec<SourceFile>,
 }
 
 impl ImportResult {
@@ -259,6 +286,7 @@ impl ImportResult {
             choices: None,
             user_action: None,
             removals: vec![],
+            files: vec![],
         }
     }
 
@@ -315,7 +343,7 @@ impl fmt::Display for ImportOutcome {
                 if !existing.is_empty() {
                     let files = existing
                         .iter()
-                        .map(|p| p.to_string_lossy())
+                        .map(|i| i.path.to_string_lossy())
                         .collect::<Vec<_>>()
                         .join(", ");
                     write!(f, ": {files}")?;
