@@ -26,8 +26,7 @@ pub const MAX_SOURCES_PER_TRACK: usize = 4;
 
 /// An alternate `enqueue_next` took from a slot and could not enqueue.
 pub struct RefusedAlternate {
-    pub source: String,
-    pub item: String,
+    pub candidate: DownloadableItem,
     pub failure: Failure,
 }
 
@@ -135,6 +134,13 @@ impl SourcePool {
             .map_or(MAX_SOURCES_PER_TRACK, |s| s.max)
     }
 
+    /// Whether `take_next` would give this slot an alternate.
+    pub fn has_next(&self, slot: usize) -> bool {
+        self.slots
+            .get(slot)
+            .is_some_and(|s| s.used < s.max && !s.alternates.is_empty())
+    }
+
     /// Next alternate for this slot, or `None` once the budget is spent, the
     /// alternates run out, or the slot does not exist.
     pub fn take_next(&mut self, slot: usize) -> Option<DownloadableItem> {
@@ -160,29 +166,41 @@ impl SourcePool {
         backend: &Arc<dyn DownloadBackend>,
         batch: &BatchRef,
     ) -> NextSource {
-        self.enqueue_next_noting(slot, backend, batch, |_, _| std::future::ready(Ok(())))
-            .await
+        self.enqueue_next_noting(
+            slot,
+            backend,
+            batch,
+            |_, _| std::future::ready(Ok(())),
+            |_, _| {},
+        )
+        .await
     }
 
     /// `enqueue_next`, awaiting `sending` with each alternate and the backend
-    /// request it goes in before it is sent to the backend. When `sending`
-    /// fails, that alternate is refused with its failure and not sent, and
-    /// no other is tried.
-    pub async fn enqueue_next_noting<F, Noted>(
+    /// request it goes in before it is sent to the backend, and calling
+    /// `refusing` with each refused alternate and its failure before the next
+    /// one is tried. When `sending` fails, that alternate is refused with its
+    /// failure and not sent, and no other is tried.
+    pub async fn enqueue_next_noting<F, Noted, R>(
         &mut self,
         slot: usize,
         backend: &Arc<dyn DownloadBackend>,
         batch: &BatchRef,
         mut sending: F,
+        mut refusing: R,
     ) -> NextSource
     where
         F: FnMut(&DownloadableItem, &str) -> Noted,
         Noted: Future<Output = Result<(), Failure>>,
+        R: FnMut(&DownloadableItem, &Failure),
     {
         let mut refused = Vec::new();
+        let mut refuse = |candidate: DownloadableItem, failure: Failure| {
+            refusing(&candidate, &failure);
+            refused.push(RefusedAlternate { candidate, failure });
+        };
         while let Some(item) = self.take_next(slot) {
-            let (source, id) = (item.source.clone(), item.id.clone());
-            let key = transfer_key(backend.id(), &source, &id);
+            let key = transfer_key(backend.id(), &item.source, &item.id);
             let registry = TransferRegistry::global();
             let claim = registry.claim(std::slice::from_ref(&key), batch);
             let failure = if claim.claimed.is_empty() {
@@ -191,11 +209,7 @@ impl SourcePool {
                 let request = backend.new_request();
                 if let Err(failure) = sending(&item, &request).await {
                     registry.release(&key, &batch.owner);
-                    refused.push(RefusedAlternate {
-                        source,
-                        item: id,
-                        failure,
-                    });
+                    refuse(item, failure);
                     break;
                 }
                 match enqueue_claimed(backend, vec![item.clone()], batch, &request).await {
@@ -214,11 +228,7 @@ impl SourcePool {
                     Err(e) => e.failure(Stage::Enqueue, e.to_string()),
                 }
             };
-            refused.push(RefusedAlternate {
-                source,
-                item: id,
-                failure,
-            });
+            refuse(item, failure);
         }
         NextSource {
             queued: None,
@@ -838,7 +848,7 @@ mod tests {
         let refused: Vec<(&str, FailureCode)> = next
             .refused
             .iter()
-            .map(|r| (r.source.as_str(), r.failure.code))
+            .map(|r| (r.candidate.source.as_str(), r.failure.code))
             .collect();
         assert_eq!(
             refused,
@@ -875,7 +885,7 @@ mod tests {
             .iter()
             .map(|r| {
                 (
-                    r.source.as_str(),
+                    r.candidate.source.as_str(),
                     r.failure.code,
                     r.failure.message.as_str(),
                 )
@@ -937,7 +947,13 @@ mod tests {
         let refused: Vec<(&str, &str, FailureCode)> = next
             .refused
             .iter()
-            .map(|r| (r.source.as_str(), r.item.as_str(), r.failure.code))
+            .map(|r| {
+                (
+                    r.candidate.source.as_str(),
+                    r.candidate.id.as_str(),
+                    r.failure.code,
+                )
+            })
             .collect();
         assert_eq!(
             refused,

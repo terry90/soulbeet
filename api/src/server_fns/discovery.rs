@@ -474,7 +474,7 @@ async fn settle_poll(
                         "Discovery: '{}' - {} failover source {} refused: {}: {}",
                         qt.artist,
                         qt.track,
-                        refused.source,
+                        refused.candidate.source,
                         refused.failure.code.as_str(),
                         refused.failure.message
                     );

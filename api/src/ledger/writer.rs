@@ -3,11 +3,13 @@
 
 use super::{
     job_state, recording_keys, Admitted, BatchOrigin, ClaimedJob, ImportDone, IndexWait, JobEvent,
-    JobState, LedgerError, NewJob, NewJobBatch, NewSearch, Pruned, RecordingKeys, Transition,
-    Transitioned, JOB_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER, SEARCH_KEPT_SECS, TERMINAL_SQL,
+    JobState, LedgerError, LiveRows, NewJob, NewJobBatch, NewSearch, Pruned, RecordingKeys,
+    Transition, Transitioned, JOB_KEPT_SECS, MCP_UNFINISHED_JOBS_PER_USER, SEARCH_KEPT_SECS,
+    TERMINAL_SQL,
 };
 use crate::auth::UserId;
 use crate::transfer_registry::TransferRegistry;
+use serde_json::{Map, Value};
 use shared::download::{
     DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, IndexState, JobSlot,
 };
@@ -21,10 +23,12 @@ use tracing::warn;
 
 pub(super) type Reply<T> = oneshot::Sender<Result<T, LedgerError>>;
 
-/// What the writer reads its writes from and sends its change numbers on.
+/// What the writer reads its writes from, sends its change numbers on and keeps the live rows
+/// in.
 pub(super) struct Inbox {
     pub(super) writes: mpsc::UnboundedReceiver<Write>,
     pub(super) changed: watch::Sender<i64>,
+    pub(super) live: LiveRows,
 }
 
 pub(super) enum Write {
@@ -99,6 +103,7 @@ pub(super) fn spawn(db: SqlitePool, inbox: Inbox, registry: &'static TransferReg
     let Inbox {
         mut writes,
         changed,
+        live,
     } = inbox;
     tokio::spawn(async move {
         let seq = sqlx::query_scalar("SELECT COALESCE(MAX(changed_seq), 0) FROM jobs")
@@ -116,6 +121,7 @@ pub(super) fn spawn(db: SqlitePool, inbox: Inbox, registry: &'static TransferReg
             changed,
             seq,
             pending: Pending::default(),
+            live,
         };
         while let Some(write) = writes.recv().await {
             writer.apply(write).await;
@@ -160,6 +166,89 @@ struct Pending {
     /// Its change number, taken by its first change of a job.
     seq: Option<i64>,
     marks: Vec<Mark>,
+    /// Each slot it may move, in the order first touched, with the timeline entry its state
+    /// gave before. An event's write appends the entries of those that moved; a transition
+    /// appends its own.
+    moved: Vec<(JobSlot, Option<Entry>)>,
+}
+
+/// A timeline entry to append: what happened, at which stage, with the facts it names. Peer
+/// text (a source, a file name, an upstream message) goes only in `facts`.
+#[derive(Debug, Clone, PartialEq)]
+struct Entry {
+    stage: Stage,
+    event: &'static str,
+    facts: Map<String, Value>,
+}
+
+impl Entry {
+    /// `event` at the stage of `state`.
+    fn at(state: JobState, event: &'static str) -> Entry {
+        let stage = match state {
+            JobState::Downloading => Stage::Transfer,
+            JobState::Importing | JobState::NeedsDecision => Stage::Import,
+            JobState::Indexing | JobState::Done => Stage::Index,
+            _ => Stage::Input,
+        };
+        Entry {
+            stage,
+            event,
+            facts: Map::new(),
+        }
+    }
+
+    fn fact(mut self, name: &str, value: impl Into<Value>) -> Entry {
+        self.facts.insert(name.to_string(), value.into());
+        self
+    }
+
+    fn slot(self, slot: u32) -> Entry {
+        self.fact("slot", slot)
+    }
+
+    fn item(self, source: &str, item: &str) -> Entry {
+        self.fact("source", source).fact("item", item)
+    }
+
+    /// At `failure`'s stage, with its code and message.
+    fn failure(self, failure: &Failure) -> Entry {
+        Entry {
+            stage: failure.stage,
+            ..self
+                .fact("code", failure.code.as_str())
+                .fact("message", failure.message.as_str())
+        }
+    }
+
+    /// The entry a slot in `state` with `row` as its last row shows; None for a state before
+    /// its download.
+    fn of_slot(slot: u32, state: JobState, row: Option<&DownloadProgress>) -> Option<Entry> {
+        let event = match state {
+            JobState::Downloading
+                if row.is_some_and(|row| row.state == DownloadState::Completed) =>
+            {
+                "downloaded"
+            }
+            JobState::Downloading => "downloading",
+            JobState::Importing => "importing",
+            JobState::Indexing => "waiting_for_navidrome",
+            JobState::Done => "in_navidrome",
+            JobState::Failed => "failed",
+            JobState::Cancelled => "cancelled",
+            JobState::Dismissed => "dismissed",
+            JobState::NeedsDecision => "waiting_for_decision",
+            JobState::Searching | JobState::NeedsSourceChoice | JobState::Queued => return None,
+        };
+        let entry = Entry::at(state, event).slot(slot);
+        Some(match (state, row) {
+            (JobState::Downloading, Some(row)) => entry.item(&row.source, &row.item),
+            (JobState::Failed | JobState::NeedsDecision, Some(row)) => match &row.failure {
+                Some(failure) => entry.failure(failure),
+                None => entry,
+            },
+            _ => entry,
+        })
+    }
 }
 
 /// Which of a job's slots `fail_slots` fails.
@@ -178,6 +267,7 @@ struct Writer {
     /// The change number of the last write that changed a job.
     seq: i64,
     pending: Pending,
+    live: LiveRows,
 }
 
 impl Writer {
@@ -259,7 +349,7 @@ impl Writer {
     /// After a write: when it committed, sets and drops its cancel marks and sends its change
     /// number; otherwise forgets both.
     fn settle(&mut self, committed: bool) {
-        let Pending { seq, marks } = std::mem::take(&mut self.pending);
+        let Pending { seq, marks, .. } = std::mem::take(&mut self.pending);
         if !committed {
             return;
         }
@@ -288,13 +378,17 @@ impl Writer {
 
     async fn record(&mut self, event: JobEvent) -> Result<(), LedgerError> {
         if let JobEvent::Slots { state, rows } = &event {
-            // Most rows are progress ticks of a stored state: skip them
-            // before taking a connection.
-            let changed = rows.iter().any(|row| {
-                row.job
-                    .as_ref()
-                    .is_some_and(|slot| self.changes(slot, *state, row))
-            });
+            // Most rows are progress ticks of a stored state: they only move the live rows,
+            // without a connection taken.
+            let mut changed = false;
+            for row in rows {
+                let Some(slot) = &row.job else { continue };
+                if self.changes(slot, *state, row) {
+                    changed = true;
+                } else if !state.is_terminal() {
+                    self.live.lock().unwrap().insert(slot.clone(), row.clone());
+                }
+            }
             if !changed {
                 return Ok(());
             }
@@ -308,6 +402,12 @@ impl Writer {
             }
             JobEvent::Picked { job, items } => {
                 self.pick_slots(&mut tx, &job, &items).await?;
+                for (slot, candidate) in &items {
+                    let entry = Entry::at(JobState::Queued, "picked")
+                        .slot(*slot)
+                        .item(&candidate.source, &candidate.id);
+                    append(&mut tx, &job, entry).await?;
+                }
                 jobs.insert(job);
             }
             JobEvent::Enqueued {
@@ -341,20 +441,58 @@ impl Writer {
                 candidate,
                 request,
             } => {
-                // Selected from the slot, so a deleted job's attempt adds nothing.
-                sqlx::query(
-                    "INSERT INTO job_attempts (job_id, slot, n, candidate, request) \
-                     SELECT job_id, slot, (SELECT COALESCE(MAX(n), 0) + 1 FROM job_attempts \
-                                           WHERE job_id = t.job_id AND slot = t.slot), ?, ? \
-                     FROM job_tracks t WHERE job_id = ? AND slot = ?",
+                next_attempt(
+                    &mut tx,
+                    &slot,
+                    candidate.as_deref(),
+                    request.as_deref(),
+                    None,
                 )
-                .bind(candidate.map(|c| serde_json::to_string(&c)).transpose()?)
-                .bind(request)
+                .await?;
+                let entry = Entry::at(JobState::Downloading, "trying").slot(slot.slot);
+                let entry = match &candidate {
+                    Some(candidate) => entry.item(&candidate.source, &candidate.id),
+                    None => entry,
+                };
+                append(&mut tx, &slot.job, entry).await?;
+                self.touch(&mut tx, &slot.job, None, now()).await?;
+            }
+            JobEvent::Refused {
+                slot,
+                candidate,
+                failure,
+            } => {
+                // A backend refusal ends the attempt stored before it was sent; an alternate
+                // the registry refused was never sent and is a finished attempt of its own.
+                let at = now();
+                let sent = sqlx::query(
+                    "UPDATE job_attempts SET started_at = COALESCE(started_at, ?), ended_at = ?, \
+                         failure = ? \
+                     WHERE job_id = ? AND slot = ? AND ended_at IS NULL AND source = ? \
+                     AND json_extract(candidate, '$.id') = ? \
+                     AND n = (SELECT MAX(n) FROM job_attempts WHERE job_id = ? AND slot = ?)",
+                )
+                .bind(at)
+                .bind(at)
+                .bind(serde_json::to_string(&failure)?)
+                .bind(&slot.job)
+                .bind(slot.slot)
+                .bind(&candidate.source)
+                .bind(&candidate.id)
                 .bind(&slot.job)
                 .bind(slot.slot)
                 .execute(&mut *tx)
-                .await?;
-                self.touch(&mut tx, &slot.job, None, now()).await?;
+                .await?
+                .rows_affected();
+                if sent == 0 {
+                    next_attempt(&mut tx, &slot, Some(&candidate), None, Some(&failure)).await?;
+                }
+                let entry = Entry::at(JobState::Downloading, "refused")
+                    .slot(slot.slot)
+                    .item(&candidate.source, &candidate.id)
+                    .failure(&failure);
+                append(&mut tx, &slot.job, entry).await?;
+                self.touch(&mut tx, &slot.job, None, at).await?;
             }
             JobEvent::ImportQueued(import) => {
                 let stored = serde_json::to_string(&*import)?;
@@ -445,7 +583,34 @@ impl Writer {
                 self.set_job(&mut tx, &job, state).await?;
             }
         }
+        for (slot, before) in std::mem::take(&mut self.pending.moved) {
+            let after = slot_entry(&mut tx, &slot).await?;
+            if let Some(entry) = after.filter(|after| before.as_ref() != Some(after)) {
+                append(&mut tx, &slot.job, entry).await?;
+            }
+        }
         Ok(tx.commit().await?)
+    }
+
+    /// Notes the timeline entry `slot` gives now, unless this write noted it already.
+    async fn note(&mut self, tx: &mut SqliteConnection, slot: &JobSlot) -> Result<(), LedgerError> {
+        if !self.pending.moved.iter().any(|(noted, _)| noted == slot) {
+            let before = slot_entry(tx, slot).await?;
+            self.pending.moved.push((slot.clone(), before));
+        }
+        Ok(())
+    }
+
+    /// `slot` reached a terminal state: it has no live row, and its open attempt ends, with
+    /// `failure` when given.
+    async fn slot_ended(
+        &mut self,
+        tx: &mut SqliteConnection,
+        slot: &JobSlot,
+        failure: Option<&Failure>,
+    ) -> Result<(), LedgerError> {
+        self.live.lock().unwrap().remove(slot);
+        end_attempts(tx, slot, failure).await
     }
 
     /// The state `job`'s slots give it (D6); None when it has none. A job searching or waiting
@@ -499,21 +664,31 @@ impl Writer {
         if !self.changes(slot, state, row) {
             return Ok(false);
         }
+        self.note(tx, slot).await?;
+        let stored_row = serde_json::to_string(row)?;
         let stored = sqlx::query(&format!(
             "UPDATE job_tracks SET state = ?, last_row = ? \
              WHERE job_id = ? AND slot = ? AND state NOT IN {TERMINAL_SQL}"
         ))
         .bind(state.as_str())
-        .bind(serde_json::to_string(row)?)
+        .bind(&stored_row)
         .bind(&slot.job)
         .bind(slot.slot)
         .execute(&mut *tx)
         .await?
         .rows_affected();
-        if stored > 0 {
-            self.stored.insert(slot.clone(), RowKey::of(state, row));
+        if stored == 0 {
+            self.live.lock().unwrap().remove(slot);
+            return Ok(false);
         }
-        Ok(stored > 0)
+        self.stored.insert(slot.clone(), RowKey::of(state, row));
+        follow_attempt(tx, slot, row, &stored_row).await?;
+        if state.is_terminal() {
+            self.slot_ended(tx, slot, row.failure.as_ref()).await?;
+        } else {
+            self.live.lock().unwrap().insert(slot.clone(), row.clone());
+        }
+        Ok(true)
     }
 
     /// Puts `slot` in `state`, keeping its last row, unless it already ended.
@@ -523,6 +698,7 @@ impl Writer {
         slot: &JobSlot,
         state: JobState,
     ) -> Result<(), LedgerError> {
+        self.note(tx, slot).await?;
         let moved = sqlx::query(&format!(
             "UPDATE job_tracks SET state = ? \
              WHERE job_id = ? AND slot = ? AND state NOT IN {TERMINAL_SQL}"
@@ -535,6 +711,9 @@ impl Writer {
         .rows_affected();
         if moved > 0 {
             self.restate(slot, state);
+            if state.is_terminal() {
+                self.slot_ended(tx, slot, None).await?;
+            }
         }
         Ok(())
     }
@@ -546,9 +725,11 @@ impl Writer {
         }
     }
 
-    /// Forgets the stored row keys of `job`'s slots: their next rows are stored.
+    /// Forgets the stored row keys and the live rows of `job`'s slots: their next rows are
+    /// stored.
     fn forget(&mut self, job: &str) {
         self.stored.retain(|slot, _| slot.job != job);
+        self.live.lock().unwrap().retain(|slot, _| slot.job != job);
     }
 
     /// Puts every unfinished slot of `job` in `state`.
@@ -558,22 +739,18 @@ impl Writer {
         job: &str,
         state: JobState,
     ) -> Result<(), LedgerError> {
-        let ended: Vec<u32> = sqlx::query_scalar(&format!(
-            "UPDATE job_tracks SET state = ? WHERE job_id = ? AND state NOT IN {TERMINAL_SQL} \
-             RETURNING slot"
+        let ending: Vec<u32> = sqlx::query_scalar(&format!(
+            "SELECT slot FROM job_tracks WHERE job_id = ? AND state NOT IN {TERMINAL_SQL}"
         ))
-        .bind(state.as_str())
         .bind(job)
         .fetch_all(&mut *tx)
         .await?;
-        for slot in ended {
-            self.restate(
-                &JobSlot {
-                    job: job.to_string(),
-                    slot,
-                },
-                state,
-            );
+        for slot in ending {
+            let slot = JobSlot {
+                job: job.to_string(),
+                slot,
+            };
+            self.set_slot(tx, &slot, state).await?;
         }
         Ok(())
     }
@@ -600,23 +777,13 @@ impl Writer {
             .bind(JobState::Queued.as_str())
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
-                "INSERT INTO job_attempts (job_id, slot, n, candidate, source) \
-                 VALUES (?, ?, (SELECT COALESCE(MAX(n), 0) + 1 FROM job_attempts \
-                                WHERE job_id = ? AND slot = ?), ?, ?)",
-            )
-            .bind(job)
-            .bind(slot)
-            .bind(job)
-            .bind(slot)
-            .bind(serde_json::to_string(candidate)?)
-            .bind(&candidate.source)
-            .execute(&mut *tx)
-            .await?;
-            self.stored.remove(&JobSlot {
+            let slot = JobSlot {
                 job: job.to_string(),
                 slot: *slot,
-            });
+            };
+            next_attempt(tx, &slot, Some(candidate), None, None).await?;
+            self.live.lock().unwrap().remove(&slot);
+            self.stored.remove(&slot);
         }
         Ok(())
     }
@@ -672,6 +839,11 @@ impl Writer {
             .bind(slot)
             .execute(&mut *tx)
             .await?;
+            let slot = JobSlot {
+                job: job.to_string(),
+                slot: *slot,
+            };
+            end_attempts(tx, &slot, Some(failure)).await?;
         }
         self.forget(job);
         Ok(failing.len())
@@ -763,6 +935,7 @@ impl Writer {
         .execute(&mut *tx)
         .await?;
         self.pick_slots(tx, &job.id, &job.picked).await?;
+        append(tx, &job.id, Entry::at(job.state, "requested")).await?;
         self.touch(tx, &job.id, None, at).await?;
         Ok(())
     }
@@ -843,7 +1016,17 @@ impl Writer {
         if !change.allowed_from().contains(&from) {
             return Ok(Transitioned::Refused { state: from });
         }
-        let to = match change {
+        // The slots a transition moves are on the timeline as the transition's entries.
+        let picked = |event, items: &[(u32, DownloadableItem)]| -> Vec<Entry> {
+            (items.iter())
+                .map(|(slot, candidate)| {
+                    Entry::at(JobState::Queued, event)
+                        .slot(*slot)
+                        .item(&candidate.source, &candidate.id)
+                })
+                .collect()
+        };
+        let (to, entries) = match change {
             Transition::Cancel if from == JobState::Downloading || gate_held => {
                 // Its transfers may exist: every monitor stops them on its next poll.
                 sqlx::query("UPDATE jobs SET cancel_requested = 1 WHERE id = ?")
@@ -851,26 +1034,32 @@ impl Writer {
                     .execute(&mut *tx)
                     .await?;
                 self.pending.marks.push(Mark::Cancel(job.to_string()));
-                from
+                (from, vec![Entry::at(from, "cancel_requested")])
             }
             Transition::Cancel => {
                 self.end_slots(&mut tx, job, JobState::Cancelled).await?;
-                JobState::Cancelled
+                let to = JobState::Cancelled;
+                (to, vec![Entry::at(to, "cancelled")])
             }
             Transition::Dismiss => {
                 self.end_slots(&mut tx, job, JobState::Dismissed).await?;
-                JobState::Dismissed
+                let to = JobState::Dismissed;
+                (to, vec![Entry::at(to, "dismissed")])
             }
             Transition::Pick { items } => {
                 self.pick_slots(&mut tx, job, &items).await?;
                 forget_send(&mut tx, job).await?;
-                JobState::Queued
+                (JobState::Queued, picked("picked", &items))
             }
-            Transition::AwaitChoice => JobState::NeedsSourceChoice,
+            Transition::AwaitChoice => {
+                let to = JobState::NeedsSourceChoice;
+                (to, vec![Entry::at(to, "waiting_for_source_choice")])
+            }
             Transition::Fail { .. } if cancel_requested => {
                 // Its user cancelled it before it could fail.
                 self.end_slots(&mut tx, job, JobState::Cancelled).await?;
-                JobState::Cancelled
+                let to = JobState::Cancelled;
+                (to, vec![Entry::at(to, "cancelled")])
             }
             Transition::Fail { failure } => {
                 if self
@@ -884,7 +1073,8 @@ impl Writer {
                         .execute(&mut *tx)
                         .await?;
                 }
-                JobState::Failed
+                let to = JobState::Failed;
+                (to, vec![Entry::at(to, "failed").failure(&failure)])
             }
             Transition::Search { search_id, filters } => {
                 // Every slot, ended ones too: the new search's pick reopens those it fills.
@@ -909,7 +1099,8 @@ impl Writer {
                 forget_send(&mut tx, job).await?;
                 self.forget(job);
                 self.pending.marks.push(Mark::Reopen(job.to_string()));
-                JobState::Searching
+                let to = JobState::Searching;
+                (to, vec![Entry::at(to, "searching_again")])
             }
             Transition::Queue { items, search_id } => {
                 self.pick_slots(&mut tx, job, &items).await?;
@@ -923,7 +1114,7 @@ impl Writer {
                 .await?;
                 forget_send(&mut tx, job).await?;
                 self.pending.marks.push(Mark::Reopen(job.to_string()));
-                JobState::Queued
+                (JobState::Queued, picked("queued", &items))
             }
             Transition::Reject { source, failure } => {
                 self.fail_slots(&mut tx, job, Failing::All, &failure)
@@ -932,18 +1123,26 @@ impl Writer {
                     "UPDATE jobs SET excluded_sources = json_insert(excluded_sources, '$[#]', ?) \
                      WHERE id = ?",
                 )
-                .bind(source)
+                .bind(&source)
                 .bind(job)
                 .execute(&mut *tx)
                 .await?;
-                JobState::Failed
+                let to = JobState::Failed;
+                let entry = Entry::at(to, "result_rejected")
+                    .fact("source", source)
+                    .failure(&failure);
+                (to, vec![entry])
             }
             Transition::Reindex { now } => {
                 self.reindex(&mut tx, job, now).await?;
-                self.followed_state(&mut tx, job).await?.unwrap_or(from)
+                let to = self.followed_state(&mut tx, job).await?.unwrap_or(from);
+                (to, vec![Entry::at(to, "waiting_for_navidrome_again")])
             }
         };
         let seq = self.set_job(&mut tx, job, to).await?;
+        for entry in entries {
+            append(&mut tx, job, entry).await?;
+        }
         tx.commit().await?;
         Ok(Transitioned::Applied { from, to, seq })
     }
@@ -1097,6 +1296,146 @@ async fn forget_send(tx: &mut SqliteConnection, job: &str) -> Result<(), LedgerE
     sqlx::query(
         "UPDATE jobs SET monitor_batch_id = NULL, batch_label = NULL, request = NULL WHERE id = ?",
     )
+    .bind(job)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// Starts `slot`'s next attempt with `candidate` (None for a transfer it adopted), sent in
+/// `request`, ending the one before it. A `refused` attempt starts and ends now with that
+/// failure. Selected from the slot, so a deleted job's attempt adds nothing.
+async fn next_attempt(
+    tx: &mut SqliteConnection,
+    slot: &JobSlot,
+    candidate: Option<&DownloadableItem>,
+    request: Option<&str>,
+    refused: Option<&Failure>,
+) -> Result<(), LedgerError> {
+    end_attempts(tx, slot, None).await?;
+    let at = refused.map(|_| now());
+    sqlx::query(
+        "INSERT INTO job_attempts \
+             (job_id, slot, n, candidate, source, request, started_at, ended_at, failure) \
+         SELECT job_id, slot, (SELECT COALESCE(MAX(n), 0) + 1 FROM job_attempts \
+                               WHERE job_id = t.job_id AND slot = t.slot), ?, ?, ?, ?, ?, ? \
+         FROM job_tracks t WHERE job_id = ? AND slot = ?",
+    )
+    .bind(candidate.map(serde_json::to_string).transpose()?)
+    .bind(candidate.map(|c| &c.source))
+    .bind(request)
+    .bind(at)
+    .bind(at)
+    .bind(refused.map(serde_json::to_string).transpose()?)
+    .bind(&slot.job)
+    .bind(slot.slot)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// Ends `slot`'s open attempt now, with `failure` when given.
+async fn end_attempts(
+    tx: &mut SqliteConnection,
+    slot: &JobSlot,
+    failure: Option<&Failure>,
+) -> Result<(), LedgerError> {
+    sqlx::query(
+        "UPDATE job_attempts SET ended_at = ?, failure = ? \
+         WHERE job_id = ? AND slot = ? AND ended_at IS NULL",
+    )
+    .bind(now())
+    .bind(failure.map(serde_json::to_string).transpose()?)
+    .bind(&slot.job)
+    .bind(slot.slot)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// `row`, stored as `stored_row`, is the last row of the open attempt of `slot` whose candidate
+/// is its transfer's file from its source: a late row of a transfer the slot left matches no
+/// open attempt. Its first InProgress row starts the attempt; a Failed, Cancelled or Completed
+/// row ends it, with the row's failure.
+async fn follow_attempt(
+    tx: &mut SqliteConnection,
+    slot: &JobSlot,
+    row: &DownloadProgress,
+    stored_row: &str,
+) -> Result<(), LedgerError> {
+    let starts = row.state == DownloadState::InProgress;
+    let ends = matches!(
+        row.state,
+        DownloadState::Failed(_) | DownloadState::Cancelled | DownloadState::Completed
+    );
+    let at = now();
+    sqlx::query(
+        "UPDATE job_attempts SET last_row = ?, \
+             started_at = CASE WHEN ? THEN COALESCE(started_at, ?) ELSE started_at END, \
+             ended_at = CASE WHEN ? THEN ? END, \
+             failure = CASE WHEN ? THEN ? END \
+         WHERE job_id = ? AND slot = ? AND ended_at IS NULL AND source = ? \
+         AND json_extract(candidate, '$.id') = ?",
+    )
+    .bind(stored_row)
+    .bind(starts)
+    .bind(at)
+    .bind(ends)
+    .bind(at)
+    .bind(ends)
+    .bind(
+        row.failure
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(&slot.job)
+    .bind(slot.slot)
+    .bind(&row.source)
+    .bind(&row.item)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// The timeline entry `slot` gives as stored now; None for a slot that is not there or whose
+/// state this version does not know.
+async fn slot_entry(
+    tx: &mut SqliteConnection,
+    slot: &JobSlot,
+) -> Result<Option<Entry>, LedgerError> {
+    let found: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT state, last_row FROM job_tracks WHERE job_id = ? AND slot = ?")
+            .bind(&slot.job)
+            .bind(slot.slot)
+            .fetch_optional(&mut *tx)
+            .await?;
+    // A slot whose stored state cannot be read still moves (an Unreadable event fails it): its
+    // entry has what can be read.
+    let Some(state) = found.as_ref().and_then(|(state, _)| JobState::parse(state)) else {
+        return Ok(None);
+    };
+    let row: Option<DownloadProgress> =
+        (found.and_then(|(_, row)| row)).and_then(|row| serde_json::from_str(&row).ok());
+    Ok(Entry::of_slot(slot.slot, state, row.as_ref()))
+}
+
+/// Appends `entry` to `job`'s timeline under its next number. Selected from the job, so a
+/// deleted job's entry adds nothing.
+async fn append(tx: &mut SqliteConnection, job: &str, entry: Entry) -> Result<(), LedgerError> {
+    let Value::String(stage) = serde_json::to_value(entry.stage)? else {
+        return Err(LedgerError(format!("stage {:?} is not named", entry.stage)));
+    };
+    sqlx::query(
+        "INSERT INTO job_events (job_id, seq, at, stage, event, facts) \
+         SELECT id, (SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE job_id = jobs.id), \
+                ?, ?, ?, ? \
+         FROM jobs WHERE id = ?",
+    )
+    .bind(now())
+    .bind(stage)
+    .bind(entry.event)
+    .bind(Value::Object(entry.facts).to_string())
     .bind(job)
     .execute(&mut *tx)
     .await?;

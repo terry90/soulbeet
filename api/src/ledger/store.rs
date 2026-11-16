@@ -7,6 +7,7 @@ use crate::models::folder::Folder;
 use shared::download::{
     DownloadProgress, DownloadQuery, DownloadableGroup, DownloadableItem, JobSlot,
 };
+use shared::failure::{Failure, Stage};
 use soulbeet::ImportMode;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -336,6 +337,122 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
         }
     }
     Ok(unfinished)
+}
+
+/// One source a slot tried, as stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttemptRecord {
+    pub n: u32,
+    /// None for a transfer the slot adopted.
+    pub candidate: Option<DownloadableItem>,
+    pub source: Option<String>,
+    /// At its transfer's first InProgress row.
+    pub started_at: Option<i64>,
+    /// When its transfer finished, failed or was cancelled, it was refused, or the slot moved
+    /// on to its next attempt.
+    pub ended_at: Option<i64>,
+    /// The last row of its transfer the ledger stored.
+    pub last_row: Option<DownloadProgress>,
+    pub failure: Option<Failure>,
+}
+
+/// One entry of a job's timeline. `event` is a snake_case name; `facts` holds `slot`, `source`,
+/// `item`, `code` and `message` as they apply, text from peers only there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimelineEntry {
+    pub seq: u32,
+    pub at: i64,
+    pub stage: Stage,
+    pub event: String,
+    pub facts: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AttemptRow {
+    slot: u32,
+    n: u32,
+    candidate: Option<String>,
+    source: Option<String>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    last_row: Option<String>,
+    failure: Option<String>,
+}
+
+/// Each slot of `job` with its attempts, oldest first.
+pub async fn attempts_of(
+    db: &SqlitePool,
+    job: &str,
+) -> Result<Vec<(u32, Vec<AttemptRecord>)>, sqlx::Error> {
+    let rows: Vec<AttemptRow> = sqlx::query_as(
+        "SELECT slot, n, candidate, source, started_at, ended_at, last_row, failure \
+         FROM job_attempts WHERE job_id = ? ORDER BY slot, n",
+    )
+    .bind(job)
+    .fetch_all(db)
+    .await?;
+    let mut slots: Vec<(u32, Vec<AttemptRecord>)> = Vec::new();
+    for row in rows {
+        let attempt = AttemptRecord {
+            n: row.n,
+            candidate: row.candidate.as_deref().map(json).transpose()?,
+            source: row.source,
+            started_at: row.started_at,
+            ended_at: row.ended_at,
+            last_row: row.last_row.as_deref().map(json).transpose()?,
+            failure: row.failure.as_deref().map(json).transpose()?,
+        };
+        match slots.last_mut() {
+            Some((slot, attempts)) if *slot == row.slot => attempts.push(attempt),
+            _ => slots.push((row.slot, vec![attempt])),
+        }
+    }
+    Ok(slots)
+}
+
+/// `job`'s timeline, in order.
+pub async fn timeline_of(db: &SqlitePool, job: &str) -> Result<Vec<TimelineEntry>, sqlx::Error> {
+    let rows: Vec<(u32, i64, String, String, String)> = sqlx::query_as(
+        "SELECT seq, at, stage, event, facts FROM job_events WHERE job_id = ? ORDER BY seq",
+    )
+    .bind(job)
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|(seq, at, stage, event, facts)| {
+            Ok(TimelineEntry {
+                seq,
+                at,
+                stage: serde_json::from_value(serde_json::Value::String(stage))
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                event,
+                facts: json(&facts)?,
+            })
+        })
+        .collect()
+}
+
+/// D5: per source, the attempts of any user that ended at or after `since` with the peer
+/// failing the transfer. One slskd account serves every user, and a peer's daily limit of
+/// failed transfers is on that account. A slow peer (stuck in its queue), a cancel, a refused
+/// enqueue and Soulful's own refusals do not count.
+pub async fn recent_failures(
+    db: &SqlitePool,
+    since: i64,
+) -> Result<HashMap<String, u32>, sqlx::Error> {
+    let rows: Vec<(String, u32)> = sqlx::query_as(
+        "SELECT a.source, COUNT(*) FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
+         WHERE a.ended_at >= ? AND a.source IS NOT NULL \
+         AND json_extract(a.failure, '$.stage') = 'transfer' \
+         AND json_extract(a.failure, '$.retry') = 'other_source' \
+         AND json_extract(a.failure, '$.code') \
+             NOT IN ('transfer_stuck_in_remote_queue', 'transfer_cancelled') \
+         GROUP BY a.source",
+    )
+    .bind(since)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().collect())
 }
 
 #[cfg(test)]

@@ -616,6 +616,10 @@ impl DownloadMonitor {
 
     /// Re-enqueue this slot from its next-best peer. Returns true when the
     /// slot was rebound, in which case the caller must not mark it failed.
+    /// `left` is the row the slot's transfer ended with, its failure set:
+    /// before an alternate is tried it ends that attempt in the ledger, the
+    /// slot still downloading. With no alternate to try, the caller's settled
+    /// row ends it.
     ///
     /// A cancel marked before this poll's `apply_cancels` has settled the
     /// slot already. One marked later in the poll, the next peer's enqueue
@@ -625,12 +629,26 @@ impl DownloadMonitor {
         &mut self,
         slot: usize,
         backend: &Arc<dyn DownloadBackend>,
-        reason: &str,
+        left: DownloadProgress,
     ) -> bool {
+        if !self.pool.has_next(slot) {
+            return false;
+        }
+        let reason = left
+            .failure
+            .as_ref()
+            .map_or("Transfer failed", |f| f.message.as_str())
+            .to_string();
+        self.ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![self.stamp(slot, left)],
+        });
         // Each source is stored before it is sent, so a restart knows which
         // peer may hold the slot's transfer and in which request. A source
-        // the ledger cannot store is not sent.
+        // the ledger cannot store is not sent. Each refused source is stored
+        // before the next one, so the newest attempt is always the slot's.
         let (ledger, job) = (self.ledger.clone(), self.tracked_files[slot].job.clone());
+        let filename = self.tracked_files[slot].filename.clone();
         let record = |item: &DownloadableItem, request: &str| {
             let ledger = ledger.clone();
             let attempt = JobEvent::Attempt {
@@ -645,20 +663,25 @@ impl DownloadMonitor {
                     .map_err(|e| database_failure(Stage::Enqueue, e))
             }
         };
-        let next = self
-            .pool
-            .enqueue_next_noting(slot, backend, &self.batch, record)
-            .await;
-        for refused in &next.refused {
+        let refusing = |item: &DownloadableItem, failure: &Failure| {
             warn!(
                 "Failover source {} refused {} for {}: {}: {}",
-                refused.source,
-                refused.item,
-                self.tracked_files[slot].filename,
-                refused.failure.code.as_str(),
-                refused.failure.message
+                item.source,
+                item.id,
+                filename,
+                failure.code.as_str(),
+                failure.message
             );
-        }
+            ledger.record(JobEvent::Refused {
+                slot: job.clone(),
+                candidate: Box::new(item.clone()),
+                failure: failure.clone(),
+            });
+        };
+        let next = self
+            .pool
+            .enqueue_next_noting(slot, backend, &self.batch, record, refusing)
+            .await;
         let Some((_, queued)) = next.queued else {
             return false;
         };
@@ -1327,7 +1350,7 @@ impl DownloadMonitor {
                     .get_or_insert_with(Instant::now);
                 if failing_since.elapsed() >= FAILED_STATE_CONFIRM {
                     let retryable = !matches!(download.state, DownloadState::Cancelled);
-                    if !retryable || !self.try_failover(slot, backend, "Transfer failed").await {
+                    if !retryable || !self.try_failover(slot, backend, download.clone()).await {
                         let row = self.write_off(
                             slot,
                             SlotPhase::Settled,
@@ -1353,15 +1376,15 @@ impl DownloadMonitor {
         failure: Failure,
         backend: &Arc<dyn DownloadBackend>,
     ) {
-        if self.try_failover(slot, backend, &failure.message).await {
-            return;
-        }
-        self.abandon(slot, backend).await;
         let row = DownloadProgress {
             queued_at_source: false,
             ..download.clone()
         }
         .failed_with(failure);
+        if self.try_failover(slot, backend, row.clone()).await {
+            return;
+        }
+        self.abandon(slot, backend).await;
         let row = self.write_off(slot, SlotPhase::TimedOut, backend.id(), row);
         self.report_settled(vec![self.stamp(slot, row)]);
     }
@@ -1436,7 +1459,8 @@ impl DownloadMonitor {
             if let Some(failure) = absent {
                 // Logged only once the track is really being written off:
                 // a successful failover reports its own retry instead.
-                if self.try_failover(slot, backend, &failure.message).await {
+                let row = make_failed_progress(&self.tracked_files[slot], failure.clone());
+                if self.try_failover(slot, backend, row.clone()).await {
                     continue;
                 }
                 warn!(
@@ -1445,7 +1469,6 @@ impl DownloadMonitor {
                     ABSENT_TRACK_TIMEOUT.as_secs(),
                     self.tracked_files[slot].filename
                 );
-                let row = make_failed_progress(&self.tracked_files[slot], failure);
                 let row = self.write_off(slot, SlotPhase::Settled, backend.id(), row);
                 failed.push(self.stamp(slot, row));
             }
@@ -1474,13 +1497,13 @@ impl DownloadMonitor {
             if !self.watching(slot) {
                 continue;
             }
-            if self.try_failover(slot, backend, &failure.message).await {
+            let row = make_failed_progress(&self.tracked_files[slot], failure.clone());
+            if self.try_failover(slot, backend, row.clone()).await {
                 retried = true;
                 continue;
             }
             // Without this, rows whose transfer never surfaced in slskd would
             // sit at "Queued" in the UI forever.
-            let row = make_failed_progress(&self.tracked_files[slot], failure.clone());
             let row = self.write_off(slot, SlotPhase::Settled, backend.id(), row);
             failed.push(self.stamp(slot, row));
         }
@@ -2089,6 +2112,98 @@ mod tests {
                 Some("dirB/bbb.flac".into()),
                 stub.requests().first().cloned()
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_that_fails_over_records_the_attempt_it_left_and_each_refused_alternate() {
+        let (mut m, _rx, mut recorded) = failover_monitor();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Rejected, ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[failed_transfer("peer_a", "dirA/aaa.flac")],
+            &backend,
+        )
+        .await;
+
+        /// An event as (kind, source, file, state of its row or code of its failure, request).
+        type Seen = (&'static str, String, String, String, Option<String>);
+        let seen: Vec<Seen> = recorded
+            .events()
+            .into_iter()
+            .map(|e| match e {
+                JobEvent::Slots {
+                    state: JobState::Downloading,
+                    rows,
+                } => {
+                    let [row] = &rows[..] else {
+                        panic!("one row: {rows:?}")
+                    };
+                    assert_eq!(row.job, Some(slot_of_j1(0)));
+                    let state = match &row.state {
+                        DownloadState::Failed(_) => "failed".to_string(),
+                        other => format!("{other:?}"),
+                    };
+                    ("slots", row.source.clone(), row.item.clone(), state, None)
+                }
+                JobEvent::Attempt {
+                    slot,
+                    candidate: Some(candidate),
+                    request,
+                } => {
+                    assert_eq!(slot, slot_of_j1(0));
+                    (
+                        "attempt",
+                        candidate.source,
+                        candidate.id,
+                        String::new(),
+                        request,
+                    )
+                }
+                JobEvent::Refused {
+                    slot,
+                    candidate,
+                    failure,
+                } => {
+                    assert_eq!(slot, slot_of_j1(0));
+                    let code = failure.code.as_str().to_string();
+                    ("refused", candidate.source, candidate.id, code, None)
+                }
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        let requests = stub.requests();
+        let s = |text: &str| text.to_string();
+        assert_eq!(
+            seen,
+            vec![
+                ("slots", s("peer_a"), s("dirA/aaa.flac"), s("failed"), None),
+                (
+                    "attempt",
+                    s("peer_b"),
+                    s("dirB/bbb.flac"),
+                    s(""),
+                    Some(requests[0].clone())
+                ),
+                (
+                    "refused",
+                    s("peer_b"),
+                    s("dirB/bbb.flac"),
+                    s("peer_offline"),
+                    None
+                ),
+                (
+                    "attempt",
+                    s("peer_c"),
+                    s("dirC/ccc.flac"),
+                    s(""),
+                    Some(requests[1].clone())
+                ),
+                ("slots", s("peer_c"), s("dirC/ccc.flac"), s("Queued"), None),
+            ]
         );
     }
 
@@ -3039,12 +3154,15 @@ mod tests {
             FailureCode::TransferNeverAppeared,
             "Download never appeared in slskd",
         );
+        // The row it left is recorded before its alternates are refused, the
+        // slot still downloading, then the slot fails.
+        let left = vec![("dirA/aaa.flac".into(), Some(slot_of_j1(0)))];
         assert_eq!(
             slots_recorded(&mut recorded),
-            vec![(
-                JobState::Failed,
-                vec![("dirA/aaa.flac".into(), Some(slot_of_j1(0)))]
-            )]
+            vec![
+                (JobState::Downloading, left.clone()),
+                (JobState::Failed, left)
+            ]
         );
     }
 

@@ -13,8 +13,9 @@ use shared::failure::Failure;
 use shared::recommendation::normalize_for_matching;
 use soulbeet::{DriverChoice, ImportMode, ImportedItem};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
@@ -178,6 +179,13 @@ pub enum JobEvent {
         slot: JobSlot,
         candidate: Option<Box<DownloadableItem>>,
         request: Option<String>,
+    },
+    /// An alternate of the slot the backend or the transfer registry refused, a finished
+    /// attempt with `failure`.
+    Refused {
+        slot: JobSlot,
+        candidate: Box<DownloadableItem>,
+        failure: Failure,
     },
     ImportQueued(Box<StoredImport>),
     /// `next` is Indexing (with `index`), Done (an import with no items, D14), NeedsDecision
@@ -467,10 +475,15 @@ impl std::fmt::Display for LedgerError {
     }
 }
 
+/// The last row sent for each slot that is not in a terminal state, kept in memory only (design
+/// 8.3): progress ticks never reach the disk.
+type LiveRows = Arc<Mutex<HashMap<JobSlot, DownloadProgress>>>;
+
 #[derive(Clone)]
 pub struct Ledger {
     writes: mpsc::UnboundedSender<Write>,
     changes: watch::Receiver<i64>,
+    live: LiveRows,
     /// No writer reads `writes`: requests are answered at once, events wait for `Recorded`.
     #[cfg(test)]
     recording: bool,
@@ -480,9 +493,11 @@ impl Ledger {
     fn channel() -> (Ledger, Inbox) {
         let (writes, inbox) = mpsc::unbounded_channel();
         let (changed, changes) = watch::channel(0);
+        let live = LiveRows::default();
         let ledger = Ledger {
             writes,
             changes,
+            live: live.clone(),
             #[cfg(test)]
             recording: false,
         };
@@ -491,8 +506,15 @@ impl Ledger {
             Inbox {
                 writes: inbox,
                 changed,
+                live,
             },
         )
+    }
+
+    /// The last row sent for `slot`, while the slot is not terminal ("Live byte counts are read
+    /// from memory", design 8.3).
+    pub fn live_row(&self, slot: &JobSlot) -> Option<DownloadProgress> {
+        self.live.lock().unwrap().get(slot).cloned()
     }
 
     /// A ledger with no writer whose events a test reads. Requests that wait for a reply
@@ -2470,6 +2492,305 @@ mod tests {
                     ..wait
                 }
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_over_slot_keeps_each_attempts_row_and_failure() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![(0, item("peer_a", "One", "a/01.flac"))],
+        });
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![row_of("j1", 0, "a/01.flac", DownloadState::InProgress, 10)],
+        });
+        // slskd's text for a peer's daily failure limit (slskd Application.cs:808).
+        let limit = Failure::new(
+            FailureCode::TransferRejectedFailureLimit,
+            Stage::Transfer,
+            RetryAdvice::OtherSource,
+            "Transfer rejected: Too many failed transfers today",
+        );
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![row_of(
+                "j1",
+                0,
+                "a/01.flac",
+                DownloadState::Failed(String::new()),
+                10,
+            )
+            .with_failure(limit.clone())],
+        });
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        ledger.record(JobEvent::Attempt {
+            slot: slot.clone(),
+            candidate: Some(Box::new(item("peer_b", "One", "b/01.flac"))),
+            request: None,
+        });
+        // A late row of the abandoned transfer ends nothing of the new attempt.
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![row_of("j1", 0, "a/01.flac", DownloadState::Cancelled, 10)],
+        });
+        ledger.settled().await;
+        let [(0, attempts)] = &store::attempts_of(&db, "j1").await.unwrap()[..] else {
+            panic!("one slot")
+        };
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|a| (a.n, a.source.clone(), a.failure.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Some("peer_a".into()), Some(limit)),
+                (2, Some("peer_b".into()), None)
+            ]
+        );
+        assert!(
+            attempts[0].started_at.is_some()
+                && attempts[0].ended_at.is_some()
+                && attempts[1].ended_at.is_none()
+        );
+        assert_eq!(
+            attempts[0].last_row.as_ref().map(|r| r.transferred),
+            Some(10)
+        );
+        assert_eq!(attempts[1].last_row, None);
+        let since = chrono::Utc::now().timestamp() - 60;
+        assert_eq!(
+            store::recent_failures(&db, since).await.unwrap(),
+            HashMap::from([("peer_a".to_string(), 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_alternate_is_one_finished_attempt_and_only_a_peers_failure_counts() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![(0, item("peer_a", "One", "a/01.flac"))],
+        });
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        let stuck = Failure::new(
+            FailureCode::TransferStuckInRemoteQueue,
+            Stage::Transfer,
+            RetryAdvice::OtherSource,
+            // The monitor's own text (stuck_in_remote_queue).
+            "Waited 15 minutes in the source's queue",
+        );
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![row_of(
+                "j1",
+                0,
+                "a/01.flac",
+                DownloadState::Failed(String::new()),
+                0,
+            )
+            .with_failure(stuck.clone())],
+        });
+        // Sent, then refused by the backend: its stored attempt ends.
+        ledger.record(JobEvent::Attempt {
+            slot: slot.clone(),
+            candidate: Some(Box::new(item("peer_b", "One", "b/01.flac"))),
+            request: Some("r2".into()),
+        });
+        let offline = Failure::new(
+            FailureCode::PeerOffline,
+            Stage::Enqueue,
+            RetryAdvice::OtherSource,
+            "peer offline",
+        );
+        ledger.record(JobEvent::Refused {
+            slot: slot.clone(),
+            candidate: Box::new(item("peer_b", "One", "b/01.flac")),
+            failure: offline.clone(),
+        });
+        // Never sent: another batch of the user holds it.
+        let held = crate::server_fns::download::enqueue::another_folder(RetryAdvice::OtherSource);
+        ledger.record(JobEvent::Refused {
+            slot: slot.clone(),
+            candidate: Box::new(item("peer_c", "One", "c/01.flac")),
+            failure: held.clone(),
+        });
+        ledger.record(JobEvent::Attempt {
+            slot: slot.clone(),
+            candidate: Some(Box::new(item("peer_d", "One", "d/01.flac"))),
+            request: Some("r4".into()),
+        });
+        ledger.settled().await;
+        let [(0, attempts)] = &store::attempts_of(&db, "j1").await.unwrap()[..] else {
+            panic!("one slot")
+        };
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|a| (
+                    a.n,
+                    a.source.clone(),
+                    a.failure.clone(),
+                    a.ended_at.is_some()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Some("peer_a".into()), Some(stuck), true),
+                (2, Some("peer_b".into()), Some(offline.clone()), true),
+                (3, Some("peer_c".into()), Some(held), true),
+                (4, Some("peer_d".into()), None, false),
+            ]
+        );
+        // Reconcile still finds the newest attempt and the request it went in.
+        let unfinished = store::unfinished(&db).await.unwrap().jobs;
+        assert_eq!(unfinished[0].slots[0].attempts.len(), 4);
+        assert_eq!(unfinished[0].slots[0].sent_in.as_deref(), Some("r4"));
+        // A slow peer, a refused enqueue and a held file are not the peer failing a transfer.
+        let since = chrono::Utc::now().timestamp() - 60;
+        assert_eq!(
+            store::recent_failures(&db, since).await.unwrap(),
+            HashMap::new()
+        );
+        let timeline = store::timeline_of(&db, "j1").await.unwrap();
+        assert_eq!(
+            timeline
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "requested",
+                "picked",
+                "downloading",
+                "trying",
+                "refused",
+                "refused",
+                "trying"
+            ]
+        );
+        assert_eq!(
+            timeline.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            (1..=7).collect::<Vec<u32>>()
+        );
+        let refused = &timeline[4];
+        assert_eq!(refused.stage, Stage::Enqueue);
+        assert_eq!(
+            serde_json::Value::Object(refused.facts.clone()),
+            serde_json::json!({
+                "slot": 0,
+                "source": "peer_b",
+                "item": "b/01.flac",
+                "code": "peer_offline",
+                "message": "peer offline",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn live_rows_follow_every_tick_and_a_finished_slot_stays_finished() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![(0, item("peer_a", "One", "a/01.flac"))],
+        });
+        for transferred in [10, 20] {
+            ledger.record(JobEvent::Slots {
+                state: JobState::Downloading,
+                rows: vec![row_of(
+                    "j1",
+                    0,
+                    "a/01.flac",
+                    DownloadState::InProgress,
+                    transferred,
+                )],
+            });
+        }
+        ledger.settled().await;
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        assert_eq!(ledger.live_row(&slot).map(|r| r.transferred), Some(20));
+        ledger.record(JobEvent::Slots {
+            state: JobState::Cancelled,
+            rows: vec![row_of("j1", 0, "a/01.flac", DownloadState::Cancelled, 20)],
+        });
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![row_of("j1", 0, "a/01.flac", DownloadState::InProgress, 30)],
+        });
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Cancelled));
+        assert_eq!(ledger.live_row(&slot), None);
+        let timeline = store::timeline_of(&db, "j1").await.unwrap();
+        assert_eq!(
+            timeline
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["requested", "picked", "downloading", "cancelled"]
+        );
+        assert_eq!(
+            timeline[1].facts.get("source"),
+            Some(&serde_json::json!("peer_a"))
+        );
+        assert_eq!(
+            timeline.iter().map(|e| e.stage).collect::<Vec<_>>(),
+            vec![Stage::Input, Stage::Input, Stage::Transfer, Stage::Input]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_applied_transition_is_on_the_timeline_once() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Searching, None), None)
+            .await
+            .unwrap();
+        let alice_id = UserId::new("alice");
+        let picked = vec![(0, item("peer_a", "One", "a/01.flac"))];
+        ledger
+            .transition(&alice_id, "j1", Transition::Pick { items: picked })
+            .await
+            .unwrap();
+        ledger
+            .transition(&alice_id, "j1", Transition::Cancel)
+            .await
+            .unwrap();
+        // Refused: a cancelled job cannot be cancelled again.
+        ledger
+            .transition(&alice_id, "j1", Transition::Cancel)
+            .await
+            .unwrap();
+        let timeline = store::timeline_of(&db, "j1").await.unwrap();
+        assert_eq!(
+            timeline
+                .iter()
+                .map(|e| (e.event.as_str(), e.facts.get("source").cloned()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("requested", None),
+                ("picked", Some(serde_json::json!("peer_a"))),
+                ("cancelled", None),
+            ]
         );
     }
 }
