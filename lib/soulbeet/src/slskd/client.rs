@@ -12,7 +12,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
-    download::{EnqueueStatus, SearchSpec, SearchStats},
+    download::{EnqueueStatus, SearchSpec, SearchStats, SourcePresence},
     failure::{
         Cause, Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
     },
@@ -815,6 +815,65 @@ impl SoulseekClient {
         }
     }
 
+    /// `GET transfers/downloads/{username}/{id}/position` (`TransfersController.cs:584-617`):
+    /// slskd asks the peer now and answers the bare place. None for 404: no such transfer, or
+    /// slskd's blacklist holds the user (`:595-598`, `:610-613`). A failed ask is a 500 whose
+    /// body is the exception's text written as a JSON string (`:56`, `:614-617`); the error
+    /// keeps that text. A transfer between retries or ended answers such a 500, `... is not
+    /// active` (Soulseek.NET `SoulseekClient.cs:1643-1646`).
+    pub async fn get_place_in_queue(&self, username: &str, id: &str) -> Result<Option<u32>> {
+        let endpoint = format!("{}/position", download_endpoint(username, id)?);
+        match self
+            .make_request::<u32, ()>(Method::GET, &endpoint, None)
+            .await
+        {
+            Ok(place) => Ok(Some(place)),
+            Err(SoulseekError::Api { status: 404, .. }) => Ok(None),
+            Err(SoulseekError::Api {
+                status: 500,
+                message,
+            }) => Err(SoulseekError::Api {
+                status: 500,
+                message: json_text(message),
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `GET users/{username}/status` (`Users/API/Controllers/UsersController.cs:253-278`),
+    /// `presence` as `UserPresence`'s name (`Program.cs:980`). An offline peer is a 200 saying
+    /// `Offline`; 404 means slskd's blacklist holds the user (`:264-267`), so it is `Blocked`.
+    pub async fn get_user_presence(&self, username: &str) -> Result<SourcePresence> {
+        let endpoint = format!("users/{}/status", path_segment(username)?);
+        match self
+            .make_request::<UserStatus, ()>(Method::GET, &endpoint, None)
+            .await
+        {
+            Ok(status) => Ok(match status.presence {
+                WirePresence::Online => SourcePresence::Online,
+                WirePresence::Away => SourcePresence::Away,
+                WirePresence::Offline => SourcePresence::Offline,
+            }),
+            Err(SoulseekError::Api { status: 404, .. }) => Ok(SourcePresence::Blocked),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `PUT searches/{id}` (`Search/API/Controllers/SearchesController.cs:209-228`): slskd
+    /// cancels the search's token (`SearchService.cs:414-423`), and the search ends
+    /// `Completed, Cancelled` with the responses it had (`SearchService.cs:337-341,359`). 404
+    /// (no such search, `:222-225`) is Ok: nothing runs.
+    pub async fn stop_search(&self, search_id: &str) -> Result<()> {
+        let endpoint = format!("searches/{search_id}");
+        match self
+            .make_request::<(), ()>(Method::PUT, &endpoint, None)
+            .await
+        {
+            Ok(()) | Err(SoulseekError::Api { status: 404, .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Checks that slskd answers and is connected and logged in to the
     /// Soulseek network; else the failure that says which, with slskd's own
     /// answer as its cause: a rejected API key is `backend_not_configured`,
@@ -917,6 +976,26 @@ fn search_refused(body: String) -> SoulseekError {
     } else {
         SoulseekError::SearchQueryRejected { body }
     }
+}
+
+/// The text of an error body a `[Produces("application/json")]` controller wrote as a JSON
+/// string; the body as sent when it is not one.
+fn json_text(body: String) -> String {
+    serde_json::from_str(&body).unwrap_or(body)
+}
+
+/// slskd's `Users/Types/Status.cs` as `GET users/{username}/status` writes it.
+#[derive(Deserialize)]
+struct UserStatus {
+    presence: WirePresence,
+}
+
+/// Soulseek.NET's `UserPresence` by name (`src/UserPresence.cs:29-45`).
+#[derive(Deserialize)]
+enum WirePresence {
+    Online,
+    Away,
+    Offline,
 }
 
 /// An error polling a search: reading its status or responses, or cancelling
@@ -1302,6 +1381,18 @@ impl crate::DownloadBackend for SoulseekClient {
 
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()> {
         self.cancel_download(username, download_id, remove).await
+    }
+
+    async fn queue_position(&self, source: &str, id: &str) -> Result<Option<u32>> {
+        self.get_place_in_queue(source, id).await
+    }
+
+    async fn source_status(&self, source: &str) -> Result<SourcePresence> {
+        self.get_user_presence(source).await
+    }
+
+    async fn stop_search(&self, search_id: &str) -> Result<()> {
+        self.stop_search(search_id).await
     }
 
     async fn health_check(&self) -> std::result::Result<(), Failure> {
@@ -2599,5 +2690,106 @@ mod tests {
             seen.lock().unwrap()[1].target,
             format!("/api/v0/transfers/downloads/peer/{id}")
         );
+    }
+
+    #[tokio::test]
+    async fn a_queued_transfers_place_is_asked_of_the_peer() {
+        let id = "890f943c-02e1-4d45-af76-d55e3d855684";
+        // TransferNotFoundException's text (Soulseek.NET src/SoulseekClient.cs:1645), answered
+        // as 500 by TransfersController.cs:614 and written as a JSON string (`:56`).
+        let inactive = "A download of @@kqzbm\\Music\\Marrow Choir\\Winter Songs\\03 - O Holy Night.flac from user carol_shares is not active";
+        let (url, seen) = serve(vec![
+            ok("3"),
+            Reply {
+                status: 404,
+                body: String::new(),
+            },
+            Reply {
+                status: 500,
+                body: serde_json::to_string(inactive).unwrap(),
+            },
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.get_place_in_queue("carol_shares", id).await.unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            client.get_place_in_queue("carol_shares", id).await.unwrap(),
+            None
+        );
+        let err = client
+            .get_place_in_queue("carol_shares", id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SoulseekError::Api { status: 500, message } if message == inactive),
+            "{err:?}"
+        );
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            format!("/api/v0/transfers/downloads/carol_shares/{id}/position")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_presence_is_read_and_a_404_is_a_blocked_user() {
+        let (url, seen) = serve(vec![
+            ok(r#"{"isPrivileged":false,"presence":"Away"}"#),
+            ok(r#"{"isPrivileged":true,"presence":"Online"}"#),
+            ok(r#"{"isPrivileged":false,"presence":"Offline"}"#),
+            Reply {
+                status: 404,
+                body: String::new(),
+            },
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        for expected in [
+            SourcePresence::Away,
+            SourcePresence::Online,
+            SourcePresence::Offline,
+            SourcePresence::Blocked,
+        ] {
+            assert_eq!(
+                client.get_user_presence("carol_shares").await.unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/api/v0/users/carol_shares/status"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_is_stopped_and_one_slskd_no_longer_has_is_no_error() {
+        let (url, seen) = serve(vec![
+            ok(""),
+            Reply {
+                status: 404,
+                body: String::new(),
+            },
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        client.stop_search(SEARCH_ID).await.unwrap();
+        client.stop_search(SEARCH_ID).await.unwrap();
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            (sent.method.as_str(), sent.target),
+            ("PUT", format!("/api/v0/searches/{SEARCH_ID}"))
+        );
+        assert_eq!(sent.body, "");
     }
 }

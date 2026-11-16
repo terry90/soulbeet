@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use shared::{
     download::{
         DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult, SearchSpec,
-        SkipKind,
+        SkipKind, SourcePresence,
     },
     failure::{Failure, UserAction},
     library::DuplicateReport,
@@ -75,6 +75,13 @@ pub trait DownloadBackend: Send + Sync {
     /// The transfer `source` holds under `id`, as `get_downloads_for` reads it; None when the backend no longer has it.
     async fn get_download(&self, source: &str, id: &str) -> Result<Option<DownloadProgress>>;
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()>;
+    /// The transfer's place in the source's queue, asked of the source now; None when the
+    /// backend no longer has the transfer.
+    async fn queue_position(&self, source: &str, id: &str) -> Result<Option<u32>>;
+    /// Whether the source is online now.
+    async fn source_status(&self, source: &str) -> Result<SourcePresence>;
+    /// Ends a running search early; its next poll reads what it found so far.
+    async fn stop_search(&self, search_id: &str) -> Result<()>;
     /// Ok when the backend can take work now; else why not, as a failure
     /// with the backend's own answer as its cause.
     async fn health_check(&self) -> std::result::Result<(), Failure>;

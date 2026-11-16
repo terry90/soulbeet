@@ -122,6 +122,12 @@ pub struct FileEntry {
     /// attempt and incremented on each retry (`Transfers/Types/Transfer.cs:155`).
     #[serde(default)]
     pub attempts: u32,
+    /// Set by slskd only once its position endpoint was asked (`DownloadService.cs:711-729`,
+    /// `Transfers/Types/Transfer.cs:142`); omitted while null (`docs/api/slskd.md:239`). It can
+    /// return to null, as slskd writes its in-memory transfer back on each update
+    /// (`DownloadService.cs:1087-1092,1611-1617`).
+    #[serde(default)]
+    pub place_in_queue: Option<i64>,
     /// slskd removed the record from its UI (`Transfers/Types/Transfer.cs:165`, sent since 0.26.0,
     /// docs/api/slskd.md:241). The single-transfer GET still returns it (`DownloadService.cs:688-704`
     /// has no `Removed` filter).
@@ -685,6 +691,10 @@ impl FileEntry {
             failure: None,
             skip: None,
             queued_at_source,
+            attempts: self.attempts,
+            queue_position: self
+                .place_in_queue
+                .and_then(|place| u32::try_from(place).ok()),
             pending_retry: None,
             job: None,
             request: self.batch_id.as_deref().and_then(request_of_batch),
@@ -1431,7 +1441,8 @@ mod tests {
                     "endedAt": "2026-07-19T05:11:30Z",
                     "bytesTransferred": 1024,
                     "averageSpeed": 250000.0,
-                    "attempts": 1,
+                    "attempts": 2,
+                    "placeInQueue": 7,
                     "removed": false,
                     "bytesRemaining": 0,
                     "elapsedTime": "00:00:06",
@@ -1444,7 +1455,10 @@ mod tests {
         let files: FlattenedFiles =
             serde_json::from_value(payload).expect("payload should deserialize");
         assert_eq!(files.files.len(), 1, "transfer entry was silently dropped");
-        assert_eq!(files.files[0].clone().into_progress(3).state, DS::Completed);
+        let row = files.files[0].clone().into_progress(3);
+        assert_eq!(row.state, DS::Completed);
+        assert_eq!(row.queue_position, Some(7));
+        assert_eq!(row.attempts, 2);
     }
 
     /// slskd computes `bytesRemaining` as `Size - BytesTransferred` and

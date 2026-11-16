@@ -252,6 +252,12 @@ pub struct DownloadProgress {
     /// The transfer waits in the source's own queue, not in the backend's
     #[serde(default)]
     pub queued_at_source: bool,
+    /// How many times the backend tried this transfer.
+    #[serde(default)]
+    pub attempts: u32,
+    /// The transfer's place in the source's queue, when last asked.
+    #[serde(default)]
+    pub queue_position: Option<u32>,
     /// A failed attempt slskd says it will retry, which the row reads as
     /// Queued: the failure that attempt stated. Never sent to the browser. A
     /// watcher reads the row as this failure once it has held it pending for
@@ -286,6 +292,17 @@ pub struct JobSlot {
     pub slot: u32,
 }
 
+/// Whether a source is online now, as its backend reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourcePresence {
+    Online,
+    Away,
+    Offline,
+    /// slskd's blacklist holds this user, so nothing can be downloaded from it.
+    Blocked,
+}
+
 /// Why an import was skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -316,6 +333,8 @@ impl DownloadProgress {
             failure: None,
             skip: None,
             queued_at_source: false,
+            attempts: 0,
+            queue_position: None,
             pending_retry: None,
             job: None,
             request: None,
@@ -648,6 +667,8 @@ mod tests {
         assert!(!row.queued_at_source);
         assert_eq!(row.job, None);
         assert_eq!(row.index, None);
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.queue_position, None);
         let sent = serde_json::to_value(row.with_job(JobSlot {
             job: "j1".into(),
             slot: 0,

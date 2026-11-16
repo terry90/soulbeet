@@ -8,7 +8,7 @@ use crate::auth::UserId;
 use async_trait::async_trait;
 use shared::download::{
     DownloadProgress, DownloadState, DownloadableGroup, DownloadableItem, EnqueueStatus, FileFacts,
-    QueuedDownload, SearchResult, SearchSpec, SearchState, SearchStats,
+    QueuedDownload, SearchResult, SearchSpec, SearchState, SearchStats, SourcePresence,
 };
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use soulbeet::error::{Result as SoulResult, SoulseekError};
@@ -363,6 +363,15 @@ impl DownloadBackend for StubBackend {
             id: id.to_string(),
             remove,
         });
+        Ok(())
+    }
+    async fn queue_position(&self, _source: &str, _id: &str) -> SoulResult<Option<u32>> {
+        Ok(None)
+    }
+    async fn source_status(&self, _source: &str) -> SoulResult<SourcePresence> {
+        Ok(SourcePresence::Online)
+    }
+    async fn stop_search(&self, _search_id: &str) -> SoulResult<()> {
         Ok(())
     }
     async fn health_check(&self) -> Result<(), Failure> {
