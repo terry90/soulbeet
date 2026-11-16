@@ -253,9 +253,14 @@ test('the Christmas playlist is filled through every injected failure by followi
   try {
     const entryError = await test.step('Navidrome down', async () => {
       await setNavidromeDown(true);
-      // Until one job waits for Navidrome to list its file and the slow peer's transfer runs.
+      // Until O Holy Night waits for Navidrome to list its file and the slow peer's transfer is the
+      // only one running (the other peers' failures come within seconds).
+      const inState = async (state: string) =>
+        ((await a.ok('get_jobs', { batch_id: batchId, states: [state] })) as { jobs: JobDoc[] }).jobs;
+      let indexing: JobDoc[] = [],
+        downloading: JobDoc[] = [];
       for (const end = Date.now() + 150_000; ; ) {
-        expect(Date.now(), 'a job reached indexing while another downloads').toBeLessThan(end);
+        expect(Date.now(), 'O Holy Night reached indexing while only Holly downloads').toBeLessThan(end);
         const b = (await a.ok('get_batch', {
           batch_id: batchId,
           since: cursor,
@@ -263,14 +268,13 @@ test('the Christmas playlist is filled through every injected failure by followi
           wait_for: 'any_change',
         })) as Batch;
         cursor = b.cursor;
-        if ((b.summary.indexing ?? 0) >= 1 && (b.summary.downloading ?? 0) >= 1) break;
+        if ((b.summary.indexing ?? 0) >= 1 && (b.summary.downloading ?? 0) >= 1) {
+          indexing = await inState('indexing');
+          downloading = await inState('downloading');
+          const only = (jobs: JobDoc[], title: string) => jobs.length === 1 && jobs[0]?.wanted.title === title;
+          if (only(indexing, 'O Holy Night') && only(downloading, 'The Holly and the Ivy')) break;
+        }
       }
-      const inState = async (state: string) =>
-        ((await a.ok('get_jobs', { batch_id: batchId, states: [state] })) as { jobs: JobDoc[] }).jobs;
-      const indexing = await inState('indexing');
-      const downloading = await inState('downloading');
-      expect(indexing.map((j) => j.wanted.title)).toEqual(['O Holy Night']);
-      expect(downloading.map((j) => j.wanted.title)).toEqual(['The Holly and the Ivy']);
       const holyId = nth(indexing, 0).job_id,
         hollyId = nth(downloading, 0).job_id;
       expect([holyId, hollyId]).toEqual([jobOf('O Holy Night'), jobOf('The Holly and the Ivy')]);
