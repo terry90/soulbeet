@@ -499,6 +499,30 @@ impl NavidromeClient {
         Ok(Some(playlist))
     }
 
+    /// The playlists holding song `id` that this user may see, from the native API
+    /// (server/nativeapi/native_api.go:184-188, handler playlists.go:221-237): public ones and
+    /// the user's own, every one for an admin (persistence/playlist_repository.go:84-93), sorted
+    /// by name, each with its owner's name (:258-262). Navidrome answers `[]` when none does
+    /// (:238-256) and a failed query as a 500 with the error's text (playlists.go:226-228), an
+    /// Http error here. A body that is not a list is a Parse error. An id that is empty, "." or
+    /// ".." names no song and is not a path segment the URL can carry, so it is a Parse error
+    /// with no request: an empty list would say no playlist holds the song.
+    pub async fn get_song_playlists(&self, id: &str) -> Result<Vec<NativePlaylist>> {
+        if matches!(id, "" | "." | "..") {
+            return Err(NavidromeError::Parse("No song id given".into()));
+        }
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|()| NavidromeError::Config("base URL cannot hold a path".into()))?
+            .pop_if_empty()
+            .extend(["api", "song", id, "playlists"]);
+        let resp = self.native_request(self.client.get(url)).await?;
+        if !resp.status().is_success() {
+            return Err(native_failure("Get song playlists", resp).await);
+        }
+        resp.json().await.map_err(parse)
+    }
+
     /// The native records of the songs `ids` this user can see, a hundred ids to a request, in
     /// any order; an id Navidrome does not list is absent, one in a missing file has
     /// `missing: true`. Empty ids are dropped, since Navidrome drops an empty filter and would
@@ -2208,6 +2232,82 @@ mod tests {
             assert!(c.get_native_playlist(id).await.unwrap().is_none());
         }
         assert_eq!(seen.lock().unwrap().len(), 4, "those ids send nothing");
+    }
+
+    /// What 0.64.2 writes for GET /api/song/{id}/playlists: `json.Marshal(model.Playlists)`
+    /// (model/playlist.go:18-42), `ownerName` joined in (persistence/playlist_repository.go:258-262).
+    const SONG_PLAYLISTS: &str = r#"[{"id":"6vN2bQ8rT4yH1kL9mX3zPa","name":"Advent","comment":"","duration":2841.2,"size":341200231,"songCount":12,"ownerName":"bob","ownerId":"2b8f1c0e7d","public":false,"path":"","sync":false,"uploadedImage":"","createdAt":"2026-11-02T18:04:51.112Z","updatedAt":"2026-11-03T09:12:40.004Z","rules":null,"evaluatedAt":null},{"id":"0aQ7wE3rT6yU9iO2pL5kJh","name":"Recently added","comment":"","duration":0,"size":0,"songCount":50,"ownerName":"alice","ownerId":"8uY3tR6eW9","public":false,"path":"","sync":false,"uploadedImage":"","createdAt":"2026-11-02T18:04:51.112Z","updatedAt":"2026-11-03T09:12:40.004Z","rules":{"all":[{"inTheLast":{"dateAdded":30}}],"sort":"-dateAdded","limit":50},"evaluatedAt":"2026-11-15T10:00:00Z"}]"#;
+
+    #[tokio::test]
+    async fn a_songs_playlists_are_read_with_their_owner_and_rules() {
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: LOGIN.into(),
+            },
+            Reply {
+                status: 200,
+                body: SONG_PLAYLISTS.into(),
+            },
+            Reply {
+                status: 200,
+                body: "[]".into(),
+            },
+        ]);
+        let c = client(&url);
+        let lists = c
+            .get_song_playlists("3sG8kPq0WmZ1xYbN4vTcDe")
+            .await
+            .unwrap();
+        assert_eq!(
+            lists
+                .iter()
+                .map(|p| (p.name.as_str(), p.owner_name.as_str(), p.is_smart()))
+                .collect::<Vec<_>>(),
+            vec![("Advent", "bob", false), ("Recently added", "alice", true)]
+        );
+        assert_eq!(
+            seen.lock().unwrap()[1].target,
+            "/api/song/3sG8kPq0WmZ1xYbN4vTcDe/playlists"
+        );
+        assert!(c.get_song_playlists("gone").await.unwrap().is_empty());
+        for id in ["", ".", ".."] {
+            assert!(
+                matches!(c.get_song_playlists(id).await, Err(NavidromeError::Parse(m)) if m == "No song id given")
+            );
+        }
+        assert_eq!(seen.lock().unwrap().len(), 3, "those ids send nothing");
+    }
+
+    #[tokio::test]
+    async fn a_song_playlists_answer_that_cannot_be_read_is_an_error_not_an_empty_list() {
+        // A failed query: http.Error's 500 with the error's text (server/nativeapi/playlists.go:226-228).
+        let without_owner = SONG_PLAYLISTS.replace(r#""ownerName":"bob","#, "");
+        let (url, _) = serve(vec![
+            reply(LOGIN),
+            Reply {
+                status: 500,
+                body: "database is locked\n".into(),
+            },
+            reply("null"),
+            reply(without_owner),
+        ]);
+        let c = client(&url);
+        let err = c
+            .get_song_playlists("3sG8kPq0WmZ1xYbN4vTcDe")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Http { action: "Get song playlists", status: 500, raw: Some(raw), .. } if raw == "database is locked\n"),
+            "{err:?}"
+        );
+        for _ in 0..2 {
+            let err = c
+                .get_song_playlists("3sG8kPq0WmZ1xYbN4vTcDe")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, NavidromeError::Parse(_)), "{err:?}");
+        }
     }
 
     #[tokio::test]

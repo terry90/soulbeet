@@ -6,6 +6,7 @@ use crate::folder_policy::PolicyRows;
 use crate::import_queue::ImportQueue;
 use crate::models::deletion_review::{DeletionRecord, DeletionReviewRow};
 use crate::models::discovery_playlist::DiscoveryTrackRow;
+use crate::models::user::User;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::navidrome::{DeletionReason, DiscoveryTrack};
 use soulbeet::navidrome::models::NativeSong;
@@ -119,16 +120,33 @@ pub enum ForgetVia<'a> {
 }
 
 impl Guard<'_> {
-    /// Resolves `song_id` from `actor`'s native record, hands back a pending discovery track of
-    /// `actor` by song id before any path is resolved, then by its stored path canonicalized
-    /// equal to the song's file (D12), and checks a library file with check_resolved (D5).
+    /// Reads `actor`'s native record of `song_id` (read_song), song_not_found when Navidrome has
+    /// none for them, and checks it (check_record).
     pub async fn check_song(&self, actor: &UserId, song_id: &str) -> Result<Verdict, Failure> {
         let song = self
-            .listeners
+            .read_song(actor, song_id)
+            .await?
+            .ok_or_else(song_not_found)?;
+        self.check_record(actor, song).await
+    }
+
+    /// `actor`'s native record of `song_id`; Ok(None) when Navidrome has none for them. Their
+    /// own Navidrome's errors are the failure, with the error as its message.
+    pub async fn read_song(
+        &self,
+        actor: &UserId,
+        song_id: &str,
+    ) -> Result<Option<NativeSong>, Failure> {
+        self.listeners
             .native_song(actor, song_id)
             .await
-            .map_err(|e| e.failure(Stage::Delete, e.to_string()))?
-            .ok_or_else(song_not_found)?;
+            .map_err(|e| e.failure(Stage::Delete, e.to_string()))
+    }
+
+    /// Checks `song`, `actor`'s native record (read_song): hands back a pending discovery track
+    /// of `actor` by song id before any path is resolved, then by its stored path canonicalized
+    /// equal to the song's file (D12), and checks a library file with check_resolved (D5).
+    pub async fn check_record(&self, actor: &UserId, song: NativeSong) -> Result<Verdict, Failure> {
         let pending = DiscoveryTrackRow::pending_for_user_in(self.db, &actor.to_string())
             .await
             .map_err(|e| database_failure(Stage::Delete, e))?;
@@ -240,9 +258,12 @@ impl Guard<'_> {
         Ok(None)
     }
 
-    /// Rules 1, 2, 5, the one-song check, 3 and 4, in that order, for `path`, the canonical
-    /// file local_file_in gave for `song`, whose identity it read as `id`. Jobs in
-    /// `exempt_jobs` do not count for rule 5.
+    /// Rules 1, 2, 5, the one-song check, 3 over the other listeners, 3 in the actor's own
+    /// read and 4, in that order (D1: everything that reads before rule 4's one write), for
+    /// `path`, the canonical file local_file_in gave for `song`, whose identity it read as `id`.
+    /// Jobs in `exempt_jobs` do not count for rule 5. The actor's user name, which rule 3 tells
+    /// their own playlists by, is read from their account; an account that is gone is
+    /// song_not_found.
     async fn check_resolved(
         &self,
         actor: &UserId,
@@ -265,7 +286,15 @@ impl Guard<'_> {
         )
         .await?;
         self.one_song(actor, &song, &path).await?;
-        let others = self.others_permit(actor, &song, &path).await?;
+        let user = User::find_by_id_in(self.db, &actor.to_string())
+            .await
+            .map_err(|e| database_failure(Stage::Delete, e))?
+            .ok_or_else(song_not_found)?;
+        let others = self
+            .others_permit(actor, &user.username, &song, &path)
+            .await?;
+        self.own_read_permits(actor, &user.username, &song.id)
+            .await?;
         let song = self.no_unknown_rater(actor, &song, &others).await?;
         Ok(Checked {
             song: Box::new(song),
@@ -660,13 +689,14 @@ pub(crate) fn not_a_track(message: impl Into<String>) -> Failure {
     )
 }
 
-/// Another listener's mark keeps the file; it never says who or what (section 13 rule 3).
+/// Another listener's mark or static playlist keeps the file; it never says who or which
+/// (section 13 rule 3, D3).
 pub(crate) fn blocked_by_other_user() -> Failure {
     Failure::new(
         FailureCode::DeleteBlockedByOtherUser,
         Stage::Delete,
         RetryAdvice::NotRetryable,
-        "Another listener rated or starred this track",
+        "Another listener rated, starred or kept this track in a playlist",
     )
 }
 
@@ -936,7 +966,7 @@ mod tests {
             refusal(lib.guard().check_song(&lib.alice(), "s1").await),
             (
                 FailureCode::DeleteBlockedByOtherUser,
-                "Another listener rated or starred this track".into()
+                "Another listener rated, starred or kept this track in a playlist".into()
             )
         );
     }
@@ -983,6 +1013,110 @@ mod tests {
         let lib = Library::new().await;
         lib.fake.unsee("bob", "s1");
         library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+    }
+
+    const KEPT: &str = "Another listener rated, starred or kept this track in a playlist";
+
+    #[tokio::test]
+    async fn another_users_private_playlist_keeps_the_track_without_naming_it() {
+        let lib = Library::new().await;
+        lib.fake.playlist("bob", "p-bob", &["s1"], false, false);
+        let f = lib
+            .guard()
+            .check_song(&lib.alice(), "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.message.as_str(), f.cause),
+            (FailureCode::DeleteBlockedByOtherUser, KEPT, None)
+        );
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        assert_eq!(
+            lib.fake.ratings_set(),
+            vec![],
+            "rule 4's write runs only for an allowed file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_of_a_listener_who_cannot_see_the_track_any_more_keeps_it() {
+        // Navidrome lists a playlist's entries by the playlist's visibility, not the library's.
+        let lib = Library::new().await;
+        lib.fake.playlist("bob", "p-bob", &["s1"], false, false);
+        lib.fake.unsee("bob", "s1");
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
+            (FailureCode::DeleteBlockedByOtherUser, KEPT.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_public_playlist_of_someone_without_soulful_keeps_the_track() {
+        let lib = Library::new().await;
+        // dave has a Navidrome account and no Soulful one; alice's own read shows his public playlist.
+        lib.fake.playlist("dave", "p-dave", &["s1"], true, false);
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
+            (FailureCode::DeleteBlockedByOtherUser, KEPT.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_private_playlist_of_someone_without_soulful_is_seen_only_through_an_admin() {
+        let lib = Library::new().await;
+        lib.fake.playlist("dave", "p-dave", &["s1"], false, false);
+        library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+        lib.fake.admin("bob");
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
+            (FailureCode::DeleteBlockedByOtherUser, KEPT.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_smart_playlist_of_another_user_does_not_keep_the_track() {
+        let lib = Library::new().await;
+        lib.fake.playlist("bob", "p-smart", &["s1"], true, true);
+        library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+    }
+
+    #[tokio::test]
+    async fn the_callers_own_playlists_do_not_block() {
+        let lib = Library::new().await;
+        lib.fake.playlist("alice", "Advent", &["s1"], false, false);
+        lib.fake
+            .playlist("Alice", "Recently added", &["s1"], false, true);
+        library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+    }
+
+    #[tokio::test]
+    async fn a_playlist_read_that_fails_keeps_the_track() {
+        // bob's song and album reads answer; his playlist read fails.
+        let lib = Library::new().await;
+        lib.fake.fails_after("bob", 2, || {
+            NavidromeLookupError::Client(NavidromeError::CircuitOpen)
+        });
+        assert_eq!(
+            refusal(lib.guard().check_song(&lib.alice(), "s1").await).0,
+            FailureCode::DeleteVetoUnknown
+        );
+        assert_eq!(lib.fake.reads_by("bob"), 3);
+        // alice's record read and her one-song search answer; her own playlist read fails.
+        let lib = Library::new().await;
+        lib.fake.fails_after("alice", 2, || {
+            NavidromeLookupError::Client(NavidromeError::CircuitOpen)
+        });
+        let f = lib
+            .guard()
+            .check_song(&lib.alice(), "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.stage),
+            (FailureCode::NavidromeCircuitOpen, Stage::Delete)
+        );
+        assert_eq!(lib.fake.reads_by("alice"), 3);
+        assert_eq!(lib.fake.ratings_set(), vec![]);
     }
 
     #[tokio::test]
@@ -2488,7 +2622,7 @@ mod tests {
                 DeleteBlockedByOtherUser,
                 Stage::Delete,
                 NotRetryable,
-                "Another listener rated or starred this track",
+                "Another listener rated, starred or kept this track in a playlist",
                 None,
             ),
             (

@@ -393,7 +393,7 @@ mod tests {
         let done = settle(&lib, &stub, &[], &target, result).await;
         assert_eq!(
             notes(&done),
-            vec!["kept the library's earlier copy A/x.flac: Another listener rated or starred this track".to_string()]
+            vec!["kept the library's earlier copy A/x.flac: Another listener rated, starred or kept this track in a playlist".to_string()]
         );
         assert!(target.join("A/x.flac").exists());
         assert!(stub.relocations().is_empty() && stub.forgets().is_empty());
@@ -446,7 +446,7 @@ mod tests {
         let done = settle(&lib, &stub, &[], &target, imported_with(vec![both])).await;
         assert_eq!(
             notes(&done),
-            vec!["kept the library's earlier copy A/x.flac, A/y.flac: Another listener rated or starred this track".to_string()]
+            vec!["kept the library's earlier copy A/x.flac, A/y.flac: Another listener rated, starred or kept this track in a playlist".to_string()]
         );
         assert!(target.join("A/x.flac").exists() && target.join("A/y.flac").exists());
         assert!(stub.forgets().is_empty() && stub.relocations().is_empty());

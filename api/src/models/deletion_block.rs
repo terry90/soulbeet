@@ -104,7 +104,7 @@ mod tests {
                 FailureCode::DeleteBlockedByOtherUser,
                 Stage::Delete,
                 RetryAdvice::NotRetryable,
-                "Another listener rated or starred this track",
+                "Another listener rated, starred or kept this track in a playlist",
             ),
         }
     }
@@ -147,7 +147,7 @@ mod tests {
             vec![(
                 "s2".to_string(),
                 "delete_blocked_by_other_user".to_string(),
-                "Another listener rated or starred this track".to_string()
+                "Another listener rated, starred or kept this track in a playlist".to_string()
             )]
         );
         // Another setting changed: the rows stay.

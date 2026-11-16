@@ -756,9 +756,9 @@ mod tests {
         );
         assert_eq!(
             note(DuplicateNote::Blocked(
-                "Another listener rated or starred this track"
+                "Another listener rated, starred or kept this track in a playlist"
             )),
-            "kept the library's earlier copy A/x.flac, /elsewhere/y.flac: Another listener rated or starred this track"
+            "kept the library's earlier copy A/x.flac, /elsewhere/y.flac: Another listener rated, starred or kept this track in a playlist"
         );
         assert_eq!(
             note(DuplicateNote::Unconfirmed),

@@ -323,11 +323,17 @@ pub struct SubsonicPlaylist {
     pub changed: String,
 }
 
-/// The native playlist record (model.Playlist, model/playlist.go:18-41), as far as a write needs it.
+/// The native playlist record (model.Playlist, model/playlist.go:18-42), as far as a write and
+/// the delete guard need it. Name, owner and public are always written, so an answer without
+/// them does not parse.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativePlaylist {
     pub id: String,
+    pub name: String,
+    /// The owner's user name, joined in (persistence/playlist_repository.go:258-262).
+    pub owner_name: String,
+    pub public: bool,
     /// Replaced from its playlist file when the file changes (core/playlists/playlists.go).
     #[serde(default)]
     pub sync: bool,

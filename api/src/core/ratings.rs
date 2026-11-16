@@ -1166,7 +1166,7 @@ mod tests {
             (listed[0].title.as_str(), listed[0].message.as_str()),
             (
                 "Silent Night",
-                "Another listener rated or starred this track"
+                "Another listener rated, starred or kept this track in a playlist"
             )
         );
         DeletionBlockRow::replace_in(&lib.db, "alice", &[])
@@ -1425,7 +1425,7 @@ mod tests {
             (listed[0].title.as_str(), listed[0].message.as_str()),
             (
                 "Silent Night",
-                "Another listener rated or starred this track"
+                "Another listener rated, starred or kept this track in a playlist"
             )
         );
         assert_eq!(report.kept_not_stored, None);

@@ -106,12 +106,12 @@ mod tests {
         let kept = vec![BlockedDeletion {
             title: "Silent Night".into(),
             artist: "Marrow Choir".into(),
-            message: "Another listener rated or starred this track".into(),
+            message: "Another listener rated, starred or kept this track in a playlist".into(),
         }];
         let html = render_kept(kept);
         assert!(
             html.contains(
-                "Silent Night - Marrow Choir: Another listener rated or starred this track"
+                "Silent Night - Marrow Choir: Another listener rated, starred or kept this track in a playlist"
             ),
             "{html}"
         );

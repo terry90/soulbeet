@@ -8,6 +8,7 @@ use shared::download::DownloadQuery;
 use shared::metadata::Track;
 use shared::navidrome::DiscoveryTrack;
 use soulbeet::navidrome::models::{NativeSong, SubsonicAlbum, SubsonicSong};
+use soulbeet::navidrome::NativePlaylist;
 use soulbeet::ImportedItem;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,8 +17,17 @@ use std::sync::{Arc, Mutex};
 
 type Pair = (String, String);
 
+/// An error a read fails with.
+type Fails = fn() -> NavidromeLookupError;
+
 /// What ping answers: the version it reports, or the error it fails with.
 type PingAnswer = Result<Option<String>, fn() -> NavidromeLookupError>;
+
+/// A playlist: owner, name (its id too), song ids, public, smart.
+type Playlist = (String, String, Vec<String>, bool, bool);
+
+/// The rules of a smart playlist, as Navidrome writes a "Recently added" one.
+const SMART_RULES: &str = r#"{"all":[{"inTheLast":{"dateAdded":30}}]}"#;
 
 /// The server version the fake reports unless told otherwise: the maintainer's.
 const VERSION: &str = "0.60.3 (34c6f12a)";
@@ -37,6 +47,9 @@ struct State {
     /// The average stored per song, as the last setRating left it.
     averages: HashMap<String, f64>,
     unreadable: HashMap<String, fn() -> NavidromeLookupError>,
+    /// Reads as a user past this count fail with the error.
+    fails_after: HashMap<String, (usize, Fails)>,
+    playlists: Vec<Playlist>,
     minimal: HashSet<String>,
     legacy: HashSet<String>,
     lost_albums: HashSet<String>,
@@ -81,10 +94,17 @@ impl State {
             .insert(song.to_string(), (mean * 100.0).round() / 100.0);
     }
 
-    /// Counts a read as `user` and fails it when `user` is unreadable.
+    /// Counts a read as `user` and fails it when `user` is unreadable, or past the reads
+    /// fails_after allows.
     fn read(&mut self, user: &UserId) -> Result<String, NavidromeLookupError> {
         let user = user.to_string();
-        *self.reads.entry(user.clone()).or_default() += 1;
+        let reads = self.reads.entry(user.clone()).or_default();
+        *reads += 1;
+        if let Some((allowed, error)) = self.fails_after.get(&user) {
+            if *reads > *allowed {
+                return Err(error());
+            }
+        }
         match self.unreadable.get(&user) {
             Some(error) => Err(error()),
             None => Ok(user),
@@ -183,6 +203,28 @@ impl FakeNavidrome {
     /// Every read as `user` fails with this error.
     pub fn unreadable(&self, user: &str, error: fn() -> NavidromeLookupError) {
         self.with(|s| s.unreadable.insert(user.into(), error));
+    }
+
+    /// The next `calls` reads as `user` (any method) answer; every later one fails with `error`.
+    pub fn fails_after(&self, user: &str, calls: usize, error: Fails) {
+        self.with(|s| {
+            let done = s.reads.get(user).copied().unwrap_or(0);
+            s.fails_after.insert(user.into(), (done + calls, error));
+        })
+    }
+
+    /// `owner`'s playlist `name` (also its id) holding `songs`, public or not, smart (with
+    /// SMART_RULES) or static.
+    pub fn playlist(&self, owner: &str, name: &str, songs: &[&str], public: bool, smart: bool) {
+        self.with(|s| {
+            s.playlists.push((
+                owner.into(),
+                name.into(),
+                songs.iter().map(|id| id.to_string()).collect(),
+                public,
+                smart,
+            ))
+        });
     }
 
     /// Undoes `unreadable`.
@@ -350,6 +392,40 @@ impl Listeners for FakeNavidrome {
             s.ratings.insert((user, id.to_string()), rating);
             s.recompute(id);
             Ok(())
+        })
+    }
+
+    /// The playlists holding `id` that are public or `user`'s (owner compared without ASCII case),
+    /// every one for an admin, sorted by name, as GetPlaylists lists them
+    /// (persistence/playlist_repository.go:84-93,238-256). Whether `user` sees the song does not
+    /// matter.
+    async fn song_playlists(
+        &self,
+        user: &UserId,
+        id: &str,
+    ) -> Result<Vec<NativePlaylist>, NavidromeLookupError> {
+        self.with(|s| {
+            let user = s.read(user)?;
+            let admin = s.admins.contains(&user);
+            let mut lists: Vec<NativePlaylist> = s
+                .playlists
+                .iter()
+                .filter(|(owner, _, songs, public, _)| {
+                    songs.iter().any(|song| song == id)
+                        && (admin || *public || owner.eq_ignore_ascii_case(&user))
+                })
+                .map(|(owner, name, songs, public, smart)| NativePlaylist {
+                    id: name.clone(),
+                    name: name.clone(),
+                    owner_name: owner.clone(),
+                    public: *public,
+                    sync: false,
+                    song_count: songs.len() as u32,
+                    rules: smart.then(|| serde_json::from_str(SMART_RULES).unwrap()),
+                })
+                .collect();
+            lists.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(lists)
         })
     }
 

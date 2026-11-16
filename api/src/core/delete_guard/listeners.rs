@@ -1,5 +1,5 @@
-//! Rules 3 and 4 of design section 13: no other listener rated or starred the track, and
-//! Navidrome's average shows no rater Soulful cannot read.
+//! Rules 3 and 4 of design section 13: no other listener rated, starred or kept the track in a
+//! static playlist, and Navidrome's average shows no rater Soulful cannot read.
 
 use super::{blocked_by_other_user, song_not_found, veto_unknown, Guard};
 use crate::auth::UserId;
@@ -9,7 +9,7 @@ use crate::models::user::User;
 use crate::services::{navidrome_client_for_user, NavidromeLookupError};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use soulbeet::navidrome::models::{keeps_song_averages, NativeSong, SubsonicAlbum, SubsonicSong};
-use soulbeet::navidrome::NavidromeClient;
+use soulbeet::navidrome::{NativePlaylist, NavidromeClient};
 use soulbeet::ImportedItem;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,6 +42,13 @@ pub trait Listeners: Send + Sync {
         id: &str,
         rating: u8,
     ) -> Result<(), NavidromeLookupError>;
+    /// The playlists holding song `id` that `user` may see: public ones and their own, every one
+    /// for a Navidrome admin.
+    async fn song_playlists(
+        &self,
+        user: &UserId,
+        id: &str,
+    ) -> Result<Vec<NativePlaylist>, NavidromeLookupError>;
     /// The present songs `user` sees that may be `item` (core::index::candidates); None when
     /// Navidrome cannot be searched for its tags.
     async fn songs_for_item(
@@ -113,6 +120,17 @@ impl Listeners for LiveListeners {
             .map_err(NavidromeLookupError::Client)
     }
 
+    async fn song_playlists(
+        &self,
+        user: &UserId,
+        id: &str,
+    ) -> Result<Vec<NativePlaylist>, NavidromeLookupError> {
+        let navi = client(user).await?;
+        navi.get_song_playlists(id)
+            .await
+            .map_err(NavidromeLookupError::Client)
+    }
+
     async fn songs_for_item(
         &self,
         user: &UserId,
@@ -177,17 +195,20 @@ pub(super) fn item_of(song: &NativeSong) -> ImportedItem {
 }
 
 impl Guard<'_> {
-    /// Rule 3 over every user of User::linked_to_navidrome_in but `actor`, for `song`, the
-    /// actor's record of the canonical file `path`: their positive track ratings, or
-    /// blocked_by_other_user for a track rating above 1, a track star, an album rating above 1
-    /// or an album star; veto_unknown when their ratings cannot be read (a read error, a song
-    /// answer without albumId, an album answer without userRating, D4, or no album for a song
-    /// they see) or when another song they see is or may be the same file. Every listener is
-    /// read, so each one's record for admins is current: a failed read is recorded, any other
-    /// answer clears it. The refusal is that of the first listener who keeps the file.
+    /// Rule 3 over every user of User::linked_to_navidrome_in but `actor` (whose user name is
+    /// `actor_name`), for `song`, the actor's record of the canonical file `path`: their positive
+    /// track ratings, or blocked_by_other_user for a track rating above 1, a track star, an album
+    /// rating above 1, an album star or a static playlist they may see that holds the song and
+    /// is not the actor's (kept_in_playlist); veto_unknown when their marks cannot be read (a
+    /// read error, a song answer without albumId, an album answer without userRating, D4, or no
+    /// album for a song they see) or when another song they see is or may be the same file.
+    /// Every listener is read, so each one's record for admins is current: a failed read is
+    /// recorded, any other answer clears it. The refusal is that of the first listener who keeps
+    /// the file.
     pub(super) async fn others_permit(
         &self,
         actor: &UserId,
+        actor_name: &str,
         song: &NativeSong,
         path: &Path,
     ) -> Result<Read, Failure> {
@@ -207,7 +228,7 @@ impl Guard<'_> {
         let mut refusal = None;
         for user in users.iter().filter(|u| u.id != actor) {
             let listener = UserId::new(&user.id);
-            let marks = self.marks_of(&listener, song, path).await;
+            let marks = self.marks_of(&listener, actor_name, song, path).await;
             let recorded = match &marks {
                 Err(Keeps::Unreadable(error)) => {
                     NavidromeReadFailureRow::record_in(self.db, &user.id, error).await
@@ -243,10 +264,14 @@ impl Guard<'_> {
     }
 
     /// `listener`'s rating of `song` (0 when unrated), None when they cannot see it, or why they
-    /// keep it.
+    /// keep it. Their playlists are read whether or not they see the song: Navidrome lists a
+    /// playlist's entries by the playlist's visibility, not by the library's
+    /// (persistence/playlist_repository.go:238-256), so an entry added before they lost access
+    /// still holds the file. The actor's own playlists (named `actor_name`) do not keep it.
     async fn marks_of(
         &self,
         listener: &UserId,
+        actor_name: &str,
         song: &NativeSong,
         path: &Path,
     ) -> Result<Option<u8>, Keeps> {
@@ -290,6 +315,14 @@ impl Guard<'_> {
                 return Err(blocked());
             }
         }
+        let playlists = self
+            .listeners
+            .song_playlists(listener, &song.id)
+            .await
+            .map_err(unreadable)?;
+        if kept_in_playlist(&playlists, actor_name) {
+            return Err(blocked());
+        }
         // The same file may be another song this listener sees (another library, a link), or
         // one whose file Soulful cannot find.
         let Some(candidates) = self
@@ -309,6 +342,27 @@ impl Guard<'_> {
             return Err(Keeps::Refused(veto_unknown()));
         }
         Ok(rating)
+    }
+
+    /// Rule 3 in the actor's own read (D3), which also shows the public playlists of Navidrome
+    /// users without a Soulful account: blocked_by_other_user when a static playlist holding
+    /// `song_id` is not the actor's (`actor_name`, kept_in_playlist). A read error is the actor's
+    /// own failure, with its error as the message.
+    pub(super) async fn own_read_permits(
+        &self,
+        actor: &UserId,
+        actor_name: &str,
+        song_id: &str,
+    ) -> Result<(), Failure> {
+        let playlists = self
+            .listeners
+            .song_playlists(actor, song_id)
+            .await
+            .map_err(|e| e.failure(Stage::Delete, e.to_string()))?;
+        match kept_in_playlist(&playlists, actor_name) {
+            true => Err(blocked_by_other_user()),
+            false => Ok(()),
+        }
     }
 
     /// Rule 4: reads `actor`'s record of `song` again (N1), re-sends N1's rating so Navidrome
@@ -431,6 +485,16 @@ impl Guard<'_> {
             None => UnknownListener::NoAdmin,
         }))
     }
+}
+
+/// Whether one of `playlists` keeps their song for a listener other than `actor_name`: a static
+/// playlist (a smart one's rules picked the song, not a person) whose owner is not the actor,
+/// names compared without regard to ASCII case as Navidrome's login compares them
+/// (persistence/user_repository.go:203).
+fn kept_in_playlist(playlists: &[NativePlaylist], actor_name: &str) -> bool {
+    playlists
+        .iter()
+        .any(|p| !p.is_smart() && !p.owner_name.eq_ignore_ascii_case(actor_name))
 }
 
 /// Why Soulful cannot show that no Navidrome user it cannot read rated a track.
