@@ -18,6 +18,7 @@ use serde_json::{json, Map};
 use crate::base_url::{explain_request, BaseExplanation, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
 use crate::connections::LoggedRequest;
+use crate::core::delete_guard::{Listeners, LiveListeners};
 use crate::core::discovery::DiscoveryEffects;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::jobs::runner::{Acquire, ACQUIRE};
@@ -62,6 +63,8 @@ pub struct ConnectionState {
     pub(crate) discovery: Arc<dyn DiscoveryEffects>,
     /// Where `sync_ratings` runs the caller's rating sync.
     pub(crate) ratings: Arc<dyn RatingSync>,
+    /// Navidrome as each user sees it, which the delete tools' guard checks through.
+    pub(crate) listeners: Arc<dyn Listeners>,
 }
 
 impl ConnectionState {
@@ -89,6 +92,7 @@ impl ConnectionState {
             acquire: ACQUIRE.clone(),
             discovery: Arc::new(LiveDiscovery),
             ratings: Arc::new(LiveSync),
+            listeners: Arc::new(LiveListeners),
         }
     }
 }

@@ -188,7 +188,7 @@ fn entry(t: &SyncedTrack) -> ItemResult {
 }
 
 /// `f` with its message and its cause's raw text cut to their bounds.
-fn cut(f: &Failure) -> Failure {
+pub(super) fn cut(f: &Failure) -> Failure {
     let mut failure = f.clone();
     failure.message = cut_json(failure.message, TEXT_MAX_CHARS);
     if let Some(cause) = &mut failure.cause {

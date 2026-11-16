@@ -131,7 +131,8 @@ impl Params {
     }
 }
 
-/// Prunes expired OAuth state from the database now and every hour (D4).
+/// Prunes expired OAuth state from the database now and every hour (D4), and the delete
+/// confirmation tokens that expired a day before.
 pub fn start_prune_task() {
     tokio::spawn(async {
         let mut every = tokio::time::interval(PRUNE_EVERY);
@@ -150,6 +151,10 @@ pub fn start_prune_task() {
                      {tokens} tokens, {grants} grants, {clients} clients"
                 ),
                 Err(e) => tracing::error!("Could not prune OAuth state: {e}"),
+            }
+            match crate::core::deletion::tokens::prune_in(&crate::db::DB, now_unix()).await {
+                Ok(tokens) => tracing::debug!("Pruned {tokens} delete confirmation tokens"),
+                Err(e) => tracing::error!("Could not prune delete confirmation tokens: {e}"),
             }
         }
     });

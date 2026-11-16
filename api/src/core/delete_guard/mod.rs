@@ -10,6 +10,7 @@ use crate::models::user::User;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::navidrome::{DeletionReason, DiscoveryTrack};
 use soulbeet::navidrome::models::NativeSong;
+use soulbeet::navidrome::NativePlaylist;
 use soulbeet::{ForgetOutcome, ImportedItem, MusicImporter};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
@@ -87,6 +88,39 @@ pub struct Checked {
     pub folder: PathBuf,
     /// The file's identity when it was checked, compared when it is removed (rule 6).
     id: unlink::FileId,
+    /// The caller's own playlists holding the song (D3), as Navidrome listed them.
+    pub playlists: Vec<NativePlaylist>,
+}
+
+impl Checked {
+    /// The file as a confirmation token stores it (D7).
+    pub(crate) fn previewed(&self) -> PreviewedFile {
+        PreviewedFile {
+            song_id: self.song.id.clone(),
+            path: self.path.clone(),
+            file: self.id,
+        }
+    }
+
+    /// Rule 6 against a preview (D8): Ok when `set` holds a file with this path and this
+    /// identity; not_previewed when no file of `set` has the path, changed_since_check when its
+    /// identity differs.
+    pub(crate) fn is_in(&self, set: &[PreviewedFile]) -> Result<(), Failure> {
+        match set.iter().find(|f| f.path == self.path) {
+            None => Err(not_previewed()),
+            Some(f) if f.file != self.id => Err(changed_since_check()),
+            Some(_) => Ok(()),
+        }
+    }
+}
+
+/// A file a preview allowed, as a confirmation token stores it (D7): the song, its canonical
+/// path and its identity when the preview checked it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreviewedFile {
+    pub song_id: String,
+    pub path: PathBuf,
+    pub file: unlink::FileId,
 }
 
 /// What started a removal, as the audit records it (D13).
@@ -264,7 +298,8 @@ impl Guard<'_> {
     }
 
     /// Rules 1, 2, 5, the one-song check, 3 over the other listeners, 3 in the actor's own
-    /// read and 4, in that order (D1: everything that reads before rule 4's one write), for
+    /// read (which also lists the actor's own playlists holding the song, kept in the Checked)
+    /// and 4, in that order (D1: everything that reads before rule 4's one write), for
     /// `path`, the canonical file local_file_in gave for `song`, whose identity it read as `id`.
     /// Jobs in `exempt_jobs` do not count for rule 5. The actor's user name, which rule 3 tells
     /// their own playlists by, is read from their account; an account that is gone is
@@ -298,14 +333,14 @@ impl Guard<'_> {
         let others = self
             .others_permit(actor, &user.username, &song, &path)
             .await?;
-        self.own_read_permits(actor, &user.username, &song.id)
-            .await?;
+        let playlists = self.own_playlists(actor, &user.username, &song.id).await?;
         let song = self.no_unknown_rater(actor, &song, &others).await?;
         Ok(Checked {
             song: Box::new(song),
             path,
             folder,
             id,
+            playlists,
         })
     }
 
@@ -338,6 +373,7 @@ impl Guard<'_> {
             path,
             folder,
             id,
+            ..
         } = checked;
         let mut record = record_of(actor, *song, &path, reason, origin);
         let unavailable = |e| NotRemoved::Kept(database_failure(Stage::Delete, e));
@@ -752,6 +788,16 @@ pub(crate) fn changed_since_check() -> Failure {
     )
 }
 
+/// The checked file is not one the confirmed preview allowed (rule 6, D8).
+pub(crate) fn not_previewed() -> Failure {
+    Failure::new(
+        FailureCode::DeleteChangedSincePreview,
+        Stage::Delete,
+        RetryAdvice::NotRetryable,
+        "This file was not in the preview this deletion was confirmed with",
+    )
+}
+
 /// A removal stopped (`error`, Soulful's own words) and the file is not where it was checked.
 fn removal_unconfirmed(error: &str) -> Failure {
     Failure::new(
@@ -1131,12 +1177,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_callers_own_playlists_do_not_block() {
+    async fn the_callers_own_playlists_do_not_block_and_are_listed() {
         let lib = Library::new().await;
         lib.fake.playlist("alice", "Advent", &["s1"], false, false);
         lib.fake
             .playlist("Alice", "Recently added", &["s1"], false, true);
-        library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+        // Another user's public smart playlist shows in alice's read, but is not hers.
+        lib.fake.playlist("bob", "Everything", &["s1"], true, true);
+        let checked = library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+        assert_eq!(
+            checked
+                .playlists
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Advent", "Recently added"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checked_file_is_in_the_set_that_holds_its_path_and_identity() {
+        let lib = Library::new().await;
+        let checked = checked(&lib).await;
+        let same = checked.previewed();
+        assert_eq!(
+            (same.song_id.as_str(), &same.path),
+            ("s1", &canonical(&lib, "music/alice/A/x.flac"))
+        );
+        assert_eq!(checked.is_in(std::slice::from_ref(&same)), Ok(()));
+        let elsewhere = PreviewedFile {
+            path: lib.root.join("music/alice/B/x.flac"),
+            ..same.clone()
+        };
+        assert_eq!(checked.is_in(&[elsewhere]).unwrap_err(), not_previewed());
+        // The same path holding another file: written again after the check.
+        std::fs::remove_file(&checked.path).unwrap();
+        std::fs::write(&checked.path, b"audio").unwrap();
+        let rewritten = library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+        assert_eq!(rewritten.is_in(&[same]).unwrap_err(), changed_since_check());
+        assert_eq!(
+            not_previewed().message,
+            "This file was not in the preview this deletion was confirmed with"
+        );
+    }
+
+    #[test]
+    fn a_stored_file_identity_reads_back_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.flac");
+        std::fs::write(&path, b"audio").unwrap();
+        let id = unlink::FileId::of(&std::fs::symlink_metadata(&path).unwrap());
+        let stored = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<unlink::FileId>(&stored).unwrap(), id);
     }
 
     #[tokio::test]

@@ -7,9 +7,10 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
-/// What makes a file the one that was checked: the same inode, size and modification time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FileId {
+/// What makes a file the one that was checked: the same inode, size and modification time. A
+/// confirmation token stores it, so a confirm deletes only the file its preview checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileId {
     dev: u64,
     ino: u64,
     size: u64,

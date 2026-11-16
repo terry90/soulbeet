@@ -17,8 +17,8 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use super::contract::{failed, rate_limited};
 use super::{
-    batches, discovery, ensure, imports, jobs, library, metadata, playlists, ratings, settings,
-    sources, status, sync, McpCaller,
+    batches, deletion, discovery, ensure, imports, jobs, library, metadata, playlists, ratings,
+    settings, sources, status, sync, McpCaller,
 };
 use crate::connection::ConnectionState;
 
@@ -271,6 +271,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     discovery::PROMOTE_DISCOVERY_TRACK,
     discovery::REMOVE_DISCOVERY_TRACK,
     sync::SYNC_RATINGS,
+    deletion::PREVIEW_DELETE_TRACKS,
+    deletion::DELETE_TRACKS,
+    deletion::GET_DELETION_HISTORY,
 ];
 
 impl ToolSpec {
@@ -487,6 +490,7 @@ mod tests {
             "get_status" | "get_settings" | "list_folders" | "get_library_stats"
             | "list_starred" | "list_playlists" | "get_jobs" | "list_batches" | "get_discovery"
             | "run_discovery" | "sync_ratings" => json!({}),
+            "get_deletion_history" => json!({}),
             "find_in_library" => {
                 json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
             }
@@ -532,6 +536,12 @@ mod tests {
             "set_star" => json!({"song_id": "3sG8kPq0WmZ1xYbN4vTcDe", "starred": true}),
             "update_settings" => json!({"discovery_enabled": true}),
             "promote_discovery_track" | "remove_discovery_track" => json!({"track_id": "t1"}),
+            "preview_delete_tracks" => {
+                json!({"song_ids": ["3sG8kPq0WmZ1xYbN4vTcDe"], "reason": "cleanup"})
+            }
+            "delete_tracks" => {
+                json!({"confirmation_token": "Xr4Lq9ZtB2mV7nW1cK8pH3sD6fJ0gY5aE_uTiOxQwRz"})
+            }
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -614,6 +624,9 @@ mod tests {
         ("promote_discovery_track", false, true, false, false),
         ("remove_discovery_track", false, true, true, false),
         ("sync_ratings", false, true, false, false),
+        ("preview_delete_tracks", false, false, false, false),
+        ("delete_tracks", false, true, true, false),
+        ("get_deletion_history", true, false, true, false),
     ];
 
     #[test]

@@ -346,23 +346,27 @@ impl Guard<'_> {
 
     /// Rule 3 in the actor's own read (D3), which also shows the public playlists of Navidrome
     /// users without a Soulful account: blocked_by_other_user when a static playlist holding
-    /// `song_id` is not the actor's (`actor_name`, kept_in_playlist). A read error is the actor's
-    /// own failure, with its error as the message.
-    pub(super) async fn own_read_permits(
+    /// `song_id` is not the actor's (`actor_name`, kept_in_playlist); else the actor's own
+    /// playlists holding it, smart ones included, as Navidrome lists them, for the preview to
+    /// show. A read error is the actor's own failure, with its error as the message.
+    pub(super) async fn own_playlists(
         &self,
         actor: &UserId,
         actor_name: &str,
         song_id: &str,
-    ) -> Result<(), Failure> {
+    ) -> Result<Vec<NativePlaylist>, Failure> {
         let playlists = self
             .listeners
             .song_playlists(actor, song_id)
             .await
             .map_err(|e| e.failure(Stage::Delete, e.to_string()))?;
-        match kept_in_playlist(&playlists, actor_name) {
-            true => Err(blocked_by_other_user()),
-            false => Ok(()),
+        if kept_in_playlist(&playlists, actor_name) {
+            return Err(blocked_by_other_user());
         }
+        Ok(playlists
+            .into_iter()
+            .filter(|p| p.owner_name.eq_ignore_ascii_case(actor_name))
+            .collect())
     }
 
     /// Rule 4: reads `actor`'s record of `song` again (N1), re-sends N1's rating so Navidrome

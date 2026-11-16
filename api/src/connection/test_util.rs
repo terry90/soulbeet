@@ -22,6 +22,7 @@ use super::log::RequestLog;
 use super::{router, ConnectionState};
 use crate::auth::{Role, UserCtx};
 use crate::base_url::BaseUrl;
+use crate::core::delete_guard::test_support::{FakeNavidrome, Library};
 use crate::core::discovery::test_support::TestDiscovery;
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::runner::{Acquire, TestEffects};
@@ -57,8 +58,8 @@ impl ConnectionState {
     /// `test_key()`, no client metadata documents, `sample_facts()`, no
     /// user linked to Navidrome, no NAVIDROME_MUSIC_PATH, acting through
     /// `acquire`, whose ledger writer serves every state made on it,
-    /// discovery on a `TestDiscovery`, and a rating sync that is always
-    /// already running.
+    /// discovery on a `TestDiscovery`, a rating sync that is always
+    /// already running, and the delete guard on an empty `FakeNavidrome`.
     pub(crate) fn on(db: SqlitePool, acquire: Arc<Acquire>) -> ConnectionState {
         ConnectionState {
             mcp_off: None,
@@ -75,8 +76,25 @@ impl ConnectionState {
             acquire,
             discovery: Arc::new(TestDiscovery::default()),
             ratings: Arc::new(FixedSync::new(Err(sync_running()))),
+            listeners: Arc::new(FakeNavidrome::default()),
         }
     }
+}
+
+/// The router on `lib`'s database and fake Navidrome, and alice's access token (user id
+/// "alice", whom `Library` made); her grant's deletion switch as `allow_delete` says.
+pub(crate) async fn app_on_library(lib: &Library, allow_delete: bool) -> (Router, String) {
+    let state = ConnectionState {
+        listeners: lib.fake.clone(),
+        ..ConnectionState::on(lib.db.clone(), Acquire::for_test(lib.db.clone()).0)
+    };
+    let token = access_token(&lib.db, "alice", RESOURCE).await;
+    sqlx::query("UPDATE oauth_grants SET allow_delete = ? WHERE user_id = 'alice'")
+        .bind(allow_delete)
+        .execute(&lib.db)
+        .await
+        .unwrap();
+    (router(state), token)
 }
 
 /// The headers `pairs` names, each set once.
