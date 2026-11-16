@@ -236,17 +236,19 @@ pub(crate) async fn drive(acquire: &Arc<Acquire>, ctx: &UserCtx, id: &str) {
         job: &job,
         options: &options,
     };
-    match job.state {
-        JobState::Searching => {
-            if !runner.search_and_pick().await {
-                return;
-            }
-        }
+    let decided = match job.state {
+        JobState::Searching => match runner.search_and_pick().await {
+            Some(decided) => decided,
+            None => return,
+        },
         // A send already recorded is its monitor's.
-        JobState::Queued if !job.sent => {}
+        JobState::Queued if !job.sent => Decided {
+            search_id: job.search_id.clone(),
+            change: job.changed_seq,
+        },
         _ => return,
-    }
-    if !runner.take_place(&taken.look_again).await {
+    };
+    if !runner.take_place(&taken.look_again, &decided).await {
         return;
     }
     // Read again: the job may have been cancelled and taken on again with another source while
@@ -310,29 +312,34 @@ const FAIL_RETRY_MAX: Duration = Duration::from_secs(30);
 const FAIL_ATTEMPTS: u32 = 7;
 
 /// Fails `user`'s job `job` with `failure` (`search_id` the search it was decided on, when there
-/// was one), writing it again, waiting longer each time up to FAIL_RETRY_MAX, until the writer
-/// applies or refuses it: a job whose failure was not written would wait with no runner. A
-/// refusal means the job moved on meanwhile. After FAIL_ATTEMPTS writes the database still
-/// refused, it logs an error and returns, so a runner lets its job go: the job then waits, still
-/// searching or queued, until the next start of the server, whose reconcile resumes or ends it.
+/// was one; `change` the job's change number, when it was decided on one), writing it again,
+/// waiting longer each time up to FAIL_RETRY_MAX, until the writer applies or refuses it: a job
+/// whose failure was not written would wait with no runner. A refusal means the job moved on
+/// meanwhile. After FAIL_ATTEMPTS writes the database still refused, it logs an error, marks the
+/// job stranded (`Ledger::strand`: no wait is offered on it) and returns, so a runner lets its
+/// job go: the job then waits, still searching or queued, until the next start of the server,
+/// whose reconcile resumes or ends it.
 pub(crate) async fn fail_job(
     ledger: &Ledger,
     user: &UserId,
     job: &str,
     failure: Failure,
     search_id: Option<String>,
+    change: Option<i64>,
 ) {
     info!("Job {job} failed: {}", logged(&failure));
     let mut wait = Duration::from_secs(1);
     for attempt in 1..=FAIL_ATTEMPTS {
-        let change = Transition::Fail {
+        let fail = Transition::Fail {
             failure: failure.clone(),
             search_id: search_id.clone(),
+            change,
         };
-        match ledger.transition(user, job, change).await {
+        match ledger.transition(user, job, fail).await {
             Ok(_) => return,
             Err(e) if attempt == FAIL_ATTEMPTS => {
                 error!("Could not fail job {job} in {FAIL_ATTEMPTS} writes, leaving it to the next start: {e}");
+                ledger.strand(job);
                 return;
             }
             Err(e) => warn!("Could not fail job {job}, trying again in {wait:?}: {e}"),
@@ -342,16 +349,31 @@ pub(crate) async fn fail_job(
     }
 }
 
+/// What a queued job's runner decided on before it waits for a download place: the search it
+/// picked from and the job's change number after its own last change.
+struct Decided {
+    search_id: Option<String>,
+    change: i64,
+}
+
 impl Runner<'_> {
     /// Asks the writer for `change`: whether it applied. Refused, the job moved on without the
     /// runner (D15); the writer logs one it could not make.
     async fn transition(&self, change: Transition) -> bool {
+        self.transition_at(change).await.is_some()
+    }
+
+    /// `transition`, with the change number it was applied under.
+    async fn transition_at(&self, change: Transition) -> Option<i64> {
         let applied = self
             .acquire
             .ledger
             .transition(&self.ctx.id(), &self.job.id, change)
             .await;
-        matches!(applied, Ok(Transitioned::Applied { .. }))
+        match applied {
+            Ok(Transitioned::Applied { seq, .. }) => Some(seq),
+            _ => None,
+        }
     }
 
     /// The search the runner read its job with: a change it decides from that read names it, so
@@ -362,6 +384,12 @@ impl Runner<'_> {
 
     /// `fail_job` of the runner's job, decided on `search_id`.
     async fn fail(&self, failure: Failure, search_id: Option<String>) {
+        self.fail_decided(failure, search_id, None).await;
+    }
+
+    /// `fail_job` of the runner's job, decided on `search_id` and, when given, the job's change
+    /// number `change`.
+    async fn fail_decided(&self, failure: Failure, search_id: Option<String>, change: Option<i64>) {
         let user = self.ctx.id();
         fail_job(
             &self.acquire.ledger,
@@ -369,48 +397,58 @@ impl Runner<'_> {
             &self.job.id,
             failure,
             search_id,
+            change,
         )
         .await;
     }
 
-    /// The searching job's search, then its pick: whether it was queued, not waiting for a
-    /// choice, failed or moved on. Every write after the search names it, so a job cancelled and
-    /// searched again meanwhile is left to its new search's runner (D15).
-    async fn search_and_pick(&self) -> bool {
+    /// The searching job's search, then its pick: what the job was queued on, or None when it
+    /// waits for a choice, failed or moved on. Every write after the search names it, so a job
+    /// cancelled and searched again meanwhile is left to its new search's runner (D15); the
+    /// search it ended under (renewed, for one that expired) is the one the job is queued on.
+    async fn search_and_pick(&self) -> Option<Decided> {
         let Some(first) = self.job.search_id.clone() else {
             // The writer gives every searching job its search: one without cannot be answered.
             warn!("Job {} is searching without a search", self.job.id);
             self.fail(search_unanswered(), None).await;
-            return false;
+            return None;
         };
         let (search_id, searched) = self.searched(first).await;
         let groups = match searched {
             Ok(groups) => groups,
             Err(Stop::Fail(failure)) => {
                 self.fail(failure, Some(search_id)).await;
-                return false;
+                return None;
             }
-            Err(Stop::Quietly) => return false,
+            Err(Stop::Quietly) => return None,
         };
         let view = match self.view(&search_id, &groups, Stage::SourceSearch).await {
             Ok(view) => view,
             Err(failure) => {
                 self.fail(failure, Some(search_id)).await;
-                return false;
+                return None;
             }
         };
         if view.candidates.is_empty() {
             self.fail(no_candidate_passed(), Some(search_id)).await;
-            return false;
+            return None;
         }
         match pick(&view.candidates, self.options) {
             Picked::Choose => {
                 self.transition(Transition::AwaitChoice { search_id }).await;
-                false
+                None
             }
             Picked::Auto(at) => {
                 let items = numbered(view.candidates[at].group.items.clone());
-                self.transition(Transition::Pick { items, search_id }).await
+                let picked = Transition::Pick {
+                    items,
+                    search_id: search_id.clone(),
+                };
+                let change = self.transition_at(picked).await?;
+                Some(Decided {
+                    search_id: Some(search_id),
+                    change,
+                })
             }
         }
     }
@@ -546,8 +584,10 @@ impl Runner<'_> {
 
     /// D8: waits until the job holds one of its user's download places, trying again each time
     /// one is given up or the job is taken on again or changed by a call (`look_again`). False
-    /// once the job left queued, or failed because no place could be claimed.
-    async fn take_place(&self, look_again: &Notify) -> bool {
+    /// once the job left queued, or failed because no place could be claimed: that failure names
+    /// what the runner `decided` on, so it is refused for a job that moved on meanwhile (a search
+    /// renewed, or cancelled and queued again on the same search).
+    async fn take_place(&self, look_again: &Notify, decided: &Decided) -> bool {
         let mut places = self.acquire.ledger.places();
         loop {
             // Seen before the claim, so a place given up after it wakes this one.
@@ -560,7 +600,8 @@ impl Runner<'_> {
                 Ok(false) => {}
                 Err(e) => {
                     let failure = database_failure(Stage::Enqueue, e);
-                    self.fail(failure, self.read_on()).await;
+                    let (search_id, change) = (decided.search_id.clone(), Some(decided.change));
+                    self.fail_decided(failure, search_id, change).await;
                     return false;
                 }
             }
@@ -1250,7 +1291,7 @@ mod tests {
         acq.db.close().await;
         tokio::time::pause();
         let (user, start) = (alice().id(), tokio::time::Instant::now());
-        let failing = fail_job(&acq.ledger, &user, &job, nothing_enqueued(), None);
+        let failing = fail_job(&acq.ledger, &user, &job, nothing_enqueued(), None, None);
         let given_up = tokio::time::timeout(Duration::from_secs(3600), failing).await;
         let waited = start.elapsed();
         tokio::time::resume();
@@ -1259,6 +1300,114 @@ mod tests {
         assert!(
             (Duration::from_secs(61)..Duration::from_secs(62)).contains(&waited),
             "{waited:?}"
+        );
+        assert!(acq.ledger.stranded(&job), "no wait is offered on it");
+    }
+
+    /// From now on the database refuses every claim of a download place.
+    async fn refuse_places(acq: &Acquire) {
+        sqlx::query(
+            "CREATE TRIGGER refuse_places BEFORE UPDATE OF gate_held ON jobs \
+             WHEN NEW.gate_held = 1 BEGIN SELECT RAISE(FAIL, 'disk I/O error'); END",
+        )
+        .execute(&acq.db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_place_that_cannot_be_claimed_fails_a_job_queued_on_a_renewed_search() {
+        let (acq, effects) = Acquire::for_alice().await;
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", auto(0.7)).await;
+        let user = alice().id();
+        let old = (store::job_record(&acq.db, &job, &user).await)
+            .unwrap()
+            .unwrap()
+            .search_id
+            .unwrap();
+        // Its search ended and expired: the runner searches again under a new id and picks.
+        acq.ledger
+            .record_search(crate::ledger::NewSearch {
+                id: old.clone(),
+                user: user.clone(),
+                backend: Some("slskd".into()),
+                query: DownloadQuery::new(vec![track("Marrow Choir", "O Holy Night")]),
+                spec: Some(StoredSpec::default()),
+            })
+            .await
+            .unwrap();
+        acq.ledger
+            .search_ended(&old, Ok((vec![], Some(Default::default()))))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE searches SET expires_at = 0 WHERE id = ?")
+            .bind(&old)
+            .execute(&acq.db)
+            .await
+            .unwrap();
+        effects.stub().script_polls(found(vec![group(
+            "peer_b",
+            vec![item("peer_b", "O Holy Night", "b/03.flac")],
+            0.85,
+        )]));
+        refuse_places(&acq).await;
+        drive(&acq, &alice(), &job).await;
+        acq.ledger.settled().await;
+        let now = (store::job_record(&acq.db, &job, &user).await)
+            .unwrap()
+            .unwrap();
+        assert_ne!(now.search_id, Some(old));
+        assert_eq!(
+            now.state,
+            JobState::Failed,
+            "the failure names the renewed search, so it is not refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runner_that_cannot_claim_a_place_leaves_a_job_cancelled_and_queued_again_meanwhile()
+    {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = queued_track_jobs(&acq, 1).await.remove(0);
+        let user = alice().id();
+        // The job as its runner read it, queued and holding no place.
+        let read = (store::job_record(&acq.db, &job, &user).await)
+            .unwrap()
+            .unwrap();
+        let picks = store::queued_picks(&acq.db, &job).await.unwrap();
+        // cancel_job, then retry_job same_source, land before the runner's claim fails: the job
+        // is queued again on the same search.
+        for change in [
+            Transition::Cancel,
+            Transition::Queue {
+                items: picks,
+                search_id: None,
+            },
+        ] {
+            let done = acq.ledger.transition(&user, &job, change).await.unwrap();
+            assert!(matches!(done, Transitioned::Applied { .. }), "{done:?}");
+        }
+        refuse_places(&acq).await;
+        let (ctx, options) = (alice(), read.options.clone().unwrap());
+        let runner = Runner {
+            acquire: &acq,
+            ctx: &ctx,
+            job: &read,
+            options: &options,
+        };
+        let decided = Decided {
+            search_id: read.search_id.clone(),
+            change: read.changed_seq,
+        };
+        assert!(!runner.take_place(&Notify::new(), &decided).await);
+        acq.ledger.settled().await;
+        let now = (store::job_record(&acq.db, &job, &user).await)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (now.state, now.search_id),
+            (JobState::Queued, read.search_id),
+            "left to the runner of the job as it is now"
         );
     }
 

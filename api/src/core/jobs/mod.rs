@@ -389,6 +389,9 @@ pub(crate) struct JobView {
     pub timeline: Vec<TimelineEntry>,
     /// The search the job reads its sources from, while it is kept.
     pub search: Option<StoredSearch>,
+    /// Its failure could not be written: it waits with no runner until the next start
+    /// (`Ledger::strand`).
+    pub stranded: bool,
 }
 
 /// Which jobs a tool shows.
@@ -459,6 +462,7 @@ pub(crate) async fn views_of(
             None => None,
         };
         views.push(JobView {
+            stranded: ledger.stranded(&job.id),
             job,
             slots,
             timeline,

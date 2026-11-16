@@ -280,7 +280,9 @@ pub(crate) async fn get_jobs(
             }
             let more = records.len() > call.page.offset + call.page.limit;
             let cursor = records.iter().map(|job| job.changed_seq).max().unwrap_or(0);
-            let unfinished = records.iter().any(|job| !job.state.is_terminal());
+            // A job stranded until the next start does not change before it.
+            let unfinished = (records.iter())
+                .any(|job| !job.state.is_terminal() && !acquire.ledger.stranded(&job.id));
             let mut fields = Map::new();
             fields.insert("change_cursor".into(), json!(cursor));
             let mut again = args.as_value();
@@ -511,7 +513,7 @@ pub(crate) const RETRY_JOB: ToolSpec = ToolSpec {
     title: "Retry a job",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Tries a job again in one of five modes. same_source: the source that failed, for a failure that says to retry it later, or a cancelled job (track jobs). next_source: the best source of the job's search not tried yet (track jobs). new_search: a new search, with optional query_text and filters, or the search_id of a find_sources search. index_only: wait for Navidrome again, for a job that failed at indexing. reject_result: a done job's file is not the recording wanted; the job reopens without that source (the file stays in the library until deleted). A mode the job's state does not allow is refused with wrong_job_state; next in every job document lists only the modes allowed now. A failure that needs a person lists none: after the person did what its user_action says, retry_job runs again. A job whose recording is already in the library takes no mode (import_already_in_library); any other mode the job does not allow now is invalid_input naming the modes it allows. Album jobs retry by new_search or index_only. Jobs started in Soulful's web page are retried there. Answers the job's full document, as get_jobs gives it; when a new search cannot be recorded, the job ends failed with that failure. A change made whose job could not be read after it answers the read's failure with facts.changed true and get_jobs in next. Failure codes: {common}, unknown_handle, expired_handle (search_id), wrong_job_state, sources_exhausted, import_already_in_library, peer_offline (same_source while the source is offline), enqueue_failed (same_source of a source slskd's blacklist holds), backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), already_running (a call with this request_key still runs).")
+        format!("Tries a job again in one of five modes. same_source: the source that failed, for a failure that says to retry it later, or a cancelled job (track jobs). next_source: the best source of the job's search not tried yet (track jobs). new_search: a new search, with optional query_text and filters, or the search_id of a find_sources search (then neither query_text nor filters: its candidates were found under its own). index_only: wait for Navidrome again, for a job that failed at indexing. reject_result: a done job's file is not the recording wanted; the job reopens without that source (the file stays in the library until deleted). A mode the job's state does not allow is refused with wrong_job_state; next in every job document lists only the modes allowed now. A failure that needs a person lists none: after the person did what its user_action says, retry_job runs again. A job whose recording is already in the library takes no mode (import_already_in_library); any other mode the job does not allow now is invalid_input naming the modes it allows. Album jobs retry by new_search or index_only. Jobs started in Soulful's web page are retried there. Answers the job's full document, as get_jobs gives it; when a new search cannot be recorded, the job ends failed with that failure. A change made whose job could not be read after it answers the read's failure with facts.changed true and get_jobs in next. Failure codes: {common}, unknown_handle, expired_handle (search_id), wrong_job_state, sources_exhausted, import_already_in_library, peer_offline (same_source while the source is offline), enqueue_failed (same_source of a source slskd's blacklist holds), backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["job_id", "mode"], "properties": {"job_id": {"type": "string", "minLength": 1}, "mode": {"enum": ["same_source", "next_source", "new_search", "index_only", "reject_result"]}, "query_text": {"type": "string", "minLength": 1}, "#,
@@ -761,7 +763,10 @@ fn read_retry(
         search.query_text = args.opt_string("query_text")?;
         search.search_id = args.opt_string("search_id")?;
         if search.search_id.is_some() {
-            args.absent("query_text", "absent when search_id is given")?;
+            // The candidates were shown under that search's own filters.
+            for name in ["query_text"].into_iter().chain(FILTERS) {
+                args.absent(name, "absent when search_id is given")?;
+            }
         }
         let read = filters(args)?;
         if FILTERS.iter().any(|name| args.has(name)) {
@@ -1587,6 +1592,21 @@ mod tests {
         assert_eq!(
             error["message"],
             "retry_job: query_text must be absent when search_id is given"
+        );
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "retry_job",
+                json!({"job_id": "j1", "mode": "new_search", "search_id": "s1",
+                    "lossless_only": true}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            error["message"],
+            "retry_job: lossless_only must be absent when search_id is given"
         );
         let error = document(
             &call_tool(

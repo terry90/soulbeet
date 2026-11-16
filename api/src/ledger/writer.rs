@@ -1265,11 +1265,12 @@ impl Writer {
             bool,
             bool,
             Option<String>,
+            i64,
         );
         let found: Option<Found> = sqlx::query_as(
             "SELECT j.state, j.gate_held, j.cancel_requested, b.origin, \
                     j.monitor_batch_id IS NOT NULL OR j.request IS NOT NULL, \
-                    j.options IS NOT NULL, j.search_id \
+                    j.options IS NOT NULL, j.search_id, j.changed_seq \
              FROM jobs j LEFT JOIN batches b ON b.id = j.batch_id \
              WHERE j.id = ? AND j.user_id = ?",
         )
@@ -1277,8 +1278,16 @@ impl Writer {
         .bind(user.to_string())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((state, gate_held, cancel_requested, origin, sent, has_options, search_id)) =
-            found
+        let Some((
+            state,
+            gate_held,
+            cancel_requested,
+            origin,
+            sent,
+            has_options,
+            search_id,
+            changed_seq,
+        )) = found
         else {
             return Ok(Transitioned::Unknown);
         };
@@ -1288,6 +1297,10 @@ impl Writer {
         }
         // D15: decided on a search the job no longer searches with.
         if (change.decided_on()).is_some_and(|read| search_id.as_deref() != Some(read)) {
+            return Ok(Transitioned::Refused { state: from });
+        }
+        // Decided on the job at a change number it has moved on from.
+        if (change.decided_at()).is_some_and(|read| changed_seq != read) {
             return Ok(Transitioned::Refused { state: from });
         }
         // Only an MCP job's runner holds a place before it sends, and records the send first: a

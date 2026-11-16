@@ -484,6 +484,7 @@ async fn search_not_started(
     let fail = Transition::Fail {
         failure: failure.clone(),
         search_id: Some(search_id.to_string()),
+        change: None,
     };
     match acquire.ledger.transition(&ctx.id(), job, fail).await {
         // Failed, or ended another way while the search was being recorded.
@@ -493,7 +494,7 @@ async fn search_not_started(
             let (ledger, user, id) = (acquire.ledger.clone(), ctx.id(), job.to_string());
             let (search_id, again) = (search_id.to_string(), failure.clone());
             tokio::spawn(async move {
-                fail_job(&ledger, &user, &id, again, Some(search_id)).await;
+                fail_job(&ledger, &user, &id, again, Some(search_id), None).await;
             });
             RetryAnswer::AppliedUnread {
                 job: job.to_string(),
@@ -1231,6 +1232,7 @@ mod tests {
         let fail = Transition::Fail {
             failure: server_restarted_search(),
             search_id: None,
+            change: None,
         };
         let failed = acq.ledger.transition(&alice().id(), &cut_off, fail).await;
         assert!(matches!(failed, Ok(Transitioned::Applied { .. })));

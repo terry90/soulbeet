@@ -11,7 +11,7 @@ use shared::download::{
     DownloadProgress, DownloadQuery, DownloadState, DownloadableItem, IndexState, SearchStats,
     SourcePresence,
 };
-use shared::failure::{cut_chars, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
+use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
 use shared::metadata::{Album, Track};
 use shared::recommendation::normalize_for_matching;
 use soulbeet::error::PeerAsk;
@@ -19,7 +19,7 @@ use soulbeet::{DownloadBackend, ImportedItem};
 
 use super::contract::{error_object, NextCall, ToolError};
 use super::next::next_calls;
-use super::paging::{leave_out, length, Keep};
+use super::paging::{chars, leave_out, length, Keep};
 use crate::core::jobs::retry::enable_deletion;
 use crate::core::jobs::{
     current_attempt, failed_slot, job_failure, job_filters, picked_file, shown_row, JobView,
@@ -31,9 +31,9 @@ use crate::ledger::store::AttemptRecord;
 use crate::ledger::{JobKind, JobState, SlotResult, StoredSpec};
 use crate::services::DEFAULT_DOWNLOAD_BACKEND;
 
-/// Peer or provider text as a result shows it.
+/// Peer or provider text as a result shows it: at most TEXT_MAX_CHARS characters as sent in JSON.
 fn cut(text: &str) -> String {
-    cut_chars(text.to_string(), TEXT_MAX_CHARS)
+    cut_json(text.to_string(), TEXT_MAX_CHARS)
 }
 
 /// `facts` with each text cut as `cut` cuts one: what a backend reports of a file is the peer's.
@@ -409,8 +409,9 @@ pub(crate) fn job_document(
 pub(crate) const JOB_DOCUMENT_MAX_CHARS: usize = 45_000;
 
 /// `doc` within JOB_DOCUMENT_MAX_CHARS. While it is longer, items are left out whole, so no id is
-/// cut, in this order: the oldest timeline entries, the oldest earlier attempts, the last items of
-/// each import's lists (the last import's first), the `cause.raw` of each import's
+/// cut, in this order: the oldest timeline entries, the oldest earlier attempts, the oldest
+/// earlier attempts the failure names (its `facts.tried_omitted` counting them), the last items
+/// of each import's lists (the last import's first), the `cause.raw` of each import's
 /// library_songs_failure (the last import's first, its `facts.omitted` naming it), the last
 /// missing titles, the last results, then the last slots. Each list's `{list}_omitted` counts what
 /// it left out.
@@ -419,6 +420,10 @@ fn bounded(doc: &mut Map<String, Value>) {
     for list in ["timeline", "tried"] {
         let over = over(doc);
         leave_out(doc, list, Keep::Newest, over);
+    }
+    let over_now = over(doc);
+    if let Some(failure) = doc.get_mut("failure").and_then(Value::as_object_mut) {
+        failure_tried_left_out(failure, over_now);
     }
     let imports = doc
         .get("results")
@@ -451,6 +456,30 @@ fn bounded(doc: &mut Map<String, Value>) {
     for list in ["missing_titles", "results", "slots"] {
         let over = over(doc);
         leave_out(doc, list, Keep::First, over);
+    }
+}
+
+/// The oldest entries of `failure`'s `tried`, an error object's, left out whole until `over`
+/// characters are gone, counted in its `facts.tried_omitted`.
+fn failure_tried_left_out(failure: &mut Map<String, Value>, over: usize) {
+    let Some(Value::Array(tried)) = failure.get_mut("tried") else {
+        return;
+    };
+    let (mut gone, mut count) = (0, 0);
+    while gone < over && !tried.is_empty() {
+        gone += chars(&tried.remove(0)) + 1;
+        count += 1;
+    }
+    if count == 0 {
+        return;
+    }
+    let facts = failure.entry("facts").or_insert_with(|| json!({}));
+    if let Value::Object(facts) = facts {
+        let before = facts
+            .get("tried_omitted")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        facts.insert("tried_omitted".into(), json!(before + count));
     }
 }
 
@@ -978,6 +1007,42 @@ mod tests {
             (&doc["failure"], doc["slots"][0]["warning"]["code"].as_str()),
             (&Value::Null, Some("peer_offline"))
         );
+    }
+
+    #[test]
+    fn a_peers_text_is_cut_to_its_bound_as_sent() {
+        // A control character is sent as six: \u0001.
+        let text = "\u{1}".repeat(TEXT_MAX_CHARS);
+        assert!(shared::failure::json_chars(&cut(&text)) <= TEXT_MAX_CHARS);
+    }
+
+    #[test]
+    fn the_failures_earlier_attempts_are_left_out_too_when_a_document_is_too_long() {
+        let long = "x".repeat(4_000);
+        let entry = |n: usize| json!({"attempt": n, "source": long, "message": long});
+        let tried: Vec<Value> = (0..10).map(entry).collect();
+        let mut doc = Map::new();
+        doc.insert("job_id".into(), json!("j1"));
+        doc.insert("tried".into(), json!([]));
+        doc.insert(
+            "failure".into(),
+            json!({"code": "peer_offline", "facts": {"job_id": "j1", "tried_omitted": 20},
+                "tried": tried, "next": []}),
+        );
+        doc.insert(
+            "slots".into(),
+            json!([{"slot": 0, "note": "y".repeat(20_000)}]),
+        );
+        bounded(&mut doc);
+        assert!(length(&doc) <= JOB_DOCUMENT_MAX_CHARS, "{}", length(&doc));
+        let failure = &doc["failure"];
+        let kept = failure["tried"].as_array().unwrap();
+        assert_eq!(
+            kept.len() as u64 + failure["facts"]["tried_omitted"].as_u64().unwrap(),
+            30
+        );
+        assert_eq!(kept.last().unwrap()["attempt"], 9, "the newest stay");
+        assert_eq!(doc["slots"].as_array().unwrap().len(), 1, "before any slot");
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use shared::failure::Failure;
 use shared::recommendation::normalize_for_matching;
 use soulbeet::{DriverChoice, ImportMode, ImportedItem};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -535,10 +535,13 @@ pub enum Transition {
     /// D15: the job ends failed: a job without unfinished slots with `failure` in `jobs.failure`,
     /// one with them (picked, then the backend or its folder failed) with `failure` on every
     /// unfinished slot's row. A job whose user asked to cancel it ends cancelled instead.
-    /// `search_id`: the search the failure came of, when it came of one.
+    /// `search_id`: the search the failure came of, when it came of one. `change`: the job's
+    /// change number the failure was decided on, for a runner that holds no download place: a job
+    /// cancelled and queued again meanwhile keeps its search, so only this tells it moved on.
     Fail {
         failure: Failure,
         search_id: Option<String>,
+        change: Option<i64>,
     },
     /// Searching again under `search_id`; the job's slots are set aside (dismissed), their
     /// attempts kept. `filters`, when given, become the job's filters; a job without options (a
@@ -589,6 +592,15 @@ impl Transition {
                 from: search_id, ..
             } => Some(search_id),
             Transition::Fail { search_id, .. } => search_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The job's change number the change was decided on, which the job must still be at when
+    /// the writer applies it.
+    pub(crate) fn decided_at(&self) -> Option<i64> {
+        match self {
+            Transition::Fail { change, .. } => *change,
             _ => None,
         }
     }
@@ -668,6 +680,8 @@ pub struct Ledger {
     changes: watch::Receiver<i64>,
     places: watch::Receiver<u64>,
     live: LiveRows,
+    /// The jobs whose failure the database kept refusing (`strand`), in memory only.
+    stranded: Arc<Mutex<HashSet<String>>>,
     /// No writer reads `writes`: requests are answered at once, events wait for `Recorded`.
     #[cfg(test)]
     recording: bool,
@@ -684,6 +698,7 @@ impl Ledger {
             changes,
             places,
             live: live.clone(),
+            stranded: Arc::default(),
             #[cfg(test)]
             recording: false,
         };
@@ -702,6 +717,17 @@ impl Ledger {
     /// from memory", design 8.3).
     pub fn live_row(&self, slot: &JobSlot) -> Option<DownloadProgress> {
         self.live.lock().unwrap().get(slot).cloned()
+    }
+
+    /// `job`'s failure could not be written: it waits, searching or queued, with no runner until
+    /// the next start of the server, which forgets this.
+    pub fn strand(&self, job: &str) {
+        self.stranded.lock().unwrap().insert(job.to_string());
+    }
+
+    /// Whether `job` waits with no runner until the next start (`strand`).
+    pub fn stranded(&self, job: &str) -> bool {
+        self.stranded.lock().unwrap().contains(job)
     }
 
     /// A ledger with no writer whose events a test reads. Requests that wait for a reply
@@ -2677,6 +2703,7 @@ mod tests {
                     Transition::Fail {
                         failure: failed_enqueue,
                         search_id: None,
+                        change: None,
                     }
                 )
                 .await
@@ -2763,6 +2790,7 @@ mod tests {
                     "No results found",
                 ),
                 search_id: Some("search-j1".into()),
+                change: None,
             },
         ] {
             assert_eq!(
@@ -2849,6 +2877,7 @@ mod tests {
                         Transition::Fail {
                             failure,
                             search_id: None,
+                            change: None,
                         },
                     )
                     .await
@@ -3760,6 +3789,7 @@ mod tests {
         let fail = Transition::Fail {
             failure: unsent,
             search_id: None,
+            change: None,
         };
         ledger.transition(&user, "j1", fail).await.unwrap();
         assert_eq!(
@@ -3782,6 +3812,7 @@ mod tests {
         let fail = Transition::Fail {
             failure: none_found,
             search_id: Some("search-j2".into()),
+            change: None,
         };
         ledger.transition(&user, "j2", fail).await.unwrap();
         let again = Transition::Search {

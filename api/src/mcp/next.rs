@@ -13,7 +13,8 @@ use crate::ledger::{BatchOrigin, JobState, Transition};
 /// How many untried candidates a job waiting for a source choice offers as download_source calls.
 const CHOICES_OFFERED: usize = 3;
 
-/// The calls that can be made for the job now. A running job: a wait for its next change. A job
+/// The calls that can be made for the job now. A running job: a wait for its next change, unless
+/// it is stranded until the next start, when no change comes before it. A job
 /// waiting for a source choice: download_source for each of its first untried candidates, with
 /// that candidate's facts. Each retry_job mode `allowed` accepts, with its deciding facts, unless
 /// the job's failure needs a person (its user_action says what; retry_job still accepts a mode
@@ -27,10 +28,12 @@ pub(crate) fn next_calls(view: &JobView, untried: &Untried) -> Vec<NextCall> {
     let id = &job.id;
     let mcp = job.origin == BatchOrigin::Mcp;
     let mut next = Vec::new();
-    if matches!(
-        job.state,
-        Searching | Queued | Downloading | Importing | Indexing
-    ) {
+    if !view.stranded
+        && matches!(
+            job.state,
+            Searching | Queued | Downloading | Importing | Indexing
+        )
+    {
         next.push(NextCall::new(
             "get_jobs",
             json!({"job_ids": [id], "detail": "full", "wait_seconds": 60,
@@ -290,5 +293,19 @@ mod tests {
             ),
             (&json!(1), &json!("peer_b"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_stranded_job_is_offered_no_wait() {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = downloading_track_job(&acq).await;
+        let mut view = view_of(&acq, &job).await;
+        let waits = |view: &JobView| {
+            (next_calls(view, &Untried::default()).iter()).any(|call| call.tool == "get_jobs")
+        };
+        assert!(waits(&view));
+        // Its failure could not be written: nothing changes it before the next start.
+        view.stranded = true;
+        assert!(!waits(&view));
     }
 }

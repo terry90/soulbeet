@@ -153,7 +153,10 @@ async fn batch_document(
     }
     let cursor = jobs.iter().map(|job| job.changed_seq).max().unwrap_or(0);
     let all_terminal = jobs.iter().all(|job| job.state.is_terminal());
-    let follow = (!all_terminal).then(|| since_call("get_batch", again, cursor));
+    // A job stranded until the next start does not change before it.
+    let moving = (jobs.iter())
+        .any(|job| !job.state.is_terminal() && !state.acquire.ledger.stranded(&job.id));
+    let follow = moving.then(|| since_call("get_batch", again, cursor));
     let shown = (jobs.iter())
         .filter(|job| job.changed_seq > since || needs_action(job.state))
         .cloned()
