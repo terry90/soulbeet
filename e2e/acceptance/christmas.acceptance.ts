@@ -4,14 +4,19 @@
 // transfer, a busy peer, only filtered results, a file beets cannot match,
 // Navidrome down, and Soulful restarted mid-download and mid-index-wait) is
 // recovered by following the error's code, retry advice, facts and next alone.
+// Then she deletes and replaces tracks once she allowed the app to, and the
+// tracks another listener rated, starred or kept in a playlist stay.
 
 import { randomUUID } from 'node:crypto';
+import { existsSync, statSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { expect, test } from '@playwright/test';
 import { fenwickCarols, wytheChapelCarols, type FixtureRelease, type FixtureTrack } from '../fixtures/dataset.js';
-import { confirmIn, openSettings, seededFolder, uniqueUser } from '../helpers/app.js';
+import { confirmIn, loginViaUi, openSettings, seededFolder, uniqueUser } from '../helpers/app.js';
 import { resetStubs, setNavidromeDown } from '../helpers/control.js';
-import { mcpMusicDirForApp, navidromeAdminPassword, navidromeAdminUser } from '../helpers/env.js';
+import { mcpAdminPassword, mcpMusicDirForApp, navidromeAdminPassword, navidromeAdminUser } from '../helpers/env.js';
+import { libraryItems, listFilesRecursive } from '../helpers/files.js';
 import {
   followerView,
   importDecision,
@@ -166,7 +171,7 @@ test('the Christmas playlist is filled through every injected failure by followi
     return { alice, bob, contextA, pageA, a };
   });
 
-  const folderId = await test.step('library', async () => {
+  const { folderId, folder } = await test.step('library', async () => {
     const folder = await seededFolder(
       contextA,
       'xmas',
@@ -179,7 +184,7 @@ test('the Christmas playlist is filled through every injected failure by followi
     const status = (await a.ok('get_status')) as { folders: { folder_id: string; name: string; path: string }[] };
     const listed = status.folders.find((f) => f.name === folder.name);
     expect(listed?.path).toBe(`${mcpMusicDirForApp}/${folder.name}`);
-    return listed?.folder_id as string;
+    return { folderId: listed?.folder_id as string, folder };
   });
 
   const { silentId, coventryId } = await test.step('owned tracks show up', async () => {
@@ -192,10 +197,10 @@ test('the Christmas playlist is filled through every injected failure by followi
         { timeout: 90_000, intervals: [5_000] },
       )
       .toEqual(['exact', 'exact']);
-    const [silentId, coventryId] = ((await a.ok('find_in_library', { references: owned })) as Items).results.map(
+    const ids = ((await a.ok('find_in_library', { references: owned })) as Items).results.map(
       (e) => matched(e)?.song_id as string,
     );
-    return { silentId, coventryId };
+    return { silentId: nth(ids, 0), coventryId: nth(ids, 1) };
   });
 
   await test.step('pin a recording', async () => {
@@ -408,7 +413,7 @@ test('the Christmas playlist is filled through every injected failure by followi
     expect([...seen].sort()).toEqual(Object.keys(EXPECTED).sort());
   });
 
-  await test.step('the playlist is complete', async () => {
+  const songOf = await test.step('the playlist is complete', async () => {
     const done = (await a.ok('get_batch', { batch_id: batchId })) as Batch;
     expect(done.summary).toEqual(expect.objectContaining({ done: 6 }));
     expect(Object.entries(done.summary).filter(([state, n]) => state !== 'done' && n > 0)).toEqual([]);
@@ -452,6 +457,7 @@ test('the Christmas playlist is filled through every injected failure by followi
     // The restart cost the slow transfer no attempt.
     expect(nth(full('The Holly and the Ivy').slots, 0).current_attempt.source).toBe('carol_slow');
     expect(full('The Holly and the Ivy').tried).toEqual([]);
+    return songOf;
   });
 
   await test.step('a job whose search finds nothing is left to judgement', async () => {
@@ -497,6 +503,247 @@ test('the Christmas playlist is filled through every injected failure by followi
     expect((await b.call('get_playlist', { playlist_id: playlistId })).doc.error).toMatchObject({
       code: 'playlist_not_found',
     });
+  });
+
+  await test.step('deletion keeps a track another user rated or starred', async () => {
+    // Files are named as Soulful sees them, under her folder's path.
+    const inFolder = (file: unknown) => typeof file === 'string' && file.startsWith(`${folder.path}/`);
+    const holyId = songOf('O Holy Night'),
+      bleakId = songOf('In the Bleak Midwinter'),
+      harkId = songOf('Hark the Herald Angels Sing'),
+      goodKingId = songOf('Good King Wenceslas');
+    // On Navidrome itself, as a listener would.
+    await subsonicAs(bob, 'setRating', { id: holyId, rating: '5' });
+
+    // Without the switch.
+    const off = {
+      code: 'permission_not_granted',
+      stage: 'delete',
+      retry: 'needs_user',
+      message: 'Deleting music is turned off for this app',
+      user_action: {
+        code: 'enable_deletion',
+        what: 'Allow deleting music for this app',
+        where: 'Settings > Users > Connected apps',
+      },
+      next: [],
+    };
+    const needSwitch: [string, Record<string, unknown>][] = [
+      ['preview_delete_tracks', { song_ids: [holyId, bleakId], reason: 'cleanup' }],
+      ['delete_tracks', { confirmation_token: 'x' }],
+      ['ensure_in_library', { items: [ref(F, 3)], folder_id: folderId, replace_existing: { confirmation_token: 'x' } }],
+    ];
+    for (const [tool, args] of needSwitch) {
+      const answer = await a.call(tool, args);
+      expect(answer.isError, tool).toBe(true);
+      expect(answer.doc.error, tool).toMatchObject(off);
+    }
+
+    // Refused to every app, whatever its switch.
+    const appsMayNot = async (when: string) => {
+      const refused: [string, Record<string, unknown>, string][] = [
+        ['set_rating', { song_id: coventryId, rating: 1 }, 'rate_in_navidrome'],
+        ['update_settings', { auto_delete: true }, 'enable_auto_delete'],
+        ['update_settings', { discovery_promote_threshold: 3 }, 'change_discovery_settings'],
+        ['update_settings', { discovery_folder_id: folderId }, 'change_discovery_settings'],
+      ];
+      for (const [tool, args, userAction] of refused) {
+        const answer = await a.call(tool, args);
+        const error = answer.doc.error as ErrorObject | undefined;
+        expect([answer.isError, error?.code, error?.user_action?.code], `${tool} ${JSON.stringify(args)} ${when}`).toEqual(
+          [true, 'permission_not_granted', userAction],
+        );
+      }
+    };
+    await appsMayNot('with deletion off');
+
+    // The switch, with its confirmation.
+    await pageA.goto('/');
+    await openSettings(pageA);
+    await pageA.getByRole('button', { name: 'Users' }).click();
+    const allow = pageA.getByRole('checkbox', { name: 'Allow deleting music' });
+    await allow.click();
+    await expect(pageA.getByRole('button', { name: 'Allow deleting', exact: true })).toBeVisible();
+    await confirmIn(
+      pageA,
+      'Let 127.0.0.1 delete music from your library? Before deleting tracks it has to show you what it would delete and get your yes. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. At most 100 tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored.',
+    );
+    // The box is disabled while it saves and then shows the stored value.
+    await expect(allow).toBeChecked();
+    expect(await a.ok('get_status')).toMatchObject({ deletion_enabled: true });
+    await appsMayNot('with deletion on');
+
+    // Only the owner has the switch: an admin sees her app, and can disconnect it, but not allow it to delete.
+    const adminContext = await browser.newContext();
+    const adminPage = await adminContext.newPage();
+    await loginViaUi(adminPage, { username: 'admin', password: mcpAdminPassword });
+    await openSettings(adminPage);
+    await adminPage.getByRole('button', { name: 'Users' }).click();
+    const aliceApp = adminPage.getByRole('listitem').filter({ hasText: `(${alice.username})` });
+    await expect(aliceApp).toContainText('127.0.0.1');
+    await expect(aliceApp.getByRole('button', { name: 'Disconnect' })).toBeVisible();
+    await expect(adminPage.getByRole('checkbox', { name: 'Allow deleting music' })).toHaveCount(0);
+    await adminContext.close();
+
+    // One blocked, one allowed: a partial answer whose token covers the allowed song only.
+    const preview = await a.call('preview_delete_tracks', { song_ids: [holyId, bleakId], reason: 'cleanup' });
+    expect(preview.isError).toBe(true);
+    const p = preview.doc as Items & { confirmation_token: string; will_delete: string[]; next: NextCall[] };
+    expect(p.error).toMatchObject({ code: 'partial', retry: 'per_item' });
+    expect(p).toMatchObject({
+      reason: 'cleanup',
+      expires_at: expect.any(String),
+      daily_limit: { limit: 100, used_last_24h: 0 },
+    });
+    const blocked = nth(p.results, 0);
+    expect(blocked).toMatchObject({
+      index: 0,
+      ok: false,
+      error: {
+        code: 'delete_blocked_by_other_user',
+        stage: 'delete',
+        retry: 'not_retryable',
+        message: 'Another listener rated, starred or kept this track in a playlist',
+        facts: { song_id: holyId, verdict: 'blocked' },
+        next: [{ tool: 'preview_delete_tracks', args: { song_ids: [holyId], reason: 'cleanup' } }],
+      },
+    });
+    // It names no one and no file.
+    expect(JSON.stringify(blocked)).not.toContain(bob.username);
+    for (const text of [blocked.error?.message, blocked.error?.cause?.raw ?? '']) expect(text).not.toContain(folder.path);
+    const allowed = nth(p.results, 1);
+    // Her own playlist is listed; it does not block.
+    expect(allowed).toMatchObject({
+      index: 1,
+      ok: true,
+      song_id: bleakId,
+      verdict: 'allowed',
+      song: { title: 'In the Bleak Midwinter' },
+      playlists: [{ playlist_id: playlistId, name: 'Christmas traditional', smart: false }],
+      playlists_omitted: 0,
+    });
+    expect(inFolder(allowed.file), String(allowed.file)).toBe(true);
+    expect(p.will_delete).toEqual([bleakId]);
+    expect(p.next).toEqual([
+      {
+        tool: 'delete_tracks',
+        args: { confirmation_token: p.confirmation_token },
+        requires_user_confirmation: true,
+      },
+    ]);
+
+    // The user said yes: the preview's next, as given.
+    const yes = nth(p.next, 0);
+    const deleted = (await a.ok(yes.tool, yes.args)) as Items;
+    expect(deleted.results).toEqual([
+      expect.objectContaining({ index: 0, ok: true, song_id: bleakId, status: 'deleted', file: allowed.file }),
+    ]);
+    expect(listFilesRecursive(folder.hostPath).filter((f) => basename(f).includes('In the Bleak Midwinter'))).toEqual(
+      [],
+    );
+    const titles = libraryItems(folder.name).map((i) => i.title);
+    expect([titles.includes('In the Bleak Midwinter'), titles.includes('O Holy Night')]).toEqual([false, true]);
+
+    // The same token again: used, and next points at the history, which names the app.
+    const reused = await a.call(yes.tool, yes.args);
+    expect(reused.isError).toBe(true);
+    const used = reused.doc.error as ErrorObject;
+    expect(used).toMatchObject({
+      code: 'expired_handle',
+      message: 'This confirmation token was already used',
+      facts: { song_ids: [bleakId], reason: 'cleanup' },
+      next: [{ tool: 'get_deletion_history', args: {} }],
+    });
+    const history = nth(used.next, 0);
+    const rowOf = async (songId: string) =>
+      ((await a.ok(history.tool, history.args)) as { deletions: Record<string, unknown>[] }).deletions.find(
+        (d) => d.song_id === songId,
+      );
+    expect(await rowOf(bleakId)).toMatchObject({
+      title: 'In the Bleak Midwinter',
+      file: allowed.file,
+      reason: 'cleanup',
+      origin: 'mcp',
+      app: '127.0.0.1',
+    });
+
+    // A replacement deletes only with a confirmed token. Hark was imported by beets into her
+    // folder above, so beets sees the new copy as its duplicate.
+    const replacing = (await a.ok('preview_delete_tracks', { song_ids: [harkId], reason: 'replaced' })) as Items & {
+      confirmation_token: string;
+    };
+    expect(replacing).toMatchObject({ will_delete: [harkId], daily_limit: { limit: 100, used_last_24h: 1 } });
+    const hark = nth(replacing.results, 0);
+    expect(hark).toMatchObject({ song_id: harkId, verdict: 'allowed' });
+    const harkFile = hark.file as string;
+    expect(inFolder(harkFile), harkFile).toBe(true);
+    const harkRelative = harkFile.slice(folder.path.length + 1);
+    const harkOnHost = join(folder.hostPath, harkRelative);
+    const oldInode = statSync(harkOnHost).ino;
+    const ensured = (await a.ok('ensure_in_library', {
+      items: [ref(F, 3)],
+      folder_id: folderId,
+      replace_existing: { confirmation_token: replacing.confirmation_token },
+      request_key: randomUUID(),
+    })) as Items & { batch_id: string };
+    const replaceJob = nth(ensured.results, 0);
+    expect(replaceJob.status).toBe('job_created');
+    for (let round = 0; ; round++) {
+      expect(round, 'get_batch rounds').toBeLessThan(4);
+      const b = (await a.ok('get_batch', {
+        batch_id: ensured.batch_id,
+        wait_seconds: 180,
+        wait_for: 'all_terminal',
+      })) as Batch;
+      if (b.all_terminal) break;
+    }
+    const job = nth(
+      ((await a.ok('get_jobs', { job_ids: [replaceJob.job_id], detail: 'full' })) as { jobs: JobDoc[] }).jobs,
+      0,
+    );
+    expect(job.state, JSON.stringify(job)).toBe('done');
+    expect(nth(job.results as Record<string, unknown>[], 0)).toMatchObject({
+      replaced: [{ files: [harkRelative], status: 'replaced' }],
+      not_replaced: [],
+    });
+    // The new copy took the old one's place: one Hark file, not the one that was there.
+    expect(listFilesRecursive(folder.hostPath).filter((f) => basename(f).includes('Hark the Herald Angels Sing'))).toEqual(
+      [harkOnHost],
+    );
+    expect(statSync(harkOnHost).ino).not.toBe(oldInode);
+    expect(libraryItems(folder.name).filter((i) => i.title === 'Hark the Herald Angels Sing')).toHaveLength(1);
+    expect(await rowOf(harkId)).toMatchObject({
+      title: 'Hark the Herald Angels Sing',
+      reason: 'replaced',
+      origin: 'mcp',
+      app: '127.0.0.1',
+    });
+
+    // Another listener's static playlist keeps a track.
+    await subsonicAs(bob, 'createPlaylist', { name: 'kept by bob', songId: goodKingId });
+    const inPlaylist = await a.call('preview_delete_tracks', { song_ids: [goodKingId], reason: 'cleanup' });
+    expect(inPlaylist.isError).toBe(true);
+    const kept = inPlaylist.doc as Items & { confirmation_token: string | null; will_delete: string[] };
+    const keptError = nth(kept.results, 0).error;
+    expect([keptError?.code, keptError?.message, kept.confirmation_token, kept.will_delete]).toEqual([
+      'delete_blocked_by_other_user',
+      'Another listener rated, starred or kept this track in a playlist',
+      null,
+      [],
+    ]);
+
+    // An album another user starred keeps each of its tracks.
+    const coventry = (await subsonicAs(alice, 'getSong', { id: coventryId })) as { song: { albumId: string } };
+    await subsonicAs(bob, 'star', { albumId: coventry.song.albumId });
+    const starred = await a.call('preview_delete_tracks', { song_ids: [coventryId], reason: 'cleanup' });
+    expect(starred.isError).toBe(true);
+    const s = starred.doc as Items & { confirmation_token: string | null; will_delete: string[] };
+    expect([nth(s.results, 0).error?.code, s.confirmation_token, s.will_delete]).toEqual([
+      'delete_blocked_by_other_user',
+      null,
+      [],
+    ]);
+    expect(existsSync(join(folder.hostPath, F.artist, F.title, 'Coventry Carol.flac'))).toBe(true);
   });
 
   await test.step('disconnecting ends the connection', async () => {
