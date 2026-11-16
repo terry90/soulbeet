@@ -9,7 +9,7 @@ use futures::future::join_all;
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::download::DownloadProgress;
-use shared::failure::{Failure, RetryAdvice, Stage};
+use shared::failure::{cut_chars, Failure, RetryAdvice, Stage, TEXT_MAX_CHARS};
 use soulbeet::navidrome::NavidromeClient;
 use soulbeet::ImportedItem;
 use sqlx::SqlitePool;
@@ -17,8 +17,8 @@ use tracing::warn;
 
 use super::args::{repeatable, Args};
 use super::contract::{
-    answer, applied_unread, failed, invalid_value, success, too_large_to_repeat, upstream_error,
-    NextCall, ToolError,
+    answer, applied_unread, error_object, failed, invalid_value, too_large_to_repeat,
+    upstream_error, NextCall, ToolError,
 };
 use super::facts::{
     asks_backend, job_document, live_facts, results_of, unanswered, Detail, LiveFacts, ReadNow,
@@ -26,7 +26,7 @@ use super::facts::{
 };
 use super::keys::{keyed, request_key, Keyed};
 use super::next::next_calls;
-use super::paging::{fit, Page};
+use super::paging::{fit, leave_out, length, Keep, Page, RESULT_MAX_CHARS};
 use super::refs::{filters, filters_schema, page_schema, request_key_schema, wait_schema};
 use super::server::{common_codes, ToolSpec};
 use super::{wait, McpCaller};
@@ -41,6 +41,7 @@ use crate::core::jobs::{
     JobSelect, JobView, RetryMode, Untried,
 };
 use crate::core::library::{navidrome_failure, navidrome_for, SongFacts};
+use crate::import_queue::FileLeft;
 use crate::ledger::store::JobRecord;
 use crate::ledger::{JobState, SlotResult};
 
@@ -550,7 +551,7 @@ pub(crate) const DISMISS_JOB: ToolSpec = ToolSpec {
     title: "Dismiss a job",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Closes a job that will not be pursued (failed, cancelled, waiting for a source choice or an import decision). For one waiting for an import decision, deletes the downloaded copy Soulful kept for it (never a library file). Answers the job's full document. Failure codes: {common}, unknown_handle (also: another decision already took the kept import; dismiss_job can be called again once it ended), wrong_job_state, already_running (a call with this request_key still runs).")
+        format!("Closes a job that will not be pursued (failed, cancelled, waiting for a source choice or an import decision). For one waiting for an import decision, deletes the downloaded copy Soulful kept for it (never a library file); a file it could not delete stays on disk, listed in files_left (its path relative to Soulful's download folder, code delete_failed and message; files_left_omitted counting any left out past 60,000 characters), and the job is dismissed all the same. Answers the job's full document. Failure codes: {common}, unknown_handle (also: another decision already took the kept import; dismiss_job can be called again once it ended), wrong_job_state, already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["job_id"], "properties": {"job_id": {"type": "string", "minLength": 1}, "#,
@@ -620,26 +621,51 @@ impl JobTool {
         answered: Result<RetryAnswer, Failure>,
         again: Option<NextCall>,
     ) -> Keyed {
-        match answered {
-            Ok(RetryAnswer::Applied(view)) => Keyed::Kept(match self.document(&view).await {
-                Ok(fields) => success(fields),
-                Err(f) => failed(applied_unread(view.job.id.clone(), f)),
-            }),
+        self.answer_leaving(job, answered, again, vec![]).await
+    }
+
+    /// `answer`, with the kept files a discard could not delete (`files_left`, each path
+    /// relative to the download folder) in a `files_left` field of the document, or of the
+    /// error's facts, when there are some: they stay on disk whatever the answer is. Each is its
+    /// path, cut as file paths are, with its failure's code and message; past RESULT_MAX_CHARS
+    /// the last are left out, `files_left_omitted` counting them.
+    pub(crate) async fn answer_leaving(
+        &self,
+        job: Option<&str>,
+        answered: Result<RetryAnswer, Failure>,
+        again: Option<NextCall>,
+        files_left: Vec<FileLeft>,
+    ) -> Keyed {
+        let (kept, mut result) = match answered {
+            Ok(RetryAnswer::Applied(view)) => {
+                let read = self.document(&view).await;
+                (
+                    true,
+                    read.map_err(|f| applied_unread(view.job.id.clone(), f)),
+                )
+            }
             Ok(RetryAnswer::AppliedUnread { job, failure }) => {
-                Keyed::Kept(failed(applied_unread(job, failure)))
+                (true, Err(applied_unread(job, failure)))
             }
             Ok(RetryAnswer::Refused(failure, facts)) => {
-                Keyed::Released(failed(self.refusal(job, failure, facts, None).await))
+                (false, Err(self.refusal(job, failure, facts, None).await))
             }
             Ok(RetryAnswer::Unavailable(failure, facts)) => {
                 let again = again.filter(|_| failure.retry == RetryAdvice::SameSourceLater);
-                Keyed::Released(failed(self.refusal(job, failure, facts, again).await))
+                (false, Err(self.refusal(job, failure, facts, again).await))
             }
             Ok(RetryAnswer::InvalidInput { field, expected }) => {
                 let ToolError { failure, facts, .. } = invalid_value(self.tool, field, &expected);
-                Keyed::Released(failed(self.refusal(job, failure, facts, None).await))
+                (false, Err(self.refusal(job, failure, facts, None).await))
             }
-            Err(f) => Keyed::Released(failed(upstream_error(f, Map::new(), again))),
+            Err(f) => (false, Err(upstream_error(f, Map::new(), again))),
+        };
+        if !files_left.is_empty() {
+            with_files_left(&mut result, &files_left);
+        }
+        match kept {
+            true => Keyed::Kept(answer(result)),
+            false => Keyed::Released(answer(result)),
         }
     }
 
@@ -682,6 +708,37 @@ impl JobTool {
         let untried = untried(&self.acquire.db, &view, now).await?;
         Ok(Some((view, untried)))
     }
+}
+
+/// `result` with `files_left` in a `files_left` field of its fields, or of its error's facts,
+/// as `JobTool::answer_leaving` says.
+fn with_files_left(result: &mut Result<Map<String, Value>, ToolError>, files_left: &[FileLeft]) {
+    let listed: Vec<Value> = (files_left.iter())
+        .map(|file| {
+            let path = cut_chars(file.path.display().to_string(), TEXT_MAX_CHARS);
+            json!({"path": path, "code": file.failure.code, "message": file.failure.message})
+        })
+        .collect();
+    let (fields, sent) = match result {
+        Ok(fields) => {
+            fields.insert("files_left".into(), Value::Array(listed));
+            // As `success` sends it.
+            let sent = length(fields) + r#""ok":true,"#.len();
+            (fields, sent)
+        }
+        Err(error) => {
+            error
+                .facts
+                .insert("files_left".into(), Value::Array(listed));
+            let document = Map::from_iter([
+                ("ok".to_string(), json!(false)),
+                ("error".to_string(), error_object(error)),
+            ]);
+            (&mut error.facts, length(&document))
+        }
+    };
+    let over = sent.saturating_sub(RESULT_MAX_CHARS);
+    leave_out(fields, "files_left", Keep::First, over);
 }
 
 /// `mode`, required, one of MODES.
@@ -791,8 +848,10 @@ pub(crate) async fn dismiss_job(
     let on = JobTool::of("dismiss_job", state, caller);
     let again = args.same_call();
     let work = async move {
-        let answered = dismiss(&on.acquire, &on.caller.ctx, &job_id).await;
-        on.answer(Some(&job_id), answered, again).await
+        let dismissed = dismiss(&on.acquire, &on.caller.ctx, &job_id).await;
+        let (answered, left) = (dismissed.answer, dismissed.files_left);
+        on.answer_leaving(Some(&job_id), answered, again, left)
+            .await
     };
     keyed(&state.acquire, caller, "dismiss_job", key, &call, work).await
 }
@@ -1579,6 +1638,25 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dismiss_job_names_a_kept_file_it_could_not_delete() {
+        use crate::core::jobs::test_support::{
+            kept_track_job_with, no_match_with_files, undeletable_kept_file,
+        };
+        let (db, acq, effects, token) = jobs_app().await;
+        let job = kept_track_job_with(&acq, &effects, no_match_with_files(1)).await;
+        let file = undeletable_kept_file(&acq);
+        let app = app_of(&db, &acq);
+        let doc = document(&call_tool(app, &token, "dismiss_job", json!({"job_id": job})).await);
+        assert_eq!(doc["state"], "dismissed", "{doc}");
+        assert_eq!(
+            doc["files_left"],
+            json!([{"path": file, "code": "delete_failed",
+                "message": "Soulful could not delete this downloaded file; it stays on disk"}])
+        );
+        assert!(acq.download_base.join(file).exists());
     }
 
     #[tokio::test]

@@ -390,15 +390,19 @@ pub(crate) fn spawn_monitor(ctx: &UserCtx, mut monitor: DownloadMonitor) {
 /// Deletes `files`, a job's own downloaded files, and prunes the folders
 /// they leave empty up to `base`; a file already gone still has its folder
 /// pruned. Nothing but these files is deleted: a folder may hold other
-/// downloads. The paths it could not delete, with the OS error.
-pub(crate) async fn discard_files(files: &[PathBuf], base: &Path) -> Vec<(PathBuf, String)> {
+/// downloads. The paths it could not delete, with the OS error: a file gone already is one, with
+/// `NotFound`.
+pub(crate) async fn discard_files(
+    files: &[PathBuf],
+    base: &Path,
+) -> Vec<(PathBuf, std::io::Error)> {
     let mut failed = Vec::new();
     for file in files {
         match tokio::fs::remove_file(file).await {
             Ok(()) => {}
             Err(e) => {
                 let gone = e.kind() == std::io::ErrorKind::NotFound;
-                failed.push((file.clone(), e.to_string()));
+                failed.push((file.clone(), e));
                 if !gone {
                     continue;
                 }
@@ -406,7 +410,7 @@ pub(crate) async fn discard_files(files: &[PathBuf], base: &Path) -> Vec<(PathBu
         }
         let folder = file.parent().unwrap_or(base);
         if let Err(e) = crate::server_fns::cleanup_empty_ancestors(folder, base).await {
-            failed.push((folder.to_path_buf(), e.to_string()));
+            failed.push((folder.to_path_buf(), e));
         }
     }
     failed
@@ -529,7 +533,9 @@ mod tests {
             album.join("08.flac"),
             gone.clone(),
         ];
-        let failed = discard_files(&files, &base).await;
+        let failed: Vec<(PathBuf, String)> = (discard_files(&files, &base).await.into_iter())
+            .map(|(path, e)| (path, e.to_string()))
+            .collect();
 
         assert_eq!(
             failed,

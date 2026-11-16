@@ -57,7 +57,7 @@ pub(crate) const RESOLVE_IMPORT: ToolSpec = ToolSpec {
     title: "Decide an import",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Decides the import a job waiting for an import decision (needs_decision) kept, with choice: retry (beets matches again on its own), as_is (the files are imported with their own tags), candidate (one of get_import_choices' candidates, by its data_source and id), musicbrainz (the MusicBrainz recording, for a track job, or release, for an album job, given as an MBID or a musicbrainz.org link), or discard (deletes the downloaded copy Soulful kept, never a library file, and dismisses the job's slots waiting for it). musicbrainz and as_is work without candidates, so a recording found with search_music can always be applied. slot as get_import_choices takes it. Answers the job's full document, as get_jobs gives it; the import then runs, so follow it with get_jobs. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; the job's slots fail), import_choice_invalid (a candidate beets did not find, a MusicBrainz link to the wrong entity), already_running (a call with this request_key still runs).")
+        format!("Decides the import a job waiting for an import decision (needs_decision) kept, with choice: retry (beets matches again on its own), as_is (the files are imported with their own tags), candidate (one of get_import_choices' candidates, by its data_source and id), musicbrainz (the MusicBrainz recording, for a track job, or release, for an album job, given as an MBID or a musicbrainz.org link), or discard (deletes the downloaded copy Soulful kept, never a library file, and dismisses the job's slots waiting for it; a file it could not delete stays on disk, listed in files_left as dismiss_job lists it, and the slots are dismissed all the same). musicbrainz and as_is work without candidates, so a recording found with search_music can always be applied. slot as get_import_choices takes it. Answers the job's full document, as get_jobs gives it; the import then runs, so follow it with get_jobs. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; the job's slots fail), import_choice_invalid (a candidate beets did not find, a MusicBrainz link to the wrong entity), already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["job_id", "choice"], "properties": {"job_id": {"type": "string", "minLength": 1}, "slot": {"type": "integer", "minimum": 0}, "choice": {"enum": ["retry", "as_is", "candidate", "musicbrainz", "discard"]}, "data_source": {"type": "string", "minLength": 1}, "id": {"type": "string", "minLength": 1}, "musicbrainz": {"type": "string", "minLength": 1}, "#,
@@ -290,14 +290,16 @@ pub(crate) async fn resolve_import(
     let work = async move {
         match resolve(&on.acquire, &on.caller.ctx, &job_id, slot, decision).await {
             Ok(decided) => {
-                let answered = match decided {
+                let answered = match decided.job {
                     Ok(view) => RetryAnswer::Applied(Box::new(view)),
                     Err(failure) => RetryAnswer::AppliedUnread {
                         job: job_id.clone(),
                         failure,
                     },
                 };
-                on.answer(Some(&job_id), Ok(answered), None).await
+                let left = decided.files_left;
+                on.answer_leaving(Some(&job_id), Ok(answered), None, left)
+                    .await
             }
             Err(refused) => {
                 let changed = refused.changed;
@@ -646,5 +648,30 @@ mod tests {
         );
         assert_eq!(doc["state"], "dismissed", "{doc}");
         assert!(!acq.download_base.join("Come Over [1f2e3d4c]").exists());
+        assert!(doc.get("files_left").is_none(), "{doc}");
+    }
+
+    #[tokio::test]
+    async fn a_discard_names_the_kept_file_it_could_not_delete() {
+        use crate::core::jobs::test_support::undeletable_kept_file;
+        let (db, acq, effects, token) = jobs_app().await;
+        let job = kept_track_job_with(&acq, &effects, no_match_with_files(1)).await;
+        let file = undeletable_kept_file(&acq);
+        let doc = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "resolve_import",
+                json!({"job_id": job, "choice": "discard"}),
+            )
+            .await,
+        );
+        assert_eq!(doc["state"], "dismissed", "{doc}");
+        assert_eq!(
+            doc["files_left"],
+            json!([{"path": file, "code": "delete_failed",
+                "message": "Soulful could not delete this downloaded file; it stays on disk"}])
+        );
+        assert!(acq.download_base.join(file).exists());
     }
 }

@@ -785,6 +785,17 @@ pub(crate) async fn kept_track_job_with(
     job
 }
 
+/// The downloaded file of `kept_track_job_with` made one the OS refuses to delete: its path now
+/// holds a folder, which unlink refuses (EISDIR) whoever runs the tests, where a read-only folder
+/// would not stop root. Its path relative to `acq`'s download folder.
+pub(crate) fn undeletable_kept_file(acq: &Acquire) -> &'static str {
+    let file = "Come Over [1f2e3d4c]/01 - Song Number 1.flac";
+    let path = acq.download_base.join(file);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    file
+}
+
 /// `import` ended with nothing to pick: kept for a decision in the ledger, and in `acq`'s queue
 /// when `queued` (one a restart could not restore is in the ledger alone).
 async fn keep(acq: &Acquire, import: StoredImport, queued: bool) {

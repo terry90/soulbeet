@@ -10,7 +10,7 @@ mod rows;
 pub(crate) mod test_support;
 
 pub(crate) use choice::{files_gone, nothing_to_retry};
-pub use retry::{forget_retries, import_choices_for, retry_import_for};
+pub use retry::{forget_retries, import_choices_for, retry_import_for, Discarded, FileLeft};
 pub(crate) use rows::import_failure;
 
 use crate::auth::UserId;
@@ -1632,7 +1632,8 @@ mod tests {
             nothing_to_retry()
         );
         let discarded = queue.discard(&alice(), "a").await.unwrap();
-        assert_eq!(discarded.sources, vec![source.clone()]);
+        assert_eq!(discarded.job.sources, vec![source.clone()]);
+        assert_eq!(discarded.files_left, vec![]);
         assert!(!source.exists() && !tmp.path().join("dl/X [1f2e3d4c]").exists());
         assert!(tmp.path().join("dl").exists());
         assert_eq!(

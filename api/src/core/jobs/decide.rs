@@ -15,7 +15,7 @@ use super::runner::Acquire;
 use super::{job_not_found, job_view, JobView};
 use crate::auth::UserCtx;
 use crate::core::database_failure;
-use crate::import_queue::{files_gone, nothing_to_retry, ImportJob};
+use crate::import_queue::{files_gone, nothing_to_retry, FileLeft, ImportJob};
 use crate::ledger::JobState;
 
 /// Why a read or a decision of a kept import was refused.
@@ -53,8 +53,13 @@ impl Refused {
     }
 }
 
-/// A decision made: the job as it is after it, or the failure of reading it then.
-pub(crate) type Decided = Result<JobView, Failure>;
+/// A decision made: the job as it is after it, or the failure of reading it then, and the kept
+/// files a discard could not delete (`in_download_folder`), which stay on disk.
+#[derive(Debug)]
+pub(crate) struct Decided {
+    pub job: Result<JobView, Failure>,
+    pub files_left: Vec<FileLeft>,
+}
 
 /// What a job's kept import offers to decide on.
 #[derive(Debug)]
@@ -204,13 +209,27 @@ pub(crate) async fn resolve(
     };
     let (queue, user) = (&acquire.queue, ctx.id());
     let decided = match choice {
-        Some(choice) => queue.retry(&user, &item, choice).await,
-        None => queue.discard(&user, &item).await.map(drop),
+        Some(choice) => queue.retry(&user, &item, choice).await.map(|()| vec![]),
+        None => (queue.discard(&user, &item).await).map(|discarded| discarded.files_left),
     };
     match decided {
-        Ok(()) => Ok(read_after(acquire, ctx, job).await),
+        Ok(left) => Ok(Decided {
+            job: read_after(acquire, ctx, job).await,
+            files_left: in_download_folder(acquire, left),
+        }),
         Err(refusal) => Err(refused(acquire, ctx, job, refusal, None).await),
     }
+}
+
+/// `left` with each path relative to the download folder, so no answer names a path of the
+/// server.
+pub(crate) fn in_download_folder(acquire: &Acquire, left: Vec<FileLeft>) -> Vec<FileLeft> {
+    (left.into_iter())
+        .map(|file| FileLeft {
+            path: relative(&file.path, &acquire.download_base),
+            ..file
+        })
+        .collect()
 }
 
 /// `ctx`'s job `job` once the writes sent before are applied: what the import queue recorded of
@@ -475,6 +494,7 @@ mod tests {
         let view = resolve(&acq, &ctx, &job, Some(1), Decision::Discard)
             .await
             .unwrap()
+            .job
             .unwrap();
         let states: Vec<JobState> = view.slots.iter().map(|s| s.state).collect();
         assert_eq!(states, vec![JobState::NeedsDecision, JobState::Dismissed]);
@@ -520,7 +540,10 @@ mod tests {
             resolve(&acq, &ctx, &job, None, Decision::Discard),
             resolve(&acq, &ctx, &job, None, Decision::Retry)
         );
-        assert_eq!(discarded.unwrap().unwrap().job.state, JobState::Dismissed);
+        assert_eq!(
+            discarded.unwrap().job.unwrap().job.state,
+            JobState::Dismissed
+        );
         let refused = retried.unwrap_err();
         let (failure, facts) = failed(&refused);
         assert_eq!(

@@ -7,8 +7,10 @@ use super::{Duplicates, ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
 use crate::ledger::{self, JobEvent};
 use shared::download::{ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use soulbeet::{ImportMode, ImportOutcome, SkipReason};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::warn;
 
@@ -34,6 +36,31 @@ pub(super) fn skipped_duplicate(outcome: &ImportOutcome, duplicates: &Duplicates
             outcome,
             ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { .. })
         )
+}
+
+/// A kept import discarded: the job, and its files the OS refused to delete.
+#[derive(Debug)]
+pub struct Discarded {
+    pub job: ImportJob,
+    pub files_left: Vec<FileLeft>,
+}
+
+/// A downloaded file of a discarded import that is still on disk, and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileLeft {
+    pub path: PathBuf,
+    pub failure: Failure,
+}
+
+/// The OS refused to delete a file of a discarded import (`e`): a person removes it.
+fn not_deleted(e: &std::io::Error) -> Failure {
+    Failure::new(
+        FailureCode::DeleteFailed,
+        Stage::Import,
+        RetryAdvice::NeedsUser,
+        "Soulful could not delete this downloaded file; it stays on disk",
+    )
+    .with_cause(Service::Filesystem, None, e.to_string())
 }
 
 struct Kept {
@@ -249,9 +276,9 @@ impl ImportQueue {
     /// Takes the kept job of `item` as a retry takes it, so a retry after it
     /// finds nothing, dismisses its rows' slots and deletes its own downloaded
     /// files under its cleanup root (a job without one keeps them). Taken before the
-    /// delete, so a deleted file was never also resubmitted. The job, or
-    /// nothing_to_retry().
-    pub async fn discard(&self, user: &UserId, item: &str) -> Result<ImportJob, ImportRefusal> {
+    /// delete, so a deleted file was never also resubmitted. The job with the
+    /// files it could not delete, which stay on disk, or nothing_to_retry().
+    pub async fn discard(&self, user: &UserId, item: &str) -> Result<Discarded, ImportRefusal> {
         let job = {
             let _emit = self.shared.emit_lock.lock().await;
             let (job, (), dropped) = self.shared.retries.take(user, item, |_| Ok(()))?;
@@ -261,15 +288,23 @@ impl ImportQueue {
             self.shared.dismiss(slots);
             Arc::unwrap_or_clone(job)
         };
+        let mut files_left = Vec::new();
         if let Some(root) = &job.cleanup_root {
             for (path, e) in crate::core::acquire::discard_files(&job.files, root).await {
                 warn!(
                     "Could not delete the discarded import {}: {e}",
                     path.display()
                 );
+                // A file gone already is not left, nor is a folder left behind.
+                if e.kind() != std::io::ErrorKind::NotFound && job.files.contains(&path) {
+                    files_left.push(FileLeft {
+                        path,
+                        failure: not_deleted(&e),
+                    });
+                }
             }
         }
-        Ok(job)
+        Ok(Discarded { job, files_left })
     }
 
     /// Drops the kept jobs of `items` and dismisses their slots (D5).

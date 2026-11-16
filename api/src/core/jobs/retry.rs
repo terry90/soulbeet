@@ -13,6 +13,7 @@ use shared::failure::{
 use soulbeet::error::PeerAsk;
 use soulbeet::ImportMode;
 
+use super::decide::in_download_folder;
 use super::runner::{fail_job, spawn_drive, Acquire};
 use super::{
     allowed, done_source, folder_for, job_already_running, job_failure, job_not_found, job_view,
@@ -26,6 +27,7 @@ use crate::core::sources::{
     view, SearchRun,
 };
 use crate::core::{database_failure, logged};
+use crate::import_queue::FileLeft;
 use crate::ledger::store::{self, StoredSearch};
 use crate::ledger::{
     Admitted, BatchOrigin, JobKind, JobOptions, JobState, NewJob, NewJobBatch, Pick, SourceFilters,
@@ -545,11 +547,31 @@ pub(crate) async fn cancel(
 /// dismisses those slots; a kept import gone while its slot still waits (another decision took it
 /// and has not recorded it yet) refuses with the queue's failure, and the call can be made again.
 /// Then the job ends dismissed; one whose slots the discards all dismissed already is answered as
-/// it is.
-pub(crate) async fn dismiss(
+/// it is. The files of the discarded imports that could not be deleted come with any answer:
+/// they stay on disk whatever happened after.
+pub(crate) async fn dismiss(acquire: &Acquire, ctx: &UserCtx, job: &str) -> Dismissed {
+    let mut files_left = Vec::new();
+    let answer = dismiss_discarding(acquire, ctx, job, &mut files_left).await;
+    Dismissed {
+        answer,
+        files_left: in_download_folder(acquire, files_left),
+    }
+}
+
+/// What dismiss_job did: its answer, and the files of the kept imports it discarded that could
+/// not be deleted, each path relative to the download folder.
+#[derive(Debug)]
+pub(crate) struct Dismissed {
+    pub answer: Result<RetryAnswer, Failure>,
+    pub files_left: Vec<FileLeft>,
+}
+
+/// `dismiss`, adding each discard's files left to `files_left`.
+async fn dismiss_discarding(
     acquire: &Acquire,
     ctx: &UserCtx,
     job: &str,
+    files_left: &mut Vec<FileLeft>,
 ) -> Result<RetryAnswer, Failure> {
     let view = named_job(acquire, ctx, job).await?;
     let states = Transition::Dismiss.allowed_from();
@@ -572,7 +594,10 @@ pub(crate) async fn dismiss(
         }
         for item in items {
             match acquire.queue.discard(&ctx.id(), &item).await {
-                Ok(_) => discarded = true,
+                Ok(done) => {
+                    discarded = true;
+                    files_left.extend(done.files_left);
+                }
                 Err(refusal) => {
                     let now = named_job(acquire, ctx, job).await?;
                     let still_waiting = now.slots.iter().any(|slot| {
@@ -1408,7 +1433,7 @@ mod tests {
                 .unwrap()
         ));
         assert!(web_page(cancel(&acq, &alice(), &job).await.unwrap()));
-        let dismissed = dismiss(&acq, &alice(), &job).await.unwrap();
+        let dismissed = dismiss(&acq, &alice(), &job).await.answer.unwrap();
         assert!(matches!(dismissed, RetryAnswer::Applied(v) if v.job.state == JobState::Dismissed));
     }
 
@@ -1464,7 +1489,8 @@ mod tests {
         });
         // The second slot's kept import is not in the queue: another decision took it.
         let job = kept_album_job(&acq, [&files[0], &files[1]], [true, false]).await;
-        let RetryAnswer::Unavailable(f, facts) = dismiss(&acq, &alice(), &job).await.unwrap()
+        let RetryAnswer::Unavailable(f, facts) =
+            dismiss(&acq, &alice(), &job).await.answer.unwrap()
         else {
             panic!()
         };
@@ -1504,7 +1530,7 @@ mod tests {
             rows: vec![row],
         });
         acq.ledger.settled().await;
-        let dismissed = dismiss(&acq, &alice(), &job).await.unwrap();
+        let dismissed = dismiss(&acq, &alice(), &job).await.answer.unwrap();
         assert!(matches!(dismissed, RetryAnswer::Applied(v) if v.job.state == JobState::Dismissed));
     }
 
@@ -1518,7 +1544,7 @@ mod tests {
             file
         });
         let job = kept_album_job(&acq, [&files[0], &files[1]], [true, true]).await;
-        let dismissed = dismiss(&acq, &alice(), &job).await.unwrap();
+        let dismissed = dismiss(&acq, &alice(), &job).await.answer.unwrap();
         assert!(matches!(dismissed, RetryAnswer::Applied(v) if v.job.state == JobState::Dismissed));
         for item in ["a/07.flac", "a/08.flac"] {
             let kept = acq.queue.import_choices(&alice().id(), item);

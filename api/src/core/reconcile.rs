@@ -3091,7 +3091,7 @@ mod tests {
         let alice = UserId::new("alice");
         let kept_file = file_of("a", "The Holly and the Ivy");
         assert!(queue.import_choices(&alice, &kept_file).is_ok());
-        let restored = queue.discard(&alice, &kept_file).await.unwrap();
+        let restored = queue.discard(&alice, &kept_file).await.unwrap().job;
         assert_eq!(
             restored.stored().map(|s| (s.sources, s.duplicates)),
             Some((vec![file("kept")], DuplicateRule::Skip))
