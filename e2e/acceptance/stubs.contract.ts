@@ -87,7 +87,10 @@ test('the Navidrome proxy refuses connections while down', async () => {
   await setNavidromeDown(true);
   try {
     const refused = await fetch(navidromeProxyUrl).then(() => null, (e: Error) => e);
-    expect((refused?.cause as NodeJS.ErrnoException | undefined)?.code).toBe('ECONNREFUSED');
+    // The proxy's listener is closed, so a container on the stack's network is
+    // refused. This test dials the published port, where the container
+    // runtime's forwarder may accept and then reset instead.
+    expect(['ECONNREFUSED', 'ECONNRESET']).toContain((refused?.cause as NodeJS.ErrnoException | undefined)?.code);
   } finally {
     await setNavidromeDown(false);
   }
