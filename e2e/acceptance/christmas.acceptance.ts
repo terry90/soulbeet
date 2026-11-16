@@ -420,7 +420,11 @@ test('the Christmas playlist is filled through every injected failure by followi
     const list = (await a.ok('get_playlist', { playlist_id: playlistId })) as {
       entries: { position: number; song_id: string; title: string }[];
     };
-    expect(list.entries.map((e) => [e.position, e.title])).toEqual(WANTED.map((w, i) => [i, w.title]));
+    const jobs = ((await a.ok('get_jobs', { batch_id: batchId, detail: 'full' })) as { jobs: JobDoc[] }).jobs;
+    const imports = jobs.map((j) => ({ title: j.wanted.title, state: j.state, results: j.results }));
+    expect(list.entries.map((e) => [e.position, e.title]), JSON.stringify(imports)).toEqual(
+      WANTED.map((w, i) => [i, w.title]),
+    );
     expect(new Set(list.entries.map((e) => e.song_id)).size).toBe(8);
     for (const e of list.entries) {
       const s = await streamAs(alice, e.song_id);
@@ -429,7 +433,6 @@ test('the Christmas playlist is filled through every injected failure by followi
     const songOf = (title: string) => list.entries.find((e) => e.title === title)?.song_id as string;
     // The tracks she owned keep their songs.
     expect([songOf('Silent Night'), songOf('Coventry Carol')]).toEqual([silentId, coventryId]);
-    const jobs = ((await a.ok('get_jobs', { batch_id: batchId, detail: 'full' })) as { jobs: JobDoc[] }).jobs;
     const full = (title: string) =>
       jobs.find((j) => j.wanted.title === title) as JobDoc & {
         tried: { code: string; source: string }[];
