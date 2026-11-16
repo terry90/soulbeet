@@ -170,10 +170,6 @@ impl DiscoveryTrackRow {
         Ok(row.map(Into::into))
     }
 
-    pub async fn update_status(id: &str, status: &DiscoveryStatus) -> Result<(), String> {
-        Self::update_status_in(&DB, id, status).await
-    }
-
     pub(crate) async fn update_status_in(
         db: &sqlx::SqlitePool,
         id: &str,

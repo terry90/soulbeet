@@ -36,15 +36,6 @@ impl DiscoveryHistoryRow {
     }
 
     /// Update the outcome for a track (e.g., promoted, removed, expired).
-    pub async fn update_outcome(
-        user_id: &str,
-        artist: &str,
-        track: &str,
-        outcome: &str,
-    ) -> Result<(), String> {
-        Self::update_outcome_in(&DB, user_id, artist, track, outcome).await
-    }
-
     pub(crate) async fn update_outcome_in(
         db: &sqlx::SqlitePool,
         user_id: &str,
