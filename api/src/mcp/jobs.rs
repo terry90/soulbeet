@@ -499,7 +499,7 @@ pub(crate) const RETRY_JOB: ToolSpec = ToolSpec {
     title: "Retry a job",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Tries a job again in one of five modes. same_source: the source that failed, for a failure that says to retry it later, or a cancelled job (track jobs). next_source: the best source of the job's search not tried yet (track jobs). new_search: a new search, with optional query_text and filters, or the search_id of a find_sources search. index_only: wait for Navidrome again, for a job that failed at indexing. reject_result: a done job's file is not the recording wanted; the job reopens without that source (the file stays in the library until deleted). A mode the job's state does not allow is refused with wrong_job_state; next in every job document lists only the modes allowed now. A failure that needs a person lists none: after the person did what its user_action says, retry_job runs again. A mode refused because of the job's own failure answers that failure. Album jobs retry by new_search or index_only. Jobs started in Soulful's web page are retried there. Answers the job's full document, as get_jobs gives it. Failure codes: {common}, unknown_handle, expired_handle (search_id), wrong_job_state, sources_exhausted, peer_offline (same_source while the source is offline), enqueue_failed (same_source of a source slskd's blacklist holds), backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), already_running (a call with this request_key still runs).")
+        format!("Tries a job again in one of five modes. same_source: the source that failed, for a failure that says to retry it later, or a cancelled job (track jobs). next_source: the best source of the job's search not tried yet (track jobs). new_search: a new search, with optional query_text and filters, or the search_id of a find_sources search. index_only: wait for Navidrome again, for a job that failed at indexing. reject_result: a done job's file is not the recording wanted; the job reopens without that source (the file stays in the library until deleted). A mode the job's state does not allow is refused with wrong_job_state; next in every job document lists only the modes allowed now. A failure that needs a person lists none: after the person did what its user_action says, retry_job runs again. A job whose recording is already in the library takes no mode (import_already_in_library); any other mode the job does not allow now is invalid_input naming the modes it allows. Album jobs retry by new_search or index_only. Jobs started in Soulful's web page are retried there. Answers the job's full document, as get_jobs gives it; when a new search cannot be recorded, the job ends failed with that failure. A change made whose job could not be read after it answers the read's failure with facts.changed true and get_jobs in next. Failure codes: {common}, unknown_handle, expired_handle (search_id), wrong_job_state, sources_exhausted, import_already_in_library, peer_offline (same_source while the source is offline), enqueue_failed (same_source of a source slskd's blacklist holds), backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["job_id", "mode"], "properties": {"job_id": {"type": "string", "minLength": 1}, "mode": {"enum": ["same_source", "next_source", "new_search", "index_only", "reject_result"]}, "query_text": {"type": "string", "minLength": 1}, "#,
@@ -594,11 +594,15 @@ impl JobTool {
     }
 
     /// The answer to `answered`, an action on job `job` (None for a job download_source was to
-    /// make). A change made answers the job's full document, kept for the request key. A refusal
-    /// carries the job's `state` and `next` as read again after it, after this call again when
-    /// the failure says the same source can answer later (`again`); an argument the job cannot
-    /// take is invalid_input; a failure that kept the action from running offers `again` as
-    /// upstream errors do. None of these changed anything, so the key is let go.
+    /// make). A change made answers the job's full document, kept for the request key; when the
+    /// job cannot be read after it, the read's failure is kept instead, with get_jobs for the job
+    /// in `next`. A refusal carries the job's `state` and `next` as read again after it; a call
+    /// held back by what it reached also offers this call again first (`again`) when the failure
+    /// says the same call can answer later, while a call the job does not take never offers it.
+    /// An argument the job cannot take is invalid_input, with the job's state and next as a
+    /// refusal has them; a failure that kept the action from
+    /// running offers `again` as upstream errors do. None of these changed anything, so the key
+    /// is let go.
     pub(crate) async fn answer(
         &self,
         job: Option<&str>,
@@ -610,17 +614,25 @@ impl JobTool {
                 Ok(fields) => success(fields),
                 Err(f) => failed(upstream_error(f, Map::new(), None)),
             }),
+            Ok(RetryAnswer::AppliedUnread { job, failure }) => {
+                Keyed::Kept(failed(applied_unread(job, failure)))
+            }
             Ok(RetryAnswer::Refused(failure, facts)) => {
+                Keyed::Released(failed(self.refusal(job, failure, facts, None).await))
+            }
+            Ok(RetryAnswer::Unavailable(failure, facts)) => {
+                let again = again.filter(|_| failure.retry == RetryAdvice::SameSourceLater);
                 Keyed::Released(failed(self.refusal(job, failure, facts, again).await))
             }
             Ok(RetryAnswer::InvalidInput { field, expected }) => {
-                Keyed::Released(failed(invalid_value(self.tool, field, &expected)))
+                let ToolError { failure, facts, .. } = invalid_value(self.tool, field, &expected);
+                Keyed::Released(failed(self.refusal(job, failure, facts, None).await))
             }
             Err(f) => Keyed::Released(failed(upstream_error(f, Map::new(), again))),
         }
     }
 
-    /// `failure` with `facts`, the state of job `job` and its next as read now.
+    /// `failure` with `facts`, the state of job `job` and its next as read now, after `again`.
     async fn refusal(
         &self,
         job: Option<&str>,
@@ -628,10 +640,7 @@ impl JobTool {
         mut facts: Map<String, Value>,
         again: Option<NextCall>,
     ) -> ToolError {
-        let mut next = Vec::new();
-        if failure.retry == RetryAdvice::SameSourceLater {
-            next.extend(again);
-        }
+        let mut next: Vec<NextCall> = again.into_iter().collect();
         if let Some(job) = job {
             match self.read(job).await {
                 Ok(Some((view, untried))) => {
@@ -661,6 +670,25 @@ impl JobTool {
         let now = chrono::Utc::now().timestamp();
         let untried = untried(&self.acquire.db, &view, now).await?;
         Ok(Some((view, untried)))
+    }
+}
+
+/// A change made to job `job` that could not be read after it: the read's `failure`, the facts
+/// that the change was made, and get_jobs for the job, never the call again (it would find the
+/// job changed).
+fn applied_unread(job: String, failure: Failure) -> ToolError {
+    let facts = Map::from_iter([
+        ("job_id".to_string(), json!(job)),
+        ("changed".to_string(), json!(true)),
+    ]);
+    ToolError {
+        failure,
+        facts,
+        tried: vec![],
+        next: vec![NextCall::new(
+            "get_jobs",
+            json!({"job_ids": [job], "detail": "full"}),
+        )],
     }
 }
 
@@ -792,7 +820,8 @@ mod tests {
     use crate::core::jobs::runner::drive;
     use crate::core::jobs::test_support::{
         auto_options, downloading_track_job, downloading_track_job_with, duplicate_track_job,
-        fail_slot, failed_track_job, failed_web_ui_job, mcp_track_job, track_job_of,
+        fail_slot, failed_track_job, failed_track_job_with, failed_web_ui_job, mcp_track_job,
+        track_job_of,
     };
     use crate::core::test_ctx;
     use crate::ledger::{JobEvent, JobState};
@@ -1195,6 +1224,80 @@ mod tests {
                 "wait_seconds": 60, "wait_for": "any_change"}},
                 {"tool": "cancel_job", "args": {"job_id": running}}])
         );
+    }
+
+    #[tokio::test]
+    async fn a_mode_refused_for_the_job_is_never_offered_again() {
+        let (db, acq, _, token) = jobs_app().await;
+        // slskd's text for a peer whose upload queue is full, which says to retry the same peer
+        // later (Application.cs:763-766).
+        let busy = Failure::new(
+            FailureCode::TransferRejectedPeerBusy,
+            Stage::Transfer,
+            RetryAdvice::SameSourceLater,
+            "Transfer rejected: Too many files",
+        );
+        let job = failed_track_job_with(&acq, "Silent Night", busy).await;
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "retry_job",
+                json!({"job_id": job, "mode": "index_only"}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            (error["code"].as_str(), error["message"].as_str()),
+            (
+                Some("invalid_input"),
+                Some("retry_job: mode must be one of same_source, next_source, new_search, the modes the job allows now")
+            ),
+            "{error}"
+        );
+        let offered: Vec<&Value> = (error["next"].as_array().unwrap().iter())
+            .filter(|n| n["tool"] == "retry_job")
+            .map(|n| &n["args"]["mode"])
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                &json!("same_source"),
+                &json!("next_source"),
+                &json!("new_search")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_change_whose_job_cannot_be_read_after_it_keeps_its_request_key() {
+        let (db, acq, _, token) = jobs_app().await;
+        let job = downloading_track_job(&acq).await;
+        // Every read of the job fails once the change is written (an unreadable row).
+        sqlx::query(&format!(
+            "CREATE TRIGGER unreadable AFTER UPDATE OF state ON jobs WHEN NEW.id = '{job}' \
+             BEGIN UPDATE jobs SET wanted = 'unreadable' WHERE id = NEW.id; END"
+        ))
+        .execute(&db)
+        .await
+        .unwrap();
+        let call = json!({"job_id": job, "request_key": "cancel-1"});
+        let first = call_tool(app_of(&db, &acq), &token, "cancel_job", call.clone()).await;
+        let error = document(&first)["error"].clone();
+        assert_eq!(
+            (&error["code"], &error["facts"]["changed"]),
+            (&json!("settings_unreadable"), &json!(true)),
+            "{error}"
+        );
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "get_jobs", "args": {"job_ids": [job], "detail": "full"}}])
+        );
+        // The connection dropped: the same key answers the first call's answer, and the cancel
+        // is not asked for again.
+        let again = call_tool(app_of(&db, &acq), &token, "cancel_job", call).await;
+        assert_eq!(document(&again), document(&first));
     }
 
     #[tokio::test]

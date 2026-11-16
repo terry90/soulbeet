@@ -1162,10 +1162,19 @@ impl Writer {
         let mut tx = self.db.begin().await?;
         // `sent`: a monitor batch or a backend request is recorded for the job's current pick,
         // so its files may have reached the backend.
-        let found: Option<(String, bool, bool, Option<String>, bool, bool)> = sqlx::query_as(
+        type Found = (
+            String,
+            bool,
+            bool,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+        );
+        let found: Option<Found> = sqlx::query_as(
             "SELECT j.state, j.gate_held, j.cancel_requested, b.origin, \
                     j.monitor_batch_id IS NOT NULL OR j.request IS NOT NULL, \
-                    j.options IS NOT NULL \
+                    j.options IS NOT NULL, j.search_id \
              FROM jobs j LEFT JOIN batches b ON b.id = j.batch_id \
              WHERE j.id = ? AND j.user_id = ?",
         )
@@ -1173,7 +1182,9 @@ impl Writer {
         .bind(user.to_string())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((state, gate_held, cancel_requested, origin, sent, has_options)) = found else {
+        let Some((state, gate_held, cancel_requested, origin, sent, has_options, search_id)) =
+            found
+        else {
             return Ok(Transitioned::Unknown);
         };
         let from = state_named(&state)?;
@@ -1199,6 +1210,7 @@ impl Writer {
                 })
                 .collect()
         };
+        let mut stopped_search = None;
         let (to, entries) = match change {
             Transition::Cancel if may_have_transfers => {
                 // Its transfers may exist: every monitor stops them on its next poll.
@@ -1211,6 +1223,9 @@ impl Writer {
             }
             Transition::Cancel => {
                 self.end_slots(&mut tx, job, JobState::Cancelled).await?;
+                if from == JobState::Searching {
+                    stopped_search = search_id;
+                }
                 let to = JobState::Cancelled;
                 (to, vec![Entry::at(to, "cancelled")])
             }
@@ -1337,7 +1352,12 @@ impl Writer {
             append(&mut tx, job, entry).await?;
         }
         tx.commit().await?;
-        Ok(Transitioned::Applied { from, to, seq })
+        Ok(Transitioned::Applied {
+            from,
+            to,
+            seq,
+            stopped_search,
+        })
     }
 
     /// Moves each failed slot of `job` whose row's wait for Navidrome failed at the index stage

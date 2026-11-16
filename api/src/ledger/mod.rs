@@ -524,6 +524,9 @@ pub enum Transitioned {
         from: JobState,
         to: JobState,
         seq: i64,
+        /// A Cancel that ended a searching job: the search it was waiting on, as the job held it
+        /// in the same write, for the caller to stop (D9).
+        stopped_search: Option<String>,
     },
     /// The job is in `state`, which the change is not allowed from, or in which it changes
     /// nothing (a Reindex of a job none of whose slots failed waiting for Navidrome).

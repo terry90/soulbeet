@@ -18,11 +18,11 @@ use super::{
 };
 use crate::auth::UserCtx;
 use crate::core::acquire::{numbered, AUTO_SELECT_SCORE_THRESHOLD};
-use crate::core::database_failure;
 use crate::core::sources::{
     candidate_not_found, owned_search, parse_candidate_id, search_not_found, start_stored,
     SearchRun,
 };
+use crate::core::{database_failure, logged};
 use crate::ledger::store::StoredSearch;
 use crate::ledger::{
     Admitted, BatchOrigin, JobKind, JobOptions, JobState, NewJob, NewJobBatch, Pick, SourceFilters,
@@ -35,8 +35,16 @@ use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 pub(crate) enum RetryAnswer {
     /// The change was made: the job as it is now.
     Applied(Box<JobView>),
-    /// Refused with this failure and its facts.
+    /// The change to job `job` was made, but the job could not be read after it: `failure` says
+    /// why.
+    AppliedUnread { job: String, failure: Failure },
+    /// The job does not take the call as it is now (its state, its kind, its candidates, its
+    /// recording already in the library), so the same call is refused until the job changes.
     Refused(Failure, Map<String, Value>),
+    /// Something the call reached failed or held it back (the backend, the source, MusicBrainz,
+    /// the import queue, the user's folders, the database, the user's job limit): the failure's
+    /// advice says whether the same call can work later. Nothing was changed.
+    Unavailable(Failure, Map<String, Value>),
     /// The job cannot take what an argument says: `field` must be `expected`.
     InvalidInput {
         field: &'static str,
@@ -152,6 +160,18 @@ async fn named_job(acquire: &Acquire, ctx: &UserCtx, job: &str) -> Result<JobVie
     job_view(acquire, ctx, job).await?.ok_or_else(job_not_found)
 }
 
+/// The answer to a change made to `ctx`'s job `job`: the job as it is now, or the change made
+/// without it when the job cannot be read.
+async fn as_changed(acquire: &Acquire, ctx: &UserCtx, job: &str) -> RetryAnswer {
+    match named_job(acquire, ctx, job).await {
+        Ok(view) => RetryAnswer::Applied(Box::new(view)),
+        Err(failure) => RetryAnswer::AppliedUnread {
+            job: job.to_string(),
+            failure,
+        },
+    }
+}
+
 /// The refusal of a job started in the web page.
 fn web_page_job(view: &JobView) -> Option<RetryAnswer> {
     (view.job.origin == BatchOrigin::Ui).then(|| RetryAnswer::InvalidInput {
@@ -189,9 +209,7 @@ async fn apply(
             if to == JobState::Queued {
                 spawn_drive(acquire.clone(), ctx.clone(), id.clone());
             }
-            Ok(RetryAnswer::Applied(Box::new(
-                named_job(acquire, ctx, id).await?,
-            )))
+            Ok(as_changed(acquire, ctx, id).await)
         }
         Transitioned::Refused { state } => Ok(refused(wrong_job_state(state, action, states))),
         Transitioned::Unknown => Err(job_not_found()),
@@ -258,19 +276,19 @@ pub(crate) async fn retry(
 }
 
 /// Why `allowed` refuses `mode` for `view`: wrong_job_state for the job's state; the job's own
-/// failure when that failure is why (its recording already in the library, a failure that does
-/// not say to try that source later, one that was not a wait for Navidrome); sources_exhausted
-/// for next_source with nothing untried; else the modes the job allows now.
+/// failure only when its recording is already in the library, which no mode changes;
+/// sources_exhausted for next_source when no untried candidate is left; else the modes the job
+/// allows now. The job's failure of any other kind is not why a mode is refused, and answering it
+/// would read as if the call itself had failed with it.
 fn refusal(view: &JobView, untried: &Untried, mode: RetryMode) -> RetryAnswer {
     let job = &view.job;
     if !mode.states().contains(&job.state) {
         let action = format!("retry_job {}", mode.as_str());
         return refused(wrong_job_state(job.state, &action, mode.states()));
     }
-    let failure = job_failure(view);
-    if let Some(f) = failure.as_ref() {
+    if let Some(f) = job_failure(view) {
         if f.code == FailureCode::ImportAlreadyInLibrary {
-            return RetryAnswer::Refused(f.clone(), Map::new());
+            return RetryAnswer::Refused(f, Map::new());
         }
     }
     let track_only = matches!(mode, RetryMode::SameSource | RetryMode::NextSource);
@@ -280,11 +298,8 @@ fn refusal(view: &JobView, untried: &Untried, mode: RetryMode) -> RetryAnswer {
             expected: "new_search or index_only: an album job is retried whole".to_string(),
         };
     }
-    if mode == RetryMode::NextSource {
+    if mode == RetryMode::NextSource && untried.best().is_none() {
         return RetryAnswer::Refused(sources_exhausted(), Map::new());
-    }
-    if let Some(f) = failure {
-        return RetryAnswer::Refused(f, Map::new());
     }
     let modes: Vec<&str> = (RetryMode::ALL.into_iter())
         .filter(|m| allowed(view, untried, *m))
@@ -308,14 +323,25 @@ async fn source_ready(acquire: &Acquire, source: &str) -> Result<(), RetryAnswer
             stage: Stage::Enqueue,
             ..f
         };
-        RetryAnswer::Refused(f, Map::new())
+        RetryAnswer::Unavailable(f, Map::new())
     })?;
-    let refused = |failure| Err(RetryAnswer::Refused(failure, source_facts(source)));
+    let refused = |failure| Err(RetryAnswer::Unavailable(failure, source_facts(source)));
     match backend.source_status(source).await {
         Ok(SourcePresence::Offline) => refused(source_offline()),
         Ok(SourcePresence::Blocked) => refused(source_blocked()),
         Ok(SourcePresence::Online | SourcePresence::Away) => Ok(()),
         Err(e) => refused(e.failure(Stage::Enqueue, e.to_string())),
+    }
+}
+
+/// What a failed read of a search the caller named answers: refused for an id that names no live
+/// search of theirs, unavailable when the database could not say.
+fn search_refused(failure: Failure, facts: Map<String, Value>) -> RetryAnswer {
+    match failure.code {
+        FailureCode::UnknownHandle | FailureCode::ExpiredHandle => {
+            RetryAnswer::Refused(failure, facts)
+        }
+        _ => RetryAnswer::Unavailable(failure, facts),
     }
 }
 
@@ -354,7 +380,7 @@ async fn search_again(
             let facts = Map::from_iter([("search_id".to_string(), json!(id))]);
             let stored = match owned_search(&acquire.db, ctx, &id).await {
                 Ok(stored) => stored,
-                Err(f) => return Ok(RetryAnswer::Refused(f, facts)),
+                Err(f) => return Ok(search_refused(f, facts)),
             };
             // A web UI search was no tool's.
             if stored.spec.is_none() {
@@ -372,12 +398,12 @@ async fn search_again(
             let mut query = job.wanted.clone();
             if job.kind == JobKind::Album {
                 if let Err(f) = acquire.effects.hydrate(ctx, &mut query).await {
-                    return Ok(RetryAnswer::Refused(f, Map::new()));
+                    return Ok(RetryAnswer::Unavailable(f, Map::new()));
                 }
             }
             let backend = match acquire.effects.backend().await {
                 Ok(backend) => backend,
-                Err(f) => return Ok(RetryAnswer::Refused(f, Map::new())),
+                Err(f) => return Ok(RetryAnswer::Unavailable(f, Map::new())),
             };
             let job_filters = job.options.as_ref().map(|o| o.filters.clone());
             let spec = StoredSpec {
@@ -413,18 +439,44 @@ async fn search_again(
     // stop mark that start_stored takes (D9).
     if let Some((backend, run)) = start {
         let started = start_stored(&acquire.searches, &acquire.ledger, ctx, backend, run).await;
-        if let Err(f) = started {
-            tracing::warn!(
-                "Could not record search {search_id} of job {}: {}; its runner searches for the job's own query",
-                job.id,
-                f.message
-            );
+        if let Err(failure) = started {
+            return Ok(search_not_started(acquire, ctx, &job.id, &search_id, failure).await);
         }
     }
     spawn_drive(acquire.clone(), ctx.clone(), job.id.clone());
-    Ok(RetryAnswer::Applied(Box::new(
-        named_job(acquire, ctx, &job.id).await?,
-    )))
+    Ok(as_changed(acquire, ctx, &job.id).await)
+}
+
+/// The search `search_id` that new_search was to start for `ctx`'s searching job `job` could not
+/// be recorded, so nothing searches with what the caller gave: the job ends failed with
+/// `failure` (cancelled when its user cancelled it meanwhile) and is answered as it then is. A
+/// runner would search the job's own query instead, so none is started. When even that write
+/// fails, the job stays searching with no runner, which cancel_job can end.
+async fn search_not_started(
+    acquire: &Acquire,
+    ctx: &UserCtx,
+    job: &str,
+    search_id: &str,
+    failure: Failure,
+) -> RetryAnswer {
+    tracing::warn!(
+        "Could not record search {search_id} of job {job}: {}",
+        logged(&failure)
+    );
+    let fail = Transition::Fail {
+        failure: failure.clone(),
+    };
+    match acquire.ledger.transition(&ctx.id(), job, fail).await {
+        // Failed, or ended another way while the search was being recorded.
+        Ok(_) => as_changed(acquire, ctx, job).await,
+        Err(e) => {
+            tracing::warn!("Could not fail job {job} after its search was not recorded: {e}");
+            RetryAnswer::AppliedUnread {
+                job: job.to_string(),
+                failure,
+            }
+        }
+    }
 }
 
 /// cancel_job: `ctx`'s job `job` stops (D9). One without transfers ends cancelled at once, its
@@ -446,15 +498,13 @@ pub(crate) async fn cancel(
         .await)
         .map_err(|e| database_failure(Stage::Input, e))?;
     match changed {
-        Transitioned::Applied { from, to, .. } => {
-            let view = named_job(acquire, ctx, job).await?;
-            // Read after the cancel, which no later search change can follow.
-            if (from, to) == (JobState::Searching, JobState::Cancelled) {
-                if let Some(id) = &view.job.search_id {
-                    acquire.searches.stop(id).await;
-                }
+        Transitioned::Applied { stopped_search, .. } => {
+            // The search the job held when it was cancelled, which no later search change can
+            // follow.
+            if let Some(id) = stopped_search {
+                acquire.searches.stop(&id).await;
             }
-            Ok(RetryAnswer::Applied(Box::new(view)))
+            Ok(as_changed(acquire, ctx, job).await)
         }
         Transitioned::Refused { state } => {
             Ok(refused(wrong_job_state(state, "cancel_job", states)))
@@ -504,7 +554,7 @@ pub(crate) async fn dismiss(
                     });
                     if still_waiting {
                         let facts = Map::from_iter([("kept".to_string(), json!("gone"))]);
-                        return Ok(RetryAnswer::Refused(refusal.failure, facts));
+                        return Ok(RetryAnswer::Unavailable(refusal.failure, facts));
                     }
                 }
             }
@@ -526,9 +576,7 @@ pub(crate) async fn dismiss(
         }
         Transitioned::Unknown => return Err(job_not_found()),
     }
-    Ok(RetryAnswer::Applied(Box::new(
-        named_job(acquire, ctx, job).await?,
-    )))
+    Ok(as_changed(acquire, ctx, job).await)
 }
 
 /// download_source: candidate `candidate_id` of the caller's live search becomes the source of
@@ -582,10 +630,10 @@ pub(crate) async fn download_source(
         return Ok(wrong_kind(wanted.kind()));
     }
     if let Some(f) = acquire.effects.importer_blocked().await {
-        return Ok(RetryAnswer::Refused(f, Map::new()));
+        return Ok(RetryAnswer::Unavailable(f, Map::new()));
     }
     if let Err(f) = acquire.effects.backend().await {
-        return Ok(RetryAnswer::Refused(f, Map::new()));
+        return Ok(RetryAnswer::Unavailable(f, Map::new()));
     }
     let folder = match folder_for(&acquire.db, ctx, folder_id.as_deref()).await {
         Ok(folder) => folder,
@@ -597,14 +645,14 @@ pub(crate) async fn download_source(
                 true => Map::new(),
                 false => Map::from_iter([("folders".to_string(), json!(listed))]),
             };
-            return Ok(RetryAnswer::Refused(failure, facts));
+            return Ok(RetryAnswer::Unavailable(failure, facts));
         }
     };
     let mut query = wanted.query();
     if let Wanted::Album(album) = &wanted {
         if let Err(f) = acquire.effects.hydrate(ctx, &mut query).await {
             let facts = Map::from_iter([("release_mbid".to_string(), json!(album.release_mbid))]);
-            return Ok(RetryAnswer::Refused(f, facts));
+            return Ok(RetryAnswer::Unavailable(f, facts));
         }
     }
     let batch = NewJobBatch {
@@ -643,12 +691,13 @@ pub(crate) async fn download_source(
     match admitted {
         Admitted::Created => {
             spawn_drive(acquire.clone(), ctx.clone(), id.clone());
-            Ok(RetryAnswer::Applied(Box::new(
-                named_job(acquire, ctx, &id).await?,
-            )))
+            Ok(as_changed(acquire, ctx, &id).await)
         }
         Admitted::AlreadyRunning { job, state } => Ok(refused(job_already_running(&job, state))),
-        Admitted::OverLimit { unfinished } => Ok(refused(over_limit(unfinished))),
+        Admitted::OverLimit { unfinished } => {
+            let (failure, facts) = over_limit(unfinished);
+            Ok(RetryAnswer::Unavailable(failure, facts))
+        }
     }
 }
 
@@ -667,7 +716,7 @@ async fn candidate(
         .await
         .map_err(|f| match f.code {
             FailureCode::UnknownHandle => unknown(),
-            _ => RetryAnswer::Refused(f, facts.clone()),
+            _ => search_refused(f, facts.clone()),
         })?;
     if stored.spec.is_none() {
         return Err(unknown());
@@ -688,12 +737,12 @@ mod tests {
     use crate::core::jobs::runner::{drive, TestEffects};
     use crate::core::jobs::test_support::{
         auto_options, done_track_job, downloading_track_job, failed_track_job,
-        failed_track_job_with, failed_web_ui_job, importing_track_job, kept_album_job,
-        mcp_track_job, queued_track_jobs, stop_slots, test_db_with_alice, view_of,
+        failed_track_job_with, failed_web_ui_job, importing_track_job, index_failed_track_job,
+        kept_album_job, mcp_track_job, queued_track_jobs, stop_slots, test_db_with_alice, view_of,
     };
-    use crate::core::sources::{search_stopped, SearchProgress, Searches};
+    use crate::core::sources::{search_stopped, server_restarted_search, SearchProgress, Searches};
     use crate::core::test_ctx;
-    use crate::ledger::JobEvent;
+    use crate::ledger::{store, JobEvent};
     use crate::server_fns::download::test_support::{search_result, track, transfer};
     use crate::transfer_registry::TransferRegistry;
     use shared::download::{DownloadQuery, DownloadState, JobSlot, SearchState};
@@ -861,7 +910,7 @@ mod tests {
         let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
         let job = failed_track_job_with(&acq, "Silent Night", peer_busy()).await;
         effects.stub().set_presence(SourcePresence::Offline);
-        let RetryAnswer::Refused(f, facts) =
+        let RetryAnswer::Unavailable(f, facts) =
             retry(&acq, &alice(), &job, RetryMode::SameSource, None)
                 .await
                 .unwrap()
@@ -874,9 +923,10 @@ mod tests {
         );
         assert_eq!(facts["source"], "peer_a");
         effects.stub().set_presence(SourcePresence::Blocked);
-        let RetryAnswer::Refused(f, _) = retry(&acq, &alice(), &job, RetryMode::SameSource, None)
-            .await
-            .unwrap()
+        let RetryAnswer::Unavailable(f, _) =
+            retry(&acq, &alice(), &job, RetryMode::SameSource, None)
+                .await
+                .unwrap()
         else {
             panic!()
         };
@@ -887,6 +937,124 @@ mod tests {
             .unwrap();
         assert!(matches!(again, RetryAnswer::Applied(v) if v.job.state == JobState::Queued));
         assert_eq!(enqueued(&effects, 1).await[0].1.items[0].1.source, "peer_a");
+    }
+
+    /// The `expected` of an invalid_input refusal of `mode`, or a panic naming what came instead.
+    fn modes_allowed(answer: RetryAnswer) -> String {
+        match answer {
+            RetryAnswer::InvalidInput {
+                field: "mode",
+                expected,
+            } => expected,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mode_the_failure_does_not_take_names_the_modes_allowed_not_the_failure() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let busy = failed_track_job_with(&acq, "Silent Night", peer_busy()).await;
+        let answer = retry(&acq, &alice(), &busy, RetryMode::IndexOnly, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            modes_allowed(answer),
+            "one of same_source, next_source, new_search, the modes the job allows now"
+        );
+        // A search Soulful's restart cut off, before the job had a source.
+        let cut_off = mcp_track_job(&acq, "Marrow Choir", "Coventry Carol", auto_options()).await;
+        let fail = Transition::Fail {
+            failure: server_restarted_search(),
+        };
+        let failed = acq.ledger.transition(&alice().id(), &cut_off, fail).await;
+        assert!(matches!(failed, Ok(Transitioned::Applied { .. })));
+        let answer = retry(&acq, &alice(), &cut_off, RetryMode::SameSource, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            modes_allowed(answer),
+            "one of new_search, the modes the job allows now"
+        );
+        // Its file is in the library: its search's other sources are not tried, though one is.
+        let indexed = index_failed_track_job(&acq).await;
+        let view = view_of(&acq, &indexed).await;
+        let left = untried(&acq.db, &view, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert!(left.best().is_some());
+        let answer = retry(&acq, &alice(), &indexed, RetryMode::NextSource, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            modes_allowed(answer),
+            "one of new_search, index_only, the modes the job allows now"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_search_that_cannot_be_recorded_fails_the_job_and_searches_nothing() {
+        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let job = failed_track_job(&acq).await;
+        // The database refuses the search's record (a full disk, a lock held too long).
+        sqlx::query(
+            "CREATE TRIGGER no_search BEFORE INSERT ON searches \
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END",
+        )
+        .execute(&acq.db)
+        .await
+        .unwrap();
+        let words = NewSearchArgs {
+            query_text: Some("Marrow Choir O Holy Night live".into()),
+            ..NewSearchArgs::default()
+        };
+        let RetryAnswer::Applied(view) =
+            retry(&acq, &alice(), &job, RetryMode::NewSearch, Some(words))
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(view.job.state, JobState::Failed);
+        let failure = job_failure(&view).unwrap();
+        assert_eq!(
+            (failure.code, failure.stage, failure.message.as_str()),
+            (
+                FailureCode::SettingsUnreadable,
+                Stage::SourceSearch,
+                "Soulful's database is unavailable"
+            )
+        );
+        // No runner searches the job's own query in its place.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(effects.stub().specs().is_empty());
+        assert!(effects.enqueued().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_change_whose_job_cannot_be_read_after_it_is_still_answered_as_made() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let job = queued_track_jobs(&acq, 1).await.remove(0);
+        // Every read of the job fails once the change is written (an unreadable row).
+        sqlx::query(&format!(
+            "CREATE TRIGGER unreadable AFTER UPDATE OF state ON jobs WHEN NEW.id = '{job}' \
+             BEGIN UPDATE jobs SET wanted = 'unreadable' WHERE id = NEW.id; END"
+        ))
+        .execute(&acq.db)
+        .await
+        .unwrap();
+        let RetryAnswer::AppliedUnread { job: id, failure } =
+            cancel(&acq, &alice(), &job).await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (id.as_str(), failure.code),
+            (job.as_str(), FailureCode::SettingsUnreadable)
+        );
+        assert_eq!(
+            store::job_state(&acq.db, &job).await,
+            Some(JobState::Cancelled)
+        );
     }
 
     #[tokio::test]
@@ -1010,7 +1178,8 @@ mod tests {
         });
         // The second slot's kept import is not in the queue: another decision took it.
         let job = kept_album_job(&acq, [&files[0], &files[1]], [true, false]).await;
-        let RetryAnswer::Refused(f, facts) = dismiss(&acq, &alice(), &job).await.unwrap() else {
+        let RetryAnswer::Unavailable(f, facts) = dismiss(&acq, &alice(), &job).await.unwrap()
+        else {
             panic!()
         };
         assert_eq!(

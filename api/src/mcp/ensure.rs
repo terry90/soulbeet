@@ -356,7 +356,7 @@ pub(crate) async fn download_source(
         let ctx = &on.caller.ctx;
         match core_download_source(&on.acquire, ctx, target, &candidate_id).await {
             // No default folder: the call again with each of the user's folders.
-            Ok(RetryAnswer::Refused(failure, facts)) if facts.contains_key("folders") => {
+            Ok(RetryAnswer::Unavailable(failure, facts)) if facts.contains_key("folders") => {
                 Keyed::Released(failed(with_folders(failure, facts, &given)))
             }
             answered => on.answer(job.as_deref(), answered, again).await,
