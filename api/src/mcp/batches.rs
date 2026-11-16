@@ -681,4 +681,38 @@ mod tests {
             assert_eq!(error["next"], json!([{"tool": "list_batches", "args": {}}]));
         }
     }
+
+    #[test]
+    fn a_fill_failure_shows_as_an_error_with_its_message_cut() {
+        use crate::core::playlists::playlist_not_found;
+        use crate::ledger::store::BatchPlaylist;
+        use crate::ledger::OrderEntry;
+        use shared::failure::{json_chars, TEXT_MAX_CHARS};
+        // An id as long as a caller may send one makes the longest message Soulful writes here.
+        let id = "p".repeat(500);
+        let entry = |settled: bool| OrderEntry {
+            job_id: (!settled).then(|| "j1".to_string()),
+            song_ids: vec![],
+            settled,
+        };
+        let state = super::playlist_state(BatchPlaylist {
+            playlist_id: id.clone(),
+            order: vec![entry(true), entry(false), entry(false)],
+            failure: Some(playlist_not_found(&id)),
+        });
+        assert_eq!(
+            (
+                &state["settled"],
+                &state["waiting"],
+                &state["failure"]["code"]
+            ),
+            (&json!(1), &json!(2), &json!("playlist_not_found"))
+        );
+        assert_eq!(
+            (&state["failure"]["facts"], &state["failure"]["next"]),
+            (&json!({}), &json!([]))
+        );
+        let message = state["failure"]["message"].as_str().unwrap();
+        assert!(json_chars(message) <= TEXT_MAX_CHARS, "{message}");
+    }
 }

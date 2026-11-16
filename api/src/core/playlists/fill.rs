@@ -529,6 +529,9 @@ mod tests {
             (order[1].settled, order[1].song_ids.clone()),
             (true, ids(&[SILENT.0]))
         );
+        let bob = UserId::new("bob");
+        let others = store::playlist_of(&db, &batch, &bob).await.unwrap();
+        assert_eq!(others, None, "another user's batch has none");
         let asked = navi.asked().len();
         assert_eq!(fill().await.unwrap(), 0);
         assert_eq!(navi.asked().len(), asked, "nothing is left to place");
