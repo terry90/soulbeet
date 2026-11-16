@@ -804,18 +804,23 @@ impl NavidromeClient {
     /// `booleanFilter` (persistence/mediafile_repository.go:125, persistence/sql_restful.go:104-107
     /// in 0.64.2); deluan/rest takes `_end - _start` rows with no cap (controller.go:217-229 at
     /// the version 0.64.2's go.mod names) and sends the count as `X-Total-Count` (:63-64).
-    /// The sort is `created_at`, which maps to `media_file.created_at`
-    /// (persistence/mediafile_repository.go:100): past an offset of DevOffsetOptimize (50,000 by
-    /// default, conf/configuration.go:1122) Navidrome leaves out the earlier rows with a subquery
-    /// that orders the joined tables by the sort (persistence/sql_base_repository.go:426-428,
-    /// 461-469), where a plain `id` names both media_file's and library's and fails. Songs added
-    /// at one time have no order among them, so a caller checks that it read as many as the count.
+    /// The sort is `recently_added` (persistence/mediafile_repository.go:101), which maps to
+    /// `media_file.created_at, media_file.id`, or to `media_file.updated_at, media_file.id` with
+    /// RecentlyAddedByModTime (:143-148, off by default, conf/configuration.go:1004), each part
+    /// in the asked order (persistence/sql_base_repository.go:184-206). Either is unique, since
+    /// `media_file.id` is the table's primary key, so no page boundary falls inside a tie. Either
+    /// is table-qualified: past an offset of DevOffsetOptimize (50,000 by default,
+    /// conf/configuration.go:1122) Navidrome leaves out the earlier rows with a subquery that
+    /// orders the joined tables by the sort (persistence/sql_base_repository.go:426-428,
+    /// 461-469), where a plain `id` names both media_file's and library's and fails. The order
+    /// can still shift between pages (a song added or removed, or a changed file with
+    /// RecentlyAddedByModTime), so a caller checks that it read as many as the count.
     pub async fn list_songs(&self, start: u32, end: u32) -> Result<SongPage> {
         let url = self.base_url.join("api/song")?;
         let query = [
             ("_start", start.to_string()),
             ("_end", end.to_string()),
-            ("_sort", "created_at".to_string()),
+            ("_sort", "recently_added".to_string()),
             ("_order", "ASC".to_string()),
             ("missing", "false".to_string()),
         ];
@@ -2380,7 +2385,7 @@ mod tests {
         );
         assert_eq!(
             seen.lock().unwrap()[1].target,
-            "/api/song?_start=0&_end=1000&_sort=created_at&_order=ASC&missing=false"
+            "/api/song?_start=0&_end=1000&_sort=recently_added&_order=ASC&missing=false"
         );
         // Without the count, a page cannot be checked against it.
         let err = c.list_songs(0, 1000).await.unwrap_err();

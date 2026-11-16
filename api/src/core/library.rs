@@ -653,14 +653,14 @@ pub(crate) fn listing(folder: &Path, roots: &[PathBuf]) -> Listing {
 /// Songs `duplicates` reads from Navidrome in one request.
 pub(crate) const DUPLICATE_PAGE: u32 = 1000;
 
-/// Navidrome's pages held `read` different songs of the `total` it counts: its library changed,
-/// or songs added at one time came back in another order, while they were read.
+/// Navidrome's pages held `read` different songs of the `total` it counts. The message names no
+/// cause: Soulful sees only the two numbers (list_songs says how the order can shift).
 fn songs_missed(read: usize, total: u64) -> Failure {
     Failure::new(
         FailureCode::NavidromeUnreachable,
         Stage::LibraryCheck,
         RetryAdvice::SameSourceLater,
-        format!("Navidrome counts {total} songs, and its pages held {read}: its library changed while it was read. Search again."),
+        format!("Navidrome counts {total} songs, and its pages held {read}. Search again."),
     )
 }
 
@@ -681,9 +681,9 @@ pub struct SongGroup {
 /// short page, grouped by (match_key(artist), match_key(title)); the groups of two or more,
 /// ordered by that key. A song id seen again on a later page is skipped (a song added mid-search
 /// shifts the offsets). A page that fails fails the search, and so do pages that hold fewer songs
-/// than Navidrome counted at the last one (songs added at one time have no order among them, so a
-/// page can repeat one and pass another), since a part would miss copies. A song removed while the
-/// pages are read can still let one pass unseen.
+/// than Navidrome counted at the last one (an order that shifts while the pages are read can make
+/// a page repeat one song and pass another), since a part would miss copies. A song removed while
+/// the pages are read can still let one pass unseen.
 pub async fn duplicates(navi: &NavidromeClient) -> Result<Vec<SongGroup>, Failure> {
     let failure = |e: NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
     let mut by_key: BTreeMap<(String, String), Vec<SongFacts>> = BTreeMap::new();
@@ -1442,8 +1442,8 @@ mod tests {
         assert_eq!(
             song_requests(&navi),
             [
-                "/api/song?_start=0&_end=1000&_sort=created_at&_order=ASC&missing=false",
-                "/api/song?_start=1000&_end=2000&_sort=created_at&_order=ASC&missing=false"
+                "/api/song?_start=0&_end=1000&_sort=recently_added&_order=ASC&missing=false",
+                "/api/song?_start=1000&_end=2000&_sort=recently_added&_order=ASC&missing=false"
             ]
         );
     }
@@ -1475,7 +1475,7 @@ mod tests {
 
     #[tokio::test]
     async fn pages_that_hold_fewer_songs_than_navidrome_counts_fail_the_search() {
-        // a1 and a2 were added at one time: the second page repeats a1 in place of a2.
+        // The order shifted between the pages: the second page repeats a1 and a2 never comes.
         let navi = NavidromeStub::start();
         let mut first: Vec<String> = (0..999)
             .map(|i| {
@@ -1502,7 +1502,7 @@ mod tests {
                 FailureCode::NavidromeUnreachable,
                 Stage::LibraryCheck,
                 RetryAdvice::SameSourceLater,
-                "Navidrome counts 1001 songs, and its pages held 1000: its library changed while it was read. Search again."
+                "Navidrome counts 1001 songs, and its pages held 1000. Search again."
             )
         );
     }
