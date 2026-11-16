@@ -207,7 +207,8 @@ pub(crate) enum JobSongs {
 /// What `user`'s job `job` ended with. A done job is Listed when Navidrome listed every import of
 /// it, else a Lookup of every file it imported. A failed job whose failed slots are all
 /// duplicates (import_already_in_library) is a Lookup of those copies and of what its other
-/// slots imported; with any other failed slot it waits, as it can be tried again.
+/// slots imported; with any other failed slot, or failed before any slot had a result (its
+/// search found nothing, or its downloads never started), it waits, as it can be tried again.
 pub(crate) async fn songs_of_job(
     db: &SqlitePool,
     user: &UserId,
@@ -225,7 +226,9 @@ pub(crate) async fn songs_of_job(
         t.state == JobState::Failed
             && !matches!(t.result, Some(SlotResult::AlreadyInLibrary { .. }))
     });
-    if retryable {
+    let ended_with_nothing =
+        record.state == JobState::Failed && tracks.iter().all(|t| t.result.is_none());
+    if retryable || ended_with_nothing {
         return Ok(JobSongs::Waiting);
     }
     // An album's import is on each of its slots: its songs and files are taken once.
@@ -435,11 +438,14 @@ mod tests {
     use crate::core::jobs::job_already_running;
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
-        batch_of_downloads, duplicate_track_job, playlist_batch_of_running, settle_done,
+        auto_options, batch_of_downloads, duplicate_track_job, mcp_track_job,
+        playlist_batch_of_running, settle_done,
     };
     use crate::core::playlists::{playlist_not_found, NotEditable};
+    use crate::core::sources::server_restarted_search;
     use crate::core::test_ctx;
     use crate::ledger::{Admitted, LedgerError, JOB_KEPT_SECS, KEY_KEPT_SECS};
+    use crate::ledger::{Transition, Transitioned};
     use crate::services::NavidromeLookupError;
     use crate::test_navidrome::{
         native_playlist, native_song, native_songs, playlist_body, playlist_rows, playlists_body,
@@ -662,6 +668,24 @@ mod tests {
         assert_eq!(
             navi.posted("/rest/updatePlaylist"),
             vec![format!("playlistId={ADVENT}&songIdToAdd={}", HOLY.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_that_failed_before_it_had_a_source_keeps_its_place_waiting() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        let job = mcp_track_job(&acq, "Marrow Choir", "Coventry Carol", auto_options()).await;
+        let fail = Transition::Fail {
+            failure: server_restarted_search(),
+            search_id: None,
+            change: None,
+        };
+        let failed = acq.ledger.transition(&alice(), &job, fail).await;
+        assert!(matches!(failed, Ok(Transitioned::Applied { .. })));
+        assert_eq!(
+            songs_of_job(&acq.db, &alice(), &job).await.unwrap(),
+            JobSongs::Waiting,
+            "no slot yet: a new search can still bring its song"
         );
     }
 
