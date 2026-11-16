@@ -70,8 +70,6 @@ fn unknown_profile(profile: &str) -> Failure {
     ))
 }
 
-/// `update` with its discovery values checked against the bounds the Settings inputs carry, and
-/// its playlist names trimmed (D14). Each map must name all three profiles.
 /// The track count each discovery profile may have.
 pub(crate) const TRACK_COUNTS: RangeInclusive<i64> = 1..=50;
 /// The days a discovery profile's tracks may wait for a rating.
@@ -79,6 +77,8 @@ pub(crate) const LIFETIME_DAYS: RangeInclusive<i64> = 1..=90;
 /// The rating at which the rating sync promotes a pending discovery track.
 pub(crate) const PROMOTE_THRESHOLDS: RangeInclusive<u8> = 1..=5;
 
+/// `update` with its discovery values checked against the bounds the Settings inputs carry, and
+/// its playlist names trimmed (D14). Each map must name all three profiles.
 pub(crate) fn checked(mut update: UpdateUserSettings) -> Result<UpdateUserSettings, NotSaved> {
     if let Some(profiles) = &update.discovery_profiles {
         let profiles_refused = NotSaved::of(Setting::DiscoveryProfiles);
