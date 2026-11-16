@@ -5,7 +5,7 @@ use thiserror::Error;
 /// `Musicbrainz` or `Lastfm`; `status` is the status it gave the error, an
 /// HTTP status or, for Last.fm's error body, Last.fm's error code, which
 /// chooses the variant; `raw` is what it answered, or why it did not.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum MetadataError {
     #[error("{} found nothing: {raw}", name(*.service))]
     NotFound {

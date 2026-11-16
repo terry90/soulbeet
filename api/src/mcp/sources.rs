@@ -26,8 +26,8 @@ use crate::core::database_failure;
 use crate::core::jobs::runner::Acquire;
 use crate::core::jobs::Wanted;
 use crate::core::sources::{
-    no_candidate_passed, owned_search, search_not_found, server_restarted_search, start_stored,
-    view, DroppedByFilter, SearchFor, SearchProgress, SearchRun, FINDS_WAITING_PER_USER, FIND_WAIT,
+    no_candidate_passed, owned_search, search_not_found, server_restarted_search, start_find, view,
+    DroppedByFilter, FindRefused, SearchProgress, SearchRun, FINDS_WAITING_PER_USER, FIND_WAIT,
     RECENT_FAILURES_SECS,
 };
 use crate::ledger::store::{self, StoredSearch};
@@ -150,6 +150,8 @@ async fn run_find(
         spec,
         limit,
     } = find;
+    // Spares the tracklist lookup of a call start_find would refuse; start_find counts again as
+    // the search enters the line, which calls made together cannot pass together.
     let waiting = acquire.searches.waiting_finds(&ctx.id());
     if waiting.len() >= FINDS_WAITING_PER_USER {
         return Err(too_many_waiting(waiting));
@@ -160,28 +162,30 @@ async fn run_find(
         if let Wanted::Album(album) = &wanted {
             facts.insert("release_mbid".into(), json!(album.release_mbid));
         }
-        return Err(failure_of(f, facts, &spec, &Dropped::NotCounted));
+        return Err(failure_of(f, facts, &spec, &Failed::Elsewhere));
     }
     let backend = acquire
         .effects
         .backend()
         .await
-        .map_err(|f| failure_of(f, Map::new(), &spec, &Dropped::NotCounted))?;
+        .map_err(|f| failure_of(f, Map::new(), &spec, &Failed::Elsewhere))?;
     let id = uuid::Uuid::new_v4().to_string();
     let run = SearchRun {
         id: id.clone(),
         query,
         spec: spec.clone(),
-        purpose: SearchFor::Find,
     };
-    let task = start_stored(&acquire.searches, &acquire.ledger, ctx, backend, run)
+    let task = start_find(&acquire.searches, &acquire.ledger, ctx, backend, run)
         .await
-        .map_err(|f| failure_of(f, Map::new(), &spec, &Dropped::NotCounted))?;
+        .map_err(|refused| match refused {
+            FindRefused::TooManyWaiting(waiting) => too_many_waiting(waiting),
+            FindRefused::Failed(f) => failure_of(f, Map::new(), &spec, &Failed::Elsewhere),
+        })?;
     // Past FIND_WAIT the search goes on in its task, and is read as stored either way.
     let _ = tokio::time::timeout(FIND_WAIT, task).await;
     let stored = owned_search(&acquire.db, ctx, &id)
         .await
-        .map_err(|f| failure_of(f, Map::new(), &spec, &Dropped::NotCounted))?;
+        .map_err(|f| failure_of(f, Map::new(), &spec, &Failed::Elsewhere))?;
     let mut page_args = Map::new();
     page_args.insert("search_id".into(), json!(id));
     if let Some(limit) = limit {
@@ -281,7 +285,7 @@ async fn search_answer(
                 database_failure(Stage::SourceSearch, e),
                 Map::new(),
                 &spec,
-                &Dropped::NotCounted,
+                &Failed::Elsewhere,
             )
         })?;
     let view = view(&id, &groups, &spec.filters, &failures, &[]);
@@ -360,12 +364,16 @@ fn too_many_waiting(waiting: Vec<String>) -> ToolError {
     }
 }
 
-/// What a failed search dropped, which decides the calls offered after it.
-enum Dropped<'a> {
-    /// The search did not run, or the backend did not finish it.
-    NotCounted,
-    /// Below-floor files the search dropped, and what the filters dropped.
-    Counted(u32, &'a DroppedByFilter),
+/// What failed, which decides the calls offered after it.
+enum Failed<'a> {
+    /// A step other than the search (the album's tracklist, the backend, the ledger), which
+    /// other search words cannot mend.
+    Elsewhere,
+    /// The search, which the backend did not finish.
+    Search,
+    /// The search the backend finished: the below-floor files it dropped and what the filters
+    /// dropped.
+    FinishedSearch(u32, &'a DroppedByFilter),
 }
 
 /// Search `id`'s failure `f`, with what it read (`stats`) and what the filters dropped.
@@ -378,24 +386,26 @@ fn search_failed(
 ) -> ToolError {
     let mut facts = search_facts(stats, spec, dropped);
     facts.insert("search_id".into(), json!(id));
-    let counted = match stats {
-        Some(s) if !spec.keep_below_floor => Dropped::Counted(s.below_floor, dropped),
-        Some(_) => Dropped::Counted(0, dropped),
-        None => Dropped::NotCounted,
+    let failed = match stats {
+        Some(s) if !spec.keep_below_floor => Failed::FinishedSearch(s.below_floor, dropped),
+        Some(_) => Failed::FinishedSearch(0, dropped),
+        None => Failed::Search,
     };
-    failure_of(f, facts, spec, &counted)
+    failure_of(f, facts, spec, &failed)
 }
 
 /// `f` with `facts`, and the find_sources calls that can follow a search of `spec` (each built
 /// from it, never from the call's own arguments): the same search when the same source can
 /// answer later, with below-floor files kept when it dropped some, without filters when they
-/// dropped some, and with other words when the advice is another query, which only the caller
-/// can choose. A search with no reference (a job's) offers none: its job's calls follow it.
+/// dropped some, and, when the search itself failed with advice for another query, with other
+/// words, which only the caller can choose. A failure elsewhere (a release MusicBrainz does not
+/// have) offers no other words: they never reach that step. A search with no
+/// reference (a job's) offers none: its job's calls follow it.
 fn failure_of(
     f: Failure,
     facts: Map<String, Value>,
     spec: &StoredSpec,
-    dropped: &Dropped,
+    failed: &Failed,
 ) -> ToolError {
     let mut next = vec![];
     if spec.reference.is_object() {
@@ -406,7 +416,7 @@ fn failure_of(
             }
             next.push(call);
         }
-        if let Dropped::Counted(below_floor, by_filter) = dropped {
+        if let Failed::FinishedSearch(below_floor, by_filter) = failed {
             if *below_floor > 0 {
                 next.push(find_call(&StoredSpec {
                     keep_below_floor: true,
@@ -427,7 +437,8 @@ fn failure_of(
                 }));
             }
         }
-        if f.retry == RetryAdvice::OtherQuery {
+        let searched = matches!(failed, Failed::Search | Failed::FinishedSearch(..));
+        if searched && f.retry == RetryAdvice::OtherQuery {
             next.push(
                 NextCall::new("find_sources", json!({"reference": spec.reference}))
                     .with("needs", json!(["query_text"])),
@@ -471,6 +482,8 @@ fn find_call(spec: &StoredSpec) -> NextCall {
 #[cfg(test)]
 mod tests {
     use shared::download::{DownloadableItem, FileFacts, SearchResult, SearchState};
+    use shared::failure::Service;
+    use soulbeet::MetadataError;
 
     use super::*;
     use crate::connection::test_util::{
@@ -1035,6 +1048,121 @@ mod tests {
             json!({"tool": "get_sources", "args": {"search_id": ids[0], "wait_seconds": 60}})
         );
         assert_eq!(effects.stub().specs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn finds_sent_together_never_leave_more_than_three_waiting() {
+        let (db, acq, effects, token) = app_with_acquire().await;
+        let (reached, _release) = effects.stub().hold_searches();
+        let app = app_of(&db, &acq);
+        let find = |title: &'static str| {
+            let (app, token) = (app.clone(), token.clone());
+            tokio::spawn(async move {
+                call_tool(
+                    app,
+                    &token,
+                    "find_sources",
+                    json!({"reference": {"artist": "Kowloon", "title": title}}),
+                )
+                .await
+            })
+        };
+        let _running = find("Wake Up");
+        reached.notified().await;
+        // Four calls all read no search waiting, then enter the line together.
+        effects.hold_backend();
+        let mut calls = Vec::from(["Come Over", "Lights Out", "Neon", "Midnight"].map(find));
+        let alice = crate::auth::UserId::new("u1");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while effects.backend_calls_held() < 4 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("every call passed the first count");
+        assert!(acq.searches.waiting_finds(&alice).is_empty());
+        effects.release_backend();
+        let refused = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(done) = calls.iter().position(|call| call.is_finished()) {
+                    return done;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("one call is refused at once");
+        let error = document(&calls.swap_remove(refused).await.unwrap())["error"].clone();
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["facts"]["search_ids"].as_array().map(Vec::len)
+            ),
+            (Some("rate_limited"), Some(3)),
+            "{error}"
+        );
+        assert_eq!(acq.searches.waiting_finds(&alice).len(), 3);
+        assert!(
+            calls.iter().all(|call| !call.is_finished()),
+            "the other three wait for the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_album_whose_tracklist_cannot_be_read_offers_no_other_words() {
+        let (db, acq, effects, token) = app_with_acquire().await;
+        let mbid = "6a09041b-0f79-3278-88d9-0552dd28d37f";
+        let reference = json!({"kind": "album", "artist": "Kowloon", "title": "Come Over",
+            "release_mbid": mbid});
+        let find = || {
+            call_tool(
+                app_of(&db, &acq),
+                &token,
+                "find_sources",
+                json!({"reference": reference, "query_text": "kowloon come over"}),
+            )
+        };
+        // What musicbrainz_rs says of a release MusicBrainz does not have (src/error.rs:17), on the
+        // URL find_album asks (lib/soulbeet/src/musicbrainz.rs:351-362, musicbrainz_rs
+        // src/api/query.rs:29-46), as From maps it (lib/soulbeet/src/musicbrainz.rs:95-99).
+        effects.fail_hydrate(MetadataError::NotFound {
+            service: Service::Musicbrainz,
+            status: None,
+            raw: format!("Musicbrainz returned \"Not found\" for query \"http://musicbrainz.org/ws/2/release/{mbid}?fmt=json&inc=recordings+artist-credits+release-groups\""),
+        });
+        let error = document(&find().await)["error"].clone();
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["retry"].as_str(),
+                error["facts"]["release_mbid"].as_str()
+            ),
+            (Some("metadata_not_found"), Some("other_query"), Some(mbid)),
+            "{error}"
+        );
+        assert_eq!(
+            error["next"],
+            json!([]),
+            "query_text never reaches the lookup"
+        );
+        // A lookup MusicBrainz can answer later offers the same call: musicbrainz_rs gave up
+        // retrying its 503 answers (src/error.rs:20, lib/soulbeet/src/musicbrainz.rs:111-117).
+        effects.fail_hydrate(MetadataError::RateLimited {
+            service: Service::Musicbrainz,
+            status: None,
+            raw: "The max retry count for the request as been exeeded. You may want to check if the correct url is set, musicbrainz is online, or you aren't hitting the ratelimit.".into(),
+        });
+        let error = document(&find().await)["error"].clone();
+        assert_eq!(
+            (error["code"].as_str(), &error["next"]),
+            (
+                Some("metadata_rate_limited"),
+                &json!([{"tool": "find_sources", "args": {"reference": reference,
+                    "query_text": "kowloon come over"}}])
+            ),
+            "{error}"
+        );
+        assert!(effects.stub().specs().is_empty(), "nothing was searched");
     }
 
     #[tokio::test]

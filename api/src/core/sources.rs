@@ -341,8 +341,8 @@ pub const RECENT_FAILURES_SECS: i64 = 24 * 60 * 60;
 /// How long find_sources waits for its search inside the call (design 11.4).
 pub const FIND_WAIT: Duration = Duration::from_secs(45);
 
-/// The most `find_sources` searches one user may have waiting for the turn; a call past it
-/// starts none.
+/// The most `find_sources` searches one user may have waiting for the turn; `start_find` past
+/// it starts none.
 pub const FINDS_WAITING_PER_USER: usize = 3;
 
 /// A search with groups none of which `view` keeps. find_sources and the job runner both
@@ -399,7 +399,7 @@ impl SearchProgress {
 
 /// Who a stored search runs for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchFor {
+enum SearchFor {
     /// A `find_sources` call.
     Find,
     /// An MCP job's runner.
@@ -445,13 +445,7 @@ impl Searches {
 
     /// The ids of `user`'s `find_sources` searches waiting for the turn, in arrival order.
     pub fn waiting_finds(&self, user: &UserId) -> Vec<String> {
-        self.runs
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|run| &run.user == user && run.purpose == SearchFor::Find && !run.holds_turn)
-            .map(|run| run.id.clone())
-            .collect()
+        waiting_finds_in(&self.runs.lock().unwrap(), user)
     }
 
     /// The backend's id of stored search `id`, once its task started it at the backend.
@@ -462,9 +456,31 @@ impl Searches {
             .and_then(|run| run.backend_search.clone())
     }
 
-    /// Puts search `id` in line; it leaves when the returned place is dropped.
-    fn enter(self: &Arc<Self>, id: &str, user: UserId, purpose: SearchFor) -> Place {
-        self.runs.lock().unwrap().push(Run {
+    /// Puts a job's search `id` in line; it leaves when the returned place is dropped.
+    fn enter(self: &Arc<Self>, id: &str, user: UserId) -> Place {
+        self.push(&mut self.runs.lock().unwrap(), id, user, SearchFor::Job)
+    }
+
+    /// Puts `user`'s find_sources search `id` in line, unless `user` already has
+    /// FINDS_WAITING_PER_USER waiting: then their ids. Counted and entered under one lock, so
+    /// calls made together never pass the bound together.
+    fn enter_find(self: &Arc<Self>, id: &str, user: UserId) -> Result<Place, Vec<String>> {
+        let mut runs = self.runs.lock().unwrap();
+        let waiting = waiting_finds_in(&runs, &user);
+        if waiting.len() >= FINDS_WAITING_PER_USER {
+            return Err(waiting);
+        }
+        Ok(self.push(&mut runs, id, user, SearchFor::Find))
+    }
+
+    fn push(
+        self: &Arc<Self>,
+        runs: &mut Vec<Run>,
+        id: &str,
+        user: UserId,
+        purpose: SearchFor,
+    ) -> Place {
+        runs.push(Run {
             id: id.to_string(),
             user,
             purpose,
@@ -502,6 +518,13 @@ impl Searches {
     }
 }
 
+fn waiting_finds_in(runs: &[Run], user: &UserId) -> Vec<String> {
+    runs.iter()
+        .filter(|run| &run.user == user && run.purpose == SearchFor::Find && !run.holds_turn)
+        .map(|run| run.id.clone())
+        .collect()
+}
+
 /// A search's place in `Searches`, given up when dropped (its task ended, however it ended).
 struct Place {
     searches: Arc<Searches>,
@@ -525,11 +548,20 @@ pub struct SearchRun {
     /// The album and tracks searched for and scored against.
     pub query: DownloadQuery,
     pub spec: StoredSpec,
-    pub purpose: SearchFor,
 }
 
-/// Records search `run.id` for `ctx` on the default backend and runs it in its own task once it
-/// holds the turn, storing how it ended. The task's answer is how it ended.
+/// Why `start_find` started no search.
+#[derive(Debug)]
+pub enum FindRefused {
+    /// The user already has FINDS_WAITING_PER_USER find_sources searches waiting for the turn:
+    /// their ids, in arrival order. Nothing was written.
+    TooManyWaiting(Vec<String>),
+    /// Recording the search failed.
+    Failed(Failure),
+}
+
+/// Records a job's search `run.id` for `ctx` on the default backend and runs it in its own task
+/// once it holds the turn, storing how it ended. The task's answer is how it ended.
 ///
 /// Called only for a new id, or for a search stored Running that no task runs (a restart cut it
 /// off), which runs again under its id. Recording a search again drops what it found, so the
@@ -542,14 +574,38 @@ pub async fn start_stored(
     backend: Arc<dyn DownloadBackend>,
     run: SearchRun,
 ) -> Result<JoinHandle<SearchProgress>, Failure> {
-    let SearchRun {
-        id,
-        query,
-        spec,
-        purpose,
-    } = run;
-    // In line before it is recorded, so a stored Running search is never read as cut off.
-    let place = searches.enter(&id, ctx.id(), purpose);
+    let place = searches.enter(&run.id, ctx.id());
+    run_in_line(place, searches, ledger, ctx, backend, run).await
+}
+
+/// `start_stored` for a new find_sources search, refused before anything is written when the
+/// user already has FINDS_WAITING_PER_USER find_sources searches waiting for the turn.
+pub async fn start_find(
+    searches: &Arc<Searches>,
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    backend: Arc<dyn DownloadBackend>,
+    run: SearchRun,
+) -> Result<JoinHandle<SearchProgress>, FindRefused> {
+    let place = searches
+        .enter_find(&run.id, ctx.id())
+        .map_err(FindRefused::TooManyWaiting)?;
+    run_in_line(place, searches, ledger, ctx, backend, run)
+        .await
+        .map_err(FindRefused::Failed)
+}
+
+/// Records search `run` and spawns its task, which keeps `place` for its life. The place is
+/// taken before the search is recorded, so a stored Running search is never read as cut off.
+async fn run_in_line(
+    place: Place,
+    searches: &Arc<Searches>,
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    backend: Arc<dyn DownloadBackend>,
+    run: SearchRun,
+) -> Result<JoinHandle<SearchProgress>, Failure> {
+    let SearchRun { id, query, spec } = run;
     ledger
         .record_search(NewSearch {
             id: id.clone(),
@@ -1154,12 +1210,11 @@ mod tests {
         }
     }
 
-    fn run(id: &str, spec: StoredSpec, purpose: SearchFor) -> SearchRun {
+    fn run(id: &str, spec: StoredSpec) -> SearchRun {
         SearchRun {
             id: id.into(),
             query: DownloadQuery::new(vec![]),
             spec,
-            purpose,
         }
     }
 
@@ -1355,12 +1410,12 @@ mod tests {
             text: Some("Kowloon One".into()),
             ..Default::default()
         };
-        let first = start_stored(
+        let first = start_find(
             &searches,
             &ledger,
             &ctx,
             backend.clone(),
-            run("s1", spec.clone(), SearchFor::Find),
+            run("s1", spec.clone()),
         )
         .await
         .unwrap();
@@ -1369,7 +1424,7 @@ mod tests {
             &ledger,
             &ctx,
             backend,
-            run("s2", StoredSpec::default(), SearchFor::Job),
+            run("s2", StoredSpec::default()),
         )
         .await
         .unwrap();
@@ -1456,16 +1511,16 @@ mod tests {
             &ledger,
             &ctx,
             backend.clone(),
-            run("s1", text("One"), SearchFor::Job),
+            run("s1", text("One")),
         )
         .await
         .unwrap();
-        let second = start_stored(
+        let second = start_find(
             &searches,
             &ledger,
             &ctx,
             backend.clone(),
-            run("s2", text("Two"), SearchFor::Find),
+            run("s2", text("Two")),
         )
         .await
         .unwrap();
@@ -1511,9 +1566,9 @@ mod tests {
     async fn a_search_takes_the_turn_when_every_one_before_it_left() {
         let searches: Arc<Searches> = Arc::default();
         let alice = UserId::new("alice");
-        let first = searches.enter("s1", alice.clone(), SearchFor::Job);
-        let second = searches.enter("s2", alice.clone(), SearchFor::Find);
-        let third = searches.enter("s3", UserId::new("bob"), SearchFor::Find);
+        let first = searches.enter("s1", alice.clone());
+        let second = searches.enter_find("s2", alice.clone()).unwrap();
+        let third = searches.enter_find("s3", UserId::new("bob")).unwrap();
         let ahead = || ["s1", "s2", "s3"].map(|id| searches.ahead_of(id));
         assert_eq!(ahead(), [Some(0), Some(1), Some(2)]);
 
@@ -1543,6 +1598,63 @@ mod tests {
         assert!(!searches.runs("s1") && !searches.runs("s2") && searches.runs("s3"));
         drop(third);
         assert!(!searches.runs("s3"));
+    }
+
+    #[test]
+    fn a_user_with_finds_waiting_up_to_the_bound_enters_no_more_and_writes_nothing() {
+        let searches: Arc<Searches> = Arc::default();
+        let (alice, bob) = (UserId::new("alice"), UserId::new("bob"));
+        let mut places = vec![searches.enter("j1", alice.clone())];
+        for id in ["f1", "f2", "f3"] {
+            places.push(searches.enter_find(id, alice.clone()).unwrap());
+        }
+        let refused = searches.enter_find("f4", alice.clone()).err();
+        assert_eq!(
+            refused,
+            Some(vec!["f1".to_string(), "f2".into(), "f3".into()])
+        );
+        assert!(!searches.runs("f4"), "a refused search is not in line");
+        // Another user's finds and a job's searches have no bound of their own here.
+        places.push(searches.enter_find("b1", bob).unwrap());
+        places.push(searches.enter("j2", alice.clone()));
+        // A find that holds the turn waits no more.
+        places.remove(0);
+        searches.runs.lock().unwrap()[0].holds_turn = true;
+        assert_eq!(
+            searches.waiting_finds(&alice),
+            vec!["f2".to_string(), "f3".into()]
+        );
+        places.push(searches.enter_find("f4", alice.clone()).unwrap());
+        assert!(searches.enter_find("f5", alice).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_refused_find_records_nothing() {
+        let db = crate::db::test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let ctx = test_ctx("alice");
+        let searches: Arc<Searches> = Arc::default();
+        let _held: Vec<Place> = ["f1", "f2", "f3"]
+            .map(|id| searches.enter_find(id, ctx.id()).unwrap())
+            .into();
+        let refused = start_find(
+            &searches,
+            &ledger,
+            &ctx,
+            backend,
+            run("f4", StoredSpec::default()),
+        )
+        .await
+        .err();
+        assert!(matches!(refused, Some(FindRefused::TooManyWaiting(ids)) if ids.len() == 3));
+        ledger.settled().await;
+        assert!(store::search_of(&db, "f4", &ctx.id())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!searches.runs("f4"));
     }
 
     #[test]

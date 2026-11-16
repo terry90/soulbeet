@@ -67,7 +67,9 @@ mod test_effects {
     use crate::server_fns::download::test_support::StubBackend;
     use shared::metadata::{AlbumWithTracks, Provider, SearchResult, Track};
     use soulbeet::{MetadataError, MetadataProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::watch;
 
     impl Acquire {
         /// An `Acquire` on `db` with its own ledger writer and line of searches, acting through
@@ -76,6 +78,9 @@ mod test_effects {
             let effects = Arc::new(TestEffects {
                 stub: StubBackend::new(vec![]),
                 tracks: Mutex::default(),
+                hydrate_error: Mutex::default(),
+                backend_held: watch::Sender::new(false),
+                backend_calls_held: AtomicUsize::new(0),
             });
             let acquire = Acquire {
                 ledger: Ledger::start(db.clone()),
@@ -88,10 +93,15 @@ mod test_effects {
     }
 
     /// Answers the `StubBackend` it holds, and hydrates through step 3's `hydrate_in` on a
-    /// provider whose album has the tracks `set_tracks` gave (none until then).
+    /// provider whose album has the tracks `set_tracks` gave (none until then), or whose
+    /// `get_album` answers the error `fail_hydrate` gave.
     pub(crate) struct TestEffects {
         stub: Arc<StubBackend>,
         tracks: Mutex<Vec<Track>>,
+        hydrate_error: Mutex<Option<MetadataError>>,
+        /// While true, `backend` calls wait for it to turn false.
+        backend_held: watch::Sender<bool>,
+        backend_calls_held: AtomicUsize,
     }
 
     impl TestEffects {
@@ -102,22 +112,49 @@ mod test_effects {
         pub(crate) fn set_tracks(&self, tracks: Vec<Track>) {
             *self.tracks.lock().unwrap() = tracks;
         }
+
+        pub(crate) fn fail_hydrate(&self, e: MetadataError) {
+            *self.hydrate_error.lock().unwrap() = Some(e);
+        }
+
+        /// Holds every `backend` call from now on until `release_backend`.
+        pub(crate) fn hold_backend(&self) {
+            self.backend_held.send_replace(true);
+        }
+
+        pub(crate) fn release_backend(&self) {
+            self.backend_held.send_replace(false);
+        }
+
+        /// The `backend` calls waiting for `release_backend`.
+        pub(crate) fn backend_calls_held(&self) -> usize {
+            self.backend_calls_held.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
     impl Effects for TestEffects {
         async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure> {
+            let mut held = self.backend_held.subscribe();
+            if *held.borrow_and_update() {
+                self.backend_calls_held.fetch_add(1, Ordering::SeqCst);
+                let _ = held.wait_for(|held| !held).await;
+                self.backend_calls_held.fetch_sub(1, Ordering::SeqCst);
+            }
             Ok(self.stub.clone())
         }
 
         async fn hydrate(&self, _ctx: &UserCtx, query: &mut DownloadQuery) -> Result<(), Failure> {
-            let tracks = self.tracks.lock().unwrap().clone();
-            metadata::hydrate_in(&Tracklist(tracks), query).await
+            let album = match self.hydrate_error.lock().unwrap().clone() {
+                Some(e) => Err(e),
+                None => Ok(self.tracks.lock().unwrap().clone()),
+            };
+            metadata::hydrate_in(&Tracklist(album), query).await
         }
     }
 
-    /// A provider whose every album has these tracks.
-    struct Tracklist(Vec<Track>);
+    /// A provider whose every album has these tracks, or which answers this error.
+    struct Tracklist(Result<Vec<Track>, MetadataError>);
 
     #[async_trait]
     impl MetadataProvider for Tracklist {
@@ -144,6 +181,7 @@ mod test_effects {
             Ok(vec![])
         }
         async fn get_album(&self, id: &str) -> Result<AlbumWithTracks, MetadataError> {
+            let tracks = self.0.clone()?;
             Ok(AlbumWithTracks {
                 album: shared::metadata::Album {
                     id: id.to_string(),
@@ -154,7 +192,7 @@ mod test_effects {
                     cover_url: None,
                     release_types: None,
                 },
-                tracks: self.0.clone(),
+                tracks,
             })
         }
     }
