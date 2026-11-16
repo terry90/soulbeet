@@ -12,10 +12,6 @@ use shared::download::{MatchCandidate, MatchChoices, MatchKind, TrackFit};
 use shared::failure::{cut_chars, TEXT_MAX_CHARS};
 use std::path::{Path, PathBuf};
 
-/// How many source files a result keeps: their tags are a peer's text, and an album folder
-/// rarely holds more.
-const SOURCE_FILES_MAX: usize = 200;
-
 #[derive(Debug)]
 pub(crate) struct Report {
     /// One entry per task, in the order beets ran them.
@@ -266,12 +262,7 @@ impl Report {
         choice: &DriverChoice,
         target: &Path,
     ) -> ImportResult {
-        result.files = self
-            .files
-            .into_iter()
-            .take(SOURCE_FILES_MAX)
-            .map(bounded)
-            .collect();
+        result.files = self.files.into_iter().map(bounded).collect();
         let mut decisions = Vec::new();
         for d in self.duplicates {
             match d {
@@ -926,10 +917,11 @@ mod tests {
             &DriverChoice::Auto,
             Path::new("/music"),
         );
-        assert_eq!(applied.files.len(), SOURCE_FILES_MAX);
+        // Every file is reported; the import queue keeps as many as it stores.
+        assert_eq!(applied.files.len(), 210);
         assert_eq!(
             applied.files.last().unwrap().path,
-            PathBuf::from(format!("/dl/X/{:03}.mp3", SOURCE_FILES_MAX - 1))
+            PathBuf::from("/dl/X/209.mp3")
         );
         assert!(applied
             .files

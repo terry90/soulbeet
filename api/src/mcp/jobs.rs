@@ -220,12 +220,17 @@ fn read_call(args: &Args) -> Result<Call, ToolError> {
 
 /// `states`, each a JobState name.
 fn read_states(args: &Args) -> Result<Vec<JobState>, ToolError> {
+    // One text for every way the list can be wrong: its shape, its length or a name.
     let refused = || {
         let names: Vec<&str> = STATES.iter().map(|s| s.as_str()).collect();
         invalid_value(
             "get_jobs",
             "states",
-            &format!("a list of job states, each one of {}", names.join(", ")),
+            &format!(
+                "a list of at most {} job states, each one of {}",
+                STATES.len(),
+                names.join(", ")
+            ),
         )
     };
     let names = args
@@ -432,15 +437,17 @@ pub(crate) async fn read_now(
     if found.is_empty() {
         return reads;
     }
-    let songs: Vec<Result<Vec<SongFacts>, Failure>> =
+    let songs: Vec<(Option<Vec<SongFacts>>, Option<Failure>)> =
         match navidrome_for(navidrome, ctx, Stage::LibraryCheck).await {
             Ok(navi) => {
-                join_all(found.iter().map(|(i, _, existing)| {
-                    listed_songs(&navi, Path::new(&views[*i].job.folder.path), existing)
+                join_all(found.iter().map(|(i, _, existing)| async {
+                    let library = Path::new(&views[*i].job.folder.path);
+                    let (songs, failure) = listed_songs(&navi, library, existing).await;
+                    (Some(songs), failure)
                 }))
                 .await
             }
-            Err(f) => found.iter().map(|_| Err(f.clone())).collect(),
+            Err(f) => found.iter().map(|_| (None, Some(f.clone()))).collect(),
         };
     for ((i, slot, _), songs) in found.iter().zip(songs) {
         reads[*i].library.insert(*slot, songs);
@@ -448,20 +455,23 @@ pub(crate) async fn read_now(
     reads
 }
 
-/// The songs Navidrome lists for each of `existing`, items in the library folder `library`.
+/// The songs Navidrome lists for each of `existing`, items in the library folder `library`:
+/// those found, and the failure of the first lookup that failed, the others looked up still.
 async fn listed_songs(
     navi: &NavidromeClient,
     library: &Path,
     existing: &[ImportedItem],
-) -> Result<Vec<SongFacts>, Failure> {
-    let mut songs = Vec::new();
+) -> (Vec<SongFacts>, Option<Failure>) {
+    let (mut songs, mut failure) = (Vec::new(), None);
     for item in existing {
-        let found = library_songs(navi, library, item)
-            .await
-            .map_err(|e| navidrome_failure(Stage::LibraryCheck, &e))?;
-        songs.extend(found.iter().map(SongFacts::from));
+        match library_songs(navi, library, item).await {
+            Ok(found) => songs.extend(found.iter().map(SongFacts::from)),
+            Err(e) => {
+                failure.get_or_insert_with(|| navidrome_failure(Stage::LibraryCheck, &e));
+            }
+        }
     }
-    Ok(songs)
+    (songs, failure)
 }
 
 const RETRY_JOB_ARGS: &[&str] = &[
@@ -1184,6 +1194,77 @@ mod tests {
                 result["library_songs_failure"]["code"].as_str()
             ),
             (&Value::Null, Some("navidrome_not_linked"))
+        );
+    }
+
+    #[tokio::test]
+    async fn one_lookup_that_fails_keeps_the_songs_the_others_found() {
+        use crate::connection::test_util::app_with_navidrome;
+        use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub};
+        use std::sync::Arc;
+        let (db, acq, effects, token) = jobs_app().await;
+        let navi = NavidromeStub::start();
+        navi.answer_when(
+            "/api/song",
+            "title=Marrow+Choir+O+Holy+Night",
+            200,
+            &format!(
+                "[{}]",
+                native_song("s1", "Marrow Choir", "O Holy Night", 263.4, None)
+            ),
+        );
+        // nginx's 502 page for the other lookup.
+        navi.answer_when("/api/song", "title=Marrow+Choir+Silent+Night", 502,
+            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n");
+        // The library's two copies beets found, each the size Navidrome lists (sparse: nothing
+        // is written).
+        let copy = |title: &str| {
+            let path = format!("Marrow Choir/Winter Songs/03 - {title}.flac");
+            let file = effects.library().join(&path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::File::create(&file)
+                .unwrap()
+                .set_len(28_734_112)
+                .unwrap();
+            ImportedItem {
+                path: path.into(),
+                recording_mbid: None,
+                artist: "Marrow Choir".into(),
+                title: title.into(),
+                beets_id: Some(17),
+                release_mbid: None,
+                album: "Winter Songs".into(),
+                match_per_mille: None,
+            }
+        };
+        let existing = vec![copy("O Holy Night"), copy("Silent Night")];
+        let dir = tempfile::tempdir().unwrap();
+        let job = duplicate_track_job(
+            &acq,
+            "O Holy Night",
+            &dir.path().join("03 - O Holy Night.flac"),
+            existing,
+        )
+        .await;
+        let app = app_with_navidrome(&db, &acq, Arc::new(NavidromeFor(Ok(navi.client()))));
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "get_jobs",
+                json!({"job_ids": [job], "detail": "full"}),
+            )
+            .await,
+        );
+        let result = &doc["jobs"][0]["results"][0];
+        assert_eq!(
+            (
+                result["library_songs"][0]["song_id"].as_str(),
+                result["library_songs"].as_array().map(Vec::len),
+                result["library_songs_failure"]["code"].as_str()
+            ),
+            (Some("s1"), Some(1), Some("navidrome_unreachable")),
+            "{result}"
         );
     }
 

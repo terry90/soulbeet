@@ -21,9 +21,11 @@ fn kept_as_audio(filename: &str) -> bool {
     path.extension().is_none() || is_audio_path(path)
 }
 
-/// The remote folder of a file a peer names with `\`-separated folders.
+/// The remote folder of a file a peer names with `\` or `/` between its folders.
 fn remote_folder(filename: &str) -> &str {
-    filename.rsplit_once('\\').map_or("", |(folder, _)| folder)
+    filename
+        .rsplit_once(['\\', '/'])
+        .map_or("", |(folder, _)| folder)
 }
 
 /// The albums found in `responses`. A file scored under MIN_SCORE_THRESHOLD
@@ -195,4 +197,61 @@ fn find_best_albums(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slskd::models::SearchResponseFile;
+
+    #[test]
+    fn a_folders_audio_files_are_counted_per_folder_whichever_separator_names_it() {
+        assert_eq!(
+            remote_folder("@@kqzbm\\Music\\Come Over\\07.flac"),
+            "@@kqzbm\\Music\\Come Over"
+        );
+        assert_eq!(remote_folder("music/Come Over/07.flac"), "music/Come Over");
+        assert_eq!(remote_folder("07.flac"), "");
+        let file = |name: &str| SearchResponseFile {
+            filename: name.into(),
+            size: 1,
+            bit_rate: None,
+            length: None,
+            sample_rate: None,
+            bit_depth: None,
+            extension: None,
+            is_variable_bit_rate: None,
+        };
+        let response = SearchResponse {
+            username: "carol_shares".into(),
+            files: vec![
+                file("music/Come Over/07 - Wake Up.flac"),
+                file("music/Come Over/08 - Come Over.flac"),
+                file("music/Come Over/cover.jpg"),
+                file("music/Singles/01 - Wake Up.flac"),
+            ],
+            has_free_upload_slot: true,
+            upload_speed: 1,
+            queue_length: 0,
+            locked_file_count: 0,
+        };
+        let wanted = [WantedTrack {
+            title: "Wake Up".into(),
+            duration_s: None,
+        }];
+        let processed = process_search_responses(&[response], "Kowloon", None, &wanted, true);
+        let mut counts: Vec<(String, u32)> = (processed.albums.iter())
+            .flat_map(|album| &album.tracks)
+            .map(|track| (track.base.filename.clone(), track.base.folder_audio_files))
+            .collect();
+        counts.sort();
+        assert_eq!(
+            counts,
+            // Come Over's two audio files, its cover not counted; the single's folder its one.
+            vec![
+                ("music/Come Over/07 - Wake Up.flac".to_string(), 2),
+                ("music/Singles/01 - Wake Up.flac".to_string(), 1),
+            ]
+        );
+    }
 }

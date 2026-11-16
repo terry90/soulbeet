@@ -450,6 +450,7 @@ fn with_folders(mut failure: Failure, facts: Map<String, Value>, given: &Value) 
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use serde_json::{json, Value};
@@ -760,7 +761,8 @@ mod tests {
     #[tokio::test]
     async fn no_default_folder_lists_the_folders_to_choose_from() {
         let (db, acq, _, token) = app_with_acquire().await;
-        add_folder(&db, "u1", "f2", "Christmas").await;
+        // Never written to: no job is made.
+        add_folder(&db, "u1", "f2", "Christmas", Path::new("/music/christmas")).await;
         set_default_folder(&db, "u1", None).await; // two folders, no default
         let error = document(
             &call_tool(
@@ -837,7 +839,7 @@ mod tests {
     async fn another_users_folder_reads_as_unknown() {
         let (db, acq, _, token) = app_with_acquire().await;
         crate::connection::test_util::add_user(&db, "u2", "bob").await;
-        add_folder(&db, "u2", "b1", "Bob's").await;
+        add_folder(&db, "u2", "b1", "Bob's", Path::new("/music/bob")).await;
         for folder_id in ["b1", "nope"] {
             let error = document(
                 &call_tool(

@@ -64,6 +64,8 @@ pub(crate) struct ImportChoices {
     pub kept_folder: PathBuf,
     /// The files of the last automatic run with their tags, each path relative to `kept_folder`.
     pub files: Vec<SourceFile>,
+    /// How many more files that run read, which the kept import does not keep.
+    pub files_left_out: u32,
     /// None while no run of the import is known (a row kept before runs were).
     pub tasks: Option<TaskCount>,
     pub output_tail: Option<String>,
@@ -168,6 +170,7 @@ pub(crate) async fn import_choices(
         job: view,
         kept_folder: relative(&folder, &acquire.download_base),
         files,
+        files_left_out: last.map_or(0, |run| run.files_left_out),
         tasks: last.map(|run| run.tasks),
         output_tail: last.map(|run| run.output_tail.clone()),
         candidates,
@@ -321,12 +324,22 @@ fn kept_folder(job: &ImportJob) -> PathBuf {
     }
 }
 
-/// `path` relative to `base`; its last name when it is not under `base`, so a result never names
-/// a path of the server.
+/// `path` relative to `base`, so a result never names a path of the server. A path that is not
+/// under `base` as written (beets reports it by another mount of the same folder) is taken from
+/// after the last folder named as `base`'s own last folder, so a disc's subfolder stays; else it
+/// is its last name.
 fn relative(path: &Path, base: &Path) -> PathBuf {
-    match path.strip_prefix(base) {
-        Ok(inside) => inside.to_path_buf(),
-        Err(_) => path.file_name().map(PathBuf::from).unwrap_or_default(),
+    if let Ok(inside) = path.strip_prefix(base) {
+        return inside.to_path_buf();
+    }
+    let parts: Vec<_> = path.components().collect();
+    let after_base = base.file_name().and_then(|name| {
+        let at = parts.iter().rposition(|part| part.as_os_str() == name)?;
+        Some(parts[at + 1..].iter().collect::<PathBuf>())
+    });
+    match after_base {
+        Some(inside) if inside.components().next().is_some() => inside,
+        _ => path.file_name().map(PathBuf::from).unwrap_or_default(),
     }
 }
 
@@ -339,7 +352,7 @@ mod tests {
     use super::*;
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
-        kept_album_job, kept_track_job_with, no_match_with_files, test_db_with_alice,
+        kept_album_job, kept_track_job_with, no_match_with_files,
     };
     use crate::core::test_ctx;
     use crate::ledger::{store, JobState};
@@ -352,9 +365,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_kept_file_is_named_inside_its_folder_wherever_beets_saw_it() {
+        let folder = Path::new("/downloads/Come Over [1f2e3d4c]");
+        assert_eq!(
+            relative(&folder.join("CD2/01.flac"), folder),
+            Path::new("CD2/01.flac")
+        );
+        // The same folder by another mount: the disc's folder stays.
+        let mounted = Path::new("/mnt/data/downloads/Come Over [1f2e3d4c]/CD2/01.flac");
+        assert_eq!(relative(mounted, folder), Path::new("CD2/01.flac"));
+        assert_eq!(
+            relative(Path::new("/elsewhere/01.flac"), folder),
+            Path::new("01.flac")
+        );
+    }
+
     #[tokio::test]
     async fn the_choices_name_the_kept_files_their_tags_and_beets_candidates() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         // beets weighed 2 candidates for "Song Number 1".
         let job = kept_track_job_with(&acq, &effects, no_match_with_files(2)).await;
         let choices = import_choices(&acq, &test_ctx("alice"), &job, None)
@@ -388,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_kept_import_is_taken_by_one_decision_only() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = kept_track_job_with(&acq, &effects, no_match_with_files(2)).await;
         let ctx = test_ctx("alice");
         let (a, b) = tokio::join!(
@@ -420,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_keeping_several_imports_is_decided_one_slot_at_a_time() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let dir = tempfile::tempdir().unwrap();
         let files = ["07.flac", "08.flac"].map(|name| {
             let file = dir.path().join(name);
@@ -456,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleted_kept_files_are_shown_gone_and_a_decision_fails_the_job() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = kept_track_job_with(&acq, &effects, no_match_with_files(1)).await;
         std::fs::remove_dir_all(acq.download_base.join("Come Over [1f2e3d4c]")).unwrap();
         let ctx = test_ctx("alice");
@@ -484,7 +513,7 @@ mod tests {
     /// The other order of the race above: the discard asks first.
     #[tokio::test]
     async fn a_retry_after_a_discard_took_the_import_is_refused_alike() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = kept_track_job_with(&acq, &effects, no_match_with_files(2)).await;
         let ctx = test_ctx("alice");
         let (discarded, retried) = tokio::join!(
@@ -505,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_musicbrainz_link_to_the_wrong_entity_keeps_the_import() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = kept_track_job_with(&acq, &effects, no_match_with_files(0)).await;
         let refused = resolve(
             &acq,

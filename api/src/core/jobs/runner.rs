@@ -635,6 +635,7 @@ pub(crate) use test_effects::TestEffects;
 #[cfg(test)]
 mod test_effects {
     use super::*;
+    use crate::core::jobs::test_support::add_alice;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use crate::importer_health::blocking_failure_of;
     use crate::ledger::JobEvent;
@@ -659,6 +660,7 @@ mod test_effects {
                 stub: StubBackend::new(vec![]),
                 importer: importer.clone(),
                 downloads: tempfile::tempdir().expect("a test download folder"),
+                library: tempfile::tempdir().expect("a test library folder"),
                 tracks: Mutex::default(),
                 hydrate_error: Mutex::default(),
                 backend_held: watch::Sender::new(false),
@@ -678,6 +680,14 @@ mod test_effects {
             };
             (Arc::new(acquire), effects)
         }
+
+        /// `for_test` of a new database holding alice and her one folder, `alice-folder`, at
+        /// the `TestEffects`' library folder, which lives as long as they do.
+        pub(crate) async fn for_alice() -> (Arc<Acquire>, Arc<TestEffects>) {
+            let (acquire, effects) = Acquire::for_test(crate::db::test_db::migrated().await);
+            add_alice(&acquire.db, effects.library()).await;
+            (acquire, effects)
+        }
     }
 
     /// Answers the `StubBackend` it holds, blocks imports as its `StubImporter`'s health says
@@ -693,6 +703,8 @@ mod test_effects {
         importer: Arc<StubImporter>,
         /// The download folder of the `Acquire` made with it.
         downloads: tempfile::TempDir,
+        /// A library folder of its own, for a user's folder to be at.
+        library: tempfile::TempDir,
         tracks: Mutex<Vec<Track>>,
         hydrate_error: Mutex<Option<MetadataError>>,
         /// While true, `backend` calls wait for it to turn false.
@@ -727,6 +739,11 @@ mod test_effects {
 
         pub(crate) fn release_backend(&self) {
             self.backend_held.send_replace(false);
+        }
+
+        /// Its library folder, on disk while it lives.
+        pub(crate) fn library(&self) -> &std::path::Path {
+            self.library.path()
         }
 
         /// Makes every `backend` call answer `failure`.
@@ -850,7 +867,7 @@ mod test_effects {
 mod tests {
     use super::*;
     use crate::core::jobs::test_support::{
-        mcp_album_job, mcp_track_job, queued_track_jobs, record_failures, test_db_with_alice,
+        mcp_album_job, mcp_track_job, queued_track_jobs, record_failures,
     };
     use crate::core::sources::no_candidate_passed;
     use crate::core::test_ctx;
@@ -929,7 +946,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_flagged_source_is_never_picked_or_kept_as_an_alternate() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         record_failures(&acq, "peer_a", 3).await;
         effects.stub().script_polls(found(vec![
             group(
@@ -979,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_review_job_waits_for_a_choice_and_downloads_nothing() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         effects.stub().script_polls(found(vec![group(
             "peer_b",
             vec![item("peer_b", "O Holy Night", "b/03.flac")],
@@ -1001,7 +1018,7 @@ mod tests {
 
     #[tokio::test]
     async fn candidates_that_all_fail_the_jobs_filters_fail_it_instead_of_waiting() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         effects.stub().script_polls(found(vec![group(
             "peer_b",
             vec![DownloadableItem {
@@ -1054,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_cancelled_while_it_searches_stays_cancelled() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let (reached, release) = effects.stub().hold_searches();
         effects.stub().script_polls(found(vec![group(
             "peer_b",
@@ -1092,7 +1109,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_seventh_download_waits_for_a_place() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let jobs = queued_track_jobs(&acq, 7).await;
         for job in &jobs[..6] {
             drive(&acq, &alice(), job).await;
@@ -1129,7 +1146,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_cancelled_while_it_waits_for_a_place_is_left_to_its_cancel() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let jobs = queued_track_jobs(&acq, 7).await;
         for job in &jobs[..6] {
             drive(&acq, &alice(), job).await;
@@ -1161,7 +1178,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_taken_on_again_while_its_runner_waits_for_a_place_is_enqueued_once() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let jobs = queued_track_jobs(&acq, 7).await;
         for job in &jobs[..6] {
             drive(&acq, &alice(), job).await;
@@ -1207,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_album_job_downloads_its_folder_as_one_album() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         effects.set_tracks(vec![
             track("Kowloon", "Wake Up"),
             track("Kowloon", "Come Over"),
@@ -1253,7 +1270,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tracklist_that_cannot_be_read_fails_the_job_with_its_failure() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let mbid = "6a09041b-0f79-3278-88d9-0552dd28d37f";
         // What musicbrainz_rs says of a release MusicBrainz does not have (src/error.rs:17), on
         // the URL find_album asks (lib/soulbeet/src/musicbrainz.rs:351-362, musicbrainz_rs
@@ -1286,7 +1303,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_reads_the_search_handed_to_it_and_waits_for_one_still_running() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", auto(0.7)).await;
         let search_id = (store::job_record(&acq.db, &job, &alice().id()).await)
             .unwrap()
@@ -1330,7 +1347,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_whose_search_expired_searches_again_under_a_new_id() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", auto(0.7)).await;
         let user = alice().id();
         let old = (store::job_record(&acq.db, &job, &user).await)

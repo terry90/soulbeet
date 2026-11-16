@@ -106,7 +106,8 @@ pub enum DriverChoice {
     Pick { data_source: String, id: String },
 }
 
-/// What a run does when beets' config says `duplicate_action: remove`.
+/// How a run handles the duplicates beets finds in the library: as beets' config says, with a
+/// `remove` reported instead of made, or skipped whatever the config says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DuplicateRun {
     /// beets acts as configured.
@@ -272,8 +273,8 @@ pub struct ImportResult {
     pub user_action: Option<UserAction>,
     /// The removals beets wanted in a `DuplicateRun::ReportRemovals` run, one per task.
     pub removals: Vec<WantedRemoval>,
-    /// The files of every task an automatic run recorded, in task order: the first 200, each
-    /// tag cut to `shared::failure::TEXT_MAX_CHARS` characters, since a peer chose them.
+    /// The files of every task an automatic run recorded, in task order, each tag cut to
+    /// `shared::failure::TEXT_MAX_CHARS` characters, since a peer chose them.
     pub files: Vec<SourceFile>,
 }
 

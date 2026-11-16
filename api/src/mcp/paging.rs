@@ -256,17 +256,32 @@ pub(crate) fn leave_out(object: &mut Map<String, Value>, list: &str, keep: Keep,
 /// the most leading items that keep the document within RESULT_MAX_CHARS
 /// once "ok" is added: for a list sent whole, with no cursor to page it.
 pub(crate) fn fit_whole(
+    fields: Map<String, Value>,
+    key: &str,
+    items: Vec<Value>,
+    left_out_key: &str,
+) -> Map<String, Value> {
+    fit_whole_after(fields, key, items, left_out_key, 0)
+}
+
+/// `fit_whole` of a list `already_left_out` items were left out of before it came, counted in
+/// `left_out_key` with those it leaves out.
+pub(crate) fn fit_whole_after(
     mut fields: Map<String, Value>,
     key: &str,
     mut items: Vec<Value>,
     left_out_key: &str,
+    already_left_out: usize,
 ) -> Map<String, Value> {
     let mut empty = empty_document(&fields, key);
     // The count at its longest.
-    empty.insert(left_out_key.into(), json!(items.len()));
+    empty.insert(left_out_key.into(), json!(already_left_out + items.len()));
     let base = chars(&Value::Object(empty));
     let k = longest_fitting(base, &items, items.len(), |_| 0);
-    fields.insert(left_out_key.into(), json!(items.len() - k));
+    fields.insert(
+        left_out_key.into(),
+        json!(already_left_out + items.len() - k),
+    );
     items.truncate(k);
     fields.insert(key.into(), Value::Array(items));
     fields

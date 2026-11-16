@@ -701,8 +701,16 @@ pub async fn tracks_of(db: &SqlitePool, job: &str) -> Result<Vec<JobTrack>, sqlx
             let row: Option<DownloadProgress> = row.as_deref().map(json).transpose()?;
             let state = state_named(&state)?;
             // Only a kept import is read here; a queued or running one is the import queue's.
-            let kept = match state {
-                JobState::NeedsDecision => import.as_deref().map(json).transpose()?,
+            // One that cannot be read leaves the slot without it, not the whole job unread: its
+            // decision is made from the import queue's own copy.
+            let kept = match (state, import.as_deref()) {
+                (JobState::NeedsDecision, Some(text)) => match json(text) {
+                    Ok(kept) => Some(kept),
+                    Err(e) => {
+                        tracing::warn!("Slot {slot} of job {job} keeps an unreadable import: {e}");
+                        None
+                    }
+                },
                 _ => None,
             };
             Ok(JobTrack {
@@ -896,9 +904,7 @@ pub async fn job_state(db: &SqlitePool, job: &str) -> Option<JobState> {
 mod tests {
     use super::*;
     use crate::core::jobs::runner::Acquire;
-    use crate::core::jobs::test_support::{
-        batch_of_downloads, named_batch, test_db_with_alice, track_job_of,
-    };
+    use crate::core::jobs::test_support::{batch_of_downloads, named_batch, track_job_of};
     use crate::ledger::{DuplicateRule, JobEvent, JobKind, Ledger, NewJob};
     use crate::server_fns::download::test_support::item;
     use shared::download::DownloadState;
@@ -1014,9 +1020,9 @@ mod tests {
 
     #[tokio::test]
     async fn running_batches_are_the_batches_with_unfinished_jobs() {
-        let db = test_db_with_alice().await;
+        let (acq, _) = Acquire::for_alice().await;
+        let db = acq.db.clone();
         crate::core::folder_of(&db, "bob").await;
-        let (acq, _) = Acquire::for_test(db.clone());
         let (running, jobs) = batch_of_downloads(&acq, 2).await;
         let end = |job: &str, state| JobEvent::Ended {
             job: job.to_string(),
@@ -1043,8 +1049,8 @@ mod tests {
 
     #[tokio::test]
     async fn batches_are_read_newest_first_with_their_counts_and_found_by_label() {
-        let db = test_db_with_alice().await;
-        let (acq, _) = Acquire::for_test(db.clone());
+        let (acq, _) = Acquire::for_alice().await;
+        let db = acq.db.clone();
         let (downloads, _) = batch_of_downloads(&acq, 2).await;
         let advent = named_batch(&acq, "Été d'Advent").await;
         let alice = UserId::new("alice");

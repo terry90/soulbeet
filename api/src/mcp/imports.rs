@@ -12,7 +12,7 @@ use super::contract::{failed, invalid_value, success, upstream_error, NextCall, 
 use super::jobs::JobTool;
 use super::keys::{keyed, request_key, Keyed};
 use super::next::next_calls;
-use super::paging::{fit_whole, leave_out, length, Keep};
+use super::paging::{fit_whole_after, leave_out, length, Keep};
 use super::refs::request_key_schema;
 use super::server::{common_codes, ToolSpec};
 use super::McpCaller;
@@ -42,7 +42,7 @@ pub(crate) const GET_IMPORT_CHOICES: ToolSpec = ToolSpec {
     title: "Show import choices",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Shows what a job waiting for an import decision (needs_decision) kept for it: kept_folder, the folder of the downloaded files relative to Soulful's download folder; files, each file relative to kept_folder with the tags beets read (artist, title, album, track, length_s), files_omitted counting those left out to stay under 60,000 characters; tasks, how many of beets' tasks imported of how many, and output_tail, the end of beets' output, from its last run; candidates, the matches beets weighed and found too far (data_source, id, artist, title, album, year, country, disambiguation, distance from 0 for an exact match to 1, the fields that differ, and for an album how the files fit its tracks; past 30,000 characters the farthest are left out, candidates_omitted counting them); and allowed_choices, the choices resolve_import takes for it. A job of an album the web page imported track by track can keep several imports: slot then names one, any slot waiting for it. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; resolve_import or dismiss_job ends the job).")
+        format!("Shows what a job waiting for an import decision (needs_decision) kept for it: kept_folder, the folder of the downloaded files relative to Soulful's download folder; files, each file relative to kept_folder with the tags beets read (artist, title, album, track, length_s), files_omitted counting those left out to stay under 60,000 characters and those past the first 200, which Soulful does not keep; tasks, how many of beets' tasks imported of how many, and output_tail, the end of beets' output, from its last run; candidates, the matches beets weighed and found too far (data_source, id, artist, title, album, year, country, disambiguation, distance from 0 for an exact match to 1, the fields that differ, and for an album how the files fit its tracks; past 30,000 characters the farthest are left out, candidates_omitted counting them); and allowed_choices, the choices resolve_import takes for it. A job of an album the web page imported track by track can keep several imports: slot then names one, any slot waiting for it. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; resolve_import or dismiss_job ends the job).")
     },
     input_schema: r#"{"type": "object", "additionalProperties": false, "required": ["job_id"], "properties": {"job_id": {"type": "string", "minLength": 1}, "slot": {"type": "integer", "minimum": 0}}}"#,
     read_only: true,
@@ -154,7 +154,8 @@ fn cut(text: &str) -> String {
 const CHOICES_MAX_CHARS: usize = 30_000;
 
 /// What get_import_choices answers: the candidates within CHOICES_MAX_CHARS, best first,
-/// `candidates_omitted` counting those left out, then the files, as many as fit.
+/// `candidates_omitted` counting those left out, then the files, as many as fit, `files_omitted`
+/// counting those left out and those the kept import never kept.
 fn choices_document(choices: ImportChoices) -> Map<String, Value> {
     let candidates: Vec<Value> = (choices.candidates.iter())
         .flat_map(|c| &c.candidates)
@@ -178,7 +179,9 @@ fn choices_document(choices: ImportChoices) -> Map<String, Value> {
                 "album": f.album, "track": f.track, "length_s": f.length_secs})
         })
         .collect();
-    fit_whole(fields, "files", files, "files_omitted")
+    // The files the kept import never kept are left out too.
+    let never_kept = choices.files_left_out as usize;
+    fit_whole_after(fields, "files", files, "files_omitted", never_kept)
 }
 
 /// A match beets weighed: its ids, names, how far it is from the files (0 an exact match), what
@@ -333,9 +336,8 @@ mod tests {
     async fn the_farthest_candidates_are_left_out_past_their_share_of_the_answer() {
         use crate::core::jobs::decide::import_choices;
         use crate::core::jobs::runner::Acquire;
-        use crate::core::jobs::test_support::test_db_with_alice;
         use crate::mcp::paging::{length, RESULT_MAX_CHARS};
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = kept_track_job_with(&acq, &effects, no_match_with_files(1)).await;
         let ctx = crate::core::test_ctx("alice");
         let mut choices = import_choices(&acq, &ctx, &job, None).await.unwrap();
@@ -363,6 +365,23 @@ mod tests {
             1,
             "the files keep their share"
         );
+    }
+
+    #[tokio::test]
+    async fn files_a_kept_import_does_not_keep_are_counted_left_out() {
+        use crate::core::jobs::decide::import_choices;
+        use crate::core::jobs::runner::Acquire;
+        let (acq, effects) = Acquire::for_alice().await;
+        // A run that read 250 files.
+        let mut read = no_match_with_files(1);
+        read.files = vec![read.files[0].clone(); 250];
+        let job = kept_track_job_with(&acq, &effects, read).await;
+        let ctx = crate::core::test_ctx("alice");
+        let choices = import_choices(&acq, &ctx, &job, None).await.unwrap();
+        assert_eq!((choices.files.len(), choices.files_left_out), (200, 50));
+        let doc = super::choices_document(choices);
+        let shown = doc["files"].as_array().unwrap().len() as u64;
+        assert_eq!(shown + doc["files_omitted"].as_u64().unwrap(), 250);
     }
 
     #[tokio::test]

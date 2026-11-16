@@ -246,8 +246,9 @@ pub(crate) struct ReadNow {
     /// The backend's answers, by slot.
     pub live: HashMap<u32, LiveFacts>,
     /// The songs Navidrome lists for an import beets found in the library, by the import's first
-    /// slot.
-    pub library: HashMap<u32, Result<Vec<SongFacts>, Failure>>,
+    /// slot: those found (None when Navidrome could not be asked at all), and the failure of a
+    /// lookup that failed.
+    pub library: HashMap<u32, (Option<Vec<SongFacts>>, Option<Failure>)>,
 }
 
 /// How long a call waits for one answer of the backend about a transfer: the place in the queue
@@ -538,18 +539,14 @@ fn failure_document(
     if failure.stage == Stage::SourceSearch {
         facts.insert("search_id".into(), json!(view.job.search_id));
         facts.extend(job_search_facts(view));
-    } else {
-        let slot = failed_slot(view);
+    } else if let Some(slot) = failed_slot(view) {
+        // A job that failed before it had a slot (its tracklist read) tried no transfer.
         facts.extend(attempt_facts(slot, wanted));
-        let mut omitted = None;
-        if let Some(slot) = slot {
-            let (earlier, left_out) = earlier_attempts(slot);
-            tried = earlier
-                .into_iter()
-                .map(|a| tried_entry(slot.slot, a))
-                .collect();
-            omitted = Some(left_out);
-        }
+        let (earlier, omitted) = earlier_attempts(slot);
+        tried = earlier
+            .into_iter()
+            .map(|a| tried_entry(slot.slot, a))
+            .collect();
         facts.insert("tried_omitted".into(), json!(omitted));
     }
     error_object(&ToolError {
@@ -586,11 +583,11 @@ fn job_search_facts(view: &JobView) -> Map<String, Value> {
 
 /// The facts of `slot`'s failed transfer (design 10.2): the attempt its row is of, the file and
 /// how far the transfer came; each null when not known.
-fn attempt_facts(slot: Option<&SlotView>, wanted: &DownloadQuery) -> Map<String, Value> {
-    let row = slot.and_then(shown_row);
-    let attempt = slot.and_then(current_attempt);
+fn attempt_facts(slot: &SlotView, wanted: &DownloadQuery) -> Map<String, Value> {
+    let row = shown_row(slot);
+    let attempt = current_attempt(slot);
     let mut facts = file_fields(attempt.and_then(|a| a.candidate.as_ref()), wanted);
-    facts.insert("slot".into(), json!(slot.map(|s| s.slot)));
+    facts.insert("slot".into(), json!(slot.slot));
     facts.insert("attempt".into(), json!(attempt.map(|a| a.n)));
     facts.insert("backend".into(), json!(DEFAULT_DOWNLOAD_BACKEND));
     facts.insert("source".into(), json!(row.map(|r| cut(&r.source))));
@@ -768,8 +765,10 @@ fn result_document(
         }
         SlotResult::AlreadyInLibrary { existing } => {
             let (songs, failure) = match slots.first().and_then(|s| now.library.get(s)) {
-                Some(Ok(songs)) => (json!(songs), Value::Null),
-                Some(Err(f)) => (Value::Null, error_value(f)),
+                Some((songs, failure)) => (
+                    json!(songs),
+                    failure.as_ref().map_or(Value::Null, error_value),
+                ),
                 None => (Value::Null, Value::Null),
             };
             json!({
@@ -862,7 +861,7 @@ mod tests {
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
         auto_options, done_track_job, failed_track_job, mcp_album_job, mcp_track_job, search_of,
-        test_db_with_alice, view_of,
+        view_of,
     };
     use crate::core::jobs::{untried, RetryMode};
     use crate::core::test_ctx;
@@ -871,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_job_carries_its_failure_its_facts_and_what_was_tried() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let job = failed_track_job(&acq).await;
         let view = view_of(&acq, &job).await;
         let now = chrono::Utc::now().timestamp();
@@ -974,7 +973,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_result_says_how_to_allow_deleting_it() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let job = done_track_job(&acq).await;
         let alice = test_ctx("alice");
         let rejected = retry(&acq, &alice, &job, RetryMode::RejectResult, None);
@@ -997,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_jobs_search_facts_count_what_the_jobs_own_filters_dropped() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let lossless = crate::ledger::JobOptions {
             filters: crate::ledger::SourceFilters {
                 lossless_only: true,
@@ -1049,8 +1048,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_job_that_failed_before_it_had_a_slot_names_no_transfer() {
+        let (acq, effects) = Acquire::for_alice().await;
+        let mbid = "6a09041b-0f79-3278-88d9-0552dd28d37f";
+        // What musicbrainz_rs says of a release MusicBrainz does not have (src/error.rs:17).
+        effects.fail_hydrate(soulbeet::MetadataError::NotFound {
+            service: shared::failure::Service::Musicbrainz,
+            status: None,
+            raw: "Musicbrainz returned \"Not found\"".into(),
+        });
+        let job = mcp_album_job(&acq, "Kowloon", "Come Over", mbid).await;
+        crate::core::jobs::runner::drive(&acq, &crate::core::test_ctx("alice"), &job).await;
+        acq.ledger.settled().await;
+        let view = view_of(&acq, &job).await;
+        let doc = job_document(
+            &view,
+            &Untried::default(),
+            Detail::Summary,
+            &ReadNow::default(),
+            false,
+        );
+        assert_eq!(doc["failure"]["code"], "metadata_not_found", "{doc}");
+        assert_eq!(doc["failure"]["facts"], json!({"job_id": job}));
+        assert!(doc["failure"].get("tried").is_none());
+    }
+
+    #[tokio::test]
     async fn a_large_albums_full_document_keeps_within_its_bound_and_counts_what_it_left_out() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let mbid = "6a09041b-0f79-3278-88d9-0552dd28d37f";
         let job = mcp_album_job(&acq, "Kowloon", "Come Over", mbid).await;
         let search_id = search_of(&acq, &job).await;

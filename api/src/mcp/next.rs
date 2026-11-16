@@ -128,7 +128,7 @@ mod tests {
     use crate::core::jobs::test_support::{
         cancelled_track_job, choosing_track_job, done_track_job, downloading_track_job,
         exhausted_track_job, failed_track_job, failed_track_job_with, failed_web_ui_job,
-        index_failed_track_job, test_db_with_alice, view_of,
+        index_failed_track_job, view_of,
     };
     use crate::core::jobs::untried;
     use shared::failure::{FailureCode, UserAction, UserActionCode};
@@ -151,7 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_running_job_offers_a_wait_and_a_cancel() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let job = downloading_track_job(&acq).await;
         let (view, untried) = read(&acq, &job).await;
         let next = next_calls(&view, &untried);
@@ -165,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_lists_only_the_modes_retry_job_accepts() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         // Soulful's text for a broken importer (importer_health), which needs a person.
         let importer_broken = Failure::new(
             FailureCode::ImporterBroken,
@@ -246,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_web_ui_job_is_offered_only_dismiss_job() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let job = failed_web_ui_job(&acq).await;
         let (view, untried) = read(&acq, &job).await;
         assert_eq!(
@@ -270,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_peer_busy_failure_offers_the_same_source_later_with_its_wait() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let job = busy_job(&acq).await;
         let (view, untried) = read(&acq, &job).await;
         let next = next_calls(&view, &untried);

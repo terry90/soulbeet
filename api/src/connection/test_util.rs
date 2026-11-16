@@ -24,7 +24,6 @@ use crate::auth::{Role, UserCtx};
 use crate::base_url::BaseUrl;
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::runner::{Acquire, TestEffects};
-use crate::core::jobs::test_support::test_db_with_alice;
 use crate::db::test_db;
 use crate::ledger::store::RunningBatch;
 use crate::mcp::status::{FolderFacts, NavidromeFacts, StatusFacts, StatusSource};
@@ -45,12 +44,17 @@ use crate::services::NavidromeLookupError;
 use crate::test_navidrome::NavidromeFor;
 
 impl ConnectionState {
+    /// `on` an `Acquire::for_test` of `db`.
+    pub(crate) fn for_test(db: SqlitePool) -> ConnectionState {
+        let acquire = Acquire::for_test(db.clone()).0;
+        ConnectionState::on(db, acquire)
+    }
+
     /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits,
     /// `test_key()`, no client metadata documents, `sample_facts()`, no
-    /// user linked to Navidrome, no NAVIDROME_MUSIC_PATH and an
-    /// `Acquire::for_test` of `db`.
-    pub(crate) fn for_test(db: SqlitePool) -> ConnectionState {
-        let db_for_acquire = db.clone();
+    /// user linked to Navidrome, no NAVIDROME_MUSIC_PATH, acting through
+    /// `acquire`, whose ledger writer serves every state made on it.
+    pub(crate) fn on(db: SqlitePool, acquire: Arc<Acquire>) -> ConnectionState {
         ConnectionState {
             mcp_off: None,
             public_url: None,
@@ -63,7 +67,7 @@ impl ConnectionState {
             navidrome: Arc::new(NavidromeFor(Err(|| NavidromeLookupError::NotLinked))),
             navidrome_music_path: None,
             log: Arc::new(RequestLog::default()),
-            acquire: Acquire::for_test(db_for_acquire).0,
+            acquire,
         }
     }
 }
@@ -428,27 +432,32 @@ async fn alice_app(state: ConnectionState) -> (SqlitePool, Router, String) {
     (db, router(state), token)
 }
 
-/// `mcp_app` on an `Acquire::for_test` of the same database: u1 (alice) with folder f1 (a
-/// directory kept on disk for the test) as her default folder, the acquisition, its test effects
-/// and her access token.
+/// `mcp_app` on an `Acquire::for_test` of the same database: u1 (alice) with folder f1 (the test
+/// effects' library folder, on disk while they live) as her default folder, the acquisition, its
+/// test effects and her access token.
 pub(crate) async fn app_with_acquire() -> (SqlitePool, Arc<Acquire>, Arc<TestEffects>, String) {
     let db = test_db::migrated().await;
+    let (acquire, effects) = Acquire::for_test(db.clone());
     add_user(&db, "u1", "alice").await;
-    add_folder(&db, "u1", "f1", "Music").await;
+    add_folder(&db, "u1", "f1", "Music", effects.library()).await;
     set_default_folder(&db, "u1", Some("f1")).await;
     let token = access_token(&db, "u1", RESOURCE).await;
-    let (acquire, effects) = Acquire::for_test(db.clone());
     (db, acquire, effects, token)
 }
 
-/// `user_id`'s folder `folder_id` named `name`, at a directory kept on disk for the test.
-pub(crate) async fn add_folder(db: &SqlitePool, user_id: &str, folder_id: &str, name: &str) {
-    let dir = tempfile::tempdir().unwrap().keep();
+/// `user_id`'s folder `folder_id` named `name`, at `path`.
+pub(crate) async fn add_folder(
+    db: &SqlitePool,
+    user_id: &str,
+    folder_id: &str,
+    name: &str,
+    path: &std::path::Path,
+) {
     sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES (?, ?, ?, ?)")
         .bind(folder_id)
         .bind(user_id)
         .bind(name)
-        .bind(dir.to_str().unwrap())
+        .bind(path.to_str().unwrap())
         .execute(db)
         .await
         .unwrap();
@@ -471,18 +480,15 @@ pub(crate) async fn set_default_folder(db: &SqlitePool, user_id: &str, folder_id
 /// The jobs of `core::jobs::test_support` are alice's (user id `alice`): a database with her,
 /// the acquisition acting on it, its effects and her access token.
 pub(crate) async fn jobs_app() -> (SqlitePool, Arc<Acquire>, Arc<TestEffects>, String) {
-    let db = test_db_with_alice().await;
+    let (acq, effects) = Acquire::for_alice().await;
+    let db = acq.db.clone();
     let token = access_token(&db, "alice", RESOURCE).await;
-    let (acq, effects) = Acquire::for_test(db.clone());
     (db, acq, effects, token)
 }
 
-/// The router of `ConnectionState::for_test(db)` acting through `acquire`.
+/// The router of `ConnectionState::on(db, acquire)`.
 pub(crate) fn app_of(db: &SqlitePool, acquire: &Arc<Acquire>) -> Router {
-    router(ConnectionState {
-        acquire: acquire.clone(),
-        ..ConnectionState::for_test(db.clone())
-    })
+    router(ConnectionState::on(db.clone(), acquire.clone()))
 }
 
 /// `app_of(db, acquire)` with `navidrome` as the caller's Navidrome.
@@ -492,9 +498,8 @@ pub(crate) fn app_with_navidrome(
     navidrome: Arc<dyn NavidromeOf>,
 ) -> Router {
     router(ConnectionState {
-        acquire: acquire.clone(),
         navidrome,
-        ..ConnectionState::for_test(db.clone())
+        ..ConnectionState::on(db.clone(), acquire.clone())
     })
 }
 

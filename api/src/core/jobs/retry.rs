@@ -779,7 +779,7 @@ mod tests {
         auto_options, done_track_job, downloading_track_job, downloading_track_job_with,
         failed_track_job, failed_track_job_with, failed_web_ui_job, file_of, importing_track_job,
         in_progress, index_failed_track_job, kept_album_job, mcp_track_job, queued_track_jobs,
-        stop_slots, test_db_with_alice, view_of,
+        stop_slots, view_of,
     };
     use crate::core::sources::{search_stopped, server_restarted_search, SearchProgress, Searches};
     use crate::core::test_ctx;
@@ -816,7 +816,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_source_takes_the_best_untried_source_and_refuses_when_none_is_left() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         // Tried peer_a and carol_shares; its search also found peer_b.
         let job = failed_track_job(&acq).await;
         let RetryAnswer::Applied(view) = retry(&acq, &alice(), &job, RetryMode::NextSource, None)
@@ -866,7 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_job_retried_downloads_again() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         // peer_a downloading; its search also found peer_b.
         let job = downloading_track_job(&acq).await;
         let cancelled = cancel(&acq, &alice(), &job).await.unwrap();
@@ -889,7 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_searching_job_stops_its_search() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let (reached, release) = effects.stub().hold_searches();
         effects.stub().script_polls(vec![Ok(search_result(
             "search",
@@ -937,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_searched_again_after_a_cancel_takes_nothing_from_the_cancelled_search() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let (reached, release) = effects.stub().hold_searches();
         let found = |source: &str, file: &str| {
             Ok(search_result(
@@ -989,7 +989,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_source_takes_only_the_files_the_searchs_filters_keep() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let album = crate::core::jobs::AlbumRef {
             artist: "Kowloon".into(),
             title: "Come Over".into(),
@@ -1067,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_source_is_refused_while_the_source_is_offline() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = failed_track_job_with(&acq, "Silent Night", peer_busy()).await;
         effects.stub().set_presence(SourcePresence::Offline);
         let RetryAnswer::Unavailable(f, facts) =
@@ -1101,7 +1101,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_source_takes_the_source_that_failed_not_an_alternate_failover_was_refused() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let title = "Silent Night";
         let job = downloading_track_job_with(&acq, title, auto_options()).await;
         // peer_a's queue is full; failover's peer_b is refused at its enqueue (the backend, as
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_source_waits_for_a_presence_check_slskd_could_not_finish() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = failed_track_job_with(&acq, "Silent Night", peer_busy()).await;
         // The Soulseek server did not answer GetStatus in time (Soulseek.NET
         // SoulseekClient.cs:3866), as slskd's global handler answers it (Program.cs:1051-1053).
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mode_the_failure_does_not_take_names_the_modes_allowed_not_the_failure() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let busy = failed_track_job_with(&acq, "Silent Night", peer_busy()).await;
         let answer = retry(&acq, &alice(), &busy, RetryMode::IndexOnly, None)
             .await
@@ -1234,7 +1234,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_search_that_cannot_be_recorded_fails_the_job_and_searches_nothing() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = failed_track_job(&acq).await;
         // The database refuses the search's record (a full disk, a lock held too long).
         sqlx::query(
@@ -1273,7 +1273,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_change_whose_job_cannot_be_read_after_it_is_still_answered_as_made() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let job = queued_track_jobs(&acq, 1).await.remove(0);
         // Every read of the job fails once the change is written (an unreadable row).
         sqlx::query(&format!(
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_cancelled_while_its_runner_waits_for_a_place_lets_the_runner_go_at_once() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let jobs = queued_track_jobs(&acq, 7).await;
         for job in &jobs[..6] {
             drive(&acq, &alice(), job).await;
@@ -1323,7 +1323,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_source_refuses_a_job_whose_file_waits_for_navidrome() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         let job = index_failed_track_job(&acq).await;
         let search = view_of(&acq, &job).await.search.unwrap().id;
         let answer = download_source(
@@ -1346,7 +1346,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_ends_a_waiting_job_and_refuses_one_that_is_importing() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let waiting = queued_track_jobs(&acq, 1).await.remove(0);
         let cancelled = cancel(&acq, &alice(), &waiting).await.unwrap();
         assert!(matches!(cancelled, RetryAnswer::Applied(v) if v.job.state == JobState::Cancelled));
@@ -1372,7 +1372,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_result_reopens_a_done_job_without_that_source() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let job = done_track_job(&acq).await;
         let RetryAnswer::Applied(view) = retry(&acq, &alice(), &job, RetryMode::RejectResult, None)
             .await
@@ -1400,7 +1400,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_web_ui_job_cannot_be_retried_or_cancelled_here() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let job = failed_web_ui_job(&acq).await;
         let web_page = |answer: RetryAnswer| matches!(answer, RetryAnswer::InvalidInput { field: "job_id", expected } if expected == WEB_PAGE_JOB);
         assert!(web_page(
@@ -1415,7 +1415,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_needs_user_failure_can_be_retried_after_the_user_acted() {
-        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, effects) = Acquire::for_alice().await;
         // Soulful's text for a broken importer: a person fixes it.
         let broken = Failure::new(
             FailureCode::ImporterBroken,
@@ -1456,7 +1456,7 @@ mod tests {
 
     #[tokio::test]
     async fn dismiss_can_be_repeated_after_a_partial_discard() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let dir = tempfile::tempdir().unwrap();
         let files = ["07.flac", "08.flac"].map(|name| {
             let file = dir.path().join(name);
@@ -1511,7 +1511,7 @@ mod tests {
 
     #[tokio::test]
     async fn dismissing_a_job_waiting_for_a_decision_discards_its_kept_import() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let dir = tempfile::tempdir().unwrap();
         let files = ["07.flac", "08.flac"].map(|name| {
             let file = dir.path().join(name);

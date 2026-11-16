@@ -30,8 +30,13 @@ impl NextCall {
         }
     }
 
-    /// The call with the fact `key` next to it.
+    /// The call with the fact `key` next to it. The facts are flattened beside `tool` and
+    /// `args`, so a fact of either name would replace them: none is ever given one.
     pub(crate) fn with(mut self, key: &str, value: Value) -> NextCall {
+        assert!(
+            !matches!(key, "tool" | "args"),
+            "a fact named {key} would replace the call's own field"
+        );
         self.facts.insert(key.to_string(), value);
         self
     }
@@ -317,6 +322,12 @@ mod tests {
     use crate::connection::test_util::text_of;
     use crate::mcp::args::tests::obj;
     use crate::mcp::args::Args;
+
+    #[test]
+    #[should_panic(expected = "a fact named tool would replace the call's own field")]
+    fn a_fact_never_replaces_the_call_it_is_next_to() {
+        let _ = NextCall::new("get_jobs", json!({})).with("tool", json!("x"));
+    }
 
     #[test]
     fn a_failure_result_has_the_contract_shape() {

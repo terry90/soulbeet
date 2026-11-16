@@ -1105,6 +1105,24 @@ mod tests {
         assert!(matches!(entry.into_progress(3).state, DS::Failed(_)));
     }
 
+    /// A peer may report a negative speed or queue: read as unreported, not as a huge number.
+    #[test]
+    fn a_negative_count_a_peer_reports_is_unreported() {
+        let r: SearchResult = serde_json::from_value(json!({"username": "p", "filename": "a.flac",
+            "size": 1, "bitrate": -1, "duration": null, "hasFreeUploadSlot": false,
+            "uploadSpeed": -1, "queueLength": -1}))
+        .unwrap();
+        let facts = file_facts(&r);
+        assert_eq!(
+            (
+                facts.source_upload_speed,
+                facts.source_queue_length,
+                facts.bitrate_kbps
+            ),
+            (None, None, None)
+        );
+    }
+
     #[test]
     fn backend_data_written_with_a_32_bit_queue_length_still_reads() {
         let r: SearchResult = serde_json::from_value(json!({"username": "p", "filename": "a.flac",

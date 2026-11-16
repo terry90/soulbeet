@@ -2413,6 +2413,41 @@ mod tests {
         assert_eq!(body["searchText"], "Marrow Choir Holy Night choir");
     }
 
+    #[tokio::test]
+    async fn blank_caller_text_sends_the_built_text_and_no_target_sends_nothing() {
+        let (url, seen) = serve(vec![ok(&format!(r#"{{"id":"{SEARCH_ID}"}}"#))]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        let wanted = vec![track("Marrow Choir", "O Holy Night")];
+        let blank = SearchSpec {
+            text: Some("   ".into()),
+            ..SearchSpec::of(None, wanted.clone())
+        };
+        client
+            .start_search(blank, Duration::seconds(120))
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+        assert_eq!(body["searchText"], search_text(None, &wanted).unwrap());
+        // Text alone names nothing to score what is found against.
+        let untargeted = SearchSpec {
+            text: Some("Marrow Choir".into()),
+            ..SearchSpec::of(None, vec![])
+        };
+        let e = client
+            .start_search(untargeted, Duration::seconds(120))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, SoulseekError::NoSearchTarget { tracks: 0 }),
+            "{e:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
     /// Review focus 1: slskd saves the record as complete before it writes
     /// the responses (`Search/SearchService.cs:284-285`, then `:359-361`).
     #[tokio::test]

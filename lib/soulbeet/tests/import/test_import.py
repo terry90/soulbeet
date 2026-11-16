@@ -227,6 +227,7 @@ def test_a_skip_run_leaves_the_library_alone_and_names_what_it_has(beets_env):
     beets_env.album(beets_env.src)
     run = beets_env.driver("auto", duplicates="skip", env={"FAKESRC_MODE": "strong"})
 
+    assert run.code == 0, run
     assert beets_env.ls("$id\t$path") == before
     [dup] = run.report["duplicates"]
     assert dup["action"] == "skipped", run

@@ -1161,7 +1161,6 @@ mod tests {
     use crate::core::jobs::test_support::{
         auto_options, downloading_track_job, downloading_track_job_with, file_of,
         importing_track_job, in_progress, kept_track_job, mcp_track_job, queued_track_jobs,
-        test_db_with_alice,
     };
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use crate::ledger::{
@@ -2811,6 +2810,16 @@ mod tests {
             store::job_state(&db, "bad-job").await,
             Some(JobState::Failed)
         );
+        // Its own record cannot be read: a failure of reading what was asked, at input.
+        let failure: String = sqlx::query_scalar("SELECT failure FROM jobs WHERE id = 'bad-job'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let failure: Failure = serde_json::from_str(&failure).unwrap();
+        assert_eq!(
+            (failure.code, failure.stage),
+            (FailureCode::ServerRestarted, Stage::Input)
+        );
         let states: Vec<String> = sqlx::query_scalar(
             "SELECT state FROM job_tracks WHERE job_id = 'bad-slot' ORDER BY slot",
         )
@@ -2971,7 +2980,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_mcp_job_resumes_in_every_state() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let (ledger, db) = (&acq.ledger, &acq.db);
         let tmp = tempfile::tempdir().unwrap();
         let stub = StubBackend::new(vec![]);
@@ -3103,7 +3112,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancel_requested_before_a_restart_is_marked_again() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let (ledger, db) = (&acq.ledger, &acq.db);
         let tmp = tempfile::tempdir().unwrap();
         let stub = StubBackend::new(vec![]);
@@ -3161,7 +3170,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_mcp_job_whose_transfer_another_batch_holds_fails_and_is_not_dismissed() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let (ledger, db) = (&acq.ledger, &acq.db);
         let tmp = tempfile::tempdir().unwrap();
         let stub = StubBackend::new(vec![]);
@@ -3213,7 +3222,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_mcp_job_resumes_without_other_sources_when_flagged_ones_cannot_be_told() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let (ledger, db) = (&acq.ledger, &acq.db);
         let tmp = tempfile::tempdir().unwrap();
         let stub = StubBackend::new(vec![]);
@@ -3245,7 +3254,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_find_sources_search_cut_off_by_a_restart_ends_and_a_jobs_search_is_left_to_it() {
-        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (acq, _) = Acquire::for_alice().await;
         let (ledger, db) = (&acq.ledger, &acq.db);
         let tmp = tempfile::tempdir().unwrap();
         let started = Started::on(StubBackend::new(vec![]));

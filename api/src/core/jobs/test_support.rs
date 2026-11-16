@@ -33,24 +33,22 @@ use std::path::Path;
 const ALICE: &str = "alice";
 const ALICE_FOLDER: &str = "alice-folder";
 
-/// A migrated database with the user alice and her one folder. The folder is the runner's
-/// temporary directory, which exists already: preparing it as an import target writes nothing.
-pub(crate) async fn test_db_with_alice() -> SqlitePool {
-    let db = crate::db::test_db::migrated().await;
+/// The user alice and her one folder, at `library`, which exists already: preparing it as an
+/// import target writes nothing.
+pub(crate) async fn add_alice(db: &SqlitePool, library: &Path) {
     sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')")
         .bind(ALICE)
         .bind(ALICE)
-        .execute(&db)
+        .execute(db)
         .await
         .unwrap();
     sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES (?, ?, 'Music', ?)")
         .bind(ALICE_FOLDER)
         .bind(ALICE)
-        .bind(std::env::temp_dir().to_str().unwrap())
-        .execute(&db)
+        .bind(library.to_str().unwrap())
+        .execute(db)
         .await
         .unwrap();
-    db
 }
 
 /// An automatic pick at 0.7, no filters, 4 sources per slot.

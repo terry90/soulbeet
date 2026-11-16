@@ -78,9 +78,16 @@ pub struct ImportJob {
 pub struct KeptRun {
     pub tasks: TaskCount,
     pub output_tail: String,
-    /// The files with their tags, from the last automatic run.
+    /// The files with their tags, from the last automatic run: the first KEPT_FILES_MAX.
     pub files: Vec<SourceFile>,
+    /// How many more files that run read, not kept.
+    #[serde(default)]
+    pub files_left_out: u32,
 }
+
+/// How many files of a run a kept import keeps: their tags are a peer's text, stored with the
+/// import, and an album folder rarely holds more.
+const KEPT_FILES_MAX: usize = 200;
 
 /// How an import treats the library's earlier copy of what it imports.
 #[derive(Debug, Clone)]
@@ -671,14 +678,20 @@ impl Shared {
 /// What a run of `job` that ended with `result` knew: its tasks and output, and the files an
 /// automatic run read, which a chosen run (beets reads no files for it) keeps from before.
 fn last_run(job: &ImportJob, result: &ImportResult) -> KeptRun {
-    let files = match job.choice {
-        DriverChoice::Auto => result.files.clone(),
-        _ => (job.last_run.as_ref()).map_or_else(Vec::new, |before| before.files.clone()),
+    let (files, files_left_out) = match (&job.choice, &job.last_run) {
+        (DriverChoice::Auto, _) => {
+            let left_out = result.files.len().saturating_sub(KEPT_FILES_MAX);
+            let kept = result.files.iter().take(KEPT_FILES_MAX).cloned().collect();
+            (kept, u32::try_from(left_out).unwrap_or(u32::MAX))
+        }
+        (_, Some(before)) => (before.files.clone(), before.files_left_out),
+        (_, None) => (Vec::new(), 0),
     };
     KeptRun {
         tasks: result.tasks,
         output_tail: result.output_tail.clone(),
         files,
+        files_left_out,
     }
 }
 
@@ -1441,6 +1454,7 @@ mod tests {
             },
             output_tail: "skipped tail".into(),
             files: vec![read.clone()],
+            files_left_out: 0,
         };
         // None while a retry has the import.
         let last_run = |queue: &ImportQueue| {
@@ -1473,6 +1487,7 @@ mod tests {
             tasks: TaskCount::default(),
             output_tail: "pick tail".into(),
             files: vec![read],
+            files_left_out: 0,
         };
         assert_eq!(last_run(&queue), Some(picked.clone()));
 

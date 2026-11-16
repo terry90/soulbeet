@@ -779,20 +779,27 @@ export class SlskdState {
    * (TransfersController.cs:584-617, DownloadService.cs:711-729): slskd asks
    * the peer and stores the answer on the record. A transfer queued at the
    * peer gets its 1-based place among that peer's transfers queued there; an
-   * id slskd never listed is a 404; any other transfer is Soulseek.NET's
-   * TransferNotFoundException (SoulseekClient.cs:1643-1646), which slskd
-   * answers as 500.
+   * id slskd never listed is a 404. A transfer that ended is no longer
+   * active: Soulseek.NET's TransferNotFoundException
+   * (SoulseekClient.cs:1643-1646), which slskd answers as 500. One still
+   * active but not queued at the peer (on its way, or being sent) is asked
+   * of the peer, whose client answers no place for a file it does not queue
+   * (PeerMessageHandler.cs:422-440): the wait for one times out
+   * (Waiter.cs:161), also a 500.
    */
   placeInQueue(id: string): Reply {
     const transfer = this.transfers.find((t) => t.id === id && !t.hidden);
     if (!transfer) {
       return { status: 404, body: null };
     }
-    if (transfer.state !== 'Queued, Remotely') {
+    if (transfer.state.startsWith('Completed')) {
       return {
         status: 500,
         body: `A download of ${transfer.filename} from user ${transfer.username} is not active`,
       };
+    }
+    if (transfer.state !== 'Queued, Remotely') {
+      return { status: 500, body: 'The wait timed out after 5000 milliseconds' };
     }
     const place =
       this.transfers
