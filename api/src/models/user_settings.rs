@@ -72,15 +72,18 @@ impl UserSettings {
         db: &sqlx::SqlitePool,
         user_id: &str,
     ) -> Result<UserSettings, String> {
-        // Try to get existing settings, or return defaults
         let settings =
             sqlx::query_as::<_, UserSettings>("SELECT * FROM user_settings WHERE user_id = ?")
                 .bind(user_id)
                 .fetch_optional(db)
                 .await
                 .map_err(|e| e.to_string())?;
+        Ok(settings.unwrap_or_else(|| Self::defaults(user_id)))
+    }
 
-        Ok(settings.unwrap_or_else(|| UserSettings {
+    /// What a user without a row has.
+    pub(crate) fn defaults(user_id: &str) -> UserSettings {
+        UserSettings {
             user_id: user_id.to_string(),
             default_metadata_provider: Some("musicbrainz".to_string()),
             last_search_type: Some("album".to_string()),
@@ -100,107 +103,85 @@ impl UserSettings {
             discovery_navidrome_playlist_id: None,
             discovery_last_generated_at: None,
             default_download_folder_id: None,
-        }))
+        }
     }
 
     pub async fn upsert(user_id: &str, update: UpdateUserSettings) -> Result<UserSettings, String> {
         Self::upsert_in(&DB, user_id, update).await
     }
 
-    /// Stores the fields of `update` that are set. Switching auto-delete off drops the tracks
-    /// its last run kept, in the same transaction, so Settings does not show them as current.
+    /// Stores the fields of `update` that are set, in one statement that writes no other
+    /// column, so two writes at once both stay; a new row takes `defaults` for the rest.
+    /// Switching auto-delete off drops the tracks its last run kept, in the same transaction,
+    /// so Settings does not show them as current.
     pub(crate) async fn upsert_in(
         db: &sqlx::SqlitePool,
         user_id: &str,
         update: UpdateUserSettings,
     ) -> Result<UserSettings, String> {
-        // Build dynamic update - only update fields that are Some
-        let current = Self::get_in(db, user_id).await?;
+        /// `given` when set, else `default`, as the column's type.
+        fn over<T: Into<U>, U>(given: Option<T>, default: U) -> U {
+            given.map_or(default, Into::into)
+        }
+        let clears_blocks = update.auto_delete_enabled == Some(false);
+        let defaults = Self::defaults(user_id);
+        let mut given: Vec<&str> = Vec::new();
+        let mut insert = sqlx::QueryBuilder::<sqlx::Sqlite>::new("");
+        // Every field of `update`, named once: a field added to it and not here fails to build.
+        macro_rules! columns {
+            ($($field:ident),*) => {
+                let UpdateUserSettings { $($field),* } = update;
+                $(if $field.is_some() {
+                    given.push(stringify!($field));
+                })*
+                insert.push(concat!(
+                    "INSERT INTO user_settings (user_id",
+                    $(", ", stringify!($field),)*
+                    ") VALUES ("
+                ));
+                let mut values = insert.separated(", ");
+                values.push_bind(user_id);
+                $(values.push_bind(over($field, defaults.$field));)*
+                insert.push(")");
+            };
+        }
+        columns!(
+            default_metadata_provider,
+            last_search_type,
+            auto_delete_enabled,
+            lastfm_api_key,
+            lastfm_username,
+            discovery_promote_threshold,
+            navidrome_banner_dismissed,
+            listenbrainz_username,
+            listenbrainz_token,
+            discovery_enabled,
+            discovery_folder_id,
+            discovery_track_count,
+            discovery_lifetime_days,
+            discovery_profiles,
+            discovery_playlist_name,
+            default_download_folder_id
+        );
+        if given.is_empty() {
+            insert.push(" ON CONFLICT(user_id) DO NOTHING");
+        } else {
+            insert.push(" ON CONFLICT(user_id) DO UPDATE SET ");
+            let mut set = insert.separated(", ");
+            for column in &given {
+                set.push(format!("{column} = excluded.{column}"));
+            }
+        }
 
-        let provider = update
-            .default_metadata_provider
-            .or(current.default_metadata_provider);
-        let search_type = update.last_search_type.or(current.last_search_type);
-        let auto_delete = update
-            .auto_delete_enabled
-            .unwrap_or(current.auto_delete_enabled);
-        let lastfm_key = update.lastfm_api_key.or(current.lastfm_api_key);
-        let lastfm_user = update.lastfm_username.or(current.lastfm_username);
-        let promote_threshold = update
-            .discovery_promote_threshold
-            .unwrap_or(current.discovery_promote_threshold);
-        let banner_dismissed = update
-            .navidrome_banner_dismissed
-            .unwrap_or(current.navidrome_banner_dismissed);
-        let lb_username = update
-            .listenbrainz_username
-            .or(current.listenbrainz_username);
-        let lb_token = update.listenbrainz_token.or(current.listenbrainz_token);
-        let disc_enabled = update
-            .discovery_enabled
-            .unwrap_or(current.discovery_enabled);
-        let disc_folder = update.discovery_folder_id.or(current.discovery_folder_id);
-        let disc_tc = update
-            .discovery_track_count
-            .unwrap_or(current.discovery_track_count);
-        let disc_lt = update
-            .discovery_lifetime_days
-            .unwrap_or(current.discovery_lifetime_days);
-        let disc_profiles = update
-            .discovery_profiles
-            .unwrap_or(current.discovery_profiles);
-        let disc_name = update
-            .discovery_playlist_name
-            .unwrap_or(current.discovery_playlist_name);
-        let default_folder = update
-            .default_download_folder_id
-            .or(current.default_download_folder_id);
-
+        // The first statement writes, so the transaction waits for other writers instead of
+        // failing as one that read first would.
         let mut tx = db.begin().await.map_err(|e| e.to_string())?;
-        sqlx::query(
-            r#"
-            INSERT INTO user_settings (user_id, default_metadata_provider, last_search_type, auto_delete_enabled, lastfm_api_key, lastfm_username, discovery_promote_threshold, navidrome_banner_dismissed, listenbrainz_username, listenbrainz_token, discovery_enabled, discovery_folder_id, discovery_track_count, discovery_lifetime_days, discovery_profiles, discovery_playlist_name, default_download_folder_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                default_metadata_provider = excluded.default_metadata_provider,
-                last_search_type = excluded.last_search_type,
-                auto_delete_enabled = excluded.auto_delete_enabled,
-                lastfm_api_key = excluded.lastfm_api_key,
-                lastfm_username = excluded.lastfm_username,
-                discovery_promote_threshold = excluded.discovery_promote_threshold,
-                navidrome_banner_dismissed = excluded.navidrome_banner_dismissed,
-                listenbrainz_username = excluded.listenbrainz_username,
-                listenbrainz_token = excluded.listenbrainz_token,
-                discovery_enabled = excluded.discovery_enabled,
-                discovery_folder_id = excluded.discovery_folder_id,
-                discovery_track_count = excluded.discovery_track_count,
-                discovery_lifetime_days = excluded.discovery_lifetime_days,
-                discovery_profiles = excluded.discovery_profiles,
-                discovery_playlist_name = excluded.discovery_playlist_name,
-                default_download_folder_id = excluded.default_download_folder_id
-            "#,
-        )
-        .bind(user_id)
-        .bind(&provider)
-        .bind(&search_type)
-        .bind(auto_delete)
-        .bind(&lastfm_key)
-        .bind(&lastfm_user)
-        .bind(promote_threshold)
-        .bind(banner_dismissed)
-        .bind(&lb_username)
-        .bind(&lb_token)
-        .bind(disc_enabled)
-        .bind(&disc_folder)
-        .bind(disc_tc)
-        .bind(disc_lt)
-        .bind(&disc_profiles)
-        .bind(&disc_name)
-        .bind(&default_folder)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-        if current.auto_delete_enabled && !auto_delete {
+        insert
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        if clears_blocks {
             super::deletion_block::DeletionBlockRow::clear_in(&mut tx, user_id).await?;
         }
         tx.commit().await.map_err(|e| e.to_string())?;
@@ -330,5 +311,49 @@ impl UserSettings {
             .get(profile)
             .copied()
             .unwrap_or(10) as usize
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use crate::db::test_db;
+
+    #[tokio::test]
+    async fn a_write_keeps_what_another_write_changed_meanwhile() {
+        let db = test_db::migrated().await;
+        // user_settings.user_id references users(id).
+        crate::core::folder_of(&db, "alice").await;
+        let (a, b) = tokio::join!(
+            UserSettings::upsert_in(
+                &db,
+                "alice",
+                UpdateUserSettings {
+                    auto_delete_enabled: Some(true),
+                    ..Default::default()
+                }
+            ),
+            UserSettings::upsert_in(
+                &db,
+                "alice",
+                UpdateUserSettings {
+                    discovery_promote_threshold: Some(4),
+                    ..Default::default()
+                }
+            )
+        );
+        a.unwrap();
+        b.unwrap();
+        let s = UserSettings::get_in(&db, "alice").await.unwrap();
+        assert_eq!(
+            (s.auto_delete_enabled, s.discovery_promote_threshold),
+            (true, 4)
+        );
+        // A new row has the defaults, not the column defaults of
+        // api/migrations/20260323000000_discovery_per_user.sql:5-8.
+        assert_eq!(
+            s.discovery_track_count,
+            UserSettings::defaults("alice").discovery_track_count
+        );
     }
 }

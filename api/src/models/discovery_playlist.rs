@@ -82,12 +82,20 @@ impl DiscoveryTrackRow {
     }
 
     pub async fn get_pending_by_folder(folder_id: &str) -> Result<Vec<DiscoveryTrack>, String> {
+        Self::get_pending_by_folder_in(&DB, folder_id).await
+    }
+
+    /// The Pending tracks of `folder_id`, oldest first.
+    pub(crate) async fn get_pending_by_folder_in(
+        db: &sqlx::SqlitePool,
+        folder_id: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
         let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
             "SELECT * FROM discovery_tracks WHERE folder_id = ? AND status = ? ORDER BY created_at",
         )
         .bind(folder_id)
         .bind(DiscoveryStatus::Pending.to_string())
-        .fetch_all(&*DB)
+        .fetch_all(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(rows.into_iter().map(Into::into).collect())

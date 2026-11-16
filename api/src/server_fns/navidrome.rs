@@ -75,7 +75,7 @@ pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> 
     let promote_threshold = user_settings.discovery_promote_threshold;
 
     let pending = if let Some(ref fid) = user_settings.discovery_folder_id {
-        DiscoveryTrackRow::get_pending_by_folder(fid).await?
+        DiscoveryTrackRow::get_pending_by_folder_in(&crate::db::DB, fid).await?
     } else {
         vec![]
     };
