@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use shared::navidrome::{DeletionReason, LibraryStats};
+use shared::navidrome::{DeletionReason, DeletionReview, LibraryStats};
 
 #[derive(PartialEq, Clone, Copy, Default)]
 pub enum DashboardTab {
@@ -113,6 +113,20 @@ fn StatCard(label: &'static str, value: String) -> Element {
     }
 }
 
+/// "Replaced" for a replaced copy, else "Deleted"; then " via {client}" when
+/// a connected app did it.
+fn deletion_label(review: &DeletionReview) -> String {
+    let what = if review.reason == DeletionReason::Replaced {
+        "Replaced"
+    } else {
+        "Deleted"
+    };
+    match &review.client {
+        Some(client) => format!("{what} via {client}"),
+        None => what.to_string(),
+    }
+}
+
 #[component]
 pub fn DeletionHistoryTab() -> Element {
     let history = use_resource(|| async { api::get_deletion_history().await });
@@ -143,16 +157,49 @@ pub fn DeletionHistoryTab() -> Element {
                                 span { class: "text-gray-400 truncate", "{item.artist}" }
                             }
                             span { class: "text-xs font-mono ml-2 text-red-400",
-                                if item.reason == DeletionReason::Replaced {
-                                    "Replaced"
-                                } else {
-                                    "Deleted"
-                                }
+                                {deletion_label(&item)}
                             }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review(reason: DeletionReason, client: Option<&str>) -> DeletionReview {
+        DeletionReview {
+            id: "r1".into(),
+            song_id: "s1".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            path: None,
+            rating: None,
+            reason,
+            created_at: "2026-11-16 10:00:00".into(),
+            origin: "mcp".into(),
+            client: client.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn a_deletion_by_an_app_names_it() {
+        assert_eq!(
+            deletion_label(&review(DeletionReason::Cleanup, Some("claude.ai"))),
+            "Deleted via claude.ai"
+        );
+        assert_eq!(
+            deletion_label(&review(DeletionReason::Replaced, None)),
+            "Replaced"
+        );
+        assert_eq!(
+            deletion_label(&review(DeletionReason::Disliked, None)),
+            "Deleted"
+        );
     }
 }
