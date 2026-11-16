@@ -82,20 +82,27 @@ impl Cause {
     }
 }
 
+/// `raw` cut by `cut_chars`, whose kept end holds a beets tail's fatal lines.
 fn cut_raw(raw: String) -> String {
     cut_chars(raw, RAW_MAX_CHARS)
 }
 
 /// `text` when it has at most `max_chars` characters. A longer one keeps
-/// its start and its end, which for a beets tail holds the fatal lines,
-/// around a line saying how many characters were left out, `max_chars`
-/// characters in all. Cuts fall on char boundaries.
+/// its start and its end around a line saying how many characters were
+/// left out, `max_chars` characters in all. Cuts fall on char boundaries.
+/// `max_chars` must hold that line for the whole text left out (25
+/// characters and one per digit of the count past the first); every caller
+/// passes a constant of hundreds.
 pub fn cut_chars(text: String, max_chars: usize) -> String {
     let total = text.chars().count();
     if total <= max_chars {
         return text;
     }
     let marker = |left_out: usize| format!("\n[{left_out} characters left out]\n");
+    debug_assert!(
+        max_chars >= marker(total).chars().count(),
+        "cut_chars: {max_chars} characters cannot hold the line saying what was left out"
+    );
     let mut kept = max_chars - marker(total).chars().count();
     // Each character kept is one fewer left out, whose count can be a
     // digit shorter: keep characters until the marker leaves no room.

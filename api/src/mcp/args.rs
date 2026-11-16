@@ -2,13 +2,22 @@
 
 use rmcp::model::JsonObject;
 use serde_json::{Map, Value};
+use shared::failure::{cut_chars, TEXT_MAX_CHARS};
 
-use super::contract::{invalid_input, invalid_value, NextCall, ToolError};
+use super::contract::{invalid_input, invalid_value, NextCall, ToolError, TOO_LARGE_TO_REPEAT};
 
 /// Longest text argument, in characters after trimming: a reference or
 /// query is echoed in `facts` and `next`, so it stays far below the result
 /// cap (design 10.1).
 const STRING_MAX_CHARS: usize = 500;
+
+/// Longest call a result offers again in `next`, in characters of its JSON
+/// text. The rest of an error result is bounded by its cuts: a name in the
+/// message and in `facts.field` at TEXT_MAX_CHARS, `cause.raw` at
+/// RAW_MAX_CHARS and a few facts of at most STRING_MAX_CHARS, each character
+/// at most six once escaped, so under 35,000 characters, and with this the
+/// whole result stays under RESULT_MAX_CHARS (design 10.1).
+const ECHO_MAX_CHARS: usize = 25_000;
 
 const A_STRING: &str = "a non-empty string of at most 500 characters";
 const AN_MBID: &str = "a MusicBrainz id: 36 characters, 8-4-4-4-12 hexadecimal digits";
@@ -48,7 +57,7 @@ impl Args {
 
     /// D1, called after the tool read every value: the alphabetically first
     /// name it does not take is refused, offering the call without the
-    /// names it does not take.
+    /// names it does not take, unless that call is too large to repeat.
     pub(crate) fn finish(&self) -> Result<(), ToolError> {
         let Some(name) = self.unknown() else {
             return Ok(());
@@ -59,15 +68,12 @@ impl Args {
             .filter(|(name, _)| self.known.contains(&name.as_str()))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
-        Err(invalid_input(
-            self.tool,
-            &self.field(name),
-            &self.takes(),
-            vec![NextCall {
-                tool: self.tool,
-                args: Value::Object(taken),
-            }],
-        ))
+        let next = repeatable(self.tool, Value::Object(taken));
+        let mut e = self.unknown_name(name, Vec::from_iter(next.clone()));
+        if next.is_none() {
+            e.failure.message = format!("{} {TOO_LARGE_TO_REPEAT}", e.failure.message);
+        }
+        Err(e)
     }
 
     /// A required text, trimmed.
@@ -166,12 +172,7 @@ impl Args {
                 known,
             };
             if let Some(unknown) = element.unknown() {
-                return Err(invalid_input(
-                    self.tool,
-                    &element.field(unknown),
-                    &element.takes(),
-                    vec![],
-                ));
+                return Err(element.unknown_name(unknown, vec![]));
             }
             elements.push(element);
         }
@@ -183,12 +184,9 @@ impl Args {
         Value::Object(self.map.clone())
     }
 
-    /// This call again (D13).
-    pub(crate) fn same_call(&self) -> NextCall {
-        NextCall {
-            tool: self.tool,
-            args: self.as_value(),
-        }
+    /// This call again (D13), unless it is too large to repeat.
+    pub(crate) fn same_call(&self) -> Option<NextCall> {
+        repeatable(self.tool, self.as_value())
     }
 
     /// `name`'s value, unless it is missing or `null`.
@@ -219,6 +217,19 @@ impl Args {
     fn refuse(&self, name: &str, expected: &str) -> ToolError {
         invalid_value(self.tool, &self.field(name), expected)
     }
+
+    /// `name` is not taken here; the caller chose the name, so it is cut
+    /// wherever it is echoed.
+    fn unknown_name(&self, name: &str, next: Vec<NextCall>) -> ToolError {
+        let field = cut_chars(self.field(name), TEXT_MAX_CHARS);
+        invalid_input(self.tool, &field, &self.takes(), next)
+    }
+}
+
+/// A call of `tool` with `args`, unless its JSON text is longer than
+/// ECHO_MAX_CHARS characters.
+pub(crate) fn repeatable(tool: &'static str, args: Value) -> Option<NextCall> {
+    (args.to_string().chars().count() <= ECHO_MAX_CHARS).then_some(NextCall { tool, args })
 }
 
 #[cfg(test)]
@@ -228,7 +239,10 @@ pub(crate) mod tests {
     use shared::failure::{FailureCode, RetryAdvice, Stage};
 
     use super::*;
-    use crate::mcp::contract::NextCall;
+    use crate::connection::test_util::text_of;
+    use crate::mcp::contract::{failed, upstream_error, NextCall};
+    use crate::mcp::paging::RESULT_MAX_CHARS;
+    use crate::services::NavidromeLookupError;
 
     pub(crate) fn obj(v: Value) -> Option<JsonObject> {
         v.as_object().cloned()
@@ -381,11 +395,11 @@ pub(crate) mod tests {
         assert_eq!(a.string("artist").unwrap(), "Bing Crosby");
         assert_eq!(
             a.same_call(),
-            NextCall {
+            Some(NextCall {
                 tool: "find_in_library",
                 args: json!({"good": "4D04E9B5-ECD1-4EF3-BAE0-5C98492AF1C8",
                 "simple": "4d04e9b5ecd14ef3bae05c98492af1c8", "artist": " Bing Crosby "})
-            }
+            })
         );
     }
 
@@ -436,5 +450,58 @@ pub(crate) mod tests {
                 .message,
             "find_in_library: references must be a list of 1 to 100 objects"
         );
+    }
+
+    /// 100 references of three 500-character fields: about 155,000
+    /// characters of arguments.
+    fn large_call(extra: Value) -> Args {
+        let field = "x".repeat(500);
+        let refs: Vec<Value> = (0..100)
+            .map(|_| json!({"artist": field, "title": field, "album": field}))
+            .collect();
+        let mut args = json!({"references": refs});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        Args::new("find_in_library", obj(args), &["references", "cursor"])
+    }
+
+    fn result_chars(e: ToolError) -> usize {
+        text_of(&failed(e)).chars().count()
+    }
+
+    #[test]
+    fn a_call_too_large_to_repeat_is_not_offered_and_its_unknown_name_is_cut() {
+        let long = "z".repeat(10_000);
+        let a = large_call(json!({long.clone(): 1}));
+        let e = a.finish().unwrap_err();
+        let field = e.facts["field"].as_str().unwrap().to_string();
+        assert_eq!(field, cut_chars(long, TEXT_MAX_CHARS));
+        assert_eq!(
+            e.failure.message,
+            format!("find_in_library takes no argument named '{field}': it takes only references, cursor The call is too large to offer again in next.")
+        );
+        assert!(e.next.is_empty());
+        assert!(result_chars(e) <= RESULT_MAX_CHARS);
+    }
+
+    #[test]
+    fn a_failure_that_could_be_retried_on_a_call_too_large_to_repeat_says_so() {
+        let a = large_call(json!({}));
+        assert_eq!(a.same_call(), None);
+        let lookup = NavidromeLookupError::Database(
+            "error returned from database: (code: 5) database is locked".into(),
+        );
+        let e = upstream_error(
+            lookup.failure(Stage::LibraryCheck, lookup.to_string()),
+            Map::new(),
+            a.same_call(),
+        );
+        assert_eq!(
+            e.failure.message,
+            "error returned from database: (code: 5) database is locked The call is too large to offer again in next."
+        );
+        assert!(e.next.is_empty());
+        assert!(result_chars(e) <= RESULT_MAX_CHARS);
     }
 }

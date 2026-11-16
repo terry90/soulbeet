@@ -102,19 +102,26 @@ fn refused_input(message: String, field: &str, expected: &str, next: Vec<NextCal
     }
 }
 
+/// What a failure's message adds when the call it would offer again is too
+/// large to repeat in `next`.
+pub(crate) const TOO_LARGE_TO_REPEAT: &str = "The call is too large to offer again in next.";
+
 /// A service's failure (D13): `retry`, the call that failed, is offered
-/// when the failure says the same source can answer later; any other
+/// when the failure says the same source can answer later, and when that
+/// call is too large to repeat (None) the message says so; any other
 /// failure offers nothing and relies on its `retry` and `user_action`.
 pub(crate) fn upstream_error(
-    failure: Failure,
+    mut failure: Failure,
     facts: Map<String, Value>,
-    retry: NextCall,
+    retry: Option<NextCall>,
 ) -> ToolError {
-    let next = if failure.retry == RetryAdvice::SameSourceLater {
-        vec![retry]
-    } else {
-        vec![]
-    };
+    let mut next = vec![];
+    if failure.retry == RetryAdvice::SameSourceLater {
+        match retry {
+            Some(call) => next.push(call),
+            None => failure.message = format!("{} {TOO_LARGE_TO_REPEAT}", failure.message),
+        }
+    }
     ToolError {
         failure,
         facts,
