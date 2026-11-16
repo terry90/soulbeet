@@ -6,7 +6,9 @@ use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, Failure, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS};
 
 use super::args::Args;
-use super::contract::{failed, items, items_text, upstream_error, ItemResult, Items, ToolError};
+use super::contract::{
+    error_object, failed, items, items_text, upstream_error, ItemResult, Items, ToolError,
+};
 use super::keys::{keyed, request_key, Keyed};
 use super::paging::RESULT_MAX_CHARS;
 use super::refs::request_key_schema;
@@ -41,7 +43,7 @@ pub(crate) const SYNC_RATINGS: ToolSpec = ToolSpec {
     title: "Run the rating sync",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Runs this user's rating sync now, as Soulful does every 6 hours: pending discovery tracks rated at or above the promote threshold move into the library, 1-star ones are deleted, and with auto-delete on and deletion switched on for this app, other 1-star songs' files are deleted unless the delete checks keep them (another listener rated or starred them, a download wants them, the file cannot be placed). Without the switch, auto-delete is skipped (auto_delete not_allowed_for_this_app) and the 6 hourly sync does it. Returns one entry per track acted on with what was done or the failure that stopped it; the top level is partial when any entry failed. A very long report keeps the first entries and counts the rest in entries_omitted; Settings lists every kept track. Takes seconds to minutes with a large library. Failure codes: {common}, {NAVIDROME_CODES}, already_running (a sync for this user is running, or a call with this request_key still runs), partial, and per entry the delete_*, import_* and unknown_handle codes.")
+        format!("Runs this user's rating sync now, as Soulful does every 6 hours: pending discovery tracks rated at or above the promote threshold move into the library, 1-star ones are deleted, and with auto-delete on and deletion switched on for this app, other 1-star songs' files are deleted unless the delete checks keep them (another listener rated or starred them, a download wants them, the file cannot be placed). Without the switch, auto-delete is skipped (auto_delete not_allowed_for_this_app) and the 6 hourly sync does it. Returns one entry per track acted on with what was done or the failure that stopped it; the top level is partial when any entry failed. A very long report keeps the first entries and counts the rest in entries_omitted; Settings lists every kept track, unless kept_not_stored holds the error that stopped storing them, when Settings still lists the previous sync's. Takes seconds to minutes with a large library. Failure codes: {common}, {NAVIDROME_CODES}, already_running (a sync for this user is running, or a call with this request_key still runs), partial, and per entry the delete_*, import_* and unknown_handle codes.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"#,
@@ -132,6 +134,12 @@ fn report_items(r: &SyncReport, left_out: &[usize]) -> Items {
         "kept_tracks": r.kept,
         "entries_omitted": left_out.len(),
         "failed_entries_omitted": failed_left_out,
+        "kept_not_stored": r.kept_not_stored.as_ref().map(|f| error_object(&ToolError {
+            failure: cut(f),
+            facts: Map::new(),
+            tried: vec![],
+            next: vec![],
+        })),
     }) else {
         unreachable!("an object literal is an object");
     };
@@ -166,17 +174,22 @@ fn entry(t: &SyncedTrack) -> ItemResult {
     let Some(failure) = &t.failure else {
         return ItemResult::Done(fields);
     };
-    let mut failure = failure.clone();
-    failure.message = cut_json(failure.message, TEXT_MAX_CHARS);
-    if let Some(cause) = &mut failure.cause {
-        cause.raw = cut_json(std::mem::take(&mut cause.raw), RAW_MAX_CHARS);
-    }
     ItemResult::Failed(ToolError {
-        failure,
+        failure: cut(failure),
         facts: fields,
         tried: vec![],
         next: vec![],
     })
+}
+
+/// `f` with its message and its cause's raw text cut to their bounds.
+fn cut(f: &Failure) -> Failure {
+    let mut failure = f.clone();
+    failure.message = cut_json(failure.message, TEXT_MAX_CHARS);
+    if let Some(cause) = &mut failure.cause {
+        cause.raw = cut_json(std::mem::take(&mut cause.raw), RAW_MAX_CHARS);
+    }
+    failure
 }
 
 #[cfg(test)]
@@ -189,6 +202,7 @@ mod tests {
     use crate::connection::test_util::{
         alice_app, call_tool, document, mcp_app, text_of, FixedSync,
     };
+    use crate::core::database_failure;
     use crate::core::delete_guard::blocked_by_other_user;
     use crate::db::test_db;
 
@@ -209,6 +223,7 @@ mod tests {
             scanned: 1342,
             auto_delete: AutoDeleteRan::On,
             kept: 1,
+            kept_not_stored: None,
             tracks: vec![
                 done("s1", SyncAction::Delete),
                 SyncedTrack {
@@ -250,6 +265,35 @@ mod tests {
             ),
             (Some(1342), Some("on"), Some(1), Some(0), Some(0))
         );
+        assert_eq!(doc["kept_not_stored"], Value::Null);
+    }
+
+    #[test]
+    fn kept_tracks_settings_does_not_list_are_named_with_the_error() {
+        let report = SyncReport {
+            scanned: 3,
+            auto_delete: AutoDeleteRan::On,
+            kept: 0,
+            kept_not_stored: Some(database_failure(Stage::Delete, "disk I/O error")),
+            tracks: vec![done("s1", SyncAction::Delete)],
+        };
+        let doc: Value = from_str(text_of(&report_result(&report))).unwrap();
+        let error = &doc["kept_not_stored"];
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["stage"].as_str(),
+                error["retry"].as_str(),
+                error["cause"]["raw"].as_str()
+            ),
+            (
+                Some("settings_unreadable"),
+                Some("delete"),
+                Some("same_source_later"),
+                Some("disk I/O error")
+            )
+        );
+        assert_eq!(doc["results"][0]["ok"], true, "the delete was still done");
     }
 
     #[test]
@@ -263,6 +307,7 @@ mod tests {
             scanned: 200,
             auto_delete: AutoDeleteRan::On,
             kept: 200,
+            kept_not_stored: None,
             tracks,
         };
         let text = text_of(&report_result(&report)).to_string();
@@ -303,6 +348,7 @@ mod tests {
             scanned: 201,
             auto_delete: AutoDeleteRan::On,
             kept: 1,
+            kept_not_stored: None,
             tracks,
         };
         let doc: Value = from_str(text_of(&report_result(&report))).unwrap();
@@ -323,6 +369,7 @@ mod tests {
             scanned: 0,
             auto_delete: AutoDeleteRan::NotAllowed,
             kept: 0,
+            kept_not_stored: None,
             tracks: vec![],
         })));
         let (db, app, token) = alice_app(ConnectionState {

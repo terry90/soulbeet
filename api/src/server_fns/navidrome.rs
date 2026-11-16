@@ -28,10 +28,14 @@ use shared::failure::Stage;
 
 #[post("/api/navidrome/sync-ratings", auth: AuthSession)]
 pub async fn sync_ratings() -> Result<SyncResult, ServerFnError> {
-    ratings::sync(&auth.0, AutoDeletePermit::Allowed)
-        .await
-        .map(|report| report.counts())
-        .map_err(failure_error)
+    let report =
+        (ratings::sync(&auth.0, AutoDeletePermit::Allowed).await).map_err(failure_error)?;
+    // SyncResult has no room for it, and a sync whose kept tracks Settings does not list did
+    // not succeed.
+    match report.kept_not_stored {
+        Some(f) => Err(failure_error(f)),
+        None => Ok(report.counts()),
+    }
 }
 
 #[get("/api/navidrome/deletion-history", auth: AuthSession)]

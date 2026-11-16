@@ -368,8 +368,11 @@ pub(crate) struct SyncReport {
     pub scanned: u32,
     pub auto_delete: AutoDeleteRan,
     pub tracks: Vec<SyncedTrack>,
-    /// The entries of auto_delete_songs that carry a failure (D12), as replace_in stored them.
+    /// The entries of auto_delete_songs that carry a failure (D12).
     pub kept: u32,
+    /// Why Settings does not list the kept tracks: replace_in failed, so it still lists the
+    /// previous sync's. None when they were stored, or auto-delete did not run.
+    pub kept_not_stored: Option<Failure>,
 }
 
 impl SyncReport {
@@ -444,7 +447,8 @@ pub(crate) struct SyncDeps<'a> {
 /// promotes those rated at the threshold or above, then runs auto-delete when the settings have
 /// it on and `permit` allows it, storing the tracks it kept. An app that may not delete promotes
 /// with `Replace::Never`, so no library copy is replaced either. Every failure comes before any
-/// action; a failure of an action is its track's entry. Entries in that order.
+/// action; a failure of an action is its track's entry, and a failure to store the kept tracks
+/// is `kept_not_stored`. Entries in that order.
 pub(crate) async fn sync_in(
     deps: &SyncDeps<'_>,
     ctx: &UserCtx,
@@ -486,7 +490,7 @@ pub(crate) async fn sync_in(
         (true, AutoDeletePermit::Allowed) => AutoDeleteRan::On,
         (true, AutoDeletePermit::NotForThisApp) => AutoDeleteRan::NotAllowed,
     };
-    let mut kept = 0;
+    let (mut kept, mut kept_not_stored) = (0, None);
     match auto_delete {
         AutoDeleteRan::Off => info!("Auto-delete is disabled for this user"),
         AutoDeleteRan::NotAllowed => info!("Auto-delete is skipped: this app may not delete"),
@@ -496,6 +500,7 @@ pub(crate) async fn sync_in(
             if let Err(e) = DeletionBlockRow::replace_in(deps.db, &ctx.user_id, &kept_tracks).await
             {
                 warn!("Could not store the tracks auto-delete kept: {e}");
+                kept_not_stored = Some(database_failure(Stage::Delete, e));
             }
             kept = kept_tracks.len() as u32;
             tracks.extend(run);
@@ -506,6 +511,7 @@ pub(crate) async fn sync_in(
         auto_delete,
         tracks,
         kept,
+        kept_not_stored,
     };
     let c = report.counts();
     info!(
@@ -726,6 +732,7 @@ async fn still_rated_one(guard: &Guard<'_>, actor: &UserId, song_id: &str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::delete_guard::blocked_by_other_user;
     use crate::core::delete_guard::test_support::Library;
     use crate::core::discovery::promote_file_gone;
     use crate::core::discovery::test_support::TestDiscovery;
@@ -1279,6 +1286,76 @@ mod tests {
                 "Silent Night",
                 "Another listener rated or starred this track"
             )
+        );
+        assert_eq!(report.kept_not_stored, None);
+    }
+
+    #[tokio::test]
+    async fn kept_tracks_that_cannot_be_stored_are_in_the_report() {
+        let lib = Library::new().await;
+        lib.song("s2", "alice/A/y.flac", b"audio");
+        lib.fake.rates("alice", "s2", 1);
+        lib.fake.rates("bob", "s2", 4);
+        set(&lib.db, auto_delete(true)).await;
+        // Settings lists an earlier sync's kept track, and the database refuses to replace it.
+        let earlier = KeptTrack {
+            song_id: "s9".into(),
+            title: "Away in a Manger".into(),
+            artist: "Marrow Choir".into(),
+            failure: blocked_by_other_user(),
+        };
+        DeletionBlockRow::replace_in(&lib.db, "alice", &[earlier])
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_kept BEFORE DELETE ON deletion_blocks \
+             BEGIN SELECT RAISE(FAIL, 'disk I/O error'); END",
+        )
+        .execute(&lib.db)
+        .await
+        .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/search3",
+            &[&search3_body(&[
+                ("s1", "O Holy Night", 1),
+                ("s2", "Silent Night", 1),
+            ])],
+        );
+        let (of, guard, runs, discovery, queue) = (
+            NavidromeFor(Ok(navi.client())),
+            lib.guard(),
+            SyncRuns::default(),
+            effects(),
+            queue(),
+        );
+        let deps = deps(&lib, &of, &guard, &queue, &discovery, &runs);
+        let report = sync_in(&deps, &test_ctx("alice"), AutoDeletePermit::Allowed)
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.counts().deleted_tracks, report.kept),
+            (1, 1),
+            "what the sync did is still reported"
+        );
+        let f = report
+            .kept_not_stored
+            .expect("the store failure is reported");
+        assert_eq!(
+            (f.code, f.stage, f.message.as_str()),
+            (
+                FailureCode::SettingsUnreadable,
+                Stage::Delete,
+                "Soulful's database is unavailable"
+            )
+        );
+        assert!(f.cause.unwrap().raw.contains("disk I/O error"));
+        let listed = DeletionBlockRow::for_user_in(&lib.db, "alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.iter().map(|b| b.title.as_str()).collect::<Vec<_>>(),
+            vec!["Away in a Manger"]
         );
     }
 
