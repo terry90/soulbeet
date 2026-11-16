@@ -381,22 +381,31 @@ pub(crate) enum JobSelect {
     },
 }
 
-/// `ctx`'s jobs as `select` says, in creation order; an id that is not one of `ctx`'s jobs is
-/// left out (get_jobs reports it).
-pub(crate) async fn jobs_view(
+/// `ctx`'s jobs as `select` says, in creation order, as their records: what a wait and a page
+/// read. An id that is not one of `ctx`'s jobs is left out (get_jobs reports it).
+pub(crate) async fn job_records(
     db: &SqlitePool,
-    ledger: &Ledger,
     ctx: &UserCtx,
     select: &JobSelect,
-) -> Result<Vec<JobView>, Failure> {
-    let failed = |e| database_failure(Stage::Input, e);
+) -> Result<Vec<JobRecord>, Failure> {
     let (ids, batch_id, states) = match select {
         JobSelect::Ids(ids) => (Some(ids.as_slice()), None, &[][..]),
         JobSelect::Filter { batch_id, states } => (None, batch_id.as_deref(), states.as_slice()),
     };
-    let jobs = store::jobs_of(db, &ctx.id(), ids, batch_id, states)
+    store::jobs_of(db, &ctx.id(), ids, batch_id, states)
         .await
-        .map_err(failed)?;
+        .map_err(|e| database_failure(Stage::Input, e))
+}
+
+/// Everything the ledger keeps of `jobs`, `ctx`'s, in their order: the views of the jobs a
+/// tool shows.
+pub(crate) async fn views_of(
+    db: &SqlitePool,
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    jobs: Vec<JobRecord>,
+) -> Result<Vec<JobView>, Failure> {
+    let failed = |e| database_failure(Stage::Input, e);
     let mut views = Vec::with_capacity(jobs.len());
     for job in jobs {
         let mut attempts: HashMap<u32, Vec<AttemptRecord>> = store::attempts_of(db, &job.id)

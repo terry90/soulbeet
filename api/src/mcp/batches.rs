@@ -18,8 +18,8 @@ use super::server::{common_codes, ToolSpec};
 use super::{wait, McpCaller};
 use crate::connection::ConnectionState;
 use crate::core::database_failure;
-use crate::core::jobs::{jobs_view, JobSelect, JobView};
-use crate::ledger::store::{batch_of, batches_of, BatchRecord};
+use crate::core::jobs::{job_records, views_of, JobSelect, JobView};
+use crate::ledger::store::{batch_of, batches_of, BatchRecord, JobRecord};
 use crate::ledger::JobState;
 
 const GET_BATCH_ARGS: &[&str] = &["batch_id", "since", "wait_seconds", "wait_for"];
@@ -93,26 +93,26 @@ pub(crate) async fn get_batch(
                 batch_id: Some(batch_id.clone()),
                 states: vec![],
             };
-            let (batch, views) = wait::until(
+            let failed = |f| upstream_error(f, Map::new(), args.same_call());
+            // The wait and the counts read records; only the jobs shown are read in full.
+            let (batch, records) = wait::until(
                 &acquire.ledger,
                 wait,
                 || async {
                     let batch = batch_of(&acquire.db, &batch_id, &caller.ctx.id())
                         .await
                         .map_err(|e| database_failure(Stage::Input, e))?;
-                    let views = match batch {
-                        Some(_) => {
-                            jobs_view(&acquire.db, &acquire.ledger, &caller.ctx, &select).await?
-                        }
+                    let records = match batch {
+                        Some(_) => job_records(&acquire.db, &caller.ctx, &select).await?,
                         None => vec![],
                     };
-                    Ok((batch, views))
+                    Ok((batch, records))
                 },
                 // A batch that is no batch of the caller's fails the call at once.
-                |(batch, views)| batch.is_none() || wait_for.holds(views, since),
+                |(batch, records)| batch.is_none() || wait_for.holds(records, since),
             )
             .await
-            .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
+            .map_err(failed)?;
             let Some(batch) = batch else {
                 return Err(ToolError {
                     failure: batch_not_found(),
@@ -121,25 +121,35 @@ pub(crate) async fn get_batch(
                     next: vec![NextCall::new("list_batches", json!({}))],
                 });
             };
-            Ok(batch_document(state, caller, &batch, views, since).await)
+            batch_document(state, caller, &batch, records, since)
+                .await
+                .map_err(failed)
         }
         .await,
     )
 }
 
-/// The batch's fields: its jobs counted by state from `views`, the cursor (the highest
-/// changed_seq of its jobs), the jobs changed since `since` and the jobs that need action.
+/// The batch's fields: its jobs counted by state from `jobs`, the cursor (the highest
+/// changed_seq of its jobs), the jobs changed since `since` and the jobs that need action, the
+/// last two read in full.
 async fn batch_document(
     state: &ConnectionState,
     caller: &McpCaller,
     batch: &BatchRecord,
-    views: Vec<JobView>,
+    jobs: Vec<JobRecord>,
     since: i64,
-) -> Map<String, Value> {
+) -> Result<Map<String, Value>, Failure> {
     let mut summary: BTreeMap<&str, u32> = BTreeMap::new();
-    for view in &views {
-        *summary.entry(view.job.state.as_str()).or_default() += 1;
+    for job in &jobs {
+        *summary.entry(job.state.as_str()).or_default() += 1;
     }
+    let cursor = jobs.iter().map(|job| job.changed_seq).max().unwrap_or(0);
+    let all_terminal = jobs.iter().all(|job| job.state.is_terminal());
+    let shown = (jobs.iter())
+        .filter(|job| job.changed_seq > since || needs_action(job.state))
+        .cloned()
+        .collect();
+    let views = views_of(&state.acquire.db, &state.acquire.ledger, &caller.ctx, shown).await?;
     let mut changed: Vec<&JobView> = (views.iter())
         .filter(|v| v.job.changed_seq > since)
         .collect();
@@ -153,12 +163,12 @@ async fn batch_document(
         "origin": batch.origin,
         "created_at": batch.created_at,
         "summary": summary,
-        "cursor": views.iter().map(|v| v.job.changed_seq).max().unwrap_or(0),
-        "all_terminal": views.iter().all(|v| v.job.state.is_terminal()),
+        "cursor": cursor,
+        "all_terminal": all_terminal,
     }) else {
         unreachable!("an object literal is an object");
     };
-    // In creation order, as jobs_view reads them.
+    // In creation order, as job_records reads them.
     let needs: Vec<JobView> = (views.into_iter())
         .filter(|v| needs_action(v.job.state))
         .collect();
@@ -166,7 +176,7 @@ async fn batch_document(
     let needs = (needs.iter().zip(&reads))
         .map(|(view, now)| (view.job.id.clone(), job_document(view, Detail::Full, now)))
         .collect();
-    fit_actions(fields, needs, changed)
+    Ok(fit_actions(fields, needs, changed))
 }
 
 /// `fields` with `needs_action`, the full documents of `needs` (each with its job id), and
@@ -368,6 +378,33 @@ mod tests {
                 &doc["next"]
             ),
             (&json!([]), Some(0), &json!([]))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_jobs_a_batch_shows_are_read_in_full() {
+        let (db, acq, _, token) = jobs_app().await;
+        let (batch, jobs) = batch_of_downloads(&acq, 2).await;
+        // The second job's slot can no longer be read: a batch showing neither change nor
+        // action needs only its state.
+        sqlx::query("UPDATE job_tracks SET last_row = 'not a row' WHERE job_id = ?")
+            .bind(&jobs[1])
+            .execute(&db)
+            .await
+            .unwrap();
+        let doc = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "get_batch",
+                json!({"batch_id": batch}),
+            )
+            .await,
+        );
+        assert_eq!(
+            (&doc["summary"], &doc["changed"], &doc["needs_action"]),
+            (&json!({"downloading": 2}), &json!([]), &json!([])),
+            "{doc}"
         );
     }
 

@@ -23,8 +23,9 @@ use super::server::{common_codes, ToolSpec};
 use super::{wait, McpCaller};
 use crate::connection::ConnectionState;
 use crate::core::index::library_songs;
-use crate::core::jobs::{job_not_found, jobs_view, JobSelect, JobView};
+use crate::core::jobs::{job_not_found, job_records, views_of, JobSelect, JobView};
 use crate::core::library::{navidrome_failure, navidrome_for, SongFacts};
+use crate::ledger::store::JobRecord;
 use crate::ledger::{JobState, SlotResult};
 
 const GET_JOBS_ARGS: &[&str] = &[
@@ -100,12 +101,12 @@ impl WaitFor {
 
     /// Over the selected jobs: AnyChange when one's changed_seq is above `since`; NeedsAction
     /// when one needs action, or all are terminal; AllTerminal when all are.
-    pub(crate) fn holds(self, jobs: &[JobView], since: i64) -> bool {
-        let all_terminal = || jobs.iter().all(|v| v.job.state.is_terminal());
+    pub(crate) fn holds(self, jobs: &[JobRecord], since: i64) -> bool {
+        let all_terminal = || jobs.iter().all(|job| job.state.is_terminal());
         match self {
-            WaitFor::AnyChange => jobs.iter().any(|v| v.job.changed_seq > since),
+            WaitFor::AnyChange => jobs.iter().any(|job| job.changed_seq > since),
             WaitFor::NeedsAction => {
-                jobs.iter().any(|v| needs_action(v.job.state)) || all_terminal()
+                jobs.iter().any(|job| needs_action(job.state)) || all_terminal()
             }
             WaitFor::AllTerminal => all_terminal(),
         }
@@ -205,46 +206,53 @@ pub(crate) async fn get_jobs(
             let acquire = &state.acquire;
             // The wait takes no cursor: it waits from the change number read now.
             let since = *acquire.ledger.changes().borrow();
-            let views = wait::until(
+            let failed = |f| upstream_error(f, Map::new(), args.same_call());
+            // The wait and the page read records; only the page's jobs are read in full.
+            let records = wait::until(
                 &acquire.ledger,
                 call.wait,
-                || jobs_view(&acquire.db, &acquire.ledger, &caller.ctx, &call.select),
+                || job_records(&acquire.db, &caller.ctx, &call.select),
                 // An id that is no job of the caller's fails the call at once.
-                |views| {
-                    !unknown_ids(&call.select, views).is_empty()
-                        || call.wait_for.holds(views, since)
+                |records| {
+                    !unknown_ids(&call.select, records).is_empty()
+                        || call.wait_for.holds(records, since)
                 },
             )
             .await
-            .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
-            let unknown = unknown_ids(&call.select, &views);
+            .map_err(failed)?;
+            let unknown = unknown_ids(&call.select, &records);
             if !unknown.is_empty() {
                 return Err(unknown_jobs(&args, &call.select, unknown));
             }
-            let shown = views.get(call.page.offset..).unwrap_or_default();
-            let shown = &shown[..shown.len().min(call.page.limit)];
+            let more = records.len() > call.page.offset + call.page.limit;
+            let page = (records.into_iter())
+                .skip(call.page.offset)
+                .take(call.page.limit)
+                .collect();
+            let shown = views_of(&acquire.db, &acquire.ledger, &caller.ctx, page)
+                .await
+                .map_err(failed)?;
             let reads = match call.detail {
                 Detail::Summary => shown.iter().map(|_| ReadNow::default()).collect(),
-                Detail::Full => read_now(state, caller, shown).await,
+                Detail::Full => read_now(state, caller, &shown).await,
             };
             let documents = (shown.iter().zip(&reads))
                 .map(|(view, now)| job_document(view, call.detail, now))
                 .collect();
-            let more = views.len() > call.page.offset + shown.len();
             Ok(fit(Map::new(), "jobs", documents, &call.page, more))
         }
         .await,
     )
 }
 
-/// The ids of `select` that are none of `views`' jobs, each once, in the order given.
-fn unknown_ids(select: &JobSelect, views: &[JobView]) -> Vec<String> {
+/// The ids of `select` that are none of `jobs`, each once, in the order given.
+fn unknown_ids(select: &JobSelect, jobs: &[JobRecord]) -> Vec<String> {
     let JobSelect::Ids(ids) = select else {
         return vec![];
     };
     let mut unknown: Vec<String> = Vec::new();
     for id in ids {
-        if !views.iter().any(|v| &v.job.id == id) && !unknown.contains(id) {
+        if !jobs.iter().any(|job| &job.id == id) && !unknown.contains(id) {
             unknown.push(id.clone());
         }
     }
@@ -386,7 +394,8 @@ mod tests {
     use crate::core::folder_of;
     use crate::core::jobs::runner::drive;
     use crate::core::jobs::test_support::{
-        auto_options, downloading_track_job, duplicate_track_job, mcp_track_job, track_job_of,
+        auto_options, downloading_track_job, downloading_track_job_with, duplicate_track_job,
+        mcp_track_job, track_job_of,
     };
     use crate::core::test_ctx;
     use crate::ledger::{JobEvent, JobState};
@@ -694,5 +703,38 @@ mod tests {
             searching["jobs"][0]["wanted"],
             json!({"kind": "track", "artist": "Marrow Choir", "title": "Silent Night"})
         );
+    }
+
+    #[tokio::test]
+    async fn only_the_jobs_of_the_page_are_read_in_full() {
+        let (db, acq, _, token) = jobs_app().await;
+        let first = downloading_track_job(&acq).await;
+        let second = downloading_track_job_with(&acq, "Silent Night", auto_options()).await;
+        // The second job's slot can no longer be read: only a call showing it reads it.
+        sqlx::query("UPDATE job_tracks SET last_row = 'not a row' WHERE job_id = ?")
+            .bind(&second)
+            .execute(&db)
+            .await
+            .unwrap();
+        let app = app_of(&db, &acq);
+        let page = document(&call_tool(app.clone(), &token, "get_jobs", json!({"limit": 1})).await);
+        assert_eq!(
+            (
+                page["jobs"][0]["job_id"].as_str(),
+                page["cursor"].is_string()
+            ),
+            (Some(first.as_str()), true),
+            "{page}"
+        );
+        let rest = document(
+            &call_tool(
+                app,
+                &token,
+                "get_jobs",
+                json!({"limit": 1, "cursor": page["cursor"]}),
+            )
+            .await,
+        );
+        assert_eq!(rest["error"]["code"], "settings_unreadable", "{rest}");
     }
 }

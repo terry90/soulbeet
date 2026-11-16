@@ -2,7 +2,7 @@
 //! `Ledger::{create_batch, record, transition, ..}` only. Every job id is a new uuid.
 
 use super::runner::{Acquire, MCP_DOWNLOADS_PER_USER};
-use super::{jobs_view, AlbumRef, JobSelect, JobView, Wanted};
+use super::{job_records, views_of, AlbumRef, JobSelect, JobView, Wanted};
 use crate::auth::UserId;
 use crate::core::library::Reference;
 use crate::core::test_ctx;
@@ -184,9 +184,9 @@ pub(crate) async fn track_job_of(acq: &Acquire, user: &str) -> String {
 /// alice's job `job` as the job tools read it.
 pub(crate) async fn view_of(acq: &Acquire, job: &str) -> JobView {
     let select = JobSelect::Ids(vec![job.to_string()]);
-    let mut views = jobs_view(&acq.db, &acq.ledger, &test_ctx(ALICE), &select)
-        .await
-        .unwrap();
+    let ctx = test_ctx(ALICE);
+    let records = job_records(&acq.db, &ctx, &select).await.unwrap();
+    let mut views = views_of(&acq.db, &acq.ledger, &ctx, records).await.unwrap();
     assert_eq!(views.len(), 1, "alice has job {job}");
     views.remove(0)
 }
