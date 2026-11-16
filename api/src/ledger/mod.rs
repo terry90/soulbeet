@@ -401,7 +401,10 @@ pub struct RecordingKeys {
 }
 
 /// The keys of `wanted` as a job of `kind`: a track's are its recording MBID and its first
-/// track's artist and title, an album's its release MBID and its artist and title.
+/// track's artist and title, an album's its release MBID and its artist and title. A web UI
+/// request of several tracks and no album is a track job keyed by its first track only, so an
+/// MCP request for that track answers already_running naming the whole web UI job, and one for
+/// any of its other tracks makes a job of its own.
 pub fn recording_keys(wanted: &DownloadQuery, kind: JobKind) -> RecordingKeys {
     let (prefix, mbid_prefix, named) = match kind {
         JobKind::Track => (
@@ -1372,6 +1375,12 @@ mod tests {
             store::job_state(&db, "running").await,
             Some(JobState::Downloading)
         );
+        // Their batches went with them: only the running job's is kept.
+        let batches: Vec<String> = sqlx::query_scalar("SELECT id FROM batches")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+        assert_eq!(batches, vec!["running".to_string()]);
     }
 
     #[tokio::test]
@@ -1745,6 +1754,21 @@ mod tests {
         assert_eq!(
             (row.state, row.failure),
             (DownloadState::ImportSkipped, Some(failure))
+        );
+        // Its timeline names the failure too.
+        let timeline = store::timeline_of(&db, "j1").await.unwrap();
+        let failed = timeline.last().unwrap();
+        assert_eq!(
+            (
+                failed.event.as_str(),
+                failed.stage,
+                failed.facts.get("code")
+            ),
+            (
+                "failed",
+                Stage::Import,
+                Some(&serde_json::json!("import_already_in_library"))
+            )
         );
     }
 
@@ -3370,6 +3394,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_adopted_transfers_attempt_follows_its_rows_to_its_end() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![(0, item("peer_a", "One", "a/01.flac"))],
+        });
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        // A restart found the slot's transfer from peer_b, not the one it picked.
+        ledger.record(JobEvent::Attempt {
+            slot: slot.clone(),
+            candidate: None,
+            request: None,
+        });
+        let from_b = || DownloadProgress {
+            source: "peer_b".into(),
+            ..row_of("j1", 0, "b/01.flac", DownloadState::InProgress, 10)
+        };
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![from_b()],
+        });
+        // Soulseek.NET's text for a peer that is not logged in (src/SoulseekClient.cs:3790).
+        let offline = Failure::new(
+            FailureCode::PeerOffline,
+            Stage::Transfer,
+            RetryAdvice::OtherSource,
+            "User peer_b appears to be offline",
+        );
+        let ended = from_b().failed_with(offline.clone());
+        ledger.record(JobEvent::Slots {
+            state: JobState::Failed,
+            rows: vec![ended.clone()],
+        });
+        ledger.settled().await;
+        let attempts = store::attempts_of(&db, "j1").await.unwrap();
+        let adopted = &attempts[0].1[1];
+        assert_eq!(
+            (
+                adopted.source.as_deref(),
+                adopted.failure.as_ref(),
+                adopted.last_row.as_ref().map(|r| &r.item)
+            ),
+            (Some("peer_b"), Some(&offline), Some(&ended.item))
+        );
+        assert!(adopted.started_at.is_some() && adopted.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_write_rolled_back_leaves_the_live_rows_as_they_were() {
+        let (ledger, db, alice, _) = ledger().await;
+        ledger
+            .create(job("j1", "alice", &alice, JobState::Queued, None), None)
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Picked {
+            job: "j1".into(),
+            items: vec![(0, item("peer_a", "One", "a/01.flac"))],
+        });
+        let downloading = row_of("j1", 0, "a/01.flac", DownloadState::InProgress, 10);
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![downloading.clone()],
+        });
+        ledger.settled().await;
+        // The database refuses the timeline entry the next move writes, after the slot's row.
+        sqlx::query(
+            "CREATE TRIGGER no_entry BEFORE INSERT ON job_events \
+             BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        ledger.record(JobEvent::Slots {
+            state: JobState::Importing,
+            rows: vec![row_of(
+                "j1",
+                0,
+                "a/01.flac",
+                DownloadState::ImportQueued(1),
+                10,
+            )],
+        });
+        ledger.settled().await;
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        assert_eq!(ledger.live_row(&slot), Some(downloading));
+        assert_eq!(
+            store::job_state(&db, "j1").await,
+            Some(JobState::Downloading)
+        );
+    }
+
+    #[tokio::test]
     async fn live_rows_follow_every_tick_and_a_finished_slot_stays_finished() {
         let (ledger, db, alice, _) = ledger().await;
         ledger
@@ -3468,6 +3594,139 @@ mod tests {
                 ("requested", None),
                 ("picked", Some(serde_json::json!("peer_a"))),
                 ("cancelled", None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ledger_started_again_counts_on_from_its_last_change() {
+        let (ledger, db, alice, _) = ledger().await;
+        let night = wanted_track("Marrow Choir", "O Holy Night", None);
+        ledger
+            .create_batch(batch_of("b1"), vec![mcp_job("j1", &alice, night)])
+            .await
+            .unwrap();
+        let last = *ledger.changes().borrow();
+        assert!(last > 0);
+        // Soulful restarted: a new writer on the same database.
+        let again = Ledger::start(db.clone());
+        let mut changes = again.changes();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            changes.wait_for(|seq| *seq == last),
+        )
+        .await
+        .expect("it reads the last change number")
+        .unwrap();
+        let applied = again
+            .transition(
+                &UserId::new("alice"),
+                "j1",
+                Transition::AwaitChoice {
+                    search_id: "search-j1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(applied, Transitioned::Applied { seq, .. } if seq > last));
+    }
+
+    #[tokio::test]
+    async fn each_change_names_what_it_did_on_the_timeline() {
+        let (ledger, db, alice, _) = ledger().await;
+        let events = |job: &'static str| {
+            let db = db.clone();
+            async move {
+                (store::timeline_of(&db, job).await.unwrap().into_iter())
+                    .map(|e| {
+                        let fact = |name: &str| {
+                            e.facts.get(name).and_then(|v| v.as_str()).map(String::from)
+                        };
+                        (e.event, fact("source"), fact("code"))
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        let entry = |event: &str, source: Option<&str>, code: Option<&str>| {
+            (
+                event.to_string(),
+                source.map(String::from),
+                code.map(String::from),
+            )
+        };
+        // A web UI download made with its pick.
+        let made = NewJob {
+            picked: vec![(0, item("peer_a", "One", "a/01.flac"))],
+            ..job("ui", "alice", &alice, JobState::Queued, None)
+        };
+        ledger.create(made, None).await.unwrap();
+        assert_eq!(
+            events("ui").await,
+            vec![
+                entry("requested", None, None),
+                entry("picked", Some("peer_a"), None)
+            ]
+        );
+        // An MCP job: chosen, cancelled holding a place, then failed while it was.
+        let user = UserId::new("alice");
+        let night = wanted_track("Marrow Choir", "O Holy Night", None);
+        let snow = wanted_track("Marrow Choir", "In the Bleak Midwinter", None);
+        let jobs = vec![mcp_job("j1", &alice, night), mcp_job("j2", &alice, snow)];
+        ledger.create_batch(batch_of("b1"), jobs).await.unwrap();
+        let choose = Transition::AwaitChoice {
+            search_id: "search-j1".into(),
+        };
+        let queue = Transition::Queue {
+            items: vec![(0, item("peer_b", "O Holy Night", "b/03.flac"))],
+            search_id: None,
+        };
+        for change in [choose, queue] {
+            ledger.transition(&user, "j1", change).await.unwrap();
+        }
+        assert!(ledger.claim_download("j1", 6).await.unwrap());
+        ledger
+            .transition(&user, "j1", Transition::Cancel)
+            .await
+            .unwrap();
+        let unsent = crate::server_fns::download::enqueue::nothing_enqueued();
+        let fail = Transition::Fail {
+            failure: unsent,
+            search_id: None,
+        };
+        ledger.transition(&user, "j1", fail).await.unwrap();
+        assert_eq!(
+            events("j1").await,
+            vec![
+                entry("requested", None, None),
+                entry("waiting_for_source_choice", None, None),
+                entry("queued", Some("peer_b"), None),
+                entry("cancel_requested", None, None),
+                entry("cancelled", None, None),
+            ]
+        );
+        // A search that found nothing, then another search.
+        let none_found = Failure::new(
+            FailureCode::SearchNoResults,
+            Stage::SourceSearch,
+            RetryAdvice::OtherQuery,
+            "No results found",
+        );
+        let fail = Transition::Fail {
+            failure: none_found,
+            search_id: Some("search-j2".into()),
+        };
+        ledger.transition(&user, "j2", fail).await.unwrap();
+        let again = Transition::Search {
+            search_id: "s2".into(),
+            filters: None,
+        };
+        ledger.transition(&user, "j2", again).await.unwrap();
+        assert_eq!(
+            events("j2").await,
+            vec![
+                entry("requested", None, None),
+                entry("failed", None, Some("search_no_results")),
+                entry("searching_again", None, None),
             ]
         );
     }

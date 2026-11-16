@@ -134,20 +134,20 @@ impl SourcePool {
             .map_or(MAX_SOURCES_PER_TRACK, |s| s.max)
     }
 
-    /// Whether `take_next` would give this slot an alternate.
+    /// Whether `take_next` would give this slot an alternate: the slot exists, has budget left
+    /// and an alternate.
     pub fn has_next(&self, slot: usize) -> bool {
         self.slots
             .get(slot)
             .is_some_and(|s| s.used < s.max && !s.alternates.is_empty())
     }
 
-    /// Next alternate for this slot, or `None` once the budget is spent, the
-    /// alternates run out, or the slot does not exist.
+    /// Next alternate for this slot, or `None` when `has_next` says there is none.
     pub fn take_next(&mut self, slot: usize) -> Option<DownloadableItem> {
-        let slot = self.slots.get_mut(slot)?;
-        if slot.used >= slot.max {
+        if !self.has_next(slot) {
             return None;
         }
+        let slot = self.slots.get_mut(slot)?;
         let item = slot.alternates.pop_front()?;
         slot.used += 1;
         Some(item)

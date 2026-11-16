@@ -200,6 +200,17 @@ struct Pending {
     /// gave before. An event's write appends the entries of those that moved; a transition
     /// appends its own.
     moved: Vec<(JobSlot, Option<Entry>)>,
+    /// Its changes to the live rows, in order, made once it commits: a write rolled back
+    /// leaves the live rows as they were.
+    live: Vec<LiveChange>,
+}
+
+/// A change to the live rows.
+enum LiveChange {
+    Set(JobSlot, DownloadProgress),
+    Remove(JobSlot),
+    /// Every live row of this job goes.
+    Forget(String),
 }
 
 /// A timeline entry to append: what happened, at which stage, with the facts it names. Peer
@@ -408,18 +419,32 @@ impl Writer {
         answer(reply, what, result);
     }
 
-    /// After a write: when it committed, sets and drops its cancel marks, sends its change
-    /// number and counts the place it freed; otherwise forgets them.
+    /// After a write: when it committed, sets and drops its cancel marks, changes the live rows,
+    /// sends its change number and counts the place it freed; otherwise forgets them.
     fn settle(&mut self, committed: bool) {
         let Pending {
             seq,
             marks,
             freed_place,
+            live,
             ..
         } = std::mem::take(&mut self.pending);
         if !committed {
             return;
         }
+        let mut rows = self.live.lock().unwrap();
+        for change in live {
+            match change {
+                LiveChange::Set(slot, row) => {
+                    rows.insert(slot, row);
+                }
+                LiveChange::Remove(slot) => {
+                    rows.remove(&slot);
+                }
+                LiveChange::Forget(job) => rows.retain(|slot, _| slot.job != job),
+            }
+        }
+        drop(rows);
         for mark in marks {
             match mark {
                 Mark::Cancel(job) => self.registry.cancel_job(&job),
@@ -721,7 +746,7 @@ impl Writer {
         slot: &JobSlot,
         failure: Option<&Failure>,
     ) -> Result<(), LedgerError> {
-        self.live.lock().unwrap().remove(slot);
+        self.pending.live.push(LiveChange::Remove(slot.clone()));
         end_attempts(tx, slot, failure).await
     }
 
@@ -805,7 +830,7 @@ impl Writer {
         .await?
         .rows_affected();
         if stored == 0 {
-            self.live.lock().unwrap().remove(slot);
+            self.pending.live.push(LiveChange::Remove(slot.clone()));
             return Ok(false);
         }
         self.stored.insert(slot.clone(), RowKey::of(state, row));
@@ -813,7 +838,7 @@ impl Writer {
         if state.is_terminal() {
             self.slot_ended(tx, slot, row.failure.as_ref()).await?;
         } else {
-            self.live.lock().unwrap().insert(slot.clone(), row.clone());
+            (self.pending.live).push(LiveChange::Set(slot.clone(), row.clone()));
         }
         Ok(true)
     }
@@ -856,7 +881,7 @@ impl Writer {
     /// stored.
     fn forget(&mut self, job: &str) {
         self.stored.retain(|slot, _| slot.job != job);
-        self.live.lock().unwrap().retain(|slot, _| slot.job != job);
+        self.pending.live.push(LiveChange::Forget(job.to_string()));
     }
 
     /// Puts every unfinished slot of `job` in `state`.
@@ -909,7 +934,7 @@ impl Writer {
                 slot: *slot,
             };
             next_attempt(tx, &slot, Some(candidate), None, None).await?;
-            self.live.lock().unwrap().remove(&slot);
+            self.pending.live.push(LiveChange::Remove(slot.clone()));
             self.stored.remove(&slot);
         }
         Ok(())
@@ -1095,6 +1120,14 @@ impl Writer {
         .await?;
         self.pick_slots(tx, &job.id, &job.picked).await?;
         append(tx, &job.id, Entry::at(job.state, "requested")).await?;
+        // A job made with its picks (a web UI download, download_source) has them on its
+        // timeline as one picked later has.
+        for (slot, candidate) in &job.picked {
+            let entry = Entry::at(JobState::Queued, "picked")
+                .slot(*slot)
+                .item(&candidate.source, &candidate.id);
+            append(tx, &job.id, entry).await?;
+        }
         self.touch(tx, &job.id, None, at).await?;
         Ok(())
     }
@@ -1693,13 +1726,16 @@ async fn follow_attempt(
         DownloadState::Failed(_) | DownloadState::Cancelled | DownloadState::Completed
     );
     let at = now();
+    // An adopted transfer's attempt (a restart found it, its candidate unknown) is followed by
+    // the slot's rows, and takes their source.
     sqlx::query(
         "UPDATE job_attempts SET last_row = ?, \
              started_at = CASE WHEN ? THEN COALESCE(started_at, ?) ELSE started_at END, \
              ended_at = CASE WHEN ? THEN ? END, \
-             failure = CASE WHEN ? THEN ? END \
-         WHERE job_id = ? AND slot = ? AND ended_at IS NULL AND source = ? \
-         AND json_extract(candidate, '$.id') = ?",
+             failure = CASE WHEN ? THEN ? END, \
+             source = COALESCE(source, ?) \
+         WHERE job_id = ? AND slot = ? AND ended_at IS NULL \
+         AND ((source = ? AND json_extract(candidate, '$.id') = ?) OR candidate IS NULL)",
     )
     .bind(stored_row)
     .bind(starts)
@@ -1713,6 +1749,7 @@ async fn follow_attempt(
             .map(serde_json::to_string)
             .transpose()?,
     )
+    .bind(&row.source)
     .bind(&slot.job)
     .bind(slot.slot)
     .bind(&row.source)
