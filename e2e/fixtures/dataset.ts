@@ -572,8 +572,8 @@ export function taggedRecording(
   return undefined;
 }
 
-/** Filename of the generated audio fixture for a share, relative to the audio dir. */
-export function audioFileName(share: PeerShare): string {
+/** Filename of the generated audio fixture for a recording in a format, relative to the audio dir. */
+export function audioFileName(share: Pick<PeerShare, 'recordingMbid' | 'format'>): string {
   return `${share.recordingMbid}.${share.format}`;
 }
 

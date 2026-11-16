@@ -4,9 +4,12 @@
 // instance.
 
 import { randomUUID } from 'node:crypto';
+import { copyFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import type { APIRequestContext, BrowserContext, Locator, Page } from '@playwright/test';
 import { expect } from '@playwright/test';
-import { musicDirForApp, slskdApiKey } from './env.js';
+import { audioFileName, type PeerShare } from '../fixtures/dataset.js';
+import { e2eRoot, mcpMusicDirForApp, musicDirForApp, musicDirOnHost, slskdApiKey } from './env.js';
 
 export interface TestUser {
   username: string;
@@ -65,6 +68,41 @@ export async function createFolder(
   });
   expect(response.ok(), `create folder ${unique}: ${response.status()}`).toBeTruthy();
   return { name: unique, path };
+}
+
+/**
+ * Makes {musicDirOnHost}/{prefix}-{8 hex} and the seeds' parent directories on
+ * the host, copies each .fixtures/audio/{audioFileName(seed)} to its
+ * relativePath, then creates the folder at {mcpMusicDirForApp}/{name} for the
+ * user logged in to `context`. The runner creates the directories, so it can
+ * seed them; the app runs as root and can write into them.
+ */
+export async function seededFolder(
+  context: BrowserContext,
+  prefix: string,
+  seeds: (Pick<PeerShare, 'recordingMbid' | 'format'> & { relativePath: string })[],
+): Promise<{ name: string; path: string; hostPath: string }> {
+  const name = `${prefix}-${randomUUID().slice(0, 8)}`;
+  const hostPath = join(musicDirOnHost, name);
+  mkdirSync(hostPath);
+  for (const seed of seeds) {
+    const target = join(hostPath, seed.relativePath);
+    mkdirSync(dirname(target), { recursive: true });
+    copyFileSync(join(e2eRoot, '.fixtures', 'audio', audioFileName(seed)), target);
+  }
+  const path = `${mcpMusicDirForApp}/${name}`;
+  const response = await context.request.post('/api/folders', { data: { name, path } });
+  expect(response.ok(), `create folder ${name}: ${response.status()}`).toBeTruthy();
+  return { name, path, hostPath };
+}
+
+/**
+ * Clicks the confirm button of the ConfirmModal showing `message`: the last
+ * button of the innermost element holding the message.
+ */
+export async function confirmIn(page: Page, message: string): Promise<void> {
+  const holder = page.locator('div').filter({ has: page.getByText(message, { exact: true }) }).last();
+  await holder.getByRole('button').last().click();
 }
 
 /**

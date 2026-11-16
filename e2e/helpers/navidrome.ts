@@ -17,6 +17,43 @@ async function adminToken(): Promise<string> {
   return ((await response.json()) as { token: string }).token;
 }
 
+/** Subsonic authentication as `user`: the password sent hex encoded, JSON answers. */
+function subsonicAuth(user: TestUser): URLSearchParams {
+  return new URLSearchParams({
+    u: user.username,
+    p: `enc:${Buffer.from(user.password, 'utf8').toString('hex')}`,
+    v: '1.16.1',
+    c: 'soulful-e2e',
+    f: 'json',
+  });
+}
+
+/** GET {navidromeUrl}/rest/{method} as `user`; its subsonic-response, failing on any status but ok. */
+export async function subsonicAs(
+  user: TestUser,
+  method: string,
+  params: Record<string, string>,
+): Promise<Record<string, unknown>> {
+  const query = subsonicAuth(user);
+  for (const [name, value] of Object.entries(params)) query.set(name, value);
+  const response = await fetch(`${navidromeUrl}/rest/${method}?${query}`);
+  const body = (await response.json()) as { 'subsonic-response': Record<string, unknown> };
+  const answer = body['subsonic-response'];
+  if (response.status !== 200 || answer.status !== 'ok') {
+    throw new Error(`Subsonic ${method} as ${user.username}: ${response.status} ${JSON.stringify(answer)}`);
+  }
+  return answer;
+}
+
+/** GET {navidromeUrl}/rest/stream for the song as `user`; the body is discarded. */
+export async function streamAs(user: TestUser, songId: string): Promise<{ status: number; contentType: string | null }> {
+  const query = subsonicAuth(user);
+  query.set('id', songId);
+  const response = await fetch(`${navidromeUrl}/rest/stream?${query}`);
+  await response.arrayBuffer();
+  return { status: response.status, contentType: response.headers.get('content-type') };
+}
+
 /**
  * Creates a regular Navidrome user through the native API. Navidrome gives a
  * new regular user the libraries marked for new users.
