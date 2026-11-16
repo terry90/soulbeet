@@ -24,7 +24,7 @@ pub(crate) const SET_RATING: ToolSpec = ToolSpec {
     title: "Rate a song or album",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Sets this user's own rating (0 to 5, 0 clears it) of a song or album in Navidrome; other users' ratings are theirs and are never read or changed. For a song, rating_sync says what the next rating sync will do with it: move a pending discovery track into the library, replacing an earlier copy of the song there, or delete one rated 1. While this user's auto-delete is on, a 1-star rating of a song is refused and nothing is written, since the next rating sync would delete its file: the user rates it 1 star in Navidrome instead. Without deletion switched on for this app, a rating that would have the next rating sync move a pending discovery track into the library is refused too, since that can replace and delete an earlier copy; next offers promote_discovery_track, which never replaces one for this app. Album ratings are never refused. Song and album ids stay valid while the files stay in the library. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome lists no such song or album for this user), permission_not_granted (a 1-star song rating while auto-delete is on, or a promoting rating from an app that may not delete), already_running.")
+        format!("Sets this user's own rating (0 to 5, 0 clears it) of a song or album in Navidrome; other users' ratings are theirs and are never read or changed. For a song, rating_sync says what the next rating sync will do with it: move a pending discovery track into the library, replacing an earlier copy of the song there, or delete one rated 1. While this user's auto-delete is on, a 1-star rating of a song is refused and nothing is written, since the next rating sync would delete its file: the user rates it 1 star in Navidrome instead. Without deletion switched on for this app, a rating at or above the promote threshold of a song that is a pending discovery track, in the discovery folder or another folder of this user, is refused too, since a rating sync would move it into the library, which can replace and delete an earlier copy; next offers promote_discovery_track, which never replaces one for this app. Album ratings are never refused. Song and album ids stay valid while the files stay in the library. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome lists no such song or album for this user), permission_not_granted (a 1-star song rating while auto-delete is on, or a promoting rating from an app that may not delete), already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["rating"], "properties": {"song_id": {"type": "string", "minLength": 1, "maxLength": 500}, "album_id": {"type": "string", "minLength": 1, "maxLength": 500}, "rating": {"type": "integer", "minimum": 0, "maximum": 5}, "#,
@@ -380,6 +380,118 @@ mod tests {
         let doc = document(&call_tool(app, &token, "set_rating", five).await);
         assert_eq!(doc["rating_sync"]["effect"], "promotes_discovery_track");
         assert_eq!(navi.posted("/rest/setRating").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_app_that_may_not_delete_cannot_move_the_discovery_folder_around_a_promoting_rating()
+    {
+        // The route: move the discovery folder away from a pending track's folder, rate the
+        // track at the threshold (the sync reads the discovery folder only), move it back. The
+        // 6 hourly sync would then promote the track through the guard, replacing an earlier
+        // library copy. Each step is refused for an app that may not delete.
+        let lib = Library::new().await;
+        lib.folder("alice", "alice-other", "music/alice-other", false)
+            .await;
+        let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
+        lib.pending_track("t1", "alice-music", "Explore", &staged, Some(HOLY.0))
+            .await;
+        let folder = |id: &str| UpdateUserSettings {
+            discovery_folder_id: Some(id.into()),
+            ..Default::default()
+        };
+        UserSettings::upsert_in(&lib.db, "alice", folder("alice-music"))
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getSong", &[&song_body(HOLY.0, HOLY.1, None, false)]);
+        navi.answer("/rest/setRating", &[OK]);
+        let state = ConnectionState {
+            navidrome: Arc::new(NavidromeFor(Ok(navi.client()))),
+            ..ConnectionState::for_test(lib.db.clone())
+        };
+        let (app, token) = (
+            router(state),
+            access_token(&lib.db, "alice", RESOURCE).await,
+        );
+        let discovery_folder = || async {
+            (UserSettings::get_in(&lib.db, "alice").await)
+                .unwrap()
+                .discovery_folder_id
+        };
+        let move_to =
+            |id: &str| json!({"discovery_folder_id": id, "request_key": format!("move-{id}")});
+        let refused = |doc: &serde_json::Value, field: &str| {
+            let error = &doc["error"];
+            assert_eq!(
+                (
+                    error["code"].as_str(),
+                    error["retry"].as_str(),
+                    error["user_action"]["code"].as_str(),
+                    &error["facts"],
+                    &error["next"]
+                ),
+                (
+                    Some("permission_not_granted"),
+                    Some("needs_user"),
+                    Some("enable_deletion"),
+                    &json!({"field": field}),
+                    &json!([])
+                )
+            );
+        };
+        let away = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "update_settings",
+                move_to("alice-other"),
+            )
+            .await,
+        );
+        refused(&away, "discovery_folder_id");
+        assert_eq!(away["error"]["message"], "This app may not delete music, so it cannot change the discovery folder: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there");
+        assert_eq!(discovery_folder().await.as_deref(), Some("alice-music"));
+
+        // The user moves it in Soulful: the rating is still refused, t1 being alice's.
+        UserSettings::upsert_in(&lib.db, "alice", folder("alice-other"))
+            .await
+            .unwrap();
+        let five = json!({"song_id": HOLY.0, "rating": 5});
+        let rated = document(&call_tool(app.clone(), &token, "set_rating", five).await);
+        assert_eq!(
+            (
+                rated["error"]["code"].as_str(),
+                &rated["error"]["facts"]["discovery_track_id"],
+                &rated["error"]["next"]
+            ),
+            (
+                Some("permission_not_granted"),
+                &json!("t1"),
+                &json!([{"tool": "promote_discovery_track", "args": {"track_id": "t1"}}])
+            )
+        );
+        assert!(!navi.asked().contains(&"/rest/setRating".to_string()));
+
+        let back = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "update_settings",
+                move_to("alice-music"),
+            )
+            .await,
+        );
+        refused(&back, "discovery_folder_id");
+        assert_eq!(discovery_folder().await.as_deref(), Some("alice-other"));
+
+        // With the switch the folder moves.
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        let moved =
+            document(&call_tool(app, &token, "update_settings", move_to("alice-music")).await);
+        assert_eq!(moved["settings"]["discovery"]["folder_id"], "alice-music");
     }
 
     #[tokio::test]

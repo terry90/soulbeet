@@ -162,7 +162,7 @@ pub(crate) const UPDATE_SETTINGS: ToolSpec = ToolSpec {
     title: "Change settings",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Changes this user's Soulful settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulful's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, its folder, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map, and the promote threshold 1 to 5, which only an app allowed to delete music may change, since a promote can replace an earlier library copy). Turning discovery off, changing its folder or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true, or discovery_promote_threshold from an app that may not delete), already_running.")
+        format!("Changes this user's Soulful settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulful's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, its folder, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map, and the promote threshold 1 to 5). Only an app allowed to delete music may change the discovery folder or the promote threshold, since the rating sync promotes the folder's pending tracks rated at or above the threshold and a promote can replace an earlier library copy. Turning discovery off, changing its folder or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true, or discovery_folder_id or discovery_promote_threshold from an app that may not delete), already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"default_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "auto_delete": {"type": "boolean"}, "discovery_enabled": {"type": "boolean"}, "discovery_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "discovery_profiles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["Conservative", "Balanced", "Adventurous"]}}, "discovery_track_counts": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_lifetime_days": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer"}, "Balanced": {"type": "integer"}, "Adventurous": {"type": "integer"}}}, "discovery_playlist_names": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "string"}, "Balanced": {"type": "string"}, "Adventurous": {"type": "string"}}}, "discovery_promote_threshold": {"type": "integer", "minimum": 0, "maximum": 255}, "#,
@@ -200,6 +200,19 @@ fn promote_threshold_refused() -> Failure {
         Stage::Input,
         RetryAdvice::NeedsUser,
         "This app may not delete music, so it cannot change the discovery promote threshold: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
+    )
+    .with_user_action(enable_deletion())
+}
+
+/// Moving the discovery folder has the next rating sync promote the pending tracks of the new
+/// one that are rated at or above the threshold, and a promote can replace an earlier library
+/// copy, deleting it.
+fn discovery_folder_refused() -> Failure {
+    Failure::new(
+        FailureCode::PermissionNotGranted,
+        Stage::Input,
+        RetryAdvice::NeedsUser,
+        "This app may not delete music, so it cannot change the discovery folder: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
     )
     .with_user_action(enable_deletion())
 }
@@ -287,6 +300,10 @@ async fn update_settings(
     let work = async move {
         if changes.auto_delete_on {
             return refusal(&args, auto_delete_on_refused(), field_facts("auto_delete"));
+        }
+        if changes.update.discovery_folder_id.is_some() && !may_delete {
+            let facts = field_facts("discovery_folder_id");
+            return refusal(&args, discovery_folder_refused(), facts);
         }
         if changes.update.discovery_promote_threshold.is_some() && !may_delete {
             let facts = field_facts("discovery_promote_threshold");

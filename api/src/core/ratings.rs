@@ -246,8 +246,10 @@ fn rated(rating: Option<u8>) -> Option<u8> {
 
 /// What the next rating sync does with `song` rated `rating`, as the sync decides it: the
 /// pending discovery track of the user's discovery folder it is promoted or removed, else
-/// nothing. A 1-star rating while auto-delete is on is refused, and so is a promote when
-/// `app_may_delete` is false.
+/// nothing. A 1-star rating while auto-delete is on is refused. When `app_may_delete` is false,
+/// so is a rating at which a pending track of any folder of the user would be promoted: the
+/// sync reads only the discovery folder's tracks, but the folder can be changed back later, by
+/// the user or an app that may delete.
 async fn sync_effect(
     db: &SqlitePool,
     user: &UserId,
@@ -266,27 +268,30 @@ async fn sync_effect(
             failure: one_star_refused(),
         });
     }
-    let pending = match &settings.discovery_folder_id {
-        Some(folder) => DiscoveryTrackRow::get_pending_by_folder_in(db, folder)
-            .await
-            .map_err(unreadable)?,
-        None => vec![],
-    };
+    let mut pending = DiscoveryTrackRow::pending_for_user_in(db, &user.to_string())
+        .await
+        .map_err(unreadable)?;
     // The song as the sync will list it: Navidrome lists a cleared rating as none.
     let rated = SubsonicSong {
         user_rating: (rating > 0).then_some(rating),
         ..song
     };
-    match pending_action(&rated, &pending, settings.discovery_promote_threshold) {
-        Some(PendingAction::Promote(track)) if !app_may_delete => Err(NotSet::WouldDelete {
+    let threshold = settings.discovery_promote_threshold;
+    if let (false, Some(PendingAction::Promote(track))) =
+        (app_may_delete, pending_action(&rated, &pending, threshold))
+    {
+        return Err(NotSet::WouldDelete {
             effect: SyncEffect::PromotesDiscoveryTrack,
             discovery_track_id: Some(track.id.clone()),
             failure: promote_refused(),
-        }),
-        Some(PendingAction::Promote(_)) => Ok(Some(SyncEffect::PromotesDiscoveryTrack)),
-        Some(PendingAction::Remove(_)) => Ok(Some(SyncEffect::RemovesDiscoveryTrack)),
-        None => Ok(None),
+        });
     }
+    pending.retain(|t| Some(&t.folder_id) == settings.discovery_folder_id.as_ref());
+    Ok(match pending_action(&rated, &pending, threshold) {
+        Some(PendingAction::Promote(_)) => Some(SyncEffect::PromotesDiscoveryTrack),
+        Some(PendingAction::Remove(_)) => Some(SyncEffect::RemovesDiscoveryTrack),
+        None => None,
+    })
 }
 
 /// A failed write of `target`: Navidrome's "data not found" (Subsonic 70) is the target gone.
@@ -929,6 +934,58 @@ mod tests {
                 Some(UserActionCode::EnableDeletion)
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_promoting_rating_is_refused_for_a_pending_track_of_any_folder_of_the_user() {
+        // t1 is pending in alice-music while the discovery folder is alice-other: the sync does
+        // not read it now, but would promote it once the folder is alice-music again.
+        let lib = Library::new().await;
+        lib.folder("alice", "alice-other", "music/alice-other", false)
+            .await;
+        let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
+        lib.pending_track("t1", "alice-music", "Explore", &staged, Some(HOLY.0))
+            .await;
+        // Another user's pending track of the same song is not alice's to promote.
+        let bobs = lib.root.join("music/bob/Discovery/Explore/03.flac");
+        lib.pending_track("t2", "bob-music", "Explore", &bobs, Some(HOLY.0))
+            .await;
+        set(
+            &lib.db,
+            UpdateUserSettings {
+                discovery_folder_id: Some("alice-other".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getSong", &[&song_body(HOLY.0, HOLY.1, None, false)]);
+        let holy = Target::Song(HOLY.0.into());
+        assert_eq!(
+            rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5, false).await,
+            Err(NotSet::WouldDelete {
+                effect: SyncEffect::PromotesDiscoveryTrack,
+                discovery_track_id: Some("t1".into()),
+                failure: promote_refused()
+            })
+        );
+        assert_eq!(navi.posted("/rest/setRating").len(), 0);
+        // An app that may delete rates it: the next sync reads alice-other only, so it does
+        // nothing with the song.
+        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5, true)
+            .await
+            .unwrap();
+        assert_eq!(a.effect, None);
+        // With t1 no longer pending, bob's track is no reason to refuse.
+        sqlx::query("UPDATE discovery_tracks SET status = 'Removed' WHERE id = 't1'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        let a = rate(&lib.db, &navi.client(), &lib.alice(), &holy, 5, false)
+            .await
+            .unwrap();
+        assert_eq!(a.effect, None);
+        assert_eq!(navi.posted("/rest/setRating").len(), 2);
     }
 
     #[tokio::test]
