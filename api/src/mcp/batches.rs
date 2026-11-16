@@ -11,7 +11,7 @@ use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_M
 use super::args::Args;
 use super::contract::{answer, invalid_value, upstream_error, NextCall, ToolError};
 use super::facts::{job_document, Detail, ReadNow};
-use super::jobs::{needs_action, read_now, WaitFor, MAX_JOB_IDS};
+use super::jobs::{needs_action, read_now, Since, WaitFor, MAX_JOB_IDS};
 use super::paging::{chars, fit, fit_whole, longest_fitting, Page};
 use super::refs::{page_schema, wait_schema};
 use super::server::{common_codes, ToolSpec};
@@ -30,7 +30,7 @@ pub(crate) const GET_BATCH: ToolSpec = ToolSpec {
     title: "Follow a batch",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) with wait_for any_change, needs_action or all_terminal waits on the server; work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). Failure codes: {common}, unknown_handle.")
+        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Pass the last answer's cursor as since, so a wait does not end again for what was already seen; work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). Failure codes: {common}, unknown_handle.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["batch_id"], "properties": {"batch_id": {"type": "string", "minLength": 1}, "since": {"type": "integer", "minimum": 0}, "#,
@@ -88,7 +88,10 @@ pub(crate) async fn get_batch(
             let (wait, wait_for) = WaitFor::read(&args)?;
             args.finish()?;
             let acquire = &state.acquire;
-            let since = since.map_or_else(|| *acquire.ledger.changes().borrow(), i64::from);
+            let since = match since {
+                Some(seq) => Since::Given(seq.into()),
+                None => Since::Now(*acquire.ledger.changes().borrow()),
+            };
             let select = JobSelect::Filter {
                 batch_id: Some(batch_id.clone()),
                 states: vec![],
@@ -121,7 +124,7 @@ pub(crate) async fn get_batch(
                     next: vec![NextCall::new("list_batches", json!({}))],
                 });
             };
-            batch_document(state, caller, &batch, records, since)
+            batch_document(state, caller, &batch, records, since.seq())
                 .await
                 .map_err(failed)
         }
@@ -294,7 +297,9 @@ mod tests {
 
     use crate::connection::test_util::{app_of, call_tool, document, jobs_app};
     use crate::core::folder_of;
+    use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{batch_of_downloads, fail_slot, named_batch};
+    use crate::ledger::{JobEvent, JobState};
 
     // On the real clock: the ledger's writer answers on SQLite's own thread.
     #[tokio::test]
@@ -378,6 +383,83 @@ mod tests {
                 &doc["next"]
             ),
             (&json!([]), Some(0), &json!([]))
+        );
+    }
+
+    /// The transfer of `job` was denied, no source left.
+    async fn denied(acq: &Acquire, job: &str) {
+        // slskd's text for a peer that queued and then denied the file (failure texts 2.2).
+        let text = "File not shared.";
+        let failure = Failure::new(
+            FailureCode::TransferRejectedNotShared,
+            Stage::Transfer,
+            RetryAdvice::OtherSource,
+            text,
+        )
+        .with_cause(Service::Slskd, None, text);
+        fail_slot(acq, job, failure).await;
+    }
+
+    /// get_batch of `batch` with `args` added, in its own task.
+    fn waiting_get_batch(
+        app: &axum::Router,
+        token: &str,
+        batch: &str,
+        args: Value,
+    ) -> tokio::task::JoinHandle<Value> {
+        let (app, token) = (app.clone(), token.to_string());
+        let mut call = json!({"batch_id": batch});
+        call.as_object_mut()
+            .unwrap()
+            .extend(args.as_object().unwrap().clone());
+        tokio::spawn(async move { call_tool(app, &token, "get_batch", call).await })
+    }
+
+    // On the real clock: the ledger's writer answers on SQLite's own thread.
+    #[tokio::test]
+    async fn a_needs_action_wait_past_a_seen_failure_waits_for_the_next_one_or_the_end() {
+        let (db, acq, _, token) = jobs_app().await;
+        let (batch, jobs) = batch_of_downloads(&acq, 3).await;
+        let app = app_of(&db, &acq);
+        denied(&acq, &jobs[0]).await;
+        let wait = json!({"wait_seconds": 180, "wait_for": "needs_action"});
+        // Without since, a job that needs action answers at once.
+        let seen = document(
+            &waiting_get_batch(&app, &token, &batch, wait.clone())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(seen["summary"]["failed"], 1, "{seen}");
+        // Past the failure seen, the wait sleeps until another job needs action.
+        let mut since = wait.clone();
+        since["since"] = seen["cursor"].clone();
+        let next = waiting_get_batch(&app, &token, &batch, since);
+        // Under the router test client's 5 s read.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!next.is_finished(), "the failure was already seen");
+        denied(&acq, &jobs[1]).await;
+        let doc = document(&next.await.unwrap());
+        assert_eq!(
+            (&doc["summary"], &doc["changed"][0]["job_id"]),
+            (&json!({"downloading": 1, "failed": 2}), &json!(jobs[1])),
+            "{doc}"
+        );
+        // Past both failures, the wait sleeps until every job has ended.
+        let mut since = wait;
+        since["since"] = doc["cursor"].clone();
+        let end = waiting_get_batch(&app, &token, &batch, since);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!end.is_finished(), "both failures were already seen");
+        acq.ledger.record(JobEvent::Ended {
+            job: jobs[2].clone(),
+            state: JobState::Cancelled,
+            failure: None,
+        });
+        let doc = document(&end.await.unwrap());
+        assert_eq!(
+            (&doc["summary"], &doc["all_terminal"]),
+            (&json!({"cancelled": 1, "failed": 2}), &json!(true)),
+            "{doc}"
         );
     }
 

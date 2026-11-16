@@ -62,7 +62,7 @@ pub(crate) const GET_JOBS: ToolSpec = ToolSpec {
     title: "Show jobs",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Shows jobs by job_ids, or by batch_id and states. Summary detail gives each job's state and failure code; full detail gives the current download with live bytes, speed, place in the source's queue and whether the source is online, earlier attempts with their failures (tried), the timeline, what beets applied and Navidrome lists (or, while Navidrome has not listed it yet, when the import ended and whether a scan was asked for; get_status says whether Navidrome is scanning), and next: the calls that can be made for the job now. wait_seconds (0 to 180) with wait_for any_change, needs_action or all_terminal waits for the jobs to change. Job ids stay valid 30 days after the job ends. Failure codes: {common}, unknown_handle (a job id this user has no job for; facts.unknown_job_ids names them).")
+        format!("Shows jobs by job_ids, or by batch_id and states. Summary detail gives each job's state and failure code; full detail gives the current download with live bytes, speed, place in the source's queue and whether the source is online, earlier attempts with their failures (tried), the timeline, what beets applied and Navidrome lists (or, while Navidrome has not listed it yet, when the import ended and whether a scan was asked for; get_status says whether Navidrome is scanning), and next: the calls that can be made for the job now. wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after the call came), needs_action (a job needs action: needs_source_choice, needs_decision or failed) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Job ids stay valid 30 days after the job ends. Failure codes: {common}, unknown_handle (a job id this user has no job for; facts.unknown_job_ids names them).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"job_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1}}, "batch_id": {"type": "string", "minLength": 1}, "states": {"type": "array", "items": {"enum": ["searching", "queued", "downloading", "importing", "indexing", "done", "needs_source_choice", "needs_decision", "failed", "cancelled", "dismissed"]}}, "detail": {"enum": ["summary", "full"]}, "#,
@@ -100,15 +100,39 @@ impl WaitFor {
     }
 
     /// Over the selected jobs: AnyChange when one's changed_seq is above `since`; NeedsAction
-    /// when one needs action, or all are terminal; AllTerminal when all are.
-    pub(crate) fn holds(self, jobs: &[JobRecord], since: i64) -> bool {
+    /// when one needs action, past a given `since` only one whose changed_seq is above it, or
+    /// when all are terminal; AllTerminal when all are.
+    pub(crate) fn holds(self, jobs: &[JobRecord], since: Since) -> bool {
         let all_terminal = || jobs.iter().all(|job| job.state.is_terminal());
         match self {
-            WaitFor::AnyChange => jobs.iter().any(|job| job.changed_seq > since),
+            WaitFor::AnyChange => jobs.iter().any(|job| job.changed_seq > since.seq()),
             WaitFor::NeedsAction => {
-                jobs.iter().any(|job| needs_action(job.state)) || all_terminal()
+                let unseen = |job: &JobRecord| match since {
+                    Since::Given(seq) => job.changed_seq > seq,
+                    Since::Now(_) => true,
+                };
+                jobs.iter()
+                    .any(|job| needs_action(job.state) && unseen(job))
+                    || all_terminal()
             }
             WaitFor::AllTerminal => all_terminal(),
+        }
+    }
+}
+
+/// The change number a wait compares the jobs' changed_seq with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Since {
+    /// The caller's: the jobs as they were then are seen.
+    Given(i64),
+    /// The ledger's when the call came, the caller naming none: no job is seen.
+    Now(i64),
+}
+
+impl Since {
+    pub(crate) fn seq(self) -> i64 {
+        match self {
+            Since::Given(seq) | Since::Now(seq) => seq,
         }
     }
 }
@@ -205,7 +229,7 @@ pub(crate) async fn get_jobs(
             let call = read_call(&args)?;
             let acquire = &state.acquire;
             // The wait takes no cursor: it waits from the change number read now.
-            let since = *acquire.ledger.changes().borrow();
+            let since = Since::Now(*acquire.ledger.changes().borrow());
             let failed = |f| upstream_error(f, Map::new(), args.same_call());
             // The wait and the page read records; only the page's jobs are read in full.
             let records = wait::until(
