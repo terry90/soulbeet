@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
-use shared::failure::{cut_chars, Failure, Stage, TEXT_MAX_CHARS};
+use serde_json::{json, Value};
+use shared::failure::{cut_chars, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
 use shared::navidrome::LibraryStats;
 use shared::recommendation::normalize_for_matching;
 use soulbeet::navidrome::models::{NativeSong, SubsonicAlbum, SubsonicArtist, SubsonicSong};
-use soulbeet::navidrome::NavidromeClient;
+use soulbeet::navidrome::{LibraryKind, NavidromeClient};
 use soulbeet::NavidromeError;
 use sqlx::SqlitePool;
 
@@ -474,6 +475,109 @@ pub async fn find(navi: &NavidromeClient, r: &Reference) -> Result<Found, Failur
         more_matches,
         candidates_truncated,
     })
+}
+
+/// One kind of library item, as the tools report it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LibraryItems {
+    Songs(Vec<SongFacts>),
+    Albums(Vec<AlbumFacts>),
+    Artists(Vec<ArtistFacts>),
+}
+
+impl LibraryItems {
+    /// Each item as its JSON object, in order.
+    pub fn into_values(self) -> Vec<Value> {
+        fn values<T: Serialize>(items: Vec<T>) -> Vec<Value> {
+            items.iter().map(|item| json!(item)).collect()
+        }
+        match self {
+            LibraryItems::Songs(songs) => values(songs),
+            LibraryItems::Albums(albums) => values(albums),
+            LibraryItems::Artists(artists) => values(artists),
+        }
+    }
+
+    /// The `kind` lists of an answer that holds all three.
+    fn of(
+        kind: LibraryKind,
+        songs: &[SubsonicSong],
+        albums: &[SubsonicAlbum],
+        artists: &[SubsonicArtist],
+    ) -> LibraryItems {
+        match kind {
+            LibraryKind::Songs => LibraryItems::Songs(songs.iter().map(SongFacts::from).collect()),
+            LibraryKind::Albums => {
+                LibraryItems::Albums(albums.iter().map(AlbumFacts::from).collect())
+            }
+            LibraryKind::Artists => {
+                LibraryItems::Artists(artists.iter().map(ArtistFacts::from).collect())
+            }
+        }
+    }
+}
+
+/// search3 of `kind` from `offset`, `count` items, most relevant first.
+/// Navidrome answers a database error as an empty or short list
+/// (server/subsonic/searching.go:47-62), so only a failed request fails.
+pub async fn search(
+    navi: &NavidromeClient,
+    query: &str,
+    kind: LibraryKind,
+    offset: u32,
+    count: u32,
+) -> Result<LibraryItems, Failure> {
+    let found = navi
+        .search3(query, kind, offset, count)
+        .await
+        .map_err(|e| navidrome_failure(Stage::LibraryCheck, &e))?;
+    Ok(LibraryItems::of(
+        kind,
+        &found.song,
+        &found.album,
+        &found.artist,
+    ))
+}
+
+/// The album with its songs in album order; album_not_found(id) when
+/// Navidrome has none this account can see (D12).
+pub async fn album(
+    navi: &NavidromeClient,
+    album_id: &str,
+) -> Result<(AlbumFacts, Vec<SongFacts>), Failure> {
+    let album = navi
+        .get_album(album_id)
+        .await
+        .map_err(|e| navidrome_failure(Stage::LibraryCheck, &e))?
+        .ok_or_else(|| album_not_found(album_id))?;
+    let songs = album.song.iter().map(SongFacts::from).collect();
+    Ok((AlbumFacts::from(&album), songs))
+}
+
+/// What the caller starred of `kind`, most recently starred first
+/// (server/filter/filters.go:221-227).
+pub async fn starred(navi: &NavidromeClient, kind: LibraryKind) -> Result<LibraryItems, Failure> {
+    let starred = navi
+        .get_starred()
+        .await
+        .map_err(|e| navidrome_failure(Stage::LibraryCheck, &e))?;
+    Ok(LibraryItems::of(
+        kind,
+        &starred.song,
+        &starred.album,
+        &starred.artist,
+    ))
+}
+
+/// An album id Navidrome does not know or that is in a library this account
+/// cannot see: Navidrome answers both alike (D12).
+pub(crate) fn album_not_found(id: &str) -> Failure {
+    Failure::new(
+        FailureCode::UnknownHandle,
+        Stage::Input,
+        RetryAdvice::NotRetryable,
+        format!("Navidrome has no album {id} that this account can see"),
+    )
 }
 
 /// Whether imports into a folder show up in Navidrome, as far as Soulful

@@ -7,13 +7,13 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_chars, Failure, Stage, TEXT_MAX_CHARS};
 use shared::navidrome::LibraryStats;
-use soulbeet::navidrome::NavidromeClient;
+use soulbeet::navidrome::{LibraryKind, NavidromeClient};
 
 use super::args::{repeatable, Args};
 use super::contract::{
     failed, invalid_value, items, items_text, success, upstream_error, ItemResult, Items, ToolError,
 };
-use super::paging::{Cursor, RESULT_MAX_CHARS};
+use super::paging::{fit, Cursor, Page, RESULT_MAX_CHARS};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::index::navidrome_keeps;
@@ -199,6 +199,188 @@ fn entry(found: Result<Found, Failure>, element: &Args, r: &Reference) -> ItemRe
     }
 }
 
+/// The kinds `search_library` and `list_starred` take, as the items key of
+/// their answer names them.
+const KINDS: &[&str] = &["songs", "albums", "artists"];
+
+/// `kind`, songs when not given, with its name.
+fn read_kind(args: &Args) -> Result<(&'static str, LibraryKind), ToolError> {
+    let name = args.opt_choice("kind", KINDS)?.unwrap_or("songs");
+    let kind = match name {
+        "songs" => LibraryKind::Songs,
+        "albums" => LibraryKind::Albums,
+        "artists" => LibraryKind::Artists,
+        other => unreachable!("opt_choice answers one of KINDS, not {other}"),
+    };
+    Ok((name, kind))
+}
+
+/// A listing's fields: echoed in the answer and the facts of a failure.
+fn listing_fields(list: Value) -> Map<String, Value> {
+    let Value::Object(fields) = list else {
+        unreachable!("a listing is an object literal");
+    };
+    fields
+}
+
+const SEARCH: &str = "search_library";
+
+/// The query refusals of `search_library` (D11).
+const SEARCH_TOO_SHORT: &str = "text of at least 2 characters, or 1 character outside the Latin alphabet, besides surrounding spaces and a trailing *";
+const SEARCH_DROPPED: &str =
+    "text with a character other than spaces, quotes, brackets, parentheses, braces, commas and slashes";
+
+/// What search3 searches of `query`: one trailing `*` removed
+/// (server/subsonic/searching.go:67), then the spaces around it and one
+/// more trailing `*` (persistence/sql_search.go:55-56).
+fn searched(query: &str) -> &str {
+    let q = query.strip_suffix('*').unwrap_or(query).trim();
+    q.strip_suffix('*').unwrap_or(q)
+}
+
+/// Whether search3 answers nothing for `q` as searched: it does for a text
+/// under 2 bytes (persistence/sql_search.go:75-77) once sanitize.Accents
+/// has turned each accented Latin letter into ASCII (searching.go:67), so
+/// one ASCII or Latin letter is too short. One character outside the Latin
+/// alphabet is searched, as Navidrome means a CJK one to be
+/// (persistence/sql_search_like.go:39-41).
+fn too_short(q: &str) -> bool {
+    let mut chars = q.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => true,
+        (Some(c), None) => {
+            c.is_ascii()
+                || ('\u{c0}'..='\u{24f}').contains(&c)
+                || ('\u{1e00}'..='\u{1eff}').contains(&c)
+        }
+        _ => false,
+    }
+}
+
+/// The query, sent as read. A text Navidrome would search as nothing is
+/// refused; so is one it may drop: search3 answers `""` with the whole
+/// library in natural order (persistence/sql_search.go:61-65), and Soulful
+/// refuses every text whose words Navidrome's sanitizer may all remove (D9).
+fn read_query(args: &Args) -> Result<String, ToolError> {
+    let query = args.string("query")?;
+    let q = searched(&query);
+    if too_short(q) {
+        return Err(invalid_value(SEARCH, "query", SEARCH_TOO_SHORT));
+    }
+    if !navidrome_keeps(q) {
+        return Err(invalid_value(SEARCH, "query", SEARCH_DROPPED));
+    }
+    Ok(query)
+}
+
+/// `search_library`: a page of one kind of item matching the query.
+pub(crate) async fn search_library(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new(SEARCH, args, &["query", "kind", "limit", "cursor"]);
+    let read = || -> Result<_, ToolError> {
+        let query = read_query(&args)?;
+        let (name, kind) = read_kind(&args)?;
+        let list = json!({"query": query, "kind": name});
+        let page = Page::read(&args, list.clone())?;
+        args.finish()?;
+        Ok((query, name, kind, list, page))
+    };
+    let (query, name, kind, list, page) = match read() {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let navi = match navidrome_of(state, caller, Stage::LibraryCheck, &args).await {
+        Ok(navi) => navi,
+        Err(e) => return failed(e),
+    };
+    let fields = listing_fields(list);
+    let offset = u32::try_from(page.offset).expect("Cursor::read keeps an offset within u32");
+    let limit = page.limit as u32;
+    match library::search(&navi, &query, kind, offset, limit + 1).await {
+        Ok(found) => {
+            let mut items = found.into_values();
+            let more = items.len() > page.limit;
+            items.truncate(page.limit);
+            success(fit(fields, name, items, &page, more))
+        }
+        Err(f) => failed(upstream_error(f, fields, args.same_call())),
+    }
+}
+
+/// `get_library_album`: the album and a page of its songs.
+pub(crate) async fn get_library_album(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new("get_library_album", args, &["album_id", "limit", "cursor"]);
+    let read = || -> Result<_, ToolError> {
+        let album_id = args.string("album_id")?;
+        let list = json!({"album_id": album_id});
+        let page = Page::read(&args, list.clone())?;
+        args.finish()?;
+        Ok((album_id, list, page))
+    };
+    let (album_id, list, page) = match read() {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let navi = match navidrome_of(state, caller, Stage::LibraryCheck, &args).await {
+        Ok(navi) => navi,
+        Err(e) => return failed(e),
+    };
+    match library::album(&navi, &album_id).await {
+        Ok((album, songs)) => {
+            let items: Vec<Value> = songs
+                .get(page.offset..)
+                .unwrap_or_default()
+                .iter()
+                .map(|song| json!(song))
+                .collect();
+            let mut fields = Map::new();
+            fields.insert("album".into(), json!(album));
+            success(fit(fields, "songs", items, &page, false))
+        }
+        Err(f) => failed(upstream_error(f, listing_fields(list), args.same_call())),
+    }
+}
+
+/// `list_starred`: a page of what the caller starred of one kind.
+pub(crate) async fn list_starred(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new("list_starred", args, &["kind", "limit", "cursor"]);
+    let read = || -> Result<_, ToolError> {
+        let (name, kind) = read_kind(&args)?;
+        let list = json!({"kind": name});
+        let page = Page::read(&args, list.clone())?;
+        args.finish()?;
+        Ok((name, kind, list, page))
+    };
+    let (name, kind, list, page) = match read() {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let navi = match navidrome_of(state, caller, Stage::LibraryCheck, &args).await {
+        Ok(navi) => navi,
+        Err(e) => return failed(e),
+    };
+    let fields = listing_fields(list);
+    match library::starred(&navi, kind).await {
+        Ok(starred) => {
+            let items = starred.into_values();
+            let items = items.get(page.offset..).unwrap_or_default().to_vec();
+            success(fit(fields, name, items, &page, false))
+        }
+        Err(f) => failed(upstream_error(f, fields, args.same_call())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -210,7 +392,9 @@ mod tests {
     use crate::core::library::LOOKUPS_AT_ONCE;
     use crate::mcp::paging::Cursor;
     use crate::services::NavidromeLookupError;
-    use crate::test_navidrome::{child, native_song, subsonic_ok, NavidromeFor, NavidromeStub};
+    use crate::test_navidrome::{
+        child, native_song, subsonic_failed, subsonic_ok, NavidromeFor, NavidromeStub,
+    };
 
     #[tokio::test]
     async fn get_library_stats_without_a_navidrome_link_says_how_to_link() {
@@ -696,6 +880,189 @@ mod tests {
         assert_eq!(
             e["message"],
             "error returned from database: (code: 5) database is locked The call is too large to offer again in next."
+        );
+    }
+
+    #[tokio::test]
+    async fn search_library_pages_through_one_kind() {
+        let navi = NavidromeStub::start();
+        let three: Vec<String> = ["O Holy Night", "Silent Night", "Night Song"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| child(&format!("s{i}"), "Marrow Choir", t))
+            .collect();
+        navi.answer(
+            "/rest/search3",
+            &[&subsonic_ok(&format!(
+                r#""searchResult3":{{"song":[{}]}}"#,
+                three.join(",")
+            ))],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "search_library",
+                json!({"query": "night", "limit": 2}),
+            )
+            .await,
+        );
+        assert_eq!(
+            (
+                doc["songs"].as_array().unwrap().len(),
+                doc["songs"][0]["song_id"].as_str(),
+                doc["songs"][0]["path"].is_null()
+            ),
+            (2, Some("s0"), true)
+        );
+        assert!(doc["cursor"].is_string());
+        assert!(navi.asked_with_queries()[0].contains("songCount=3"));
+    }
+
+    #[tokio::test]
+    async fn search_library_refuses_what_navidrome_would_not_search() {
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/search3", &[&subsonic_ok(r#""searchResult3":{}"#)]);
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let short = "text of at least 2 characters, or 1 character outside the Latin alphabet, besides surrounding spaces and a trailing *";
+        for (query, expected) in [
+            (" n* ", short),
+            // sanitize.Accents turns it into "e", one byte (server/subsonic/searching.go:67)
+            ("é", short),
+            ("()", "text with a character other than spaces, quotes, brackets, parentheses, braces, commas and slashes"),
+        ] {
+            let e = &document(
+                &call_tool(
+                    app.clone(),
+                    &token,
+                    "search_library",
+                    json!({"query": query}),
+                )
+                .await,
+            )["error"];
+            assert_eq!(
+                (e["code"].as_str(), &e["facts"]),
+                (
+                    Some("invalid_input"),
+                    &json!({"field": "query", "expected": expected})
+                ),
+                "{query}"
+            );
+        }
+        assert!(navi.asked_with_queries().is_empty());
+        let doc = document(&call_tool(app, &token, "search_library", json!({"query": "ét"})).await);
+        assert_eq!(doc["ok"], true);
+        assert!(
+            navi.asked_with_queries()[0].contains("query=%C3%A9t"),
+            "{:?}",
+            navi.asked_with_queries()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_album_navidrome_cannot_find_is_an_unknown_handle() {
+        let navi = NavidromeStub::start();
+        // server/subsonic/browsing.go:197
+        navi.answer("/rest/getAlbum", &[&subsonic_failed(70, "Album not found")]);
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let e = &document(
+            &call_tool(
+                app,
+                &token,
+                "get_library_album",
+                json!({"album_id": "7hQ2nLr5VxZ0cYbM8wTkAf"}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (
+                e["code"].as_str(),
+                e["stage"].as_str(),
+                e["retry"].as_str(),
+                e["message"].as_str()
+            ),
+            (
+                Some("unknown_handle"),
+                Some("input"),
+                Some("not_retryable"),
+                Some("Navidrome has no album 7hQ2nLr5VxZ0cYbM8wTkAf that this account can see")
+            )
+        );
+        assert_eq!(e["next"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn an_album_comes_with_its_songs() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getAlbum",
+            &[&subsonic_ok(&format!(
+                r#""album":{{"id":"7hQ2nLr5VxZ0cYbM8wTkAf","name":"Winter Songs","artist":"Marrow Choir","songCount":1,"duration":263,"year":2019,"userRating":5,"genres":[],"song":[{}]}}"#,
+                child("3sG8kPq0WmZ1xYbN4vTcDe", "Marrow Choir", "O Holy Night")
+            ))],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "get_library_album",
+                json!({"album_id": "7hQ2nLr5VxZ0cYbM8wTkAf"}),
+            )
+            .await,
+        );
+        assert_eq!(
+            (
+                doc["album"]["name"].as_str(),
+                doc["album"]["year"].as_u64(),
+                doc["album"]["rating"].as_u64(),
+                doc["songs"][0]["title"].as_str()
+            ),
+            (
+                Some("Winter Songs"),
+                Some(2019),
+                Some(5),
+                Some("O Holy Night")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn starred_artists_are_listed_and_a_refusal_is_not_offered_again() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getStarred2",
+            &[
+                &subsonic_ok(
+                    r#""starred2":{"artist":[{"id":"2kD9pWq4ZxC1vBnM6yTjLs","name":"Marrow Choir","albumCount":1,"starred":"2026-11-03T09:10:00.000Z","musicBrainzId":""}]}"#,
+                ),
+                // getStarredItems returns the database error and mapToSubsonicError writes it
+                // (album_lists.go:190-194, api.go:290-291)
+                &subsonic_failed(0, "Internal Server Error: database is locked"),
+            ],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let doc = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "list_starred",
+                json!({"kind": "artists"}),
+            )
+            .await,
+        );
+        assert_eq!(
+            doc["artists"],
+            json!([{"artist_id": "2kD9pWq4ZxC1vBnM6yTjLs", "name": "Marrow Choir", "album_count": 1, "rating": 0,
+                "starred": true, "starred_at": "2026-11-03T09:10:00.000Z", "mbid": null}])
+        );
+        let e =
+            &document(&call_tool(app, &token, "list_starred", json!({"kind": "artists"})).await)
+                ["error"];
+        assert_eq!(
+            (e["code"].as_str(), &e["next"]),
+            (Some("navidrome_refused"), &json!([]))
         );
     }
 }

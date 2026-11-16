@@ -120,6 +120,45 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         open_world: false,
         call: |state, caller, args| Box::pin(library::find_in_library(state, caller, args)),
     },
+    ToolSpec {
+        name: "search_library",
+        title: "Search library",
+        description: |_| {
+            format!("Searches the user's Navidrome library by free text for songs, albums or artists (kind, default songs). Each word must start a word of the title, album, artist or another credited name; results come most relevant first. At least 2 characters, or 1 character outside the Latin alphabet, and not only quotes, brackets, commas or slashes. Songs have the facts find_in_library gives without the path; albums their year, song count, the user's rating and star; artists their album count, rating and star. Ids stay valid while the item stays in the library. Pages of 25 by default (limit up to 100); pass back cursor for the next page. Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}.")
+        },
+        input_schema: r#"{"type":"object","properties":{"query":{"type":"string"},"kind":{"type":"string","enum":["songs","albums","artists"]},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["query"],"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(library::search_library(state, caller, args)),
+    },
+    ToolSpec {
+        name: "get_library_album",
+        title: "Library album",
+        description: |_| {
+            format!("Shows one album of the user's Navidrome library with its songs in album order, from an album id that search_library, list_starred or a song's album_id gave. Pages of 25 songs by default (limit up to 100). Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}, unknown_handle (no album with this id that this account can see).")
+        },
+        input_schema: r#"{"type":"object","properties":{"album_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["album_id"],"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(library::get_library_album(state, caller, args)),
+    },
+    ToolSpec {
+        name: "list_starred",
+        title: "Starred items",
+        description: |_| {
+            format!("Lists what the user starred in Navidrome: songs, albums or artists (kind, default songs), most recently starred first. Pages of 25 by default (limit up to 100). Failure codes: {COMMON_CODES}, {NAVIDROME_CODES}.")
+        },
+        input_schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["songs","albums","artists"]},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"additionalProperties":false}"#,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+        call: |state, caller, args| Box::pin(library::list_starred(state, caller, args)),
+    },
 ];
 
 impl ToolSpec {
@@ -301,10 +340,13 @@ mod tests {
     /// before an unknown name.
     fn valid_args(tool: &str) -> Value {
         match tool {
-            "get_status" | "get_settings" | "list_folders" | "get_library_stats" => json!({}),
+            "get_status" | "get_settings" | "list_folders" | "get_library_stats"
+            | "list_starred" => json!({}),
             "find_in_library" => {
                 json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
             }
+            "search_library" => json!({"query": "night"}),
+            "get_library_album" => json!({"album_id": "7hQ2nLr5VxZ0cYbM8wTkAf"}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
