@@ -12,7 +12,7 @@ use futures::future::{join_all, BoxFuture, Shared};
 use futures::FutureExt;
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{cut_json, Failure, Stage, TEXT_MAX_CHARS};
+use shared::failure::{cut_json, Failure, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS};
 use shared::system::{HealthLevel, SystemHealth};
 use soulbeet::navidrome::ScanStatus;
 
@@ -202,16 +202,18 @@ impl FreeSpaceReads {
     /// A blocking read of `path` that takes itself out of `running` once it
     /// returns or panics. The caller inserts it while it holds the lock, and
     /// the read's thread takes the same lock to remove it, so the entry it
-    /// removes is its own.
+    /// removes is its own. The guard is made on the read's thread: a
+    /// runtime that is shutting down drops the closure unrun on the caller's
+    /// thread, under the caller's lock, and an unrun closure holds no guard.
     fn start(self: &Arc<Self>, path: PathBuf) -> FreeSpaceRead {
-        let leaving = Leaving {
-            reads: self.clone(),
-            path,
-        };
-        tokio::task::spawn_blocking(move || (leaving.reads.reader)(&leaving.path))
-            .map(|joined| joined.unwrap_or_else(|join| Err(join.to_string())))
-            .boxed()
-            .shared()
+        let reads = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let leaving = Leaving { reads, path };
+            (leaving.reads.reader)(&leaving.path)
+        })
+        .map(|joined| joined.unwrap_or_else(|join| Err(join.to_string())))
+        .boxed()
+        .shared()
     }
 }
 
@@ -261,9 +263,18 @@ pub(crate) async fn call(
 }
 
 /// The status document's fields; a fact that could not be read is `null`,
-/// next to its failure. The folders are listed while the document stays
-/// within RESULT_MAX_CHARS; `folders_left_out` counts the rest, which
-/// list_folders pages through.
+/// next to its failure. Batch labels and importer issues are outside text
+/// (an album title, beets' own output), cut as `cut_json` does: a label
+/// and an issue title to TEXT_MAX_CHARS, an issue detail, which can hold
+/// a Python error, to RAW_MAX_CHARS like a cause. The running batches and
+/// then the folders are listed while the document stays within
+/// RESULT_MAX_CHARS; `running_batches_left_out` and `folders_left_out`
+/// count the rest (list_folders pages through the folders). The importer
+/// issues are sent whole: beside a few fixed ones they come from the beets
+/// probe's report, one line the probe keeps under 8,000 characters by
+/// cutting each plugin error to 500, 200, 80 or 0 characters
+/// (lib/soulbeet/src/beets/probe.py, `MAX_LINE`), or from the probe's
+/// output tail.
 pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<String, Value> {
     let health = &facts.health;
     let navidrome = facts.navidrome.as_ref();
@@ -276,8 +287,8 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
         .map(|issue| {
             json!({
                 "severity": level_name(issue.severity),
-                "title": issue.title,
-                "detail": issue.detail,
+                "title": cut_json(issue.title.clone(), TEXT_MAX_CHARS),
+                "detail": cut_json(issue.detail.clone(), RAW_MAX_CHARS),
             })
         })
         .collect();
@@ -290,9 +301,12 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
     let running_batches: Vec<Value> = facts
         .running_batches
         .iter()
-        .map(|b| json!({"batch_id": b.batch_id, "label": b.label, "transfers": b.transfers}))
+        .map(|b| {
+            json!({"batch_id": b.batch_id, "label": cut_json(b.label.clone(), TEXT_MAX_CHARS),
+                "transfers": b.transfers})
+        })
         .collect();
-    let Value::Object(fields) = json!({
+    let Value::Object(mut fields) = json!({
         "base_url": caller.base.to_string(),
         "mcp_url": mcp_url(&caller.base),
         "user": {"username": caller.ctx.username, "role": caller.ctx.role},
@@ -313,11 +327,21 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
             "scan_failure": scan_failure,
         },
         "default_folder_id": facts.default_folder_id,
-        "running_batches": running_batches,
         "deletion_enabled": caller.allow_delete,
     }) else {
         unreachable!("an object literal is an object");
     };
+    // The batches are fitted with room kept for the folders' empty list and
+    // their count at its longest, so fitting the folders after them in what
+    // is left keeps the whole within the cap.
+    fields.insert("folders".into(), json!([]));
+    fields.insert("folders_left_out".into(), json!(folders.len()));
+    let fields = fit_whole(
+        fields,
+        "running_batches",
+        running_batches,
+        "running_batches_left_out",
+    );
     fit_whole(fields, "folders", folders, "folders_left_out")
 }
 
@@ -392,6 +416,7 @@ mod tests {
                 "folders_left_out": 0,
                 "default_folder_id": "f1",
                 "running_batches": [{"batch_id": "b1", "label": "Come Over", "transfers": 2}],
+                "running_batches_left_out": 0,
                 "deletion_enabled": false
             })
         );
@@ -594,6 +619,33 @@ mod tests {
         assert!(reads.running.lock().unwrap().is_empty());
     }
 
+    /// A runtime that is shutting down drops a blocking closure without
+    /// running it, inside spawn_blocking (tokio 1.48.0
+    /// src/runtime/blocking/pool.rs:393-404), while `read` holds the lock on
+    /// `running`. Dropping the unrun read must not take that lock again.
+    #[test]
+    fn a_read_the_runtime_drops_unrun_does_not_take_the_lock_its_caller_holds() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        drop(runtime);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _entered = handle.enter();
+            let reads = FreeSpaceReads::new(free_space, FREE_SPACE_WAIT);
+            let running = reads.running.lock().unwrap();
+            let read = reads.start(PathBuf::from("/mnt/any"));
+            drop(running);
+            drop(read);
+            done.send(()).unwrap();
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "starting a read the runtime refused deadlocked on `running`"
+        );
+    }
+
     #[test]
     fn folders_that_would_pass_the_cap_are_left_out_and_counted() {
         let mut facts = sample_facts();
@@ -622,6 +674,46 @@ mod tests {
         );
         let name = doc["folders"][0]["name"].as_str().unwrap();
         assert!(shared::failure::json_chars(name) <= TEXT_MAX_CHARS);
+        doc.insert("ok".into(), json!(true));
+        assert!(Value::Object(doc).to_string().chars().count() <= RESULT_MAX_CHARS);
+    }
+
+    #[test]
+    fn batch_labels_and_importer_issues_are_cut_and_batches_past_the_cap_counted() {
+        let mut facts = sample_facts();
+        let quotes = "\"".repeat(5_000);
+        facts.health.importer.issues[0].title = quotes.clone();
+        facts.health.importer.issues[0].detail = quotes.clone();
+        facts.running_batches = (0..200)
+            .map(|i| RunningBatch {
+                batch_id: format!("b{i}"),
+                label: quotes.clone(),
+                transfers: 1,
+            })
+            .collect();
+        let mut doc = status_fields(&facts, &alice_caller(false));
+        let issue = &doc["importer"]["issues"][0];
+        assert_eq!(
+            (
+                issue["title"].as_str().unwrap(),
+                issue["detail"].as_str().unwrap()
+            ),
+            (
+                cut_json(quotes.clone(), TEXT_MAX_CHARS).as_str(),
+                cut_json(quotes.clone(), RAW_MAX_CHARS).as_str()
+            )
+        );
+        let batches = doc["running_batches"].as_array().unwrap();
+        assert_eq!(
+            batches[0]["label"],
+            json!(cut_json(quotes.clone(), TEXT_MAX_CHARS))
+        );
+        assert!(
+            batches.len() > 1 && batches.len() < 200,
+            "{}",
+            batches.len()
+        );
+        assert_eq!(doc["running_batches_left_out"], json!(200 - batches.len()));
         doc.insert("ok".into(), json!(true));
         assert!(Value::Object(doc).to_string().chars().count() <= RESULT_MAX_CHARS);
     }
