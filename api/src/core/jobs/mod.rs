@@ -275,10 +275,10 @@ pub(crate) async fn ensure(
         return Err(failure.into());
     }
     acquire.effects.backend().await?;
-    let now = crate::oauth::now_unix();
     let previewed = match &replace {
         Some(ReplaceConsent { app, secret }) => {
             let expect = Some(DeletionReason::Replaced);
+            let now = crate::oauth::now_unix();
             let peeked = (peek_in(&acquire.db, app, secret, expect, now).await)
                 .map_err(EnsureRefusal::Token)?;
             peeked.files
@@ -341,7 +341,8 @@ pub(crate) async fn ensure(
     }
     let library_checked = navi.is_some();
     // Taken only when some job will replace, right before the batch is written: two calls with
-    // one token make one batch.
+    // one token make one batch. The clock is read again: the lookups take their time, and the
+    // token must be valid when it is taken. The yes holds REPLACE_CONSENT_SECS from the take.
     let taken = match &replace {
         Some(ReplaceConsent { app, secret })
             if wanting
@@ -349,14 +350,19 @@ pub(crate) async fn ensure(
                 .any(|(_, _, replacing)| !replacing.is_empty()) =>
         {
             let expect = Some(DeletionReason::Replaced);
+            let now = crate::oauth::now_unix();
             let taken = (take_in(&acquire.db, app, secret, expect, now).await)
                 .map_err(EnsureRefusal::Token)?;
-            Some((app.grant_id.clone(), taken.files))
+            Some((
+                app.grant_id.clone(),
+                taken.files,
+                now + REPLACE_CONSENT_SECS,
+            ))
         }
         _ => None,
     };
     let after_take = |failure: Failure| match &taken {
-        Some((_, files)) => EnsureRefusal::Taken {
+        Some((_, files, _)) => EnsureRefusal::Taken {
             failure,
             song_ids: files.iter().map(|f| f.song_id.clone()).collect(),
         },
@@ -376,17 +382,16 @@ pub(crate) async fn ensure(
         let id = batch.id.clone();
         let jobs: Vec<NewJob> = (wanting.iter())
             .map(|(i, _, replacing)| {
-                let set =
-                    (taken.as_ref())
-                        .filter(|_| !replacing.is_empty())
-                        .map(|(grant_id, files)| ReplaceSet {
-                            grant_id: grant_id.clone(),
-                            files: (files.iter())
-                                .filter(|f| replacing.contains(&f.song_id))
-                                .cloned()
-                                .collect(),
-                            expires_at: now + REPLACE_CONSENT_SECS,
-                        });
+                let set = (taken.as_ref()).filter(|_| !replacing.is_empty()).map(
+                    |(grant_id, files, expires_at)| ReplaceSet {
+                        grant_id: grant_id.clone(),
+                        files: (files.iter())
+                            .filter(|f| replacing.contains(&f.song_id))
+                            .cloned()
+                            .collect(),
+                        expires_at: *expires_at,
+                    },
+                );
                 let options = JobOptions {
                     replace: set,
                     ..options.clone()
@@ -879,12 +884,14 @@ mod tests {
     use crate::auth::UserId;
     use crate::connection::test_util::{app_with_acquire, grant_of};
     use crate::core::delete_guard::test_support::previewed_file;
-    use crate::core::deletion::tokens::issue_in;
+    use crate::core::deletion::tokens::{issue_in, TokenRefusalKind};
+    use crate::core::deletion::TOKEN_SECS;
     use crate::core::jobs::test_support::auto_options;
     use crate::core::test_ctx;
     use crate::ledger::items_label;
     use crate::ledger::store;
     use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub, HOLY, SILENT};
+    use soulbeet::navidrome::NavidromeClient;
 
     fn track(title: &str) -> Wanted {
         Wanted::Track(Reference {
@@ -1005,6 +1012,81 @@ mod tests {
                 set.expires_at
             );
         }
+    }
+
+    /// Navidrome that answers `navidrome_of` only after `wait`, as a slow one does.
+    struct SlowNavidrome(NavidromeFor, std::time::Duration);
+
+    #[async_trait::async_trait]
+    impl NavidromeOf for SlowNavidrome {
+        async fn navidrome_of(
+            &self,
+            user: &UserId,
+        ) -> Result<Arc<NavidromeClient>, NavidromeLookupError> {
+            tokio::time::sleep(self.1).await;
+            self.0.navidrome_of(user).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_that_expires_during_the_lookups_is_refused_at_the_take() {
+        let (db, acquire, effects, _) = app_with_acquire().await;
+        sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        let found = format!(
+            "[{}]",
+            native_song(HOLY.0, "Marrow Choir", HOLY.1, 263.4, None)
+        );
+        navi.answer_when("/api/song", "title=Marrow+Choir+O+Holy+Night", 200, &found);
+        let library = std::fs::canonicalize(effects.library()).unwrap();
+        let path = library.join("holy.flac");
+        std::fs::write(&path, b"audio").unwrap();
+        let app = App {
+            user: UserId::new("u1"),
+            grant_id: grant_of(&db, "u1").await,
+        };
+        // Valid for one more second when the call starts; the lookups take two.
+        let issued_at = crate::oauth::now_unix() - TOKEN_SECS + 1;
+        let files = [previewed_file(HOLY.0, &path)];
+        let issued = issue_in(&db, &app, DeletionReason::Replaced, &files, issued_at)
+            .await
+            .unwrap();
+        let slow = SlowNavidrome(
+            NavidromeFor(Ok(navi.client())),
+            std::time::Duration::from_secs(2),
+        );
+        let refused = ensure(
+            &acquire,
+            &slow,
+            &test_ctx("u1"),
+            None,
+            None,
+            vec![track("O Holy Night")],
+            auto_options(),
+            false,
+            Some(ReplaceConsent {
+                app: app.clone(),
+                secret: issued.secret.clone(),
+            }),
+        )
+        .await;
+        match refused {
+            Err(EnsureRefusal::Token(r)) => assert_eq!(r.kind, TokenRefusalKind::Expired),
+            other => panic!("{other:?}"),
+        }
+        let batches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM batches")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(batches, 0);
+        let used: Option<i64> = sqlx::query_scalar("SELECT used_at FROM delete_tokens")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(used, None);
     }
 
     #[test]

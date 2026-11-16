@@ -799,21 +799,39 @@ impl NavidromeClient {
         .await
     }
 
-    /// Present songs (missing=false) in id order, rows `start` to `end` (exclusive). The
-    /// `missing` filter is `booleanFilter` (persistence/mediafile_repository.go:125,
-    /// persistence/sql_restful.go:104-107 in 0.64.2).
-    pub async fn list_songs(&self, start: u32, end: u32) -> Result<Vec<NativeSong>> {
-        self.native_songs(
-            "List songs",
-            &[
-                ("_start", start.to_string()),
-                ("_end", end.to_string()),
-                ("_sort", "id".to_string()),
-                ("_order", "ASC".to_string()),
-                ("missing", "false".to_string()),
-            ],
-        )
-        .await
+    /// Present songs (missing=false) in the order Navidrome added them, rows `start` to `end`
+    /// (exclusive), and how many present songs Navidrome counts now. The `missing` filter is
+    /// `booleanFilter` (persistence/mediafile_repository.go:125, persistence/sql_restful.go:104-107
+    /// in 0.64.2); deluan/rest takes `_end - _start` rows with no cap (controller.go:217-229 at
+    /// the version 0.64.2's go.mod names) and sends the count as `X-Total-Count` (:63-64).
+    /// The sort is `created_at`, which maps to `media_file.created_at`
+    /// (persistence/mediafile_repository.go:100): past an offset of DevOffsetOptimize (50,000 by
+    /// default, conf/configuration.go:1122) Navidrome leaves out the earlier rows with a subquery
+    /// that orders the joined tables by the sort (persistence/sql_base_repository.go:426-428,
+    /// 461-469), where a plain `id` names both media_file's and library's and fails. Songs added
+    /// at one time have no order among them, so a caller checks that it read as many as the count.
+    pub async fn list_songs(&self, start: u32, end: u32) -> Result<SongPage> {
+        let url = self.base_url.join("api/song")?;
+        let query = [
+            ("_start", start.to_string()),
+            ("_end", end.to_string()),
+            ("_sort", "created_at".to_string()),
+            ("_order", "ASC".to_string()),
+            ("missing", "false".to_string()),
+        ];
+        let resp = self
+            .native_request(self.client.get(url).query(&query))
+            .await?;
+        if !resp.status().is_success() {
+            return Err(native_failure("List songs", resp).await);
+        }
+        let total = (resp.headers().get("x-total-count"))
+            .and_then(|count| count.to_str().ok()?.parse().ok())
+            .ok_or_else(|| {
+                NavidromeError::Parse("Navidrome listed songs without a valid X-Total-Count".into())
+            })?;
+        let songs = resp.json().await.map_err(parse)?;
+        Ok(SongPage { songs, total })
     }
 
     /// Present songs (missing=false), the one Navidrome added last first, rows `start` to `end`
@@ -976,6 +994,13 @@ pub enum StarTarget<'a> {
     Album(&'a str),
 }
 
+/// A page of list_songs: its songs, and how many present songs Navidrome counted.
+#[derive(Debug)]
+pub struct SongPage {
+    pub songs: Vec<NativeSong>,
+    pub total: u64,
+}
+
 /// The playlist fields updatePlaylist changes; a field left None is not sent.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlaylistMeta<'a> {
@@ -1021,7 +1046,7 @@ fn undecodable(e: serde_json::Error) -> NavidromeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_http::{serve, Reply};
+    use crate::test_http::{serve, serve_with_headers, Reply};
 
     fn client(base_url: &str) -> NavidromeClient {
         NavidromeClientBuilder::new()
@@ -2331,25 +2356,35 @@ mod tests {
     const BAD_GATEWAY: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
 
     #[tokio::test]
-    async fn present_songs_are_listed_a_page_at_a_time_in_id_order() {
-        let (url, seen) = serve(vec![
-            reply(LOGIN),
-            reply(NATIVE_SONG),
-            Reply {
-                status: 502,
-                body: BAD_GATEWAY.into(),
-            },
+    async fn present_songs_are_listed_a_page_at_a_time_in_the_order_navidrome_added_them() {
+        let (url, seen) = serve_with_headers(vec![
+            (reply(LOGIN), vec![]),
+            (reply(NATIVE_SONG), vec![("X-Total-Count", "1".into())]),
+            (reply(NATIVE_SONG), vec![]),
+            (
+                Reply {
+                    status: 502,
+                    body: BAD_GATEWAY.into(),
+                },
+                vec![],
+            ),
         ]);
         let c = client(&url);
-        let songs = c.list_songs(0, 1000).await.unwrap();
+        let page = c.list_songs(0, 1000).await.unwrap();
         assert_eq!(
-            songs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
-            vec!["3sG8kPq0WmZ1xYbN4vTcDe"]
+            (
+                page.songs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+                page.total
+            ),
+            (vec!["3sG8kPq0WmZ1xYbN4vTcDe"], 1)
         );
         assert_eq!(
             seen.lock().unwrap()[1].target,
-            "/api/song?_start=0&_end=1000&_sort=id&_order=ASC&missing=false"
+            "/api/song?_start=0&_end=1000&_sort=created_at&_order=ASC&missing=false"
         );
+        // Without the count, a page cannot be checked against it.
+        let err = c.list_songs(0, 1000).await.unwrap_err();
+        assert!(matches!(&err, NavidromeError::Parse(_)), "{err:?}");
         let err = c.list_songs(1000, 2000).await.unwrap_err();
         assert!(
             matches!(&err, NavidromeError::Http { action: "List songs", status: 502, body: None, raw: Some(r) } if r == BAD_GATEWAY),

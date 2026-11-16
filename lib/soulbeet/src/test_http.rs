@@ -23,12 +23,19 @@ pub(crate) struct Seen {
 /// Answers the n-th connection with replies[n] (`Connection: close`, JSON
 /// content type) and records each request; base URL `http://127.0.0.1:{port}`.
 pub(crate) fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Seen>>>) {
+    serve_with_headers(replies.into_iter().map(|r| (r, vec![])).collect())
+}
+
+/// serve, each reply sent with its own extra headers (name, value).
+pub(crate) fn serve_with_headers(
+    replies: Vec<(Reply, Vec<(&'static str, String)>)>,
+) -> (String, Arc<Mutex<Vec<Seen>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = seen.clone();
     std::thread::spawn(move || {
-        for reply in replies {
+        for (reply, headers) in replies {
             let (stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream);
             let request = read_request(&mut reader);
@@ -37,9 +44,12 @@ pub(crate) fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Seen>>>) {
                 .ok()
                 .and_then(|s| s.canonical_reason())
                 .unwrap_or("");
+            let extra: String = (headers.iter())
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect();
             let response = format!(
                 "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                 {extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 reply.status,
                 reply.body.len(),
                 reply.body

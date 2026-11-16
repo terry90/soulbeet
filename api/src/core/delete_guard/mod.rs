@@ -2675,6 +2675,19 @@ mod tests {
             room_in(&mut conn, &UserId::new("bob"), 25, now).await,
             Ok(0)
         );
+        // More than a day's room at once never fits, whatever was deleted: no time is given.
+        let f = room_in(&mut conn, &UserId::new("bob"), 101, now)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (f.code, f.retry, f.retry_after_seconds, f.message.as_str()),
+            (
+                FailureCode::DeleteDailyLimit,
+                RetryAdvice::NotRetryable,
+                None,
+                "At most 100 tracks a day can be deleted through connected apps, fewer than the 101 asked at once."
+            )
+        );
     }
 
     #[tokio::test]

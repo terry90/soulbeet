@@ -30,6 +30,8 @@ type Answers = Arc<Mutex<Book>>;
 struct Book {
     bodies: HashMap<String, VecDeque<String>>,
     when: Vec<When>,
+    /// Headers sent with every answer to an endpoint, as (name, value).
+    headers: HashMap<String, Vec<(String, String)>>,
 }
 
 /// An answer for the requests to `endpoint` whose query contains `query_part`.
@@ -63,6 +65,7 @@ impl NavidromeStub {
                 VecDeque::from([r#"{"token":"jwt"}"#.to_string()]),
             )]),
             when: Vec::new(),
+            headers: HashMap::new(),
         }));
         let asked = Arc::new(Mutex::new(Vec::new()));
         let (bodies, paths) = (answers.clone(), asked.clone());
@@ -95,6 +98,13 @@ impl NavidromeStub {
             status,
             body: body.to_string(),
         });
+    }
+
+    /// Sends header `name: value` with every answer to `endpoint`.
+    pub fn header(&self, endpoint: &str, name: &str, value: &str) {
+        let mut answers = self.answers.lock().unwrap();
+        let headers = answers.headers.entry(endpoint.to_string()).or_default();
+        headers.push((name.to_string(), value.to_string()));
     }
 
     /// The path of each request, in order.
@@ -166,13 +176,20 @@ fn serve(stream: TcpStream, answers: &Answers, asked: &Mutex<Vec<Asked>>) -> std
     }
     let mut posted = vec![0; length];
     reader.read_exact(&mut posted)?;
-    let (status, body) = answers.lock().unwrap().answer(&endpoint, target);
+    let (status, body, extra) = {
+        let mut book = answers.lock().unwrap();
+        let (status, body) = book.answer(&endpoint, target);
+        let extra: String = (book.headers.get(&endpoint).into_iter().flatten())
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
+        (status, body, extra)
+    };
     let posted = String::from_utf8_lossy(&posted).into_owned();
     asked.lock().unwrap().push((target.to_string(), posted));
     let status = StatusCode::from_u16(status).expect("a test sets a valid status");
     let response = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         {extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         status.as_u16(),
         status.canonical_reason().unwrap_or_default(),
         body.len()

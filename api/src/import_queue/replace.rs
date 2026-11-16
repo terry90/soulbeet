@@ -6,7 +6,7 @@ use crate::core::delete_guard::{
     Checked, ForgetVia, Guard, NotRemoved, Origin, PreviewedFile, ReplaceSet,
 };
 use crate::core::deletion::replace_consent_expired;
-use crate::core::logged;
+use crate::core::{logged, stored_time};
 use crate::ledger::{Replacement, ReplacementOutcome};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::navidrome::DeletionReason;
@@ -91,7 +91,12 @@ pub(super) async fn settle_removals(
             previewed: previewed.map(|(set, _)| set.files.as_slice()),
             expired: previewed
                 .filter(|(set, now)| *now >= set.expires_at)
-                .map(|(set, _)| replace_consent_expired(set.expires_at)),
+                .map(
+                    |(set, _)| match stored_time(Stage::Delete, set.expires_at) {
+                        Ok(at) => replace_consent_expired(at),
+                        Err(unreadable) => unreadable,
+                    },
+                ),
             exempt_jobs,
             target,
         },
@@ -269,9 +274,10 @@ impl Run<'_> {
                 .await;
             match outcome {
                 Ok(done) => {
-                    self.taken.insert(removal.existing[deleted].path.clone());
-                    self.removed.push(path.clone());
-                    removed.push(path);
+                    let item = removal.existing[deleted].path.clone();
+                    self.taken.insert(item.clone());
+                    self.removed.push(path);
+                    removed.push(item);
                     warnings.extend(done);
                 }
                 Err(stop) => {
@@ -1064,21 +1070,22 @@ mod tests {
         let stub = StubImporter::new();
         let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
         let s = replace(&lib, &stub, &set, now, result).await;
+        let ran_out = replace_consent_expired(chrono::DateTime::from_timestamp(now, 0).unwrap());
         assert_eq!(
             s.replaced[0].outcome,
             ReplacementOutcome::Kept {
-                failure: replace_consent_expired(now)
+                failure: ran_out.clone()
             }
         );
         assert_eq!(
-            replace_consent_expired(now).message,
+            ran_out.message,
             "The confirmation to replace this copy ran out at 2027-01-15 08:00:00 UTC; preview it again with reason replaced"
         );
         assert_eq!(
             notes(&s.result),
             vec![format!(
                 "kept the library's earlier copy A/x.flac: {}",
-                replace_consent_expired(now).message
+                ran_out.message
             )]
         );
         assert_eq!(lib.fake.ratings_set(), rated, "nothing was checked");
@@ -1112,7 +1119,7 @@ mod tests {
         std::fs::set_permissions(target.join("B"), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             matches!(&s.replaced[0].outcome, ReplacementOutcome::PartlyRemoved { removed, failure }
-                if *removed == vec![x.clone()] && failure.code == FailureCode::DeleteFailed),
+                if *removed == vec![PathBuf::from("A/x.flac")] && failure.code == FailureCode::DeleteFailed),
             "{:?}",
             s.replaced
         );

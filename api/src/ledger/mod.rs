@@ -229,8 +229,9 @@ pub enum ReplacementOutcome {
     Replaced,
     /// None deleted; why.
     Kept { failure: Failure },
-    /// `removed` (canonical paths) deleted before `failure` stopped the rest; a removal that
-    /// stopped before it reported is not in `removed`, and its failure says the file may be gone.
+    /// `removed` deleted before `failure` stopped the rest, their paths as `existing` gives them;
+    /// a removal that stopped before it reported is not in `removed`, and its failure says the
+    /// file may be gone.
     PartlyRemoved {
         removed: Vec<PathBuf>,
         failure: Failure,

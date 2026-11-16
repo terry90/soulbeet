@@ -32,6 +32,18 @@ pub(crate) fn database_failure(stage: Stage, e: impl std::fmt::Display) -> Failu
     .with_cause(Service::Database, None, e.to_string())
 }
 
+/// A time as a failure message says it: `%Y-%m-%d %H:%M:%S UTC`.
+pub(crate) fn utc_text(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+/// Unix time `at`, stored by Soulful, as a time; a database failure when it is out of chrono's
+/// range, which no time Soulful writes reaches.
+pub(crate) fn stored_time(stage: Stage, at: i64) -> Result<chrono::DateTime<chrono::Utc>, Failure> {
+    chrono::DateTime::from_timestamp(at, 0)
+        .ok_or_else(|| database_failure(stage, format!("stored time {at} is out of range")))
+}
+
 /// `f`'s message for a log line, followed by its upstream cause when it has one:
 /// "{message} (cause: {service}[ {status}]: {raw})".
 pub(crate) fn logged(f: &Failure) -> String {

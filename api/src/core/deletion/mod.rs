@@ -12,11 +12,11 @@ use shared::navidrome::{DeletionReason, DiscoveryTrack};
 use soulbeet::navidrome::models::NativeSong;
 
 use crate::auth::UserId;
-use crate::core::database_failure;
 use crate::core::delete_guard::quota::room_in;
 use crate::core::delete_guard::{
     changed_since_check, song_not_found, Checked, ForgetVia, Guard, Origin, Verdict,
 };
+use crate::core::{database_failure, utc_text};
 use crate::import_queue::ImportQueue;
 use tokens::{take_in, DeleteTokenRefusal};
 
@@ -31,7 +31,7 @@ pub(crate) const TOKEN_SECS: i64 = 600;
 pub(crate) const REPLACE_CONSENT_SECS: i64 = 24 * 60 * 60;
 
 /// The yes to replace a copy, given by a replace_existing token, ran out at `at` (D9).
-pub(crate) fn replace_consent_expired(at: i64) -> Failure {
+pub(crate) fn replace_consent_expired(at: chrono::DateTime<chrono::Utc>) -> Failure {
     Failure::new(
         FailureCode::ExpiredHandle,
         Stage::Delete,
@@ -40,14 +40,6 @@ pub(crate) fn replace_consent_expired(at: i64) -> Failure {
             "The confirmation to replace this copy ran out at {}; preview it again with reason replaced",
             utc_text(at)
         ),
-    )
-}
-
-/// Unix time `at` as a message says it: `%Y-%m-%d %H:%M:%S UTC`.
-fn utc_text(at: i64) -> String {
-    chrono::DateTime::from_timestamp(at, 0).map_or_else(
-        || format!("{at} seconds after 1970-01-01 00:00:00 UTC"),
-        |at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
     )
 }
 
@@ -82,7 +74,7 @@ pub(crate) struct PreviewEntry {
 #[derive(Debug)]
 pub(crate) struct IssuedToken {
     pub secret: String,
-    pub expires_at: i64,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
     pub song_ids: Vec<String>,
 }
 
@@ -95,18 +87,19 @@ pub(crate) struct Preview {
     pub used_today: u32,
 }
 
-/// Design 13's preview of deleting `song_ids` for `reason`. The day's room for every song is
-/// read first, on a connection given back before any Navidrome read (D4), so a request that
-/// cannot fit reads nothing. Then per song, in order: the caller's record (read_song; none is
-/// Blocked with song_not_found, a read that failed Blocked with its failure) and its check
-/// (check_record); a token for the Allowed ones
-/// (tokens::issue_in), none when no song is allowed. Nothing is deleted.
+/// Design 13's preview of deleting `song_ids` for `reason`, reading the time from `clock`. The
+/// day's room for every song is read first, on a connection given back before any Navidrome
+/// read (D4), so a request that cannot fit reads nothing. Then per song, in order: the caller's
+/// record (read_song; none is Blocked with song_not_found, a read that failed Blocked with its
+/// failure) and its check (check_record); a token for the Allowed ones (tokens::issue_in), none
+/// when no song is allowed, valid TOKEN_SECS from when it is stored, after the checks. Nothing is
+/// deleted.
 pub(crate) async fn preview(
     guard: &Guard<'_>,
     app: &App,
     song_ids: &[String],
     reason: DeletionReason,
-    now: i64,
+    clock: impl Fn() -> i64,
 ) -> Result<Preview, Failure> {
     let used_today = {
         let mut conn = guard
@@ -114,7 +107,7 @@ pub(crate) async fn preview(
             .acquire()
             .await
             .map_err(|e| database_failure(Stage::Delete, e))?;
-        room_in(&mut conn, &app.user, song_ids.len() as u32, now).await?
+        room_in(&mut conn, &app.user, song_ids.len() as u32, clock()).await?
     };
     let mut entries = Vec::with_capacity(song_ids.len());
     for song_id in song_ids {
@@ -144,7 +137,7 @@ pub(crate) async fn preview(
         .collect();
     let token = match files.is_empty() {
         true => None,
-        false => Some(tokens::issue_in(guard.db, app, reason, &files, now).await?),
+        false => Some(tokens::issue_in(guard.db, app, reason, &files, clock()).await?),
     };
     Ok(Preview {
         entries,
@@ -284,7 +277,7 @@ mod tests {
 
     /// The token of a preview of s1 alone for `reason` at `now`.
     async fn s1_token(lib: &Library, reason: DeletionReason, now: i64) -> IssuedToken {
-        preview(&lib.guard(), &alice_app(), &ids(&["s1"]), reason, now)
+        preview(&lib.guard(), &alice_app(), &ids(&["s1"]), reason, || now)
             .await
             .unwrap()
             .token
@@ -313,7 +306,7 @@ mod tests {
             &alice_app(),
             &ids(&["s1", "s2", "s5", "gone"]),
             DeletionReason::Cleanup,
-            now,
+            || now,
         )
         .await
         .unwrap();
@@ -333,7 +326,7 @@ mod tests {
         assert_eq!(p.used_today, 0);
         let token = p.token.unwrap();
         assert_eq!(
-            (token.song_ids, token.expires_at),
+            (token.song_ids, token.expires_at.timestamp()),
             (ids(&["s1"]), now + TOKEN_SECS)
         );
         assert!(lib.root.join("music/alice/A/x.flac").exists());
@@ -360,7 +353,7 @@ mod tests {
             &alice_app(),
             &ids(&["s1"]),
             DeletionReason::Disliked,
-            now,
+            || now,
         )
         .await
         .unwrap();
@@ -384,7 +377,7 @@ mod tests {
             &alice_app(),
             &many,
             DeletionReason::Cleanup,
-            now,
+            || now,
         )
         .await
         .unwrap_err();
@@ -396,7 +389,7 @@ mod tests {
             &alice_app(),
             &many[..10],
             DeletionReason::Cleanup,
-            now,
+            || now,
         )
         .await
         .unwrap();
@@ -605,7 +598,7 @@ mod tests {
             &alice_app(),
             &ids(&["s1", "s2"]),
             DeletionReason::Cleanup,
-            now,
+            || now,
         )
         .await
         .unwrap()
@@ -642,7 +635,7 @@ mod tests {
             &alice_app(),
             &ids(&["s1", "s2"]),
             DeletionReason::Cleanup,
-            now,
+            || now,
         )
         .await
         .unwrap()

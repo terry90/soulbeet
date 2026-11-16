@@ -3,7 +3,7 @@
 //! read on the connection of the transaction that writes, never before it.
 
 use crate::auth::UserId;
-use crate::core::database_failure;
+use crate::core::{database_failure, stored_time, utc_text};
 use crate::oauth::grants::grant_app_in;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::navidrome::DAILY_APP_DELETIONS;
@@ -35,14 +35,17 @@ pub(crate) fn permission_not_granted() -> Failure {
 
 /// D4: `user`'s audit rows of origin mcp created after `now - DAY_SECS`, every app's. Ok(used)
 /// when `wanted` more fit DAILY_APP_DELETIONS, else daily_limit with the time the
-/// (used + wanted - limit)-th oldest of those rows leaves the window. Callers want at most the
-/// limit (one file, or one token's songs).
+/// (used + wanted - limit)-th oldest of those rows leaves the window. More than the limit at once
+/// never fits, so it is refused with more_than_a_day before anything is read.
 pub(crate) async fn room_in(
     conn: &mut SqliteConnection,
     user: &UserId,
     wanted: u32,
     now: i64,
 ) -> Result<u32, Failure> {
+    if wanted > DAILY_APP_DELETIONS {
+        return Err(more_than_a_day(wanted));
+    }
     let counted: Vec<i64> = sqlx::query_scalar(
         "SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM deletion_reviews \
          WHERE user_id = ? AND origin = 'mcp' AND created_at > datetime(?, 'unixepoch') \
@@ -57,30 +60,37 @@ pub(crate) async fn room_in(
     if used + wanted <= DAILY_APP_DELETIONS {
         return Ok(used);
     }
+    // wanted <= the limit, so over <= used: the over-th oldest row is counted.
     let over = (used + wanted - DAILY_APP_DELETIONS) as usize;
-    // Only a request over the limit on its own has no such row: room for it never frees, and the
-    // window empties when its newest row leaves.
-    let leaves = counted
-        .get(over - 1)
-        .or(counted.last())
-        .map_or(now, |created| *created);
-    Err(daily_limit(used, wanted, leaves + DAY_SECS, now))
+    let resets_at = stored_time(Stage::Delete, counted[over - 1] + DAY_SECS)?;
+    Err(daily_limit(used, wanted, resets_at, now))
 }
 
 /// The day's room is used up: `used` app deletions in the last 24 hours, and room for `wanted`
 /// more at `resets_at`.
-pub(crate) fn daily_limit(used: u32, wanted: u32, resets_at: i64, now: i64) -> Failure {
-    let at = chrono::DateTime::from_timestamp(resets_at, 0).map_or_else(
-        || format!("{resets_at} seconds after 1970-01-01 00:00:00 UTC"),
-        |at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-    );
+pub(crate) fn daily_limit(
+    used: u32,
+    wanted: u32,
+    resets_at: chrono::DateTime<chrono::Utc>,
+    now: i64,
+) -> Failure {
     Failure::new(
         FailureCode::DeleteDailyLimit,
         Stage::Delete,
         RetryAdvice::SameSourceLater,
-        format!("At most {DAILY_APP_DELETIONS} tracks a day can be deleted through connected apps, and {used} were deleted in the last 24 hours. {wanted} more can be deleted from {at}."),
+        format!("At most {DAILY_APP_DELETIONS} tracks a day can be deleted through connected apps, and {used} were deleted in the last 24 hours. {wanted} more can be deleted from {}.", utc_text(resets_at)),
     )
-    .with_retry_after((resets_at - now).clamp(1, i64::from(u32::MAX)) as u32)
+    .with_retry_after((resets_at.timestamp() - now).clamp(1, i64::from(u32::MAX)) as u32)
+}
+
+/// `wanted` deletions at once, more than a day's room can ever hold.
+fn more_than_a_day(wanted: u32) -> Failure {
+    Failure::new(
+        FailureCode::DeleteDailyLimit,
+        Stage::Delete,
+        RetryAdvice::NotRetryable,
+        format!("At most {DAILY_APP_DELETIONS} tracks a day can be deleted through connected apps, fewer than the {wanted} asked at once."),
+    )
 }
 
 /// D5: the host of grant `grant_id`'s app when the grant is `user`'s and allows deletion, else

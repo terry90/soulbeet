@@ -4,13 +4,14 @@
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{cut_json, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS};
+use shared::failure::{cut_json, RetryAdvice, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS};
 use shared::navidrome::{DeletionReason, DeletionReview, DAILY_APP_DELETIONS};
 use soulbeet::navidrome::NativePlaylist;
 
 use super::args::Args;
 use super::contract::{
-    answer, failed, items, items_text, upstream_error, ItemResult, Items, NextCall, ToolError,
+    answer, error_object, failed, items, items_text, upstream_error, ItemResult, Items, NextCall,
+    ToolError,
 };
 use super::keys::{keyed, request_key, Keyed};
 use super::library::navidrome_of;
@@ -48,7 +49,7 @@ pub(crate) const FIND_DUPLICATES: ToolSpec = ToolSpec {
     title: "Duplicate songs",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Finds songs the user's Navidrome library holds more than once: groups of present songs with the same artist and title (compared without case, accents or punctuation), each song with its id, album, format, bitrate, size, duration, path, recording MBID and this user's rating, and per group same_recording: true when every song has the same recording MBID, false when they have different ones, null when one has none. A group lists at most {SONGS_PER_TOKEN} songs and songs_omitted counts the rest. Reads the whole library, so it can take seconds to a minute on a large one. The song ids work in preview_delete_tracks. Failure codes: {common}, {NAVIDROME_CODES}.")
+        format!("Finds songs the user's Navidrome library holds more than once: groups of present songs with the same artist and title (compared without case, accents or punctuation), each song with its id, album, format, bitrate, size, duration, path, recording MBID and this user's rating, and per group same_recording: true when every song has the same recording MBID, false when they have different ones, null when one has none. A group lists at most {SONGS_PER_TOKEN} songs and songs_omitted counts the rest. Reads the whole library, so it can take seconds to a minute on a large one; it fails when Navidrome's pages held fewer songs than it counts, and a song removed while it reads can let another pass unseen, so search again after deleting. The song ids work in preview_delete_tracks. Failure codes: {common}, {NAVIDROME_CODES}.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"#,
@@ -159,8 +160,12 @@ async fn find_duplicates(
             let groups = library::duplicates(&navi)
                 .await
                 .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
-            let groups: Vec<Value> = groups.iter().map(group_value).collect();
-            let shown = groups.get(page.offset..).unwrap_or_default().to_vec();
+            // One more than the page holds tells fit whether more follow.
+            let shown: Vec<Value> = (groups.iter())
+                .skip(page.offset)
+                .take(page.limit + 1)
+                .map(group_value)
+                .collect();
             Ok(fit(Map::new(), "groups", shown, &page, false))
         }
         .await,
@@ -215,7 +220,7 @@ async fn preview_delete_tracks(
         &app_of(caller),
         &song_ids,
         reason,
-        now_unix(),
+        now_unix,
     )
     .await;
     match previewed {
@@ -252,9 +257,7 @@ fn preview_answer(args: &Args, reason: DeletionReason, p: Preview) -> CallToolRe
     let Value::Object(fields) = json!({
         "reason": reason.as_str(),
         "confirmation_token": token.map(|t| &t.secret),
-        "expires_at": token
-            .and_then(|t| chrono::DateTime::from_timestamp(t.expires_at, 0))
-            .map(|at| at.to_rfc3339()),
+        "expires_at": token.map(|t| t.expires_at.to_rfc3339()),
         "will_delete": token.map_or(&[][..], |t| &t.song_ids[..]),
         "daily_limit": {"limit": DAILY_APP_DELETIONS, "used_last_24h": p.used_today},
         "next": next,
@@ -270,20 +273,33 @@ fn preview_answer(args: &Args, reason: DeletionReason, p: Preview) -> CallToolRe
         cursor: None,
         fields,
     };
-    let over = |answered: &Items| items_text(answered).chars().count() > RESULT_MAX_CHARS;
-    for at in (0..answered.results.len()).rev() {
-        if !over(&answered) {
-            break;
-        }
-        title_only(&mut answered.results[at]);
-    }
-    if over(&answered) {
+    shrink_from_the_end(&mut answered, |result, _| title_only(result));
+    if items_text(&answered).chars().count() > RESULT_MAX_CHARS {
         return failed(args.refuse(
             "song_ids",
-            "fewer songs: this preview does not fit in one answer, so preview fewer songs at a time",
+            "a shorter list: the preview of these songs does not fit in one answer",
         ));
     }
     items(answered)
+}
+
+/// Shrinks the results of `answered` with `shrink`, from the last one up, while the answer is
+/// over RESULT_MAX_CHARS; `shrink` is told by how many characters. The answer is measured once,
+/// then each change by its own entry: the rest of the document does not change with it.
+fn shrink_from_the_end(answered: &mut Items, mut shrink: impl FnMut(&mut ItemResult, usize)) {
+    let own_chars = |result: &ItemResult| match result {
+        ItemResult::Done(fields) => Value::Object(fields.clone()).to_string().chars().count(),
+        ItemResult::Failed(error) => error_object(error).to_string().chars().count(),
+    };
+    let mut chars = items_text(answered).chars().count();
+    for result in answered.results.iter_mut().rev() {
+        if chars <= RESULT_MAX_CHARS {
+            return;
+        }
+        let before = own_chars(result);
+        shrink(result, chars - RESULT_MAX_CHARS);
+        chars = chars + own_chars(result) - before;
+    }
 }
 
 /// One song of the preview, and the call that removes it when it is a pending discovery track
@@ -454,23 +470,12 @@ fn confirmed_answer(done: Confirmed) -> CallToolResult {
         cursor: None,
         fields,
     };
-    let over_by =
-        |answered: &Items| (items_text(answered).chars().count()).saturating_sub(RESULT_MAX_CHARS);
-    for at in (0..answered.results.len()).rev() {
-        if over_by(&answered) == 0 {
-            break;
-        }
-        title_only(&mut answered.results[at]);
-    }
-    for at in (0..answered.results.len()).rev() {
-        let over = over_by(&answered);
-        if over == 0 {
-            break;
-        }
-        if let ItemResult::Done(fields) = &mut answered.results[at] {
+    shrink_from_the_end(&mut answered, |result, _| title_only(result));
+    shrink_from_the_end(&mut answered, |result, over| {
+        if let ItemResult::Done(fields) = result {
             leave_out(fields, "warnings", Keep::First, over);
         }
-    }
+    });
     items(answered)
 }
 
@@ -557,6 +562,12 @@ async fn get_deletion_history(
                     args.same_call(),
                 )
             };
+            // A stored row no retry can make readable: nothing is offered.
+            let unreadable = |e: String| {
+                let mut failure = database_failure(Stage::Delete, e);
+                failure.retry = RetryAdvice::NotRetryable;
+                upstream_error(failure, Map::new(), None)
+            };
             // One more than the page says whether more follow.
             let rows = DeletionReviewRow::page_in(
                 &state.db,
@@ -570,7 +581,7 @@ async fn get_deletion_history(
             let deletions = (rows.iter().take(page.limit))
                 .map(deletion_fields)
                 .collect::<Result<Vec<Value>, String>>()
-                .map_err(unavailable)?;
+                .map_err(unreadable)?;
             Ok(fit(Map::new(), "deletions", deletions, &page, more))
         }
         .await,
@@ -612,7 +623,9 @@ mod tests {
     use crate::core::delete_guard::quota::{daily_limit, enable_deletion};
     use crate::core::delete_guard::test_support::Library;
     use crate::core::deletion::tokens::{token_expired, token_not_found, token_used};
+    use crate::core::deletion::ConfirmEntry;
     use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub};
+    use std::path::PathBuf;
 
     async fn preview_s1(app: &axum::Router, token: &str) -> Value {
         document(
@@ -920,6 +933,7 @@ mod tests {
     #[test]
     fn each_token_refusal_offers_the_call_that_helps() {
         use TokenRefusalKind::*;
+        let at = |t| chrono::DateTime::from_timestamp(t, 0).unwrap();
         let known = |kind, failure| DeleteTokenRefusal {
             kind,
             failure,
@@ -936,22 +950,22 @@ mod tests {
             ("ensure_in_library", known(Used, token_used()), json!([])),
             (
                 "delete_tracks",
-                known(Expired, token_expired(1_800_000_000)),
+                known(Expired, token_expired(at(1_800_000_000))),
                 preview.clone(),
             ),
             (
                 "ensure_in_library",
-                known(Expired, token_expired(1_800_000_000)),
+                known(Expired, token_expired(at(1_800_000_000))),
                 preview.clone(),
             ),
             (
                 "delete_tracks",
-                known(Room, daily_limit(100, 1, 1_800_000_400, 1_800_000_000)),
+                known(Room, daily_limit(100, 1, at(1_800_000_400), 1_800_000_000)),
                 preview.clone(),
             ),
             (
                 "ensure_in_library",
-                known(Room, daily_limit(100, 1, 1_800_000_400, 1_800_000_000)),
+                known(Room, daily_limit(100, 1, at(1_800_000_400), 1_800_000_000)),
                 preview,
             ),
             (
@@ -984,6 +998,16 @@ mod tests {
                 },
                 json!([]),
             ),
+            (
+                "delete_tracks",
+                DeleteTokenRefusal {
+                    kind: Database,
+                    failure: database_failure(Stage::Delete, "disk I/O error"),
+                    song_ids: vec![],
+                    reason: None,
+                },
+                json!([]),
+            ),
         ] {
             let kind = r.kind;
             let e = token_refused(tool, r);
@@ -994,7 +1018,7 @@ mod tests {
             );
             assert_eq!(
                 e.facts.contains_key("song_ids"),
-                kind != NotFound,
+                kind != NotFound && kind != Database,
                 "{tool} {kind:?}"
             );
             assert!(
@@ -1011,6 +1035,10 @@ mod tests {
         let ids: Vec<String> = (0..26).map(|i| format!("s{i}")).collect();
         for (args, field) in [
             (json!({"song_ids": ids, "reason": "cleanup"}), "song_ids"),
+            (
+                json!({"song_ids": ["s1", "s1"], "reason": "cleanup"}),
+                "song_ids",
+            ),
             (
                 json!({"song_ids": ["s1", " s1"], "reason": "cleanup"}),
                 "song_ids",
@@ -1104,6 +1132,65 @@ mod tests {
         let listed = &results[0]["playlists"][0];
         assert_eq!(listed["playlist_id"].as_str().unwrap().len(), 600);
         assert!(listed["name"].as_str().unwrap().chars().count() < 600);
+    }
+
+    #[tokio::test]
+    async fn a_long_confirm_keeps_every_file_and_shortens_song_facts_then_warnings_from_the_end() {
+        let lib = Library::new().await;
+        let song = NativeSong {
+            title: "t".repeat(500),
+            artist: "a".repeat(500),
+            album: "b".repeat(500),
+            ..lib.record("s1")
+        };
+        let entries = (0..25)
+            .map(|i| ConfirmEntry {
+                song_id: format!("s{i:02}"),
+                file: PathBuf::from(format!("/music/alice/L/{i:02}.flac")),
+                outcome: ConfirmOutcome::Deleted {
+                    song: Box::new(song.clone()),
+                    warnings: vec!["w".repeat(RAW_MAX_CHARS); 3],
+                },
+            })
+            .collect();
+        let result = confirmed_answer(Confirmed {
+            reason: DeletionReason::Cleanup,
+            entries,
+        });
+        let text = result.content[0].as_text().unwrap().text.clone();
+        assert!(text.chars().count() <= RESULT_MAX_CHARS);
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        let results = doc["results"].as_array().unwrap();
+        assert_eq!(results.len(), 25);
+        for (i, entry) in results.iter().enumerate() {
+            assert_eq!(
+                (
+                    &entry["status"],
+                    &entry["file"],
+                    &entry["song_facts_omitted"]
+                ),
+                (
+                    &json!("deleted"),
+                    &json!(format!("/music/alice/L/{i:02}.flac")),
+                    &json!(true)
+                ),
+                "{i}"
+            );
+        }
+        assert_eq!(
+            (
+                results[0]["warnings"].as_array().unwrap().len(),
+                &results[0]["warnings_omitted"]
+            ),
+            (3, &Value::Null)
+        );
+        assert_eq!(
+            (
+                results[24]["warnings"].as_array().unwrap().len(),
+                &results[24]["warnings_omitted"]
+            ),
+            (0, &json!(3))
+        );
     }
 
     #[tokio::test]
@@ -1241,6 +1328,8 @@ mod tests {
         );
         let preview = (PREVIEW_DELETE_TRACKS.description)(120);
         let delete = (DELETE_TRACKS.description)(120);
+        let duplicates = (FIND_DUPLICATES.description)(120);
+        assert!(duplicates.contains(&format!("A group lists at most {SONGS_PER_TOKEN} songs")));
         assert!(preview.contains(&format!("Checks up to {SONGS_PER_TOKEN} songs")));
         assert!(preview.contains(&format!("valid {} minutes", TOKEN_SECS / 60)));
         assert!(delete.contains(&format!("for {} minutes", TOKEN_SECS / 60)));
@@ -1258,6 +1347,7 @@ mod tests {
             native_song("z1", "Marrow Choir", "Silent Night", 222.0, None),
         ];
         navi.answer("/api/song", &[&format!("[{}]", songs.join(","))]);
+        navi.header("/api/song", "X-Total-Count", "3");
         let (_, app, token) =
             mcp_app_with(std::sync::Arc::new(NavidromeFor(Ok(navi.client())))).await;
         let doc = document(&call_tool(app, &token, "find_duplicates", json!({})).await);
@@ -1297,6 +1387,7 @@ mod tests {
             })
             .collect();
         navi.answer("/api/song", &[&format!("[{}]", songs.join(","))]);
+        navi.header("/api/song", "X-Total-Count", &songs.len().to_string());
         let (_, app, token) =
             mcp_app_with(std::sync::Arc::new(NavidromeFor(Ok(navi.client())))).await;
         let doc = document(&call_tool(app, &token, "find_duplicates", json!({})).await);

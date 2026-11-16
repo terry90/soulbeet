@@ -653,6 +653,17 @@ pub(crate) fn listing(folder: &Path, roots: &[PathBuf]) -> Listing {
 /// Songs `duplicates` reads from Navidrome in one request.
 pub(crate) const DUPLICATE_PAGE: u32 = 1000;
 
+/// Navidrome's pages held `read` different songs of the `total` it counts: its library changed,
+/// or songs added at one time came back in another order, while they were read.
+fn songs_missed(read: usize, total: u64) -> Failure {
+    Failure::new(
+        FailureCode::NavidromeUnreachable,
+        Stage::LibraryCheck,
+        RetryAdvice::SameSourceLater,
+        format!("Navidrome counts {total} songs, and its pages held {read}: its library changed while it was read. Search again."),
+    )
+}
+
 /// Songs of the library that share an artist and title (compared as `match_key` does).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SongGroup {
@@ -668,20 +679,22 @@ pub struct SongGroup {
 
 /// D11: every present song of the caller through `list_songs`, DUPLICATE_PAGE at a time until a
 /// short page, grouped by (match_key(artist), match_key(title)); the groups of two or more,
-/// ordered by that key. A song id seen again on a later page is skipped. A page that fails fails the search, since a part would miss copies.
+/// ordered by that key. A song id seen again on a later page is skipped (a song added mid-search
+/// shifts the offsets). A page that fails fails the search, and so do pages that hold fewer songs
+/// than Navidrome counted at the last one (songs added at one time have no order among them, so a
+/// page can repeat one and pass another), since a part would miss copies. A song removed while the
+/// pages are read can still let one pass unseen.
 pub async fn duplicates(navi: &NavidromeClient) -> Result<Vec<SongGroup>, Failure> {
     let failure = |e: NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
     let mut by_key: BTreeMap<(String, String), Vec<SongFacts>> = BTreeMap::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut start = 0;
-    loop {
+    let total = loop {
         let page = navi
             .list_songs(start, start + DUPLICATE_PAGE)
             .await
             .map_err(failure)?;
-        let last = page.len() < DUPLICATE_PAGE as usize;
-        for song in &page {
-            // A song added mid-search shifts the offsets, so a page can repeat a row.
+        for song in &page.songs {
             if !seen.insert(song.id.clone()) {
                 continue;
             }
@@ -690,10 +703,13 @@ pub async fn duplicates(navi: &NavidromeClient) -> Result<Vec<SongGroup>, Failur
                 .or_default()
                 .push(SongFacts::from(song));
         }
-        if last {
-            break;
+        if page.songs.len() < DUPLICATE_PAGE as usize {
+            break page.total;
         }
         start += DUPLICATE_PAGE;
+    };
+    if (seen.len() as u64) < total {
+        return Err(songs_missed(seen.len(), total));
     }
     Ok(by_key
         .into_values()
@@ -1404,6 +1420,7 @@ mod tests {
                 &format!("[{}]", second.join(",")),
             ],
         );
+        navi.header("/api/song", "X-Total-Count", "1002");
         let groups = duplicates(&navi.client()).await.unwrap();
         assert_eq!(
             groups
@@ -1422,9 +1439,13 @@ mod tests {
                 ("Silent Night", None, vec!["b1", "b2"])
             ]
         );
-        assert!(song_requests(&navi)
-            .iter()
-            .any(|t| t.contains("_start=1000&_end=2000")));
+        assert_eq!(
+            song_requests(&navi),
+            [
+                "/api/song?_start=0&_end=1000&_sort=created_at&_order=ASC&missing=false",
+                "/api/song?_start=1000&_end=2000&_sort=created_at&_order=ASC&missing=false"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1447,8 +1468,43 @@ mod tests {
             "/api/song",
             &[&format!("[{}]", first.join(",")), &format!("[{last}]")],
         );
+        navi.header("/api/song", "X-Total-Count", "1000");
         let groups = duplicates(&navi.client()).await.unwrap();
         assert!(groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pages_that_hold_fewer_songs_than_navidrome_counts_fail_the_search() {
+        // a1 and a2 were added at one time: the second page repeats a1 in place of a2.
+        let navi = NavidromeStub::start();
+        let mut first: Vec<String> = (0..999)
+            .map(|i| {
+                native_song(
+                    &format!("f{i:04}"),
+                    "Filler",
+                    &format!("Track {i}"),
+                    200.0,
+                    None,
+                )
+            })
+            .collect();
+        let a1 = native_song("a1", "Marrow Choir", "O Holy Night", 263.4, None);
+        first.push(a1.clone());
+        navi.answer(
+            "/api/song",
+            &[&format!("[{}]", first.join(",")), &format!("[{a1}]")],
+        );
+        navi.header("/api/song", "X-Total-Count", "1001");
+        let f = duplicates(&navi.client()).await.unwrap_err();
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::NavidromeUnreachable,
+                Stage::LibraryCheck,
+                RetryAdvice::SameSourceLater,
+                "Navidrome counts 1001 songs, and its pages held 1000: its library changed while it was read. Search again."
+            )
+        );
     }
 
     #[tokio::test]
@@ -1472,6 +1528,7 @@ mod tests {
             native_song("c", "Marrow Choir", "Away in a Manger", 180.0, None),
         ];
         navi.answer("/api/song", &[&format!("[{}]", songs.join(","))]);
+        navi.header("/api/song", "X-Total-Count", "3");
         let groups = duplicates(&navi.client()).await.unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].same_recording, Some(false));
