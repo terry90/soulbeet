@@ -3,12 +3,12 @@
 
 use crate::auth::UserId;
 use crate::core::delete_guard::{
-    Checked, ForgetVia, Guard, NotRemoved, Origin, PreviewedFile, ReplaceSet,
+    previewed_at, Checked, ForgetVia, Guard, NotRemoved, Origin, PreviewedFile, ReplaceSet,
 };
 use crate::core::deletion::replace_consent_expired;
 use crate::core::{logged, stored_time};
 use crate::ledger::{Replacement, ReplacementOutcome};
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::navidrome::DeletionReason;
 use soulbeet::{
     duplicate_note, DuplicateNote, ImportOutcome, ImportResult, ImportedItem, MusicImporter,
@@ -167,6 +167,11 @@ impl Remover<'_> {
     /// `item`, an earlier copy in the target, checked by the guard and, for a replacing job,
     /// against the preview.
     async fn check(&self, item: &ImportedItem) -> Result<Checked, Failure> {
+        // A copy the preview does not hold is kept before the guard's checks, whose rule 4
+        // re-sends a rating to Navidrome; the checked file is held to the preview again after.
+        if let Some(previewed) = self.previewed {
+            previewed_at(&self.target.join(&item.path), previewed).await?;
+        }
         let checked = (self.guard)
             .check_file(self.actor, item, self.target, self.exempt_jobs)
             .await?;
@@ -348,20 +353,37 @@ fn stopped_notes(
         ));
     }
     let (kept, reason) = match stop {
-        NotRemoved::Kept(f) => (&earlier[deleted..], f.message.as_str()),
+        NotRemoved::Kept(f) => (&earlier[deleted..], kept_reason(f)),
         NotRemoved::Unconfirmed(_) => {
             notes.push(duplicate_note(
                 &earlier[deleted..=deleted],
                 target,
                 DuplicateNote::Unconfirmed,
             ));
-            (&earlier[deleted + 1..], AFTER_UNCONFIRMED)
+            (&earlier[deleted + 1..], AFTER_UNCONFIRMED.to_string())
         }
     };
     if !kept.is_empty() {
-        notes.push(duplicate_note(kept, target, DuplicateNote::Blocked(reason)));
+        notes.push(duplicate_note(
+            kept,
+            target,
+            DuplicateNote::Blocked(&reason),
+        ));
     }
     notes
+}
+
+/// Why `f` kept a copy, as its note says it: the message, and for a failed unlink the
+/// filesystem's reason too (delete_failed's cause, an OS error, which names no path).
+fn kept_reason(f: &Failure) -> String {
+    match &f.cause {
+        Some(cause)
+            if f.code == FailureCode::DeleteFailed && cause.service == Service::Filesystem =>
+        {
+            format!("{}: {}", f.message, cause.raw)
+        }
+        _ => f.message.clone(),
+    }
 }
 
 /// Gives each of `items` that is an item of `imported` the path `moved` gives its id, both
@@ -593,7 +615,10 @@ mod tests {
             notes(&done),
             vec![
                 "removed the library's earlier copy A/x.flac".to_string(),
-                "kept the library's earlier copy B/y.flac: Could not delete the file".to_string(),
+                format!(
+                    "kept the library's earlier copy B/y.flac: Could not delete the file: {}",
+                    std::io::Error::from_raw_os_error(13) // EACCES
+                ),
             ]
         );
         assert!(!x.exists() && y.exists());
@@ -963,10 +988,13 @@ mod tests {
         lib.fake.rates("alice", "s2", 1);
         lib.app("g1", "alice", true).await;
         let only_s2 = replace_set(&lib, &["s2"], later()).await;
+        let rated = lib.fake.ratings_set();
         let stub = StubImporter::new();
         let now = chrono::Utc::now().timestamp();
         let result = imported_with(vec![removal("A/x.flac", vec![new_copy(7, 3)])]);
         let s = replace(&lib, &stub, &only_s2, now, result).await;
+        // Kept before the guard's checks: rule 4 re-sent no rating for a copy never previewed.
+        assert_eq!(lib.fake.ratings_set(), rated);
         assert_eq!(
             notes(&s.result),
             vec!["kept the library's earlier copy A/x.flac: This file was not in the preview this deletion was confirmed with".to_string()]

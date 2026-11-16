@@ -369,7 +369,9 @@ async fn learn_one(
     local: &Path,
     at: Learner,
 ) -> Result<bool, String> {
-    match proven_root(song, local).await? {
+    let proven =
+        (proven_root(song, local).await).map_err(|e| format!("{}: {e}", local.display()))?;
+    match proven {
         Some(proven) => store_root(db, song, &proven, at).await,
         None => Ok(false),
     }
@@ -381,8 +383,8 @@ enum FromFolders {
     Learned,
     /// No file proves a root, or more than one does.
     Unproven,
-    /// A file that may be the song's could not be read ("{path}: {error}", the first one), so
-    /// "exactly one proves a root" cannot be shown.
+    /// A file that may be the song's could not be read (the first one's error, without its path,
+    /// which is logged), so "exactly one proves a root" cannot be shown.
     Unreadable(String),
 }
 
@@ -422,7 +424,7 @@ async fn learn_from_folders(
                 {
                     continue
                 }
-                Err(e) => Err(format!("{}: {e}", local.display())),
+                Err(e) => Err(e),
                 Ok(_) => proven_root(song, &local).await,
             };
             match found {
@@ -438,12 +440,13 @@ async fn learn_from_folders(
                 Err(e) => {
                     warn!(
                         "Could not read whether song {} of Navidrome library {} is the file at \
-                         {e}, so the library's root is not learned from {}",
+                         {}: {e}, so the library's root is not learned from {}",
                         song.id,
                         song.library_id,
+                        local.display(),
                         folder.display()
                     );
-                    unreadable.get_or_insert(e);
+                    unreadable.get_or_insert(e.to_string());
                 }
             }
         }
@@ -471,29 +474,26 @@ struct Proven {
 /// root, as local_file_in refuses one). The modification time tells the imported file from
 /// another of its size whose path ends like it (another user's copy of the release, listed
 /// before Navidrome lists the import), which would give a root one level too deep: a copy is
-/// written at another time.
-async fn proven_root(song: &NativeSong, local: &Path) -> Result<Option<Proven>, String> {
+/// written at another time. An error is the filesystem's, for `local` or its root.
+async fn proven_root(song: &NativeSong, local: &Path) -> Result<Option<Proven>, std::io::Error> {
     let Some(relative) = inside(&song.path) else {
         return Ok(None);
     };
     if !local.is_absolute() || !local.ends_with(relative) {
         return Ok(None);
     }
-    let unreadable = |e: std::io::Error| format!("{}: {e}", local.display());
-    let file = tokio::fs::symlink_metadata(local)
-        .await
-        .map_err(unreadable)?;
+    let file = tokio::fs::symlink_metadata(local).await?;
     if !file.is_file() || file.len() != song.size {
         return Ok(None);
     }
-    let modified = file.modified().map_err(unreadable)?;
+    let modified = file.modified()?;
     if chrono::DateTime::<chrono::Utc>::from(modified) != song.updated_at {
         return Ok(None);
     }
     let kept = local.components().count() - relative.components().count();
     let root: PathBuf = local.components().take(kept).collect();
-    let canonical = tokio::fs::canonicalize(local).await.map_err(unreadable)?;
-    let canonical_root = tokio::fs::canonicalize(&root).await.map_err(unreadable)?;
+    let canonical = tokio::fs::canonicalize(local).await?;
+    let canonical_root = tokio::fs::canonicalize(&root).await?;
     if canonical_root.join(relative) != canonical {
         return Ok(None);
     }

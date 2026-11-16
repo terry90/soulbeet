@@ -106,12 +106,35 @@ impl Checked {
     /// identity; not_previewed when no file of `set` has the path, changed_since_check when its
     /// identity differs.
     pub(crate) fn is_in(&self, set: &[PreviewedFile]) -> Result<(), Failure> {
-        match set.iter().find(|f| f.path == self.path) {
-            None => Err(not_previewed()),
-            Some(f) if f.file != self.id => Err(changed_since_check()),
-            Some(_) => Ok(()),
-        }
+        held_by(set, &self.path, self.id)
     }
+}
+
+/// Rule 6 against a preview (D8) for the canonical file `path` whose identity is `id`.
+fn held_by(set: &[PreviewedFile], path: &Path, id: unlink::FileId) -> Result<(), Failure> {
+    match set.iter().find(|f| f.path == path) {
+        None => Err(not_previewed()),
+        Some(f) if f.file != id => Err(changed_since_check()),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Rule 6 against a preview (D8) for the file at `path` as it is now, before any check reads
+/// Navidrome: held_by of its canonical path and identity. A file that cannot be read is
+/// path_unresolved, as check_file says it.
+pub(crate) async fn previewed_at(path: &Path, set: &[PreviewedFile]) -> Result<(), Failure> {
+    let no_file = |e: std::io::Error| {
+        path_unresolved("No file at the path beets reported").with_cause(
+            Service::Filesystem,
+            None,
+            e.to_string(),
+        )
+    };
+    let canonical = tokio::fs::canonicalize(path).await.map_err(no_file)?;
+    let meta = tokio::fs::symlink_metadata(&canonical)
+        .await
+        .map_err(no_file)?;
+    held_by(set, &canonical, unlink::FileId::of(&meta))
 }
 
 /// A file a preview allowed, as a confirmation token stores it (D7): the song, its canonical
@@ -1221,6 +1244,9 @@ mod tests {
         lib.fake.playlist("alice", "Advent", &["s1"], false, false);
         lib.fake
             .playlist("Alice", "Recently added", &["s1"], false, true);
+        // A static one whose owner Navidrome lists as "ALICE" is hers: Navidrome's names do not
+        // differ only in case.
+        lib.fake.playlist("ALICE", "Carols", &["s1"], false, false);
         // Another user's public smart playlist shows in alice's read, but is not hers.
         lib.fake.playlist("bob", "Everything", &["s1"], true, true);
         let checked = library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
@@ -1230,7 +1256,7 @@ mod tests {
                 .iter()
                 .map(|p| p.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Advent", "Recently added"]
+            vec!["Advent", "Carols", "Recently added"]
         );
     }
 
@@ -1578,6 +1604,26 @@ mod tests {
         assert_eq!(
             refusal(lib.guard().check_song(&lib.alice(), "s1").await).0,
             FailureCode::DeleteInUse
+        );
+        // Only the job's own import may delete it, through the set it stored.
+        let stored: Option<String> = sqlx::query_scalar("SELECT options FROM jobs WHERE id = 'j1'")
+            .fetch_one(&lib.db)
+            .await
+            .unwrap();
+        let stored: crate::ledger::JobOptions = serde_json::from_str(&stored.unwrap()).unwrap();
+        let own = lib
+            .guard()
+            .check_file(
+                &lib.alice(),
+                &item_x(),
+                &lib.root.join("music/alice"),
+                &["j1".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            own.is_in(&stored.replace.expect("a replacing job").files),
+            Ok(())
         );
     }
 
@@ -2256,7 +2302,6 @@ mod tests {
             .await;
         let locked = lib.root.join("backup/alice/A");
         std::fs::create_dir_all(&locked).unwrap();
-        let unreadable = std::fs::canonicalize(&locked).unwrap().join("x.flac");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let checked = lib.guard().check_song(&lib.alice(), "s1").await;
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2276,11 +2321,8 @@ mod tests {
             Some(Cause::new(
                 Service::Filesystem,
                 None,
-                format!(
-                    "{}: {}",
-                    unreadable.display(),
-                    std::io::Error::from_raw_os_error(13) // EACCES
-                )
+                // EACCES, without the file's path, which the log has.
+                std::io::Error::from_raw_os_error(13).to_string()
             ))
         );
         assert_eq!(learned_root(&lib).await, None);
@@ -2648,6 +2690,45 @@ mod tests {
         let lib = Library::new().await;
         lib.app_deletions(100, 3_600).await;
         delete_as(&lib, &Origin::Auto).await.unwrap();
+        let lib = Library::new().await;
+        let app = lib.app("g1", "alice", true).await;
+        for origin in ["ui", "auto"] {
+            for _ in 0..100 {
+                sqlx::query(
+                    "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, origin, reason) \
+                     VALUES (?, 'alice', 's', 't', 'a', 'al', ?, 'disliked')",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(origin)
+                .execute(&lib.db)
+                .await
+                .unwrap();
+            }
+        }
+        delete_as(&lib, &app).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_app_whose_host_cannot_be_told_deletes_nothing() {
+        // A registered client's redirect URI that names no host: the audit row could not name
+        // the app, so the database failure keeps the file.
+        let lib = Library::new().await;
+        let app = lib.app("g1", "alice", true).await;
+        sqlx::query("UPDATE oauth_grants SET redirect_uri = 'urn:ietf:wg:oauth:2.0:oob'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        let f = delete_as(&lib, &app).await.unwrap_err();
+        assert_eq!(
+            (f.code, f.stage),
+            (FailureCode::SettingsUnreadable, Stage::Delete)
+        );
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deletion_reviews")
+            .fetch_one(&lib.db)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[tokio::test]

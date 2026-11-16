@@ -527,8 +527,6 @@ mod tests {
         json!({"artist": "Marrow Choir", "title": title})
     }
 
-    /// nginx's 502 page (src/http/ngx_http_special_response.c), which the native client keeps
-
     #[tokio::test]
     async fn a_reference_navidrome_would_drop_is_refused_before_navidrome_is_asked() {
         let navi = NavidromeStub::start();

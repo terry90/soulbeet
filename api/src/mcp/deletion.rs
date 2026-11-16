@@ -1284,6 +1284,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_stored_deletion_time_that_cannot_be_read_offers_no_call_again() {
+        let lib = Library::new().await;
+        sqlx::query(
+            "INSERT INTO deletion_reviews (id, user_id, song_id, title, artist, album, origin, reason, created_at) \
+             VALUES ('d1', 'alice', 's1', 't', 'a', 'al', 'mcp', 'cleanup', 'yesterday')",
+        )
+        .execute(&lib.db)
+        .await
+        .unwrap();
+        let (app, token) = app_on_library(&lib, true).await;
+        let error =
+            &document(&call_tool(app, &token, "get_deletion_history", json!({})).await)["error"];
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["retry"].as_str(),
+                &error["next"]
+            ),
+            (
+                Some("settings_unreadable"),
+                Some("not_retryable"),
+                &json!([])
+            )
+        );
+    }
+
     #[test]
     fn the_descriptions_say_deletion_is_permanent_and_needs_the_users_yes() {
         let preview = (PREVIEW_DELETE_TRACKS.description)(120);

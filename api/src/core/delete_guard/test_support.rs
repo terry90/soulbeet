@@ -387,10 +387,13 @@ impl Listeners for FakeNavidrome {
         })
     }
 
-    /// The playlists holding `id` that are public or `user`'s (owner compared without ASCII case),
-    /// every one for an admin, sorted by name, as GetPlaylists lists them
-    /// (persistence/playlist_repository.go:84-93,238-256). Whether `user` sees the song does not
-    /// matter.
+    /// The playlists holding `id` that are public or `user`'s, every one for an admin, as
+    /// GetPlaylists picks them (persistence/playlist_repository.go:84-93,238-256). Whether `user`
+    /// sees the song does not matter. Two things differ from Navidrome: ownership compares names
+    /// without ASCII case where Navidrome compares owner_id (the same answer, since Navidrome
+    /// refuses names that differ only in case, persistence/user_repository.go:342), and the list
+    /// is sorted by byte order where Navidrome sorts naturally by name, so no test relies on the
+    /// order.
     async fn song_playlists(
         &self,
         user: &UserId,
@@ -409,11 +412,10 @@ impl Listeners for FakeNavidrome {
                     songs.iter().any(|song| song == id)
                         && (admin || *public || owner.eq_ignore_ascii_case(&user))
                 })
-                .map(|(owner, name, songs, public, smart)| NativePlaylist {
+                .map(|(owner, name, songs, _, smart)| NativePlaylist {
                     id: name.clone(),
                     name: name.clone(),
                     owner_name: owner.clone(),
-                    public: *public,
                     sync: false,
                     song_count: songs.len() as u32,
                     rules: smart.then(|| serde_json::from_str(SMART_RULES).unwrap()),

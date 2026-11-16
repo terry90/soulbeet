@@ -365,7 +365,7 @@ impl Guard<'_> {
         }
         Ok(playlists
             .into_iter()
-            .filter(|p| p.owner_name.eq_ignore_ascii_case(actor_name))
+            .filter(|p| owned_by(p, actor_name))
             .collect())
     }
 
@@ -498,7 +498,14 @@ impl Guard<'_> {
 fn kept_in_playlist(playlists: &[NativePlaylist], actor_name: &str) -> bool {
     playlists
         .iter()
-        .any(|p| !p.is_smart() && !p.owner_name.eq_ignore_ascii_case(actor_name))
+        .any(|p| !p.is_smart() && !owned_by(p, actor_name))
+}
+
+/// D3's ownership: `playlist`'s owner is the user named `name`, compared without regard to ASCII
+/// case as Navidrome's login compares them (persistence/user_repository.go:203), which also
+/// refuses two names that differ only so (:342).
+fn owned_by(playlist: &NativePlaylist, name: &str) -> bool {
+    playlist.owner_name.eq_ignore_ascii_case(name)
 }
 
 /// Why Soulful cannot show that no Navidrome user it cannot read rated a track.
