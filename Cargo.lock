@@ -4216,6 +4216,7 @@ dependencies = [
 name = "shared"
 version = "0.8.0"
 dependencies = [
+ "percent-encoding",
  "serde",
  "serde_json",
 ]
@@ -5433,7 +5434,6 @@ dependencies = [
  "shared",
  "tower-cookies",
  "ui",
- "url",
  "web-sys",
 ]
 

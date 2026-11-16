@@ -16,8 +16,8 @@ use ui::{
     SettingsProvider,
 };
 use views::{
-    leave_login, DashboardPage, LoginPage, SearchPage, SettingsPage, SettingsTab,
-    SettingsTabRequest,
+    leave_login, DashboardPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage, SettingsPage,
+    SettingsTab, SettingsTabRequest,
 };
 
 mod auth;
@@ -31,6 +31,8 @@ pub enum Route {
     #[layout(AuthGuard)]
         #[route("/login")]
         LoginPage {},
+        #[route("/login/return?:..return_to")]
+        LoginReturnPage { return_to: ReturnTo },
 
         #[layout(WebNavbar)]
             #[route("/")]
@@ -116,18 +118,15 @@ fn AuthGuard() -> Element {
     let nav = use_navigator();
     let current = use_route::<Route>();
 
-    use_effect(move || {
-        let is_logged_in = auth.is_logged_in();
-
-        // If not logged in AND we're not already on /login -> go to login
-        if !is_logged_in && !matches!(current, Route::LoginPage {}) {
+    use_effect(move || match (auth.is_logged_in(), &current) {
+        (false, Route::LoginPage {} | Route::LoginReturnPage { .. }) => {}
+        (false, _) => {
             nav.replace(Route::LoginPage {});
         }
-
-        // If logged in and on /login -> back to where sign-in was asked for
-        if is_logged_in && matches!(current, Route::LoginPage {}) {
-            leave_login(nav);
-        }
+        (true, Route::LoginPage {}) => leave_login(nav, None),
+        // Back to the request that asked for sign-in
+        (true, Route::LoginReturnPage { return_to }) => leave_login(nav, return_to.accepted()),
+        (true, _) => {}
     });
 
     rsx! {
@@ -464,5 +463,49 @@ fn NavidromeBanner() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SENT: &str =
+        "/login/return?return_to=%2Foauth%2Fauthorize%3Fclient_id%3Ddcr_e2e%26state%3Da%2526b";
+    const BACK: &str = "/oauth/authorize?client_id=dcr_e2e&state=a%26b";
+
+    fn return_to_of(route: &Route) -> Option<&str> {
+        match route {
+            Route::LoginReturnPage { return_to } => return_to.accepted(),
+            other => panic!("not the login return page: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_login_return_route_carries_the_request_exactly() {
+        let route: Route = SENT.parse().unwrap();
+        assert_eq!(return_to_of(&route), Some(BACK));
+        // The router replaces the address with this when it differs, so it
+        // must keep the request as sent.
+        assert_eq!(route.to_string(), SENT);
+        assert_eq!(
+            route.to_string(),
+            shared::oauth::login_return_location(BACK)
+        );
+    }
+
+    #[test]
+    fn a_request_off_the_authorize_path_is_carried_but_refused() {
+        let sent = shared::oauth::login_return_location("//evil.example/oauth/authorize");
+        let route: Route = sent.parse().unwrap();
+        assert_eq!(return_to_of(&route), None);
+        assert_eq!(route.to_string(), sent);
+    }
+
+    #[test]
+    fn the_plain_login_route_keeps_its_bare_address() {
+        let route: Route = "/login".parse().unwrap();
+        assert_eq!(route, Route::LoginPage {});
+        assert_eq!(route.to_string(), "/login");
     }
 }

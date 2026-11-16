@@ -23,7 +23,7 @@ async fn serve(state: ConnectionState) -> (String, tokio::task::JoinHandle<()>) 
     (format!("http://{addr}"), server)
 }
 
-/// The `return_to` of a 303 to `/login?return_to=..`.
+/// The `return_to` of a 303 to `/login/return?return_to=..`.
 fn return_to_of(location: &str) -> String {
     Url::parse(&format!("http://127.0.0.1{location}"))
         .unwrap()

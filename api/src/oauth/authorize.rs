@@ -15,7 +15,7 @@ use axum::http::header::RETRY_AFTER;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Extension;
-use shared::oauth::AUTHORIZE_PATH;
+use shared::oauth::{login_return_location, AUTHORIZE_PATH};
 use tower_cookies::Cookies;
 use url::Url;
 
@@ -118,8 +118,7 @@ pub(crate) async fn show(
                 Some(query) => format!("{AUTHORIZE_PATH}?{query}"),
                 None => AUTHORIZE_PATH.to_string(),
             };
-            let back: String = url::form_urlencoded::byte_serialize(back.as_bytes()).collect();
-            return Redirect::to(&format!("/login?return_to={back}")).into_response();
+            return Redirect::to(&login_return_location(&back)).into_response();
         }
     };
     let Some(client_id) = params.get("client_id") else {
@@ -461,7 +460,10 @@ mod tests {
         let (status, headers, _) = get(app, &format!("/oauth/authorize?{}", query()), None).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         let location = headers["location"].to_str().unwrap();
-        assert!(location.starts_with("/login?return_to="), "{location}");
+        assert!(
+            location.starts_with("/login/return?return_to="),
+            "{location}"
+        );
         let back = Url::parse(&format!("https://music.example.com{location}"))
             .unwrap()
             .query_pairs()
@@ -1144,7 +1146,7 @@ mod tests {
         assert!(headers["location"]
             .to_str()
             .unwrap()
-            .starts_with("/login?return_to="));
+            .starts_with("/login/return?return_to="));
         assert_eq!(docs.calls(), 0);
     }
 
