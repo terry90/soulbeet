@@ -88,6 +88,10 @@ interface TransferRecord {
   /** ghost transfers are accepted but never show up in listings */
   hidden: boolean;
   removed: boolean;
+  /** id of the batch enqueue that made it (Transfer.BatchId, slskd 0.26) */
+  batchId: string;
+  /** what the last position request answered (Transfer.PlaceInQueue), null until asked */
+  placeInQueue: number | null;
   plan: TransferStep[];
   /** number of plan steps already applied */
   applied: number;
@@ -554,6 +558,8 @@ export class SlskdState {
         destination,
         hidden: behavior === 'ghost',
         removed: false,
+        batchId: id,
+        placeInQueue: null,
         plan: plan.map((step) => ({ ...step })),
         applied: 1,
         delivered: false,
@@ -718,7 +724,7 @@ export class SlskdState {
     const averageSpeed = transfer.state === 'InProgress' ? 250000 : 0;
     // slskd 0.26 wire shape: no startOffset (property dropped) and no
     // stateDescription ([JsonIgnore] upstream), null fields omitted
-    // entirely (WhenWritingNull), removed and attempts serialized.
+    // entirely (WhenWritingNull), removed, attempts and batchId serialized.
     // elapsedTime appears once startedAt is set, remainingTime once
     // averageSpeed is non-zero (computed properties on slskd's Transfer).
     const json: Record<string, unknown> = {
@@ -735,7 +741,11 @@ export class SlskdState {
       percentComplete: transfer.percentComplete,
       attempts: transfer.attempts,
       removed: transfer.removed,
+      batchId: transfer.batchId,
     };
+    if (transfer.placeInQueue !== null) {
+      json.placeInQueue = transfer.placeInQueue;
+    }
     if (transfer.enqueuedAtMs) {
       json.enqueuedAt = new Date(transfer.enqueuedAtMs).toISOString();
     }
@@ -762,6 +772,34 @@ export class SlskdState {
   downloadJson(id: string): Record<string, unknown> | null {
     const transfer = this.transfers.find((t) => t.id === id && !t.hidden);
     return transfer ? this.transferJson(transfer) : null;
+  }
+
+  /**
+   * GET /api/v0/transfers/downloads/{username}/{id}/position
+   * (TransfersController.cs:584-617, DownloadService.cs:711-729): slskd asks
+   * the peer and stores the answer on the record. A transfer queued at the
+   * peer gets its 1-based place among that peer's transfers queued there; an
+   * id slskd never listed is a 404; any other transfer is Soulseek.NET's
+   * TransferNotFoundException (SoulseekClient.cs:1643-1646), which slskd
+   * answers as 500.
+   */
+  placeInQueue(id: string): Reply {
+    const transfer = this.transfers.find((t) => t.id === id && !t.hidden);
+    if (!transfer) {
+      return { status: 404, body: null };
+    }
+    if (transfer.state !== 'Queued, Remotely') {
+      return {
+        status: 500,
+        body: `A download of ${transfer.filename} from user ${transfer.username} is not active`,
+      };
+    }
+    const place =
+      this.transfers
+        .filter((t) => t.username === transfer.username && t.state === 'Queued, Remotely')
+        .indexOf(transfer) + 1;
+    transfer.placeInQueue = place;
+    return { status: 200, body: place };
   }
 
   /** GET /api/v0/transfers/downloads shape: user -> directories -> files. */
@@ -811,6 +849,19 @@ export class SlskdState {
         files: files.map((t) => this.transferJson(t)),
       })),
     };
+  }
+
+  /**
+   * GET /api/v0/users/{username}/status (UsersController.cs:253-278): an
+   * offline peer, and a user the dataset does not know, read Offline.
+   */
+  userStatusJson(username: string): Record<string, unknown> {
+    const behavior = this.behaviorOf(username);
+    const offline =
+      !peers.some((p) => p.username === username) ||
+      behavior === 'offline' ||
+      behavior === 'enqueueoffline';
+    return { isPrivileged: false, presence: offline ? 'Offline' : 'Online' };
   }
 
   /** Debug/control snapshot for specs. */

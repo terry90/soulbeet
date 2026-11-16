@@ -186,6 +186,32 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
           sendEmpty(res, 204);
         },
       },
+      {
+        method: 'GET',
+        pattern: '/api/v0/transfers/downloads/:username/:id/position',
+        handler: ({ res, params }) => {
+          const id = parseGuid(params.id as string);
+          if (id === null) {
+            sendEmpty(res, 400);
+            return;
+          }
+          const result = state.placeInQueue(id);
+          if (result.status === 404) {
+            sendEmpty(res, 404);
+            return;
+          }
+          // [Produces("application/json")] writes the 500's text as a JSON string.
+          sendJson(res, result.status, result.body);
+        },
+      },
+
+      // ---- users ----------------------------------------------------------
+      {
+        method: 'GET',
+        pattern: '/api/v0/users/:username/status',
+        handler: ({ res, params }) =>
+          sendJson(res, 200, state.userStatusJson(params.username as string)),
+      },
 
       // ---- control API (specs only, not part of slskd) --------------------
       {
