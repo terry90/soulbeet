@@ -2,13 +2,14 @@
 //! failure, its kind and its untried candidates, by the predicate the job tools refuse with.
 
 use serde_json::{json, Value};
-use shared::failure::{Failure, RetryAdvice, Stage};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 
 use super::contract::NextCall;
 use super::facts::candidate_document;
+use crate::core::deletion::SONGS_PER_TOKEN;
 use crate::core::jobs::decide::kept_imports;
-use crate::core::jobs::{allowed, job_failure, JobView, RetryMode, Untried};
-use crate::ledger::{BatchOrigin, JobState, Transition};
+use crate::core::jobs::{allowed, job_failure, slot_failure, JobView, RetryMode, Untried};
+use crate::ledger::{BatchOrigin, JobState, SlotResult, Transition};
 
 /// How many untried candidates a job waiting for a source choice offers as download_source calls.
 const CHOICES_OFFERED: usize = 3;
@@ -21,8 +22,15 @@ const CHOICES_OFFERED: usize = 3;
 /// once they acted). A job waiting for an import decision: get_import_choices and resolve_import's
 /// retry for each import it keeps, naming its slot when it keeps several. dismiss_job and
 /// cancel_job where those transitions apply. A web UI job is offered only the wait, the import
-/// decision and dismiss_job: its own pipeline runs it.
-pub(crate) fn next_calls(view: &JobView, untried: &Untried) -> Vec<NextCall> {
+/// decision and dismiss_job: its own pipeline runs it. With `deletion_enabled` (D14) the retry
+/// entries are followed by a preview, never a deletion, of what the job left behind: for a slot
+/// failed with result_rejected, the songs its result lists (the wrong copy); for a done slot, the
+/// copies a replacing import did not replace.
+pub(crate) fn next_calls(
+    view: &JobView,
+    untried: &Untried,
+    deletion_enabled: bool,
+) -> Vec<NextCall> {
     use JobState::*;
     let job = &view.job;
     let id = &job.id;
@@ -82,6 +90,9 @@ pub(crate) fn next_calls(view: &JobView, untried: &Untried) -> Vec<NextCall> {
             }
         }
     }
+    if deletion_enabled {
+        next.extend(leftover_previews(view));
+    }
     let job_call = |tool| NextCall::new(tool, json!({"job_id": id}));
     if Transition::Dismiss.allowed_from().contains(&job.state) {
         next.push(job_call("dismiss_job"));
@@ -90,6 +101,38 @@ pub(crate) fn next_calls(view: &JobView, untried: &Untried) -> Vec<NextCall> {
         next.push(job_call("cancel_job"));
     }
     next
+}
+
+/// preview_delete_tracks, reason replaced, for each slot's leftovers (D14), at most
+/// SONGS_PER_TOKEN songs a call.
+fn leftover_previews(view: &JobView) -> Vec<NextCall> {
+    let mut previews = Vec::new();
+    for slot in &view.slots {
+        let rejected = slot.state == JobState::Failed
+            && slot_failure(slot).is_some_and(|f| f.code == FailureCode::ResultRejected);
+        let songs: Vec<&str> = match (&slot.result, slot.state) {
+            (
+                Some(SlotResult::Imported {
+                    listed: Some(listed),
+                    ..
+                }),
+                _,
+            ) if rejected => listed.iter().map(|s| s.song_id.as_str()).collect(),
+            (Some(SlotResult::Imported { not_replaced, .. }), JobState::Done) => {
+                not_replaced.iter().map(String::as_str).collect()
+            }
+            _ => continue,
+        };
+        if songs.is_empty() {
+            continue;
+        }
+        let songs = &songs[..songs.len().min(SONGS_PER_TOKEN)];
+        previews.push(NextCall::new(
+            "preview_delete_tracks",
+            json!({"song_ids": songs, "reason": "replaced"}),
+        ));
+    }
+    previews
 }
 
 /// retry_job in `mode` for the job, with its deciding facts: same_source the wait its failure
@@ -128,11 +171,12 @@ fn retry_call(
 mod tests {
     use super::*;
     use crate::auth::UserId;
+    use crate::core::jobs::retry::retry;
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
         cancelled_track_job, choosing_track_job, done_track_job, downloading_track_job,
         exhausted_track_job, failed_track_job, failed_track_job_with, failed_web_ui_job,
-        index_failed_track_job, queued_track_jobs, view_of,
+        index_failed_track_job, queued_track_jobs, settle_done, view_of,
     };
     use crate::core::jobs::untried;
     use crate::ledger::{store, Transitioned};
@@ -159,7 +203,7 @@ mod tests {
         let (acq, _) = Acquire::for_alice().await;
         let job = downloading_track_job(&acq).await;
         let (view, untried) = read(&acq, &job).await;
-        let next = next_calls(&view, &untried);
+        let next = next_calls(&view, &untried, false);
         assert_eq!(
             serde_json::to_value(&next).unwrap(),
             json!([{"tool": "get_jobs",
@@ -202,7 +246,7 @@ mod tests {
         let mut offered = Vec::new();
         for (name, job) in &fixtures {
             let (view, untried) = read(&acq, job).await;
-            let next = modes(&next_calls(&view, &untried));
+            let next = modes(&next_calls(&view, &untried, false));
             let accepted: Vec<String> = (RetryMode::ALL.into_iter())
                 .filter(|m| allowed(&view, &untried, *m))
                 .map(|m| m.as_str().to_string())
@@ -255,7 +299,7 @@ mod tests {
         let job = failed_web_ui_job(&acq).await;
         let (view, untried) = read(&acq, &job).await;
         assert_eq!(
-            serde_json::to_value(next_calls(&view, &untried)).unwrap(),
+            serde_json::to_value(next_calls(&view, &untried, false)).unwrap(),
             json!([{"tool": "dismiss_job", "args": {"job_id": job}}])
         );
     }
@@ -278,7 +322,7 @@ mod tests {
         let (acq, _) = Acquire::for_alice().await;
         let job = busy_job(&acq).await;
         let (view, untried) = read(&acq, &job).await;
-        let next = next_calls(&view, &untried);
+        let next = next_calls(&view, &untried, false);
         let same = next
             .iter()
             .find(|n| n.tool == "retry_job" && n.args["mode"] == "same_source")
@@ -303,7 +347,8 @@ mod tests {
         let job = downloading_track_job(&acq).await;
         let mut view = view_of(&acq, &job).await;
         let waits = |view: &JobView| {
-            (next_calls(view, &Untried::default()).iter()).any(|call| call.tool == "get_jobs")
+            (next_calls(view, &Untried::default(), false).iter())
+                .any(|call| call.tool == "get_jobs")
         };
         assert!(waits(&view));
         // Its failure could not be written: nothing changes it before the next start.
@@ -316,7 +361,8 @@ mod tests {
         let (acq, _) = Acquire::for_alice().await;
         let job = queued_track_jobs(&acq, 1).await.remove(0);
         let waits = |view: &JobView| {
-            (next_calls(view, &Untried::default()).iter()).any(|call| call.tool == "get_jobs")
+            (next_calls(view, &Untried::default(), false).iter())
+                .any(|call| call.tool == "get_jobs")
         };
         acq.ledger.strand(&job);
         assert!(!waits(&view_of(&acq, &job).await));
@@ -336,5 +382,81 @@ mod tests {
         let view = view_of(&acq, &job).await;
         assert_eq!((view.job.state, view.stranded), (JobState::Queued, false));
         assert!(waits(&view));
+    }
+
+    fn preview_of(songs: &[&str]) -> NextCall {
+        NextCall::new(
+            "preview_delete_tracks",
+            json!({"song_ids": songs, "reason": "replaced"}),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_rejected_result_offers_its_files_deletion_only_when_the_app_may_delete() {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = downloading_track_job(&acq).await;
+        settle_done(&acq, &job, "s1").await;
+        let ctx = crate::core::test_ctx("alice");
+        retry(&acq, &ctx, &job, RetryMode::RejectResult, None)
+            .await
+            .unwrap();
+        let (view, untried) = read(&acq, &job).await;
+        assert_eq!(view.job.state, JobState::Failed);
+        let offer = preview_of(&["s1"]);
+        assert!(next_calls(&view, &untried, true).contains(&offer));
+        assert!(!next_calls(&view, &untried, false).contains(&offer));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_result_that_lists_no_song_offers_no_deletion() {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = done_track_job(&acq).await;
+        let ctx = crate::core::test_ctx("alice");
+        retry(&acq, &ctx, &job, RetryMode::RejectResult, None)
+            .await
+            .unwrap();
+        let (view, untried) = read(&acq, &job).await;
+        let next = next_calls(&view, &untried, true);
+        assert!(
+            next.iter().all(|c| c.tool != "preview_delete_tracks"),
+            "{next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_done_job_offers_the_copies_it_did_not_replace() {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = done_track_job(&acq).await;
+        let mut view = view_of(&acq, &job).await;
+        let Some(SlotResult::Imported { not_replaced, .. }) = view.slots[0].result.as_mut() else {
+            panic!("{:?}", view.slots[0].result)
+        };
+        *not_replaced = vec!["s2".into()];
+        let untried = untried(&acq.db, &view, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let offer = preview_of(&["s2"]);
+        assert!(next_calls(&view, &untried, true).contains(&offer));
+        assert!(!next_calls(&view, &untried, false).contains(&offer));
+    }
+
+    #[tokio::test]
+    async fn a_preview_offer_names_at_most_one_tokens_songs() {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = done_track_job(&acq).await;
+        let mut view = view_of(&acq, &job).await;
+        let Some(SlotResult::Imported { not_replaced, .. }) = view.slots[0].result.as_mut() else {
+            panic!("{:?}", view.slots[0].result)
+        };
+        *not_replaced = (0..SONGS_PER_TOKEN + 5).map(|i| format!("s{i}")).collect();
+        let next = next_calls(&view, &Untried::default(), true);
+        let offered = next
+            .iter()
+            .find(|c| c.tool == "preview_delete_tracks")
+            .unwrap();
+        assert_eq!(
+            offered.args["song_ids"].as_array().unwrap().len(),
+            SONGS_PER_TOKEN
+        );
     }
 }

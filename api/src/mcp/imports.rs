@@ -82,7 +82,12 @@ fn offered(e: ToolError, again: Option<NextCall>) -> ToolError {
 
 /// `refused` as `tool`'s error: its failure and facts (`changed` when it changed the job), with
 /// the job's state and the calls it takes as read after it, but `refused.refused_tool`'s.
-async fn refusal_error(acquire: &Acquire, tool: &'static str, refused: Refused) -> ToolError {
+async fn refusal_error(
+    acquire: &Acquire,
+    tool: &'static str,
+    refused: Refused,
+    deletion_enabled: bool,
+) -> ToolError {
     let (failure, mut facts) = match refused.why {
         Why::Failed(failure, facts) => (failure, facts),
         Why::Slot { expected } => {
@@ -99,7 +104,7 @@ async fn refusal_error(acquire: &Acquire, tool: &'static str, refused: Refused) 
         let now = chrono::Utc::now().timestamp();
         match untried(&acquire.db, view, now).await {
             Ok(untried) => {
-                next = (next_calls(view, &untried).into_iter())
+                next = (next_calls(view, &untried, deletion_enabled).into_iter())
                     .filter(|call| Some(call.tool) != refused.refused_tool)
                     .collect();
             }
@@ -138,7 +143,7 @@ pub(crate) async fn get_import_choices(
     match import_choices(&state.acquire, &caller.ctx, &job_id, slot).await {
         Ok(choices) => success(choices_document(choices)),
         Err(refused) => {
-            let error = refusal_error(&state.acquire, TOOL, refused).await;
+            let error = refusal_error(&state.acquire, TOOL, refused, caller.allow_delete).await;
             failed(offered(error, args.same_call()))
         }
     }
@@ -303,7 +308,13 @@ pub(crate) async fn resolve_import(
             }
             Err(refused) => {
                 let changed = refused.changed;
-                let error = refusal_error(&on.acquire, "resolve_import", refused).await;
+                let error = refusal_error(
+                    &on.acquire,
+                    "resolve_import",
+                    refused,
+                    on.caller.allow_delete,
+                )
+                .await;
                 match changed {
                     true => Keyed::Kept(failed(error)),
                     false => Keyed::Released(failed(offered(error, again))),

@@ -338,7 +338,7 @@ pub(crate) fn job_document(
     let job = &view.job;
     // The search's query holds an album's tracklist.
     let wanted = view.search.as_ref().map_or(&job.wanted, |s| &s.query);
-    let next = next_calls(view, untried);
+    let next = next_calls(view, untried, deletion_enabled);
     let mut doc = Map::new();
     doc.insert("job_id".into(), json!(job.id));
     doc.insert("batch_id".into(), json!(job.batch_id));

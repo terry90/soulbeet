@@ -684,7 +684,7 @@ impl JobTool {
             match self.read(job).await {
                 Ok(Some((view, untried))) => {
                     facts.insert("state".into(), json!(view.job.state.as_str()));
-                    next.extend(next_calls(&view, &untried));
+                    next.extend(next_calls(&view, &untried, self.caller.allow_delete));
                 }
                 Ok(None) => {}
                 Err(f) => warn!(
