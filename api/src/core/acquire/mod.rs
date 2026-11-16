@@ -69,6 +69,7 @@ pub(super) fn request_stopped(e: &tokio::task::JoinError) -> Failure {
 /// into `batch_folder(label, batch_id)` and imports into `target` in
 /// `import_mode`, treating what the library has by `duplicates`; the
 /// request's user owns it.
+#[derive(Clone)]
 pub struct NewBatch {
     pub batch_id: String,
     pub label: String,
@@ -115,6 +116,7 @@ impl NewBatch {
 
 /// What one job asks the backend for: its files by slot, and other sources
 /// for them.
+#[derive(Clone)]
 pub struct Acquisition {
     pub job: String,
     pub items: Vec<(u32, DownloadableItem)>,
@@ -125,12 +127,12 @@ pub struct Acquisition {
 }
 
 /// `items` as the slots 0..n of a job.
-pub(super) fn numbered(items: Vec<DownloadableItem>) -> Vec<(u32, DownloadableItem)> {
+pub(crate) fn numbered(items: Vec<DownloadableItem>) -> Vec<(u32, DownloadableItem)> {
     (0..).zip(items).collect()
 }
 
 /// Creates `folder`'s directory, and returns its path as the import target.
-pub(super) async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> {
+pub(crate) async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> {
     let target = PathBuf::from(&folder.path);
     tokio::fs::create_dir_all(&target)
         .await

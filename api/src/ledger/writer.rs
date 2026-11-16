@@ -23,11 +23,12 @@ use tracing::warn;
 
 pub(super) type Reply<T> = oneshot::Sender<Result<T, LedgerError>>;
 
-/// What the writer reads its writes from, sends its change numbers on and keeps the live rows
-/// in.
+/// What the writer reads its writes from, sends its change numbers and freed places on and keeps
+/// the live rows in.
 pub(super) struct Inbox {
     pub(super) writes: mpsc::UnboundedReceiver<Write>,
     pub(super) changed: watch::Sender<i64>,
+    pub(super) freed: watch::Sender<u64>,
     pub(super) live: LiveRows,
 }
 
@@ -121,6 +122,7 @@ pub(super) fn spawn(db: SqlitePool, inbox: Inbox, registry: &'static TransferReg
     let Inbox {
         mut writes,
         changed,
+        freed,
         live,
     } = inbox;
     tokio::spawn(async move {
@@ -137,6 +139,7 @@ pub(super) fn spawn(db: SqlitePool, inbox: Inbox, registry: &'static TransferReg
             stored: HashMap::new(),
             registry,
             changed,
+            freed,
             seq,
             pending: Pending::default(),
             live,
@@ -184,6 +187,8 @@ struct Pending {
     /// Its change number, taken by its first change of a job.
     seq: Option<i64>,
     marks: Vec<Mark>,
+    /// Whether it gave up a download place (D8).
+    freed_place: bool,
     /// Each slot it may move, in the order first touched, with the timeline entry its state
     /// gave before. An event's write appends the entries of those that moved; a transition
     /// appends its own.
@@ -282,6 +287,8 @@ struct Writer {
     stored: HashMap<JobSlot, RowKey>,
     registry: &'static TransferRegistry,
     changed: watch::Sender<i64>,
+    /// Counts the writes that gave up a download place.
+    freed: watch::Sender<u64>,
     /// The change number of the last write that changed a job.
     seq: i64,
     pending: Pending,
@@ -387,10 +394,15 @@ impl Writer {
         answer(reply, what, result);
     }
 
-    /// After a write: when it committed, sets and drops its cancel marks and sends its change
-    /// number; otherwise forgets both.
+    /// After a write: when it committed, sets and drops its cancel marks, sends its change
+    /// number and counts the place it freed; otherwise forgets them.
     fn settle(&mut self, committed: bool) {
-        let Pending { seq, marks, .. } = std::mem::take(&mut self.pending);
+        let Pending {
+            seq,
+            marks,
+            freed_place,
+            ..
+        } = std::mem::take(&mut self.pending);
         if !committed {
             return;
         }
@@ -403,6 +415,9 @@ impl Writer {
         if let Some(seq) = seq {
             self.seq = seq;
             self.changed.send_replace(seq);
+        }
+        if freed_place {
+            self.freed.send_modify(|count| *count += 1);
         }
     }
 
@@ -642,8 +657,19 @@ impl Writer {
                     jobs.insert(slot.job.clone());
                 }
             }
-            JobEvent::Ended { job, state } => {
+            JobEvent::Ended {
+                job,
+                state,
+                failure,
+            } => {
                 self.end_slots(&mut tx, &job, state).await?;
+                if let Some(failure) = failure {
+                    sqlx::query("UPDATE jobs SET failure = ? WHERE id = ?")
+                        .bind(serde_json::to_string(&failure)?)
+                        .bind(&job)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 self.set_job(&mut tx, &job, state).await?;
             }
         }
@@ -946,16 +972,22 @@ impl Writer {
     ) -> Result<i64, LedgerError> {
         let seq = self.next_seq();
         let state = state.map(JobState::as_str);
+        let freed = sqlx::query(
+            "UPDATE jobs SET gate_held = 0 \
+             WHERE id = ? AND gate_held = 1 AND COALESCE(?, state) NOT IN ('queued', 'downloading')",
+        )
+        .bind(job)
+        .bind(state)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        self.pending.freed_place |= freed > 0;
         sqlx::query(
-            "UPDATE jobs SET state = COALESCE(?, state), changed_seq = ?, updated_at = ?, \
-             gate_held = CASE WHEN COALESCE(?, state) IN ('queued', 'downloading') \
-                         THEN gate_held ELSE 0 END \
-             WHERE id = ?",
+            "UPDATE jobs SET state = COALESCE(?, state), changed_seq = ?, updated_at = ? WHERE id = ?",
         )
         .bind(state)
         .bind(seq)
         .bind(at)
-        .bind(state)
         .bind(job)
         .execute(&mut *tx)
         .await?;
@@ -1165,6 +1197,14 @@ impl Writer {
             Transition::AwaitChoice => {
                 let to = JobState::NeedsSourceChoice;
                 (to, vec![Entry::at(to, "waiting_for_source_choice")])
+            }
+            Transition::SearchAgain { search_id } => {
+                sqlx::query("UPDATE jobs SET search_id = ? WHERE id = ?")
+                    .bind(search_id)
+                    .bind(job)
+                    .execute(&mut *tx)
+                    .await?;
+                (from, vec![Entry::at(from, "searching_again")])
             }
             Transition::Fail { .. } if cancel_requested => {
                 // Its user cancelled it before it could fail.

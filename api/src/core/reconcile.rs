@@ -11,12 +11,16 @@ use crate::core::acquire::{
     alternates_from, enqueue_and_watch, fail_job, manual_batch_label, run_search, spawn_monitor,
     Acquisition, AutoRun, NewBatch, RequestBatch,
 };
+use crate::core::jobs::runner::{spawn_drive, ACQUIRE};
 use crate::core::metadata::lastfm_key;
+use crate::core::sources::{server_restarted_search, view, RECENT_FAILURES_SECS};
 use crate::core::{backend_unavailable, database_failure, sources};
 use crate::globals::{get_or_create_user_channel, send_user_event};
 use crate::import_queue::{ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::ledger::store::{self, SlotRecord, StoredSearch, Unfinished, UnfinishedJob};
-use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger, NewSearch, StoredImport, LEDGER};
+use crate::ledger::{
+    BatchOrigin, DuplicateRule, JobEvent, JobState, Ledger, NewSearch, StoredImport, LEDGER,
+};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{already_running, held_failure, transfer_key};
 use crate::server_fns::download::failover::{alternates_for, SourcePool, MAX_SOURCES_PER_TRACK};
@@ -61,11 +65,23 @@ pub(crate) fn import_lost() -> Failure {
     )
 }
 
+/// The candidate `record`'s current pick started at: the attempts before it are an earlier
+/// pick's.
+fn current_pick(record: &SlotRecord) -> Option<&DownloadableItem> {
+    let first = record.pick_n.saturating_sub(1) as usize;
+    record.attempts.get(first)?.as_ref()
+}
+
+/// The sources each slot of `job` may use: its own for an MCP job (D7), the web UI's otherwise.
+fn max_sources(job: &UnfinishedJob) -> usize {
+    (job.options.as_ref()).map_or(MAX_SOURCES_PER_TRACK, |o| o.max_sources as usize)
+}
+
 /// The row `slot` shows, its `job` set: its last one, or before it had one a
-/// queued row of its first source.
+/// queued row of its current pick.
 fn shown_row(slot: &JobSlot, record: &SlotRecord) -> Option<DownloadProgress> {
     let row = record.row.clone().or_else(|| {
-        let item = record.attempts.first()?.as_ref()?;
+        let item = current_pick(record)?;
         Some(DownloadProgress::queued(
             item.id.clone(),
             item.source.clone(),
@@ -284,6 +300,8 @@ pub(crate) trait Resume: Send + Sync {
     );
     /// Runs the auto-download pipeline of `run`'s job.
     async fn search(&self, ctx: UserCtx, folder: Folder, query: DownloadQuery, run: AutoRun);
+    /// Takes `ctx`'s MCP job `job` on with the job runner.
+    async fn drive(&self, ctx: &UserCtx, job: String);
 }
 
 /// The server's: the default backend, real monitors, enqueues and searches.
@@ -344,6 +362,10 @@ impl Resume for Live {
             Err(failure) => fail_job(&LEDGER, &ctx, &run, failure).await,
         }
     }
+
+    async fn drive(&self, ctx: &UserCtx, job: String) {
+        spawn_drive(ACQUIRE.clone(), ctx.clone(), job);
+    }
 }
 
 /// Shows `rows` (each with its slot) to `user` and records them Failed.
@@ -399,24 +421,32 @@ struct Downloads {
 }
 
 impl Downloads {
-    /// Adds `slot`, its pool entry being the alternates of its first source
-    /// among `candidates` it has not tried, and the sources it used.
-    fn add(&mut self, slot: JobSlot, record: SlotRecord, candidates: &[DownloadableGroup]) {
+    /// Adds `slot`, its pool entry being the alternates of its current pick
+    /// among `candidates` it has not tried, the sources that pick used, and
+    /// the `max_sources` it may use.
+    fn add(
+        &mut self,
+        slot: JobSlot,
+        record: SlotRecord,
+        candidates: &[DownloadableGroup],
+        max_sources: usize,
+    ) {
         let tried: Vec<DownloadableItem> = record.attempts.iter().flatten().cloned().collect();
-        let alternates = match record.attempts.first() {
-            Some(Some(first)) => alternates_for(first, &alternates_from(candidates, &tried)),
-            _ => Vec::new(),
+        let alternates = match current_pick(&record) {
+            Some(first) => alternates_for(first, &alternates_from(candidates, &tried)),
+            None => Vec::new(),
         };
-        self.pools.insert(
-            slot.clone(),
-            (alternates, record.attempts.len(), MAX_SOURCES_PER_TRACK),
-        );
+        let earlier = record.pick_n.saturating_sub(1) as usize;
+        let used = record.attempts.len().saturating_sub(earlier);
+        self.pools
+            .insert(slot.clone(), (alternates, used, max_sources));
         self.slots.push((slot, record));
     }
 }
 
 /// The monitor batch `batch_id` of `job`'s user among `downloads`, added
-/// with `label` when it is not there yet.
+/// with `label` when it is not there yet: an MCP job's skips what the library
+/// has.
 fn batch_of<'a>(
     downloads: &'a mut Vec<Downloads>,
     job: &UnfinishedJob,
@@ -430,18 +460,22 @@ fn batch_of<'a>(
     {
         Some(at) => at,
         None => {
+            let batch = BatchRef::new(
+                TransferOwner {
+                    user_id: user,
+                    batch_id: batch_id.to_string(),
+                },
+                label.to_string(),
+                PathBuf::from(&job.folder.path),
+                job.import_mode,
+            );
             downloads.push(Downloads {
                 ctx: job.ctx.clone(),
                 queued: Vec::new(),
-                batch: BatchRef::new(
-                    TransferOwner {
-                        user_id: user,
-                        batch_id: batch_id.to_string(),
-                    },
-                    label.to_string(),
-                    PathBuf::from(&job.folder.path),
-                    job.import_mode,
-                ),
+                batch: match job.origin {
+                    BatchOrigin::Ui => batch,
+                    BatchOrigin::Mcp => batch.skipping_duplicates(),
+                },
                 slots: Vec::new(),
                 pools: HashMap::new(),
             });
@@ -487,12 +521,18 @@ fn queued_without_files(
     })
 }
 
-/// Ends `job` failed: Soulful stopped where nothing can pick it up again.
-fn end_interrupted(ledger: &Ledger, job: &str, why: &str) {
+/// Ends `job` failed at `stage`: Soulful stopped where nothing can pick it up again, `why`.
+fn end_interrupted(ledger: &Ledger, job: &str, stage: Stage, why: &str) {
     warn!("Ending job {job}, which cannot resume: {why}");
     ledger.record(JobEvent::Ended {
         job: job.to_string(),
         state: JobState::Failed,
+        failure: Some(Failure::new(
+            FailureCode::ServerRestarted,
+            stage,
+            RetryAdvice::SameSourceLater,
+            format!("Soulful restarted and could not resume this job: {why}"),
+        )),
     });
 }
 
@@ -564,9 +604,10 @@ pub(crate) async fn reconcile_in(
 
 /// Resumes every job of `unfinished`, each slot by its state; indexing
 /// slots and jobs waiting for a source choice are left to the index runner
-/// and the prune. A job or slot whose stored state cannot be read ends
+/// and the prune. An MCP job searching, or queued with nothing sent, goes to
+/// the job runner. A job or slot whose stored state cannot be read ends
 /// failed, and so does a job stopped before it had a search to resume or a
-/// slot to download.
+/// slot to download. First the MCP searches the restart cut off end, failed.
 pub(crate) async fn resume_unfinished(
     db: &SqlitePool,
     ledger: &Ledger,
@@ -579,11 +620,17 @@ pub(crate) async fn resume_unfinished(
         jobs,
         unreadable_jobs,
         unreadable_slots,
+        cut_searches,
     } = unfinished;
+    for id in cut_searches {
+        // The writer logs a write the database refused.
+        let _ = (ledger.search_ended(&id, Err((server_restarted_search(), None)))).await;
+    }
     for (job, e) in unreadable_jobs {
         end_interrupted(
             ledger,
             &job,
+            Stage::Input,
             &format!("its stored state cannot be read: {e}"),
         );
     }
@@ -601,6 +648,13 @@ pub(crate) async fn resume_unfinished(
     info!("Resuming {} unfinished jobs", jobs.len());
 
     let now = chrono::Utc::now().timestamp();
+    // Read once: an MCP job's failover passes flagged sources over (D5).
+    let failures = store::recent_failures(db, now - RECENT_FAILURES_SECS)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Could not read the sources' recent failures to resume jobs: {e}");
+            HashMap::new()
+        });
     let mut kept = Vec::new();
     let mut importing = Vec::new();
     let mut downloads: Vec<Downloads> = Vec::new();
@@ -611,20 +665,55 @@ pub(crate) async fn resume_unfinished(
             Some(id) => stored_search(db, id, &user).await,
             None => None,
         };
+        let mcp = job.origin == BatchOrigin::Mcp;
         if job.state == JobState::Searching {
-            // An auto-download's job is made with its search.
+            // Every job searching is made with its search.
             match job.search_id.clone() {
+                Some(_) if mcp => resume.drive(&job.ctx, job.id).await,
                 Some(search_id) => resume_search(ledger, resume, job, search_id, search, now).await,
-                None => end_interrupted(ledger, &job.id, "it is searching without a search"),
+                None => end_interrupted(
+                    ledger,
+                    &job.id,
+                    Stage::SourceSearch,
+                    "it is searching without a search",
+                ),
             }
             continue;
         }
         if let Some(why) = queued_without_files(&job, &partly_unreadable) {
-            end_interrupted(ledger, &job.id, why);
+            end_interrupted(ledger, &job.id, Stage::Enqueue, why);
+            continue;
+        }
+        // Nothing was sent: the batch is stored before a send and dropped at every pick.
+        if mcp && job.state == JobState::Queued && job.monitor_batch_id.is_none() {
+            match job.cancel_requested {
+                true => ledger.record(JobEvent::Ended {
+                    job: job.id,
+                    state: JobState::Cancelled,
+                    failure: None,
+                }),
+                false => resume.drive(&job.ctx, job.id).await,
+            }
             continue;
         }
 
-        let candidates = search.and_then(|s| s.candidates).unwrap_or_default();
+        // An MCP job's alternates are its search's candidates as its own view keeps them.
+        let candidates = match (search, &job.options) {
+            (Some(search), Some(options)) => {
+                let groups = search.candidates.unwrap_or_default();
+                let filters = &options.filters;
+                view(
+                    &search.id,
+                    &groups,
+                    filters,
+                    &failures,
+                    &job.excluded_sources,
+                )
+                .unflagged_groups()
+            }
+            (search, _) => search.and_then(|s| s.candidates).unwrap_or_default(),
+        };
+        let cap = max_sources(&job);
         let mut waiting = Vec::new();
         for record in std::mem::take(&mut job.slots) {
             let slot = JobSlot {
@@ -671,6 +760,7 @@ pub(crate) async fn resume_unfinished(
                         slot,
                         record,
                         &candidates,
+                        cap,
                     );
                 }
                 JobState::Queued => waiting.push((slot, record)),
@@ -771,9 +861,10 @@ async fn adopt_sent(
     let label = queued.job.batch_label.clone().unwrap_or_default();
     let mut rest = Vec::new();
     let mut rows = Vec::new();
+    let cap = max_sources(&queued.job);
     for (slot, mut record) in std::mem::take(&mut queued.slots) {
-        let held = match (record.attempts.first(), &queued.job.request) {
-            (Some(Some(first)), Some(request)) => sent(backend, first, request).await,
+        let held = match (current_pick(&record), &queued.job.request) {
+            (Some(first), Some(request)) => sent(backend, first, request).await,
             _ => None,
         };
         let Some(transfer) = held else {
@@ -787,7 +878,12 @@ async fn adopt_sent(
         rows.push(row.clone());
         record.row = Some(row);
         record.state = JobState::Downloading;
-        batch_of(downloads, &queued.job, &batch_id, &label).add(slot, record, &queued.candidates);
+        batch_of(downloads, &queued.job, &batch_id, &label).add(
+            slot,
+            record,
+            &queued.candidates,
+            cap,
+        );
     }
     if !rows.is_empty() {
         ledger.record(JobEvent::Slots {
@@ -955,8 +1051,8 @@ async fn resume_batch(
 }
 
 impl Queued {
-    /// Its job, and what sending its slots again asks for: each by its first
-    /// source, the search's other candidates standing by as alternates.
+    /// Its job, and what sending its slots again asks for: each by its current
+    /// pick, the search's other candidates standing by as alternates.
     fn acquisition(self) -> (UnfinishedJob, Acquisition) {
         let Queued {
             job,
@@ -964,15 +1060,15 @@ impl Queued {
             candidates,
         } = self;
         let items: Vec<(u32, DownloadableItem)> = slots
-            .into_iter()
-            .filter_map(|(slot, record)| Some((slot.slot, record.attempts.into_iter().next()??)))
+            .iter()
+            .filter_map(|(slot, record)| Some((slot.slot, current_pick(record)?.clone())))
             .collect();
         let picked: Vec<DownloadableItem> = items.iter().map(|(_, item)| item.clone()).collect();
         let acquisition = Acquisition {
             job: job.id.clone(),
             alternates: alternates_from(&candidates, &picked),
             items,
-            max_sources: MAX_SOURCES_PER_TRACK,
+            max_sources: max_sources(&job),
         };
         (job, acquisition)
     }
@@ -992,7 +1088,10 @@ async fn enqueue_anew(resume: &dyn Resume, backend: &Arc<dyn DownloadBackend>, q
         label: manual_batch_label(&picked),
         target: PathBuf::from(&job.folder.path),
         import_mode: job.import_mode,
-        duplicates: DuplicateRule::Guarded,
+        duplicates: match job.origin {
+            BatchOrigin::Ui => DuplicateRule::Guarded,
+            BatchOrigin::Mcp => DuplicateRule::Skip,
+        },
     };
     resume
         .enqueue(&job.ctx, backend.clone(), fresh.into(), acquisition)
@@ -1023,14 +1122,21 @@ pub async fn start() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::jobs::runner::{Acquire, MCP_DOWNLOADS_PER_USER};
+    use crate::core::jobs::test_support::{
+        auto_options, downloading_track_job, downloading_track_job_with, file_of,
+        importing_track_job, in_progress, kept_track_job, mcp_track_job, queued_track_jobs,
+        test_db_with_alice,
+    };
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use crate::ledger::{
-        store, ImportDone, IndexWait, JobKind, NewJob, NewSearch, StoredImport, SEARCH_KEPT_SECS,
+        store, ImportDone, IndexWait, JobKind, JobOptions, NewJob, NewSearch, StoredImport,
+        StoredSpec, Transition, SEARCH_KEPT_SECS,
     };
     use crate::server_fns::download::test_support::{batch, group, item, transfer, StubBackend};
     use shared::download::{DownloadQuery, DownloadState, DownloadableItem, JobSlot};
     use shared::failure::{FailureCode, RetryAdvice, Stage};
-    use soulbeet::{DriverChoice, ImportedItem};
+    use soulbeet::{DriverChoice, DuplicateRun, ImportedItem};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -1047,6 +1153,7 @@ mod tests {
             import: None,
             attempts,
             sent_in: None,
+            pick_n: 1,
         }
     }
 
@@ -1280,6 +1387,10 @@ mod tests {
         enqueued: Mutex<Vec<EnqueueStart>>,
         /// job, search id, stored groups
         searched: Mutex<Vec<(String, String, Option<usize>)>>,
+        /// Each watched batch's id, duplicates rule and the cap of each slot of its pool.
+        rules: Mutex<Vec<(String, DuplicateRule, Vec<usize>)>>,
+        /// The jobs handed to the job runner.
+        driven: Mutex<Vec<String>>,
     }
 
     impl Started {
@@ -1290,6 +1401,8 @@ mod tests {
                 found: Mutex::default(),
                 enqueued: Mutex::default(),
                 searched: Mutex::default(),
+                rules: Mutex::default(),
+                driven: Mutex::default(),
             }
         }
 
@@ -1307,6 +1420,7 @@ mod tests {
             self.watched.lock().unwrap().is_empty()
                 && self.enqueued.lock().unwrap().is_empty()
                 && self.searched.lock().unwrap().is_empty()
+                && self.driven.lock().unwrap().is_empty()
         }
     }
 
@@ -1320,13 +1434,21 @@ mod tests {
             _: &UserCtx,
             batch: BatchRef,
             transfers: Vec<WatchedTransfer>,
-            _: SourcePool,
+            pool: SourcePool,
             found: Vec<ResolvedSlot>,
         ) {
             self.found
                 .lock()
                 .unwrap()
                 .extend(found.into_iter().map(|f| (f.path, f.row.job)));
+            let caps = (0..pool.slot_count())
+                .map(|s| pool.max_sources(s))
+                .collect();
+            (self.rules.lock().unwrap()).push((
+                batch.owner.batch_id.clone(),
+                batch.duplicates,
+                caps,
+            ));
             self.watched.lock().unwrap().push((
                 batch.owner.batch_id,
                 batch.label,
@@ -1361,6 +1483,9 @@ mod tests {
                 run.search_id,
                 run.found.map(|g| g.len()),
             ));
+        }
+        async fn drive(&self, _: &UserCtx, job: String) {
+            self.driven.lock().unwrap().push(job);
         }
     }
 
@@ -1776,6 +1901,9 @@ mod tests {
         }
         async fn search(&self, _: UserCtx, _: Folder, _: DownloadQuery, _: AutoRun) {
             unreachable!("no job here searches")
+        }
+        async fn drive(&self, _: &UserCtx, _: String) {
+            unreachable!("no job here is an MCP job")
         }
     }
 
@@ -2781,6 +2909,268 @@ mod tests {
                 .map(|f| (f.path.clone(), f.row.job.clone()))
                 .collect::<Vec<_>>(),
             vec![(base.path().join(&b.destination).join("01.flac"), Some(slot))]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mcp_job_resumes_in_every_state() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (ledger, db) = (&acq.ledger, &acq.db);
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = StubBackend::new(vec![]);
+        let started = Started::on(stub.clone());
+        let importer = Arc::new(StubImporter::new());
+        let queue = ImportQueue::new(RecordingDeps::new(importer.clone()));
+        let file = |name: &str| {
+            let source = tmp.path().join(name).join("03.flac");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, b"flac").unwrap();
+            source
+        };
+
+        let searching =
+            mcp_track_job(&acq, "Marrow Choir", "Ding Dong Merrily", auto_options()).await;
+        let [queued, cancel_requested] =
+            <[String; 2]>::try_from(queued_track_jobs(&acq, 2).await).expect("two jobs");
+        // Cancelled while it held its place, before it sent anything.
+        assert!(ledger
+            .claim_download(&cancel_requested, MCP_DOWNLOADS_PER_USER)
+            .await
+            .unwrap());
+        ledger
+            .transition(&UserId::new("alice"), &cancel_requested, Transition::Cancel)
+            .await
+            .unwrap();
+        let two_sources = JobOptions {
+            max_sources: 2,
+            ..auto_options()
+        };
+        let downloading = downloading_track_job_with(&acq, "Silent Night", two_sources).await;
+        // slskd still has its transfer.
+        let listed = in_progress(&downloading, "Silent Night");
+        stub.set_listing(vec![transfer(
+            "peer_a",
+            &listed.item,
+            &listed.id,
+            DownloadState::InProgress,
+        )]);
+        let importing = importing_track_job(&acq, "Coventry Carol", &file("importing")).await;
+        let kept = kept_track_job(&acq, "The Holly and the Ivy", &file("kept")).await;
+        let indexing = downloading_track_job(&acq).await;
+        let slot = JobSlot {
+            job: indexing.clone(),
+            slot: 0,
+        };
+        ledger.record(JobEvent::Slots {
+            state: JobState::Indexing,
+            rows: vec![in_progress(&indexing, "O Holy Night").with_state(DownloadState::Imported)],
+        });
+        ledger.record(JobEvent::Indexing {
+            slots: vec![slot],
+            wait: Box::new(IndexWait {
+                import: "/downloads/Come Over [1f2e3d4c]/03.flac".into(),
+                library: "/music".into(),
+                items: vec![ImportedItem {
+                    path: "Marrow Choir/Winter Songs/03 O Holy Night.flac".into(),
+                    recording_mbid: None,
+                    artist: "Marrow Choir".into(),
+                    title: "O Holy Night".into(),
+                    album: "Winter Songs".into(),
+                    beets_id: None,
+                    release_mbid: None,
+                    match_per_mille: None,
+                }],
+                since: 0,
+                baseline: None,
+                checked: None,
+            }),
+        });
+        ledger.settled().await;
+
+        reconcile_in(db, ledger, &queue, &started, tmp.path()).await;
+        ledger.settled().await;
+
+        assert_eq!(*started.driven.lock().unwrap(), vec![searching, queued]);
+        assert!(started.enqueued.lock().unwrap().is_empty());
+        assert!(started.searched.lock().unwrap().is_empty());
+        assert_eq!(
+            store::job_state(db, &cancel_requested).await,
+            Some(JobState::Cancelled)
+        );
+        let watched = started.watched.lock().unwrap().clone();
+        assert_eq!(
+            (watched.iter())
+                .map(|(_, _, transfers)| transfers.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![(
+                listed.id.clone(),
+                JobSlot {
+                    job: downloading.clone(),
+                    slot: 0
+                }
+            )]]
+        );
+        assert_eq!(
+            *started.rules.lock().unwrap(),
+            vec![(watched[0].0.clone(), DuplicateRule::Skip, vec![2])]
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while importer.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await
+            }
+        })
+        .await
+        .expect("the interrupted import ran again");
+        assert_eq!(importer.duplicate_runs(), vec![DuplicateRun::Skip]);
+        let alice = UserId::new("alice");
+        let kept_file = file_of("a", "The Holly and the Ivy");
+        assert!(queue.import_choices(&alice, &kept_file).is_ok());
+        let restored = queue.discard(&alice, &kept_file).await.unwrap();
+        assert_eq!(
+            restored.stored().map(|s| (s.sources, s.duplicates)),
+            Some((vec![file("kept")], DuplicateRule::Skip))
+        );
+        assert_eq!(
+            store::job_state(db, &importing).await,
+            Some(JobState::Importing)
+        );
+        assert_eq!(
+            store::job_state(db, &kept).await,
+            Some(JobState::NeedsDecision)
+        );
+        assert_eq!(
+            store::job_state(db, &indexing).await,
+            Some(JobState::Indexing)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_find_sources_search_cut_off_by_a_restart_ends_and_a_jobs_search_is_left_to_it() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (ledger, db) = (&acq.ledger, &acq.db);
+        let tmp = tempfile::tempdir().unwrap();
+        let started = Started::on(StubBackend::new(vec![]));
+        let alice = UserId::new("alice");
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", auto_options()).await;
+        let job_search = store::job_record(db, &job, &alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .search_id
+            .unwrap();
+        let running = |id: &str, spec: Option<StoredSpec>| NewSearch {
+            id: id.into(),
+            user: alice.clone(),
+            backend: Some("slskd".into()),
+            query: DownloadQuery::new(vec![]),
+            spec,
+        };
+        for search in [
+            running(&job_search, Some(StoredSpec::default())),
+            running("find", Some(StoredSpec::default())),
+            running("ui", None),
+        ] {
+            ledger.record_search(search).await.unwrap();
+        }
+
+        reconcile_in(db, ledger, &queue(), &started, tmp.path()).await;
+        ledger.settled().await;
+
+        let failure_of = |id: &'static str| async move {
+            let stored = store::search_of(db, id, &UserId::new("alice")).await;
+            stored.unwrap().unwrap().failure
+        };
+        assert_eq!(failure_of("find").await, Some(server_restarted_search()));
+        assert_eq!(
+            failure_of("ui").await,
+            None,
+            "a web UI search is polled again"
+        );
+        let job_search = store::search_of(db, &job_search, &alice).await.unwrap();
+        assert_eq!(job_search.unwrap().failure, None);
+        assert_eq!(*started.driven.lock().unwrap(), vec![job]);
+    }
+
+    #[tokio::test]
+    async fn a_job_ended_at_startup_keeps_why_as_its_failure() {
+        let (ledger, db) = ledger().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let started = Started::on(StubBackend::new(vec![]));
+        job_of(&ledger, &db, "no-search", JobState::Searching, None, vec![]).await;
+        job_of(&ledger, &db, "no-files", JobState::Queued, None, vec![]).await;
+        ledger.settled().await;
+
+        reconcile_in(&db, &ledger, &queue(), &started, tmp.path()).await;
+        ledger.settled().await;
+
+        for (id, stage, why) in [
+            (
+                "no-search",
+                Stage::SourceSearch,
+                "it is searching without a search",
+            ),
+            (
+                "no-files",
+                Stage::Enqueue,
+                "it stopped before it had files to download",
+            ),
+        ] {
+            let stored: String = sqlx::query_scalar("SELECT failure FROM jobs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            let f: Failure = serde_json::from_str(&stored).unwrap();
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message),
+                (
+                    FailureCode::ServerRestarted,
+                    stage,
+                    RetryAdvice::SameSourceLater,
+                    format!("Soulful restarted and could not resume this job: {why}")
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_slot_picked_again_resumes_from_its_current_pick() {
+        let b = batch("Come Over");
+        let mut downloads = Downloads {
+            ctx: crate::core::test_ctx("alice"),
+            batch: b,
+            slots: Vec::new(),
+            queued: Vec::new(),
+            pools: HashMap::new(),
+        };
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        // An earlier search's pick, then this search's peer_a and its failover to peer_b.
+        let record = SlotRecord {
+            pick_n: 2,
+            ..record(
+                0,
+                JobState::Downloading,
+                transfer("peer_b", "b/01.flac", "t-b01", DownloadState::InProgress),
+                vec![
+                    Some(item("peer_x", "One", "x/01.flac")),
+                    Some(item("peer_a", "One", "a/01.flac")),
+                    Some(item("peer_b", "One", "b/01.flac")),
+                ],
+            )
+        };
+        let candidates = [
+            group("peer_a", vec![item("peer_a", "One", "a/01.flac")], 0.9),
+            group("peer_b", vec![item("peer_b", "One", "b/01.flac")], 0.8),
+            group("peer_c", vec![item("peer_c", "One", "c/01.flac")], 0.7),
+        ];
+        downloads.add(slot.clone(), record, &candidates, 3);
+        assert_eq!(
+            downloads.pools[&slot],
+            (vec![item("peer_c", "One", "c/01.flac")], 2, 3),
+            "the earlier pick's source counts against no cap of this one"
         );
     }
 }

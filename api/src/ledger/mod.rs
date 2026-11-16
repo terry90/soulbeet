@@ -238,10 +238,12 @@ pub enum JobEvent {
     Dismiss(Vec<JobSlot>),
     /// Slots whose stored state cannot be read: they end failed, their stored row kept.
     Unreadable(Vec<JobSlot>),
-    /// A job ended before or without its slots: every unfinished slot takes `state` too.
+    /// A job ended before or without its slots: every unfinished slot takes `state` too. A
+    /// `failure`, when given, is stored as the job's (one that failed before it had a slot).
     Ended {
         job: String,
         state: JobState,
+        failure: Option<Failure>,
     },
 }
 
@@ -468,6 +470,9 @@ pub enum Transition {
     Pick { items: Vec<(u32, DownloadableItem)> },
     /// D15: the job waits for Claude's choice.
     AwaitChoice,
+    /// The runner, for a searching job whose search ended and expired: the job searches again
+    /// under `search_id`, so the expired search's candidate ids keep naming what they named.
+    SearchAgain { search_id: String },
     /// D15: the job ends failed: a job without unfinished slots with `failure` in `jobs.failure`,
     /// one with them (picked, then the backend or its folder failed) with `failure` on every
     /// unfinished slot's row. A job whose user asked to cancel it ends cancelled instead.
@@ -497,7 +502,9 @@ impl Transition {
         match self {
             Transition::Cancel => &[Searching, NeedsSourceChoice, Queued, Downloading],
             Transition::Dismiss => &[Failed, Cancelled, NeedsSourceChoice, NeedsDecision],
-            Transition::Pick { .. } | Transition::AwaitChoice => &[Searching],
+            Transition::Pick { .. } | Transition::AwaitChoice | Transition::SearchAgain { .. } => {
+                &[Searching]
+            }
             Transition::Fail { .. } => &[Searching, Queued],
             Transition::Search { .. } | Transition::Queue { .. } => {
                 &[Failed, Cancelled, NeedsSourceChoice]
@@ -572,6 +579,7 @@ type LiveRows = Arc<Mutex<HashMap<JobSlot, DownloadProgress>>>;
 pub struct Ledger {
     writes: mpsc::UnboundedSender<Write>,
     changes: watch::Receiver<i64>,
+    places: watch::Receiver<u64>,
     live: LiveRows,
     /// No writer reads `writes`: requests are answered at once, events wait for `Recorded`.
     #[cfg(test)]
@@ -582,10 +590,12 @@ impl Ledger {
     fn channel() -> (Ledger, Inbox) {
         let (writes, inbox) = mpsc::unbounded_channel();
         let (changed, changes) = watch::channel(0);
+        let (freed, places) = watch::channel(0);
         let live = LiveRows::default();
         let ledger = Ledger {
             writes,
             changes,
+            places,
             live: live.clone(),
             #[cfg(test)]
             recording: false,
@@ -595,6 +605,7 @@ impl Ledger {
             Inbox {
                 writes: inbox,
                 changed,
+                freed,
                 live,
             },
         )
@@ -702,6 +713,12 @@ impl Ledger {
     /// The last change number; it moves on with every write that changes a job.
     pub fn changes(&self) -> watch::Receiver<i64> {
         self.changes.clone()
+    }
+
+    /// Counts the download places given up: it moves on after every write that freed one, so a
+    /// runner waiting for a place tries again only then.
+    pub fn places(&self) -> watch::Receiver<u64> {
+        self.places.clone()
     }
 
     /// D8: true when `job` (queued) already holds a download place or takes one now, its user's
@@ -1545,6 +1562,7 @@ mod tests {
         ledger.record(JobEvent::Ended {
             job: "finished".into(),
             state: JobState::Failed,
+            failure: None,
         });
         ledger.settled().await;
         let rows = store::open_rows(&db, &UserId::new("alice")).await.unwrap();
@@ -1742,6 +1760,7 @@ mod tests {
         let ended = JobEvent::Ended {
             job: "j1".into(),
             state: JobState::Failed,
+            failure: None,
         };
         ledger.record(ended.clone());
         assert_eq!(recorded.events(), vec![ended]);
@@ -2021,6 +2040,7 @@ mod tests {
         ledger.record(JobEvent::Ended {
             job: "ui".into(),
             state: JobState::Failed,
+            failure: None,
         });
         let again = ledger
             .create_batch(
@@ -2076,6 +2096,7 @@ mod tests {
         ledger.record(JobEvent::Ended {
             job: first,
             state: JobState::Failed,
+            failure: None,
         });
         assert_eq!(
             ledger.create_batch(batch_of("b3"), next()).await.unwrap(),
@@ -2100,6 +2121,7 @@ mod tests {
         ledger.record(JobEvent::Ended {
             job: "j1".into(),
             state: JobState::Failed,
+            failure: None,
         });
         let user = UserId::new("alice");
         let (a, b) = tokio::join!(
@@ -2175,6 +2197,7 @@ mod tests {
         ledger.record(JobEvent::Ended {
             job: "j1".into(),
             state: JobState::Failed,
+            failure: None,
         });
         let user = UserId::new("alice");
         let filters = SourceFilters {
@@ -2249,11 +2272,40 @@ mod tests {
         ledger.record(JobEvent::Ended {
             job: ids[0].clone(),
             state: JobState::Failed,
+            failure: None,
         });
         assert!(
             ledger.claim_download(&ids[2], 2).await.unwrap(),
             "a place frees when its job moves on"
         );
+    }
+
+    #[tokio::test]
+    async fn places_move_on_only_when_a_held_place_is_given_up() {
+        let (ledger, _, alice, _) = ledger().await;
+        let jobs = queued_carols(2, &alice);
+        let ids: Vec<String> = jobs.iter().map(|j| j.id.clone()).collect();
+        ledger.create_batch(batch_of("b1"), jobs).await.unwrap();
+        let mut places = ledger.places();
+        places.borrow_and_update();
+        assert!(ledger.claim_download(&ids[0], 2).await.unwrap());
+        ledger.record(JobEvent::Ended {
+            job: ids[1].clone(),
+            state: JobState::Failed,
+            failure: None,
+        });
+        ledger.settled().await;
+        assert!(
+            !places.has_changed().unwrap(),
+            "neither a claim nor a job ending without a place gives one up"
+        );
+        ledger.record(JobEvent::Ended {
+            job: ids[0].clone(),
+            state: JobState::Failed,
+            failure: None,
+        });
+        ledger.settled().await;
+        assert!(places.has_changed().unwrap());
     }
 
     #[tokio::test]
@@ -2266,6 +2318,7 @@ mod tests {
         ledger.record(JobEvent::Ended {
             job: ids[0].clone(),
             state: JobState::Failed,
+            failure: None,
         });
         let user = UserId::new("alice");
         ledger
@@ -2549,6 +2602,7 @@ mod tests {
         ledger.record(JobEvent::Ended {
             job: "j1".into(),
             state: JobState::Failed,
+            failure: None,
         });
         let applied = ledger
             .transition(

@@ -7,6 +7,8 @@ use shared::download::DownloadQuery;
 use shared::metadata::{Album, Track};
 
 pub mod runner;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// An album asked for by its MusicBrainz release (D1).
 #[derive(Debug, Clone, PartialEq)]

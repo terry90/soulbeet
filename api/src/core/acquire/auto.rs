@@ -354,6 +354,7 @@ pub(crate) async fn fail_job(ledger: &Ledger, ctx: &UserCtx, run: &AutoRun, fail
     ledger.record(JobEvent::Ended {
         job: run.job.clone(),
         state: JobState::Failed,
+        failure: None,
     });
 }
 

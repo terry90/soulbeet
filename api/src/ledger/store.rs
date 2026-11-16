@@ -1,7 +1,10 @@
 //! Reads of the ledger, straight from the pool.
 
 use super::writer::import_mode_named;
-use super::{IndexWait, JobState, SlotResult, StoredImport, StoredSpec, TERMINAL_SQL};
+use super::{
+    BatchOrigin, IndexWait, JobKind, JobOptions, JobState, SlotResult, StoredImport, StoredSpec,
+    TERMINAL_SQL,
+};
 use crate::auth::{Role, UserCtx, UserId};
 use crate::models::folder::Folder;
 use shared::download::{
@@ -72,6 +75,129 @@ pub async fn search_of(
         },
     )
     .transpose()
+}
+
+/// A job as stored, with the user and folder it runs for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobRecord {
+    pub id: String,
+    pub ctx: UserCtx,
+    pub folder: Folder,
+    pub batch_id: String,
+    pub origin: BatchOrigin,
+    pub kind: JobKind,
+    pub wanted: DownloadQuery,
+    /// None for a web UI job.
+    pub options: Option<JobOptions>,
+    pub state: JobState,
+    pub search_id: Option<String>,
+    /// Sources whose result the user rejected, never offered to the job again.
+    pub excluded_sources: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub changed_seq: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct JobRow {
+    user_id: String,
+    username: String,
+    role: Role,
+    folder_id: String,
+    folder_owner: String,
+    folder_name: String,
+    folder_path: String,
+    folder_shared: bool,
+    batch_id: String,
+    origin: String,
+    kind: String,
+    wanted: String,
+    options: Option<String>,
+    state: String,
+    search_id: Option<String>,
+    excluded_sources: String,
+    created_at: i64,
+    updated_at: i64,
+    changed_seq: i64,
+}
+
+/// `user`'s job `id`, or None for an unknown id or another user's.
+pub async fn job_record(
+    db: &SqlitePool,
+    id: &str,
+    user: &UserId,
+) -> Result<Option<JobRecord>, sqlx::Error> {
+    let row: Option<JobRow> = sqlx::query_as(
+        "SELECT j.user_id, u.username, u.role, j.folder_id, f.user_id AS folder_owner, \
+                f.name AS folder_name, f.path AS folder_path, f.shared AS folder_shared, \
+                j.batch_id, b.origin, j.kind, j.wanted, j.options, j.state, j.search_id, \
+                j.excluded_sources, j.created_at, j.updated_at, j.changed_seq \
+         FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
+         JOIN batches b ON b.id = j.batch_id \
+         WHERE j.id = ? AND j.user_id = ?",
+    )
+    .bind(id)
+    .bind(user.to_string())
+    .fetch_optional(db)
+    .await?;
+    row.map(|row| {
+        Ok(JobRecord {
+            id: id.to_string(),
+            ctx: UserCtx {
+                user_id: row.user_id,
+                username: row.username,
+                role: row.role,
+            },
+            folder: Folder {
+                id: row.folder_id,
+                user_id: row.folder_owner,
+                name: row.folder_name,
+                path: row.folder_path,
+                shared: row.folder_shared,
+            },
+            batch_id: row.batch_id,
+            origin: origin_named(Some(&row.origin))?,
+            kind: kind_named(&row.kind)?,
+            wanted: json(&row.wanted)?,
+            options: row.options.as_deref().map(json).transpose()?,
+            state: state_named(&row.state)?,
+            search_id: row.search_id,
+            excluded_sources: json(&row.excluded_sources)?,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            changed_seq: row.changed_seq,
+        })
+    })
+    .transpose()
+}
+
+fn kind_named(name: &str) -> Result<JobKind, sqlx::Error> {
+    match name {
+        "track" => Ok(JobKind::Track),
+        "album" => Ok(JobKind::Album),
+        other => Err(sqlx::Error::Decode(
+            format!("unknown job kind {other:?}").into(),
+        )),
+    }
+}
+
+/// The queued slots of `job`, in order, each with the candidate its current pick starts at.
+pub async fn queued_picks(
+    db: &SqlitePool,
+    job: &str,
+) -> Result<Vec<(u32, DownloadableItem)>, sqlx::Error> {
+    let rows: Vec<(u32, String)> = sqlx::query_as(
+        "SELECT t.slot, a.candidate FROM job_tracks t \
+         JOIN job_attempts a ON a.job_id = t.job_id AND a.slot = t.slot AND a.n = t.pick_n \
+         WHERE t.job_id = ? AND t.state = ? AND a.candidate IS NOT NULL ORDER BY t.slot",
+    )
+    .bind(job)
+    .bind(JobState::Queued.as_str())
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|(slot, candidate)| Ok((slot, json(&candidate)?)))
+        .collect()
 }
 
 /// The last row of every unfinished slot of `user`'s jobs, oldest job first, each with its `job`
@@ -193,6 +319,9 @@ pub struct SlotRecord {
     /// The backend request a failover sent its newest attempt in; None when that attempt is its
     /// first source, which went in the job's request, or a transfer it adopted.
     pub sent_in: Option<String>,
+    /// The number of the attempt its current pick started at (1 for the first): the attempts
+    /// before it are of an earlier pick.
+    pub pick_n: u32,
 }
 
 /// A job not in a terminal state, with the user and folder it runs for (a job whose user or folder
@@ -211,6 +340,13 @@ pub struct UnfinishedJob {
     /// The backend request of the job's latest enqueue.
     pub request: Option<String>,
     pub slots: Vec<SlotRecord>,
+    pub origin: BatchOrigin,
+    /// None for a web UI job.
+    pub options: Option<JobOptions>,
+    /// Sources whose result the user rejected, never offered to the job again.
+    pub excluded_sources: Vec<String>,
+    /// Its user asked to cancel it while it may have had transfers (D9).
+    pub cancel_requested: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -231,6 +367,10 @@ struct UnfinishedRow {
     monitor_batch_id: Option<String>,
     batch_label: Option<String>,
     request: Option<String>,
+    origin: Option<String>,
+    options: Option<String>,
+    excluded_sources: String,
+    cancel_requested: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -240,11 +380,23 @@ struct SlotRow {
     state: String,
     last_row: Option<String>,
     import_job: Option<String>,
+    pick_n: u32,
 }
 
 fn state_named(name: &str) -> Result<JobState, sqlx::Error> {
     JobState::parse(name)
         .ok_or_else(|| sqlx::Error::Decode(format!("unknown job state {name:?}").into()))
+}
+
+/// A batch's stored origin; a job without a batch is the web UI's.
+fn origin_named(name: Option<&str>) -> Result<BatchOrigin, sqlx::Error> {
+    match name {
+        Some("mcp") => Ok(BatchOrigin::Mcp),
+        Some("ui") | None => Ok(BatchOrigin::Ui),
+        Some(other) => Err(sqlx::Error::Decode(
+            format!("unknown batch origin {other:?}").into(),
+        )),
+    }
 }
 
 /// The unfinished jobs, and the jobs and slots among them whose stored state cannot be read.
@@ -256,26 +408,39 @@ pub struct Unfinished {
     pub unreadable_jobs: Vec<(String, sqlx::Error)>,
     /// Slots of the jobs in `jobs` whose row, import or attempts cannot be read, with why.
     pub unreadable_slots: Vec<(JobSlot, sqlx::Error)>,
+    /// The MCP searches stored running that no unfinished job searching resumes: the restart
+    /// cut them off.
+    pub cut_searches: Vec<String>,
 }
 
-/// Every unfinished job, oldest first, its slots in order. `ctx` comes from
-/// the job's user row (id, username, role), `folder` from its folder row. A
-/// job or slot whose stored state cannot be read is set apart, so the others
-/// still resume.
+/// Every unfinished job, oldest first, its slots in order, and the MCP searches a restart cut
+/// off. `ctx` comes from the job's user row (id, username, role), `folder` from its folder row.
+/// A job or slot whose stored state cannot be read is set apart, so the others still resume.
 pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
     // created_at has one-second resolution: insertion order breaks its ties.
     let jobs: Vec<UnfinishedRow> = sqlx::query_as(&format!(
         "SELECT j.id, j.user_id, u.username, u.role, j.folder_id, f.user_id AS folder_owner, \
                 f.name AS folder_name, f.path AS folder_path, f.shared AS folder_shared, \
                 j.wanted, j.import_mode, j.state, j.search_id, j.monitor_batch_id, j.batch_label, \
-                j.request \
+                j.request, b.origin, j.options, j.excluded_sources, j.cancel_requested \
          FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
+         LEFT JOIN batches b ON b.id = j.batch_id \
          WHERE j.state NOT IN {TERMINAL_SQL} ORDER BY j.created_at, j.rowid"
     ))
     .fetch_all(db)
     .await?;
+    let cut_searches: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM searches \
+         WHERE spec IS NOT NULL AND candidates IS NULL AND failure IS NULL \
+         AND id NOT IN (SELECT j.search_id FROM jobs j JOIN batches b ON b.id = j.batch_id \
+                        WHERE b.origin = ? AND j.state = ? AND j.search_id IS NOT NULL)",
+    )
+    .bind(BatchOrigin::Mcp.as_str())
+    .bind(JobState::Searching.as_str())
+    .fetch_all(db)
+    .await?;
     let slots: Vec<SlotRow> = sqlx::query_as(&format!(
-        "SELECT t.job_id, t.slot, t.state, t.last_row, t.import_job \
+        "SELECT t.job_id, t.slot, t.state, t.last_row, t.import_job, t.pick_n \
          FROM job_tracks t JOIN jobs j ON j.id = t.job_id \
          WHERE j.state NOT IN {TERMINAL_SQL} ORDER BY t.job_id, t.slot"
     ))
@@ -289,7 +454,10 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
     .fetch_all(db)
     .await?;
 
-    let mut unfinished = Unfinished::default();
+    let mut unfinished = Unfinished {
+        cut_searches,
+        ..Unfinished::default()
+    };
     // Each slot's attempts, and the request of the newest.
     type Tried = (Vec<Option<DownloadableItem>>, Option<String>);
     let mut tried: HashMap<JobSlot, Result<Tried, sqlx::Error>> = HashMap::new();
@@ -322,6 +490,7 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
                 import: row.import_job.as_deref().map(json).transpose()?,
                 attempts,
                 sent_in,
+                pick_n: row.pick_n,
             })
         })();
         match record {
@@ -352,6 +521,10 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
                 monitor_batch_id: row.monitor_batch_id,
                 batch_label: row.batch_label,
                 request: row.request,
+                origin: origin_named(row.origin.as_deref())?,
+                options: row.options.as_deref().map(json).transpose()?,
+                excluded_sources: json(&row.excluded_sources)?,
+                cancel_requested: row.cancel_requested,
                 slots: by_job.remove(&row.id).unwrap_or_default(),
                 id: row.id.clone(),
             })
@@ -604,6 +777,7 @@ mod tests {
         ledger.record(JobEvent::Ended {
             job: "j1".into(),
             state: JobState::Failed,
+            failure: None,
         });
         ledger.settled().await;
         assert!(unfinished(&db).await.unwrap().jobs.is_empty());

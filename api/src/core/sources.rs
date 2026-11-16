@@ -435,6 +435,21 @@ impl Searches {
         self.runs.lock().unwrap().iter().any(|run| run.id == id)
     }
 
+    /// Waits until no task of this process runs stored search `id`: its task stored how it
+    /// ended, or could not.
+    pub async fn until_left(&self, id: &str) {
+        loop {
+            let left = self.left.notified();
+            tokio::pin!(left);
+            // Registered before the look, so a search leaving after it still wakes this one.
+            left.as_mut().enable();
+            if !self.runs(id) {
+                return;
+            }
+            left.await;
+        }
+    }
+
     /// The searches holding or waiting for the turn before search `id`; None once it holds the
     /// turn, and for a search no task runs.
     pub fn ahead_of(&self, id: &str) -> Option<usize> {
@@ -686,6 +701,17 @@ pub struct DroppedByFilter {
 pub struct CandidateView {
     pub candidates: Vec<Candidate>,
     pub dropped_by_filter: DroppedByFilter,
+}
+
+impl CandidateView {
+    /// The groups of its candidates whose source is not flagged, the ones a job's automatic
+    /// pick and its failover may use (D4, D5).
+    pub fn unflagged_groups(&self) -> Vec<DownloadableGroup> {
+        (self.candidates.iter())
+            .filter(|c| !c.flagged())
+            .map(|c| c.group.clone())
+            .collect()
+    }
 }
 
 /// D6: extensions that are always lossless. `m4a` holds AAC or ALAC alike, so it is not one.
