@@ -22,6 +22,7 @@ use crate::core::discovery::DiscoveryEffects;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::jobs::runner::{Acquire, ACQUIRE};
 use crate::mcp::status::{LiveStatus, StatusSource};
+use crate::mcp::sync::{LiveSync, RatingSync};
 use crate::oauth::cimd::{CimdFetcher, ClientDocuments, UnbuiltFetcher};
 use crate::oauth::limits::Limits;
 use crate::security::GateReason;
@@ -59,6 +60,8 @@ pub struct ConnectionState {
     pub(crate) acquire: Arc<Acquire>,
     /// What the discovery tools start runs and import through.
     pub(crate) discovery: Arc<dyn DiscoveryEffects>,
+    /// Where `sync_ratings` runs the caller's rating sync.
+    pub(crate) ratings: Arc<dyn RatingSync>,
 }
 
 impl ConnectionState {
@@ -85,6 +88,7 @@ impl ConnectionState {
             log: LIVE_LOG.clone(),
             acquire: ACQUIRE.clone(),
             discovery: Arc::new(LiveDiscovery),
+            ratings: Arc::new(LiveSync),
         }
     }
 }

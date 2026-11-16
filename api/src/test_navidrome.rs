@@ -434,6 +434,24 @@ pub(crate) fn song_body(id: &str, title: &str, rating: Option<u8>, starred: bool
     subsonic_ok(&format!(r#""song":{song}"#))
 }
 
+/// search3's answer listing `songs` (id, title, rating) as `child(id, "Marrow Choir", title)`
+/// rated `rating` by this user; no songs leave `song` out (responses.go:344-348, omitempty).
+pub(crate) fn search3_body(songs: &[(&str, &str, u8)]) -> String {
+    let songs: Vec<serde_json::Value> = (songs.iter())
+        .map(|(id, title, rating)| {
+            let mut song: serde_json::Value =
+                serde_json::from_str(&child(id, "Marrow Choir", title)).expect("child writes JSON");
+            song["userRating"] = json!(rating);
+            song
+        })
+        .collect();
+    let result = match songs.is_empty() {
+        true => json!({}),
+        false => json!({ "song": songs }),
+    };
+    subsonic_ok(&format!(r#""searchResult3":{result}"#))
+}
+
 /// getAlbum's answer for album `id` named `name` by "Marrow Choir", starred and rated `rating` by
 /// this user, without songs. AlbumID3 always sends `userRating`, 0 when unrated (responses.go:269).
 pub(crate) fn album_body(id: &str, name: &str, rating: u8) -> String {

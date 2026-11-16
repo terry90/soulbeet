@@ -257,6 +257,7 @@ pub fn start_channel_cleanup_task() {
 
 #[cfg(feature = "server")]
 async fn run_automation() {
+    use crate::core::ratings::AutoDeletePermit;
     use crate::models::user::User;
 
     // Run automation for each connected user
@@ -333,13 +334,24 @@ async fn run_automation() {
     // 1. Sync ratings for each connected user
     for user in &connected_users {
         info!("Automation: syncing ratings for user {}...", user.username);
-        match crate::server_fns::navidrome::sync_ratings_internal(&user.id).await {
-            Ok(result) => info!(
-                "Automation: sync complete for {} - {} scanned, {} deletions, {} promoted, {} removed, {} kept",
-                user.username, result.total_songs_scanned, result.deleted_tracks,
-                result.promoted_tracks, result.removed_tracks, result.kept_tracks
+        let ctx = crate::auth::UserCtx {
+            user_id: user.id.clone(),
+            username: user.username.clone(),
+            role: user.role,
+        };
+        match crate::core::ratings::sync(&ctx, AutoDeletePermit::Allowed).await {
+            Ok(report) => {
+                let result = report.counts();
+                info!(
+                    "Automation: sync complete for {} - {} scanned, {} deletions, {} promoted, {} removed, {} kept",
+                    user.username, result.total_songs_scanned, result.deleted_tracks,
+                    result.promoted_tracks, result.removed_tracks, result.kept_tracks
+                )
+            }
+            Err(f) => info!(
+                "Automation: sync failed for {}: {}",
+                user.username, f.message
             ),
-            Err(e) => info!("Automation: sync failed for {}: {}", user.username, e),
         }
     }
 

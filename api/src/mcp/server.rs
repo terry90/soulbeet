@@ -18,7 +18,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use super::contract::{failed, rate_limited};
 use super::{
     batches, discovery, ensure, imports, jobs, library, metadata, playlists, ratings, settings,
-    sources, status, McpCaller,
+    sources, status, sync, McpCaller,
 };
 use crate::connection::ConnectionState;
 
@@ -270,6 +270,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     discovery::RUN_DISCOVERY,
     discovery::PROMOTE_DISCOVERY_TRACK,
     discovery::REMOVE_DISCOVERY_TRACK,
+    sync::SYNC_RATINGS,
 ];
 
 impl ToolSpec {
@@ -485,7 +486,7 @@ mod tests {
         match tool {
             "get_status" | "get_settings" | "list_folders" | "get_library_stats"
             | "list_starred" | "list_playlists" | "get_jobs" | "list_batches" | "get_discovery"
-            | "run_discovery" => json!({}),
+            | "run_discovery" | "sync_ratings" => json!({}),
             "find_in_library" => {
                 json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
             }
@@ -612,6 +613,7 @@ mod tests {
         ("run_discovery", false, false, false, true),
         ("promote_discovery_track", false, false, false, false),
         ("remove_discovery_track", false, true, true, false),
+        ("sync_ratings", false, true, false, false),
     ];
 
     #[test]

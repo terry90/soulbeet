@@ -164,7 +164,7 @@ pub struct BlockedDeletion {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct SyncResult {
     pub deleted_tracks: u32,
     pub promoted_tracks: u32,

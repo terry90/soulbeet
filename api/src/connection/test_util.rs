@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,9 +25,11 @@ use crate::base_url::BaseUrl;
 use crate::core::discovery::test_support::TestDiscovery;
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::runner::{Acquire, TestEffects};
+use crate::core::ratings::{sync_running, AutoDeletePermit, SyncReport};
 use crate::db::test_db;
 use crate::ledger::store::RunningBatch;
 use crate::mcp::status::{FolderFacts, NavidromeFacts, StatusFacts, StatusSource};
+use crate::mcp::sync::RatingSync;
 use crate::mcp::McpCaller;
 use crate::models::folder::Folder;
 use crate::models::user_settings::{UpdateUserSettings, UserSettings};
@@ -54,8 +56,9 @@ impl ConnectionState {
     /// MCP on, no `PUBLIC_URL`, no gate reasons, the default limits,
     /// `test_key()`, no client metadata documents, `sample_facts()`, no
     /// user linked to Navidrome, no NAVIDROME_MUSIC_PATH, acting through
-    /// `acquire`, whose ledger writer serves every state made on it, and
-    /// discovery on a `TestDiscovery`.
+    /// `acquire`, whose ledger writer serves every state made on it,
+    /// discovery on a `TestDiscovery`, and a rating sync that is always
+    /// already running.
     pub(crate) fn on(db: SqlitePool, acquire: Arc<Acquire>) -> ConnectionState {
         ConnectionState {
             mcp_off: None,
@@ -71,6 +74,7 @@ impl ConnectionState {
             log: Arc::new(RequestLog::default()),
             acquire,
             discovery: Arc::new(TestDiscovery::default()),
+            ratings: Arc::new(FixedSync::new(Err(sync_running()))),
         }
     }
 }
@@ -428,7 +432,7 @@ pub(crate) async fn mcp_app_with(navidrome: Arc<dyn NavidromeOf>) -> (SqlitePool
 }
 
 /// A router on `state`, whose database gains u1 (alice), and u1's access token for music.example.com.
-async fn alice_app(state: ConnectionState) -> (SqlitePool, Router, String) {
+pub(crate) async fn alice_app(state: ConnectionState) -> (SqlitePool, Router, String) {
     let db = state.db.clone();
     add_user(&db, "u1", "alice").await;
     let token = access_token(&db, "u1", RESOURCE).await;
@@ -600,6 +604,38 @@ pub(crate) struct FixedStatus(pub Result<StatusFacts, Failure>);
 impl StatusSource for FixedStatus {
     async fn gather(&self, _ctx: &UserCtx) -> Result<StatusFacts, Failure> {
         self.0.clone()
+    }
+}
+
+/// Answers a clone of its value for every sync, recording each user id and permit it is
+/// called with.
+pub(crate) struct FixedSync {
+    answer: Result<SyncReport, Failure>,
+    calls: Mutex<Vec<(String, AutoDeletePermit)>>,
+}
+
+impl FixedSync {
+    pub(crate) fn new(answer: Result<SyncReport, Failure>) -> FixedSync {
+        FixedSync {
+            answer,
+            calls: Mutex::new(vec![]),
+        }
+    }
+
+    /// Each call's user id and permit, in order.
+    pub(crate) fn calls(&self) -> Vec<(String, AutoDeletePermit)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl RatingSync for FixedSync {
+    async fn sync(&self, ctx: &UserCtx, permit: AutoDeletePermit) -> Result<SyncReport, Failure> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((ctx.user_id.clone(), permit));
+        self.answer.clone()
     }
 }
 
