@@ -1,14 +1,16 @@
 //! `ensure_in_library`: says which tracks the library has and starts a job for each other item,
-//! all in one batch.
+//! all in one batch; `download_source`: one candidate a search found becomes a job's source.
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{FailureCode, Stage};
+use shared::failure::{Failure, FailureCode, Stage};
 
 use super::args::{repeatable, Args};
 use super::contract::{
-    failed, items, too_large_to_repeat, upstream_error, ItemResult, Items, NextCall, ToolError,
+    failed, invalid_value, items, too_large_to_repeat, upstream_error, ItemResult, Items, NextCall,
+    ToolError,
 };
+use super::jobs::JobTool;
 use super::keys::{keyed, request_key, Keyed};
 use super::refs::{
     filters, filters_schema, reference_schema, reference_value, request_key_schema, wanted,
@@ -20,6 +22,9 @@ use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
 use crate::core::acquire::AUTO_SELECT_SCORE_THRESHOLD;
 use crate::core::index::NavidromeOf;
+use crate::core::jobs::retry::{
+    download_source as core_download_source, RetryAnswer, SourceTarget,
+};
 use crate::core::jobs::runner::{Acquire, MCP_DOWNLOADS_PER_USER};
 use crate::core::jobs::{ensure, CallRefused, EnsureItem, Wanted};
 use crate::ledger::{JobOptions, JobState, Pick, MCP_UNFINISHED_JOBS_PER_USER};
@@ -271,19 +276,140 @@ fn call_refused(refused: CallRefused, call: &Value) -> ToolError {
     }
 }
 
+const DOWNLOAD_SOURCE: &str = "download_source";
+
+const DOWNLOAD_SOURCE_ARGS: &[&str] = &[
+    "candidate_id",
+    "job_id",
+    "reference",
+    "folder_id",
+    "request_key",
+];
+
+pub(crate) const DOWNLOAD_SOURCE_TOOL: ToolSpec = ToolSpec {
+    name: DOWNLOAD_SOURCE,
+    title: "Download a chosen source",
+    description: |calls_a_minute| {
+        let common = common_codes(calls_a_minute);
+        format!("Downloads one candidate of a find_sources or job search: for job_id (a job waiting for a source choice, failed or cancelled) it becomes the job's source; with a reference (and folder_id, else the default folder) it starts a new job in a new batch. The candidate's search must be of the same kind as the job or reference (track or album). Jobs started in Soulful's web page take their source there. Answers the job's full document, as get_jobs gives it. Failure codes: {common}, unknown_handle (job, candidate or folder), expired_handle, wrong_job_state, folder_required, importer_broken, backend_not_configured, already_running (a job already wants this recording; or a call with this request_key still runs), metadata_not_found, metadata_unavailable (album tracklist).")
+    },
+    input_schema: concat!(
+        r#"{"type": "object", "additionalProperties": false, "required": ["candidate_id"], "properties": {"candidate_id": {"type": "string", "minLength": 1}, "job_id": {"type": "string", "minLength": 1}, "reference": "#,
+        reference_schema!(),
+        r#", "folder_id": {"type": "string", "minLength": 1}, "#,
+        request_key_schema!(),
+        "}}"
+    ),
+    read_only: false,
+    destructive: false,
+    idempotent: false,
+    open_world: true,
+    call: |state, caller, args| Box::pin(download_source(state, caller, args)),
+};
+
+/// A download_source call as read: the candidate, whose job it becomes, the key.
+fn read_download(args: &Args) -> Result<(String, SourceTarget, Option<String>), ToolError> {
+    let candidate_id = args.string("candidate_id")?;
+    let target = match args.opt_string("job_id")? {
+        Some(job_id) => {
+            args.absent("reference", "absent when job_id is given")?;
+            args.absent("folder_id", "absent when job_id is given")?;
+            SourceTarget::Job(job_id)
+        }
+        None if args.has("reference") => SourceTarget::New {
+            wanted: wanted(&args.object("reference", REFERENCE_FIELDS)?)?,
+            folder_id: args.opt_string("folder_id")?,
+        },
+        None => {
+            let expected = "a job id, or a reference with folder_id";
+            return Err(invalid_value(DOWNLOAD_SOURCE, "job_id", expected));
+        }
+    };
+    let key = request_key(args)?;
+    args.finish()?;
+    Ok((candidate_id, target, key))
+}
+
+/// `download_source`: a candidate becomes a job's source, once per request key.
+pub(crate) async fn download_source(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new(DOWNLOAD_SOURCE, args, DOWNLOAD_SOURCE_ARGS);
+    let (candidate_id, target, key) = match read_download(&args) {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let call = match &target {
+        SourceTarget::Job(job_id) => json!({"candidate_id": candidate_id, "job_id": job_id}),
+        SourceTarget::New { wanted, folder_id } => json!({"candidate_id": candidate_id,
+            "reference": reference_value(wanted), "folder_id": folder_id}),
+    };
+    let on = JobTool::of(DOWNLOAD_SOURCE, state, caller);
+    let (again, given) = (args.same_call(), args.as_value());
+    let work = async move {
+        let job = match &target {
+            SourceTarget::Job(id) => Some(id.clone()),
+            SourceTarget::New { .. } => None,
+        };
+        let ctx = &on.caller.ctx;
+        match core_download_source(&on.acquire, ctx, target, &candidate_id).await {
+            // No default folder: the call again with each of the user's folders.
+            Ok(RetryAnswer::Refused(failure, facts)) if facts.contains_key("folders") => {
+                Keyed::Released(failed(with_folders(failure, facts, &given)))
+            }
+            answered => on.answer(job.as_deref(), answered, again).await,
+        }
+    };
+    keyed(&state.acquire, caller, DOWNLOAD_SOURCE, key, &call, work).await
+}
+
+/// folder_required with the user's `folders` in `facts`: the call `given` again with each one's
+/// folder_id.
+fn with_folders(mut failure: Failure, facts: Map<String, Value>, given: &Value) -> ToolError {
+    let ids = (facts["folders"].as_array().into_iter().flatten()).map(|f| f["folder_id"].clone());
+    let next: Vec<NextCall> = ids
+        .filter_map(|folder_id| {
+            let mut call = given.clone();
+            call["folder_id"] = folder_id;
+            repeatable(DOWNLOAD_SOURCE, call)
+        })
+        .collect();
+    if next.is_empty() {
+        failure.message = too_large_to_repeat(&failure.message);
+    }
+    ToolError {
+        failure,
+        facts,
+        tried: vec![],
+        next,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use serde_json::{json, Value};
 
+    use std::time::Duration;
+
+    use shared::download::{DownloadQuery, SearchState, SearchStats};
+
+    use crate::auth::UserId;
     use crate::connection::test_util::{
         add_folder, app_of, app_with_acquire, app_with_navidrome, call_tool, count, document,
         jobs_app, set_default_folder,
     };
-    use crate::core::jobs::test_support::batch_of_searches;
+    use crate::core::acquire::{Acquisition, NewBatch};
+    use crate::core::folder_of;
+    use crate::core::jobs::runner::{Acquire, TestEffects};
+    use crate::core::jobs::test_support::{batch_of_searches, choosing_track_job, view_of};
     use crate::import_queue::test_support::{broken, ready};
     use crate::ledger::MCP_UNFINISHED_JOBS_PER_USER;
+    use crate::ledger::{NewSearch, StoredSpec};
+    use crate::server_fns::download::test_support::{group, item, search_result, track};
     use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub};
 
     #[tokio::test]
@@ -830,6 +956,260 @@ mod tests {
             (Some("invalid_input"), Some("replace_existing"))
         );
         assert_eq!(count(&db, "jobs").await, 0);
+    }
+
+    /// The id of `source`'s candidate in the search of alice's job `job`.
+    async fn candidate_of(acq: &Acquire, job: &str, source: &str) -> String {
+        let search = view_of(acq, job).await.search.unwrap();
+        let groups = search.candidates.unwrap();
+        let index = groups.iter().position(|g| g.source == source).unwrap();
+        format!("{}:{index}", search.id)
+    }
+
+    /// The enqueues once there are `n`, the job runner sending them in its own task.
+    async fn enqueued(effects: &TestEffects, n: usize) -> Vec<(NewBatch, Acquisition)> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while effects.enqueued().len() < n {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the runner enqueued");
+        effects.enqueued()
+    }
+
+    #[tokio::test]
+    async fn download_source_continues_a_job_waiting_for_a_choice() {
+        let (db, acq, effects, token) = jobs_app().await;
+        let job = choosing_track_job(&acq).await;
+        let candidate = candidate_of(&acq, &job, "peer_b").await;
+        let doc = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "download_source",
+                json!({"job_id": job, "candidate_id": candidate}),
+            )
+            .await,
+        );
+        assert_eq!(
+            (doc["job_id"].as_str(), doc["state"].as_str()),
+            (Some(job.as_str()), Some("queued")),
+            "{doc}"
+        );
+        let sent = enqueued(&effects, 1).await;
+        assert_eq!(
+            (sent[0].1.job.as_str(), sent[0].1.items[0].1.source.as_str()),
+            (job.as_str(), "peer_b")
+        );
+        // Queued now: another choice for it is refused, with what can be done instead.
+        let other = candidate_of(&acq, &job, "peer_a").await;
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "download_source",
+                json!({"job_id": job, "candidate_id": other}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            (error["code"].as_str(), error["facts"]["state"].as_str()),
+            (Some("wrong_job_state"), Some("queued")),
+            "{error}"
+        );
+        let tools: Vec<&str> = (error["next"].as_array().unwrap().iter())
+            .map(|n| n["tool"].as_str().unwrap())
+            .collect();
+        assert_eq!(tools, vec!["get_jobs", "cancel_job"]);
+    }
+
+    #[tokio::test]
+    async fn a_candidate_of_another_users_search_reads_like_an_unknown_one() {
+        let (db, acq, _, token) = jobs_app().await;
+        folder_of(&db, "bob").await;
+        let bob = UserId::new("bob");
+        let search_id = uuid::Uuid::new_v4().to_string();
+        acq.ledger
+            .record_search(NewSearch {
+                id: search_id.clone(),
+                user: bob,
+                backend: Some("slskd".into()),
+                query: DownloadQuery::new(vec![track("Marrow Choir", "O Holy Night")]),
+                spec: Some(StoredSpec::default()),
+            })
+            .await
+            .unwrap();
+        let found = vec![group(
+            "peer_a",
+            vec![item("peer_a", "O Holy Night", "a/03.flac")],
+            0.9,
+        )];
+        acq.ledger
+            .search_ended(&search_id, Ok((found, SearchStats::default())))
+            .await
+            .unwrap();
+        for candidate in [
+            format!("{search_id}:0"),
+            format!("{search_id}:7"),
+            "not a candidate".to_string(),
+        ] {
+            let error = document(
+                &call_tool(
+                    app_of(&db, &acq),
+                    &token,
+                    "download_source",
+                    json!({"candidate_id": candidate,
+                        "reference": {"artist": "Marrow Choir", "title": "O Holy Night"}}),
+                )
+                .await,
+            )["error"]
+                .clone();
+            assert_eq!(
+                (error["code"].as_str(), error["message"].as_str()),
+                (Some("unknown_handle"), Some("Candidate not found")),
+                "{candidate}"
+            );
+        }
+        assert_eq!(count(&db, "jobs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_chosen_candidate_with_a_reference_starts_a_job_in_a_new_batch() {
+        let (db, acq, effects, token) = jobs_app().await;
+        let job = choosing_track_job(&acq).await;
+        let candidate = candidate_of(&acq, &job, "peer_b").await;
+        // alice has no default folder: the call again with each of hers.
+        let reference = json!({"artist": "Marrow Choir", "title": "O Come All Ye Faithful"});
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "download_source",
+                json!({"candidate_id": candidate, "reference": reference}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(error["code"], "folder_required", "{error}");
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "download_source", "args": {"candidate_id": candidate,
+                "reference": reference, "folder_id": "alice-folder"}}])
+        );
+        // The same recording as alice's waiting job: refused, naming it.
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "download_source",
+                json!({"candidate_id": candidate, "reference": reference,
+                    "folder_id": "alice-folder"}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            (error["code"].as_str(), error["facts"]["job_id"].as_str()),
+            (Some("already_running"), Some(job.as_str())),
+            "{error}"
+        );
+        let other = json!({"artist": "Marrow Choir", "title": "Adeste Fideles"});
+        let doc = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "download_source",
+                json!({"candidate_id": candidate, "reference": other,
+                    "folder_id": "alice-folder"}),
+            )
+            .await,
+        );
+        assert_eq!(doc["state"], "queued", "{doc}");
+        assert_ne!(doc["batch_id"], view_of(&acq, &job).await.job.batch_id);
+        let sent = enqueued(&effects, 1).await;
+        assert_eq!(sent[0].1.items[0].1.source, "peer_b");
+        // A track's candidate for an album: refused.
+        let album = json!({"kind": "album", "artist": "Kowloon", "title": "Come Over",
+            "release_mbid": "6a09041b-0f79-3278-88d9-0552dd28d37f"});
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "download_source",
+                json!({"candidate_id": candidate, "reference": album}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            error["message"],
+            "download_source: candidate_id must be a candidate of an album search"
+        );
+    }
+
+    // On the real clock: the database answers from its own thread, and the search polls once,
+    // 2 s after it starts.
+    #[tokio::test]
+    async fn a_review_batch_offers_each_jobs_candidates_through_get_batch() {
+        let (db, acq, effects, token) = app_with_acquire().await;
+        effects.stub().script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            vec![
+                group(
+                    "peer_a",
+                    vec![item("peer_a", "O Holy Night", "a/03.flac")],
+                    0.9,
+                ),
+                group(
+                    "peer_b",
+                    vec![item("peer_b", "O Holy Night", "b/03.flac")],
+                    0.8,
+                ),
+            ],
+        ))]);
+        let app = app_of(&db, &acq);
+        let made = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "ensure_in_library",
+                json!({"pick": "review",
+                    "items": [{"artist": "Marrow Choir", "title": "O Holy Night"}]}),
+            )
+            .await,
+        );
+        let batch = made["batch_id"].clone();
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "get_batch",
+                json!({"batch_id": batch, "wait_seconds": 180, "wait_for": "needs_action"}),
+            )
+            .await,
+        );
+        let job = &doc["needs_action"][0];
+        assert_eq!(job["state"], "needs_source_choice", "{doc}");
+        let choices: Vec<&Value> = (job["next"].as_array().unwrap().iter())
+            .filter(|n| n["tool"] == "download_source")
+            .collect();
+        assert_eq!(
+            choices
+                .iter()
+                .map(|n| n["source"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["peer_a", "peer_b"]
+        );
+        assert!(
+            choices
+                .iter()
+                .all(|n| n["args"]["job_id"] == job["job_id"]
+                    && n["args"]["candidate_id"].is_string())
+        );
+        assert!(effects.enqueued().is_empty(), "review downloads nothing");
     }
 
     #[tokio::test]

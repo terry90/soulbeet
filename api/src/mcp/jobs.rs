@@ -1,29 +1,44 @@
-//! `get_jobs`: the caller's jobs, by id or by batch and state, waiting for them to change when
-//! asked.
+//! The job tools: `get_jobs` shows the caller's jobs, by id or by batch and state, waiting for
+//! them to change when asked; `retry_job`, `cancel_job` and `dismiss_job` act on one.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::download::DownloadProgress;
-use shared::failure::{Failure, Stage};
+use shared::failure::{Failure, RetryAdvice, Stage};
 use soulbeet::navidrome::NavidromeClient;
 use soulbeet::ImportedItem;
+use sqlx::SqlitePool;
+use tracing::warn;
 
 use super::args::{repeatable, Args};
-use super::contract::{answer, invalid_value, too_large_to_repeat, upstream_error, ToolError};
+use super::contract::{
+    answer, failed, invalid_value, success, too_large_to_repeat, upstream_error, NextCall,
+    ToolError,
+};
 use super::facts::{
     asks_backend, job_document, live_facts, results_of, unanswered, Detail, LiveFacts, ReadNow,
 };
+use super::keys::{keyed, request_key, Keyed};
+use super::next::next_calls;
 use super::paging::{fit, Page};
-use super::refs::{page_schema, wait_schema};
+use super::refs::{filters, filters_schema, page_schema, request_key_schema, wait_schema};
 use super::server::{common_codes, ToolSpec};
 use super::{wait, McpCaller};
+use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
 use crate::core::index::library_songs;
-use crate::core::jobs::{job_not_found, job_records, views_of, JobSelect, JobView};
+use crate::core::index::NavidromeOf;
+use crate::core::jobs::retry::{cancel, dismiss, retry, NewSearchArgs, RetryAnswer};
+use crate::core::jobs::runner::Acquire;
+use crate::core::jobs::{
+    job_not_found, job_records, job_view, recent_failures, untried, untried_given, views_of,
+    JobSelect, JobView, RetryMode, Untried,
+};
 use crate::core::library::{navidrome_failure, navidrome_for, SongFacts};
 use crate::ledger::store::JobRecord;
 use crate::ledger::{JobState, SlotResult};
@@ -256,17 +271,32 @@ pub(crate) async fn get_jobs(
             let shown = views_of(&acquire.db, &acquire.ledger, &caller.ctx, page)
                 .await
                 .map_err(failed)?;
+            let untried = untried_of(&acquire.db, &shown).await.map_err(failed)?;
             let reads = match call.detail {
                 Detail::Summary => shown.iter().map(|_| ReadNow::default()).collect(),
-                Detail::Full => read_now(state, caller, &shown).await,
+                Detail::Full => read_now(acquire, &*state.navidrome, &caller.ctx, &shown).await,
             };
-            let documents = (shown.iter().zip(&reads))
-                .map(|(view, now)| job_document(view, call.detail, now))
+            let documents = (shown.iter().zip(&untried).zip(&reads))
+                .map(|((view, untried), now)| {
+                    job_document(view, untried, call.detail, now, caller.allow_delete)
+                })
                 .collect();
             Ok(fit(Map::new(), "jobs", documents, &call.page, more))
         }
         .await,
     )
+}
+
+/// Each of `views`' untried candidates, the sources' recent failures read once.
+pub(crate) async fn untried_of(
+    db: &SqlitePool,
+    views: &[JobView],
+) -> Result<Vec<Untried>, Failure> {
+    let now = chrono::Utc::now().timestamp();
+    let failures = recent_failures(db, now).await?;
+    Ok((views.iter())
+        .map(|view| untried_given(view, &failures, now))
+        .collect())
 }
 
 /// The ids of `select` that are none of `jobs`, each once, in the order given.
@@ -317,11 +347,12 @@ fn unknown_jobs(args: &Args, select: &JobSelect, unknown: Vec<String>) -> ToolEr
 }
 
 /// What the full documents of `views` read now: the backend's answers about each running
-/// transfer, all asked at once, and the songs Navidrome lists for each import beets found in the
-/// library.
+/// transfer, all asked at once, and the songs `ctx`'s Navidrome lists for each import beets found
+/// in the library.
 pub(crate) async fn read_now(
-    state: &ConnectionState,
-    caller: &McpCaller,
+    acquire: &Acquire,
+    navidrome: &dyn NavidromeOf,
+    ctx: &UserCtx,
     views: &[JobView],
 ) -> Vec<ReadNow> {
     let mut reads: Vec<ReadNow> = views.iter().map(|_| ReadNow::default()).collect();
@@ -336,7 +367,7 @@ pub(crate) async fn read_now(
         })
         .collect();
     if !running.is_empty() {
-        let answers: Vec<Option<LiveFacts>> = match state.acquire.effects.backend().await {
+        let answers: Vec<Option<LiveFacts>> = match acquire.effects.backend().await {
             Ok(backend) => {
                 join_all(running.iter().map(|(_, _, row)| live_facts(&backend, row))).await
             }
@@ -373,7 +404,7 @@ pub(crate) async fn read_now(
         return reads;
     }
     let songs: Vec<Result<Vec<SongFacts>, Failure>> =
-        match navidrome_for(&*state.navidrome, &caller.ctx, Stage::LibraryCheck).await {
+        match navidrome_for(navidrome, ctx, Stage::LibraryCheck).await {
             Ok(navi) => {
                 join_all(found.iter().map(|(i, _, existing)| {
                     listed_songs(&navi, Path::new(&views[*i].job.folder.path), existing)
@@ -404,6 +435,320 @@ async fn listed_songs(
     Ok(songs)
 }
 
+const RETRY_JOB_ARGS: &[&str] = &[
+    "job_id",
+    "mode",
+    "query_text",
+    "formats",
+    "min_bitrate_kbps",
+    "lossless_only",
+    "max_queue_length",
+    "search_id",
+    "request_key",
+];
+
+const JOB_ARGS: &[&str] = &["job_id", "request_key"];
+
+/// retry_job's modes, as the schema lists them.
+const MODES: [&str; 5] = [
+    "same_source",
+    "next_source",
+    "new_search",
+    "index_only",
+    "reject_result",
+];
+
+/// The filters of a new_search.
+const FILTERS: [&str; 4] = [
+    "formats",
+    "min_bitrate_kbps",
+    "lossless_only",
+    "max_queue_length",
+];
+
+pub(crate) const RETRY_JOB: ToolSpec = ToolSpec {
+    name: "retry_job",
+    title: "Retry a job",
+    description: |calls_a_minute| {
+        let common = common_codes(calls_a_minute);
+        format!("Tries a job again in one of five modes. same_source: the source that failed, for a failure that says to retry it later, or a cancelled job (track jobs). next_source: the best source of the job's search not tried yet (track jobs). new_search: a new search, with optional query_text and filters, or the search_id of a find_sources search. index_only: wait for Navidrome again, for a job that failed at indexing. reject_result: a done job's file is not the recording wanted; the job reopens without that source (the file stays in the library until deleted). A mode the job's state does not allow is refused with wrong_job_state; next in every job document lists only the modes allowed now. A failure that needs a person lists none: after the person did what its user_action says, retry_job runs again. A mode refused because of the job's own failure answers that failure. Album jobs retry by new_search or index_only. Jobs started in Soulful's web page are retried there. Answers the job's full document, as get_jobs gives it. Failure codes: {common}, unknown_handle, expired_handle (search_id), wrong_job_state, sources_exhausted, peer_offline (same_source while the source is offline), enqueue_failed (same_source of a source slskd's blacklist holds), backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), already_running (a call with this request_key still runs).")
+    },
+    input_schema: concat!(
+        r#"{"type": "object", "additionalProperties": false, "required": ["job_id", "mode"], "properties": {"job_id": {"type": "string", "minLength": 1}, "mode": {"enum": ["same_source", "next_source", "new_search", "index_only", "reject_result"]}, "query_text": {"type": "string", "minLength": 1}, "#,
+        filters_schema!(),
+        r#", "search_id": {"type": "string", "minLength": 1}, "#,
+        request_key_schema!(),
+        "}}"
+    ),
+    read_only: false,
+    destructive: false,
+    idempotent: false,
+    open_world: true,
+    call: |state, caller, args| Box::pin(retry_job(state, caller, args)),
+};
+
+pub(crate) const CANCEL_JOB: ToolSpec = ToolSpec {
+    name: "cancel_job",
+    title: "Cancel a job",
+    description: |calls_a_minute| {
+        let common = common_codes(calls_a_minute);
+        format!("Cancels a job that is searching, waiting for a source choice, queued or downloading: its search or transfers stop. A transfer that already finished still imports. Jobs started in Soulful's web page are cancelled there. Answers the job's full document. Failure codes: {common}, unknown_handle, wrong_job_state, already_running (a call with this request_key still runs).")
+    },
+    input_schema: concat!(
+        r#"{"type": "object", "additionalProperties": false, "required": ["job_id"], "properties": {"job_id": {"type": "string", "minLength": 1}, "#,
+        request_key_schema!(),
+        "}}"
+    ),
+    read_only: false,
+    destructive: false,
+    idempotent: false,
+    open_world: true,
+    call: |state, caller, args| Box::pin(cancel_job(state, caller, args)),
+};
+
+pub(crate) const DISMISS_JOB: ToolSpec = ToolSpec {
+    name: "dismiss_job",
+    title: "Dismiss a job",
+    description: |calls_a_minute| {
+        let common = common_codes(calls_a_minute);
+        format!("Closes a job that will not be pursued (failed, cancelled, waiting for a source choice or an import decision). For one waiting for an import decision, deletes the downloaded copy Soulful kept for it (never a library file). Answers the job's full document. Failure codes: {common}, unknown_handle (also: another decision already took the kept import; dismiss_job can be called again once it ended), wrong_job_state, already_running (a call with this request_key still runs).")
+    },
+    input_schema: concat!(
+        r#"{"type": "object", "additionalProperties": false, "required": ["job_id"], "properties": {"job_id": {"type": "string", "minLength": 1}, "#,
+        request_key_schema!(),
+        "}}"
+    ),
+    read_only: false,
+    destructive: false,
+    idempotent: false,
+    open_world: true,
+    call: |state, caller, args| Box::pin(dismiss_job(state, caller, args)),
+};
+
+/// What a job tool's work acts and reads through, owned, so the work runs in a task of its own.
+#[derive(Clone)]
+pub(crate) struct JobTool {
+    tool: &'static str,
+    pub acquire: Arc<Acquire>,
+    navidrome: Arc<dyn NavidromeOf>,
+    pub caller: McpCaller,
+}
+
+impl JobTool {
+    pub(crate) fn of(tool: &'static str, state: &ConnectionState, caller: &McpCaller) -> JobTool {
+        JobTool {
+            tool,
+            acquire: state.acquire.clone(),
+            navidrome: state.navidrome.clone(),
+            caller: caller.clone(),
+        }
+    }
+
+    /// `view`'s full document, as get_jobs gives it.
+    async fn document(&self, view: &JobView) -> Result<Map<String, Value>, Failure> {
+        let now = chrono::Utc::now().timestamp();
+        let untried = untried(&self.acquire.db, view, now).await?;
+        let ctx = &self.caller.ctx;
+        let reads = read_now(
+            &self.acquire,
+            &*self.navidrome,
+            ctx,
+            std::slice::from_ref(view),
+        );
+        let read = reads.await.pop().unwrap_or_default();
+        let deletion_enabled = self.caller.allow_delete;
+        let Value::Object(fields) =
+            job_document(view, &untried, Detail::Full, &read, deletion_enabled)
+        else {
+            unreachable!("a job document is an object");
+        };
+        Ok(fields)
+    }
+
+    /// The answer to `answered`, an action on job `job` (None for a job download_source was to
+    /// make). A change made answers the job's full document, kept for the request key. A refusal
+    /// carries the job's `state` and `next` as read again after it, after this call again when
+    /// the failure says the same source can answer later (`again`); an argument the job cannot
+    /// take is invalid_input; a failure that kept the action from running offers `again` as
+    /// upstream errors do. None of these changed anything, so the key is let go.
+    pub(crate) async fn answer(
+        &self,
+        job: Option<&str>,
+        answered: Result<RetryAnswer, Failure>,
+        again: Option<NextCall>,
+    ) -> Keyed {
+        match answered {
+            Ok(RetryAnswer::Applied(view)) => Keyed::Kept(match self.document(&view).await {
+                Ok(fields) => success(fields),
+                Err(f) => failed(upstream_error(f, Map::new(), None)),
+            }),
+            Ok(RetryAnswer::Refused(failure, facts)) => {
+                Keyed::Released(failed(self.refusal(job, failure, facts, again).await))
+            }
+            Ok(RetryAnswer::InvalidInput { field, expected }) => {
+                Keyed::Released(failed(invalid_value(self.tool, field, &expected)))
+            }
+            Err(f) => Keyed::Released(failed(upstream_error(f, Map::new(), again))),
+        }
+    }
+
+    /// `failure` with `facts`, the state of job `job` and its next as read now.
+    async fn refusal(
+        &self,
+        job: Option<&str>,
+        failure: Failure,
+        mut facts: Map<String, Value>,
+        again: Option<NextCall>,
+    ) -> ToolError {
+        let mut next = Vec::new();
+        if failure.retry == RetryAdvice::SameSourceLater {
+            next.extend(again);
+        }
+        if let Some(job) = job {
+            match self.read(job).await {
+                Ok(Some((view, untried))) => {
+                    facts.insert("state".into(), json!(view.job.state.as_str()));
+                    next.extend(next_calls(&view, &untried));
+                }
+                Ok(None) => {}
+                Err(f) => warn!(
+                    "Could not read job {job} again after a refusal: {}",
+                    f.message
+                ),
+            }
+        }
+        ToolError {
+            failure,
+            facts,
+            tried: vec![],
+            next,
+        }
+    }
+
+    /// The caller's job `job` and its untried candidates.
+    async fn read(&self, job: &str) -> Result<Option<(JobView, Untried)>, Failure> {
+        let Some(view) = job_view(&self.acquire, &self.caller.ctx, job).await? else {
+            return Ok(None);
+        };
+        let now = chrono::Utc::now().timestamp();
+        let untried = untried(&self.acquire.db, &view, now).await?;
+        Ok(Some((view, untried)))
+    }
+}
+
+/// `mode`, required, one of MODES.
+fn read_mode(args: &Args) -> Result<RetryMode, ToolError> {
+    let refused = || invalid_value("retry_job", "mode", &format!("one of {}", MODES.join(", ")));
+    let name = args.opt_choice("mode", &MODES)?.ok_or_else(refused)?;
+    (RetryMode::ALL.into_iter())
+        .find(|mode| mode.as_str() == name)
+        .ok_or_else(refused)
+}
+
+/// A retry_job call as read: the job, the mode, what a new_search searches with, the key.
+fn read_retry(
+    args: &Args,
+) -> Result<(String, RetryMode, NewSearchArgs, Option<String>), ToolError> {
+    let job_id = args.string("job_id")?;
+    let mode = read_mode(args)?;
+    let mut search = NewSearchArgs::default();
+    if mode == RetryMode::NewSearch {
+        search.query_text = args.opt_string("query_text")?;
+        search.search_id = args.opt_string("search_id")?;
+        if search.search_id.is_some() {
+            args.absent("query_text", "absent when search_id is given")?;
+        }
+        let read = filters(args)?;
+        if FILTERS.iter().any(|name| args.has(name)) {
+            search.filters = Some(read);
+        }
+    } else {
+        let names = ["query_text"]
+            .into_iter()
+            .chain(FILTERS)
+            .chain(["search_id"]);
+        for name in names {
+            args.absent(name, "absent unless mode is new_search")?;
+        }
+    }
+    let key = request_key(args)?;
+    args.finish()?;
+    Ok((job_id, mode, search, key))
+}
+
+/// `retry_job`: one mode of retry on the caller's job, once per request key.
+pub(crate) async fn retry_job(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new("retry_job", args, RETRY_JOB_ARGS);
+    let (job_id, mode, search, key) = match read_retry(&args) {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let call = json!({"job_id": job_id, "mode": mode.as_str(), "query_text": search.query_text,
+        "filters": search.filters, "search_id": search.search_id});
+    let on = JobTool::of("retry_job", state, caller);
+    let again = args.same_call();
+    let work = async move {
+        let ctx = &on.caller.ctx;
+        let answered = retry(&on.acquire, ctx, &job_id, mode, Some(search)).await;
+        on.answer(Some(&job_id), answered, again).await
+    };
+    keyed(&state.acquire, caller, "retry_job", key, &call, work).await
+}
+
+/// The job id and key of a cancel_job or dismiss_job call.
+fn read_job(args: &Args) -> Result<(String, Option<String>), ToolError> {
+    let job_id = args.string("job_id")?;
+    let key = request_key(args)?;
+    args.finish()?;
+    Ok((job_id, key))
+}
+
+/// `cancel_job`: the caller's job stops, once per request key.
+pub(crate) async fn cancel_job(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new("cancel_job", args, JOB_ARGS);
+    let (job_id, key) = match read_job(&args) {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let call = json!({"job_id": job_id});
+    let on = JobTool::of("cancel_job", state, caller);
+    let again = args.same_call();
+    let work = async move {
+        let answered = cancel(&on.acquire, &on.caller.ctx, &job_id).await;
+        on.answer(Some(&job_id), answered, again).await
+    };
+    keyed(&state.acquire, caller, "cancel_job", key, &call, work).await
+}
+
+/// `dismiss_job`: the caller's job is closed, once per request key.
+pub(crate) async fn dismiss_job(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    args: Option<JsonObject>,
+) -> CallToolResult {
+    let args = Args::new("dismiss_job", args, JOB_ARGS);
+    let (job_id, key) = match read_job(&args) {
+        Ok(read) => read,
+        Err(e) => return failed(e),
+    };
+    let call = json!({"job_id": job_id});
+    let on = JobTool::of("dismiss_job", state, caller);
+    let again = args.same_call();
+    let work = async move {
+        let answered = dismiss(&on.acquire, &on.caller.ctx, &job_id).await;
+        on.answer(Some(&job_id), answered, again).await
+    };
+    keyed(&state.acquire, caller, "dismiss_job", key, &call, work).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -419,7 +764,7 @@ mod tests {
     use crate::core::jobs::runner::drive;
     use crate::core::jobs::test_support::{
         auto_options, downloading_track_job, downloading_track_job_with, duplicate_track_job,
-        mcp_track_job, track_job_of,
+        failed_track_job, failed_web_ui_job, mcp_track_job, track_job_of,
     };
     use crate::core::test_ctx;
     use crate::ledger::{JobEvent, JobState};
@@ -477,7 +822,8 @@ mod tests {
         assert_eq!(
             doc["jobs"][0]["next"],
             json!([{"tool": "get_jobs", "args": {"job_ids": [job], "detail": "full",
-                "wait_seconds": 60, "wait_for": "any_change"}}])
+                "wait_seconds": 60, "wait_for": "any_change"}},
+                {"tool": "cancel_job", "args": {"job_id": job}}])
         );
     }
 
@@ -562,9 +908,14 @@ mod tests {
             ),
             "{doc}"
         );
+        // Other words, or let it go.
         assert_eq!(
             (doc["jobs"][0]["state"].as_str(), &failure["next"]),
-            (Some("failed"), &json!([]))
+            (
+                Some("failed"),
+                &json!([{"tool": "retry_job", "args": {"job_id": job, "mode": "new_search"}},
+                    {"tool": "dismiss_job", "args": {"job_id": job}}])
+            )
         );
     }
 
@@ -727,6 +1078,139 @@ mod tests {
             searching["jobs"][0]["wanted"],
             json!({"kind": "track", "artist": "Marrow Choir", "title": "Silent Night"})
         );
+    }
+
+    #[tokio::test]
+    async fn retry_job_answers_the_jobs_full_document_or_its_refusal_with_what_can_be_done() {
+        let (db, acq, _, token) = jobs_app().await;
+        let failed = failed_track_job(&acq).await;
+        let doc = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "retry_job",
+                json!({"job_id": failed, "mode": "next_source"}),
+            )
+            .await,
+        );
+        assert_eq!(
+            (doc["job_id"].as_str(), doc["state"].as_str()),
+            (Some(failed.as_str()), Some("queued")),
+            "{doc}"
+        );
+        assert!(doc["slots"].is_array() && doc["timeline"].is_array());
+        let running = downloading_track_job_with(&acq, "Silent Night", auto_options()).await;
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "retry_job",
+                json!({"job_id": running, "mode": "new_search"}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            error["message"],
+            "The job is downloading; retry_job new_search needs a job that is needs_source_choice, failed or cancelled"
+        );
+        assert_eq!(
+            (&error["facts"]["state"], &error["facts"]["allowed_states"]),
+            (
+                &json!("downloading"),
+                &json!(["needs_source_choice", "failed", "cancelled"])
+            )
+        );
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "get_jobs", "args": {"job_ids": [running], "detail": "full",
+                "wait_seconds": 60, "wait_for": "any_change"}},
+                {"tool": "cancel_job", "args": {"job_id": running}}])
+        );
+    }
+
+    #[tokio::test]
+    async fn search_arguments_belong_to_new_search_only() {
+        let (db, acq, _, token) = jobs_app().await;
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "retry_job",
+                json!({"job_id": "j1", "mode": "next_source", "lossless_only": true}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            error["message"],
+            "retry_job: lossless_only must be absent unless mode is new_search"
+        );
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "retry_job",
+                json!({"job_id": "j1", "mode": "new_search", "search_id": "s1",
+                    "query_text": "Marrow Choir"}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            error["message"],
+            "retry_job: query_text must be absent when search_id is given"
+        );
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "retry_job",
+                json!({"job_id": "j1"}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(
+            error["message"],
+            "retry_job: mode must be one of same_source, next_source, new_search, index_only, reject_result"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_job_and_dismiss_job_act_on_the_callers_jobs_only() {
+        let (db, acq, _, token) = jobs_app().await;
+        let job = downloading_track_job(&acq).await;
+        let app = app_of(&db, &acq);
+        let doc =
+            document(&call_tool(app.clone(), &token, "cancel_job", json!({"job_id": job})).await);
+        // Its transfer is stopped by its monitor: the job stays downloading until then.
+        assert_eq!(doc["state"], "downloading", "{doc}");
+        let web = failed_web_ui_job(&acq).await;
+        let error =
+            document(&call_tool(app.clone(), &token, "cancel_job", json!({"job_id": web})).await)
+                ["error"]
+                .clone();
+        assert_eq!(
+            error["message"],
+            "cancel_job: job_id must be a job started by ensure_in_library or download_source; this one was started in Soulful's web page, where it can be cancelled or retried"
+        );
+        let doc =
+            document(&call_tool(app.clone(), &token, "dismiss_job", json!({"job_id": web})).await);
+        assert_eq!(doc["state"], "dismissed", "{doc}");
+        folder_of(&db, "bob").await;
+        let bobs = track_job_of(&acq, "bob").await;
+        for tool in ["cancel_job", "dismiss_job"] {
+            let error =
+                document(&call_tool(app.clone(), &token, tool, json!({"job_id": bobs})).await)
+                    ["error"]
+                    .clone();
+            assert_eq!(
+                (error["code"].as_str(), error["message"].as_str()),
+                (Some("unknown_handle"), Some("Job not found")),
+                "{tool}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -17,6 +17,11 @@ use soulbeet::ImportMode;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+/// How long a job's cancel mark is kept: a job that ends drops its mark, so one left over this
+/// long belongs to a job the ledger lost.
+const JOB_MARK_KEPT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Who started a batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,8 +114,8 @@ struct Held {
     /// its key's claim.
     cancelled: HashSet<TransferKey>,
     /// Jobs whose user asked to cancel them while they may have transfers
-    /// (design D9). The ledger's writer sets and clears these marks.
-    cancelled_jobs: HashSet<String>,
+    /// (design D9), with when. The ledger's writer sets and clears these marks.
+    cancelled_jobs: HashMap<String, Instant>,
 }
 
 impl Held {
@@ -284,14 +289,21 @@ impl TransferRegistry {
         held.held_by(key, owner) && held.cancelled.contains(key)
     }
 
-    /// Marks `job` cancelled: every monitor stops each of its slots.
+    /// Marks `job` cancelled: every monitor stops each of its slots on its next poll. Marks
+    /// older than JOB_MARK_KEPT are dropped when one is added.
     pub fn cancel_job(&self, job: &str) {
-        self.held().cancelled_jobs.insert(job.to_string());
+        self.cancel_job_at(job, Instant::now());
+    }
+
+    fn cancel_job_at(&self, job: &str, now: Instant) {
+        let mut held = self.held();
+        (held.cancelled_jobs).retain(|_, marked| now.duration_since(*marked) < JOB_MARK_KEPT);
+        held.cancelled_jobs.insert(job.to_string(), now);
     }
 
     /// Whether `job` is marked cancelled.
     pub fn job_cancelled(&self, job: &str) -> bool {
-        self.held().cancelled_jobs.contains(job)
+        self.held().cancelled_jobs.contains_key(job)
     }
 
     /// Drops `job`'s cancel mark: it ended, or it downloads again.
@@ -421,6 +433,19 @@ impl Drop for InboxReservation {
 mod tests {
     use super::*;
     use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
+
+    #[test]
+    fn a_job_mark_older_than_a_day_is_dropped_when_another_is_added() {
+        let registry = TransferRegistry::default();
+        registry.cancel_job("j1");
+        registry.reopen_job("j0");
+        assert!(registry.job_cancelled("j1"));
+        let later = Instant::now() + JOB_MARK_KEPT + Duration::from_secs(1);
+        registry.cancel_job_at("j2", later);
+        assert!(!registry.job_cancelled("j1") && registry.job_cancelled("j2"));
+        registry.reopen_job("j2");
+        assert!(!registry.job_cancelled("j2"));
+    }
 
     fn batch(user_id: &str, batch_id: &str, import_mode: ImportMode) -> BatchRef {
         BatchRef::new(

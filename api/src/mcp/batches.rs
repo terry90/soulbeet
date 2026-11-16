@@ -11,14 +11,14 @@ use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_M
 use super::args::Args;
 use super::contract::{answer, invalid_value, upstream_error, NextCall, ToolError};
 use super::facts::{job_document, Detail, ReadNow};
-use super::jobs::{needs_action, read_now, Since, WaitFor, MAX_JOB_IDS};
+use super::jobs::{needs_action, read_now, untried_of, Since, WaitFor, MAX_JOB_IDS};
 use super::paging::{chars, fit, fit_whole, longest_fitting, Page};
 use super::refs::{page_schema, wait_schema};
 use super::server::{common_codes, ToolSpec};
 use super::{wait, McpCaller};
 use crate::connection::ConnectionState;
 use crate::core::database_failure;
-use crate::core::jobs::{job_records, views_of, JobSelect, JobView};
+use crate::core::jobs::{job_records, views_of, JobSelect, JobView, Untried};
 use crate::ledger::store::{batch_of, batches_of, BatchRecord, JobRecord};
 use crate::ledger::JobState;
 
@@ -152,13 +152,24 @@ async fn batch_document(
         .filter(|job| job.changed_seq > since || needs_action(job.state))
         .cloned()
         .collect();
-    let views = views_of(&state.acquire.db, &state.acquire.ledger, &caller.ctx, shown).await?;
-    let mut changed: Vec<&JobView> = (views.iter())
-        .filter(|v| v.job.changed_seq > since)
+    let acquire = &state.acquire;
+    let views = views_of(&acquire.db, &acquire.ledger, &caller.ctx, shown).await?;
+    let untried = untried_of(&acquire.db, &views).await?;
+    let mut changed: Vec<(&JobView, &Untried)> = (views.iter().zip(&untried))
+        .filter(|(v, _)| v.job.changed_seq > since)
         .collect();
-    changed.sort_by_key(|v| Reverse(v.job.changed_seq));
+    changed.sort_by_key(|(v, _)| Reverse(v.job.changed_seq));
+    let deletion_enabled = caller.allow_delete;
     let changed: Vec<Value> = (changed.into_iter())
-        .map(|v| job_document(v, Detail::Summary, &ReadNow::default()))
+        .map(|(v, untried)| {
+            job_document(
+                v,
+                untried,
+                Detail::Summary,
+                &ReadNow::default(),
+                deletion_enabled,
+            )
+        })
         .collect();
     let Value::Object(fields) = json!({
         "batch_id": batch.id,
@@ -172,12 +183,15 @@ async fn batch_document(
         unreachable!("an object literal is an object");
     };
     // In creation order, as job_records reads them.
-    let needs: Vec<JobView> = (views.into_iter())
-        .filter(|v| needs_action(v.job.state))
-        .collect();
-    let reads = read_now(state, caller, &needs).await;
-    let needs = (needs.iter().zip(&reads))
-        .map(|(view, now)| (view.job.id.clone(), job_document(view, Detail::Full, now)))
+    let (needs, needs_untried): (Vec<JobView>, Vec<Untried>) = (views.into_iter().zip(untried))
+        .filter(|(v, _)| needs_action(v.job.state))
+        .unzip();
+    let reads = read_now(acquire, &*state.navidrome, &caller.ctx, &needs).await;
+    let needs = (needs.iter().zip(&needs_untried).zip(&reads))
+        .map(|((view, untried), now)| {
+            let document = job_document(view, untried, Detail::Full, now, deletion_enabled);
+            (view.job.id.clone(), document)
+        })
         .collect();
     Ok(fit_actions(fields, needs, changed))
 }

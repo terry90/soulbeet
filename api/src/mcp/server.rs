@@ -250,6 +250,10 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     batches::GET_BATCH,
     batches::LIST_BATCHES,
     ensure::ENSURE_IN_LIBRARY,
+    jobs::RETRY_JOB,
+    jobs::CANCEL_JOB,
+    jobs::DISMISS_JOB,
+    ensure::DOWNLOAD_SOURCE_TOOL,
 ];
 
 impl ToolSpec {
@@ -423,7 +427,11 @@ mod tests {
                 "get_release",
                 "get_recording_releases",
                 "find_sources",
-                "ensure_in_library"
+                "ensure_in_library",
+                "retry_job",
+                "cancel_job",
+                "dismiss_job",
+                "download_source"
             ]
         );
         assert!(tools[0]["description"]
@@ -479,6 +487,14 @@ mod tests {
             "ensure_in_library" => {
                 json!({"items": [{"artist": "Marrow Choir", "title": "O Holy Night"}]})
             }
+            "retry_job" => {
+                json!({"job_id": "5b0e3c2a-7d41-4f6e-9a18-c3d2e1f0a9b8", "mode": "new_search"})
+            }
+            "cancel_job" | "dismiss_job" => {
+                json!({"job_id": "5b0e3c2a-7d41-4f6e-9a18-c3d2e1f0a9b8"})
+            }
+            "download_source" => json!({"candidate_id": "3f1c0d52-8a8e-4c2b-9d61-2b7f0e5a4c19:0",
+                "job_id": "5b0e3c2a-7d41-4f6e-9a18-c3d2e1f0a9b8"}),
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -541,6 +557,10 @@ mod tests {
         ("get_batch", true, false, true, false),
         ("list_batches", true, false, true, false),
         ("ensure_in_library", false, false, false, true),
+        ("retry_job", false, false, false, true),
+        ("cancel_job", false, false, false, true),
+        ("dismiss_job", false, false, false, true),
+        ("download_source", false, false, false, true),
     ];
 
     #[test]

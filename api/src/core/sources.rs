@@ -6,7 +6,9 @@ use crate::auth::{UserCtx, UserId};
 use crate::core::{backend_unavailable, database_failure, metadata};
 use crate::db::DB;
 use crate::ledger::store::{self, StoredSearch};
-use crate::ledger::{Ledger, NewSearch, SearchOutcome, SourceFilters, StoredSpec, LEDGER};
+use crate::ledger::{
+    Ledger, NewSearch, SearchOutcome, SourceFilters, StoredSpec, LEDGER, SEARCH_KEPT_SECS,
+};
 use crate::services::{
     available_download_backends, download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND,
 };
@@ -356,6 +358,16 @@ pub fn no_candidate_passed() -> Failure {
     )
 }
 
+/// D9: a job's search stopped before it ran, because the job was cancelled.
+pub fn search_stopped() -> Failure {
+    Failure::new(
+        FailureCode::SearchStopped,
+        Stage::SourceSearch,
+        RetryAdvice::NotRetryable,
+        "The search was stopped because its job was cancelled",
+    )
+}
+
 /// A stored search that no task runs any more: Soulful restarted while it ran.
 pub fn server_restarted_search() -> Failure {
     Failure::new(
@@ -412,8 +424,20 @@ struct Run {
     user: UserId,
     purpose: SearchFor,
     holds_turn: bool,
-    /// The backend's id of the search, once the task started it.
-    backend_search: Option<String>,
+    /// The backend's id of the search and the backend, once the task started it.
+    started: Option<(String, Arc<dyn DownloadBackend>)>,
+    /// `Searches::stop` asked for it: it never takes the turn, or is stopped at the backend.
+    stop: bool,
+}
+
+/// The searches in line, and the ids stopped before a task ran them.
+#[derive(Default)]
+struct Line {
+    /// In arrival order: the first holds the turn once its task took it, the rest wait.
+    runs: Vec<Run>,
+    /// Ids `Searches::stop` named while no task ran them, with when (unix seconds): a task that
+    /// starts one of them afterwards stores it stopped without searching.
+    stops: HashMap<String, i64>,
 }
 
 /// The MCP searches: one at a time, every MCP search holding the turn while it runs (design
@@ -421,9 +445,9 @@ struct Run {
 /// for it.
 #[derive(Default)]
 pub struct Searches {
-    /// In arrival order: the first holds the turn once its task took it, the rest wait.
-    runs: Mutex<Vec<Run>>,
-    /// Notified when a search leaves, so the next one takes the turn.
+    line: Mutex<Line>,
+    /// Notified when a search leaves or is stopped, so the next one takes the turn and a stopped
+    /// one stops waiting for it.
     left: Notify,
 }
 
@@ -432,7 +456,12 @@ impl Searches {
     /// the task's life). A stored search that reads Running and is not running here was cut off
     /// by a restart.
     pub fn runs(&self, id: &str) -> bool {
-        self.runs.lock().unwrap().iter().any(|run| run.id == id)
+        self.line
+            .lock()
+            .unwrap()
+            .runs
+            .iter()
+            .any(|run| run.id == id)
     }
 
     /// Waits until no task of this process runs stored search `id`: its task stored how it
@@ -453,54 +482,88 @@ impl Searches {
     /// The searches holding or waiting for the turn before search `id`; None once it holds the
     /// turn, and for a search no task runs.
     pub fn ahead_of(&self, id: &str) -> Option<usize> {
-        let runs = self.runs.lock().unwrap();
-        let place = runs.iter().position(|run| run.id == id)?;
-        (!runs[place].holds_turn).then_some(place)
+        let line = self.line.lock().unwrap();
+        let place = line.runs.iter().position(|run| run.id == id)?;
+        (!line.runs[place].holds_turn).then_some(place)
     }
 
     /// The ids of `user`'s `find_sources` searches waiting for the turn, in arrival order.
     pub fn waiting_finds(&self, user: &UserId) -> Vec<String> {
-        waiting_finds_in(&self.runs.lock().unwrap(), user)
+        waiting_finds_in(&self.line.lock().unwrap().runs, user)
     }
 
     /// The backend's id of stored search `id`, once its task started it at the backend.
     pub fn backend_search(&self, id: &str) -> Option<String> {
-        let runs = self.runs.lock().unwrap();
-        runs.iter()
+        let line = self.line.lock().unwrap();
+        line.runs
+            .iter()
             .find(|run| run.id == id)
-            .and_then(|run| run.backend_search.clone())
+            .and_then(|run| run.started.as_ref().map(|(search, _)| search.clone()))
+    }
+
+    /// D9: stops stored search `id`. One waiting for the turn never starts and is stored failed
+    /// with `search_stopped`; one running is stopped at the backend and keeps what it found. For
+    /// an id no task runs yet it leaves a stop mark, taken under the lock `start_stored`
+    /// registers with, so a task that starts that id afterwards stores it stopped without
+    /// searching; marks older than SEARCH_KEPT_SECS are dropped when one is added. True when a
+    /// task runs it.
+    pub async fn stop(&self, id: &str) -> bool {
+        let started = {
+            let mut line = self.line.lock().unwrap();
+            match line.runs.iter_mut().find(|run| run.id == id) {
+                Some(run) => {
+                    run.stop = true;
+                    run.started.clone()
+                }
+                None => {
+                    let now = chrono::Utc::now().timestamp();
+                    line.stops.retain(|_, at| *at > now - SEARCH_KEPT_SECS);
+                    line.stops.insert(id.to_string(), now);
+                    return false;
+                }
+            }
+        };
+        // A search waiting for the turn looks again, and leaves.
+        self.left.notify_waiters();
+        // One still starting is stopped by its task once the backend named it (`started`).
+        if let Some((search, backend)) = started {
+            stop_at_backend(&backend, &search).await;
+        }
+        true
     }
 
     /// Puts a job's search `id` in line; it leaves when the returned place is dropped.
     fn enter(self: &Arc<Self>, id: &str, user: UserId) -> Place {
-        self.push(&mut self.runs.lock().unwrap(), id, user, SearchFor::Job)
+        self.push(&mut self.line.lock().unwrap(), id, user, SearchFor::Job)
     }
 
     /// Puts `user`'s find_sources search `id` in line, unless `user` already has
     /// FINDS_WAITING_PER_USER waiting: then their ids. Counted and entered under one lock, so
     /// calls made together never pass the bound together.
     fn enter_find(self: &Arc<Self>, id: &str, user: UserId) -> Result<Place, Vec<String>> {
-        let mut runs = self.runs.lock().unwrap();
-        let waiting = waiting_finds_in(&runs, &user);
+        let mut line = self.line.lock().unwrap();
+        let waiting = waiting_finds_in(&line.runs, &user);
         if waiting.len() >= FINDS_WAITING_PER_USER {
             return Err(waiting);
         }
-        Ok(self.push(&mut runs, id, user, SearchFor::Find))
+        Ok(self.push(&mut line, id, user, SearchFor::Find))
     }
 
     fn push(
         self: &Arc<Self>,
-        runs: &mut Vec<Run>,
+        line: &mut Line,
         id: &str,
         user: UserId,
         purpose: SearchFor,
     ) -> Place {
-        runs.push(Run {
+        let stop = line.stops.remove(id).is_some();
+        line.runs.push(Run {
             id: id.to_string(),
             user,
             purpose,
             holds_turn: false,
-            backend_search: None,
+            started: None,
+            stop,
         });
         Place {
             searches: self.clone(),
@@ -508,28 +571,59 @@ impl Searches {
         }
     }
 
-    /// Waits until search `id` is first in line, and takes the turn.
-    async fn take_turn(&self, id: &str) {
+    /// Waits until search `id` is first in line, and takes the turn: true then, false once it is
+    /// stopped before.
+    async fn take_turn(&self, id: &str) -> bool {
         loop {
             let left = self.left.notified();
             tokio::pin!(left);
             // Registered before the look, so a search leaving after it still wakes this one.
             left.as_mut().enable();
-            if let Some(first) = self.runs.lock().unwrap().first_mut() {
-                if first.id == id {
-                    first.holds_turn = true;
-                    return;
+            {
+                let mut line = self.line.lock().unwrap();
+                if line.runs.iter().any(|run| run.id == id && run.stop) {
+                    return false;
+                }
+                if let Some(first) = line.runs.first_mut() {
+                    if first.id == id {
+                        first.holds_turn = true;
+                        return true;
+                    }
                 }
             }
             left.await;
         }
     }
 
-    fn started(&self, id: &str, backend_search: &str) {
-        let mut runs = self.runs.lock().unwrap();
-        if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
-            run.backend_search = Some(backend_search.to_string());
+    /// The backend started search `id` as `backend_search`: whether it was stopped meanwhile, so
+    /// its task stops it at the backend now.
+    fn started(&self, id: &str, backend_search: &str, backend: &Arc<dyn DownloadBackend>) -> bool {
+        let mut line = self.line.lock().unwrap();
+        match line.runs.iter_mut().find(|run| run.id == id) {
+            Some(run) => {
+                run.started = Some((backend_search.to_string(), backend.clone()));
+                run.stop
+            }
+            None => false,
         }
+    }
+
+    /// Takes the turn with a search of its own until the returned place is dropped, so searches
+    /// started meanwhile wait for it.
+    #[cfg(test)]
+    pub async fn hold_turn_for_test(self: &Arc<Self>) -> Place {
+        let id = uuid::Uuid::new_v4().to_string();
+        let place = self.enter(&id, UserId::new("tester"));
+        self.take_turn(&id).await;
+        place
+    }
+}
+
+/// Asks the backend to stop its search `search`; a refusal is logged, the search then running to
+/// its own end.
+async fn stop_at_backend(backend: &Arc<dyn DownloadBackend>, search: &str) {
+    if let Err(e) = backend.stop_search(search).await {
+        warn!("Could not stop search {search} at the backend: {e}");
     }
 }
 
@@ -541,18 +635,18 @@ fn waiting_finds_in(runs: &[Run], user: &UserId) -> Vec<String> {
 }
 
 /// A search's place in `Searches`, given up when dropped (its task ended, however it ended).
-struct Place {
+pub struct Place {
     searches: Arc<Searches>,
     id: String,
 }
 
 impl Drop for Place {
     fn drop(&mut self) {
-        let mut runs = self.searches.runs.lock().unwrap();
-        if let Some(place) = runs.iter().position(|run| run.id == self.id) {
-            runs.remove(place);
+        let mut line = self.searches.line.lock().unwrap();
+        if let Some(place) = line.runs.iter().position(|run| run.id == self.id) {
+            line.runs.remove(place);
         }
-        drop(runs);
+        drop(line);
         self.searches.left.notify_waiters();
     }
 }
@@ -634,7 +728,13 @@ async fn run_in_line(
     let (searches, ledger) = (searches.clone(), ledger.clone());
     Ok(tokio::spawn(async move {
         let _place = place;
-        searches.take_turn(&id).await;
+        if !searches.take_turn(&id).await {
+            let outcome = Err((search_stopped(), None));
+            let progress = SearchProgress::of_outcome(&outcome);
+            // The writer logs a write the database refused.
+            let _ = ledger.search_ended(&id, outcome).await;
+            return progress;
+        }
         let search = SearchSpec {
             album: query.album,
             tracks: query.tracks,
@@ -644,7 +744,9 @@ async fn run_in_line(
         let name = DEFAULT_DOWNLOAD_BACKEND;
         let (mut groups, stop) = match start_backend_search(name, &backend, &search).await {
             Ok(backend_search) => {
-                searches.started(&id, &backend_search);
+                if searches.started(&id, &backend_search, &backend) {
+                    stop_at_backend(&backend, &backend_search).await;
+                }
                 poll_backend_search(name, &backend, &backend_search).await
             }
             Err(stop) => (Vec::new(), stop),
@@ -1500,6 +1602,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stopped_search_never_runs_or_stops_at_the_backend_keeping_what_it_found() {
+        let db = crate::db::test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let stub = StubBackend::new(vec![]);
+        let found = vec![group(
+            "peer_a",
+            vec![item("peer_a", "One", "a/01.flac")],
+            0.9,
+        )];
+        stub.script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            found.clone(),
+        ))]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let ctx = test_ctx("alice");
+        let searches: Arc<Searches> = Arc::default();
+        // A cancel that came before the runner started its job's search.
+        assert!(!searches.stop("s1").await, "no task runs s1 yet");
+        let stopped = start_stored(
+            &searches,
+            &ledger,
+            &ctx,
+            backend.clone(),
+            run("s1", StoredSpec::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stopped.await.unwrap(),
+            SearchProgress::Failed(search_stopped(), None)
+        );
+        assert!(stub.specs().is_empty(), "it never searched");
+        let stored = store::search_of(&db, "s1", &ctx.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.failure, Some(search_stopped()));
+
+        let running = start_stored(
+            &searches,
+            &ledger,
+            &ctx,
+            backend,
+            run("s2", StoredSpec::default()),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while searches.backend_search("s2").is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the backend started it");
+        assert!(searches.stop("s2").await);
+        assert_eq!(stub.stopped_searches(), vec!["search".to_string()]);
+        assert_eq!(
+            running.await.unwrap(),
+            SearchProgress::Done(found, SearchStats::default())
+        );
+    }
+
+    #[tokio::test]
     async fn the_second_stored_search_starts_after_the_first_ended() {
         let db = crate::db::test_db::migrated().await;
         crate::core::folder_of(&db, "alice").await;
@@ -1599,7 +1766,8 @@ mod tests {
         assert_eq!(ahead(), [Some(0), Some(1), Some(2)]);
 
         searches.take_turn("s1").await;
-        searches.started("s1", "backend-1");
+        let stub: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        assert!(!searches.started("s1", "backend-1", &stub));
         assert_eq!(ahead(), [None, Some(1), Some(2)]);
         assert_eq!(
             (searches.backend_search("s1"), searches.backend_search("s2")),
@@ -1645,7 +1813,7 @@ mod tests {
         places.push(searches.enter("j2", alice.clone()));
         // A find that holds the turn waits no more.
         places.remove(0);
-        searches.runs.lock().unwrap()[0].holds_turn = true;
+        searches.line.lock().unwrap().runs[0].holds_turn = true;
         assert_eq!(
             searches.waiting_finds(&alice),
             vec!["f2".to_string(), "f3".into()]

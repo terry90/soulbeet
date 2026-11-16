@@ -282,6 +282,11 @@ impl Args {
         repeatable(self.tool, self.as_value())
     }
 
+    /// Whether `name` was given a value other than `null`.
+    pub(crate) fn has(&self, name: &str) -> bool {
+        self.given(name).is_some()
+    }
+
     /// `name`'s value, unless it is missing or `null`.
     fn given(&self, name: &str) -> Option<&Value> {
         self.map.get(name).filter(|value| !value.is_null())

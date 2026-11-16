@@ -98,6 +98,9 @@ pub struct JobRecord {
     pub changed_seq: i64,
     /// The failure of a job that failed before it had a slot (its tracklist or its search).
     pub failure: Option<Failure>,
+    /// Its current pick's send is recorded (a monitor batch or a backend request): the files are
+    /// a monitor's, or reconciliation's after a restart, never the job runner's to send again.
+    pub sent: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -123,6 +126,7 @@ struct JobRow {
     updated_at: i64,
     changed_seq: i64,
     failure: Option<String>,
+    sent: bool,
 }
 
 /// The query of a JobRow, from `jobs j` joined with its user `u`, folder `f` and batch `b`.
@@ -130,7 +134,8 @@ const JOB_SELECT: &str = "SELECT j.id, j.user_id, u.username, u.role, j.folder_i
             f.user_id AS folder_owner, f.name AS folder_name, f.path AS folder_path, \
             f.shared AS folder_shared, j.batch_id, b.origin, j.kind, j.wanted, j.options, \
             j.state, j.search_id, j.excluded_sources, j.created_at, j.updated_at, \
-            j.changed_seq, j.failure \
+            j.changed_seq, j.failure, \
+            j.monitor_batch_id IS NOT NULL OR j.request IS NOT NULL AS sent \
      FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
      JOIN batches b ON b.id = j.batch_id";
 
@@ -212,6 +217,7 @@ fn job_of(row: JobRow) -> Result<JobRecord, sqlx::Error> {
         updated_at: row.updated_at,
         changed_seq: row.changed_seq,
         failure: row.failure.as_deref().map(json).transpose()?,
+        sent: row.sent,
     })
 }
 

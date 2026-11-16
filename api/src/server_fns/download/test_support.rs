@@ -146,6 +146,7 @@ pub struct StubBackend {
     search_hold: Mutex<Option<Hold>>,
     stopped_searches: Mutex<Vec<String>>,
     queue_position: Mutex<Option<u32>>,
+    presence: Mutex<SourcePresence>,
 }
 
 /// Holds every `download` (or `start_search`) call until released, after announcing it.
@@ -173,6 +174,7 @@ impl StubBackend {
             search_hold: Mutex::new(None),
             stopped_searches: Mutex::new(Vec::new()),
             queue_position: Mutex::new(None),
+            presence: Mutex::new(SourcePresence::Online),
         })
     }
 
@@ -236,6 +238,11 @@ impl StubBackend {
     /// What `queue_position` answers for every transfer; None until set.
     pub fn set_queue_position(&self, position: Option<u32>) {
         *self.queue_position.lock().unwrap() = position;
+    }
+
+    /// What `source_status` answers for every source; Online until set.
+    pub fn set_presence(&self, presence: SourcePresence) {
+        *self.presence.lock().unwrap() = presence;
     }
 
     /// What `get_downloads_for` (filtered by peer) and `get_downloads` return.
@@ -426,7 +433,7 @@ impl DownloadBackend for StubBackend {
         Ok(*self.queue_position.lock().unwrap())
     }
     async fn source_status(&self, _source: &str) -> SoulResult<SourcePresence> {
-        Ok(SourcePresence::Online)
+        Ok(*self.presence.lock().unwrap())
     }
     async fn stop_search(&self, search_id: &str) -> SoulResult<()> {
         self.stopped_searches

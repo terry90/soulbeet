@@ -12,6 +12,7 @@ use crate::core::sources::{
     Searches, RECENT_FAILURES_SECS,
 };
 use crate::core::{backend_unavailable, database_failure, metadata};
+use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
 use crate::importer_health::blocking_failure;
 use crate::ledger::store::{self, JobRecord, StoredSearch};
 use crate::ledger::{
@@ -24,7 +25,9 @@ use shared::download::{DownloadQuery, DownloadableGroup, DownloadableItem, Queue
 use shared::failure::{Failure, Stage};
 use soulbeet::{DownloadBackend, ImportMode};
 use sqlx::SqlitePool;
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 /// What acquisition does outside the ledger, so tests run it on stubs.
@@ -56,17 +59,78 @@ pub(crate) struct Acquire {
     pub effects: Arc<dyn Effects>,
     /// One MCP search at a time.
     pub searches: Arc<Searches>,
+    /// Where finished downloads are imported and kept imports wait for a decision.
+    pub queue: ImportQueue,
+    /// The jobs a runner takes on now.
+    runners: Runners,
 }
 
-/// The server's: its database, LEDGER, the live effects and one line of searches.
+/// The server's: its database, LEDGER, the live effects, one line of searches and IMPORT_QUEUE.
 pub(crate) static ACQUIRE: LazyLock<Arc<Acquire>> = LazyLock::new(|| {
     Arc::new(Acquire {
         db: (*crate::db::DB).clone(),
         ledger: LEDGER.clone(),
         effects: Arc::new(LiveEffects),
         searches: Arc::default(),
+        queue: IMPORT_QUEUE.clone(),
+        runners: Runners::default(),
     })
 });
+
+/// One runner per job at a time: a job taken on again (a retry, a chosen source) while an
+/// earlier runner of it still waits for a download place is taken on once that one ends, and
+/// that one looks at the job again at once, so a job is never enqueued twice.
+#[derive(Default)]
+struct Runners {
+    /// Each job a runner has, with what tells that runner to look at its job again.
+    jobs: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Notified when a runner ends.
+    ended: Notify,
+}
+
+impl Runners {
+    /// Waits until no runner has job `id`, telling the one that has it to look at it again, and
+    /// takes it until the returned guard drops.
+    async fn take(&self, id: &str) -> RunnerOf<'_> {
+        loop {
+            let ended = self.ended.notified();
+            tokio::pin!(ended);
+            // Registered before the look, so a runner ending after it still wakes this one.
+            ended.as_mut().enable();
+            {
+                let mut jobs = self.jobs.lock().unwrap();
+                match jobs.get(id) {
+                    Some(look_again) => look_again.notify_one(),
+                    None => {
+                        let look_again = Arc::new(Notify::new());
+                        jobs.insert(id.to_string(), look_again.clone());
+                        return RunnerOf {
+                            runners: self,
+                            id: id.to_string(),
+                            look_again,
+                        };
+                    }
+                }
+            }
+            ended.await;
+        }
+    }
+}
+
+/// A job's runner, given up when dropped.
+struct RunnerOf<'a> {
+    runners: &'a Runners,
+    id: String,
+    /// Notified when the job is taken on again while this runner has it.
+    look_again: Arc<Notify>,
+}
+
+impl Drop for RunnerOf<'_> {
+    fn drop(&mut self) {
+        self.runners.jobs.lock().unwrap().remove(&self.id);
+        self.runners.ended.notify_waiters();
+    }
+}
 
 /// The services the server is configured with.
 struct LiveEffects;
@@ -127,8 +191,10 @@ pub(crate) fn pick(candidates: &[Candidate], options: &JobOptions) -> Picked {
 /// Takes job `id` of `ctx` on from its state: searching (hydrate an album, search or read its
 /// search, pick), then queued (wait for a download place, then enqueue). Returns when the job is
 /// enqueued, waits for a choice, ends, or a transition it asked for was refused (another call
-/// moved the job, D15). A web UI job has its own pipeline and is left to it.
+/// moved the job, D15). A web UI job has its own pipeline and is left to it. One runner takes a
+/// job at a time: a second waits for the first to end, then reads the job as it is then.
 pub(crate) async fn drive(acquire: &Arc<Acquire>, ctx: &UserCtx, id: &str) {
+    let taken = acquire.runners.take(id).await;
     let job = match store::job_record(&acquire.db, id, &ctx.id()).await {
         Ok(Some(job)) => job,
         Ok(None) => return,
@@ -146,15 +212,39 @@ pub(crate) async fn drive(acquire: &Arc<Acquire>, ctx: &UserCtx, id: &str) {
         job: &job,
         options: &options,
     };
-    let search_id = match job.state {
-        JobState::Searching => match runner.search_and_pick().await {
-            Some(search_id) => Some(search_id),
-            None => return,
-        },
-        JobState::Queued => job.search_id.clone(),
+    match job.state {
+        JobState::Searching => {
+            if !runner.search_and_pick().await {
+                return;
+            }
+        }
+        // A send already recorded is its monitor's.
+        JobState::Queued if !job.sent => {}
         _ => return,
+    }
+    if !runner.take_place(&taken.look_again).await {
+        return;
+    }
+    // Read again: the job may have been cancelled and taken on again with another source while
+    // this runner waited for its place.
+    let job = match store::job_record(&acquire.db, id, &ctx.id()).await {
+        Ok(Some(job)) if job.state == JobState::Queued && !job.sent => job,
+        Ok(_) => return,
+        Err(e) => {
+            warn!("Could not read job {id} to enqueue it: {e}");
+            return;
+        }
     };
-    runner.download(search_id.as_deref()).await;
+    let Some(options) = job.options.clone() else {
+        return;
+    };
+    let runner = Runner {
+        acquire,
+        ctx,
+        job: &job,
+        options: &options,
+    };
+    runner.download().await;
 }
 
 /// `drive` in a task of its own.
@@ -195,37 +285,36 @@ impl Runner<'_> {
         self.transition(Transition::Fail { failure }).await;
     }
 
-    /// The searching job's search, then its pick: the id of the search it was queued from, or
-    /// None when it waits for a choice, failed or moved on.
-    async fn search_and_pick(&self) -> Option<String> {
+    /// The searching job's search, then its pick: whether it was queued, not waiting for a
+    /// choice, failed or moved on.
+    async fn search_and_pick(&self) -> bool {
         let (search_id, groups) = match self.searched().await {
             Ok(found) => found,
             Err(Stop::Fail(failure)) => {
                 self.fail(failure).await;
-                return None;
+                return false;
             }
-            Err(Stop::Quietly) => return None,
+            Err(Stop::Quietly) => return false,
         };
         let view = match self.view(&search_id, &groups, Stage::SourceSearch).await {
             Ok(view) => view,
             Err(failure) => {
                 self.fail(failure).await;
-                return None;
+                return false;
             }
         };
         if view.candidates.is_empty() {
             self.fail(no_candidate_passed()).await;
-            return None;
+            return false;
         }
         match pick(&view.candidates, self.options) {
             Picked::Choose => {
                 self.transition(Transition::AwaitChoice).await;
-                None
+                false
             }
             Picked::Auto(at) => {
                 let items = numbered(view.candidates[at].group.items.clone());
-                let picked = self.transition(Transition::Pick { items }).await;
-                picked.then_some(search_id)
+                self.transition(Transition::Pick { items }).await
             }
         }
     }
@@ -336,13 +425,10 @@ impl Runner<'_> {
         ))
     }
 
-    /// The queued job, once it holds a download place: its slots' current picks enqueued into a
-    /// batch of its own, the unflagged candidates of its search `search_id` standing by.
-    async fn download(&self, search_id: Option<&str>) {
-        if !self.take_place().await {
-            return;
-        }
-        let (backend, fresh, acquisition) = match self.request(search_id).await {
+    /// The queued job holding a download place: its slots' current picks enqueued into a batch
+    /// of its own, the unflagged candidates of its search standing by.
+    async fn download(&self) {
+        let (backend, fresh, acquisition) = match self.request().await {
             Ok(Some(request)) => request,
             Ok(None) => return,
             Err(failure) => return self.fail(failure).await,
@@ -357,8 +443,9 @@ impl Runner<'_> {
     }
 
     /// D8: waits until the job holds one of its user's download places, trying again each time
-    /// one is given up. False once the job left queued.
-    async fn take_place(&self) -> bool {
+    /// one is given up or the job is taken on again (`look_again`). False once the job left
+    /// queued.
+    async fn take_place(&self, look_again: &Notify) -> bool {
         let mut places = self.acquire.ledger.places();
         loop {
             // Seen before the claim, so a place given up after it wakes this one.
@@ -382,19 +469,23 @@ impl Runner<'_> {
                     return false;
                 }
             }
-            if places.changed().await.is_err() {
-                return false;
+            tokio::select! {
+                changed = places.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+                () = look_again.notified() => {}
             }
         }
     }
 
     /// What the job's enqueue asks for: the backend, a batch of its own importing tracks as
     /// singletons and an album whole (step 5 D1), skipping what the library has, and its slots'
-    /// current picks with the unflagged candidates of search `search_id` as alternates. None
-    /// when it has no queued slot left.
+    /// current picks with the unflagged candidates of its search as alternates. None when it has
+    /// no queued slot left.
     async fn request(
         &self,
-        search_id: Option<&str>,
     ) -> Result<Option<(Arc<dyn DownloadBackend>, NewBatch, Acquisition)>, Failure> {
         let backend = (self.acquire.effects.backend().await).map_err(|f| Failure {
             stage: Stage::Enqueue,
@@ -420,7 +511,9 @@ impl Runner<'_> {
         };
         let acquisition = Acquisition {
             job: self.job.id.clone(),
-            alternates: self.alternates(search_id, &picked).await?,
+            alternates: self
+                .alternates(self.job.search_id.as_deref(), &picked)
+                .await?,
             items,
             max_sources: self.options.max_sources as usize,
         };
@@ -452,8 +545,9 @@ pub(crate) use test_effects::TestEffects;
 #[cfg(test)]
 mod test_effects {
     use super::*;
-    use crate::import_queue::test_support::StubImporter;
+    use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use crate::importer_health::blocking_failure_of;
+    use crate::ledger::JobEvent;
     use crate::server_fns::download::test_support::StubBackend;
     use shared::download::EnqueueStatus;
     use shared::metadata::{AlbumWithTracks, Provider, SearchResult, Track};
@@ -463,10 +557,12 @@ mod test_effects {
     use tokio::sync::watch;
 
     impl Acquire {
-        /// An `Acquire` on `db` with its own ledger writer and line of searches, acting through
-        /// the `TestEffects` it returns.
+        /// An `Acquire` on `db` with its own ledger writer, line of searches and import queue
+        /// (whose ledger events reach that ledger), acting through the `TestEffects` it returns.
         pub(crate) fn for_test(db: SqlitePool) -> (Arc<Acquire>, Arc<TestEffects>) {
+            let ledger = Ledger::start(db.clone());
             let effects = Arc::new(TestEffects {
+                ledger: ledger.clone(),
                 stub: StubBackend::new(vec![]),
                 importer: StubImporter::new(),
                 tracks: Mutex::default(),
@@ -475,11 +571,14 @@ mod test_effects {
                 backend_calls_held: AtomicUsize::new(0),
                 enqueued: Mutex::default(),
             });
+            let deps = RecordingDeps::into_ledger(Arc::new(StubImporter::new()), ledger.clone());
             let acquire = Acquire {
-                ledger: Ledger::start(db.clone()),
+                ledger,
                 db,
                 effects: effects.clone(),
                 searches: Arc::default(),
+                queue: ImportQueue::new(deps),
+                runners: Runners::default(),
             };
             (Arc::new(acquire), effects)
         }
@@ -489,8 +588,10 @@ mod test_effects {
     /// (ready until `importer().set_health`), and hydrates through step 3's `hydrate_in` on a
     /// provider whose album has the tracks `set_tracks` gave (none until then), or whose
     /// `get_album` answers the error `fail_hydrate` gave. Keeps every enqueue and answers it
-    /// with each item enqueued, recording nothing.
+    /// with each item enqueued, recording only its send (Enqueued), as enqueue_and_watch records
+    /// it before the backend hears of it.
     pub(crate) struct TestEffects {
+        ledger: Ledger,
         stub: Arc<StubBackend>,
         importer: StubImporter,
         tracks: Mutex<Vec<Track>>,
@@ -578,6 +679,14 @@ mod test_effects {
                     status: EnqueueStatus::Enqueued,
                 })
                 .collect();
+            let sent = JobEvent::Enqueued {
+                job: acquisition.job.clone(),
+                monitor_batch_id: fresh.batch_id.clone(),
+                batch_label: fresh.label.clone(),
+                request: uuid::Uuid::new_v4().to_string(),
+            };
+            (self.ledger.record_stored(sent).await)
+                .map_err(|e| database_failure(Stage::Enqueue, e))?;
             self.enqueued.lock().unwrap().push((fresh, acquisition));
             Ok(answers)
         }
@@ -926,6 +1035,52 @@ mod tests {
             store::job_state(&acq.db, &jobs[6]).await,
             Some(JobState::Cancelled)
         );
+    }
+
+    #[tokio::test]
+    async fn a_job_taken_on_again_while_its_runner_waits_for_a_place_is_enqueued_once() {
+        let (acq, effects) = Acquire::for_test(test_db_with_alice().await);
+        let jobs = queued_track_jobs(&acq, 7).await;
+        for job in &jobs[..6] {
+            drive(&acq, &alice(), job).await;
+        }
+        let waiting = &jobs[6];
+        let first = tokio::spawn({
+            let (acq, job) = (acq.clone(), waiting.clone());
+            async move { drive(&acq, &alice(), &job).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Cancelled without a place, then picked again: a second runner for it.
+        let user = alice().id();
+        acq.ledger
+            .transition(&user, waiting, Transition::Cancel)
+            .await
+            .unwrap();
+        let again = Transition::Queue {
+            items: vec![(0, item("peer_b", "Song Number 7", "b/07.flac"))],
+            search_id: None,
+        };
+        acq.ledger.transition(&user, waiting, again).await.unwrap();
+        let second = tokio::spawn({
+            let (acq, job) = (acq.clone(), waiting.clone());
+            async move { drive(&acq, &alice(), &job).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(effects.enqueued().len(), 6, "no place is free yet");
+        acq.ledger.record(JobEvent::Ended {
+            job: jobs[0].clone(),
+            state: JobState::Failed,
+            failure: None,
+        });
+        for runner in [first, second] {
+            tokio::time::timeout(Duration::from_secs(10), runner)
+                .await
+                .expect("both runners end")
+                .unwrap();
+        }
+        let enqueued = effects.enqueued();
+        assert_eq!(enqueued.len(), 7, "the job was enqueued once");
+        assert_eq!(enqueued[6].1.items[0].1.source, "peer_b");
     }
 
     #[tokio::test]

@@ -1,21 +1,108 @@
-//! D11: the calls a job's `next` offers, built in this one place from the job's state.
+//! D11: the calls a job's `next` offers, built in this one place from the job's state, its
+//! failure, its kind and its untried candidates, by the predicate the job tools refuse with.
 
-use serde_json::json;
+use serde_json::{json, Value};
+use shared::failure::{Failure, RetryAdvice, Stage};
 
 use super::contract::NextCall;
-use crate::core::jobs::JobView;
-use crate::ledger::JobState;
+use super::facts::candidate_document;
+use crate::core::jobs::{allowed, job_failure, JobView, RetryMode, Untried};
+use crate::ledger::{BatchOrigin, JobState, Transition};
 
-/// The calls that can be made for the job now: while it runs, a wait for its next change.
-pub(crate) fn next_calls(view: &JobView) -> Vec<NextCall> {
+/// How many untried candidates a job waiting for a source choice offers as download_source calls.
+const CHOICES_OFFERED: usize = 3;
+
+/// The calls that can be made for the job now. A running job: a wait for its next change. A job
+/// waiting for a source choice: download_source for each of its first untried candidates, with
+/// that candidate's facts. Each retry_job mode `allowed` accepts, with its deciding facts, unless
+/// the job's failure needs a person (its user_action says what; retry_job still accepts a mode
+/// once they acted). dismiss_job and cancel_job where those transitions apply. A web UI job is
+/// offered only the wait and dismiss_job: its own pipeline runs it.
+pub(crate) fn next_calls(view: &JobView, untried: &Untried) -> Vec<NextCall> {
     use JobState::*;
-    match view.job.state {
-        Searching | Queued | Downloading | Importing | Indexing => vec![NextCall::new(
+    let job = &view.job;
+    let id = &job.id;
+    let mcp = job.origin == BatchOrigin::Mcp;
+    let mut next = Vec::new();
+    if matches!(
+        job.state,
+        Searching | Queued | Downloading | Importing | Indexing
+    ) {
+        next.push(NextCall::new(
             "get_jobs",
-            json!({"job_ids": [view.job.id], "detail": "full", "wait_seconds": 60,
+            json!({"job_ids": [id], "detail": "full", "wait_seconds": 60,
                 "wait_for": "any_change"}),
-        )],
-        NeedsSourceChoice | NeedsDecision | Done | Failed | Cancelled | Dismissed => vec![],
+        ));
+    }
+    // The search's query holds an album's tracklist.
+    let wanted = view.search.as_ref().map_or(&job.wanted, |s| &s.query);
+    if mcp && job.state == NeedsSourceChoice {
+        for candidate in untried.candidates.iter().take(CHOICES_OFFERED) {
+            let Value::Object(facts) = candidate_document(candidate, wanted) else {
+                unreachable!("a candidate document is an object");
+            };
+            next.push(NextCall {
+                tool: "download_source",
+                args: json!({"job_id": id, "candidate_id": candidate.id}),
+                facts,
+            });
+        }
+    }
+    let failure = job_failure(view);
+    let needs_user = (failure.as_ref()).is_some_and(|f| f.retry == RetryAdvice::NeedsUser);
+    if !needs_user {
+        let modes = [
+            RetryMode::IndexOnly,
+            RetryMode::SameSource,
+            RetryMode::NextSource,
+            RetryMode::NewSearch,
+            RetryMode::RejectResult,
+        ];
+        for mode in modes {
+            if allowed(view, untried, mode) {
+                next.push(retry_call(view, untried, mode, failure.as_ref()));
+            }
+        }
+    }
+    let job_call = |tool| NextCall::new(tool, json!({"job_id": id}));
+    if Transition::Dismiss.allowed_from().contains(&job.state) {
+        next.push(job_call("dismiss_job"));
+    }
+    if mcp && Transition::Cancel.allowed_from().contains(&job.state) {
+        next.push(job_call("cancel_job"));
+    }
+    next
+}
+
+/// retry_job in `mode` for the job, with its deciding facts: same_source the wait its failure
+/// asks for, next_source how many untried candidates are left and the best one, new_search after
+/// a failed search the wait that search's failure asks for.
+fn retry_call(
+    view: &JobView,
+    untried: &Untried,
+    mode: RetryMode,
+    failure: Option<&Failure>,
+) -> NextCall {
+    let call = NextCall::new(
+        "retry_job",
+        json!({"job_id": view.job.id, "mode": mode.as_str()}),
+    );
+    let wait = failure.and_then(|f| f.retry_after_seconds);
+    match mode {
+        RetryMode::SameSource => call.with("retry_after_seconds", json!(wait)),
+        RetryMode::NextSource => {
+            let wanted = view.search.as_ref().map_or(&view.job.wanted, |s| &s.query);
+            let best = untried.best().map(|c| candidate_document(c, wanted));
+            call.with("untried_candidates", json!(untried.candidates.len()))
+                .with("best_candidate", json!(best))
+        }
+        RetryMode::NewSearch => match (failure, wait) {
+            (Some(f), Some(wait)) if f.stage == Stage::SourceSearch => {
+                call.with("retry_after_seconds", json!(wait))
+            }
+            _ => call,
+        },
+        RetryMode::IndexOnly | RetryMode::RejectResult => call,
     }
 }
 
@@ -23,18 +110,170 @@ pub(crate) fn next_calls(view: &JobView) -> Vec<NextCall> {
 mod tests {
     use super::*;
     use crate::core::jobs::runner::Acquire;
-    use crate::core::jobs::test_support::{downloading_track_job, test_db_with_alice, view_of};
+    use crate::core::jobs::test_support::{
+        cancelled_track_job, choosing_track_job, done_track_job, downloading_track_job,
+        exhausted_track_job, failed_track_job, failed_track_job_with, failed_web_ui_job,
+        index_failed_track_job, test_db_with_alice, view_of,
+    };
+    use crate::core::jobs::untried;
+    use shared::failure::{FailureCode, UserAction, UserActionCode};
+
+    async fn read(acq: &Acquire, job: &str) -> (JobView, Untried) {
+        let view = view_of(acq, job).await;
+        let untried = untried(&acq.db, &view, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        (view, untried)
+    }
+
+    /// The modes of the retry_job entries of `next`.
+    fn modes(next: &[NextCall]) -> Vec<String> {
+        (next.iter())
+            .filter(|n| n.tool == "retry_job")
+            .map(|n| n.args["mode"].as_str().unwrap().to_string())
+            .collect()
+    }
 
     #[tokio::test]
-    async fn a_running_job_offers_only_a_wait() {
+    async fn a_running_job_offers_a_wait_and_a_cancel() {
         let (acq, _) = Acquire::for_test(test_db_with_alice().await);
         let job = downloading_track_job(&acq).await;
-        let view = view_of(&acq, &job).await;
-        let next = next_calls(&view);
+        let (view, untried) = read(&acq, &job).await;
+        let next = next_calls(&view, &untried);
         assert_eq!(
             serde_json::to_value(&next).unwrap(),
             json!([{"tool": "get_jobs",
-                "args": {"job_ids": [job], "detail": "full", "wait_seconds": 60, "wait_for": "any_change"}}])
+                "args": {"job_ids": [job], "detail": "full", "wait_seconds": 60, "wait_for": "any_change"}},
+                {"tool": "cancel_job", "args": {"job_id": job}}])
+        );
+    }
+
+    #[tokio::test]
+    async fn next_lists_only_the_modes_retry_job_accepts() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        // Soulful's text for a broken importer (importer_health), which needs a person.
+        let importer_broken = Failure::new(
+            FailureCode::ImporterBroken,
+            Stage::Import,
+            RetryAdvice::NeedsUser,
+            "No metadata source plugin loaded",
+        )
+        .with_user_action(UserAction::new(
+            UserActionCode::FixImporter,
+            "Fix the importer",
+            "Settings > System",
+        ));
+        let fixtures = [
+            ("failed, an untried source", failed_track_job(&acq).await),
+            (
+                "failed, every source tried",
+                exhausted_track_job(&acq).await,
+            ),
+            ("failed, busy source", busy_job(&acq).await),
+            ("failed at the index", index_failed_track_job(&acq).await),
+            (
+                "needs a person",
+                failed_track_job_with(&acq, "Silent Night", importer_broken).await,
+            ),
+            ("done", done_track_job(&acq).await),
+            ("cancelled", cancelled_track_job(&acq).await),
+            ("waiting for a choice", choosing_track_job(&acq).await),
+        ];
+        let mut offered = Vec::new();
+        for (name, job) in &fixtures {
+            let (view, untried) = read(&acq, job).await;
+            let next = modes(&next_calls(&view, &untried));
+            let accepted: Vec<String> = (RetryMode::ALL.into_iter())
+                .filter(|m| allowed(&view, &untried, *m))
+                .map(|m| m.as_str().to_string())
+                .collect();
+            assert!(
+                next.iter().all(|m| accepted.contains(m)),
+                "{name}: {next:?} {accepted:?}"
+            );
+            if *name == "needs a person" {
+                // Offered nothing; accepted once the person did what user_action says.
+                assert!(next.is_empty(), "{name}");
+                assert_eq!(accepted, vec!["next_source", "new_search"], "{name}");
+            } else {
+                let mut sorted = next.clone();
+                sorted.sort();
+                let mut accepted = accepted;
+                accepted.sort();
+                assert_eq!(sorted, accepted, "{name}");
+            }
+            offered.push((*name, next));
+        }
+        let expected: Vec<(&str, Vec<&str>)> = vec![
+            (
+                "failed, an untried source",
+                vec!["next_source", "new_search"],
+            ),
+            ("failed, every source tried", vec!["new_search"]),
+            (
+                "failed, busy source",
+                vec!["same_source", "next_source", "new_search"],
+            ),
+            ("failed at the index", vec!["index_only", "new_search"]),
+            ("needs a person", vec![]),
+            ("done", vec!["reject_result"]),
+            (
+                "cancelled",
+                vec!["same_source", "next_source", "new_search"],
+            ),
+            ("waiting for a choice", vec!["new_search"]),
+        ];
+        let offered: Vec<(&str, Vec<&str>)> = (offered.iter())
+            .map(|(name, modes)| (*name, modes.iter().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(offered, expected);
+    }
+
+    #[tokio::test]
+    async fn a_web_ui_job_is_offered_only_dismiss_job() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let job = failed_web_ui_job(&acq).await;
+        let (view, untried) = read(&acq, &job).await;
+        assert_eq!(
+            serde_json::to_value(next_calls(&view, &untried)).unwrap(),
+            json!([{"tool": "dismiss_job", "args": {"job_id": job}}])
+        );
+    }
+
+    /// slskd's text for a peer whose upload queue is full (Application.cs:763-766), which says to
+    /// try the same peer later.
+    async fn busy_job(acq: &Acquire) -> String {
+        let busy = Failure::new(
+            FailureCode::TransferRejectedPeerBusy,
+            Stage::Transfer,
+            RetryAdvice::SameSourceLater,
+            "Transfer rejected: Too many files",
+        )
+        .with_retry_after(600);
+        failed_track_job_with(acq, "Coventry Carol", busy).await
+    }
+
+    #[tokio::test]
+    async fn a_peer_busy_failure_offers_the_same_source_later_with_its_wait() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let job = busy_job(&acq).await;
+        let (view, untried) = read(&acq, &job).await;
+        let next = next_calls(&view, &untried);
+        let same = next
+            .iter()
+            .find(|n| n.tool == "retry_job" && n.args["mode"] == "same_source")
+            .expect("same_source is offered");
+        assert_eq!(same.facts["retry_after_seconds"], 600);
+        let other = next
+            .iter()
+            .find(|n| n.args["mode"] == "next_source")
+            .unwrap();
+        assert_eq!(
+            (
+                &other.facts["untried_candidates"],
+                &other.facts["best_candidate"]["source"]
+            ),
+            (&json!(1), &json!("peer_b"))
         );
     }
 }

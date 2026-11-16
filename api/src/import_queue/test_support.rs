@@ -4,7 +4,7 @@ use super::QueueDeps;
 use crate::auth::UserId;
 use crate::core::delete_guard::test_support::FakeNavidrome;
 use crate::core::delete_guard::Guard;
-use crate::ledger::JobEvent;
+use crate::ledger::{JobEvent, Ledger};
 use async_trait::async_trait;
 use shared::download::{
     DownloadEvent, DownloadProgress, DownloadState, MatchCandidate, MatchChoices, MatchKind,
@@ -360,12 +360,13 @@ impl MusicImporter for StubImporter {
 }
 
 /// Hands out one importer and, when given one, a delete guard; records every event per user id
-/// and every ledger event.
+/// and every ledger event, and hands the ledger events to a ledger when given one.
 pub struct RecordingDeps {
     importer: Arc<StubImporter>,
     guard: Option<(SqlitePool, Arc<FakeNavidrome>)>,
     events: Mutex<Vec<(UserId, DownloadEvent)>>,
     ledger: Mutex<Vec<JobEvent>>,
+    into: Option<Ledger>,
 }
 
 impl RecordingDeps {
@@ -383,16 +384,32 @@ impl RecordingDeps {
         Self::build(importer, Some((db, fake)))
     }
 
+    /// Deps whose ledger events also reach `ledger`, as the server's reach its ledger.
+    pub fn into_ledger(importer: Arc<StubImporter>, ledger: Ledger) -> Arc<Self> {
+        Arc::new(RecordingDeps {
+            into: Some(ledger),
+            ..Self::unwrapped(importer, None)
+        })
+    }
+
     fn build(
         importer: Arc<StubImporter>,
         guard: Option<(SqlitePool, Arc<FakeNavidrome>)>,
     ) -> Arc<Self> {
-        Arc::new(RecordingDeps {
+        Arc::new(Self::unwrapped(importer, guard))
+    }
+
+    fn unwrapped(
+        importer: Arc<StubImporter>,
+        guard: Option<(SqlitePool, Arc<FakeNavidrome>)>,
+    ) -> Self {
+        RecordingDeps {
             importer,
             guard,
             events: Mutex::new(vec![]),
             ledger: Mutex::new(vec![]),
-        })
+            into: None,
+        }
     }
 
     /// What the queue recorded in the ledger, in order.
@@ -433,6 +450,9 @@ impl QueueDeps for RecordingDeps {
     }
 
     fn record(&self, event: JobEvent) {
+        if let Some(ledger) = &self.into {
+            ledger.record(event.clone());
+        }
         self.ledger.lock().unwrap().push(event);
     }
 

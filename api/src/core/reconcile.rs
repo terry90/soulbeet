@@ -24,7 +24,9 @@ use crate::ledger::{
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{already_running, held_failure, transfer_key};
 use crate::server_fns::download::failover::{alternates_for, SourcePool, MAX_SOURCES_PER_TRACK};
-use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
+use crate::server_fns::download::monitor::{
+    cancelled_on_request, DownloadMonitor, WatchedTransfer,
+};
 use crate::server_fns::download::process::{
     find_on_disk, import_job, resolve_on_disk, unresolved_row, ResolvedSlot,
 };
@@ -302,6 +304,8 @@ pub(crate) trait Resume: Send + Sync {
     async fn search(&self, ctx: UserCtx, folder: Folder, query: DownloadQuery, run: AutoRun);
     /// Takes `ctx`'s MCP job `job` on with the job runner.
     async fn drive(&self, ctx: &UserCtx, job: String);
+    /// Marks job `job` cancelled in the transfer registry (D9), so every monitor stops its slots.
+    fn cancel_job(&self, job: &str);
 }
 
 /// The server's: the default backend, real monitors, enqueues and searches.
@@ -366,18 +370,24 @@ impl Resume for Live {
     async fn drive(&self, ctx: &UserCtx, job: String) {
         spawn_drive(ACQUIRE.clone(), ctx.clone(), job);
     }
+
+    fn cancel_job(&self, job: &str) {
+        TransferRegistry::global().cancel_job(job);
+    }
 }
 
 /// Shows `rows` (each with its slot) to `user` and records them Failed.
 async fn fail_rows(ledger: &Ledger, user: &UserId, rows: Vec<DownloadProgress>) {
+    end_rows(ledger, user, JobState::Failed, rows).await;
+}
+
+/// Shows `rows` (each with its slot) to `user` and records them in `state`.
+async fn end_rows(ledger: &Ledger, user: &UserId, state: JobState, rows: Vec<DownloadProgress>) {
     if rows.is_empty() {
         return;
     }
     send_user_event(user, DownloadEvent::Progress(rows.clone())).await;
-    ledger.record(JobEvent::Slots {
-        state: JobState::Failed,
-        rows,
-    });
+    ledger.record(JobEvent::Slots { state, rows });
 }
 
 /// One stored import the slots of unfinished jobs share, with their rows.
@@ -622,6 +632,11 @@ pub(crate) async fn resume_unfinished(
         unreadable_slots,
         cut_searches,
     } = unfinished;
+    // D9: the marks a cancel set lived in memory; set again before any job resumes, so every
+    // monitor started below stops the slots of a job cancelled before the restart.
+    for job in jobs.iter().filter(|job| job.cancel_requested) {
+        resume.cancel_job(&job.id);
+    }
     for id in cut_searches {
         // The writer logs a write the database refused.
         let _ = (ledger.search_ended(&id, Err((server_restarted_search(), None)))).await;
@@ -824,7 +839,17 @@ pub(crate) async fn resume_unfinished(
     };
     let mut fresh = Vec::new();
     for job in queued {
-        if let Some(job) = adopt_sent(ledger, &backend, &mut downloads, job).await {
+        let Some(job) = adopt_sent(ledger, &backend, &mut downloads, job).await else {
+            continue;
+        };
+        // Cancelled before it sent anything: nothing is sent now.
+        if job.job.cancel_requested {
+            ledger.record(JobEvent::Ended {
+                job: job.job.id,
+                state: JobState::Cancelled,
+                failure: None,
+            });
+        } else {
             fresh.push(job);
         }
     }
@@ -846,9 +871,10 @@ pub(crate) async fn resume_unfinished(
 /// Moves the queued slots of `queued`'s job whose file the backend already
 /// holds into the job's monitor batch, recording each as downloading, and
 /// hands that batch the others: it imports the ones found in its folder with
-/// the rest of it and sends the others again. The batch is stored before the
-/// backend hears of a file, so a job without one sent nothing: it is given
-/// back, to enqueue into a new batch.
+/// the rest of it and sends the others again, unless the job's user cancelled
+/// it, which ends them cancelled. The batch is stored before the backend
+/// hears of a file, so a job without one sent nothing: it is given back, to
+/// enqueue into a new batch.
 async fn adopt_sent(
     ledger: &Ledger,
     backend: &Arc<dyn DownloadBackend>,
@@ -891,12 +917,24 @@ async fn adopt_sent(
             rows,
         });
     }
-    if !rest.is_empty() {
-        queued.slots = rest;
-        batch_of(downloads, &queued.job, &batch_id, &label)
-            .queued
-            .push(queued);
+    if rest.is_empty() {
+        return None;
     }
+    if queued.job.cancel_requested {
+        // Its user cancelled it: what the backend does not hold is not sent again.
+        let rows = (rest.iter())
+            .filter_map(|(slot, record)| shown_row(slot, record))
+            .map(|row| {
+                (row.with_state(DownloadState::Cancelled)).with_failure(cancelled_on_request())
+            })
+            .collect();
+        end_rows(ledger, &queued.job.ctx.id(), JobState::Cancelled, rows).await;
+        return None;
+    }
+    queued.slots = rest;
+    batch_of(downloads, &queued.job, &batch_id, &label)
+        .queued
+        .push(queued);
     None
 }
 
@@ -1392,6 +1430,9 @@ mod tests {
         rules: Mutex<Vec<(String, DuplicateRule, Vec<usize>)>>,
         /// The jobs handed to the job runner.
         driven: Mutex<Vec<String>>,
+        /// Each job marked cancelled ("cancel_job {job}") and each transfer watched ("watch
+        /// {job}"), in the order they came.
+        steps: Mutex<Vec<String>>,
     }
 
     impl Started {
@@ -1404,6 +1445,7 @@ mod tests {
                 searched: Mutex::default(),
                 rules: Mutex::default(),
                 driven: Mutex::default(),
+                steps: Mutex::default(),
             }
         }
 
@@ -1450,6 +1492,8 @@ mod tests {
                 batch.duplicates,
                 caps,
             ));
+            (self.steps.lock().unwrap())
+                .extend(transfers.iter().map(|t| format!("watch {}", t.job.job)));
             self.watched.lock().unwrap().push((
                 batch.owner.batch_id,
                 batch.label,
@@ -1487,6 +1531,9 @@ mod tests {
         }
         async fn drive(&self, _: &UserCtx, job: String) {
             self.driven.lock().unwrap().push(job);
+        }
+        fn cancel_job(&self, job: &str) {
+            self.steps.lock().unwrap().push(format!("cancel_job {job}"));
         }
     }
 
@@ -1905,6 +1952,9 @@ mod tests {
         }
         async fn drive(&self, _: &UserCtx, _: String) {
             unreachable!("no job here is an MCP job")
+        }
+        fn cancel_job(&self, _: &str) {
+            unreachable!("no job here was cancelled")
         }
     }
 
@@ -3043,6 +3093,64 @@ mod tests {
             store::job_state(db, &indexing).await,
             Some(JobState::Indexing)
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_requested_before_a_restart_is_marked_again() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let (ledger, db) = (&acq.ledger, &acq.db);
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = StubBackend::new(vec![]);
+        let started = Started::on(stub.clone());
+        let queue = ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())));
+        let alice = UserId::new("alice");
+        let downloading = downloading_track_job_with(&acq, "Gaudete", auto_options()).await;
+        let listed = in_progress(&downloading, "Gaudete");
+        stub.set_listing(vec![transfer(
+            "peer_a",
+            &listed.item,
+            &listed.id,
+            DownloadState::InProgress,
+        )]);
+        // Queued, its file recorded as sent, which slskd no longer holds.
+        let sent = queued_track_jobs(&acq, 1).await.remove(0);
+        assert!(ledger
+            .claim_download(&sent, MCP_DOWNLOADS_PER_USER)
+            .await
+            .unwrap());
+        ledger.record(JobEvent::Enqueued {
+            job: sent.clone(),
+            monitor_batch_id: uuid::Uuid::new_v4().to_string(),
+            batch_label: "Song Number 1".into(),
+            request: uuid::Uuid::new_v4().to_string(),
+        });
+        for job in [&downloading, &sent] {
+            ledger
+                .transition(&alice, job, Transition::Cancel)
+                .await
+                .unwrap();
+            // The restart lost the mark the cancel set.
+            TransferRegistry::global().reopen_job(job);
+        }
+        ledger.settled().await;
+
+        reconcile_in(db, ledger, &queue, &started, tmp.path()).await;
+        ledger.settled().await;
+
+        let steps = started.steps.lock().unwrap().clone();
+        assert_eq!(
+            steps,
+            vec![
+                format!("cancel_job {downloading}"),
+                format!("cancel_job {sent}"),
+                format!("watch {downloading}"),
+            ]
+        );
+        assert!(
+            started.enqueued.lock().unwrap().is_empty(),
+            "nothing sent again"
+        );
+        assert_eq!(store::job_state(db, &sent).await, Some(JobState::Cancelled));
     }
 
     #[tokio::test]

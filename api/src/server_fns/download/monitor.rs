@@ -175,7 +175,7 @@ fn stuck_in_remote_queue() -> Failure {
 }
 
 /// A transfer its user cancelled.
-fn cancelled_on_request() -> Failure {
+pub(crate) fn cancelled_on_request() -> Failure {
     transfer_failure(
         FailureCode::TransferCancelled,
         RetryAdvice::NotRetryable,
@@ -436,9 +436,15 @@ impl DownloadMonitor {
         TransferRegistry::global().release(&self.slot_key(slot, backend), &self.batch.owner)
     }
 
+    /// Whether `slot`'s job is marked cancelled (D9): its user cancelled the
+    /// job, wherever failover moved the slot.
+    fn job_cancelled(&self, slot: usize) -> bool {
+        TransferRegistry::global().job_cancelled(&self.tracked_files[slot].job.job)
+    }
+
     /// Ends `slot` without a file as `settle` does, and gives the row it ends
-    /// with: `row`, or Cancelled when its user cancelled it after this poll's
-    /// `apply_cancels` ran.
+    /// with: `row`, or Cancelled when its user cancelled it, or its job, after
+    /// this poll's `apply_cancels` ran.
     fn write_off(
         &mut self,
         slot: usize,
@@ -446,7 +452,7 @@ impl DownloadMonitor {
         backend: &'static str,
         row: DownloadProgress,
     ) -> DownloadProgress {
-        if self.settle(slot, phase, backend) {
+        if self.settle(slot, phase, backend) || self.job_cancelled(slot) {
             self.cancelled_row(slot, backend)
         } else {
             row
@@ -624,14 +630,15 @@ impl DownloadMonitor {
     /// A cancel marked before this poll's `apply_cancels` has settled the
     /// slot already. One marked later in the poll, the next peer's enqueue
     /// included, moves to the new transfer with the slot, and the next
-    /// poll's `apply_cancels` stops that transfer.
+    /// poll's `apply_cancels` stops that transfer. A slot whose job is
+    /// marked cancelled tries no other source.
     async fn try_failover(
         &mut self,
         slot: usize,
         backend: &Arc<dyn DownloadBackend>,
         left: DownloadProgress,
     ) -> bool {
-        if !self.pool.has_next(slot) {
+        if !self.pool.has_next(slot) || self.job_cancelled(slot) {
             return false;
         }
         let reason = left
@@ -932,9 +939,9 @@ impl DownloadMonitor {
         }
     }
 
-    /// Stop every watched slot whose transfer its user cancelled, and show
-    /// it Cancelled. A slot whose own transfer already completed is left
-    /// alone, so its file is still imported.
+    /// Stop every watched slot whose transfer, or job, its user cancelled,
+    /// and show it Cancelled. A slot whose own transfer already completed is
+    /// left alone, so its file is still imported.
     async fn apply_cancels(
         &mut self,
         downloads: &[DownloadProgress],
@@ -943,9 +950,9 @@ impl DownloadMonitor {
         let registry = TransferRegistry::global();
         let mut cancelled = Vec::new();
         for slot in 0..self.tracked_files.len() {
-            if !self.watching(slot)
-                || !registry.is_cancelled(&self.slot_key(slot, backend.id()), &self.batch.owner)
-            {
+            let marked = self.job_cancelled(slot)
+                || registry.is_cancelled(&self.slot_key(slot, backend.id()), &self.batch.owner);
+            if !self.watching(slot) || !marked {
                 continue;
             }
             let tracked = &self.tracked_files[slot];
@@ -1964,11 +1971,27 @@ mod tests {
         sources: Vec<&str>,
         filenames: Vec<&str>,
     ) -> (DownloadMonitor, Recorded) {
+        monitor_for_job(tx, "j1", sources, filenames)
+    }
+
+    /// `monitor_on` with its slots in job `job`.
+    fn monitor_for_job(
+        tx: broadcast::Sender<DownloadEvent>,
+        job: &str,
+        sources: Vec<&str>,
+        filenames: Vec<&str>,
+    ) -> (DownloadMonitor, Recorded) {
         let (ledger, recorded) = Ledger::recording();
         let m = DownloadMonitor::new(
             (0..)
                 .zip(sources.into_iter().zip(filenames))
-                .map(|(slot, (source, filename))| watched(source, filename, slot))
+                .map(|(slot, (source, filename))| WatchedTransfer {
+                    job: JobSlot {
+                        job: job.to_string(),
+                        slot,
+                    },
+                    ..watched(source, filename, slot)
+                })
                 .collect(),
             PathBuf::from("/music"),
             tx,
@@ -3487,6 +3510,92 @@ mod tests {
             ]
         );
         assert_eq!(phase(&m, 0), SlotPhase::Settled);
+    }
+
+    #[tokio::test]
+    async fn a_job_cancelled_before_its_transfers_exist_is_stopped_at_the_first_poll() {
+        let (tx, _rx) = broadcast::channel(16);
+        let job = uuid::Uuid::new_v4().to_string();
+        TransferRegistry::global().cancel_job(&job);
+        let (mut m, mut recorded) = monitor_for_job(tx, &job, vec!["peer_a"], vec!["one.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        poll_tracks(
+            &mut m,
+            &[listed("peer_a", "one.flac", DownloadState::InProgress)],
+            &backend,
+        )
+        .await;
+        assert_eq!(stub.cancelled(), vec![Cancel::only("peer_a", "t-one.flac")]);
+        assert!(recorded.events().iter().any(|e| matches!(
+            e,
+            JobEvent::Slots {
+                state: JobState::Cancelled,
+                ..
+            }
+        )));
+        TransferRegistry::global().reopen_job(&job);
+    }
+
+    #[tokio::test]
+    async fn a_reopened_job_is_not_stopped() {
+        let (tx, _rx) = broadcast::channel(16);
+        let job = uuid::Uuid::new_v4().to_string();
+        TransferRegistry::global().cancel_job(&job);
+        TransferRegistry::global().reopen_job(&job);
+        let (mut m, _) = monitor_for_job(tx, &job, vec!["peer_b"], vec!["one.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        poll_tracks(
+            &mut m,
+            &[listed("peer_b", "one.flac", DownloadState::InProgress)],
+            &backend,
+        )
+        .await;
+        assert!(stub.cancelled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_failover_ends_cancelled() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let job = uuid::Uuid::new_v4().to_string();
+        let (m, mut recorded) = monitor_for_job(tx, &job, vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let mut m = m.with_failover(SourcePool::single(vec![
+            item("peer_a", "Wake Up", "dirA/aaa.flac"),
+            item("peer_b", "Wake Up", "dirB/bbb.flac"),
+        ]));
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+        let listing = [failed_transfer("peer_a", "dirA/aaa.flac")];
+        m.apply_cancels(&listing, &backend).await;
+        // The job is cancelled after this poll's apply_cancels, as its transfer fails.
+        TransferRegistry::global().cancel_job(&job);
+        let matched = m.find_matching_downloads(&listing, &backend);
+        let sending = m.peers_sending(&listing);
+        m.process_tracks(&matched, &sending, &backend).await;
+        assert!(stub.destinations().is_empty(), "no other source was asked");
+        assert_eq!(phase(&m, 0), SlotPhase::Settled);
+        assert_eq!(
+            slots_recorded(&mut recorded).last(),
+            Some(&(
+                JobState::Cancelled,
+                vec![(
+                    "dirA/aaa.flac".to_string(),
+                    Some(JobSlot {
+                        job: job.clone(),
+                        slot: 0
+                    })
+                )]
+            ))
+        );
+        assert_eq!(
+            rows_for(&mut rx, "dirA/aaa.flac")
+                .last()
+                .map(|r| r.state.clone()),
+            Some(DownloadState::Cancelled)
+        );
+        TransferRegistry::global().reopen_job(&job);
     }
 
     #[tokio::test]

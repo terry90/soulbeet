@@ -4,15 +4,22 @@
 use super::runner::{Acquire, MCP_DOWNLOADS_PER_USER};
 use super::{job_records, views_of, AlbumRef, JobSelect, JobView, Wanted};
 use crate::auth::UserId;
+use crate::core::index::not_found_after_scan;
 use crate::core::library::Reference;
 use crate::core::test_ctx;
+use crate::import_queue::ImportJob;
 use crate::ledger::store;
 use crate::ledger::{
-    Admitted, BatchOrigin, DuplicateRule, JobEvent, JobOptions, JobState, NewJob, NewJobBatch,
-    NewSearch, Pick, SlotResult, SourceFilters, StoredImport, StoredSpec, Transition, Transitioned,
+    Admitted, BatchOrigin, DuplicateRule, IndexWait, JobEvent, JobOptions, JobState, NewJob,
+    NewJobBatch, NewSearch, Pick, SlotResult, SourceFilters, StoredImport, StoredSpec, Transition,
+    Transitioned,
 };
+use crate::server_fns::download::monitor::cancelled_on_request;
 use crate::server_fns::download::test_support::{group, item, transfer};
-use shared::download::{DownloadProgress, DownloadState, JobSlot, SearchStats};
+use shared::download::{
+    DownloadProgress, DownloadQuery, DownloadState, DownloadableItem, IndexState, JobSlot,
+    SearchStats,
+};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use soulbeet::{DriverChoice, ImportMode, ImportOutcome, ImportedItem, SkipReason};
 use sqlx::SqlitePool;
@@ -289,6 +296,49 @@ pub(crate) async fn downloading_track_job_with(
 /// peer_a and a peer_b group, peer_a was picked, took a download place and was enqueued, and
 /// one InProgress row came for it.
 async fn start_downloading(acq: &Acquire, job: &str, title: &str) {
+    let picked = search_found(acq, job, title).await;
+    applied(
+        acq,
+        job,
+        Transition::Pick {
+            items: vec![(0, picked)],
+        },
+    )
+    .await;
+    downloading_from(acq, job, &item("peer_a", title, &file_of("a", title))).await;
+}
+
+/// alice's queued job `job` takes a download place, is enqueued and its file `from` sends an
+/// InProgress row, as its runner and monitor record them.
+pub(crate) async fn downloading_from(acq: &Acquire, job: &str, from: &DownloadableItem) {
+    assert!(acq
+        .ledger
+        .claim_download(job, MCP_DOWNLOADS_PER_USER)
+        .await
+        .unwrap());
+    acq.ledger.record(JobEvent::Enqueued {
+        job: job.to_string(),
+        monitor_batch_id: uuid::Uuid::new_v4().to_string(),
+        batch_label: "Come Over".into(),
+        request: uuid::Uuid::new_v4().to_string(),
+    });
+    let row = transfer(
+        &from.source,
+        &from.id,
+        &format!("t-{}", from.id),
+        DownloadState::InProgress,
+    )
+    .with_job(slot_0(job));
+    acq.ledger.record(JobEvent::Slots {
+        state: JobState::Downloading,
+        rows: vec![row],
+    });
+    acq.ledger.settled().await;
+}
+
+/// The search of alice's searching track job `job` for Marrow Choir - `title` ends with a peer_a
+/// and a peer_b group, best first: peer_a's file.
+async fn search_found(acq: &Acquire, job: &str, title: &str) -> DownloadableItem {
     let record = store::job_record(&acq.db, job, &alice())
         .await
         .unwrap()
@@ -321,30 +371,184 @@ async fn start_downloading(acq: &Acquire, job: &str, title: &str) {
         .search_ended(&search_id, Ok((groups, SearchStats::default())))
         .await
         .unwrap();
-    applied(
-        acq,
-        job,
-        Transition::Pick {
-            items: vec![(0, picked)],
-        },
+    picked
+}
+
+/// alice's track job for Marrow Choir - "O Come All Ye Faithful" waiting for a source choice:
+/// its search found a peer_a and a peer_b group.
+pub(crate) async fn choosing_track_job(acq: &Acquire) -> String {
+    let title = "O Come All Ye Faithful";
+    let job = mcp_track_job(acq, "Marrow Choir", title, auto_options()).await;
+    search_found(acq, &job, title).await;
+    applied(acq, &job, Transition::AwaitChoice).await;
+    job
+}
+
+/// `downloading_track_job_with` `title`, whose transfer from peer_a failed with `failure` and no
+/// source was left.
+pub(crate) async fn failed_track_job_with(acq: &Acquire, title: &str, failure: Failure) -> String {
+    let job = downloading_track_job_with(acq, title, auto_options()).await;
+    fail_slot(acq, &job, failure).await;
+    job
+}
+
+/// A peer's refusal of a file it does not share, as slskd words it (Soulseek.NET
+/// src/SoulseekClient.cs:3310, slskd src/slskd/Application.cs:580): retry another source.
+fn not_shared() -> Failure {
+    let text = "Transfer rejected: File not shared.";
+    Failure::new(
+        FailureCode::TransferRejectedNotShared,
+        Stage::Transfer,
+        RetryAdvice::OtherSource,
+        text,
     )
-    .await;
-    assert!(acq
-        .ledger
-        .claim_download(job, MCP_DOWNLOADS_PER_USER)
-        .await
-        .unwrap());
-    acq.ledger.record(JobEvent::Enqueued {
-        job: job.to_string(),
-        monitor_batch_id: uuid::Uuid::new_v4().to_string(),
-        batch_label: "Come Over".into(),
-        request: uuid::Uuid::new_v4().to_string(),
+    .with_cause(Service::Slskd, None, text)
+}
+
+/// Job `job`'s next source `from` was tried and failed with `failure`, no source left after it.
+pub(crate) async fn failed_from(
+    acq: &Acquire,
+    job: &str,
+    from: &DownloadableItem,
+    failure: Failure,
+) {
+    acq.ledger.record(JobEvent::Attempt {
+        slot: slot_0(job),
+        candidate: Some(Box::new(from.clone())),
+        request: Some(uuid::Uuid::new_v4().to_string()),
     });
+    let row = transfer(
+        &from.source,
+        &from.id,
+        &format!("t-{}", from.id),
+        DownloadState::Queued,
+    )
+    .failed_with(failure)
+    .with_job(slot_0(job));
     acq.ledger.record(JobEvent::Slots {
-        state: JobState::Downloading,
-        rows: vec![in_progress(job, title)],
+        state: JobState::Failed,
+        rows: vec![row],
     });
     acq.ledger.settled().await;
+}
+
+/// A failed track job "Ding Dong Merrily" that tried both sources its search found.
+pub(crate) async fn exhausted_track_job(acq: &Acquire) -> String {
+    let title = "Ding Dong Merrily";
+    let job = downloading_track_job_with(acq, title, auto_options()).await;
+    acq.ledger.record(JobEvent::Slots {
+        state: JobState::Downloading,
+        rows: vec![in_progress(&job, title).failed_with(not_shared())],
+    });
+    let next = item("peer_b", title, &file_of("b", title));
+    failed_from(acq, &job, &next, not_shared()).await;
+    job
+}
+
+/// `downloading_track_job` "The First Noel", cancelled, its transfer stopped by its monitor.
+pub(crate) async fn cancelled_track_job(acq: &Acquire) -> String {
+    let job = downloading_track_job_with(acq, "The First Noel", auto_options()).await;
+    applied(acq, &job, Transition::Cancel).await;
+    stop_slots(acq, &job).await;
+    job
+}
+
+/// The monitor stopped every slot of alice's job `job` that has a row: their rows, Cancelled.
+pub(crate) async fn stop_slots(acq: &Acquire, job: &str) {
+    let rows = (view_of(acq, job).await.slots.into_iter())
+        .filter_map(|slot| slot.row)
+        .map(|row| {
+            row.with_state(DownloadState::Cancelled)
+                .with_failure(cancelled_on_request())
+        })
+        .collect();
+    acq.ledger.record(JobEvent::Slots {
+        state: JobState::Cancelled,
+        rows,
+    });
+    acq.ledger.settled().await;
+}
+
+/// What beets applied for Marrow Choir - `title`.
+fn applied_item(title: &str) -> ImportedItem {
+    ImportedItem {
+        path: format!("Marrow Choir/Winter Songs/03 - {title}.flac").into(),
+        recording_mbid: None,
+        artist: "Marrow Choir".into(),
+        title: title.into(),
+        album: "Winter Songs".into(),
+        beets_id: Some(412),
+        release_mbid: None,
+        match_per_mille: Some(980),
+    }
+}
+
+/// `importing_track_job` "Joy to the World", imported from peer_a: done, as a user without
+/// Navidrome's import ends.
+pub(crate) async fn done_track_job(acq: &Acquire) -> String {
+    let title = "Joy to the World";
+    let source = Path::new("/downloads/Come Over [1f2e3d4c]/03 - Joy to the World.flac");
+    let job = importing_track_job(acq, title, source).await;
+    let row = in_progress(&job, title).with_state(DownloadState::Imported);
+    acq.ledger
+        .record(JobEvent::ImportDone(Box::new(crate::ledger::ImportDone {
+            import: import_of(&job, title, source),
+            rows: vec![row],
+            next: JobState::Done,
+            index: None,
+            results: vec![(
+                slot_0(&job),
+                SlotResult::Imported {
+                    applied: vec![applied_item(title)],
+                    untagged: false,
+                    listed: None,
+                },
+            )],
+        })));
+    acq.ledger.settled().await;
+    job
+}
+
+/// `importing_track_job` "Away in a Manger", imported, whose wait for Navidrome failed: Navidrome
+/// scanned and does not list the file, as the index runner records it.
+pub(crate) async fn index_failed_track_job(acq: &Acquire) -> String {
+    let title = "Away in a Manger";
+    let source = Path::new("/downloads/Come Over [1f2e3d4c]/03 - Away in a Manger.flac");
+    let job = importing_track_job(acq, title, source).await;
+    let row = in_progress(&job, title).with_state(DownloadState::Imported);
+    let wait = IndexWait {
+        import: source.display().to_string(),
+        library: std::env::temp_dir(),
+        items: vec![applied_item(title)],
+        since: 0,
+        baseline: None,
+        checked: None,
+    };
+    acq.ledger
+        .record(JobEvent::ImportDone(Box::new(crate::ledger::ImportDone {
+            import: import_of(&job, title, source),
+            rows: vec![row.clone()],
+            next: JobState::Indexing,
+            index: Some(wait),
+            results: vec![(
+                slot_0(&job),
+                SlotResult::Imported {
+                    applied: vec![applied_item(title)],
+                    untagged: false,
+                    listed: None,
+                },
+            )],
+        })));
+    let lost = DownloadProgress {
+        index: Some(IndexState::Failed(not_found_after_scan())),
+        ..row
+    };
+    acq.ledger.record(JobEvent::Slots {
+        state: JobState::Failed,
+        rows: vec![lost],
+    });
+    acq.ledger.settled().await;
+    job
 }
 
 /// `downloading_track_job`, whose transfer from peer_a the peer rejected for a file it does not
@@ -352,26 +556,11 @@ async fn start_downloading(acq: &Acquire, job: &str, title: &str) {
 pub(crate) async fn failed_track_job(acq: &Acquire) -> String {
     let job = downloading_track_job(acq).await;
     let title = "O Holy Night";
-    // Soulseek.NET's text for a refused upload (src/SoulseekClient.cs:3310) with slskd's reason
-    // for a file it does not share (src/slskd/Application.cs:580).
-    let not_shared = "Transfer rejected: File not shared.";
-    let rejected = Failure::new(
-        FailureCode::TransferRejectedNotShared,
-        Stage::Transfer,
-        RetryAdvice::OtherSource,
-        not_shared,
-    )
-    .with_cause(Service::Slskd, None, not_shared);
     acq.ledger.record(JobEvent::Slots {
         state: JobState::Downloading,
-        rows: vec![in_progress(&job, title).failed_with(rejected)],
+        rows: vec![in_progress(&job, title).failed_with(not_shared())],
     });
     let next = item("carol_shares", title, &file_of("c", title));
-    acq.ledger.record(JobEvent::Attempt {
-        slot: slot_0(&job),
-        candidate: Some(Box::new(next.clone())),
-        request: Some(uuid::Uuid::new_v4().to_string()),
-    });
     // Soulseek.NET's text for a peer that is not logged in (src/SoulseekClient.cs:3790).
     let not_online = "User carol_shares appears to be offline";
     let offline = Failure::new(
@@ -381,17 +570,39 @@ pub(crate) async fn failed_track_job(acq: &Acquire) -> String {
         not_online,
     )
     .with_cause(Service::Slskd, None, not_online);
-    let row = transfer(
-        "carol_shares",
-        &next.id,
-        &format!("t-{}", next.id),
-        DownloadState::Queued,
-    )
-    .failed_with(offline)
-    .with_job(slot_0(&job));
-    acq.ledger.record(JobEvent::Slots {
+    failed_from(acq, &job, &next, offline).await;
+    job
+}
+
+/// alice's web UI job for Marrow Choir - O Holy Night, which picked peer_a's file and failed.
+pub(crate) async fn failed_web_ui_job(acq: &Acquire) -> String {
+    let job = uuid::Uuid::new_v4().to_string();
+    let wanted = DownloadQuery::new(vec![crate::server_fns::download::test_support::track(
+        "Marrow Choir",
+        "O Holy Night",
+    )]);
+    acq.ledger
+        .create(
+            NewJob {
+                id: job.clone(),
+                user: alice(),
+                folder_id: ALICE_FOLDER.into(),
+                kind: crate::ledger::JobKind::of(&wanted),
+                wanted,
+                import_mode: ImportMode::Singleton,
+                state: JobState::Queued,
+                search_id: None,
+                picked: vec![(0, item("peer_a", "O Holy Night", "a/03.flac"))],
+                options: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    acq.ledger.record(JobEvent::Ended {
+        job: job.clone(),
         state: JobState::Failed,
-        rows: vec![row],
+        failure: None,
     });
     acq.ledger.settled().await;
     job
@@ -481,19 +692,105 @@ pub(crate) async fn duplicate_track_job(
 }
 
 /// `importing_track_job` whose import beets skipped with nothing to pick: the import is kept
-/// for a decision, as the import queue's finish records one.
+/// for a decision, in `acq`'s queue and the ledger, as the import queue's finish keeps one.
+/// `source` holds audio.
 pub(crate) async fn kept_track_job(acq: &Acquire, title: &str, source: &Path) -> String {
     let job = importing_track_job(acq, title, source).await;
-    let import = import_of(&job, title, source);
-    let row = in_progress(&job, title).with_state(DownloadState::ImportSkipped);
+    keep(acq, import_of(&job, title, source), true).await;
+    job
+}
+
+/// `import` ended with nothing to pick: kept for a decision in the ledger, and in `acq`'s queue
+/// when `queued` (one a restart could not restore is in the ledger alone).
+async fn keep(acq: &Acquire, import: StoredImport, queued: bool) {
+    let rows = (import.rows.iter())
+        .map(|(_, row)| row.clone().with_state(DownloadState::ImportSkipped))
+        .collect();
+    if queued {
+        acq.queue
+            .restore(ImportJob::from_stored(import.clone(), alice()))
+            .await
+            .expect("its sources hold audio");
+    }
     acq.ledger
         .record(JobEvent::ImportDone(Box::new(crate::ledger::ImportDone {
             import,
-            rows: vec![row],
+            rows,
             next: JobState::NeedsDecision,
             index: None,
             results: vec![],
         })));
     acq.ledger.settled().await;
+}
+
+/// alice's album job for Kowloon - Come Over whose two files, from peer_a, were imported apart,
+/// each import kept for a decision: the job, and each slot's import, in `acq`'s queue only when
+/// `queued` says so (one a restart could not restore is kept in the ledger alone). `sources`
+/// hold audio.
+pub(crate) async fn kept_album_job(
+    acq: &Acquire,
+    sources: [&Path; 2],
+    queued: [bool; 2],
+) -> String {
+    let job = mcp_album_job(
+        acq,
+        "Kowloon",
+        "Come Over",
+        "6a09041b-0f79-3278-88d9-0552dd28d37f",
+    )
+    .await;
+    let files = [
+        item("peer_a", "Wake Up", "a/07.flac"),
+        item("peer_a", "Come Over", "a/08.flac"),
+    ];
+    applied(
+        acq,
+        &job,
+        Transition::Pick {
+            items: (0..).zip(files.clone()).collect(),
+        },
+    )
+    .await;
+    assert!(acq
+        .ledger
+        .claim_download(&job, MCP_DOWNLOADS_PER_USER)
+        .await
+        .unwrap());
+    let rows: Vec<DownloadProgress> = (0..)
+        .zip(&files)
+        .map(|(slot, file)| {
+            transfer(
+                "peer_a",
+                &file.id,
+                &format!("t-{}", file.id),
+                DownloadState::Completed,
+            )
+            .with_job(JobSlot {
+                job: job.clone(),
+                slot,
+            })
+        })
+        .collect();
+    acq.ledger.record(JobEvent::Slots {
+        state: JobState::Downloading,
+        rows: rows.clone(),
+    });
+    for ((row, source), queued) in rows.into_iter().zip(sources).zip(queued) {
+        let row = row.with_state(DownloadState::ImportQueued(1));
+        let slot = row.job.clone().unwrap();
+        let import = StoredImport {
+            sources: vec![source.to_path_buf()],
+            target: std::env::temp_dir(),
+            album: true,
+            cleanup_root: None,
+            choices: None,
+            choice: DriverChoice::Auto,
+            rows: vec![(slot, row)],
+            duplicates: DuplicateRule::Skip,
+        };
+        acq.ledger
+            .record(JobEvent::ImportQueued(Box::new(import.clone())));
+        keep(acq, import, queued).await;
+    }
     job
 }

@@ -18,7 +18,8 @@ use soulbeet::{DownloadBackend, ImportedItem};
 
 use super::contract::{error_object, NextCall, ToolError};
 use super::next::next_calls;
-use crate::core::jobs::{failed_slot, job_failure, JobView, SlotView};
+use crate::core::jobs::retry::enable_deletion;
+use crate::core::jobs::{failed_slot, job_failure, JobView, SlotView, Untried};
 use crate::core::library::SongFacts;
 use crate::core::sources::{self, Candidate, DroppedByFilter, SearchProgress};
 use crate::ledger::store::AttemptRecord;
@@ -292,12 +293,20 @@ const TRIED_PER_SLOT: usize = 10;
 
 /// The job as get_jobs shows it (design 11.5). Summary: what it is, its state and its failure;
 /// full adds each slot with its current transfer (`now.live` answering for the running ones),
-/// the earlier attempts (`tried`), the timeline, what each import gave and `next`.
-pub(crate) fn job_document(view: &JobView, detail: Detail, now: &ReadNow) -> Value {
+/// the earlier attempts (`tried`), the timeline, what each import gave and `next`, computed from
+/// the job and its `untried` candidates. `deletion_enabled`: whether the calling app may delete
+/// music, which a rejected result's failure tells how to allow when it may not.
+pub(crate) fn job_document(
+    view: &JobView,
+    untried: &Untried,
+    detail: Detail,
+    now: &ReadNow,
+    deletion_enabled: bool,
+) -> Value {
     let job = &view.job;
     // The search's query holds an album's tracklist.
     let wanted = view.search.as_ref().map_or(&job.wanted, |s| &s.query);
-    let next = next_calls(view);
+    let next = next_calls(view, untried);
     let mut doc = Map::new();
     doc.insert("job_id".into(), json!(job.id));
     doc.insert("batch_id".into(), json!(job.batch_id));
@@ -309,7 +318,7 @@ pub(crate) fn job_document(view: &JobView, detail: Detail, now: &ReadNow) -> Val
     doc.insert("updated_at".into(), json!(job.updated_at));
     doc.insert(
         "failure".into(),
-        failure_document(view, wanted, next.clone()),
+        failure_document(view, wanted, next.clone(), deletion_enabled),
     );
     if detail == Detail::Summary {
         return Value::Object(doc);
@@ -455,12 +464,22 @@ fn error_value(failure: &Failure) -> Value {
 
 /// `job_failure` as an error object with its facts (D16): a failure of the job's search with
 /// what the search read; any other with the attempt it is of, the slot's earlier attempts as
-/// `tried`, and `next`. Null for a job that did not fail.
-fn failure_document(view: &JobView, wanted: &DownloadQuery, next: Vec<NextCall>) -> Value {
+/// `tried`, and `next`. A rejected result stays in the library until deleted (design 11.5): when
+/// deletion is not enabled for the app, its user_action says how a person enables it. Null for a
+/// job that did not fail.
+fn failure_document(
+    view: &JobView,
+    wanted: &DownloadQuery,
+    next: Vec<NextCall>,
+    deletion_enabled: bool,
+) -> Value {
     let Some(mut failure) = job_failure(view) else {
         return Value::Null;
     };
     failure.message = cut(&failure.message);
+    if failure.code == FailureCode::ResultRejected && !deletion_enabled {
+        failure.user_action = Some(enable_deletion());
+    }
     let mut facts = Map::new();
     facts.insert("job_id".into(), json!(view.job.id));
     let mut tried = vec![];
@@ -787,8 +806,13 @@ fn album_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::jobs::retry::{retry, RetryAnswer};
     use crate::core::jobs::runner::Acquire;
-    use crate::core::jobs::test_support::{failed_track_job, test_db_with_alice, view_of};
+    use crate::core::jobs::test_support::{
+        done_track_job, failed_track_job, test_db_with_alice, view_of,
+    };
+    use crate::core::jobs::{untried, RetryMode};
+    use crate::core::test_ctx;
     use crate::server_fns::download::test_support::{group, item, track};
     use shared::download::FileFacts;
 
@@ -796,11 +820,10 @@ mod tests {
     async fn a_failed_job_carries_its_failure_its_facts_and_what_was_tried() {
         let (acq, _) = Acquire::for_test(test_db_with_alice().await);
         let job = failed_track_job(&acq).await;
-        let doc = job_document(
-            &view_of(&acq, &job).await,
-            Detail::Summary,
-            &ReadNow::default(),
-        );
+        let view = view_of(&acq, &job).await;
+        let now = chrono::Utc::now().timestamp();
+        let untried = untried(&acq.db, &view, now).await.unwrap();
+        let doc = job_document(&view, &untried, Detail::Summary, &ReadNow::default(), false);
         assert_eq!(doc["state"], "failed");
         let failure = &doc["failure"];
         assert_eq!(
@@ -853,15 +876,29 @@ mod tests {
                 Some("a/03 - O Holy Night.flac")
             )
         );
-        // A failed job offers nothing yet, and summary detail stops at the failure.
-        assert_eq!(failure["next"], json!([]));
+        // The source its search found and it did not try, another search, or let it go; summary
+        // detail stops at the failure.
+        let offered: Vec<(&str, &str)> = (failure["next"].as_array().unwrap().iter())
+            .map(|n| {
+                let mode = n["args"]["mode"].as_str().unwrap_or("");
+                (n["tool"].as_str().unwrap(), mode)
+            })
+            .collect();
+        assert_eq!(
+            offered,
+            vec![
+                ("retry_job", "next_source"),
+                ("retry_job", "new_search"),
+                ("dismiss_job", "")
+            ]
+        );
+        assert_eq!(
+            failure["next"][0]["best_candidate"]["source"], "peer_b",
+            "{failure}"
+        );
         assert!(doc.get("slots").is_none() && doc.get("next").is_none());
 
-        let full = job_document(
-            &view_of(&acq, &job).await,
-            Detail::Full,
-            &ReadNow::default(),
-        );
+        let full = job_document(&view, &untried, Detail::Full, &ReadNow::default(), false);
         assert_eq!(full["tried"], failure["tried"]);
         let slot = &full["slots"][0];
         assert_eq!(
@@ -880,6 +917,29 @@ mod tests {
             .collect();
         assert_eq!(events.last(), Some(&"failed"), "{full}");
         assert_eq!(full["timeline_omitted"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_result_says_how_to_allow_deleting_it() {
+        let (acq, _) = Acquire::for_test(test_db_with_alice().await);
+        let job = done_track_job(&acq).await;
+        let alice = test_ctx("alice");
+        let rejected = retry(&acq, &alice, &job, RetryMode::RejectResult, None);
+        assert!(matches!(rejected.await.unwrap(), RetryAnswer::Applied(_)));
+        let view = view_of(&acq, &job).await;
+        let untried = untried(&acq.db, &view, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let doc = job_document(&view, &untried, Detail::Full, &ReadNow::default(), false);
+        assert_eq!(doc["failure"]["code"], "result_rejected");
+        // The file stays in the library until deleted, which this app may not do.
+        assert_eq!(
+            doc["failure"]["user_action"],
+            json!({"code": "enable_deletion", "what": "Allow deleting music for this app",
+                "where": "Settings > Users > Connected apps"})
+        );
+        let allowed = job_document(&view, &untried, Detail::Full, &ReadNow::default(), true);
+        assert!(allowed["failure"]["user_action"].is_null());
     }
 
     #[test]
