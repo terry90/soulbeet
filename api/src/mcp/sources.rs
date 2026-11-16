@@ -8,11 +8,12 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::download::SearchStats;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+use tokio::task::JoinHandle;
 
 use super::args::Args;
 use super::contract::{answer, failed, upstream_error, NextCall, ToolError};
 use super::facts::{candidate_document, search_facts};
-use super::keys::{keyed, request_key};
+use super::keys::{keyed, request_key, Keyed};
 use super::paging::{fit, Listing, Page, MAX_LIMIT};
 use super::refs::{
     filters, filters_schema, page_schema, reference_schema, reference_value, request_key_schema,
@@ -52,7 +53,7 @@ pub(crate) const FIND_SOURCES: ToolSpec = ToolSpec {
     title: "Find download sources",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Searches the download backend (slskd, the Soulseek network) for a track or an album and ranks what it finds. Takes a reference ({{artist, title, album?, recording_mbid?, duration_s?}} for a track, or {{kind: \"album\", artist, title, release_mbid}} for an album, whose tracklist is read from MusicBrainz), optional query_text to send instead of \"artist title\", quality filters (formats, min_bitrate_kbps, lossless_only, max_queue_length) and include_below_floor to keep weak matches, flagged. Returns candidates with candidate_id, source, remote file or folder, extension, size, bitrate, sample rate, bit depth, duration and its difference from the wanted one, match and quality scores, for albums the tracks found and the missing titles, the source's free slot, speed, queue and its failed transfers in the last 24 hours (3 or more: flagged, never picked automatically). Waits up to 45 seconds; a longer search answers state pending with search_id for get_sources. Searches run one at a time for the whole server, every user's included: pending says how many run or wait before this one (searches_ahead), and a user with {FINDS_WAITING_PER_USER} searches waiting is answered rate_limited with their search_ids. A repeat with the same request_key answers the first call's result instead of searching again. Search ids and candidate ids stay valid 24 hours. Failure codes: {common}, backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), search_no_results (nothing on the network), search_all_filtered (found, but scored out or filtered; the facts say how many of each), search_timeout, search_query_rejected, search_already_running, search_lost, search_rate_limited, already_running (a call with this request_key still runs).")
+        format!("Searches the download backend (slskd, the Soulseek network) for a track or an album and ranks what it finds. Takes a reference ({{artist, title, album?, recording_mbid?, duration_s?}} for a track, or {{kind: \"album\", artist, title, release_mbid}} for an album, whose tracklist is read from MusicBrainz), optional query_text to send instead of \"artist title\", quality filters (formats, min_bitrate_kbps, lossless_only, max_queue_length) and include_below_floor to keep weak matches, flagged. Returns candidates with candidate_id, source, remote file or folder, extension, size, bitrate, sample rate, bit depth, duration and its difference from the wanted one, match and quality scores, for albums the tracks found and the missing titles, the source's free slot, speed, queue and its failed transfers in the last 24 hours (3 or more: flagged, never picked automatically). Waits up to 45 seconds; a longer search answers state pending with search_id for get_sources. Searches run one at a time for the whole server, every user's included: pending says how many run or wait before this one (searches_ahead), and a user with {FINDS_WAITING_PER_USER} searches waiting is answered rate_limited with their search_ids. A repeat with the same request_key answers the first call's result instead of searching again, unless that call was refused before its search started: then the repeat runs. Search ids and candidate ids stay valid 24 hours. Failure codes: {common}, backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), search_no_results (nothing on the network), search_all_filtered (found, but scored out or filtered; the facts say how many of each), search_timeout, search_query_rejected, search_already_running, search_lost, search_rate_limited, already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["reference"], "properties": {"reference": "#,
@@ -112,7 +113,13 @@ pub(crate) async fn find_sources(
         "filters": find.spec.filters, "include_below_floor": find.spec.keep_below_floor,
         "limit": find.limit});
     let (acquire, ctx) = (state.acquire.clone(), caller.ctx.clone());
-    let work = async move { answer(run_find(&acquire, &ctx, find).await) };
+    let work = async move {
+        match start_search(&acquire, &ctx, find).await {
+            Ok(started) => Keyed::Kept(answer(searched(&acquire, &ctx, started).await)),
+            // Nothing was written: the same call can run again.
+            Err(refused) => Keyed::Released(failed(refused)),
+        }
+    };
     keyed(&state.acquire, caller, "find_sources", key, &call, work).await
 }
 
@@ -140,11 +147,21 @@ fn read_find(args: &Args) -> Result<(Find, Option<String>), ToolError> {
     ))
 }
 
-async fn run_find(
+/// A search find_sources recorded and started.
+struct Started {
+    id: String,
+    task: JoinHandle<SearchProgress>,
+    spec: StoredSpec,
+    limit: Option<u32>,
+}
+
+/// Records and starts the search `find` asks for. Each refusal comes before the search is
+/// recorded, so it wrote nothing.
+async fn start_search(
     acquire: &Arc<Acquire>,
     ctx: &UserCtx,
     find: Find,
-) -> Result<Map<String, Value>, ToolError> {
+) -> Result<Started, ToolError> {
     let Find {
         wanted,
         spec,
@@ -181,6 +198,26 @@ async fn run_find(
             FindRefused::TooManyWaiting(waiting) => too_many_waiting(waiting),
             FindRefused::Failed(f) => failure_of(f, Map::new(), &spec, &Failed::Elsewhere),
         })?;
+    Ok(Started {
+        id,
+        task,
+        spec,
+        limit,
+    })
+}
+
+/// The answer to the search `started`: once it ends, or as pending after FIND_WAIT.
+async fn searched(
+    acquire: &Arc<Acquire>,
+    ctx: &UserCtx,
+    started: Started,
+) -> Result<Map<String, Value>, ToolError> {
+    let Started {
+        id,
+        task,
+        spec,
+        limit,
+    } = started;
     // Past FIND_WAIT the search goes on in its task, and is read as stored either way.
     let _ = tokio::time::timeout(FIND_WAIT, task).await;
     let stored = owned_search(&acquire.db, ctx, &id)
@@ -489,7 +526,7 @@ mod tests {
 
     use super::*;
     use crate::connection::test_util::{
-        access_token, add_user, alice_caller, app_of, app_with_acquire, call_tool, document,
+        access_token, add_user, alice_caller, app_of, app_with_acquire, call_tool, count, document,
         text_of, RESOURCE,
     };
     use crate::mcp::args::tests::obj;
@@ -1019,7 +1056,8 @@ mod tests {
                 app,
                 &token,
                 "find_sources",
-                json!({"reference": {"artist": "Kowloon", "title": "Midnight"}}),
+                json!({"reference": {"artist": "Kowloon", "title": "Midnight"},
+                    "request_key": "k1"}),
             )
             .await,
         )["error"]
@@ -1050,6 +1088,8 @@ mod tests {
             json!({"tool": "get_sources", "args": {"search_id": ids[0], "wait_seconds": 60}})
         );
         assert_eq!(effects.stub().specs().len(), 1);
+        // Refused before a search started: the key is free for the same call later.
+        assert_eq!(count(&db, "request_keys").await, 0);
     }
 
     #[tokio::test]

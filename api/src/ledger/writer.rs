@@ -92,6 +92,11 @@ pub(super) enum Write {
         is_error: bool,
         reply: Reply<()>,
     },
+    ReleaseKey {
+        key: RequestKey,
+        instance: String,
+        reply: Reply<()>,
+    },
     Event(JobEvent),
     /// An event whose sender waits until it is stored.
     Stored {
@@ -369,6 +374,14 @@ impl Writer {
             } => {
                 let stored = finish_key(&self.db, &key, &document, is_error).await;
                 self.finish(reply, "store a request key's result", stored)
+            }
+            Write::ReleaseKey {
+                key,
+                instance,
+                reply,
+            } => {
+                let released = release_key(&self.db, &key, &instance).await;
+                self.finish(reply, "release a request key", released)
             }
             Write::Event(event) => {
                 let recorded = self.event(event).await;
@@ -1486,6 +1499,23 @@ async fn finish_key(
     .bind(&key.grant_id)
     .bind(&key.tool)
     .bind(&key.key)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Removes `key`'s reservation made by process `instance` while it holds no result, so the
+/// key's next call runs as its first.
+async fn release_key(db: &SqlitePool, key: &RequestKey, instance: &str) -> Result<(), LedgerError> {
+    sqlx::query(
+        "DELETE FROM request_keys WHERE user_id = ? AND grant_id = ? AND tool = ? AND key = ? \
+         AND instance = ? AND document IS NULL",
+    )
+    .bind(key.user.to_string())
+    .bind(&key.grant_id)
+    .bind(&key.tool)
+    .bind(&key.key)
+    .bind(instance)
     .execute(db)
     .await?;
     Ok(())

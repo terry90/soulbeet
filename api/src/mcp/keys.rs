@@ -55,11 +55,22 @@ pub(crate) fn key_running() -> ToolError {
     }
 }
 
+/// What a keyed call's work answered, and whether its key keeps the answer.
+pub(crate) enum Keyed {
+    /// The work made or joined a job, batch or search, or its answer is final: a repeat with
+    /// the key answers it.
+    Kept(CallToolResult),
+    /// A refusal made before the work wrote anything: the key is let go, and a repeat with it
+    /// runs the work again.
+    Released(CallToolResult),
+}
+
 /// Runs `work` once per `key` of the caller's app for `tool` (design 10.3); without a key,
 /// always. `call` is the call's arguments as the tool read them, `request_key` left out: a key
 /// repeated with other arguments is refused. The work runs in its own task, so a client that
-/// leaves does not stop it, and its result is stored for the key, failures included. A repeat
-/// answers the stored result while the first call has ended, `key_running` while it runs.
+/// leaves does not stop it. A kept answer is stored for the key, failures included; a released
+/// one, or one the ledger could not store, lets the key go. A repeat answers the stored result
+/// while the first call has ended, `key_running` while it runs.
 pub(crate) async fn keyed<Fut>(
     acquire: &Acquire,
     caller: &McpCaller,
@@ -69,10 +80,15 @@ pub(crate) async fn keyed<Fut>(
     work: Fut,
 ) -> CallToolResult
 where
-    Fut: Future<Output = CallToolResult> + Send + 'static,
+    Fut: Future<Output = Keyed> + Send + 'static,
 {
     let Some(key) = key else {
-        return run(tokio::spawn(work)).await;
+        return run(tokio::spawn(async move {
+            match work.await {
+                Keyed::Kept(result) | Keyed::Released(result) => result,
+            }
+        }))
+        .await;
     };
     let key = RequestKey {
         user: caller.ctx.id(),
@@ -109,17 +125,25 @@ where
         Ok(KeyReservation::Fresh) => {
             let ledger = acquire.ledger.clone();
             run(tokio::spawn(async move {
-                let result = work.await;
-                let document = result
-                    .content
-                    .first()
-                    .and_then(|block| block.as_text())
-                    .map(|text| text.text.clone())
-                    .unwrap_or_default();
-                // The writer logs a result it could not store; the caller still gets it.
-                let _ = ledger
-                    .finish_key(&key, document, result.is_error == Some(true))
-                    .await;
+                let (result, keep) = match work.await {
+                    Keyed::Kept(result) => (result, true),
+                    Keyed::Released(result) => (result, false),
+                };
+                let stored = keep && {
+                    let document = result
+                        .content
+                        .first()
+                        .and_then(|block| block.as_text())
+                        .map(|text| text.text.clone())
+                        .unwrap_or_default();
+                    let is_error = result.is_error == Some(true);
+                    ledger.finish_key(&key, document, is_error).await.is_ok()
+                };
+                // The writer logs a write it could not make; the caller gets the result either
+                // way.
+                if !stored {
+                    let _ = ledger.release_key(&key, &INSTANCE).await;
+                }
                 result
             }))
             .await
@@ -147,7 +171,7 @@ mod tests {
     use crate::mcp::contract::success;
 
     /// A call a repeated key must never run.
-    async fn never() -> CallToolResult {
+    async fn never() -> Keyed {
         unreachable!("a repeated key never runs its call")
     }
 
@@ -155,15 +179,37 @@ mod tests {
         success(Map::from_iter([("answer".to_string(), json!(text))]))
     }
 
-    #[tokio::test]
-    async fn a_repeat_with_the_same_key_gets_the_first_document() {
-        let db = crate::db::test_db::migrated().await;
+    /// alice's caller through her grant, and the acquisition over `db`.
+    async fn alice_on(db: sqlx::SqlitePool) -> (McpCaller, Arc<Acquire>) {
         add_user(&db, "u1", "alice").await;
         let caller = McpCaller {
             grant_id: grant_id_of(&db, "u1", RESOURCE).await,
             ..alice_caller(false)
         };
-        let (acquire, _) = Acquire::for_test(db);
+        (caller, Acquire::for_test(db).0)
+    }
+
+    /// `keyed` for find_sources with the key "k1" on one fixed call.
+    async fn call_k1(
+        acquire: &Acquire,
+        caller: &McpCaller,
+        work: impl Future<Output = Keyed> + Send + 'static,
+    ) -> CallToolResult {
+        let call = json!({"reference": {"kind": "track", "artist": "Kowloon", "title": "Wake Up"}});
+        keyed(
+            acquire,
+            caller,
+            "find_sources",
+            Some("k1".into()),
+            &call,
+            work,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_repeat_with_the_same_key_gets_the_first_document() {
+        let (caller, acquire) = alice_on(crate::db::test_db::migrated().await).await;
         let call = json!({"reference": {"kind": "track", "artist": "Kowloon", "title": "Wake Up"}});
         let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         let first = tokio::spawn({
@@ -173,7 +219,7 @@ mod tests {
                 let work = async move {
                     entered.notify_one();
                     release.notified().await;
-                    answer("first")
+                    Keyed::Kept(answer("first"))
                 };
                 keyed(
                     &acquire,
@@ -223,9 +269,60 @@ mod tests {
         );
         // Without a key, every call runs.
         let unkeyed = keyed(&acquire, &caller, "find_sources", None, &call, async {
-            answer("second")
+            Keyed::Kept(answer("second"))
         })
         .await;
         assert_eq!(text_of(&unkeyed), text_of(&answer("second")));
+    }
+
+    #[tokio::test]
+    async fn a_call_refused_before_it_acted_leaves_its_key_to_the_next_call() {
+        let (caller, acquire) = alice_on(crate::db::test_db::migrated().await).await;
+        let limited = || {
+            failed(ToolError {
+                failure: Failure::new(
+                    FailureCode::RateLimited,
+                    Stage::SourceSearch,
+                    RetryAdvice::SameSourceLater,
+                    "This user already has 3 source searches waiting for their turn; read them with get_sources first",
+                ),
+                facts: Map::new(),
+                tried: vec![],
+                next: vec![],
+            })
+        };
+        let refused = call_k1(&acquire, &caller, async move { Keyed::Released(limited()) }).await;
+        assert_eq!(
+            (text_of(&refused), refused.is_error),
+            (text_of(&limited()), Some(true))
+        );
+        // The same call with the same key runs again, and its answer is the key's.
+        let ran = call_k1(&acquire, &caller, async { Keyed::Kept(answer("second")) }).await;
+        assert_eq!(text_of(&ran), text_of(&answer("second")));
+        let again = call_k1(&acquire, &caller, never()).await;
+        assert_eq!(text_of(&again), text_of(&answer("second")));
+    }
+
+    #[tokio::test]
+    async fn a_result_that_cannot_be_stored_leaves_its_key_to_the_next_call() {
+        let db = crate::db::test_db::migrated().await;
+        let (caller, acquire) = alice_on(db.clone()).await;
+        // The database refuses to store any key's result.
+        sqlx::query(
+            "CREATE TRIGGER refuse_results BEFORE UPDATE OF document ON request_keys \
+             BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let first = call_k1(&acquire, &caller, async { Keyed::Kept(answer("first")) }).await;
+        assert_eq!(text_of(&first), text_of(&answer("first")));
+        sqlx::query("DROP TRIGGER refuse_results")
+            .execute(&db)
+            .await
+            .unwrap();
+        // Not left running: the same call with the same key runs again.
+        let ran = call_k1(&acquire, &caller, async { Keyed::Kept(answer("second")) }).await;
+        assert_eq!(text_of(&ran), text_of(&answer("second")));
     }
 }

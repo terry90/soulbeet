@@ -9,7 +9,7 @@ use super::args::{repeatable, Args};
 use super::contract::{
     failed, items, too_large_to_repeat, upstream_error, ItemResult, Items, NextCall, ToolError,
 };
-use super::keys::{keyed, request_key};
+use super::keys::{keyed, request_key, Keyed};
 use super::refs::{
     filters, filters_schema, reference_schema, reference_value, request_key_schema, wanted,
     REFERENCE_FIELDS,
@@ -140,13 +140,15 @@ fn read_ensure(args: &Args) -> Result<(Ensure, Option<String>), ToolError> {
 }
 
 /// The call: a call-level refusal, or each item's result with the batch, whether the library
-/// was looked in, and the call that follows the batch.
+/// was looked in, and the call that follows the batch. A request key keeps the answer of a call
+/// that made a batch or refused no item; a refusal of the call, or of an item when no batch was
+/// made, wrote nothing, and the same call can run again.
 async fn run(
     acquire: &std::sync::Arc<Acquire>,
     navidrome: &dyn NavidromeOf,
     ctx: &UserCtx,
     read: Ensure,
-) -> CallToolResult {
+) -> Keyed {
     let Ensure {
         items: wanted,
         given,
@@ -158,8 +160,10 @@ async fn run(
     let folder_id = folder_id.as_deref();
     let ensured = match ensure(acquire, navidrome, ctx, folder_id, label, wanted, options).await {
         Ok(ensured) => ensured,
-        Err(refused) => return failed(call_refused(refused, &call)),
+        Err(refused) => return Keyed::Released(failed(call_refused(refused, &call))),
     };
+    let keep = ensured.batch_id.is_some()
+        || !(ensured.items.iter()).any(|item| matches!(item, EnsureItem::Refused(..)));
     let results = (ensured.items.into_iter())
         .zip(&given)
         .map(|(item, given)| item_result(item, given, &call))
@@ -180,7 +184,7 @@ async fn run(
         ),
         ("next".to_string(), json!(next)),
     ]);
-    items(Items {
+    let result = items(Items {
         stage: Stage::Input,
         noun: "items",
         start: 0,
@@ -188,7 +192,12 @@ async fn run(
         pending: 0,
         cursor: None,
         fields,
-    })
+    });
+    if keep {
+        Keyed::Kept(result)
+    } else {
+        Keyed::Released(result)
+    }
 }
 
 /// One item's entry. A refused one offers what follows its failure: the job that already wants
@@ -273,7 +282,7 @@ mod tests {
         jobs_app, set_default_folder,
     };
     use crate::core::jobs::test_support::batch_of_searches;
-    use crate::import_queue::test_support::broken;
+    use crate::import_queue::test_support::{broken, ready};
     use crate::ledger::MCP_UNFINISHED_JOBS_PER_USER;
     use crate::test_navidrome::{native_song, NavidromeFor, NavidromeStub};
 
@@ -712,7 +721,7 @@ mod tests {
                 &token,
                 "ensure_in_library",
                 json!({"items": [{"artist": "Marrow Choir", "title": "O Holy Night"}],
-                    "folder_id": "alice-folder"}),
+                    "folder_id": "alice-folder", "request_key": "k1"}),
             )
             .await,
         );
@@ -747,6 +756,8 @@ mod tests {
             json!([{"tool": "list_batches", "args": {}}])
         );
         assert_eq!(doc["batch_id"], Value::Null);
+        // Nothing was made: the key is free for the same call later.
+        assert_eq!(count(&db, "request_keys").await, 0);
     }
 
     #[tokio::test]
@@ -778,6 +789,25 @@ mod tests {
         assert_eq!(
             (count(&db, "batches").await, count(&db, "jobs").await),
             (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyed_call_refused_before_any_job_runs_again_with_its_key() {
+        let (db, acq, effects, token) = app_with_acquire().await;
+        effects.importer().set_health(broken());
+        let call = json!({"items": [{"artist": "Marrow Choir", "title": "O Holy Night"}],
+            "request_key": "k1"});
+        let refused = document(
+            &call_tool(app_of(&db, &acq), &token, "ensure_in_library", call.clone()).await,
+        );
+        assert_eq!(refused["error"]["code"], "importer_broken", "{refused}");
+        effects.importer().set_health(ready());
+        let ran = document(&call_tool(app_of(&db, &acq), &token, "ensure_in_library", call).await);
+        assert_eq!(ran["results"][0]["status"], "job_created", "{ran}");
+        assert_eq!(
+            (count(&db, "batches").await, count(&db, "jobs").await),
+            (1, 1)
         );
     }
 

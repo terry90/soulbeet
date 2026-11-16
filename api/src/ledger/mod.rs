@@ -839,6 +839,18 @@ impl Ledger {
         .await
     }
 
+    /// Lets go of `key` while process `instance` holds it with no result stored: the key's next
+    /// call runs as its first. A stored result stays.
+    pub async fn release_key(&self, key: &RequestKey, instance: &str) -> Result<(), LedgerError> {
+        let (key, instance) = (key.clone(), instance.to_string());
+        self.write(|reply| Write::ReleaseKey {
+            key,
+            instance,
+            reply,
+        })
+        .await
+    }
+
     /// At `now`: deletes searches with expires_at <= now, dismisses jobs
     /// waiting for a source whose search is gone or expired (D11) and stamps
     /// their updated_at with `now`, deletes terminal jobs with
@@ -3250,6 +3262,45 @@ mod tests {
                 .reserve_key(&k1, "h1", "i1", 1_000 + KEY_KEPT_SECS + 2)
                 .await,
             Ok(KeyReservation::Fresh)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_released_reservation_is_fresh_again_and_a_stored_result_stays() {
+        let (ledger, db, _, _) = ledger().await;
+        let key = RequestKey {
+            user: UserId::new("alice"),
+            grant_id: grant_of(&db, "alice", crate::connection::test_util::RESOURCE).await,
+            tool: "find_sources".into(),
+            key: "k1".into(),
+        };
+        assert_eq!(
+            ledger.reserve_key(&key, "h1", "i1", 1_000).await,
+            Ok(KeyReservation::Fresh)
+        );
+        // Only the process that holds a reservation lets it go.
+        ledger.release_key(&key, "i0").await.unwrap();
+        assert_eq!(
+            ledger.reserve_key(&key, "h1", "i1", 1_001).await,
+            Ok(KeyReservation::Running)
+        );
+        ledger.release_key(&key, "i1").await.unwrap();
+        assert_eq!(
+            ledger.reserve_key(&key, "h1", "i1", 1_002).await,
+            Ok(KeyReservation::Fresh)
+        );
+        // A stored result is never let go.
+        ledger
+            .finish_key(&key, r#"{"ok":true}"#.into(), false)
+            .await
+            .unwrap();
+        ledger.release_key(&key, "i1").await.unwrap();
+        assert_eq!(
+            ledger.reserve_key(&key, "h1", "i1", 1_003).await,
+            Ok(KeyReservation::Done {
+                document: r#"{"ok":true}"#.into(),
+                is_error: false
+            })
         );
     }
 }
