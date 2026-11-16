@@ -54,7 +54,6 @@ pub fn ConnectedAppsPanel() -> Element {
                         on_allow_delete: move |(grant_id, allowed): (String, bool)| {
                             spawn(async move { finish(auth.call(set_app_deletion(grant_id, allowed)).await) });
                         },
-                        on_declined: move |_| apps.restart(),
                         on_disconnect: move |grant_id: String| {
                             spawn(async move { finish(auth.call(revoke_connected_app(grant_id)).await) });
                         },
@@ -92,8 +91,6 @@ fn AppList(
     apps: Vec<ConnectedApp>,
     origin: String,
     on_allow_delete: EventHandler<(String, bool)>,
-    /// The user cancelled turning deletion on; the list must show what is stored.
-    on_declined: EventHandler<()>,
     on_disconnect: EventHandler<String>,
 ) -> Element {
     let mut pending = use_signal(|| None::<PendingDisconnect>);
@@ -130,13 +127,19 @@ fn AppList(
                                         input {
                                             r#type: "checkbox",
                                             checked: app.allow_delete,
-                                            onchange: {
+                                            // The click is cancelled so the browser never toggles the
+                                            // box itself: it only changes when `checked` changes, that
+                                            // is when the stored value does. A cancelled confirmation
+                                            // therefore leaves it as stored. (Resource::restart keeps
+                                            // the old value, so a reload would not reset a toggled box.)
+                                            onclick: {
                                                 let asked = PendingDisconnect {
                                                     grant_id: app.grant_id.clone(),
                                                     app_host: app.app_host.clone(),
                                                 };
                                                 let was_allowed = app.allow_delete;
-                                                move |_| {
+                                                move |evt: MouseEvent| {
+                                                    evt.prevent_default();
                                                     if needs_confirmation(was_allowed) {
                                                         pending_enable.set(Some(asked.clone()));
                                                     } else {
@@ -176,7 +179,6 @@ fn AppList(
                 },
                 on_cancel: move |_| {
                     pending_enable.set(None);
-                    on_declined.call(());
                 },
             }
         }
@@ -206,7 +208,7 @@ mod tests {
         let mut dom = VirtualDom::new_with_props(
             |(apps, origin): (Vec<ConnectedApp>, String)| {
                 rsx! {
-                    AppList { apps, origin, on_allow_delete: |_| {}, on_declined: |_| {}, on_disconnect: |_| {} }
+                    AppList { apps, origin, on_allow_delete: |_| {}, on_disconnect: |_| {} }
                 }
             },
             (apps, origin.to_string()),
