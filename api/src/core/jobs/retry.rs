@@ -720,6 +720,7 @@ pub(crate) async fn download_source(
         // Named by the writer after its one job.
         label: None,
         origin: BatchOrigin::Mcp,
+        for_playlist: false,
     };
     let job = NewJob {
         id: uuid::Uuid::new_v4().to_string(),

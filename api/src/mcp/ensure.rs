@@ -17,7 +17,7 @@ use super::contract::{
 use super::jobs::JobTool;
 use super::keys::{keyed, request_key, Keyed};
 use super::library::navidrome_of;
-use super::paging::RESULT_MAX_CHARS;
+use super::paging::{self, Keep, RESULT_MAX_CHARS};
 use super::playlists::{
     name_arg, playlist_fields, refusal_error, ADD_PLAYLIST_TRACKS, ADD_PLAYLIST_TRACKS_ARGS,
     A_NAME, COMMENT_MAX_CHARS, CREATE_PLAYLIST, CREATE_PLAYLIST_ARGS, GET_PLAYLIST_ARGS,
@@ -74,7 +74,7 @@ pub(crate) const ENSURE_IN_LIBRARY: ToolSpec = ToolSpec {
     title: "Get music into the library",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file: a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo, then its next calls, then its cause.raw, then cuts its message, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial. With playlist ({{playlist_id}} of one of this user's static playlists, or {{create: {{name, comment?, public?, allow_duplicate_name?}}}}), the playlist gets the owned tracks now in the order given and each other track at its place as its job finishes, whether or not this chat stays open; get_batch shows how far it is. Also playlist_not_found, playlist_not_owner, playlist_not_editable, playlist_name_taken.")
+        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file: a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo, then its next calls, then its cause.raw, then cuts its message, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial. With playlist ({{playlist_id}} of one of this user's static playlists, or {{create: {{name, comment?, public?, allow_duplicate_name?}}}}), the playlist gets the owned tracks now in the order given and each other track at its place as its job finishes, whether or not this chat stays open; get_batch shows how far it is. A playlist refused before any job is made fails the call with playlist_not_found, playlist_not_owner, playlist_not_editable or playlist_name_taken; once the jobs are made, playlist.error says what stopped the playlist: those codes, unknown_handle (an owned song whose file is missing), playlist_tracks_not_written, playlist_not_written (a comment or public flag not shown) or one of the Navidrome codes.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["items"], "properties": {"items": {"type": "array", "minItems": 1, "maxItems": 50, "items": "#,
@@ -254,7 +254,19 @@ async fn run(
         None => vec![],
     };
     let folder_id = folder_id.as_deref();
-    let ensured = match ensure(acquire, navidrome, ctx, folder_id, label, wanted, options).await {
+    let for_playlist = playlist.is_some();
+    let ensured = match ensure(
+        acquire,
+        navidrome,
+        ctx,
+        folder_id,
+        label,
+        wanted,
+        options,
+        for_playlist,
+    )
+    .await
+    {
         Ok(ensured) => ensured,
         Err(refused) => return Keyed::Released(failed(call_refused(refused, &call))),
     };
@@ -275,6 +287,11 @@ async fn run(
         };
     let playlist_field = (written.as_ref())
         .map(|(target, written)| playlist_answer(target, &ensured.items, written));
+    let (playlist_written, playlist_error) = match playlist_field {
+        Some(Ok(written)) => (Some(written), None),
+        Some(Err(e)) => (None, Some(e)),
+        None => (None, None),
+    };
     let results = (ensured.items.into_iter())
         .zip(&given)
         .map(|(item, given)| item_result(item, given, &call))
@@ -295,7 +312,7 @@ async fn run(
         ),
         ("next".to_string(), json!(next)),
     ]);
-    if let Some(playlist) = playlist_field {
+    if let Some(playlist) = playlist_written {
         fields.insert("playlist".to_string(), playlist);
     }
     let mut answered = Items {
@@ -307,7 +324,7 @@ async fn run(
         cursor: None,
         fields,
     };
-    bounded(&mut answered);
+    bounded(&mut answered, playlist_error);
     let result = items(answered);
     if keep {
         Keyed::Kept(result)
@@ -338,12 +355,12 @@ fn playlist_answer(
     target: &PlaylistTarget,
     items: &[EnsureItem],
     written: &Result<Written, PlaylistRefusal>,
-) -> Value {
+) -> Result<Value, ToolError> {
     let r = match written {
         Ok(w) => {
             let mut fields = Map::from_iter([("ok".to_string(), json!(true))]);
             fields.extend(playlist_fields(w));
-            return Value::Object(fields);
+            return Ok(Value::Object(fields));
         }
         Err(r) => r,
     };
@@ -375,8 +392,12 @@ fn playlist_answer(
         ),
     };
     let made = Args::new(tool, made.as_object().cloned(), known);
-    let error = refusal_error(&made, target_id(target), r);
-    json!({"ok": false, "error": error_object(&error)})
+    Err(refusal_error(&made, target_id(target), r))
+}
+
+/// The answer's `playlist` for `begin`'s error `e`.
+fn playlist_failed(e: &ToolError) -> Value {
+    json!({"ok": false, "error": error_object(e)})
 }
 
 /// The reference fields a refused item's facts echo.
@@ -390,50 +411,82 @@ const ECHOED: [&str; 7] = [
     "duration_s",
 ];
 
-/// `answered` within RESULT_MAX_CHARS (D4). Past it, refused items, the last first, leave out the
-/// reference their facts echo (the caller has it by its index), then their calls in `next`, then
-/// their failure's `cause.raw`, then cut their failure's message to TEXT_MAX_CHARS as sent; each
-/// one's `facts.omitted` names what it left out. Ids (a job that already wants the recording)
-/// stay. What is left of a refused item is Soulful's own fields, its ids and that message, so
-/// MAX_ITEMS of them keep within the bound whatever the failures held.
-fn bounded(answered: &mut Items) {
+/// `answered` within RESULT_MAX_CHARS (D4), with `playlist`, the error of its playlist when
+/// `begin` failed, as its `playlist`. Past it, the playlist's error, then refused items, the last
+/// first, leave out the reference their facts echo (the caller has it by its index), then their
+/// calls in `next`, then their failure's `cause.raw`, then cut their failure's message to
+/// TEXT_MAX_CHARS as sent; each one's `facts.omitted` names what it left out. Ids (a job that
+/// already wants the recording) stay. What is left of a refused item is Soulful's own fields, its
+/// ids and that message, so MAX_ITEMS of them keep within the bound whatever the failures held;
+/// past that, the playlist's error leaves out whole ids of its longest id list, again and again.
+fn bounded(answered: &mut Items, mut playlist: Option<ToolError>) {
+    fn shown(answered: &mut Items, playlist: &Option<ToolError>) {
+        if let Some(e) = playlist {
+            answered
+                .fields
+                .insert("playlist".into(), playlist_failed(e));
+        }
+    }
     let over = |answered: &Items| items_text(answered).chars().count() > RESULT_MAX_CHARS;
+    shown(answered, &playlist);
     for step in ["reference", "next", "cause.raw", "message"] {
+        if let Some(e) = playlist.as_mut().filter(|_| over(answered)) {
+            if leave_out(e, step) {
+                shown(answered, &playlist);
+            }
+        }
         for at in (0..answered.results.len()).rev() {
             if !over(answered) {
                 return;
             }
-            let ItemResult::Failed(error) = &mut answered.results[at] else {
-                continue;
-            };
-            let left_out = match step {
-                "reference" => {
-                    let before = error.facts.len();
-                    error
-                        .facts
-                        .retain(|name, _| !ECHOED.contains(&name.as_str()));
-                    error.facts.len() < before
-                }
-                "next" => !std::mem::take(&mut error.next).is_empty(),
-                "cause.raw" => (error.failure.cause.as_mut())
-                    .is_some_and(|cause| !std::mem::take(&mut cause.raw).is_empty()),
-                _ => {
-                    let message = &mut error.failure.message;
-                    let cut = cut_json(message.clone(), TEXT_MAX_CHARS);
-                    let changed = cut != *message;
-                    *message = cut;
-                    changed
-                }
-            };
-            if !left_out {
-                continue;
-            }
-            let omitted = error.facts.entry("omitted").or_insert_with(|| json!([]));
-            if let Value::Array(omitted) = omitted {
-                omitted.push(json!(step));
+            if let ItemResult::Failed(error) = &mut answered.results[at] {
+                leave_out(error, step);
             }
         }
     }
+    while let Some(e) = playlist.as_mut().filter(|_| over(answered)) {
+        let longest = (e.facts.iter())
+            .filter(|(_, value)| value.as_array().is_some_and(|list| !list.is_empty()))
+            .max_by_key(|(_, value)| value.to_string().chars().count())
+            .map(|(key, _)| key.clone());
+        let Some(list) = longest else {
+            return;
+        };
+        let over_by = items_text(answered).chars().count() - RESULT_MAX_CHARS;
+        paging::leave_out(&mut e.facts, &list, Keep::First, over_by);
+        shown(answered, &playlist);
+    }
+}
+
+/// `step` of `bounded` on `error`: whether it left something out, which its `facts.omitted`
+/// then names.
+fn leave_out(error: &mut ToolError, step: &'static str) -> bool {
+    let left_out = match step {
+        "reference" => {
+            let before = error.facts.len();
+            error
+                .facts
+                .retain(|name, _| !ECHOED.contains(&name.as_str()));
+            error.facts.len() < before
+        }
+        "next" => !std::mem::take(&mut error.next).is_empty(),
+        "cause.raw" => (error.failure.cause.as_mut())
+            .is_some_and(|cause| !std::mem::take(&mut cause.raw).is_empty()),
+        _ => {
+            let message = &mut error.failure.message;
+            let cut = cut_json(message.clone(), TEXT_MAX_CHARS);
+            let changed = cut != *message;
+            *message = cut;
+            changed
+        }
+    };
+    if left_out {
+        let omitted = error.facts.entry("omitted").or_insert_with(|| json!([]));
+        if let Value::Array(omitted) = omitted {
+            omitted.push(json!(step));
+        }
+    }
+    left_out
 }
 
 /// One item's entry. A refused one offers what follows its failure: the job that already wants
@@ -984,6 +1037,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_long_playlist_error_is_bounded_with_the_items() {
+        use crate::mcp::contract::{NextCall, ToolError};
+        use shared::failure::RetryAdvice;
+        let failure = Failure::new(
+            FailureCode::NavidromeUnreachable,
+            Stage::LibraryCheck,
+            RetryAdvice::SameSourceLater,
+            "Find songs failed: HTTP 502",
+        );
+        let mut answered = refused_with(&failure);
+        // begin's refusal of 1000 owned songs Navidrome no longer lists, ids as long as a caller
+        // may send them, with the call that would make the playlist of them.
+        let unknown: Vec<String> = (0..1000).map(|i| format!("{i:0>500}")).collect();
+        let playlist = ToolError {
+            failure: Failure::new(
+                FailureCode::UnknownHandle,
+                Stage::Input,
+                RetryAdvice::NotRetryable,
+                "Navidrome does not list 1000 of these songs for you and has 0 with a missing file",
+            ),
+            facts: serde_json::Map::from_iter([
+                ("playlist_id".to_string(), Value::Null),
+                ("unknown_song_ids".to_string(), json!(unknown)),
+            ]),
+            tried: vec![],
+            next: vec![NextCall::new(
+                "create_playlist",
+                json!({"name": "Christmas", "song_ids": unknown}),
+            )],
+        };
+        super::bounded(&mut answered, Some(playlist));
+        let text = super::items_text(&answered);
+        assert!(
+            text.chars().count() <= RESULT_MAX_CHARS,
+            "{}",
+            text.chars().count()
+        );
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        let error = &doc["playlist"]["error"];
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                &error["next"],
+                &error["facts"]["omitted"]
+            ),
+            (Some("unknown_handle"), &json!([]), &json!(["next"]))
+        );
+        let (kept, omitted) = (
+            error["facts"]["unknown_song_ids"].as_array().unwrap().len() as u64,
+            error["facts"]["unknown_song_ids_omitted"].as_u64().unwrap(),
+        );
+        assert_eq!(kept + omitted, 1000);
+    }
+
     /// The error of `answered`'s item `at`, as sent.
     fn sent_error(answered: &super::Items, at: usize) -> Value {
         let doc: Value = serde_json::from_str(&super::items_text(answered)).unwrap();
@@ -1003,7 +1111,7 @@ mod tests {
         )
         .with_cause(Service::Navidrome, Some(502), "\"".repeat(RAW_MAX_CHARS));
         let mut answered = refused_with(&failure);
-        super::bounded(&mut answered);
+        super::bounded(&mut answered, None);
         let text = super::items_text(&answered);
         assert!(
             text.chars().count() <= RESULT_MAX_CHARS,
@@ -1046,7 +1154,7 @@ mod tests {
         )
         .with_cause(Service::Navidrome, Some(502), "\"".repeat(RAW_MAX_CHARS));
         let mut answered = refused_with(&failure);
-        super::bounded(&mut answered);
+        super::bounded(&mut answered, None);
         let text = super::items_text(&answered);
         assert!(
             text.chars().count() <= RESULT_MAX_CHARS,
@@ -1698,7 +1806,8 @@ mod tests {
         );
         assert_eq!(
             batch["playlist"],
-            json!({"playlist_id": ADVENT, "settled": 1, "waiting": 1, "failure": null})
+            json!({"playlist_id": ADVENT, "settled": 1, "waiting": 1, "failure": null,
+                "hidden_entries_dropped": 0})
         );
     }
 
@@ -1741,7 +1850,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_playlist_that_failed_after_the_jobs_were_made_offers_its_own_call() {
+    async fn a_playlist_create_that_failed_after_the_jobs_were_made_offers_the_list_to_look_in() {
         let navi = NavidromeStub::start();
         library_with_silent_night(&navi);
         navi.answer_when("/rest/createPlaylist", "", 502, BAD_GATEWAY);
@@ -1765,10 +1874,10 @@ mod tests {
             ),
             "{doc}"
         );
+        // The create was sent and may have been made: making it again could make a second one.
         assert_eq!(
             error["next"],
-            json!([{"tool": "create_playlist", "args": {"name": "Christmas",
-                "song_ids": [SILENT.0], "public": true, "allow_duplicate_name": false}}])
+            json!([{"tool": "list_playlists", "args": {}}])
         );
         // The batch exists: the key keeps the answer, and nothing runs twice.
         let again = call_tool(app.clone(), &token, "ensure_in_library", call).await;

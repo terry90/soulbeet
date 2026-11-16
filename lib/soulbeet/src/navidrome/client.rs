@@ -389,8 +389,10 @@ impl NavidromeClient {
 
     /// createPlaylist with `playlistId` and one `songId` per id: Navidrome replaces every entry of
     /// the playlist in one transaction (core/playlists/playlists.go Create), rows of libraries
-    /// this account cannot see included, and drops ids it cannot read without an error. It checks
-    /// the owner and refuses a smart or file-synced playlist (Subsonic error 50). Ok(false) when
+    /// this account cannot see included, and drops ids it cannot read without an error. For a
+    /// non-admin account it refuses another user's playlist, and for any account a smart or
+    /// file-synced one (Subsonic error 50); an admin account writes another user's playlist
+    /// without an error, so core checks the owner itself before every write. Ok(false) when
     /// Navidrome has no such playlist for this user. Navidrome keeps the old entries when the
     /// list is empty (persistence/playlist_repository.go Put rewrites rows only for a non-empty
     /// list), so core empties a playlist with `remove_playlist_tracks` and never calls this with
@@ -438,8 +440,10 @@ impl NavidromeClient {
         written(self.post_form("updatePlaylist", &params).await)
     }
 
-    /// deletePlaylist. Ok(false) on 70. Navidrome answers a playlist this user does not own with
-    /// Subsonic error 50, which passes through as an error.
+    /// deletePlaylist. Ok(false) on 70. Navidrome answers a non-admin account's delete of a
+    /// playlist it does not own with Subsonic error 50, which passes through as an error; an
+    /// admin account deletes another user's playlist without one, so core checks the owner
+    /// itself first.
     pub async fn delete_playlist(&self, id: &str) -> Result<bool> {
         written(self.post_form("deletePlaylist", &[("id", id)]).await)
     }
@@ -2055,7 +2059,7 @@ mod tests {
 
     #[tokio::test]
     async fn meta_sends_only_what_changes() {
-        let (url, seen) = serve(vec![reply(OK), reply(OK)]);
+        let (url, seen) = serve(vec![reply(OK), reply(OK), reply(OK)]);
         let c = client(&url);
         c.update_playlist_meta(
             ADVENT,
@@ -2077,6 +2081,16 @@ mod tests {
         )
         .await
         .unwrap();
+        c.update_playlist_meta(
+            ADVENT,
+            &PlaylistMeta {
+                name: None,
+                comment: None,
+                public: Some(false),
+            },
+        )
+        .await
+        .unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!(
             (
@@ -2093,6 +2107,7 @@ mod tests {
             ),
             (vec![], vec!["true"])
         );
+        assert_eq!(form_values(&seen[2].body, "public"), vec!["false"]);
     }
 
     #[tokio::test]
@@ -2129,18 +2144,13 @@ mod tests {
             reply(NATIVE_PLAYLIST),
             reply(smart),
             reply(synced),
+            reply(NATIVE_PLAYLIST),
         ]);
         let c = client(&url);
         let p = c.get_native_playlist(ADVENT).await.unwrap().unwrap();
         assert_eq!(
-            (
-                p.owner_name.as_str(),
-                p.public,
-                p.is_smart(),
-                p.sync,
-                p.song_count
-            ),
-            ("alice", false, false, false, 1)
+            (p.id.as_str(), p.is_smart(), p.sync, p.song_count),
+            (ADVENT, false, false, 1)
         );
         assert!(c
             .get_native_playlist(ADVENT)
@@ -2152,6 +2162,12 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap()[1].target,
             "/api/playlist/6vN2bQ8rT4yH1kL9mX3zPa"
+        );
+        // A record of another playlist than the one asked for is never taken for it.
+        let err = c.get_native_playlist("other").await.unwrap_err();
+        assert!(
+            matches!(&err, NavidromeError::Parse(m) if m == "Navidrome answered another playlist for other"),
+            "{err:?}"
         );
     }
 

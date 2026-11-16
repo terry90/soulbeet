@@ -448,6 +448,10 @@ pub struct NewJobBatch {
     /// takes (`items_label`).
     pub label: Option<String>,
     pub origin: BatchOrigin,
+    /// The batch of an `ensure_in_library` call with a playlist: written also when every job it
+    /// is given is already running for an earlier call, to hold the order the fill places them
+    /// in (D17).
+    pub for_playlist: bool,
 }
 
 /// One item of a batch whose playlist fills as its jobs finish, in the batch's `playlist_order`
@@ -783,7 +787,7 @@ impl Ledger {
     /// Records `batch` and its `jobs`, in order, each with its recording keys. A job that is the
     /// same recording as an unfinished job of its user (one earlier in this call included) is
     /// not made, nor one past MCP_UNFINISHED_JOBS_PER_USER in an MCP batch. The batch is
-    /// written only when one of its jobs is made.
+    /// written only when one of its jobs is made, or, `for_playlist`, one is already running.
     pub async fn create_batch(
         &self,
         batch: NewJobBatch,
@@ -961,16 +965,19 @@ impl Ledger {
         .await
     }
 
-    /// `batch`'s playlist order is now `order`.
+    /// `batch`'s playlist order is now `order`, and the fill that settled it dropped
+    /// `hidden_dropped` more hidden entries.
     pub async fn set_playlist_order(
         &self,
         batch: &str,
         order: Vec<OrderEntry>,
+        hidden_dropped: u32,
     ) -> Result<(), LedgerError> {
         let batch = batch.to_string();
         self.write(|reply| Write::SetPlaylistOrder {
             batch,
             order,
+            hidden_dropped,
             reply,
         })
         .await
@@ -2081,6 +2088,7 @@ mod tests {
             user: UserId::new("alice"),
             label: Some("Christmas".into()),
             origin: BatchOrigin::Mcp,
+            for_playlist: false,
         }
     }
 

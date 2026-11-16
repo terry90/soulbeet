@@ -201,6 +201,9 @@ pub(crate) async fn folder_for(
 /// `InLibrary`, one whose lookup failed is refused with that failure. Makes one batch, labelled
 /// `label`, else after the jobs it holds (`items_label`), with a job for each other item (an
 /// album always gets one), each with a new search id, and starts the runner on each new job.
+/// With `for_playlist`, the batch is made also when every item's job is already running for an
+/// earlier call, so it can hold the order a playlist fills them in.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn ensure(
     acquire: &Arc<Acquire>,
     navidrome: &dyn NavidromeOf,
@@ -209,6 +212,7 @@ pub(crate) async fn ensure(
     label: Option<String>,
     items: Vec<Wanted>,
     options: JobOptions,
+    for_playlist: bool,
 ) -> Result<Ensured, CallRefused> {
     if let Some(failure) = acquire.effects.importer_blocked().await {
         return Err(failure.into());
@@ -254,6 +258,7 @@ pub(crate) async fn ensure(
             user: ctx.id(),
             label,
             origin: BatchOrigin::Mcp,
+            for_playlist,
         };
         let id = batch.id.clone();
         let jobs: Vec<NewJob> = (wanting.iter())
@@ -280,6 +285,9 @@ pub(crate) async fn ensure(
                     EnsureItem::Created { job_id, fuzzy }
                 }
                 Admitted::AlreadyRunning { job, state } => {
+                    if for_playlist {
+                        batch_id = Some(id.clone());
+                    }
                     let (failure, facts) = job_already_running(&job, state);
                     EnsureItem::AlreadyRunning {
                         job_id: job,

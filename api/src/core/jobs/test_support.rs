@@ -94,30 +94,50 @@ async fn mcp_batch(
         user: UserId::new(user),
         label: Some(label.to_string()),
         origin: BatchOrigin::Mcp,
+        for_playlist: false,
     };
     let batch_id = batch.id.clone();
-    let jobs: Vec<NewJob> = wanted
-        .into_iter()
-        .map(|wanted| NewJob {
-            id: uuid::Uuid::new_v4().to_string(),
-            user: UserId::new(user),
-            folder_id: format!("{user}-folder"),
-            wanted: wanted.query(),
-            import_mode: match wanted.kind() {
-                crate::ledger::JobKind::Track => ImportMode::Singleton,
-                crate::ledger::JobKind::Album => ImportMode::Album,
-            },
-            state: JobState::Searching,
-            search_id: Some(uuid::Uuid::new_v4().to_string()),
-            picked: vec![],
-            kind: wanted.kind(),
-            options: Some(options.clone()),
-        })
+    let jobs: Vec<NewJob> = (wanted.into_iter())
+        .map(|wanted| new_mcp_job(user, wanted, &options))
         .collect();
     let ids = jobs.iter().map(|job| job.id.clone()).collect::<Vec<_>>();
     let admitted = acq.ledger.create_batch(batch, jobs).await.unwrap();
     assert_eq!(admitted, vec![Admitted::Created; ids.len()]);
     (batch_id, ids)
+}
+
+/// `user`'s MCP job for `wanted`, searching under a new search id, in their folder.
+fn new_mcp_job(user: &str, wanted: Wanted, options: &JobOptions) -> NewJob {
+    NewJob {
+        id: uuid::Uuid::new_v4().to_string(),
+        user: UserId::new(user),
+        folder_id: format!("{user}-folder"),
+        wanted: wanted.query(),
+        import_mode: match wanted.kind() {
+            crate::ledger::JobKind::Track => ImportMode::Singleton,
+            crate::ledger::JobKind::Album => ImportMode::Album,
+        },
+        state: JobState::Searching,
+        search_id: Some(uuid::Uuid::new_v4().to_string()),
+        picked: vec![],
+        kind: wanted.kind(),
+        options: Some(options.clone()),
+    }
+}
+
+/// alice's MCP batch `id` of an `ensure_in_library` call with a playlist that asks again for the
+/// recording of `batch_of_downloads`' first job: what the writer answers for that job.
+pub(crate) async fn playlist_batch_of_running(acq: &Acquire, id: &str) -> Vec<Admitted> {
+    let batch = NewJobBatch {
+        id: id.to_string(),
+        user: UserId::new(ALICE),
+        label: None,
+        origin: BatchOrigin::Mcp,
+        for_playlist: true,
+    };
+    let wanted = track("Marrow Choir", "Song Number 1");
+    let job = new_mcp_job(ALICE, wanted, &auto_options());
+    acq.ledger.create_batch(batch, vec![job]).await.unwrap()
 }
 
 /// alice's MCP batch `label` with one searching job, for Marrow Choir - `label`: the batch's id.

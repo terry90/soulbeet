@@ -32,7 +32,7 @@ pub(crate) const GET_BATCH: ToolSpec = ToolSpec {
     title: "Follow a batch",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Pass the last answer's cursor as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to the cursor. Work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). For a batch ensure_in_library made with a playlist, playlist gives its playlist_id, how many items are settled in it (placed, or ended with nothing to place), how many are waiting (items whose jobs are not finished, or failed: a job failed for good keeps its place waiting until it is retried or dismissed), and the failure of the last fill that failed (null once one succeeds); a failure whose retry is not same_source_later stops the fill. Failure codes: {common}, unknown_handle.")
+        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Pass the last answer's cursor as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to the cursor. Work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). For a batch ensure_in_library made with a playlist, playlist gives its playlist_id, how many items are settled in it (placed, or ended with nothing to place), how many are waiting (items whose jobs are not finished, or failed: a job failed for good keeps its place waiting until it is retried or dismissed), the failure of the last fill that failed (null once one succeeds; one whose retry is neither same_source_later nor needs_user stops the fill), and hidden_entries_dropped, the entries of libraries this user cannot see that the fill dropped when it placed songs between others and so rewrote the list. Failure codes: {common}, unknown_handle.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["batch_id"], "properties": {"batch_id": {"type": "string", "minLength": 1}, "since": {"type": "integer", "minimum": 0}, "#,
@@ -248,8 +248,9 @@ fn fit_actions(
     fit_whole(fields, "changed", changed, "changed_more")
 }
 
-/// A batch's playlist as get_batch shows it: its items settled and waiting, and the failure of
-/// its last fill as an error with no facts or calls, its message cut to TEXT_MAX_CHARS.
+/// A batch's playlist as get_batch shows it: its items settled and waiting, the failure of its
+/// last fill as an error with no facts or calls, its message cut to TEXT_MAX_CHARS, and the
+/// hidden entries its fill dropped.
 fn playlist_state(playlist: BatchPlaylist) -> Value {
     let settled = playlist.order.iter().filter(|entry| entry.settled).count();
     let failure = playlist.failure.map(|mut failure| {
@@ -262,7 +263,8 @@ fn playlist_state(playlist: BatchPlaylist) -> Value {
         })
     });
     json!({"playlist_id": playlist.playlist_id, "settled": settled,
-        "waiting": playlist.order.len() - settled, "failure": failure})
+        "waiting": playlist.order.len() - settled, "failure": failure,
+        "hidden_entries_dropped": playlist.hidden_dropped})
 }
 
 /// The batch's label, cut as a text from outside Soulful (an album title).
@@ -699,6 +701,7 @@ mod tests {
             playlist_id: id.clone(),
             order: vec![entry(true), entry(false), entry(false)],
             failure: Some(playlist_not_found(&id)),
+            hidden_dropped: 2,
         });
         assert_eq!(
             (
@@ -708,6 +711,7 @@ mod tests {
             ),
             (&json!(1), &json!(2), &json!("playlist_not_found"))
         );
+        assert_eq!(state["hidden_entries_dropped"], 2);
         assert_eq!(
             (&state["failure"]["facts"], &state["failure"]["next"]),
             (&json!({}), &json!([]))

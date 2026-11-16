@@ -13,8 +13,9 @@ use tokio::sync::OwnedMutexGuard;
 use tracing::warn;
 
 use super::{
-    create_held, editable, facts, failed, ids_of, lock, name_free, names_key, owned, owned_read,
-    playlist_key, write_tracks, NewPlaylist, PlaylistRefusal, TrackWrite, Written,
+    create_held, editable, facts, failed, ids_of, lock, name_free, names_key, new_songs,
+    owned_read, playlist_key, present_songs, write_tracks, NewPlaylist, PlaylistRefusal,
+    TrackWrite, Written,
 };
 use crate::auth::{UserCtx, UserId};
 use crate::core::index::{library_songs, NavidromeOf, ServerNavidrome};
@@ -90,8 +91,9 @@ pub(crate) async fn prepare(
 
 /// After `ensure`, under the locks `prepare` took: the playlist gets the songs `order_of(items)`
 /// settled, in that order, created with them or appended to the caller's playlist, with the
-/// usual checks and read back. Then `batch`, when ensure made one, stores that order for the
-/// fill; a batch that could not store it is Unfollowed.
+/// usual checks and read back; a song the playlist already lists is not added again
+/// (`new_songs`). Then `batch`, when ensure made one, stores that order for the fill; a batch
+/// that could not store it is Unfollowed.
 pub(crate) async fn begin(
     ledger: &Ledger,
     navi: &NavidromeClient,
@@ -108,17 +110,17 @@ pub(crate) async fn begin(
                 name: new.name.clone(),
                 comment: new.comment.clone(),
                 public: new.public,
-                song_ids: owned_songs,
+                song_ids: new_songs(&[], &owned_songs),
                 allow_duplicate_name: new.allow_duplicate_name,
             };
             create_held(navi, ctx, &new).await?
         }
-        PlaylistTarget::Existing(id) if owned_songs.is_empty() => owned(navi, ctx, id).await?,
         PlaylistTarget::Existing(id) => {
             write_tracks(navi, ctx, id, |_, tracks| {
-                let mut after = ids_of(tracks);
-                after.extend_from_slice(&owned_songs);
-                Ok((TrackWrite::Append(owned_songs.clone()), after))
+                let current = ids_of(tracks);
+                let mut after = current.clone();
+                after.extend(new_songs(&current, &owned_songs));
+                Ok((TrackWrite::growing(&current, &after), after))
             })
             .await?
         }
@@ -261,12 +263,14 @@ async fn library_ids(
 }
 
 /// Under the playlist's lock: every item of `ctx`'s batch `batch` not settled whose job ended
-/// is ready, with the songs it ended with (none for a dismissed job); with none ready, Ok(0)
-/// without a Navidrome call. Otherwise the ready items' songs go into the playlist at their
-/// places (`place`), appended when the new list is the old one with a tail, else written whole,
-/// with the usual checks and read back; then the ready items are stored settled with their songs.
-/// The number of items settled. An item whose songs the playlist already lists is not placed
-/// again: an earlier fill placed them and failed after its write.
+/// is ready, with the songs it ended with (none for a dismissed job) that Navidrome still lists
+/// with their files present: a song gone since never holds the others back. With none ready,
+/// Ok(0) without a Navidrome call. Otherwise the ready items' songs the playlist does not list
+/// yet (`new_songs`: an earlier fill may have placed them and failed after its write) go into
+/// the playlist at their places (`place`), appended when the new list is the old one with a
+/// tail, else written whole, with the usual checks and read back; then the ready items are
+/// stored settled with their songs, with the entries a whole rewrite dropped as hidden. The
+/// number of items settled.
 pub(crate) async fn fill_in(
     db: &SqlitePool,
     ledger: &Ledger,
@@ -303,41 +307,49 @@ pub(crate) async fn fill_in(
     if ready.is_empty() {
         return Ok(0);
     }
+    let all: Vec<String> = ready.iter().flat_map(|(_, songs)| songs.clone()).collect();
+    let present = present_songs(navi, &all).await?;
+    for (_, songs) in &mut ready {
+        songs.retain(|id| present.contains(id));
+    }
+    let mut hidden_dropped = 0;
     if ready.iter().any(|(_, songs)| !songs.is_empty()) {
-        write_tracks(navi, ctx, &playlist_id, |_, tracks| {
+        let written = write_tracks(navi, ctx, &playlist_id, |_, tracks| {
             let current = ids_of(tracks);
             let mut placed = order.clone();
+            let mut listed = current.clone();
             let mut fresh = Vec::new();
             for (at, songs) in &ready {
-                if songs.iter().all(|id| current.contains(id)) {
+                let gained = new_songs(&listed, songs);
+                if gained.is_empty() {
                     placed[*at].settled = true;
                     placed[*at].song_ids = songs.clone();
                 } else {
-                    fresh.push((*at, songs.clone()));
+                    listed.extend(gained.iter().cloned());
+                    fresh.push((*at, gained));
                 }
             }
             let after = place(&current, &placed, &fresh);
-            let write = match after.strip_prefix(current.as_slice()) {
-                // Nothing to place: the read back alone.
-                Some([]) => TrackWrite::Remove(vec![]),
-                Some(tail) => TrackWrite::Append(tail.to_vec()),
-                None => TrackWrite::Replace(after.clone()),
-            };
-            Ok((write, after))
+            Ok((TrackWrite::growing(&current, &after), after))
         })
         .await?;
+        hidden_dropped = written.hidden_dropped;
     }
     let settled = ready.len() as u32;
     for (at, songs) in ready {
         order[at].settled = true;
         order[at].song_ids = songs;
     }
-    (ledger.set_playlist_order(batch, order).await).map_err(|e| unstored(e.to_string()))?;
+    (ledger
+        .set_playlist_order(batch, order, hidden_dropped)
+        .await)
+        .map_err(|e| unstored(e.to_string()))?;
     Ok(settled)
 }
 
 /// One fill of every batch `batches_to_fill` lists, through its user's Navidrome, storing each
-/// one's outcome: its failure, or none once a fill succeeds after one failed.
+/// one's outcome when it differs from the stored one: its failure, or none once a fill succeeds
+/// after one failed.
 pub(crate) async fn round(db: &SqlitePool, ledger: &Ledger, navidrome: &dyn NavidromeOf) {
     let batches = match store::batches_to_fill(db).await {
         Ok(batches) => batches,
@@ -349,7 +361,7 @@ pub(crate) async fn round(db: &SqlitePool, ledger: &Ledger, navidrome: &dyn Navi
     for BatchToFill {
         batch_id,
         ctx,
-        failed,
+        failure: stored,
     } in batches
     {
         let filled = match navidrome_for(navidrome, &ctx, Stage::Playlist).await {
@@ -359,15 +371,14 @@ pub(crate) async fn round(db: &SqlitePool, ledger: &Ledger, navidrome: &dyn Navi
             Err(f) => Err(f),
         };
         let failure = filled.err();
-        match &failure {
-            None if !failed => continue,
-            Some(f) if !failed => {
-                warn!(
-                    "Could not fill the playlist of batch {batch_id}: {}",
-                    logged(f)
-                );
-            }
-            _ => {}
+        if failure == stored {
+            continue;
+        }
+        if let (Some(f), None) = (&failure, &stored) {
+            warn!(
+                "Could not fill the playlist of batch {batch_id}: {}",
+                logged(f)
+            );
         }
         // The writer logs a write it could not make; the next round tries again.
         let _ = ledger.set_playlist_failure(&batch_id, failure).await;
@@ -402,9 +413,12 @@ mod tests {
     use super::*;
     use crate::core::jobs::job_already_running;
     use crate::core::jobs::runner::Acquire;
-    use crate::core::jobs::test_support::{batch_of_downloads, duplicate_track_job, settle_done};
+    use crate::core::jobs::test_support::{
+        batch_of_downloads, duplicate_track_job, playlist_batch_of_running, settle_done,
+    };
     use crate::core::playlists::{playlist_not_found, NotEditable};
     use crate::core::test_ctx;
+    use crate::ledger::Admitted;
     use crate::services::NavidromeLookupError;
     use crate::test_navidrome::{
         native_playlist, native_song, native_songs, playlist_body, playlist_rows, playlists_body,
@@ -552,6 +566,7 @@ mod tests {
         let navi = NavidromeStub::start();
         let both = [(1, HOLY.0, HOLY.1, false), (2, SILENT.0, SILENT.1, false)];
         advent(&navi, &both, &both);
+        navi.answer("/api/song", &[&native_songs(&[(SILENT.0, false)])]);
         let ctx = test_ctx("alice");
         let placed = fill_in(&db, &acq.ledger, &navi.client(), &ctx, &batch).await;
         assert_eq!(placed.unwrap(), 1);
@@ -640,6 +655,7 @@ mod tests {
             .unwrap();
         settle_done(&acq, &jobs[0], SILENT.0).await;
         let navi = NavidromeStub::start();
+        navi.answer("/api/song", &[&native_songs(&[(SILENT.0, false)])]);
         // server/subsonic/playlists.go:47 (0.64.2)
         navi.answer(
             "/rest/getPlaylist",
@@ -863,5 +879,209 @@ mod tests {
             "{r:?}"
         );
         assert!(r.after_write());
+    }
+
+    #[tokio::test]
+    async fn a_song_gone_since_never_holds_the_others_back() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        let db = acq.db.clone();
+        let (batch, jobs) = batch_of_downloads(&acq, 2).await;
+        let order = vec![waiting(&jobs[0]), waiting(&jobs[1])];
+        acq.ledger
+            .set_playlist(&batch, ADVENT, order)
+            .await
+            .unwrap();
+        settle_done(&acq, &jobs[0], SILENT.0).await;
+        settle_done(&acq, &jobs[1], AWAY.0).await;
+        // Navidrome no longer lists AWAY: its file went after the job ended.
+        let navi = NavidromeStub::start();
+        advent(&navi, &[], &[(1, SILENT.0, SILENT.1, false)]);
+        navi.answer("/api/song", &[&native_songs(&[(SILENT.0, false)])]);
+        let ctx = test_ctx("alice");
+        let placed = fill_in(&db, &acq.ledger, &navi.client(), &ctx, &batch).await;
+        assert_eq!(placed.unwrap(), 2);
+        assert_eq!(
+            navi.posted("/rest/updatePlaylist"),
+            vec![format!("playlistId={ADVENT}&songIdToAdd={}", SILENT.0)]
+        );
+        let order = store::playlist_of(&db, &batch, &alice())
+            .await
+            .unwrap()
+            .unwrap()
+            .order;
+        assert_eq!(
+            (order[1].settled, order[1].song_ids.clone()),
+            (true, vec![]),
+            "settled with no song"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_song_placed_between_others_rewrites_the_list_and_counts_the_hidden_entries() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        let db = acq.db.clone();
+        let (batch, jobs) = batch_of_downloads(&acq, 1).await;
+        let order = vec![
+            entry(0, &[HOLY.0], true),
+            waiting(&jobs[0]),
+            entry(2, &[AWAY.0], true),
+        ];
+        acq.ledger
+            .set_playlist(&batch, ADVENT, order)
+            .await
+            .unwrap();
+        settle_done(&acq, &jobs[0], SILENT.0).await;
+        let navi = NavidromeStub::start();
+        advent(
+            &navi,
+            &[(1, HOLY.0, HOLY.1, false), (3, AWAY.0, AWAY.1, false)],
+            &[
+                (1, HOLY.0, HOLY.1, false),
+                (2, SILENT.0, SILENT.1, false),
+                (3, AWAY.0, AWAY.1, false),
+            ],
+        );
+        // Row 2 is a track of a library alice cannot see: the native record counts it.
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&native_playlist(ADVENT, "Advent", 3, false, None)],
+        );
+        navi.answer("/api/song", &[&native_songs(&[(SILENT.0, false)])]);
+        let ctx = test_ctx("alice");
+        let placed = fill_in(&db, &acq.ledger, &navi.client(), &ctx, &batch).await;
+        assert_eq!(placed.unwrap(), 1);
+        assert_eq!(
+            navi.posted("/rest/createPlaylist"),
+            vec![format!(
+                "playlistId={ADVENT}&songId={}&songId={}&songId={}",
+                HOLY.0, SILENT.0, AWAY.0
+            )]
+        );
+        let stored = store::playlist_of(&db, &batch, &alice())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((stored.hidden_dropped, stored.order[1].settled), (1, true));
+    }
+
+    #[tokio::test]
+    async fn a_fill_waiting_for_the_user_is_tried_each_round_and_stored_once() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        let db = acq.db.clone();
+        let (batch, jobs) = batch_of_downloads(&acq, 1).await;
+        acq.ledger
+            .set_playlist(&batch, ADVENT, vec![waiting(&jobs[0])])
+            .await
+            .unwrap();
+        settle_done(&acq, &jobs[0], SILENT.0).await;
+        sqlx::query(
+            "CREATE TABLE failure_writes (n INTEGER); \
+             CREATE TRIGGER count_failure_writes AFTER UPDATE OF playlist_failure ON batches \
+             BEGIN INSERT INTO failure_writes VALUES (1); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        // alice unlinked Navidrome: the fill waits for her to link it again.
+        let unlinked = NavidromeFor(Err(|| NavidromeLookupError::NotLinked));
+        for _ in 0..2 {
+            round(&db, &acq.ledger, &unlinked).await;
+            assert_eq!(
+                store::batches_to_fill(&db).await.unwrap()[0].batch_id,
+                batch,
+                "needs_user: the next round tries again"
+            );
+        }
+        let stored = store::playlist_of(&db, &batch, &alice())
+            .await
+            .unwrap()
+            .unwrap();
+        let failure = stored.failure.unwrap();
+        assert_eq!(
+            (failure.code, failure.retry),
+            (FailureCode::NavidromeNotLinked, RetryAdvice::NeedsUser)
+        );
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM failure_writes")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(writes, 1, "the same failure is stored once");
+        // Linked again: the fill goes on.
+        let navi = NavidromeStub::start();
+        advent(&navi, &[], &[(1, SILENT.0, SILENT.1, false)]);
+        navi.answer("/api/song", &[&native_songs(&[(SILENT.0, false)])]);
+        round(&db, &acq.ledger, &NavidromeFor(Ok(navi.client()))).await;
+        let stored = store::playlist_of(&db, &batch, &alice())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((stored.failure, stored.order[0].settled), (None, true));
+    }
+
+    #[tokio::test]
+    async fn a_playlist_batch_whose_jobs_all_run_for_an_earlier_call_is_kept_and_filled() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        let db = acq.db.clone();
+        let (_, jobs) = batch_of_downloads(&acq, 1).await;
+        let admitted = playlist_batch_of_running(&acq, "b-playlist").await;
+        assert!(
+            matches!(&admitted[..], [Admitted::AlreadyRunning { job, .. }] if *job == jobs[0]),
+            "{admitted:?}"
+        );
+        acq.ledger
+            .set_playlist("b-playlist", ADVENT, vec![waiting(&jobs[0])])
+            .await
+            .unwrap();
+        // A prune keeps it while its playlist waits, though it holds no job of its own.
+        acq.ledger
+            .prune(chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert!(store::playlist_of(&db, "b-playlist", &alice())
+            .await
+            .unwrap()
+            .is_some());
+        settle_done(&acq, &jobs[0], SILENT.0).await;
+        let navi = NavidromeStub::start();
+        advent(&navi, &[], &[(1, SILENT.0, SILENT.1, false)]);
+        navi.answer("/api/song", &[&native_songs(&[(SILENT.0, false)])]);
+        round(&db, &acq.ledger, &NavidromeFor(Ok(navi.client()))).await;
+        assert_eq!(
+            navi.posted("/rest/updatePlaylist"),
+            vec![format!("playlistId={ADVENT}&songIdToAdd={}", SILENT.0)]
+        );
+        // Settled, it goes at the next prune.
+        acq.ledger
+            .prune(chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert!(store::playlist_of(&db, "b-playlist", &alice())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_song_the_playlist_lists_is_not_added_again_when_the_batch_begins() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        let (batch, jobs) = batch_of_downloads(&acq, 1).await;
+        let navi = NavidromeStub::start();
+        let holy = [(1, HOLY.0, HOLY.1, false)];
+        advent(&navi, &holy, &holy);
+        let (ctx, target) = (test_ctx("alice"), PlaylistTarget::Existing(ADVENT.into()));
+        // The library has HOLY (the item's first song), which the playlist already lists.
+        let items = ensured(&jobs[0]);
+        let written = begin(
+            &acq.ledger,
+            &navi.client(),
+            &ctx,
+            Some(&batch),
+            &target,
+            &items,
+        )
+        .await
+        .unwrap();
+        assert_eq!(written.song_ids, ids(&[HOLY.0]));
+        assert!(navi.posted("/rest/updatePlaylist").is_empty());
     }
 }

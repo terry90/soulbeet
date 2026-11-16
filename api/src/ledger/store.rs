@@ -898,6 +898,8 @@ pub struct BatchPlaylist {
     pub order: Vec<OrderEntry>,
     /// The failure of the last fill, None once one succeeded.
     pub failure: Option<Failure>,
+    /// The entries of other libraries the fill dropped by rewriting the list whole.
+    pub hidden_dropped: u32,
 }
 
 /// The playlist `user`'s batch `batch` fills; None for a batch without one, an unknown id or
@@ -907,19 +909,20 @@ pub async fn playlist_of(
     batch: &str,
     user: &UserId,
 ) -> Result<Option<BatchPlaylist>, sqlx::Error> {
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT playlist_id, playlist_order, playlist_failure FROM batches \
-         WHERE id = ? AND user_id = ? AND playlist_id IS NOT NULL",
+    let row: Option<(String, String, Option<String>, u32)> = sqlx::query_as(
+        "SELECT playlist_id, playlist_order, playlist_failure, playlist_hidden_dropped \
+         FROM batches WHERE id = ? AND user_id = ? AND playlist_id IS NOT NULL",
     )
     .bind(batch)
     .bind(user.to_string())
     .fetch_optional(db)
     .await?;
-    row.map(|(playlist_id, order, failure)| {
+    row.map(|(playlist_id, order, failure, hidden_dropped)| {
         Ok(BatchPlaylist {
             playlist_id,
             order: json(&order)?,
             failure: failure.as_deref().map(json).transpose()?,
+            hidden_dropped,
         })
     })
     .transpose()
@@ -931,37 +934,40 @@ pub struct BatchToFill {
     pub batch_id: String,
     /// The batch's user, as their row stands.
     pub ctx: UserCtx,
-    /// Whether the last fill failed.
-    pub failed: bool,
+    /// The failure of the last fill, None when it succeeded.
+    pub failure: Option<Failure>,
 }
 
 /// The batches, oldest first, with a playlist, an item not settled, and no stored fill failure
-/// whose retry is other than same_source_later: one that is not stops the fill.
+/// whose retry is other than same_source_later or needs_user: one that is stops the fill. One
+/// that needs the user (Navidrome no longer linked) is tried each round, so the fill goes on
+/// once the user acted.
 pub async fn batches_to_fill(db: &SqlitePool) -> Result<Vec<BatchToFill>, sqlx::Error> {
-    let rows: Vec<(String, String, String, Role, bool)> = sqlx::query_as(
-        "SELECT b.id, b.user_id, u.username, u.role, b.playlist_failure IS NOT NULL \
+    let rows: Vec<(String, String, String, Role, Option<String>)> = sqlx::query_as(
+        "SELECT b.id, b.user_id, u.username, u.role, b.playlist_failure \
          FROM batches b JOIN users u ON u.id = b.user_id \
          WHERE b.playlist_id IS NOT NULL \
          AND EXISTS (SELECT 1 FROM json_each(b.playlist_order) e \
                      WHERE json_extract(e.value, '$.settled') = 0) \
          AND (b.playlist_failure IS NULL \
-              OR json_extract(b.playlist_failure, '$.retry') = 'same_source_later') \
+              OR json_extract(b.playlist_failure, '$.retry') IN ('same_source_later', 'needs_user')) \
          ORDER BY b.created_at, b.rowid",
     )
     .fetch_all(db)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(batch_id, user_id, username, role, failed)| BatchToFill {
-            batch_id,
-            ctx: UserCtx {
-                user_id,
-                username,
-                role,
-            },
-            failed,
+    (rows.into_iter())
+        .map(|(batch_id, user_id, username, role, failure)| {
+            Ok(BatchToFill {
+                batch_id,
+                ctx: UserCtx {
+                    user_id,
+                    username,
+                    role,
+                },
+                failure: failure.as_deref().map(json).transpose()?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]

@@ -69,7 +69,7 @@ pub(crate) const CREATE_PLAYLIST: ToolSpec = ToolSpec {
     title: "Create a playlist",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Creates a static Navidrome playlist owned by this user with the given songs in the given order, then reads it back from Navidrome. song_ids are Navidrome song ids (find_in_library, search_library, get_playlist), at most 1000; the list may be empty. Returns the playlist as Navidrome lists it. Playlist ids stay valid until the playlist is deleted; song ids while the file stays in the library. A repeat with the same request_key returns the first result. Takes a few seconds. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome does not list some song ids for this user, or their files are missing; facts name them and next repeats the call without them), playlist_name_taken (this user already has a playlist with that name; pass allow_duplicate_name to make another), playlist_tracks_not_written, already_running (a call with this request_key still runs).")
+        format!("Creates a static Navidrome playlist owned by this user with the given songs in the given order, then reads it back from Navidrome. song_ids are Navidrome song ids (find_in_library, search_library, get_playlist), at most 1000; the list may be empty. Returns the playlist as Navidrome lists it. Playlist ids stay valid until the playlist is deleted; song ids while the file stays in the library. A repeat with the same request_key returns the first result. Takes a few seconds. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome does not list some song ids for this user, or their files are missing; facts name them and next repeats the call without them), playlist_name_taken (this user already has a playlist with that name; pass allow_duplicate_name to make another), playlist_tracks_not_written, playlist_not_written (a comment or public flag Navidrome answered but does not show), playlist_not_found (the playlist went before its comment or public flag was written), already_running (a call with this request_key still runs). A create that failed once its request was sent may have made the playlist: next offers list_playlists to look for it rather than the same call.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 255}, "song_ids": {"type": "array", "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 500}}, "comment": {"type": "string", "maxLength": 2000}, "public": {"type": "boolean"}, "allow_duplicate_name": {"type": "boolean"}, "#,
@@ -145,7 +145,7 @@ pub(crate) const ADD_PLAYLIST_TRACKS: ToolSpec = ToolSpec {
     title: "Add tracks to a playlist",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Adds songs to one of this user's playlists, at the end or before position (an entry's position as get_playlist lists it; the position after the last entry also adds at the end). Appending keeps the entries of libraries this user cannot see; inserting rewrites the list like set_playlist_tracks and drops them (hidden_entries_dropped). The result is read back. A repeat with the same request_key returns the first result. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle, playlist_not_found, playlist_not_owner, playlist_not_editable, playlist_tracks_not_written, already_running, and invalid_input for a position get_playlist does not list.")
+        format!("Adds songs to one of this user's playlists, at the end or before position (an entry's position as get_playlist lists it; the position after the last entry also adds at the end). Appending keeps the entries of libraries this user cannot see; inserting rewrites the list like set_playlist_tracks and drops them (hidden_entries_dropped). The result is read back. A repeat with the same request_key returns the first result. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle, playlist_not_found, playlist_not_owner, playlist_not_editable, playlist_tracks_not_written, already_running, and invalid_input for a position get_playlist does not list. An add that failed once its request was sent may have been made: next offers get_playlist rather than the same call, which would add the songs twice.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["playlist_id", "song_ids"], "properties": {"playlist_id": {"type": "string", "minLength": 1}, "song_ids": {"type": "array", "minItems": 1, "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 500}}, "position": {"type": "integer", "minimum": 0, "maximum": 100000}, "#,
@@ -164,7 +164,7 @@ pub(crate) const REMOVE_PLAYLIST_TRACKS: ToolSpec = ToolSpec {
     title: "Remove tracks from a playlist",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Removes entries from one of this user's playlists. Each entry names its position (as get_playlist lists it) and the song id there; if the playlist changed and a position holds another song, nothing is removed (playlist_changed; call get_playlist again). The result is read back. A repeat with the same request_key returns the first result. Failure codes: {common}, {NAVIDROME_CODES}, playlist_not_found, playlist_not_owner, playlist_not_editable, playlist_changed, playlist_tracks_not_written, already_running.")
+        format!("Removes entries from one of this user's playlists. Each entry names its position (as get_playlist lists it) and the song id there; if the playlist changed and a position holds another song, nothing is removed (playlist_changed; call get_playlist again). The result is read back. A repeat with the same request_key returns the first result. Failure codes: {common}, {NAVIDROME_CODES}, playlist_not_found, playlist_not_owner, playlist_not_editable, playlist_changed, playlist_tracks_not_written, already_running. A removal that failed once its request was sent may have been made: next offers get_playlist rather than the same call.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["playlist_id", "entries"], "properties": {"playlist_id": {"type": "string", "minLength": 1}, "entries": {"type": "array", "minItems": 1, "maxItems": 1000, "items": {"type": "object", "additionalProperties": false, "required": ["position", "song_id"], "properties": {"position": {"type": "integer", "minimum": 0, "maximum": 100000}, "song_id": {"type": "string", "minLength": 1, "maxLength": 500}}}}, "#,
@@ -235,6 +235,13 @@ fn not_got(f: Failure, playlist_id: &str, args: &Args) -> ToolError {
         e.next = vec![list_playlists_call()];
     }
     e
+}
+
+/// Whether `tool`, a playlist write, leaves the playlist the same when called twice.
+fn idempotent(tool: &str) -> bool {
+    [UPDATE_PLAYLIST, DELETE_PLAYLIST, SET_PLAYLIST_TRACKS]
+        .iter()
+        .any(|spec| spec.name == tool && spec.idempotent)
 }
 
 fn list_playlists_call() -> NextCall {
@@ -457,7 +464,7 @@ pub(crate) async fn remove_playlist_tracks(
             return Err(invalid_value(
                 args.tool(),
                 "entries",
-                "a list of 1 to 1000 objects with distinct positions",
+                &format!("a list of 1 to {SONG_IDS_MAX} objects with distinct positions"),
             ));
         }
         let navi = navidrome_of(state, caller, Stage::Playlist, &args).await?;
@@ -548,6 +555,16 @@ pub(crate) fn refusal_error(
     let mut fact = |key: &str, value: Value| facts.insert(key.into(), value);
     // The calls to offer, None for one too large to repeat.
     let next: Vec<Option<NextCall>> = match r {
+        // The write may have been made: a call that is not idempotent is not offered again, as
+        // it would add the songs twice, or make a second playlist. The playlist shows what was.
+        PlaylistRefusal::WriteFailed(f)
+            if f.code != FailureCode::PlaylistNotFound && !idempotent(args.tool()) =>
+        {
+            match playlist_id {
+                Some(id) => vec![Some(get_playlist_call(id))],
+                None => vec![Some(list_playlists_call())],
+            }
+        }
         PlaylistRefusal::Failed(f) | PlaylistRefusal::WriteFailed(f)
             if f.code != FailureCode::PlaylistNotFound =>
         {
@@ -571,11 +588,11 @@ pub(crate) fn refusal_error(
             let kept: Vec<String> = (asked.unwrap_or_default().into_iter())
                 .filter(|id| !unknown.contains(id) && !missing_file.contains(id))
                 .collect();
-            // An add takes at least one song.
-            if kept.is_empty() && args.tool() == ADD_PLAYLIST_TRACKS.name {
-                vec![]
-            } else {
-                vec![args.call_with(json!({"song_ids": kept}))]
+            match playlist_id {
+                // With no song left, the same call would empty the playlist (set) or add nothing
+                // (add): the playlist is offered instead.
+                Some(id) if kept.is_empty() => vec![Some(get_playlist_call(id))],
+                _ => vec![args.call_with(json!({"song_ids": kept}))],
             }
         }
         PlaylistRefusal::TracksNotWritten {
@@ -601,12 +618,15 @@ pub(crate) fn refusal_error(
         }
         PlaylistRefusal::Unfinished {
             playlist_id: id,
+            failure: unfinished,
             described,
-            ..
         } => {
             fact("playlist_id", json!(id));
             fact("created", json!(true));
-            if *described {
+            if unfinished.code == FailureCode::PlaylistNotFound {
+                // It went after it was made: nothing is left to describe.
+                vec![Some(list_playlists_call())]
+            } else if *described {
                 vec![Some(get_playlist_call(id))]
             } else {
                 // The comment and public flag the call asked for, still to be written.
@@ -1494,7 +1514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_add_of_songs_navidrome_does_not_list_offers_the_others_or_nothing() {
+    async fn an_add_of_songs_navidrome_does_not_list_offers_the_others_or_the_playlist() {
         let navi = NavidromeStub::start();
         navi.answer(
             "/rest/getPlaylist",
@@ -1523,7 +1543,7 @@ mod tests {
                 &json!([{"tool": "add_playlist_tracks", "args": {"playlist_id": ADVENT, "song_ids": [HOLY.0]}}])
             )
         );
-        // None left to add: an add of no songs would be refused, so nothing is offered.
+        // None left to add: an add of no songs would be refused, so the playlist is offered.
         let error = &document(
             &call_tool(
                 app,
@@ -1542,7 +1562,7 @@ mod tests {
             (
                 Some("unknown_handle"),
                 Some("Navidrome does not list 1 of these songs for you and has 0 with a missing file"),
-                &json!([])
+                &json!([{"tool": "get_playlist", "args": {"playlist_id": ADVENT}}])
             )
         );
     }
@@ -1618,6 +1638,129 @@ mod tests {
             (
                 0,
                 "You already have a playlist with this name. The call is too large to offer again in next."
+            )
+        );
+    }
+
+    /// nginx's answer when Navidrome behind it does not answer.
+    const BAD_GATEWAY: &str = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+
+    /// `navi` answers alice's static, empty playlist ADVENT, and HOLY as present.
+    fn empty_advent(navi: &NavidromeStub) {
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        navi.answer(&format!("/api/playlist/{ADVENT}/tracks"), &["[]"]);
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&native_playlist(ADVENT, "Advent", 0, false, None)],
+        );
+        navi.answer("/api/song", &[&native_songs(&[(HOLY.0, false)])]);
+    }
+
+    #[tokio::test]
+    async fn a_write_that_failed_once_sent_is_offered_again_only_when_a_repeat_changes_nothing() {
+        let navi = NavidromeStub::start();
+        empty_advent(&navi);
+        // The proxy lost Navidrome's answer: the write may have been made.
+        navi.answer_when("/rest/updatePlaylist", "", 502, BAD_GATEWAY);
+        navi.answer_when("/rest/createPlaylist", "", 502, BAD_GATEWAY);
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let songs = json!({"playlist_id": ADVENT, "song_ids": [HOLY.0]});
+        let error =
+            &document(&call_tool(app.clone(), &token, "add_playlist_tracks", songs.clone()).await)
+                ["error"];
+        assert_eq!(
+            (
+                error["code"].as_str(),
+                error["retry"].as_str(),
+                &error["next"]
+            ),
+            (
+                Some("navidrome_unreachable"),
+                Some("same_source_later"),
+                &json!([{"tool": "get_playlist", "args": {"playlist_id": ADVENT}}])
+            ),
+            "an add again would list the song twice"
+        );
+        let error =
+            &document(&call_tool(app.clone(), &token, "set_playlist_tracks", songs.clone()).await)
+                ["error"];
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "set_playlist_tracks", "args": songs}]),
+            "a set again leaves the same list"
+        );
+        navi.answer("/rest/getPlaylists", &[&playlists_body(&[])]);
+        let error = &document(
+            &call_tool(
+                app,
+                &token,
+                "create_playlist",
+                json!({"name": "Advent", "song_ids": [HOLY.0]}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "list_playlists", "args": {}}]),
+            "a create again could make a second playlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_of_songs_navidrome_lists_none_of_offers_the_playlist_not_an_empty_set() {
+        let navi = NavidromeStub::start();
+        empty_advent(&navi);
+        navi.answer("/api/song", &["[]"]);
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let error = &document(
+            &call_tool(
+                app,
+                &token,
+                "set_playlist_tracks",
+                json!({"playlist_id": ADVENT, "song_ids": [AWAY.0]}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (error["code"].as_str(), &error["next"]),
+            (
+                Some("unknown_handle"),
+                &json!([{"tool": "get_playlist", "args": {"playlist_id": ADVENT}}])
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_playlist_that_went_before_its_comment_offers_the_list() {
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getPlaylists", &[&playlists_body(&[])]);
+        navi.answer(
+            "/rest/createPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        // server/subsonic/playlists.go:47 (0.64.2): deleted between the create and the comment.
+        navi.answer(
+            "/rest/updatePlaylist",
+            &[&subsonic_failed(70, "playlist not found")],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let error = &document(
+            &call_tool(
+                app,
+                &token,
+                "create_playlist",
+                json!({"name": "Advent", "comment": "Carols"}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (error["code"].as_str(), &error["next"]),
+            (
+                Some("playlist_not_found"),
+                &json!([{"tool": "list_playlists", "args": {}}])
             )
         );
     }

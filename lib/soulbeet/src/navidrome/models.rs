@@ -328,9 +328,6 @@ pub struct SubsonicPlaylist {
 #[serde(rename_all = "camelCase")]
 pub struct NativePlaylist {
     pub id: String,
-    pub name: String,
-    pub owner_name: String,
-    pub public: bool,
     /// Replaced from its playlist file when the file changes (core/playlists/playlists.go).
     #[serde(default)]
     pub sync: bool,

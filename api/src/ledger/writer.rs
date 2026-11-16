@@ -108,6 +108,7 @@ pub(super) enum Write {
     SetPlaylistOrder {
         batch: String,
         order: Vec<OrderEntry>,
+        hidden_dropped: u32,
         reply: Reply<()>,
     },
     SetPlaylistFailure {
@@ -424,9 +425,10 @@ impl Writer {
             Write::SetPlaylistOrder {
                 batch,
                 order,
+                hidden_dropped,
                 reply,
             } => {
-                let set = set_playlist_order(&self.db, &batch, &order).await;
+                let set = set_playlist_order(&self.db, &batch, &order, hidden_dropped).await;
                 self.finish(reply, "store a batch's playlist order", set)
             }
             Write::SetPlaylistFailure {
@@ -1187,6 +1189,7 @@ impl Writer {
                 .or(job.wanted.tracks.first().map(|t| &t.title))
                 .cloned(),
             origin: BatchOrigin::Ui,
+            for_playlist: false,
         };
         insert_batch(&mut tx, &batch).await?;
         let keys = recording_keys(&job.wanted, job.kind);
@@ -1227,6 +1230,10 @@ impl Writer {
             taken.push(job.wanted.clone());
             self.insert_job(&mut tx, job, &batch.id, keys).await?;
             admitted.push(Admitted::Created);
+        }
+        let waits = (admitted.iter()).any(|a| matches!(a, Admitted::AlreadyRunning { .. }));
+        if !written && batch.for_playlist && waits {
+            insert_batch(&mut tx, &batch).await?;
         }
         if written && batch.label.is_none() {
             // Named after the jobs it holds, not those refused.
@@ -1548,8 +1555,11 @@ impl Writer {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // A batch whose playlist waits for jobs of earlier calls has none of its own.
         sqlx::query(
-            "DELETE FROM batches WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = batches.id)",
+            "DELETE FROM batches WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = batches.id) \
+             AND NOT EXISTS (SELECT 1 FROM json_each(batches.playlist_order) e \
+                             WHERE json_extract(e.value, '$.settled') = 0)",
         )
         .execute(&mut *tx)
         .await?;
@@ -1681,12 +1691,17 @@ async fn set_playlist_order(
     db: &SqlitePool,
     batch: &str,
     order: &[OrderEntry],
+    hidden_dropped: u32,
 ) -> Result<(), LedgerError> {
-    sqlx::query("UPDATE batches SET playlist_order = ? WHERE id = ?")
-        .bind(serde_json::to_string(order)?)
-        .bind(batch)
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "UPDATE batches SET playlist_order = ?, \
+         playlist_hidden_dropped = playlist_hidden_dropped + ? WHERE id = ?",
+    )
+    .bind(serde_json::to_string(order)?)
+    .bind(hidden_dropped)
+    .bind(batch)
+    .execute(db)
+    .await?;
     Ok(())
 }
 

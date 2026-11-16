@@ -49,14 +49,11 @@ pub(crate) async fn lock(key: &str) -> OwnedMutexGuard<()> {
     mutex.lock_owned().await
 }
 
-/// The keys of the locks someone holds or waits for.
+/// The keys in the lock map, dead ones included until a `lock` prunes them.
 #[cfg(test)]
 fn lock_entries() -> Vec<String> {
     let locks = LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
-    (locks.iter())
-        .filter(|(_, held)| held.strong_count() > 0)
-        .map(|(key, _)| key.clone())
-        .collect()
+    locks.keys().cloned().collect()
 }
 
 /// The lock key of playlist `id`.
@@ -477,8 +474,7 @@ pub(crate) async fn present(
     navi: &NavidromeClient,
     song_ids: &[String],
 ) -> Result<(), PlaylistRefusal> {
-    let songs = navi.get_native_songs(song_ids).await.map_err(failed)?;
-    let listed: HashMap<&str, bool> = songs.iter().map(|s| (s.id.as_str(), s.missing)).collect();
+    let listed = listed_files(navi, song_ids).await?;
     let (mut unknown, mut missing_file) = (vec![], vec![]);
     let mut seen = HashSet::new();
     for id in song_ids.iter().filter(|id| seen.insert(id.as_str())) {
@@ -496,6 +492,37 @@ pub(crate) async fn present(
             missing_file,
         })
     }
+}
+
+/// Each of `song_ids` Navidrome lists for the caller, and whether its file is missing.
+async fn listed_files(
+    navi: &NavidromeClient,
+    song_ids: &[String],
+) -> Result<HashMap<String, bool>, PlaylistRefusal> {
+    let songs = navi.get_native_songs(song_ids).await.map_err(failed)?;
+    Ok(songs.into_iter().map(|s| (s.id, s.missing)).collect())
+}
+
+/// The songs of `song_ids` Navidrome lists for the caller with their files present.
+pub(crate) async fn present_songs(
+    navi: &NavidromeClient,
+    song_ids: &[String],
+) -> Result<HashSet<String>, PlaylistRefusal> {
+    let listed = listed_files(navi, song_ids).await?;
+    Ok((listed.into_iter())
+        .filter_map(|(id, missing)| (!missing).then_some(id))
+        .collect())
+}
+
+/// The songs of `songs` a playlist listing `current` gains: each one it does not list, once.
+/// Every write that adds a batch's songs follows this one rule, so a song is never listed twice
+/// through Soulful.
+pub(crate) fn new_songs(current: &[String], songs: &[String]) -> Vec<String> {
+    let mut seen: HashSet<&str> = current.iter().map(String::as_str).collect();
+    (songs.iter())
+        .filter(|id| seen.insert(id.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// NameTaken when one of the caller's own playlists, other than `except`, has exactly `name`,
@@ -705,22 +732,54 @@ pub(crate) async fn delete(
     }
 }
 
+/// A list with at least one element.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NonEmpty<T>(Vec<T>);
+
+impl<T> NonEmpty<T> {
+    pub(crate) fn new(list: Vec<T>) -> Option<NonEmpty<T>> {
+        (!list.is_empty()).then_some(NonEmpty(list))
+    }
+}
+
+impl<T> std::ops::Deref for NonEmpty<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
 /// How a track write reaches Navidrome. Append adds after the last row and keeps every row;
 /// Remove deletes the rows at these positions and keeps the others, hidden ones included; Replace
-/// rewrites the list, so the rows this account cannot see are dropped. Replace never takes an
-/// empty list, which Navidrome ignores.
+/// rewrites the list, so the rows this account cannot see are dropped. None takes an empty list,
+/// which Navidrome ignores for a Replace; Nothing is a write with nothing to send.
 pub(crate) enum TrackWrite {
-    Append(Vec<String>),
-    Replace(Vec<String>),
-    Remove(Vec<usize>),
+    Nothing,
+    Append(NonEmpty<String>),
+    Replace(NonEmpty<String>),
+    Remove(NonEmpty<usize>),
+}
+
+impl TrackWrite {
+    /// The write that turns `current` into `after`, a list holding every entry of `current`:
+    /// Nothing when it is `current`, Append when it adds a tail, else Replace.
+    pub(crate) fn growing(current: &[String], after: &[String]) -> TrackWrite {
+        match after.strip_prefix(current) {
+            Some(tail) => {
+                NonEmpty::new(tail.to_vec()).map_or(TrackWrite::Nothing, TrackWrite::Append)
+            }
+            None => NonEmpty::new(after.to_vec()).map_or(TrackWrite::Nothing, TrackWrite::Replace),
+        }
+    }
 }
 
 /// The caller holds `playlist_key(id)`. Reads the caller's playlist as `owned` does; `plan`, on
 /// its facts and native rows, gives the write and the song ids the playlist must list after it, or
-/// a refusal. Then the native record: a smart or synced playlist is NotEditable (D4), offering
-/// that list without its missing files; `present` on the songs the list gains; the write (none
-/// for a Remove of nothing); and the read back, which must list exactly that list. Nothing is
-/// written before `present`, so every refusal up to there leaves the playlist as it was.
+/// a refusal. For Nothing that read is the answer. Otherwise the native record: a smart or synced
+/// playlist is NotEditable (D4), offering that list without its missing files; `present` on the
+/// songs the list gains; the write; and the read back, which must list exactly that list. Nothing
+/// is written before `present`, so every refusal up to there leaves the playlist as it was.
 async fn write_tracks(
     navi: &NavidromeClient,
     ctx: &UserCtx,
@@ -733,27 +792,24 @@ async fn write_tracks(
     let (playlist, tracks) = owned_read(navi, ctx, id).await?;
     let before = facts(&playlist, &ctx.username);
     let (write, after) = plan(&before, &tracks)?;
+    if let TrackWrite::Nothing = write {
+        return Ok(written(&playlist, &tracks, ctx));
+    }
     let native = editable(navi, &before, &tracks, &after).await?;
     present(navi, &surplus(&after, &ids_of(&tracks))).await?;
     let (answer, hidden_dropped) = match &write {
-        TrackWrite::Append(ids) => (Some(navi.append_playlist_tracks(id, ids).await), 0),
+        TrackWrite::Nothing => unreachable!("answered above"),
+        TrackWrite::Append(ids) => (navi.append_playlist_tracks(id, ids).await, 0),
         TrackWrite::Replace(ids) => (
-            Some(navi.replace_playlist_tracks(id, ids).await),
+            navi.replace_playlist_tracks(id, ids).await,
             native.song_count.saturating_sub(tracks.len() as u32),
         ),
-        TrackWrite::Remove(positions) if positions.is_empty() => (None, 0),
-        TrackWrite::Remove(positions) => {
-            (Some(navi.remove_playlist_tracks(id, positions).await), 0)
-        }
+        TrackWrite::Remove(positions) => (navi.remove_playlist_tracks(id, positions).await, 0),
     };
-    let sent = answer.is_some();
-    if let Some(answer) = answer {
-        wrote(answer, id).map_err(PlaylistRefusal::WriteFailed)?;
-    }
-    let (playlist, tracks) = read(navi, ctx, id).await.map_err(|f| match sent {
-        true => PlaylistRefusal::WriteFailed(f),
-        false => PlaylistRefusal::Failed(f),
-    })?;
+    wrote(answer, id).map_err(PlaylistRefusal::WriteFailed)?;
+    let (playlist, tracks) = read(navi, ctx, id)
+        .await
+        .map_err(PlaylistRefusal::WriteFailed)?;
     let w = Written {
         hidden_dropped,
         ..written(&playlist, &tracks, ctx)
@@ -807,12 +863,13 @@ pub(crate) async fn set_tracks(
 ) -> Result<Written, PlaylistRefusal> {
     let _playlist = lock(&playlist_key(id)).await;
     write_tracks(navi, ctx, id, |_, tracks| {
-        Ok(if song_ids.is_empty() {
-            let every = tracks.iter().map(position_of).collect();
-            (TrackWrite::Remove(every), vec![])
-        } else {
-            (TrackWrite::Replace(song_ids.to_vec()), song_ids.to_vec())
-        })
+        let every = tracks.iter().map(position_of).collect();
+        let write = match (NonEmpty::new(song_ids.to_vec()), NonEmpty::new(every)) {
+            (Some(list), _) => TrackWrite::Replace(list),
+            (None, Some(every)) => TrackWrite::Remove(every),
+            (None, None) => TrackWrite::Nothing,
+        };
+        Ok((write, song_ids.to_vec()))
     })
     .await
 }
@@ -832,9 +889,10 @@ pub(crate) async fn add_tracks(
     write_tracks(navi, ctx, id, |playlist, tracks| {
         let mut after = ids_of(tracks);
         let end = tracks.last().map_or(0, |t| position_of(t) + 1);
+        let current = after.clone();
         let Some(before) = before.filter(|&before| before != end) else {
             after.extend_from_slice(song_ids);
-            return Ok((TrackWrite::Append(song_ids.to_vec()), after));
+            return Ok((TrackWrite::growing(&current, &after), after));
         };
         let at = (tracks.iter())
             .position(|t| position_of(t) == before)
@@ -843,7 +901,7 @@ pub(crate) async fn add_tracks(
                 position: before,
             })?;
         after.splice(at..at, song_ids.iter().cloned());
-        Ok((TrackWrite::Replace(after.clone()), after))
+        Ok((TrackWrite::growing(&current, &after), after))
     })
     .await
 }
@@ -881,7 +939,8 @@ pub(crate) async fn remove_tracks(
             .map(|t| t.song.id.clone())
             .collect();
         let positions = entries.iter().map(|(position, _)| *position).collect();
-        Ok((TrackWrite::Remove(positions), after))
+        let write = NonEmpty::new(positions).map_or(TrackWrite::Nothing, TrackWrite::Remove);
+        Ok((write, after))
     })
     .await
 }
@@ -1609,7 +1668,7 @@ mod tests {
             &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
         );
         // The second set reads what the first wrote, removes the three entries and reads it back
-        // empty; the third finds no entry and writes nothing.
+        // empty; the third finds no entry, so it neither writes nor reads again.
         let three = playlist_rows(&[
             (1, SILENT.0, SILENT.1, false),
             (2, HOLY.0, HOLY.1, false),
@@ -1668,9 +1727,7 @@ mod tests {
                 "/rest/updatePlaylist".into(),
                 read.clone(),
                 tracks_of(ADVENT),
-                read.clone(),
-                tracks_of(ADVENT),
-                native,
+                // Nothing to write: the first read is the answer.
                 read,
                 tracks_of(ADVENT),
             ]
@@ -2117,15 +2174,20 @@ mod tests {
         let guard = lock(&playlist_key("p-lock-test")).await;
         assert!(lock_entries().contains(&"playlist:p-lock-test".to_string()));
         drop(guard);
+        // The next lock taken, of any key, prunes the entry nobody holds.
+        drop(lock(&playlist_key("p-lock-other")).await);
         assert!(!lock_entries().contains(&"playlist:p-lock-test".to_string()));
     }
 
     #[tokio::test]
     async fn a_second_holder_of_a_lock_waits_for_the_first() {
         let first = lock(&playlist_key("p-wait-test")).await;
-        let second = tokio::spawn(async { drop(lock(&playlist_key("p-wait-test")).await) });
-        tokio::task::yield_now().await;
-        assert!(!second.is_finished());
+        let mut second = tokio::spawn(async { drop(lock(&playlist_key("p-wait-test")).await) });
+        let short = std::time::Duration::from_millis(50);
+        assert!(
+            tokio::time::timeout(short, &mut second).await.is_err(),
+            "the second waits while the first holds it"
+        );
         drop(first);
         second.await.unwrap();
     }
