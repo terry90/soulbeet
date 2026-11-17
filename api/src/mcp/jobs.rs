@@ -674,6 +674,9 @@ impl JobTool {
         again: Option<NextCall>,
         files_left: Vec<FileLeft>,
     ) -> Keyed {
+        // Answered the same again: the job's calls leave it out, unless it is offered as the
+        // call that can answer later.
+        let refused = again.clone();
         let (kept, mut result) = match answered {
             Ok(RetryAnswer::Applied(view)) => {
                 let read = self.document(&view).await;
@@ -686,15 +689,17 @@ impl JobTool {
                 (true, Err(applied_unread(job, failure)))
             }
             Ok(RetryAnswer::Refused(failure, facts)) => {
-                (false, Err(self.refusal(job, failure, facts, None).await))
+                let refusal = self.refusal(job, failure, facts, None, refused.as_ref());
+                (false, Err(refusal.await))
             }
             Ok(RetryAnswer::Unavailable(failure, facts)) => {
                 let again = again.filter(|_| failure.retry == RetryAdvice::SameSourceLater);
-                (false, Err(self.refusal(job, failure, facts, again).await))
+                let refusal = self.refusal(job, failure, facts, again, refused.as_ref());
+                (false, Err(refusal.await))
             }
             Ok(RetryAnswer::InvalidInput { field, expected }) => {
                 let ToolError { failure, facts, .. } = invalid_value(self.tool, field, &expected);
-                (false, Err(self.refusal(job, failure, facts, None).await))
+                (false, Err(self.refusal(job, failure, facts, None, None).await))
             }
             Err(f) => (false, Err(upstream_error(f, Map::new(), again))),
         };
@@ -708,19 +713,26 @@ impl JobTool {
     }
 
     /// `failure` with `facts`, the state of job `job` and its next as read now, after `again`.
+    /// The job's calls that would make the `refused` call again (that call or one with fewer of
+    /// its arguments) are left out: they would be refused the same way.
     async fn refusal(
         &self,
         job: Option<&str>,
         failure: Failure,
         mut facts: Map<String, Value>,
         again: Option<NextCall>,
+        refused: Option<&NextCall>,
     ) -> ToolError {
         let mut next: Vec<NextCall> = again.into_iter().collect();
         if let Some(job) = job {
             match self.read(job).await {
                 Ok(Some((view, untried))) => {
                     facts.insert("state".into(), json!(view.job.state.as_str()));
-                    next.extend(next_calls(&view, &untried, self.caller.allow_delete));
+                    let offered = next_calls(&view, &untried, self.caller.allow_delete);
+                    next.extend(
+                        (offered.into_iter())
+                            .filter(|call| !refused.is_some_and(|r| repeats(call, r))),
+                    );
                 }
                 Ok(None) => {}
                 Err(f) => warn!(
@@ -746,6 +758,15 @@ impl JobTool {
         let untried = untried(&self.acquire.db, &view, now).await?;
         Ok(Some((view, untried)))
     }
+}
+
+/// Whether `call` makes the `refused` call again: the same tool with no argument but the
+/// refused call's, each with the same value.
+fn repeats(call: &NextCall, refused: &NextCall) -> bool {
+    let (Value::Object(args), Value::Object(given)) = (&call.args, &refused.args) else {
+        return false;
+    };
+    call.tool == refused.tool && args.iter().all(|(name, value)| given.get(name) == Some(value))
 }
 
 /// `result` with `files_left` in a `files_left` field of its fields, or of its error's facts,
@@ -1579,6 +1600,42 @@ mod tests {
                 &json!("next_source"),
                 &json!("new_search")
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_refused_for_an_offline_source_is_not_offered_again() {
+        use shared::download::SourcePresence;
+        let (db, acq, effects, token) = jobs_app().await;
+        // slskd's text for a peer whose upload queue is full, which says to retry the same peer
+        // later (Application.cs:763-766).
+        let busy = Failure::new(
+            FailureCode::TransferRejectedPeerBusy,
+            Stage::Transfer,
+            RetryAdvice::SameSourceLater,
+            "Transfer rejected: Too many files",
+        );
+        let job = failed_track_job_with(&acq, "Silent Night", busy).await;
+        effects.stub().set_presence(SourcePresence::Offline);
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "retry_job",
+                json!({"job_id": job, "mode": "same_source"}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(error["code"], "peer_offline", "{error}");
+        let offered: Vec<&Value> = (error["next"].as_array().unwrap().iter())
+            .filter(|n| n["tool"] == "retry_job")
+            .map(|n| &n["args"]["mode"])
+            .collect();
+        assert_eq!(
+            offered,
+            [&json!("next_source"), &json!("new_search")],
+            "{error}"
         );
     }
 
