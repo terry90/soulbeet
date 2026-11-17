@@ -151,12 +151,12 @@ mod tests {
             "Navidrome could not be read (cause: navidrome 500: Internal Server Error)"
         );
         let bare = Failure::new(
-            FailureCode::NotOwner,
+            FailureCode::UnknownHandle,
             Stage::Delete,
             RetryAdvice::NotRetryable,
-            "Not your track",
+            "Discovery track not found",
         );
-        assert_eq!(logged(&bare), "Not your track");
+        assert_eq!(logged(&bare), "Discovery track not found");
     }
 
     #[test]

@@ -100,15 +100,6 @@ fn discovery_track_not_found() -> Failure {
     )
 }
 
-fn not_your_track() -> Failure {
-    Failure::new(
-        FailureCode::NotOwner,
-        Stage::Input,
-        RetryAdvice::NotRetryable,
-        "Not authorized to modify this track",
-    )
-}
-
 /// Another call holds the track or ended it (D16).
 pub(crate) fn track_not_pending() -> Failure {
     Failure::new(
@@ -308,14 +299,15 @@ pub(crate) async fn overview_in(
     })
 }
 
-/// The track's folder when `user_id` owns it: `folder_not_found` for none, `not_your_track`
-/// for another user's.
+/// The track's folder when `user_id` owns it: `folder_not_found` for none, and for another
+/// user's `discovery_track_not_found`, as for a track that does not exist: no id of another
+/// user's tells that it exists.
 fn track_folder_of(folder: Option<Folder>, user_id: &str) -> Result<Folder, Failure> {
     let folder = folder.ok_or_else(folder_not_found)?;
     if folder.user_id == user_id {
         Ok(folder)
     } else {
-        Err(not_your_track())
+        Err(discovery_track_not_found())
     }
 }
 
@@ -660,7 +652,7 @@ mod tests {
             }
         };
 
-        assert_eq!(claim("bob").await, Err(not_your_track()));
+        assert_eq!(claim("bob").await, Err(discovery_track_not_found()));
         // Still Pending, so its owner can promote it.
         assert_eq!(
             claim("alice").await,
@@ -680,13 +672,6 @@ mod tests {
                 Stage::Input,
                 NotRetryable,
                 "Discovery track not found",
-            ),
-            (
-                not_your_track(),
-                NotOwner,
-                Stage::Input,
-                NotRetryable,
-                "Not authorized to modify this track",
             ),
             (
                 track_not_pending(),
@@ -721,7 +706,7 @@ mod tests {
         };
         assert_eq!(
             track_folder_of(Some(folder("user-b")), "user-a"),
-            Err(not_your_track())
+            Err(discovery_track_not_found())
         );
         assert_eq!(track_folder_of(None, "user-a"), Err(folder_not_found()));
         assert_eq!(
@@ -843,11 +828,11 @@ mod tests {
             promote(&lib.db, &effects, &bob, "t1", ui)
                 .await
                 .unwrap_err(),
-            NotDone::Unclaimed(not_your_track())
+            NotDone::Unclaimed(discovery_track_not_found())
         );
         assert_eq!(
             remove_in(&lib.db, &bob, "t1").await.unwrap_err(),
-            NotDone::Unclaimed(not_your_track())
+            NotDone::Unclaimed(discovery_track_not_found())
         );
         assert!(staged.exists());
         assert_eq!(lib.track_status("t1").await, "Pending");

@@ -69,7 +69,7 @@ pub(crate) const PROMOTE_DISCOVERY_TRACK: ToolSpec = ToolSpec {
     title: "Keep a discovery track",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Moves a pending discovery track into this user's library folder through beets, as rating it at the promote threshold would at the next rating sync, except that without deletion switched on for this app an earlier library copy of the song is never replaced: the promote then ends import_already_in_library, the track stays pending, and next offers removing the staged copy. With the switch on, an earlier copy is replaced without a preview, as this app's deletion: counted in the {DAILY_APP_DELETIONS} tracks a day connected apps may delete and named in the deletion history. track_id comes from get_discovery. Takes seconds to a minute. Failure codes: {common}, unknown_handle, not_owner, expired_handle (no longer pending: promoted, removed or being promoted), import_files_gone (the staged file is gone; next offers its removal), the import_* codes, already_running.")
+        format!("Moves a pending discovery track into this user's library folder through beets, as rating it at the promote threshold would at the next rating sync, except that without deletion switched on for this app an earlier library copy of the song is never replaced: the promote then ends import_already_in_library, the track stays pending, and next offers removing the staged copy. With the switch on, an earlier copy is replaced without a preview, as this app's deletion: counted in the {DAILY_APP_DELETIONS} tracks a day connected apps may delete and named in the deletion history. track_id comes from get_discovery. Takes seconds to a minute. Failure codes: {common}, unknown_handle (no pending track of this user has this id), expired_handle (no longer pending: promoted, removed or being promoted), import_files_gone (the staged file is gone; next offers its removal), the import_* codes, already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["track_id"], "properties": {"track_id": {"type": "string", "minLength": 1, "maxLength": 500}, "#,
@@ -88,7 +88,7 @@ pub(crate) const REMOVE_DISCOVERY_TRACK: ToolSpec = ToolSpec {
     title: "Remove a discovery track",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Deletes a pending discovery track's file from the discovery folder and marks it removed, as the Remove button does. The file was never in the library. track_id comes from get_discovery. Failure codes: {common}, unknown_handle, not_owner, expired_handle (no longer pending), delete_outside_library (the stored file is not inside its profile folder), delete_failed, already_running.")
+        format!("Deletes a pending discovery track's file from the discovery folder and marks it removed, as the Remove button does. The file was never in the library. track_id comes from get_discovery. Failure codes: {common}, unknown_handle (no pending track of this user has this id), expired_handle (no longer pending), delete_outside_library (the stored file is not inside its profile folder), delete_failed, already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["track_id"], "properties": {"track_id": {"type": "string", "minLength": 1, "maxLength": 500}, "#,
@@ -352,7 +352,7 @@ fn track_answer(
     let failure = not_done.into_failure();
     use FailureCode::*;
     let next = match failure.code {
-        UnknownHandle | NotOwner | ExpiredHandle => Some(NextCall::new("get_discovery", json!({}))),
+        UnknownHandle | ExpiredHandle => Some(NextCall::new("get_discovery", json!({}))),
         ImportFilesGone | ImportAlreadyInLibrary => Some(NextCall::new(
             "remove_discovery_track",
             json!({"track_id": track_id}),
@@ -717,10 +717,7 @@ mod tests {
         )["error"];
         assert_eq!(
             (error["code"].as_str(), error["message"].as_str()),
-            (
-                Some("not_owner"),
-                Some("Not authorized to modify this track")
-            )
+            (Some("unknown_handle"), Some("Discovery track not found"))
         );
         assert_eq!(lib.track_status("t2").await, "Pending");
     }

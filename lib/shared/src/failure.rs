@@ -330,7 +330,6 @@ failure_codes! {
     InvalidInput => "invalid_input",
     UnknownHandle => "unknown_handle",
     ExpiredHandle => "expired_handle",
-    NotOwner => "not_owner",
     PermissionNotGranted => "permission_not_granted",
     FolderRequired => "folder_required",
     RateLimited => "rate_limited",
@@ -447,11 +446,10 @@ mod tests {
     /// `sources_exhausted`, `result_rejected` and `search_stopped`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 86] = [
+    const NAMES: [&str; 85] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
-        "not_owner",
         "permission_not_granted",
         "folder_required",
         "rate_limited",
