@@ -1,6 +1,7 @@
 //! The job tools: `get_jobs` shows the caller's jobs, by id or by batch and state, waiting for
 //! them to change when asked; `retry_job`, `cancel_job` and `dismiss_job` act on one.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -745,8 +746,8 @@ impl JobTool {
     }
 
     /// `failure` with `facts`, the state of job `job` and its next as read now, after `again`.
-    /// The job's calls that would make the `refused` call again (that call or one with fewer of
-    /// its arguments) are left out: they would be refused the same way.
+    /// The job's calls that would make the `refused` call again (`repeats`) are left out: they
+    /// would be refused the same way.
     async fn refusal(
         &self,
         job: Option<&str>,
@@ -792,16 +793,17 @@ impl JobTool {
     }
 }
 
-/// Whether `call` makes the `refused` call again: the same tool with no argument but the
-/// refused call's, each with the same value.
+/// Whether `call` makes the `refused` call again: the same tool with the same arguments, each
+/// with the same value. An argument given as null is absent, as the tools read it.
 fn repeats(call: &NextCall, refused: &NextCall) -> bool {
-    let (Value::Object(args), Value::Object(given)) = (&call.args, &refused.args) else {
-        return false;
-    };
-    call.tool == refused.tool
-        && args
-            .iter()
-            .all(|(name, value)| given.get(name) == Some(value))
+    fn given(args: &Value) -> Option<BTreeMap<&String, &Value>> {
+        let Value::Object(args) = args else {
+            return None;
+        };
+        Some(args.iter().filter(|(_, value)| !value.is_null()).collect())
+    }
+    let args = given(&call.args);
+    call.tool == refused.tool && args.is_some() && args == given(&refused.args)
 }
 
 /// `result` with `files_left` in a `files_left` field of its fields, or of its error's facts,
@@ -1813,6 +1815,26 @@ mod tests {
             [&json!("next_source"), &json!("new_search")],
             "{error}"
         );
+    }
+
+    #[test]
+    fn only_the_same_call_repeats_a_refused_one() {
+        use super::{repeats, NextCall};
+        let call = |args: Value| NextCall::new("retry_job", args);
+        let bare = call(json!({"job_id": "j1", "mode": "new_search"}));
+        let worded = call(json!({"job_id": "j1", "mode": "new_search", "query_text": "Noel"}));
+        // A refused search with other words leaves the job's bare new_search offered, and the
+        // other way round.
+        assert!(!repeats(&bare, &worded));
+        assert!(!repeats(&worded, &bare));
+        assert!(repeats(&bare, &bare));
+        assert!(repeats(&worded, &worded));
+        // An argument given as null is one not given.
+        let null_words = call(json!({"job_id": "j1", "mode": "new_search", "query_text": null}));
+        assert!(repeats(&bare, &null_words));
+        // The same arguments to another tool are another call.
+        let other = NextCall::new("cancel_job", json!({"job_id": "j1"}));
+        assert!(!repeats(&other, &call(json!({"job_id": "j1"}))));
     }
 
     #[tokio::test]
