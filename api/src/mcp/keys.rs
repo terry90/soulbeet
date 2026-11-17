@@ -122,16 +122,20 @@ where
         .ledger
         .reserve_key(&key, &call_hash, &INSTANCE, now)
         .await;
-    // A reservation of this process whose call ended: let go now, then taken afresh.
-    if matches!(reserved, Ok(KeyReservation::Running)) && unreleased().contains(&key) {
+    // A reservation of this process whose call ended: let go now, then taken afresh. Only the
+    // call that takes the key out of UNRELEASED lets it go: another call that found it running
+    // at the same time must not delete the reservation this one takes afresh.
+    if matches!(reserved, Ok(KeyReservation::Running)) && unreleased().remove(&key) {
         reserved = match acquire.ledger.release_key(&key, &INSTANCE).await {
             Ok(()) => {
-                unreleased().remove(&key);
                 (acquire.ledger)
                     .reserve_key(&key, &call_hash, &INSTANCE, now)
                     .await
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                unreleased().insert(key.clone());
+                Err(e)
+            }
         };
     }
     match reserved {
@@ -413,5 +417,67 @@ mod tests {
         // The call ended: the same call with the same key runs again, not "still running".
         let ran = call_k1(&acquire, &caller, async { Keyed::Kept(answer("second")) }).await;
         assert_eq!(text_of(&ran), text_of(&answer("second")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn calls_that_meet_a_key_the_database_would_not_let_go_run_it_once() {
+        let db = crate::db::test_db::migrated().await;
+        let (caller, acquire) = alice_on(db.clone()).await;
+        let refuse = [
+            ("refuse_results", "UPDATE OF document"),
+            ("refuse_release", "DELETE"),
+        ];
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for round in 0..20 {
+            // The first call's key stays reserved and is remembered as not let go.
+            for (name, event) in refuse {
+                sqlx::query(&format!(
+                    "CREATE TRIGGER {name} BEFORE {event} ON request_keys \
+                     BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END"
+                ))
+                .execute(&db)
+                .await
+                .unwrap();
+            }
+            call_k1(&acquire, &caller, async { Keyed::Kept(answer("first")) }).await;
+            for (name, _) in refuse {
+                sqlx::query(&format!("DROP TRIGGER {name}"))
+                    .execute(&db)
+                    .await
+                    .unwrap();
+            }
+            // Calls that all find the key running at once: one of them lets it go and runs.
+            runs.store(0, std::sync::atomic::Ordering::SeqCst);
+            let calls: Vec<_> = (0..8)
+                .map(|_| {
+                    let (acquire, caller, runs) = (acquire.clone(), caller.clone(), runs.clone());
+                    tokio::spawn(async move {
+                        call_k1(&acquire, &caller, async move {
+                            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Keyed::Kept(answer("ran"))
+                        })
+                        .await
+                    })
+                })
+                .collect();
+            for call in calls {
+                let answered = call.await.unwrap();
+                let doc: Value = serde_json::from_str(text_of(&answered)).unwrap();
+                assert!(
+                    text_of(&answered) == text_of(&answer("ran"))
+                        || doc["error"]["code"] == "already_running",
+                    "round {round}: {doc}"
+                );
+            }
+            assert_eq!(
+                runs.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "round {round}"
+            );
+            sqlx::query("DELETE FROM request_keys")
+                .execute(&db)
+                .await
+                .unwrap();
+        }
     }
 }
