@@ -79,10 +79,10 @@ fn KeptList(kept: Vec<BlockedDeletion>) -> Element {
 #[component]
 fn UnreadableList(listeners: Vec<UnreadableListener>) -> Element {
     rsx! {
-        SectionTitle { title: "Accounts Soulful cannot read" }
+        SectionTitle { title: "Accounts Soulbeet cannot read" }
         if listeners.is_empty() {
             p { class: "text-sm font-mono text-gray-300",
-                "Soulful can read every linked account."
+                "Soulbeet can read every linked account."
             }
         } else {
             p { class: "text-sm font-mono text-gray-300 mb-3",
@@ -166,6 +166,6 @@ mod tests {
         );
         assert!(html
             .contains("While an account cannot be read, no file it might have rated is deleted."));
-        assert!(render_unreadable(vec![]).contains("Soulful can read every linked account."));
+        assert!(render_unreadable(vec![]).contains("Soulbeet can read every linked account."));
     }
 }

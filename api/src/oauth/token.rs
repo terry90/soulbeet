@@ -101,7 +101,7 @@ async fn exchange(
             return Err(oauth_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_grant_type",
-                "Soulful supports the grant types authorization_code and refresh_token only",
+                "Soulbeet supports the grant types authorization_code and refresh_token only",
             ))
         }
     };
@@ -204,7 +204,7 @@ fn wrong_resource(base: &BaseUrl) -> Response {
 /// which counts it against neither.
 fn admit(limits: &Limits, presented: &Presented) -> Result<(), Response> {
     const GRANT: &str = "Too many refreshes for this connection";
-    const USER: &str = "Too many token requests for this Soulful account";
+    const USER: &str = "Too many token requests for this Soulbeet account";
     let mut budgets: Vec<(&WindowLimiter, &str, &str)> = Vec::with_capacity(2);
     if let Some(grant_id) = &presented.grant_id {
         budgets.push((&limits.token_grant, grant_id, GRANT));
@@ -245,7 +245,7 @@ fn unavailable(request: &str, e: String) -> Response {
     oauth_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "server_error",
-        "Soulful's database is unavailable",
+        "Soulbeet's database is unavailable",
     )
 }
 
@@ -509,7 +509,7 @@ mod tests {
         assert!((59..=60).contains(&wait), "{wait}");
         assert_eq!(
             doc,
-            json!({"error": "rate_limited", "error_description": format!("Too many token requests for this Soulful account. Try again in {wait} seconds.")})
+            json!({"error": "rate_limited", "error_description": format!("Too many token requests for this Soulbeet account. Try again in {wait} seconds.")})
         );
         // bob's Claude shares alice's client id and is not locked out.
         assert_eq!(
@@ -610,7 +610,7 @@ mod tests {
         assert!(refused["error_description"]
             .as_str()
             .unwrap()
-            .starts_with("Too many token requests for this Soulful account."));
+            .starts_with("Too many token requests for this Soulbeet account."));
     }
 
     #[tokio::test]
@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(
             doc,
             json!({"error": "unsupported_grant_type",
-            "error_description": "Soulful supports the grant types authorization_code and refresh_token only"})
+            "error_description": "Soulbeet supports the grant types authorization_code and refresh_token only"})
         );
     }
 
@@ -720,7 +720,7 @@ mod tests {
             (status, doc),
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": "server_error", "error_description": "Soulful's database is unavailable"})
+                json!({"error": "server_error", "error_description": "Soulbeet's database is unavailable"})
             )
         );
     }

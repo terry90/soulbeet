@@ -162,7 +162,7 @@ pub(crate) const UPDATE_SETTINGS: ToolSpec = ToolSpec {
     title: "Change settings",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Changes this user's Soulful settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulful's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map). The discovery folder and the promote threshold are changed only by the user, in Soulful's Settings, whether or not deletion is switched on for this app: the rating sync moves the folder's pending tracks rated at or above the threshold into the library, and a promote can replace and delete an earlier library copy outside this app's daily limit. Turning discovery off or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true, discovery_folder_id or discovery_promote_threshold), already_running.")
+        format!("Changes this user's Soulbeet settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulbeet's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map). The discovery folder and the promote threshold are changed only by the user, in Soulbeet's Settings, whether or not deletion is switched on for this app: the rating sync moves the folder's pending tracks rated at or above the threshold into the library, and a promote can replace and delete an earlier library copy outside this app's daily limit. Turning discovery off or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true, discovery_folder_id or discovery_promote_threshold), already_running.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"default_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "auto_delete": {"type": "boolean"}, "discovery_enabled": {"type": "boolean"}, "discovery_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "discovery_profiles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["Conservative", "Balanced", "Adventurous"]}}, "discovery_track_counts": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer", "minimum": 1, "maximum": 50}, "Balanced": {"type": "integer", "minimum": 1, "maximum": 50}, "Adventurous": {"type": "integer", "minimum": 1, "maximum": 50}}}, "discovery_lifetime_days": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer", "minimum": 1, "maximum": 90}, "Balanced": {"type": "integer", "minimum": 1, "maximum": 90}, "Adventurous": {"type": "integer", "minimum": 1, "maximum": 90}}}, "discovery_playlist_names": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "string"}, "Balanced": {"type": "string"}, "Adventurous": {"type": "string"}}}, "discovery_promote_threshold": {"type": "integer", "minimum": 1, "maximum": 5}, "#,
@@ -183,12 +183,12 @@ fn auto_delete_on_refused() -> Failure {
         FailureCode::PermissionNotGranted,
         Stage::Input,
         RetryAdvice::NeedsUser,
-        "Only you can turn auto-delete on, in Soulful's Settings: it deletes the files of songs you rate 1 star at every rating sync",
+        "Only you can turn auto-delete on, in Soulbeet's Settings: it deletes the files of songs you rate 1 star at every rating sync",
     )
     .with_user_action(UserAction::new(
         UserActionCode::EnableAutoDelete,
         "Turn on auto-delete yourself",
-        "Soulful Settings > Library",
+        "Soulbeet Settings > Library",
     ))
 }
 
@@ -202,13 +202,13 @@ fn promote_threshold_refused() -> Failure {
         FailureCode::PermissionNotGranted,
         Stage::Input,
         RetryAdvice::NeedsUser,
-        "Only you can change the discovery promote threshold, in Soulful's Settings: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
+        "Only you can change the discovery promote threshold, in Soulbeet's Settings: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
     )
     .with_user_action(UserAction::new(
         UserActionCode::ChangeDiscoverySettings,
         "Change the discovery promote threshold yourself",
         // Its own row of the Library tab, below the Discovery block.
-        "Soulful Settings > Library",
+        "Soulbeet Settings > Library",
     ))
 }
 
@@ -220,12 +220,12 @@ fn discovery_folder_refused() -> Failure {
         FailureCode::PermissionNotGranted,
         Stage::Input,
         RetryAdvice::NeedsUser,
-        "Only you can change the discovery folder, in Soulful's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
+        "Only you can change the discovery folder, in Soulbeet's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
     )
     .with_user_action(UserAction::new(
         UserActionCode::ChangeDiscoverySettings,
         "Change the discovery folder yourself",
-        "Soulful Settings > Library > Discovery",
+        "Soulbeet Settings > Library > Discovery",
     ))
 }
 
@@ -473,7 +473,7 @@ mod tests {
                     Some("settings_unreadable"),
                     Some("input"),
                     Some("same_source_later"),
-                    Some("Soulful's database is unavailable")
+                    Some("Soulbeet's database is unavailable")
                 ),
                 "{tool}"
             );
@@ -546,11 +546,11 @@ mod tests {
             );
             assert_eq!(
                 error["message"],
-                "Only you can turn auto-delete on, in Soulful's Settings: it deletes the files of songs you rate 1 star at every rating sync"
+                "Only you can turn auto-delete on, in Soulbeet's Settings: it deletes the files of songs you rate 1 star at every rating sync"
             );
             assert_eq!(
                 error["user_action"],
-                json!({"code": "enable_auto_delete", "what": "Turn on auto-delete yourself", "where": "Soulful Settings > Library"})
+                json!({"code": "enable_auto_delete", "what": "Turn on auto-delete yourself", "where": "Soulbeet Settings > Library"})
             );
             assert_eq!(
                 (&error["facts"], &error["next"]),
@@ -603,16 +603,16 @@ mod tests {
             (
                 "discovery_promote_threshold",
                 json!({"discovery_promote_threshold": 1, "request_key": "k"}),
-                "Only you can change the discovery promote threshold, in Soulful's Settings: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
+                "Only you can change the discovery promote threshold, in Soulbeet's Settings: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
                 "Change the discovery promote threshold yourself",
-                "Soulful Settings > Library",
+                "Soulbeet Settings > Library",
             ),
             (
                 "discovery_folder_id",
                 json!({"discovery_folder_id": "f1", "request_key": "k"}),
-                "Only you can change the discovery folder, in Soulful's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
+                "Only you can change the discovery folder, in Soulbeet's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
                 "Change the discovery folder yourself",
-                "Soulful Settings > Library > Discovery",
+                "Soulbeet Settings > Library > Discovery",
             ),
         ];
         for allow_delete in [0, 1] {

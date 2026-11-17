@@ -216,7 +216,7 @@ fn admit(state: &ConnectionState, explained: &BaseExplanation) -> Result<BaseUrl
             StatusCode::FORBIDDEN,
             "https_required",
             format!(
-                "Soulful derived the address {base} for this request. Claude connects only \
+                "Soulbeet derived the address {base} for this request. Claude connects only \
                  over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: \
                  proto=https), or set PUBLIC_URL."
             ),
@@ -373,7 +373,7 @@ mod tests {
             body,
             json!({
                 "error": "https_required",
-                "message": "Soulful derived the address http://192.168.1.5:9765 for this request. Claude connects only over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: proto=https), or set PUBLIC_URL.",
+                "message": "Soulbeet derived the address http://192.168.1.5:9765 for this request. Claude connects only over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: proto=https), or set PUBLIC_URL.",
                 "derived_base": "http://192.168.1.5:9765",
                 "host_from": "host",
                 "scheme_from": "local_host_is_http"

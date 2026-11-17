@@ -43,9 +43,9 @@ fn RemoteAccessView(access: RemoteAccess) -> Element {
     rsx! {
         div { class: "text-sm font-mono text-gray-300 space-y-1 mb-4",
             match (&access.derived_base, &access.base_problem) {
-                (Some(base), _) => rsx! { p { "Soulful sees this page's request at {base}" } },
+                (Some(base), _) => rsx! { p { "Soulbeet sees this page's request at {base}" } },
                 (None, Some(problem)) => rsx! {
-                    p { class: "text-red-400", "Soulful cannot tell this page's address: {problem}" }
+                    p { class: "text-red-400", "Soulbeet cannot tell this page's address: {problem}" }
                 },
                 (None, None) => rsx! {},
             }
@@ -61,7 +61,7 @@ fn RemoteAccessView(access: RemoteAccess) -> Element {
         SectionTitle { title: "Latest connection requests" }
         if access.recent.is_empty() {
             p { class: "text-gray-500 font-mono italic",
-                "No request has reached the connection paths since Soulful started."
+                "No request has reached the connection paths since Soulbeet started."
             }
         } else {
             div { class: "overflow-x-auto",

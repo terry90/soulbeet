@@ -113,9 +113,9 @@ mod tests {
         assert_eq!(
             login_failure_message(&server_error(
                 409,
-                "There is no Soulful account named 'x'. An admin creates accounts in Settings > Users."
+                "There is no Soulbeet account named 'x'. An admin creates accounts in Settings > Users."
             )),
-            "There is no Soulful account named 'x'. An admin creates accounts in Settings > Users."
+            "There is no Soulbeet account named 'x'. An admin creates accounts in Settings > Users."
         );
         assert_eq!(
             login_failure_message(&server_error(401, "Invalid username or password")),

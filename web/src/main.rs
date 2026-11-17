@@ -316,7 +316,7 @@ fn WebNavbar() -> Element {
                 StatusBanner {
                     dot_class: "bg-beet-accent",
                     label: "UPDATE",
-                    message: "Soulful was updated. Reload this page.".to_string(),
+                    message: "Soulbeet was updated. Reload this page.".to_string(),
                     button {
                         class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted cursor-pointer",
                         onclick: |_| {

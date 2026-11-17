@@ -1171,7 +1171,7 @@ mod tests {
             (
                 FailureCode::SettingsUnreadable,
                 Stage::Enqueue,
-                "Soulful's database is unavailable"
+                "Soulbeet's database is unavailable"
             )
         );
         assert!(stub.destinations().is_empty(), "a file was sent unstored");

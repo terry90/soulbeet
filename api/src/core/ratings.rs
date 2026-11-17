@@ -277,11 +277,11 @@ fn unplaced(f: Failure) -> Failure {
     }
     let (fix, action) = match f.message.as_str() {
         NO_LIBRARY_ROOT => (
-            "Make Navidrome's music folder readable by Soulful at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library, or rate the song yourself in Navidrome.",
+            "Make Navidrome's music folder readable by Soulbeet at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulbeet sees Navidrome's default library, or rate the song yourself in Navidrome.",
             UserAction::new(
                 UserActionCode::ConfigureNavidrome,
-                "Make Navidrome's music folder readable by Soulful at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library",
-                "Soulful's environment",
+                "Make Navidrome's music folder readable by Soulbeet at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulbeet sees Navidrome's default library",
+                "Soulbeet's environment",
             ),
         ),
         _ => (
@@ -294,7 +294,7 @@ fn unplaced(f: Failure) -> Failure {
         ),
     };
     let message = format!(
-        "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot place the song's file. {}. {fix}",
+        "Soulbeet cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot place the song's file. {}. {fix}",
         f.message
     );
     Failure {
@@ -1049,7 +1049,7 @@ mod tests {
         // user's to make in Navidrome; no setting of Soulful's would find the file.
         assert_eq!(
             f.message,
-            "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot place the song's file. No file at this song's path. Rate the song yourself in Navidrome."
+            "Soulbeet cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot place the song's file. No file at this song's path. Rate the song yourself in Navidrome."
         );
         assert_eq!(
             f.user_action,
@@ -1067,7 +1067,7 @@ mod tests {
         let root_gone = unplaced(crate::core::delete_guard::path_unresolved(NO_LIBRARY_ROOT));
         assert_eq!(
             root_gone.message,
-            "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot place the song's file. No folder at this song's library root. Make Navidrome's music folder readable by Soulful at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library, or rate the song yourself in Navidrome."
+            "Soulbeet cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot place the song's file. No folder at this song's library root. Make Navidrome's music folder readable by Soulbeet at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulbeet sees Navidrome's default library, or rate the song yourself in Navidrome."
         );
         assert_eq!(
             root_gone.user_action.map(|a| a.code),
@@ -1745,7 +1745,7 @@ mod tests {
             (
                 FailureCode::SettingsUnreadable,
                 Stage::Delete,
-                "Soulful's database is unavailable"
+                "Soulbeet's database is unavailable"
             )
         );
         assert!(f.cause.unwrap().raw.contains("disk I/O error"));

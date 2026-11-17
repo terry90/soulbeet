@@ -127,7 +127,7 @@ fn release_provider(
             FailureCode::ProviderNotConfigured,
             Stage::Metadata,
             RetryAdvice::NeedsUser,
-            "A lastfm: release id needs a Last.fm API key saved in Soulful's settings",
+            "A lastfm: release id needs a Last.fm API key saved in Soulbeet's settings",
         )
         .with_user_action(soulbeet::lastfm::configure_lastfm()));
     }
@@ -360,7 +360,7 @@ mod tests {
                     FailureCode::ProviderNotConfigured,
                     Stage::Metadata,
                     RetryAdvice::NeedsUser,
-                    "A lastfm: release id needs a Last.fm API key saved in Soulful's settings"
+                    "A lastfm: release id needs a Last.fm API key saved in Soulbeet's settings"
                 )
             );
             assert_eq!(f.user_action, Some(soulbeet::lastfm::configure_lastfm()));

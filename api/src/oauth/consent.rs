@@ -58,7 +58,7 @@ pub(crate) fn consent_page(view: &ConsentView) -> Response {
     let app = escape_html(view.app_host);
     let redirect = escape_html(view.redirect_host);
     let mut body = format!(
-        "<h1>Connect {app} to Soulful</h1>\n<p>{app} wants to use Soulful as {}.</p>\n",
+        "<h1>Connect {app} to Soulbeet</h1>\n<p>{app} wants to use Soulbeet as {}.</p>\n",
         escape_html(view.username)
     );
     if let Some(name) = view.client_name {
@@ -70,10 +70,10 @@ pub(crate) fn consent_page(view: &ConsentView) -> Response {
     body.push_str(
         "<p>Once allowed, it can see your library, downloads and settings, search for music, \
          download into your folders, and manage your playlists and ratings. It cannot delete \
-         music unless you turn that on for it in Settings &gt; Connected apps.</p>\n",
+         music unless you turn that on for it in Settings &gt; Users &gt; Connected apps.</p>\n",
     );
     body.push_str(&format!(
-        "<p>When you answer, Soulful sends you back to {redirect}.</p>\n"
+        "<p>When you answer, Soulbeet sends you back to {redirect}.</p>\n"
     ));
     if view.returns_to_loopback {
         body.push_str(&format!(
@@ -89,15 +89,15 @@ pub(crate) fn consent_page(view: &ConsentView) -> Response {
          </form>\n",
         escape_html(view.request_id)
     ));
-    page(StatusCode::OK, &format!("Connect {app} to Soulful"), &body)
+    page(StatusCode::OK, &format!("Connect {app} to Soulbeet"), &body)
 }
 
 /// `message` on a page of its own, with the consent page's headers.
 pub(crate) fn error_page(status: StatusCode, message: &str) -> Response {
     page(
         status,
-        "Soulful",
-        &format!("<h1>Soulful</h1>\n<p>{}</p>\n", escape_html(message)),
+        "Soulbeet",
+        &format!("<h1>Soulbeet</h1>\n<p>{}</p>\n", escape_html(message)),
     )
 }
 

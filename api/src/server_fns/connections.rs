@@ -129,7 +129,7 @@ pub(crate) fn address_advice(
     let base = match &explained.result {
         Ok(base) => base,
         Err(e) => {
-            advice.push(format!("Soulful cannot tell this request's address: {e}"));
+            advice.push(format!("Soulbeet cannot tell this request's address: {e}"));
             return advice;
         }
     };
@@ -148,7 +148,7 @@ pub(crate) fn address_advice(
     let host_problem = match explained.host_from {
         _ if browser.same_host(base) => None,
         HostSource::Host | HostSource::Authority => Some(format!(
-            "Your browser is on {browser_host}, but the request reached Soulful naming \
+            "Your browser is on {browser_host}, but the request reached Soulbeet naming \
              {base_host}. Have the proxy send X-Forwarded-Host (or Forwarded host=) with the \
              public name."
         )),
@@ -162,7 +162,7 @@ pub(crate) fn address_advice(
     advice.extend(host_problem);
     if browser.is_https() && !base.is_https() {
         advice.push(
-            "Your browser uses https, but Soulful sees http: have the proxy send \
+            "Your browser uses https, but Soulbeet sees http: have the proxy send \
              X-Forwarded-Proto: https (or Forwarded proto=https)."
                 .into(),
         );
@@ -206,9 +206,9 @@ mod tests {
         let browser = BaseUrl::parse("https://music.example.com").unwrap();
         // soulful:9765 is the upstream name a plain proxy_pass sends as Host
         assert_eq!(advice(&[("host", "soulful:9765"), ("x-forwarded-proto", "https")], None), vec![
-            "Your browser is on music.example.com, but the request reached Soulful naming soulful:9765. Have the proxy send X-Forwarded-Host (or Forwarded host=) with the public name.".to_string()]);
+            "Your browser is on music.example.com, but the request reached Soulbeet naming soulful:9765. Have the proxy send X-Forwarded-Host (or Forwarded host=) with the public name.".to_string()]);
         assert_eq!(advice(&[("host", "music.example.com"), ("x-forwarded-proto", "http")], None), vec![
-            "Your browser uses https, but Soulful sees http: have the proxy send X-Forwarded-Proto: https (or Forwarded proto=https).".to_string(),
+            "Your browser uses https, but Soulbeet sees http: have the proxy send X-Forwarded-Proto: https (or Forwarded proto=https).".to_string(),
             "Claude cannot use this address: it is plain http.".to_string()]);
         assert_eq!(advice(&[
                 ("host", "soulful:9765"),
@@ -234,7 +234,7 @@ mod tests {
             WORKS.to_string()]);
         let none = explain_base(&HeaderMap::new(), None, None);
         assert_eq!(address_advice(&browser, &none, true), vec![
-            "Soulful cannot tell this request's address: The request names no host (Forwarded host=, X-Forwarded-Host or Host)".to_string()]);
+            "Soulbeet cannot tell this request's address: The request names no host (Forwarded host=, X-Forwarded-Host or Host)".to_string()]);
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
         // HTTP/2 names the host in the request's authority, not in Host.
         assert_eq!(
             advice(&[("x-forwarded-proto", "https")], Some("soulful:9765")),
-            vec!["Your browser is on music.example.com, but the request reached Soulful naming soulful:9765. Have the proxy send X-Forwarded-Host (or Forwarded host=) with the public name.".to_string()]
+            vec!["Your browser is on music.example.com, but the request reached Soulbeet naming soulful:9765. Have the proxy send X-Forwarded-Host (or Forwarded host=) with the public name.".to_string()]
         );
         assert_eq!(
             advice(&[("x-forwarded-proto", "https")], Some("music.example.com")),

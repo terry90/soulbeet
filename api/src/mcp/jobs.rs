@@ -578,7 +578,7 @@ pub(crate) const RETRY_JOB: ToolSpec = ToolSpec {
     title: "Retry a job",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Tries a job again in one of five modes. same_source: the source that failed, for a failure that says to retry it later, or a cancelled job (track jobs). next_source: the best source of the job's search not tried yet (track jobs). new_search: a new search, with optional query_text and filters, or the search_id of a find_sources search (then neither query_text nor filters: its candidates were found under its own). index_only: wait for Navidrome again, for a job that failed at indexing. reject_result: a done job's file is not the recording wanted; the job reopens without that source (the file stays in the library until deleted). A mode the job's state does not allow is refused with wrong_job_state; next in every job document lists only the modes allowed now. A failure that needs a person lists none: after the person did what its user_action says, retry_job runs again. A job whose recording is already in the library takes no mode (import_already_in_library); any other mode the job does not allow now is invalid_input naming the modes it allows. Album jobs retry by new_search or index_only. Jobs started in Soulful's web page are retried there. Answers the job's full document, as get_jobs gives it; when a new search cannot be recorded, the job ends failed with that failure. A change made whose job could not be read after it answers the read's failure with facts.changed true and get_jobs in next. Failure codes: {common}, unknown_handle, expired_handle (search_id), wrong_job_state, sources_exhausted, import_already_in_library, peer_offline (same_source while the source is offline), enqueue_failed (same_source of a source slskd's blacklist holds), backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), already_running (a call with this request_key still runs).")
+        format!("Tries a job again in one of five modes. same_source: the source that failed, for a failure that says to retry it later, or a cancelled job (track jobs). next_source: the best source of the job's search not tried yet (track jobs). new_search: a new search, with optional query_text and filters, or the search_id of a find_sources search (then neither query_text nor filters: its candidates were found under its own). index_only: wait for Navidrome again, for a job that failed at indexing. reject_result: a done job's file is not the recording wanted; the job reopens without that source (the file stays in the library until deleted). A mode the job's state does not allow is refused with wrong_job_state; next in every job document lists only the modes allowed now. A failure that needs a person lists none: after the person did what its user_action says, retry_job runs again. A job whose recording is already in the library takes no mode (import_already_in_library); any other mode the job does not allow now is invalid_input naming the modes it allows. Album jobs retry by new_search or index_only. Jobs started in Soulbeet's web page are retried there. Answers the job's full document, as get_jobs gives it; when a new search cannot be recorded, the job ends failed with that failure. A change made whose job could not be read after it answers the read's failure with facts.changed true and get_jobs in next. Failure codes: {common}, unknown_handle, expired_handle (search_id), wrong_job_state, sources_exhausted, import_already_in_library, peer_offline (same_source while the source is offline), enqueue_failed (same_source of a source slskd's blacklist holds), backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["job_id", "mode"], "properties": {"job_id": {"type": "string", "minLength": 1}, "mode": {"enum": ["same_source", "next_source", "new_search", "index_only", "reject_result"]}, "query_text": {"type": "string", "minLength": 1}, "#,
@@ -599,7 +599,7 @@ pub(crate) const CANCEL_JOB: ToolSpec = ToolSpec {
     title: "Cancel a job",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Cancels a job that is searching, waiting for a source choice, queued or downloading: its search or transfers stop. A transfer that already finished still imports. Jobs started in Soulful's web page are cancelled there. Answers the job's full document. Failure codes: {common}, unknown_handle, wrong_job_state, already_running (a call with this request_key still runs).")
+        format!("Cancels a job that is searching, waiting for a source choice, queued or downloading: its search or transfers stop. A transfer that already finished still imports. Jobs started in Soulbeet's web page are cancelled there. Answers the job's full document. Failure codes: {common}, unknown_handle, wrong_job_state, already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["job_id"], "properties": {"job_id": {"type": "string", "minLength": 1}, "#,
@@ -618,7 +618,7 @@ pub(crate) const DISMISS_JOB: ToolSpec = ToolSpec {
     title: "Dismiss a job",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Closes a job that will not be pursued (failed, cancelled, waiting for a source choice or an import decision). For one waiting for an import decision, deletes the downloaded copy Soulful kept for it (never a library file); a file it could not delete stays on disk, listed in files_left (its path relative to Soulful's download folder, code delete_failed and message; files_left_omitted counting any left out past 60,000 characters), and the job is dismissed all the same. Answers the job's full document. Failure codes: {common}, unknown_handle (also: another decision already took the kept import; dismiss_job can be called again once it ended), wrong_job_state, already_running (a call with this request_key still runs).")
+        format!("Closes a job that will not be pursued (failed, cancelled, waiting for a source choice or an import decision). For one waiting for an import decision, deletes the downloaded copy Soulbeet kept for it (never a library file); a file it could not delete stays on disk, listed in files_left (its path relative to Soulbeet's download folder, code delete_failed and message; files_left_omitted counting any left out past 60,000 characters), and the job is dismissed all the same. Answers the job's full document. Failure codes: {common}, unknown_handle (also: another decision already took the kept import; dismiss_job can be called again once it ended), wrong_job_state, already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["job_id"], "properties": {"job_id": {"type": "string", "minLength": 1}, "#,
@@ -1911,7 +1911,7 @@ mod tests {
                 .clone();
         assert_eq!(
             error["message"],
-            "cancel_job: job_id must be a job started by ensure_in_library or download_source; this one was started in Soulful's web page, where it can be cancelled or retried"
+            "cancel_job: job_id must be a job started by ensure_in_library or download_source; this one was started in Soulbeet's web page, where it can be cancelled or retried"
         );
         let doc =
             document(&call_tool(app.clone(), &token, "dismiss_job", json!({"job_id": web})).await);
@@ -1945,7 +1945,7 @@ mod tests {
         assert_eq!(
             doc["files_left"],
             json!([{"path": file, "code": "delete_failed",
-                "message": "Soulful could not delete this downloaded file; it stays on disk"}])
+                "message": "Soulbeet could not delete this downloaded file; it stays on disk"}])
         );
         assert!(acq.download_base.join(file).exists());
     }

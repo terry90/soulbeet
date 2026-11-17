@@ -542,7 +542,7 @@ mod tests {
         // Port 1 on loopback refuses the connection at once.
         let url =
             "http://127.0.0.1:1/2.0/?method=track.search&api_key=3f2b9c1e8d7a6b5c&format=json";
-        let client = build_client("Soulful test");
+        let client = build_client("Soulbeet test");
         let e = resilient_send(|| client.get(url), "Last.fm API")
             .await
             .unwrap_err();

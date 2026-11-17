@@ -133,7 +133,7 @@ pub async fn download_updates_ws(
     if let Err(why) = allowed {
         warn!("Refused a download updates socket for user {user}: {why}");
         return Err(forbidden_error(
-            "Download updates can only be opened from Soulful's own page",
+            "Download updates can only be opened from Soulbeet's own page",
         ));
     }
     let token = cookies

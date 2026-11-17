@@ -77,7 +77,7 @@ pub(crate) const GET_SOURCES: ToolSpec = ToolSpec {
     title: "Read a source search",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Reads a search find_sources started: its state, what it read and its candidates, a page at a time. Takes search_id, wait_seconds (0 to 180) to wait for a running search, limit and cursor. Failure codes: {common}, unknown_handle (no such search for this user), expired_handle (older than 24 hours), search_stopped (the search of a cancelled job), server_restarted (Soulful restarted while the search ran), and the search's own failure codes as find_sources lists them.")
+        format!("Reads a search find_sources started: its state, what it read and its candidates, a page at a time. Takes search_id, wait_seconds (0 to 180) to wait for a running search, limit and cursor. Failure codes: {common}, unknown_handle (no such search for this user), expired_handle (older than 24 hours), search_stopped (the search of a cancelled job), server_restarted (Soulbeet restarted while the search ran), and the search's own failure codes as find_sources lists them.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["search_id"], "properties": {"search_id": {"type": "string", "minLength": 1}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 180}, "#,

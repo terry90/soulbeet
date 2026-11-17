@@ -714,7 +714,7 @@ mod tests {
             shared::failure::FailureCode::ImportBeetsFailed,
             shared::failure::Stage::Import,
             shared::failure::RetryAdvice::SameSourceLater,
-            "beets may have moved the new copy, and Soulful could not read where item 7 is: beet export failed (exit status: 1): ",
+            "beets may have moved the new copy, and Soulbeet could not read where item 7 is: beet export failed (exit status: 1): ",
         );
         stub.script_relocate(Relocation {
             now: vec![],

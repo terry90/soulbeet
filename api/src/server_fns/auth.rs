@@ -207,7 +207,7 @@ fn ping_verdict(ping: &Result<(), soulbeet::NavidromeError>) -> NavidromeAuthRes
 #[cfg(feature = "server")]
 fn several_accounts(username: &str) -> String {
     format!(
-        "Several Soulful accounts match '{username}' when letter case is ignored, so none of \
+        "Several Soulbeet accounts match '{username}' when letter case is ignored, so none of \
          them can sign in. Ask an admin to delete the accounts that are not yours."
     )
 }
@@ -390,15 +390,15 @@ pub(crate) async fn apply_navidrome_login(
     let id = match navidrome_login_plan(existing, mode) {
         LoginPlan::RefuseUnlinked => {
             return Ok(LoginOutcome::Refused(format!(
-                "A Soulful account named '{username}' exists but is not linked to Navidrome. \
-                 Sign in with its Soulful password, change that password to your Navidrome \
+                "A Soulbeet account named '{username}' exists but is not linked to Navidrome. \
+                 Sign in with its Soulbeet password, change that password to your Navidrome \
                  password in Settings > Users, then sign in again. An admin can also set it \
                  for you."
             )));
         }
         LoginPlan::RefuseNoAccount => {
             return Ok(LoginOutcome::Refused(format!(
-                "There is no Soulful account named '{username}'. An admin creates accounts in \
+                "There is no Soulbeet account named '{username}'. An admin creates accounts in \
                  Settings > Users."
             )));
         }
@@ -1022,7 +1022,7 @@ mod tests {
                 .unwrap();
         match outcome {
             LoginOutcome::Refused(msg) => assert!(
-                msg.starts_with("A Soulful account named 'bob' exists but is not linked"),
+                msg.starts_with("A Soulbeet account named 'bob' exists but is not linked"),
                 "{msg}"
             ),
             other => panic!("expected a refusal, got {other:?}"),
@@ -1156,7 +1156,7 @@ mod tests {
                     .unwrap();
             match outcome {
                 LoginOutcome::Refused(msg) => {
-                    assert!(msg.starts_with("Several Soulful accounts"), "{msg}")
+                    assert!(msg.starts_with("Several Soulbeet accounts"), "{msg}")
                 }
                 other => panic!("expected a refusal, got {other:?}"),
             }
@@ -1179,7 +1179,7 @@ mod tests {
             .unwrap();
             assert_eq!(code(&err), 409);
             assert!(
-                err.to_string().contains("Several Soulful accounts"),
+                err.to_string().contains("Several Soulbeet accounts"),
                 "{err}"
             );
         }

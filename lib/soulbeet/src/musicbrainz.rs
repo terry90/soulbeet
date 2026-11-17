@@ -127,7 +127,7 @@ impl From<musicbrainz_rs::Error> for MetadataError {
             },
             Error::MissingRetryToken | Error::InvalidUserAgent(_) => unreachable!(
                 "musicbrainz_rs 44c25c8 never constructs MissingRetryToken, and gives \
-                 InvalidUserAgent only from MusicBrainzClient::new, which Soulful calls \
+                 InvalidUserAgent only from MusicBrainzClient::new, which Soulbeet calls \
                  once under expect: {e}"
             ),
         }

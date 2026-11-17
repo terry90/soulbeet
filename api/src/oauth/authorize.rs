@@ -45,15 +45,15 @@ const AUTHORIZE_PARAMS: &[&str] = &[
 const ANSWER_PARAMS: &[&str] = &["request", "decision"];
 
 const UNKNOWN_APP: &str =
-    "Soulful does not know this app. Start the connection again from the app.";
+    "Soulbeet does not know this app. Start the connection again from the app.";
 const UNREGISTERED_REDIRECT: &str = "This app asked to return to an address it did not register.";
-const SESSION_ENDED: &str = "Your Soulful session ended. Start the connection again from the app.";
+const SESSION_ENDED: &str = "Your Soulbeet session ended. Start the connection again from the app.";
 const REQUEST_GONE: &str =
     "This sign-in request expired or was already used. Start the connection again from the app.";
 const NOT_UNDERSTOOD: &str =
-    "Soulful did not understand the answer. Start the connection again from the app.";
+    "Soulbeet did not understand the answer. Start the connection again from the app.";
 const DATABASE_UNAVAILABLE: &str =
-    "Soulful's database is unavailable. Start the connection again from the app.";
+    "Soulbeet's database is unavailable. Start the connection again from the app.";
 
 /// The parameters of `raw` named in `names`, or the page refusing a request
 /// that sent one twice.
@@ -159,7 +159,7 @@ pub(crate) async fn show(
             return error_page(
                 StatusCode::BAD_REQUEST,
                 &format!(
-                    "This app sent a request Soulful cannot accept ({error}: {description}). \
+                    "This app sent a request Soulbeet cannot accept ({error}: {description}). \
                      Start the connection again from the app."
                 ),
             )
@@ -207,7 +207,7 @@ async fn document_client(
         }
         error_page(
             StatusCode::BAD_REQUEST,
-            &format!("Soulful could not use this app's client metadata at {client_id}: {e}"),
+            &format!("Soulbeet could not use this app's client metadata at {client_id}: {e}"),
         )
     };
     let url = client_id_url(client_id).map_err(unusable)?;
@@ -269,7 +269,7 @@ fn validate<'a>(
     {
         return Err((
             "invalid_scope",
-            "Soulful grants the scopes soulful and offline_access only".into(),
+            "Soulbeet grants the scopes soulful and offline_access only".into(),
         ));
     }
     if !params
@@ -483,11 +483,11 @@ mod tests {
         for (change, text) in [
             (
                 ("client_id", Some("dcr_nobody")),
-                "Soulful does not know this app. Start the connection again from the app.",
+                "Soulbeet does not know this app. Start the connection again from the app.",
             ),
             (
                 ("client_id", None),
-                "Soulful does not know this app. Start the connection again from the app.",
+                "Soulbeet does not know this app. Start the connection again from the app.",
             ),
             (
                 ("redirect_uri", Some("https://evil.example/cb")),
@@ -570,7 +570,7 @@ mod tests {
             (
                 ("scope", Some("soulful admin")),
                 "invalid_scope",
-                "Soulful grants the scopes soulful and offline_access only",
+                "Soulbeet grants the scopes soulful and offline_access only",
             ),
             (
                 ("resource", Some("https://other.example/mcp")),
@@ -592,7 +592,7 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{change:?}");
             assert!(headers.get("location").is_none(), "{change:?}");
             let text = format!(
-                "This app sent a request Soulful cannot accept ({error}: {description}). \
+                "This app sent a request Soulbeet cannot accept ({error}: {description}). \
                  Start the connection again from the app."
             );
             assert!(page.contains(&text), "{change:?}: {page}");
@@ -613,10 +613,10 @@ mod tests {
         );
         assert_eq!(headers["referrer-policy"], "no-referrer");
         for text in [
-            "<title>Connect claude.ai to Soulful</title>",
-            "claude.ai wants to use Soulful as alice.",
+            "<title>Connect claude.ai to Soulbeet</title>",
+            "claude.ai wants to use Soulbeet as alice.",
             "It calls itself \"&lt;script&gt;alert(1)&lt;/script&gt;\".",
-            "When you answer, Soulful sends you back to claude.ai.",
+            "When you answer, Soulbeet sends you back to claude.ai.",
             r#"<form method="post" action="/oauth/authorize">"#,
             r#"<button type="submit" name="decision" value="allow">Allow</button>"#,
             r#"<button type="submit" name="decision" value="deny">Deny</button>"#,
@@ -776,7 +776,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(
-            page.contains("Your Soulful session ended. Start the connection again from the app.")
+            page.contains("Your Soulbeet session ended. Start the connection again from the app.")
         );
         assert_eq!(count(&db, "oauth_requests").await, 1);
     }
@@ -801,7 +801,7 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{answer:?}");
             assert!(headers.get("location").is_none(), "{answer:?}");
             assert!(page.contains(
-                "Soulful did not understand the answer. Start the connection again from the app."
+                "Soulbeet did not understand the answer. Start the connection again from the app."
             ));
         }
         assert_eq!(count(&db, "oauth_requests").await, 1);
@@ -836,7 +836,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(page.contains(
-            "Soulful&#39;s database is unavailable. Start the connection again from the app."
+            "Soulbeet&#39;s database is unavailable. Start the connection again from the app."
         ));
         let (status, headers, _) =
             get(app, &format!("/oauth/authorize?{}", query()), Some(&cookie)).await;
@@ -881,7 +881,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(
-            page.contains("Your Soulful session ended. Start the connection again from the app.")
+            page.contains("Your Soulbeet session ended. Start the connection again from the app.")
         );
         assert_eq!(count(&db, "oauth_requests").await, 0);
     }
@@ -927,7 +927,7 @@ mod tests {
         let (status, _, page) =
             get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(page.contains("Connect claude.ai to Soulful") && !page.contains("It calls itself"));
+        assert!(page.contains("Connect claude.ai to Soulbeet") && !page.contains("It calls itself"));
         let (status, _, _) = post_form(
             app,
             "/oauth/authorize",
@@ -962,8 +962,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(page.contains(
-            "Soulful could not use this app&#39;s client metadata at \
-             https://claude.ai/oauth/claude-code-client-metadata: Soulful could not fetch it"
+            "Soulbeet could not use this app&#39;s client metadata at \
+             https://claude.ai/oauth/claude-code-client-metadata: Soulbeet could not fetch it"
         ));
         assert!(!page.contains("private"));
     }
@@ -1030,7 +1030,7 @@ mod tests {
         ]);
         let (status, _, page) = get(app, &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(page.contains("Connect 127.0.0.1 to Soulful"));
+        assert!(page.contains("Connect 127.0.0.1 to Soulbeet"));
         assert!(page.contains(
             "This app runs on a computer (it returns to 127.0.0.1). Allow it only if you started it yourself."
         ));
@@ -1104,7 +1104,7 @@ mod tests {
             get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK);
         for text in [
-            "Connect claude.ai to Soulful",
+            "Connect claude.ai to Soulbeet",
             "It calls itself \"Claude Code\".",
             "This app runs on a computer (it returns to localhost). Allow it only if you started it yourself.",
         ] {
@@ -1212,7 +1212,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(headers.get("location").is_none());
-        assert!(page.contains("Soulful could not use this app&#39;s client metadata at https://claude.ai/oauth/claude-code-client-metadata: it answered HTTP 404"), "{page}");
+        assert!(page.contains("Soulbeet could not use this app&#39;s client metadata at https://claude.ai/oauth/claude-code-client-metadata: it answered HTTP 404"), "{page}");
 
         let (db, docs, app) = cimd_app(Ok(claude_code())).await;
         let cookie = signed_in(&db, "u1", "alice").await;

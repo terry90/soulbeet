@@ -59,7 +59,7 @@ fn not_deleted(e: &std::io::Error) -> Failure {
         FailureCode::DeleteFailed,
         Stage::Import,
         RetryAdvice::NeedsUser,
-        "Soulful could not delete this downloaded file; it stays on disk",
+        "Soulbeet could not delete this downloaded file; it stays on disk",
     )
     .with_cause(Service::Filesystem, None, e.to_string())
 }

@@ -310,8 +310,8 @@ fn upgrade_slskd() -> UserAction {
 fn update_soulful_or_slskd() -> UserAction {
     UserAction::new(
         UserActionCode::UpdateSoulfulOrBackend,
-        "Update Soulful or slskd so that Soulful can read slskd's answers again",
-        "Soulful and slskd",
+        "Update Soulbeet or slskd so that Soulbeet can read slskd's answers again",
+        "Soulbeet and slskd",
     )
 }
 
@@ -683,8 +683,8 @@ mod tests {
             update_soulful_or_slskd(),
             action(
                 UserActionCode::UpdateSoulfulOrBackend,
-                "Update Soulful or slskd so that Soulful can read slskd's answers again",
-                "Soulful and slskd"
+                "Update Soulbeet or slskd so that Soulbeet can read slskd's answers again",
+                "Soulbeet and slskd"
             )
         );
     }

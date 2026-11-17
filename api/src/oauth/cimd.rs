@@ -46,7 +46,7 @@ impl std::fmt::Display for CimdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CimdError::NotAClientIdUrl(m) | CimdError::Invalid(m) => write!(f, "{m}"),
-            CimdError::Fetch(_) => write!(f, "Soulful could not fetch it"),
+            CimdError::Fetch(_) => write!(f, "Soulbeet could not fetch it"),
             CimdError::Status(s) => write!(f, "it answered HTTP {s}"),
             CimdError::TooLarge => write!(f, "it is larger than 64 KiB"),
             CimdError::NotJson(e) => write!(f, "it is not a JSON object ({e})"),
@@ -56,7 +56,7 @@ impl std::fmt::Display for CimdError {
             CimdError::MissingField(field) => write!(f, "it has no {field}"),
             CimdError::NotPublic(m) => write!(
                 f,
-                "it asks for client authentication ({m}), which Soulful does not support"
+                "it asks for client authentication ({m}), which Soulbeet does not support"
             ),
         }
     }
@@ -707,7 +707,7 @@ mod tests {
                 CimdError::Fetch(
                     "dns error: the name resolves only to private or local addresses".into(),
                 ),
-                "Soulful could not fetch it",
+                "Soulbeet could not fetch it",
             ),
             (
                 CimdError::Invalid("client_name must be at most 200 characters"),
@@ -716,7 +716,7 @@ mod tests {
             (
                 CimdError::NotPublic("token_endpoint_auth_method private_key_jwt".into()),
                 "it asks for client authentication (token_endpoint_auth_method private_key_jwt), \
-                 which Soulful does not support",
+                 which Soulbeet does not support",
             ),
         ] {
             assert_eq!(e.to_string(), text);

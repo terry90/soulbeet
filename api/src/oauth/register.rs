@@ -48,8 +48,8 @@ pub(crate) async fn register(
                 StatusCode::TOO_MANY_REQUESTS,
                 "too_many_clients",
                 format!(
-                    "Soulful holds {DCR_CAP} registered apps, all connected. Disconnect one in \
-                     Settings > Connected apps."
+                    "Soulbeet holds {DCR_CAP} registered apps, all connected. Disconnect one in \
+                     Settings > Users > Connected apps."
                 ),
             )
         }
@@ -58,7 +58,7 @@ pub(crate) async fn register(
             return oauth_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
-                "Soulful's database is unavailable",
+                "Soulbeet's database is unavailable",
             );
         }
     }
@@ -120,7 +120,7 @@ async fn read_client(body: Body) -> Result<NewClient, Response> {
         .is_some_and(|m| m != "none")
     {
         return Err(invalid_metadata(
-            "Soulful registers public clients only: token_endpoint_auth_method must be none",
+            "Soulbeet registers public clients only: token_endpoint_auth_method must be none",
         ));
     }
     let grant_type_allowed = |g: &Value| g == "authorization_code" || g == "refresh_token";
@@ -129,7 +129,7 @@ async fn read_client(body: Body) -> Result<NewClient, Response> {
             .is_some_and(|g| g.iter().all(grant_type_allowed))
     }) {
         return Err(invalid_metadata(
-            "Soulful supports the grant types authorization_code and refresh_token only",
+            "Soulbeet supports the grant types authorization_code and refresh_token only",
         ));
     }
     if doc
@@ -137,7 +137,7 @@ async fn read_client(body: Body) -> Result<NewClient, Response> {
         .is_some_and(|r| *r != json!(["code"]))
     {
         return Err(invalid_metadata(
-            "Soulful supports the response type code only",
+            "Soulbeet supports the response type code only",
         ));
     }
     Ok(client)
@@ -214,17 +214,17 @@ mod tests {
             (
                 json!({"redirect_uris": [CLAUDE_CALLBACK], "token_endpoint_auth_method": "client_secret_basic"}),
                 "invalid_client_metadata",
-                "Soulful registers public clients only: token_endpoint_auth_method must be none",
+                "Soulbeet registers public clients only: token_endpoint_auth_method must be none",
             ),
             (
                 json!({"redirect_uris": [CLAUDE_CALLBACK], "grant_types": ["client_credentials"]}),
                 "invalid_client_metadata",
-                "Soulful supports the grant types authorization_code and refresh_token only",
+                "Soulbeet supports the grant types authorization_code and refresh_token only",
             ),
             (
                 json!({"redirect_uris": [CLAUDE_CALLBACK], "response_types": ["token"]}),
                 "invalid_client_metadata",
-                "Soulful supports the response type code only",
+                "Soulbeet supports the response type code only",
             ),
             (
                 json!({"redirect_uris": [CLAUDE_CALLBACK], "client_name": "c".repeat(201)}),
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(
             doc,
             json!({"error": "too_many_clients", "error_description":
-                "Soulful holds 100 registered apps, all connected. Disconnect one in Settings > Connected apps."})
+                "Soulbeet holds 100 registered apps, all connected. Disconnect one in Settings > Users > Connected apps."})
         );
         assert_eq!(count(&db, "oauth_clients").await, DCR_CAP);
 
@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             doc,
-            json!({"error": "server_error", "error_description": "Soulful's database is unavailable"})
+            json!({"error": "server_error", "error_description": "Soulbeet's database is unavailable"})
         );
     }
 }

@@ -116,11 +116,11 @@ pub(crate) async fn move_items(s: &BeetsSettings, root: &Path, item_ids: &[u64])
     for (id, why) in unread {
         let message = match moved {
             Err(_) => format!(
-                "Soulful could not read where beets left item {id}: {}",
+                "Soulbeet could not read where beets left item {id}: {}",
                 why.text
             ),
             Ok(_) => format!(
-                "beets may have moved the new copy, and Soulful could not read where item {id} \
+                "beets may have moved the new copy, and Soulbeet could not read where item {id} \
                  is: {}",
                 why.text
             ),
@@ -550,7 +550,7 @@ mod tests {
                 (FailureCode::ImportBeetsFailed, RetryAdvice::SameSourceLater)
             );
             let prefix = format!(
-                "beets may have moved the new copy, and Soulful could not read where item 7 is: {why}"
+                "beets may have moved the new copy, and Soulbeet could not read where item 7 is: {why}"
             );
             assert!(message.starts_with(&prefix), "{message}");
             // The line beets printed is the cause, as Soulful's own failure to read it.
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(relocation.now, vec![(7, "A/B/03.flac".into())]);
         assert_eq!(
             failure_of(&relocation).2,
-            "beets may have moved the new copy, and Soulful could not read where item 9 is: \
+            "beets may have moved the new copy, and Soulbeet could not read where item 9 is: \
              beet export gave item 7 for item 9"
         );
     }
@@ -649,7 +649,7 @@ mod tests {
         let message = failure_of(&relocation).2;
         assert!(
             message.starts_with(
-                "beets may have moved the new copy, and Soulful could not read where item 7 is: \
+                "beets may have moved the new copy, and Soulbeet could not read where item 7 is: \
                  beet export failed ("
             ),
             "{message}"
@@ -714,7 +714,7 @@ mod tests {
                 Service::Soulful,
                 None,
                 format!(
-                    "error: permission denied\n{}\nSoulful could not read where beets left item \
+                    "error: permission denied\n{}\nSoulbeet could not read where beets left item \
                      9: {why_9}\n9|||broken",
                     outside(dir.path())
                 )
@@ -738,7 +738,7 @@ mod tests {
                 Service::Soulful,
                 None,
                 format!(
-                    "beets may have moved the new copy, and Soulful could not read where item 9 \
+                    "beets may have moved the new copy, and Soulbeet could not read where item 9 \
                      is: {why_9}\n9|||broken"
                 )
             ))
@@ -778,9 +778,9 @@ mod tests {
                 None,
                 format!(
                     "error: permission denied\n\
-                     Soulful could not read where beets left item 7: beet export listed 2 items \
+                     Soulbeet could not read where beets left item 7: beet export listed 2 items \
                      for item 7\n{}\n{}\n\
-                     Soulful could not read where beets left item 9: beet export gave item 8 for \
+                     Soulbeet could not read where beets left item 9: beet export gave item 8 for \
                      item 9\n{eight}",
                     sevens[0], sevens[1]
                 )

@@ -48,7 +48,7 @@ impl fmt::Display for UserChangeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound => f.write_str("User not found"),
-            Self::LastAdmin => f.write_str("Soulful needs at least one admin"),
+            Self::LastAdmin => f.write_str("Soulbeet needs at least one admin"),
             Self::UsernameTaken => f.write_str("That username is taken"),
             Self::Db(e) => f.write_str(e),
         }

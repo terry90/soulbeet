@@ -88,7 +88,7 @@ pub(crate) fn challenge(base: &BaseUrl, description: &str) -> HeaderValue {
         r#"Bearer error="invalid_token", error_description="{description}", resource_metadata="{}", scope="{SCOPE}""#,
         resource_metadata_url(base)
     );
-    HeaderValue::from_str(&value).expect("a base URL and Soulful's own texts are header-safe")
+    HeaderValue::from_str(&value).expect("a base URL and Soulbeet's own texts are header-safe")
 }
 
 /// Refuses a request from a refused `Origin`, then one without a live token
@@ -137,7 +137,7 @@ async fn admit(
             Err(refusal(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "settings_unreadable",
-                "Soulful's database is unavailable",
+                "Soulbeet's database is unavailable",
             ))
         }
         Ok(None) => Err(invalid_token(&base, UNKNOWN_TOKEN)),
@@ -375,7 +375,7 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             body,
-            json!({"error": "settings_unreadable", "message": "Soulful's database is unavailable"})
+            json!({"error": "settings_unreadable", "message": "Soulbeet's database is unavailable"})
         );
     }
 

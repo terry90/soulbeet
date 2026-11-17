@@ -130,7 +130,7 @@ impl std::fmt::Display for BaseUrlError {
             Self::Userinfo => write!(f, "The address must not contain a user name or password"),
             Self::PathNotAllowed => write!(
                 f,
-                "The address must not have a path: Soulful cannot run under a sub-path"
+                "The address must not have a path: Soulbeet cannot run under a sub-path"
             ),
             Self::InvalidPublicUrl(e) => write!(f, "PUBLIC_URL is not usable: {e}"),
         }

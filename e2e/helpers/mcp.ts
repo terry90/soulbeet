@@ -199,8 +199,8 @@ export async function connectAs(page: Page, user: TestUser): Promise<McpSession>
   await page.getByPlaceholder('Enter username').fill(user.username);
   await page.getByPlaceholder('Enter password').fill(user.password);
   await page.getByRole('button', { name: 'AUTHENTICATE' }).click();
-  await expect(page.getByRole('heading', { name: 'Connect 127.0.0.1 to Soulful' })).toBeVisible();
-  await expect(page.getByText(`127.0.0.1 wants to use Soulful as ${user.username}.`)).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Connect 127.0.0.1 to Soulbeet' })).toBeVisible();
+  await expect(page.getByText(`127.0.0.1 wants to use Soulbeet as ${user.username}.`)).toBeVisible();
   await expect(page.getByText('It calls itself "Soulful acceptance".')).toBeVisible();
 
   // The app's 303 sends the browser to the callback. A route handler sees

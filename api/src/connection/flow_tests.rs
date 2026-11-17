@@ -126,7 +126,7 @@ async fn an_mcp_client_signs_in_lists_tools_calls_get_status_and_refreshes() {
         .text()
         .await
         .unwrap();
-    assert!(page.contains("Connect 127.0.0.1 to Soulful") && page.contains("as alice"));
+    assert!(page.contains("Connect 127.0.0.1 to Soulbeet") && page.contains("as alice"));
     let r = browser
         .post(format!("{base}/oauth/authorize"))
         .header("cookie", &cookie)

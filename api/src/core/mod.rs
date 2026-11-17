@@ -27,7 +27,7 @@ pub(crate) fn database_failure(stage: Stage, e: impl std::fmt::Display) -> Failu
         FailureCode::SettingsUnreadable,
         stage,
         RetryAdvice::SameSourceLater,
-        "Soulful's database is unavailable",
+        "Soulbeet's database is unavailable",
     )
     .with_cause(Service::Database, None, e.to_string())
 }
@@ -125,7 +125,7 @@ mod tests {
                 FailureCode::SettingsUnreadable,
                 Stage::Input,
                 RetryAdvice::SameSourceLater,
-                "Soulful's database is unavailable"
+                "Soulbeet's database is unavailable"
             )
         );
         assert_eq!(f.cause, Some(Cause::new(Service::Database, None, raw)));
@@ -136,7 +136,7 @@ mod tests {
         let raw = "error returned from database: (code: 5) database is locked";
         assert_eq!(
             logged(&database_failure(Stage::Delete, raw)),
-            format!("Soulful's database is unavailable (cause: database: {raw})")
+            format!("Soulbeet's database is unavailable (cause: database: {raw})")
         );
         let with_status = Failure::new(
             FailureCode::NavidromeUnreachable,

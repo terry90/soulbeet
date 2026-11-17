@@ -374,7 +374,7 @@ pub fn server_restarted_search() -> Failure {
         FailureCode::ServerRestarted,
         Stage::SourceSearch,
         RetryAdvice::SameSourceLater,
-        "Soulful restarted while this search ran",
+        "Soulbeet restarted while this search ran",
     )
 }
 

@@ -53,7 +53,7 @@ pub(crate) fn transfer_lost() -> Failure {
         FailureCode::ServerRestarted,
         Stage::Transfer,
         RetryAdvice::SameSourceLater,
-        "Soulful restarted and slskd no longer has this download",
+        "Soulbeet restarted and slskd no longer has this download",
     )
 }
 
@@ -63,7 +63,7 @@ pub(crate) fn import_lost() -> Failure {
         FailureCode::ServerRestarted,
         Stage::Import,
         RetryAdvice::NotRetryable,
-        "Soulful restarted during this import and the downloaded files are gone",
+        "Soulbeet restarted during this import and the downloaded files are gone",
     )
 }
 
@@ -539,7 +539,7 @@ fn end_interrupted(ledger: &Ledger, job: &str, stage: Stage, why: &str) {
             FailureCode::ServerRestarted,
             stage,
             RetryAdvice::SameSourceLater,
-            format!("Soulful restarted and could not resume this job: {why}"),
+            format!("Soulbeet restarted and could not resume this job: {why}"),
         )),
     });
 }
@@ -1384,13 +1384,13 @@ mod tests {
                 transfer_lost(),
                 Stage::Transfer,
                 RetryAdvice::SameSourceLater,
-                "Soulful restarted and slskd no longer has this download",
+                "Soulbeet restarted and slskd no longer has this download",
             ),
             (
                 import_lost(),
                 Stage::Import,
                 RetryAdvice::NotRetryable,
-                "Soulful restarted during this import and the downloaded files are gone",
+                "Soulbeet restarted during this import and the downloaded files are gone",
             ),
         ] {
             assert_eq!(
@@ -3336,7 +3336,7 @@ mod tests {
                     FailureCode::ServerRestarted,
                     stage,
                     RetryAdvice::SameSourceLater,
-                    format!("Soulful restarted and could not resume this job: {why}")
+                    format!("Soulbeet restarted and could not resume this job: {why}")
                 )
             );
         }

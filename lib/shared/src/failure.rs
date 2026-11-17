@@ -218,7 +218,7 @@ impl UserAction {
         Self::new(
             UserActionCode::FixDownloadPath,
             format!(
-                "Make the folder the download backend saves into readable by Soulful at {}",
+                "Make the folder the download backend saves into readable by Soulbeet at {}",
                 download_path.display()
             ),
             "DOWNLOAD_PATH and the volume mounted there",
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(path.code, UserActionCode::FixDownloadPath);
         assert_eq!(
             path.what,
-            "Make the folder the download backend saves into readable by Soulful at /downloads"
+            "Make the folder the download backend saves into readable by Soulbeet at /downloads"
         );
     }
 

@@ -25,7 +25,7 @@ pub(crate) fn text(stored: &str) -> Value {
     match parsed {
         Ok(t) => Value::String(at(t)),
         Err(e) => {
-            tracing::warn!("A stored time '{stored}' is not one Soulful writes: {e}");
+            tracing::warn!("A stored time '{stored}' is not one Soulbeet writes: {e}");
             Value::Null
         }
     }

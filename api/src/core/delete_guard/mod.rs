@@ -834,7 +834,7 @@ pub(crate) fn veto_unknown() -> Failure {
         FailureCode::DeleteVetoUnknown,
         Stage::Delete,
         RetryAdvice::SameSourceLater,
-        "Soulful could not read another listener's ratings for this track",
+        "Soulbeet could not read another listener's ratings for this track",
     )
 }
 
@@ -920,7 +920,7 @@ mod tests {
         std::fs::canonicalize(lib.root.join(rel)).unwrap()
     }
 
-    const VETO: &str = "Soulful could not read another listener's ratings for this track";
+    const VETO: &str = "Soulbeet could not read another listener's ratings for this track";
 
     #[tokio::test]
     async fn a_file_only_its_owner_rated_one_star_is_allowed_after_the_average_is_refreshed() {
@@ -945,7 +945,7 @@ mod tests {
     }
 
     const UNKNOWN: &str =
-        "Another Navidrome listener Soulful cannot read may have rated this track";
+        "Another Navidrome listener Soulbeet cannot read may have rated this track";
 
     #[tokio::test]
     async fn an_average_a_rater_soulful_cannot_read_may_hide_in_needs_every_navidrome_user_read() {
@@ -971,8 +971,8 @@ mod tests {
             f.user_action,
             Some(UserAction::new(
                 UserActionCode::RelinkNavidrome,
-                "Sign in to Soulful once as a Navidrome admin, so Soulful can list Navidrome's users",
-                "Soulful sign-in",
+                "Sign in to Soulbeet once as a Navidrome admin, so Soulbeet can list Navidrome's users",
+                "Soulbeet sign-in",
             ))
         );
         // Asked of alice and bob, neither an admin.
@@ -992,7 +992,7 @@ mod tests {
                 FailureCode::DeleteVetoUnknown,
                 UNKNOWN,
                 Some(
-                    "Have every Navidrome user sign in to Soulful once, so Soulful can read their ratings"
+                    "Have every Navidrome user sign in to Soulbeet once, so Soulbeet can read their ratings"
                         .to_string()
                 )
             )
@@ -1023,11 +1023,11 @@ mod tests {
         let cannot_see = (
             FailureCode::DeleteVetoUnknown,
             RetryAdvice::NeedsUser,
-            "A linked listener's Navidrome account cannot see this track, so Soulful cannot rule out a rating they gave it earlier, and the copy is kept"
+            "A linked listener's Navidrome account cannot see this track, so Soulbeet cannot rule out a rating they gave it earlier, and the copy is kept"
                 .to_string(),
             Some(UserAction::new(
                 UserActionCode::ConfigureNavidrome,
-                "Give every Navidrome account linked to Soulful access to this track's library, so Soulful can read their ratings of it",
+                "Give every Navidrome account linked to Soulbeet access to this track's library, so Soulbeet can read their ratings of it",
                 "Navidrome's user settings",
             )),
         );
@@ -2405,7 +2405,7 @@ mod tests {
             (f.code, f.message.as_str(), f.cause),
             (
                 FailureCode::NavidromeCircuitOpen,
-                "Soulful could not read your Navidrome server's version, which this deletion check needs",
+                "Soulbeet could not read your Navidrome server's version, which this deletion check needs",
                 Some(Cause::new(
                     Service::Navidrome,
                     None,

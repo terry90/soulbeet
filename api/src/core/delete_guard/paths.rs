@@ -544,7 +544,7 @@ async fn store_root(
                     NavidromeLibraryRow::delete_in(db, song.library_id).await?;
                     warn!(
                         "Navidrome library {} ({}) was learned at {} on this machine, and {} puts \
-                         it at {}: one of the two came from another file, so Soulful forgets both \
+                         it at {}: one of the two came from another file, so Soulbeet forgets both \
                          until an import shows it again",
                         song.library_id,
                         song.library_path,

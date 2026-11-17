@@ -13,7 +13,7 @@ pub enum MetadataError {
         status: Option<u16>,
         raw: String,
     },
-    #[error("{} is rate limiting Soulful: {raw}", name(*.service))]
+    #[error("{} is rate limiting Soulbeet: {raw}", name(*.service))]
     RateLimited {
         service: Service,
         status: Option<u16>,
@@ -25,7 +25,7 @@ pub enum MetadataError {
         status: Option<u16>,
         raw: String,
     },
-    #[error("{} refused Soulful's API key: {raw}", name(*.service))]
+    #[error("{} refused Soulbeet's API key: {raw}", name(*.service))]
     NotConfigured {
         service: Service,
         status: Option<u16>,

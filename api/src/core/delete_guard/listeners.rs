@@ -391,7 +391,7 @@ impl Guard<'_> {
         let version = self.listeners.server_version(actor).await.map_err(|e| {
             e.failure(
                 Stage::Delete,
-                "Soulful could not read your Navidrome server's version, which this deletion check needs",
+                "Soulbeet could not read your Navidrome server's version, which this deletion check needs",
             )
         })?;
         if !version.as_deref().is_some_and(keeps_song_averages) {
@@ -454,7 +454,7 @@ impl Guard<'_> {
             return Ok(());
         }
         info!(
-            "Navidrome users whose ratings Soulful did not read keep a file: {}",
+            "Navidrome users whose ratings Soulbeet did not read keep a file: {}",
             unread.join(", ")
         );
         Err(unknown_listener(
@@ -528,31 +528,31 @@ fn unknown_listener(why: UnknownListener) -> Failure {
             FailureCode::DeleteVetoUnknown,
             Stage::Delete,
             retry,
-            "Another Navidrome listener Soulful cannot read may have rated this track",
+            "Another Navidrome listener Soulbeet cannot read may have rated this track",
         )
     };
     match why {
         UnknownListener::NoAdmin => failure(RetryAdvice::NeedsUser)
             .with_user_action(UserAction::new(
             UserActionCode::RelinkNavidrome,
-            "Sign in to Soulful once as a Navidrome admin, so Soulful can list Navidrome's users",
-            "Soulful sign-in",
+            "Sign in to Soulbeet once as a Navidrome admin, so Soulbeet can list Navidrome's users",
+            "Soulbeet sign-in",
         )),
         UnknownListener::NotSignedIn => failure(RetryAdvice::NeedsUser)
             .with_user_action(UserAction::new(
             UserActionCode::RelinkNavidrome,
-            "Have every Navidrome user sign in to Soulful once, so Soulful can read their ratings",
-            "Soulful sign-in",
+            "Have every Navidrome user sign in to Soulbeet once, so Soulbeet can read their ratings",
+            "Soulbeet sign-in",
         )),
         UnknownListener::CannotSee => Failure::new(
             FailureCode::DeleteVetoUnknown,
             Stage::Delete,
             RetryAdvice::NeedsUser,
-            "A linked listener's Navidrome account cannot see this track, so Soulful cannot rule out a rating they gave it earlier, and the copy is kept",
+            "A linked listener's Navidrome account cannot see this track, so Soulbeet cannot rule out a rating they gave it earlier, and the copy is kept",
         )
         .with_user_action(UserAction::new(
             UserActionCode::ConfigureNavidrome,
-            "Give every Navidrome account linked to Soulful access to this track's library, so Soulful can read their ratings of it",
+            "Give every Navidrome account linked to Soulbeet access to this track's library, so Soulbeet can read their ratings of it",
             "Navidrome's user settings",
         )),
         // The lookup error's own cause (Navidrome's answer), none for a stored password.

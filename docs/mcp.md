@@ -162,18 +162,18 @@ Two Cloudflare limits:
 
 Admins find **Remote access** in Settings > Config. It shows:
 
-- the address Soulbeet derived for the page's own request ("Soulful sees this page's request at {address}"); open Settings at your public address, so the request passes through the same proxy as Claude's;
+- the address Soulbeet derived for the page's own request ("Soulbeet sees this page's request at {address}"); open Settings at your public address, so the request passes through the same proxy as Claude's;
 - where the host and the scheme came from: `forwarded`, `x_forwarded_host`, `host`, `authority`, `public_url` or `missing` for the host, and `forwarded`, `x_forwarded_proto`, `local_host_is_http`, `named_host_is_https`, `public_url` or `unread` for the scheme;
 - advice lines, which compare that address with the one your browser is on:
   - "Claude (MCP) access is turned off: {why}."
   - "Claude (MCP) access stays off until the security checks in Settings pass."
   - "PUBLIC_URL pins the address to {address}; request headers are not read."
-  - "Your browser is on {browser host}, but the request reached Soulful naming {host}. Have the proxy send X-Forwarded-Host (or Forwarded host=) with the public name."
+  - "Your browser is on {browser host}, but the request reached Soulbeet naming {host}. Have the proxy send X-Forwarded-Host (or Forwarded host=) with the public name."
   - "Your browser is on {browser host}, but the proxy names {host} in X-Forwarded-Host. Check the proxy's forwarded host." (or "in Forwarded")
-  - "Your browser uses https, but Soulful sees http: have the proxy send X-Forwarded-Proto: https (or Forwarded proto=https)."
+  - "Your browser uses https, but Soulbeet sees http: have the proxy send X-Forwarded-Proto: https (or Forwarded proto=https)."
   - "Claude cannot use this address: it is plain http."
-  - "Soulful cannot tell this request's address: {problem}"
-  - "This address works for Claude: add https://music.example.com/mcp as a custom connector."
+  - "Soulbeet cannot tell this request's address: {problem}"
+  - "This address works for Claude: add {address}/mcp as a custom connector."
 - **Latest connection requests**: requests to `/.well-known/`, `/oauth/` and `/mcp`, with the time, the address derived, where it came from, the `Host`, `X-Forwarded-Host`, `X-Forwarded-Proto` and `Forwarded` headers as received, and the status with its refusal code. Soulbeet keeps the latest 50 of each of three kinds: refusals that keep Claude out (`origin_not_allowed`, `https_required`, `mcp_unavailable`, `mcp_disabled`, `address_unreadable`), other refused or failed requests, and answered ones. The list is in memory and starts empty when Soulbeet starts.
 
 ## Connect from claude.ai and the phone app
@@ -185,13 +185,13 @@ Admins find **Remote access** in Settings > Config. It shows:
 5. If you are not signed in, Soulbeet shows its sign-in page (`/login/return?return_to=...`). Sign in with your Soulbeet account, or with your Navidrome account when Soulbeet uses Navidrome sign-in.
 6. Soulbeet then asks:
 
-   > **Connect claude.ai to Soulful**
+   > **Connect claude.ai to Soulbeet**
    >
-   > claude.ai wants to use Soulful as {your user name}.
+   > claude.ai wants to use Soulbeet as {your user name}.
    >
-   > Once allowed, it can see your library, downloads and settings, search for music, download into your folders, and manage your playlists and ratings. It cannot delete music unless you turn that on for it in Settings > Connected apps.
+   > Once allowed, it can see your library, downloads and settings, search for music, download into your folders, and manage your playlists and ratings. It cannot delete music unless you turn that on for it in Settings > Users > Connected apps.
    >
-   > When you answer, Soulful sends you back to claude.ai.
+   > When you answer, Soulbeet sends you back to claude.ai.
 
    When the app names itself, the page adds "It calls itself "{name}"." For an app whose every return address is on your own computer, it adds "This app runs on a computer (it returns to {host}). Allow it only if you started it yourself." Click **Allow**. **Deny** sends you back with the connection refused.
 
@@ -241,7 +241,7 @@ Without the switch, `preview_delete_tracks` and `delete_tracks` answer `permissi
 
 Some changes are refused to every app, whether or not its deletion switch is on, because they would let a later sync delete files without a preview:
 
-- turning auto-delete on: "Only you can turn auto-delete on, in Soulful's Settings: it deletes the files of songs you rate 1 star at every rating sync";
+- turning auto-delete on: "Only you can turn auto-delete on, in Soulbeet's Settings: it deletes the files of songs you rate 1 star at every rating sync";
 - changing the discovery folder or the promote threshold;
 - rating a song 1 star: "A connected app may not rate a song 1 star: while auto-delete is on, now or once it is turned on, the rating sync deletes the files of songs rated 1 star without a preview. Rate it 1 star yourself in Navidrome, or delete it with preview_delete_tracks and delete_tracks.";
 - rating a pending discovery track at all (clearing a rating is allowed).
@@ -274,7 +274,7 @@ The full list is under [Known limits](#known-limits).
 
 What each tool does, in the order Claude sees them. Every tool answers one JSON document, and a failure has a stable code (see [Error codes](#error-codes)). Every time a tool answers or takes is RFC 3339 in UTC to the second, such as `2026-11-15T10:00:00Z`.
 
-### Status and settings
+### Status, settings and folders
 
 - `get_status`: what Soulbeet can do for this user now: whether slskd and beets work, the Navidrome link and scan status, the folders with free space and `in_navidrome` (`listed` when a Navidrome library Soulbeet has located on this machine holds the folder, so imports into it show up in Navidrome; `unknown` otherwise), the batches still running, whether this app may delete music, and Soulbeet's address.
 - `get_settings`: the user's settings: default folder, auto-delete, metadata provider, Last.fm and ListenBrainz names (never keys), discovery settings.
@@ -323,9 +323,9 @@ What each tool does, in the order Claude sees them. Every tool answers one JSON 
 - `add_playlist_tracks`: adds songs at the end or before a position.
 - `remove_playlist_tracks`: removes entries, each named by its position and song.
 
-### Ratings and settings
+### Ratings, stars and settings changes
 
-- `set_rating`: sets the user's own rating of a song or album; a 1-star song rating and any rating of a pending discovery track are refused.
+- `set_rating`: sets the user's own rating of a song or album; a 1-star song rating and any rating of a pending discovery track other than clearing it are refused.
 - `set_star`: stars or unstars a song or album.
 - `update_settings`: changes the default folder, turns auto-delete off, and changes discovery's on/off, profiles, track counts, lifetimes and playlist names.
 
@@ -400,10 +400,10 @@ Claude's endpoints answer a refusal as `{"error": code, "message": text}`.
 
 - `mcp_disabled` (404): "Claude (MCP) access is turned off: MCP=off is set", or "Claude (MCP) access is turned off: MCP is set to '{value}', which is neither on nor off". Set `MCP=on` or remove it.
 - `mcp_unavailable` (503): "Claude (MCP) access stays off until the security checks in Settings pass". The answer does not say which check fails: an admin sees that in Settings > Config under Security Checks, with the texts quoted under [Requirements](#requirements). Fix what it lists.
-- `address_unreadable` (400): "Cannot tell this request's address: {problem}", where the problem is one of "The request names no host (Forwarded host=, X-Forwarded-Host or Host)", "'{value}' is not a valid host", "'{value}' is not http or https", "The address must not contain a user name or password", "The address must not have a path: Soulful cannot run under a sub-path", or "PUBLIC_URL is not usable: {problem}". Fix the proxy header or `PUBLIC_URL` it names.
-- `https_required` (403): "Soulful derived the address {address} for this request. Claude connects only over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: proto=https), or set PUBLIC_URL." The answer also gives `derived_base`, `host_from` and `scheme_from`.
+- `address_unreadable` (400): "Cannot tell this request's address: {problem}", where the problem is one of "The request names no host (Forwarded host=, X-Forwarded-Host or Host)", "'{value}' is not a valid host", "'{value}' is not http or https", "The address must not contain a user name or password", "The address must not have a path: Soulbeet cannot run under a sub-path", or "PUBLIC_URL is not usable: {problem}". Fix the proxy header or `PUBLIC_URL` it names.
+- `https_required` (403): "Soulbeet derived the address {address} for this request. Claude connects only over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: proto=https), or set PUBLIC_URL." The answer also gives `derived_base`, `host_from` and `scheme_from`.
 - `origin_not_allowed` (403): "Requests from {origin} are not accepted". A request to `/mcp` came with an `Origin` that is plain http and neither Soulbeet's own address nor loopback, or that is not an origin at all (`null`). Claude is not affected; this guards against DNS rebinding.
-- `settings_unreadable` (503): "Soulful's database is unavailable". Check the server's disk and log.
+- `settings_unreadable` (503): "Soulbeet's database is unavailable". Check the server's disk and log.
 
 When `PUBLIC_URL` is set but unusable, nobody can sign in, and Settings > Config says "PUBLIC_URL is not usable: {problem}. It must look like https://host or https://host:port. Nobody can sign in until it is fixed or removed."
 
@@ -419,15 +419,15 @@ The `WWW-Authenticate` header names `invalid_token` with one of these descriptio
 
 Soulbeet's sign-in and consent pages show these texts:
 
-- "Soulful does not know this app. Start the connection again from the app."
+- "Soulbeet does not know this app. Start the connection again from the app."
 - "This app asked to return to an address it did not register."
-- "Your Soulful session ended. Start the connection again from the app."
+- "Your Soulbeet session ended. Start the connection again from the app."
 - "This sign-in request expired or was already used. Start the connection again from the app." A sign-in request lasts 10 minutes. Clicking Allow (or Deny) twice is fine: for 30 seconds the same answer from the same browser goes back to the app the same way.
-- "Soulful did not understand the answer. Start the connection again from the app."
-- "Soulful's database is unavailable. Start the connection again from the app."
+- "Soulbeet did not understand the answer. Start the connection again from the app."
+- "Soulbeet's database is unavailable. Start the connection again from the app."
 - "This app sent {parameter} more than once. Start the connection again from the app."
-- "This app sent a request Soulful cannot accept ({error}: {description}). Start the connection again from the app." With `invalid_target` the description is "resource must be {address}/mcp": the address in Claude differs from the address Soulbeet derives. Make them the same (see [Check the address](#check-the-address)).
-- "Soulful could not use this app's client metadata at {url}: {problem}"
+- "This app sent a request Soulbeet cannot accept ({error}: {description}). Start the connection again from the app." With `invalid_target` the description is "resource must be {address}/mcp": the address in Claude differs from the address Soulbeet derives. Make them the same (see [Check the address](#check-the-address)).
+- "Soulbeet could not use this app's client metadata at {url}: {problem}"
 - "Too many app sign-ins in a minute. Try again in {n} seconds."
 
 ### OAuth errors
@@ -435,8 +435,8 @@ Soulbeet's sign-in and consent pages show these texts:
 The registration and token endpoints answer `{"error", "error_description"}`:
 
 - `rate_limited` at registration: "Too many app registrations on this server. Try again in {n} seconds."
-- `too_many_clients`: "Soulful holds 100 registered apps, all connected. Disconnect one in Settings > Connected apps."
-- `rate_limited` at the token endpoint: "Too many token requests for this Soulful account. Try again in {n} seconds." or "Too many refreshes for this connection. Try again in {n} seconds."
+- `too_many_clients`: "Soulbeet holds 100 registered apps, all connected. Disconnect one in Settings > Users > Connected apps."
+- `rate_limited` at the token endpoint: "Too many token requests for this Soulbeet account. Try again in {n} seconds." or "Too many refreshes for this connection. Try again in {n} seconds."
 - `invalid_target`: "resource must be {address}/mcp", as above, or "The refresh token was issued for another address of this server".
 - `invalid_grant`: "The refresh token is unknown, expired or revoked", or "The refresh token was already used; the connection is ended". Connect again.
 
@@ -558,19 +558,19 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 |---|---|---|
 | `configure_backend` | "Set the slskd URL and API key", or "Check the Soulseek username and password slskd signs in with" | "Settings > Config", or "slskd" |
 | `upgrade_backend` | "Upgrade slskd to 0.26 or newer" | "slskd" |
-| `update_soulful_or_backend` | "Update Soulful or slskd so that Soulful can read slskd's answers again" | "Soulful and slskd" |
+| `update_soulful_or_backend` | "Update Soulbeet or slskd so that Soulbeet can read slskd's answers again" | "Soulbeet and slskd" |
 | `fix_importer` | "Fix the beets setup: {problem}" | "Settings > Config" |
-| `fix_download_path` | "Make the folder the download backend saves into readable by Soulful at {DOWNLOAD_PATH}" | "DOWNLOAD_PATH and the volume mounted there" |
+| `fix_download_path` | "Make the folder the download backend saves into readable by Soulbeet at {DOWNLOAD_PATH}" | "DOWNLOAD_PATH and the volume mounted there" |
 | `free_disk_space` | "Free disk space: {message}" | "The disk that holds the path in the message" |
-| `relink_navidrome` | "Sign in to Soulful again with your current Navidrome password", "Sign in to Soulful once as a Navidrome admin, so Soulful can list Navidrome's users", or "Have every Navidrome user sign in to Soulful once, so Soulful can read their ratings" | "Soulful sign-in" |
-| `configure_navidrome` | "Set NAVIDROME_URL to the address of your Navidrome server", "Make Navidrome's music folder readable by Soulful at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library", or "Give every Navidrome account linked to Soulful access to this track's library, so Soulful can read their ratings of it" | "Soulful's environment", or "Navidrome's user settings" |
+| `relink_navidrome` | "Sign in to Soulbeet again with your current Navidrome password", "Sign in to Soulbeet once as a Navidrome admin, so Soulbeet can list Navidrome's users", or "Have every Navidrome user sign in to Soulbeet once, so Soulbeet can read their ratings" | "Soulbeet sign-in" |
+| `configure_navidrome` | "Set NAVIDROME_URL to the address of your Navidrome server", "Make Navidrome's music folder readable by Soulbeet at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulbeet sees Navidrome's default library", or "Give every Navidrome account linked to Soulbeet access to this track's library, so Soulbeet can read their ratings of it" | "Soulbeet's environment", or "Navidrome's user settings" |
 | `configure_provider` | "Set a valid Last.fm API key" | "Settings > Library" |
 | `enable_deletion` | "Allow deleting music for this app" | "Settings > Users > Connected apps" |
 | `enable_indexing` | "Make this Navidrome account an admin, enable Navidrome's file watcher, or set a scan schedule" | "Navidrome" |
 | `add_folder` | "Add a library folder", or "Choose a discovery folder" | "Settings > Library", or "Settings > Library > Discovery" |
 | `rate_in_navidrome` | "Rate the song 1 star yourself in Navidrome", or "Rate the song yourself in Navidrome" | "Navidrome" |
-| `enable_auto_delete` | "Turn on auto-delete yourself" | "Soulful Settings > Library" |
-| `change_discovery_settings` | "Change the discovery promote threshold yourself", or "Change the discovery folder yourself" | "Soulful Settings > Library" (the threshold), or "Soulful Settings > Library > Discovery" (the folder) |
+| `enable_auto_delete` | "Turn on auto-delete yourself" | "Soulbeet Settings > Library" |
+| `change_discovery_settings` | "Change the discovery promote threshold yourself", or "Change the discovery folder yourself" | "Soulbeet Settings > Library" (the threshold), or "Soulbeet Settings > Library > Discovery" (the folder) |
 
 ## Failure causes
 

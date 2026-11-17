@@ -146,8 +146,8 @@ impl NavidromeError {
 pub fn relink_navidrome() -> UserAction {
     UserAction::new(
         UserActionCode::RelinkNavidrome,
-        "Sign in to Soulful again with your current Navidrome password",
-        "Soulful sign-in",
+        "Sign in to Soulbeet again with your current Navidrome password",
+        "Soulbeet sign-in",
     )
 }
 
@@ -155,7 +155,7 @@ pub fn configure_navidrome() -> UserAction {
     UserAction::new(
         UserActionCode::ConfigureNavidrome,
         "Set NAVIDROME_URL to the address of your Navidrome server",
-        "Soulful's environment",
+        "Soulbeet's environment",
     )
 }
 

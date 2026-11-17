@@ -77,7 +77,7 @@ pub(crate) enum SourceTarget {
 
 /// What retry_job, cancel_job and download_source say of a job started in the web page, whose
 /// pipeline writes its changes unchecked, so the ledger cannot stop it.
-const WEB_PAGE_JOB: &str = "a job started by ensure_in_library or download_source; this one was started in Soulful's web page, where it can be cancelled or retried";
+const WEB_PAGE_JOB: &str = "a job started by ensure_in_library or download_source; this one was started in Soulbeet's web page, where it can be cancelled or retried";
 
 /// What download_source says of a job whose file is in the library already, waiting for
 /// Navidrome to list it.
@@ -1278,7 +1278,7 @@ mod tests {
             (
                 FailureCode::SettingsUnreadable,
                 Stage::SourceSearch,
-                "Soulful's database is unavailable"
+                "Soulbeet's database is unavailable"
             )
         );
         // No runner searches the job's own query in its place.

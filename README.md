@@ -142,13 +142,13 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `REGISTRATION` | Who can create accounts: `navidrome` (accounts appear when a Navidrome user signs in), `admin` (only an admin creates accounts), `open` (anyone can register) | `navidrome` with `NAVIDROME_URL`, else `admin` |
 | `BEETS_CONFIG` | Path to your beets config file. Replaces the shipped `/app/beets_config.yaml` (beets defaults still apply underneath) | `beets_config.yaml` |
 | `BEETS_PYTHON` | Python interpreter that runs beets imports and the config check. By default it is read from the `#!` line of `beet` (`/usr/bin/python3` in the image) | |
-| `PUBLIC_URL` | Optional. The public address (`https://host[:port]`, no path). When set, Soulful uses it instead of reading the address from request headers | |
+| `PUBLIC_URL` | Optional. The public address (`https://host[:port]`, no path). When set, Soulbeet uses it instead of reading the address from request headers | |
 | `MCP` | `on` or `off`, in any case, for the OAuth and `/mcp` endpoints Claude uses; any other value turns them off and logs a warning | `on` (unset) |
 | `NAVIDROME_MUSIC_PATH` | Optional. Where Soulbeet sees the root of Navidrome's default library. Set it when Soulbeet mounts that library at another path than Navidrome does (e.g. Navidrome at `/music`, Soulbeet at `/media/music`): deletion checks, the rating sync and Claude's tools use it to find Navidrome's songs on disk. Without it, Soulbeet learns where each library is from the files it imports | |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
-**Note**: For an account linked to Navidrome, Navidrome decides: if it rejects your credentials, the sign-in is refused. Only while Navidrome cannot be reached (or `NAVIDROME_URL` is not set) does Soulbeet check the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. Accounts not linked to Navidrome sign in with their Soulbeet password. A Navidrome login only takes over an existing Soulful account that is already linked to Navidrome or whose Soulful password is the same.
+**Note**: For an account linked to Navidrome, Navidrome decides: if it rejects your credentials, the sign-in is refused. Only while Navidrome cannot be reached (or `NAVIDROME_URL` is not set) does Soulbeet check the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. Accounts not linked to Navidrome sign in with their Soulbeet password. A Navidrome login only takes over an existing Soulbeet account that is already linked to Navidrome or whose Soulbeet password is the same.
 
 **Note**: Usernames are unique without regard to letter case, so `Bob` and `bob` are the same name.
 
