@@ -124,7 +124,7 @@ impl NavidromeClient {
     /// A Subsonic write as a form body. Navidrome copies the form into the
     /// query before every handler (server/subsonic/middlewares.go:32
     /// `postFormToQueryParams`, applied to all routes at
-    /// server/subsonic/api.go:80).
+    /// server/subsonic/api.go:94, both in 0.64.2).
     async fn post_form<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -808,7 +808,10 @@ impl NavidromeClient {
     /// `media_file.created_at, media_file.id`, or to `media_file.updated_at, media_file.id` with
     /// RecentlyAddedByModTime (:143-148, off by default, conf/configuration.go:1004), each part
     /// in the asked order (persistence/sql_base_repository.go:184-206). Either is unique, since
-    /// `media_file.id` is the table's primary key, so no page boundary falls inside a tie. Either
+    /// `media_file.id` is the table's primary key, so no page boundary falls inside a tie. Before
+    /// 0.64 (0.60.3: persistence/mediafile_repository.go:113-118) the sort is the time alone; its
+    /// sub-second times rarely tie, and a tie split by a page boundary shows as the count check
+    /// failing, never as a song read twice unnoticed. Either
     /// is table-qualified: past an offset of DevOffsetOptimize (50,000 by default,
     /// conf/configuration.go:1122) Navidrome leaves out the earlier rows with a subquery that
     /// orders the joined tables by the sort (persistence/sql_base_repository.go:426-428,
@@ -841,8 +844,8 @@ impl NavidromeClient {
 
     /// Present songs (missing=false), the one Navidrome added last first, rows `start` to `end`
     /// (exclusive). The `created_at` sort is `media_file.created_at`
-    /// (persistence/mediafile_repository.go:86), set when a file is first stored (`:132`) and kept
-    /// by later scans (persistence/sql_base_repository.go:431).
+    /// (persistence/mediafile_repository.go:100 in 0.64.2), set when a file is first stored
+    /// (`:185-187`) and left out of every later update (persistence/sql_base_repository.go:565-578).
     pub async fn newest_songs(&self, start: u32, end: u32) -> Result<Vec<NativeSong>> {
         self.native_songs(
             "Find songs",
