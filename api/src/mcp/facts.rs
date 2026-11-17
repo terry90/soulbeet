@@ -20,7 +20,6 @@ use soulbeet::{DownloadBackend, ImportedItem};
 use super::contract::{error_object, NextCall, ToolError};
 use super::next::next_calls;
 use super::paging::{chars, leave_out, length, Keep};
-use super::time;
 use crate::core::delete_guard::quota::enable_deletion;
 use crate::core::jobs::{
     current_attempt, failed_slot, job_failure, job_filters, picked_file, shown_row, JobView,
@@ -28,6 +27,7 @@ use crate::core::jobs::{
 };
 use crate::core::library::SongFacts;
 use crate::core::sources::{self, Candidate, DroppedByFilter, SearchProgress};
+use crate::core::time;
 use crate::ledger::store::{AttemptRecord, StoredSearch};
 use crate::ledger::{JobKind, JobState, Replacement, ReplacementOutcome, SlotResult, StoredSpec};
 use crate::services::DEFAULT_DOWNLOAD_BACKEND;

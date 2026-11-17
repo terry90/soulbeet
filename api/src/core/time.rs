@@ -1,5 +1,6 @@
 //! Times as every tool answers and takes them: RFC 3339 in UTC to the second,
-//! `2026-11-15T10:00:00Z`, whatever form Soulful keeps them in.
+//! `2026-11-15T10:00:00Z`, whatever form Soulful keeps them in or Navidrome
+//! sends them in.
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use serde_json::Value;
@@ -31,6 +32,18 @@ pub(crate) fn text(stored: &str) -> Value {
     }
 }
 
+/// A time Navidrome sent, RFC 3339 to the nanosecond (Go's `time.Time` in JSON), as a tool
+/// answers it. None for text in no such form.
+pub(crate) fn navidrome(sent: &str) -> Option<String> {
+    match DateTime::parse_from_rfc3339(sent) {
+        Ok(t) => Some(at(t.with_timezone(&Utc))),
+        Err(e) => {
+            tracing::warn!("Navidrome sent the time '{sent}', which is not RFC 3339: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +63,21 @@ mod tests {
         );
         assert_eq!(text("yesterday"), Value::Null);
         assert_eq!(unix(i64::MAX), Value::Null);
+    }
+
+    #[test]
+    fn a_navidrome_time_answers_to_the_second_in_utc() {
+        for sent in [
+            "2026-11-02T18:04:51.112Z",
+            "2026-11-02T18:04:51.112934567Z",
+            "2026-11-02T19:04:51+01:00",
+        ] {
+            assert_eq!(
+                navidrome(sent).as_deref(),
+                Some("2026-11-02T18:04:51Z"),
+                "{sent}"
+            );
+        }
+        assert_eq!(navidrome("2026-11-02"), None);
     }
 }

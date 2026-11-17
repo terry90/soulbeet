@@ -614,7 +614,7 @@ mod tests {
                         "track": 3, "duration_s": 263, "format": "flac", "bitrate_kbps": 912,
                         "size_bytes": 28734112, "path": "Marrow Choir/Winter Songs/03 - O Holy Night.flac",
                         "recording_mbid": null, "rating": 4, "starred": true,
-                        "starred_at": "2026-11-02T18:04:51.112Z", "play_count": 3,
+                        "starred_at": "2026-11-02T18:04:51Z", "play_count": 3,
                         "match": {"kind": "exact", "score": null, "differs": [], "duration_delta_s": 0,
                             "unchecked": []}}]}],
                 "cursor": null})
@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(
             doc["artists"],
             json!([{"artist_id": "2kD9pWq4ZxC1vBnM6yTjLs", "name": "Marrow Choir", "album_count": 1, "rating": 0,
-                "starred": true, "starred_at": "2026-11-03T09:10:00.000Z", "mbid": null}])
+                "starred": true, "starred_at": "2026-11-03T09:10:00Z", "mbid": null}])
         );
         let e =
             &document(&call_tool(app, &token, "list_starred", json!({"kind": "artists"})).await)

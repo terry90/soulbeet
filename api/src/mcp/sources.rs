@@ -20,7 +20,6 @@ use super::refs::{
     wanted, REFERENCE_FIELDS,
 };
 use super::server::{common_codes, ToolSpec};
-use super::time;
 use super::{wait, McpCaller};
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
@@ -32,6 +31,7 @@ use crate::core::sources::{
     DroppedByFilter, FindRefused, SearchProgress, SearchRun, FINDS_WAITING_PER_USER, FIND_WAIT,
     RECENT_FAILURES_SECS,
 };
+use crate::core::time;
 use crate::ledger::store::{self, StoredSearch};
 use crate::ledger::StoredSpec;
 

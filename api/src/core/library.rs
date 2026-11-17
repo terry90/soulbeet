@@ -19,6 +19,7 @@ use sqlx::SqlitePool;
 use crate::auth::UserCtx;
 use crate::core::database_failure;
 use crate::core::index::{NavidromeOf, LOOKUP_PAGE};
+use crate::core::time;
 use crate::models::navidrome_library::NavidromeLibraryRow;
 
 /// A song as the tools report it, from a native record or a Subsonic child
@@ -58,9 +59,14 @@ fn text(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| cut(value.to_string()))
 }
 
-/// An id or time taken from Navidrome, never cut; empty is unknown.
+/// An id taken from Navidrome, never cut; empty is unknown.
 fn given(value: Option<&str>) -> Option<String> {
     value.filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+/// A time taken from Navidrome, as a tool answers it (`time::navidrome`); empty is unknown.
+fn when(value: Option<&str>) -> Option<String> {
+    value.filter(|v| !v.is_empty()).and_then(time::navidrome)
 }
 
 /// A number Navidrome sends as 0 when it does not know it (model/mediafile.go:49-63).
@@ -86,7 +92,7 @@ impl From<&NativeSong> for SongFacts {
             recording_mbid: given(song.mbz_recording_id.as_deref()),
             rating: song.rating,
             starred: song.starred,
-            starred_at: given(song.starred_at.as_deref()),
+            starred_at: when(song.starred_at.as_deref()),
             play_count: song.play_count,
         }
     }
@@ -110,7 +116,7 @@ impl From<&SubsonicSong> for SongFacts {
             recording_mbid: given(song.music_brainz_id.as_deref()),
             rating: song.user_rating.unwrap_or(0),
             starred: song.starred.is_some(),
-            starred_at: given(song.starred.as_deref()),
+            starred_at: when(song.starred.as_deref()),
             play_count: song.play_count.map_or(0, u64::from),
         }
     }
@@ -145,7 +151,7 @@ impl From<&SubsonicAlbum> for AlbumFacts {
             genre: album.genre.as_deref().and_then(text),
             rating: album.user_rating.unwrap_or(0),
             starred: album.starred.is_some(),
-            starred_at: given(album.starred.as_deref()),
+            starred_at: when(album.starred.as_deref()),
             play_count: album.play_count.unwrap_or(0),
         }
     }
@@ -171,7 +177,7 @@ impl From<&SubsonicArtist> for ArtistFacts {
             album_count: artist.album_count,
             rating: artist.user_rating.unwrap_or(0),
             starred: artist.starred.is_some(),
-            starred_at: given(artist.starred.as_deref()),
+            starred_at: when(artist.starred.as_deref()),
             mbid: given(artist.music_brainz_id.as_deref()),
         }
     }
@@ -770,7 +776,7 @@ mod tests {
                 recording_mbid: Some("0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c".into()),
                 rating: 4,
                 starred: true,
-                starred_at: Some("2026-11-02T18:04:51.112Z".into()),
+                starred_at: Some("2026-11-02T18:04:51Z".into()),
                 play_count: 3
             }
         );
