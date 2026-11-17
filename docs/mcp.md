@@ -372,7 +372,7 @@ Soulbeet's limits:
 | Stored searches | 24 hours |
 | Request keys | 7 days |
 | Access token | 1 hour |
-| Refresh token | 60 days from its issue |
+| Refresh token | 60 days from its issue; a connection keeps its newest 100 used ones to catch a reuse, and an older one is refused as unknown |
 | Sign-in request | 10 minutes |
 | Pending sign-ins | 20 per user |
 | Connected apps | 20 per user; a new one ends the least recently used |

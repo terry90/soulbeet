@@ -22,6 +22,11 @@ pub(crate) const REFRESH_LIFETIME: i64 = 60 * 24 * 3600;
 /// How long after its rotation a refresh token still answers its successor
 /// pair, in seconds (D4).
 pub(crate) const REFRESH_GRACE: i64 = 60;
+/// Most rotated refresh tokens a grant keeps, the newest: an older one's reuse answers unknown
+/// instead of ending the grant, and still gives no token. Claude's hourly refresh keeps a grant
+/// at about 1,440 rotated tokens in 60 days; this bounds a client that refreshes as fast as the
+/// budgets allow.
+pub(crate) const ROTATED_KEPT: i64 = 100;
 /// A client with no grant is pruned this long after its last use (its registration when never used), D4.
 pub(crate) const UNUSED_CLIENT_LIFETIME: i64 = 90 * 24 * 3600;
 /// Most grants a user holds; a new one ends the least recently used beyond
@@ -245,6 +250,17 @@ pub(crate) async fn refresh_in(
         )
         .await?;
         insert_token(&mut tx, &next, &grant_id, "refresh", now + REFRESH_LIFETIME).await?;
+        sqlx::query(
+            "DELETE FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh' \
+               AND rotated_at IS NOT NULL AND token_hash NOT IN \
+               (SELECT token_hash FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh' \
+                  AND rotated_at IS NOT NULL ORDER BY rotated_at DESC LIMIT ?)",
+        )
+        .bind(&grant_id)
+        .bind(&grant_id)
+        .bind(ROTATED_KEPT)
+        .execute(&mut *tx)
+        .await?;
         mark_client_used(&mut tx, client_id, now).await?;
         tx.commit().await?;
         return Ok(Issued {
@@ -610,7 +626,8 @@ pub(crate) struct Pruned {
 /// grants left without a token, then the clients with no grant, code or
 /// consent request whose last use (their registration when never used) is
 /// `UNUSED_CLIENT_LIFETIME` old. A rotated refresh token stays until its own
-/// expiry, so its reuse is still caught.
+/// expiry, so its reuse is still caught, unless ROTATED_KEPT newer ones of its
+/// grant replaced it (refresh_in).
 pub(crate) async fn prune_in(db: &SqlitePool, now: i64) -> Result<Pruned, String> {
     let delete = |query: Query<'static, Sqlite, SqliteArguments<'static>>| async move {
         query
@@ -996,6 +1013,35 @@ mod tests {
             Some(ENDED)
         );
         assert_eq!(count(&db, "oauth_grants").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_grant_keeps_only_its_newest_rotated_refresh_tokens() {
+        let (db, first) = refreshable().await;
+        let mut refresh = first.clone();
+        for n in 0..ROTATED_KEPT + 5 {
+            refresh = refresh_in(&db, test_key(), &refresh, "dcr_c", RESOURCE, T + 100 * (n + 1))
+                .await
+                .unwrap()
+                .refresh_token
+                .unwrap();
+        }
+        let rotated: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oauth_tokens WHERE kind = 'refresh' AND rotated_at IS NOT NULL",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(rotated, ROTATED_KEPT);
+        // The oldest is gone: its reuse is unknown and ends nothing.
+        let at = T + 100 * (ROTATED_KEPT + 7);
+        assert_eq!(
+            refresh_in(&db, test_key(), &first, "dcr_c", RESOURCE, at)
+                .await
+                .err(),
+            Some(TokenRefusal::InvalidGrant(REFRESH_UNKNOWN))
+        );
+        assert_eq!(count(&db, "oauth_grants").await, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
