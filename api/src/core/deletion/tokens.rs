@@ -81,15 +81,14 @@ pub(crate) async fn issue_in(
     let shown = chrono::DateTime::from_timestamp(expires_at, 0)
         .expect("now_unix reads the clock, ten minutes from which chrono can place");
     sqlx::query(
-        "INSERT INTO delete_tokens (token_hash, user_id, grant_id, reason, files, created_at, expires_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO delete_tokens (token_hash, user_id, grant_id, reason, files, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(hash(&secret))
     .bind(app.user.to_string())
     .bind(&app.grant_id)
     .bind(reason.as_str())
     .bind(stored)
-    .bind(now)
     .bind(expires_at)
     .execute(&mut *tx)
     .await

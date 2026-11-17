@@ -39,7 +39,7 @@ impl NavidromeLibraryRow {
             "INSERT INTO navidrome_libraries (library_id, navidrome_path, local_path) \
              VALUES (?, ?, ?) \
              ON CONFLICT (library_id) DO UPDATE SET navidrome_path = excluded.navidrome_path, \
-             local_path = excluded.local_path, learned_at = datetime('now')",
+             local_path = excluded.local_path",
         )
         .bind(row.library_id)
         .bind(&row.navidrome_path)
