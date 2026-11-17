@@ -38,16 +38,17 @@ pub const SEEDED_ADMIN_ID: &str = "00000000-0000-0000-0000-000000000000";
 static SEEDED_ADMIN_HAS_DEFAULT_PASSWORD: AtomicBool = AtomicBool::new(true);
 
 #[cfg(feature = "server")]
-const WEAK_SECRET_KEY: &str = "SECRET_KEY is shorter than 32 bytes. Set it to a random value \
-     of at least 32 bytes, for example the output of `openssl rand -hex 32`, or remove it so \
-     Soulful generates one. Changing SECRET_KEY ends every session and makes the stored \
+const WEAK_SECRET_KEY: &str = "SECRET_KEY is shorter than 32 bytes, so Soulbeet does not use \
+     it and signs sessions with the key stored in secret.key next to the database. Remove \
+     SECRET_KEY, or set it to a random value of at least 32 bytes, for example the output of \
+     `openssl rand -hex 32`. Setting a new SECRET_KEY ends every session and makes the stored \
      Navidrome passwords unreadable: each user is asked to sign in again once.";
 
 /// The reasons the instance is not safe to expose. Empty means open. Never hashes.
 #[cfg(feature = "server")]
 pub fn gate_reasons() -> Vec<GateReason> {
     gate_reasons_from(
-        crate::secret_key::current().is_weak(),
+        crate::secret_key::short_env_key_set(),
         seeded_admin_has_default_password(),
     )
 }

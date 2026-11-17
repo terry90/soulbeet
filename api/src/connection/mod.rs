@@ -13,7 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
-use serde_json::{json, Map};
+use serde_json::Map;
 
 use crate::base_url::{explain_request, BaseExplanation, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
@@ -188,15 +188,13 @@ fn admit(state: &ConnectionState, explained: &BaseExplanation) -> Result<BaseUrl
             format!("Claude (MCP) access is turned off: {why}"),
         ));
     }
-    let reasons = (state.gate)();
-    if !reasons.is_empty() {
-        let mut extra = Map::new();
-        extra.insert("reasons".into(), json!(reasons));
-        return Err(refusal_with(
+    // Which check fails is shown only to the admin, in Settings: an anonymous
+    // caller learns nothing about the instance's weaknesses.
+    if !(state.gate)().is_empty() {
+        return Err(refusal(
             StatusCode::SERVICE_UNAVAILABLE,
             "mcp_unavailable",
             GATE_CLOSED,
-            extra,
         ));
     }
     let base = match &explained.result {
@@ -278,6 +276,7 @@ mod tests {
     use super::test_util::*;
     use super::*;
     use crate::db::test_db;
+    use serde_json::json;
 
     #[tokio::test]
     async fn the_endpoints_answer_404_while_mcp_is_off() {
@@ -342,7 +341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_endpoints_answer_503_naming_each_gate_reason() {
+    async fn the_endpoints_answer_503_without_naming_the_failing_checks() {
         fn both() -> Vec<GateReason> {
             crate::security::gate_reasons_from(true, true)
         }
@@ -351,21 +350,13 @@ mod tests {
             ..ConnectionState::for_test(test_db::migrated().await)
         };
         let (status, _, body) = get_json(router(state), "/oauth/token", &[("host", HOST)]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            (status, body["error"].as_str()),
-            (StatusCode::SERVICE_UNAVAILABLE, Some("mcp_unavailable"))
-        );
-        assert_eq!(
-            body["message"],
-            "Claude (MCP) access stays off until the security checks in Settings pass"
-        );
-        assert_eq!(body["reasons"], serde_json::to_value(both()).unwrap());
-        assert_eq!(
-            (
-                body["reasons"][0]["code"].as_str(),
-                body["reasons"][1]["code"].as_str()
-            ),
-            (Some("weak_secret_key"), Some("default_admin_password"))
+            body,
+            json!({
+                "error": "mcp_unavailable",
+                "message": "Claude (MCP) access stays off until the security checks in Settings pass"
+            })
         );
     }
 

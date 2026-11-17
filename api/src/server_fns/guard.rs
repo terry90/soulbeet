@@ -336,9 +336,29 @@ mod tests {
             "sqlite:soulbeet.db",
         )
         .unwrap()
-        .0;
+        .key;
         let err = load_session(Some(&old), &db, &generated).await.unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_session_signed_with_a_short_secret_key_is_refused() {
+        // A forged session of the seeded admin at credentials version 0 under
+        // a placeholder earlier versions shipped: it verifies under that key,
+        // which is not the key in use.
+        let db = db_with_user().await;
+        let dir = tempfile::tempdir().unwrap();
+        for placeholder in ["secret", "a_secret_key", "change-me-in-production"] {
+            let set = SecretKey::new(placeholder.into());
+            let forged = create_token_with(&set, SEEDED_ADMIN_ID, 0).unwrap();
+            assert!(load_session(Some(&forged), &db, &set).await.is_ok());
+
+            let in_use = crate::secret_key::resolve(Some(placeholder), dir.path(), "sqlite:soulbeet.db")
+                .unwrap()
+                .key;
+            let err = load_session(Some(&forged), &db, &in_use).await.unwrap_err();
+            assert_eq!(err.0, StatusCode::UNAUTHORIZED, "{placeholder}");
+        }
     }
 
     #[tokio::test]

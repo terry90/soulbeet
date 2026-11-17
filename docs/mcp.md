@@ -31,7 +31,7 @@ Long work goes on in Soulbeet after the chat ends: a batch of downloads keeps ru
 - **https with a certificate Claude trusts.** Soulbeet refuses Claude's endpoints over plain http, except on a loopback address for local tests.
 - **Soulbeet at the root of that name.** Soulbeet cannot run under a sub-path: `https://music.example.com` works, `https://example.com/music` does not.
 - **The Security Checks in Settings > Config pass.** Until they do, Claude's endpoints answer `mcp_unavailable`. The two checks are:
-  - `SECRET_KEY` is unset (Soulbeet then generates a key) or at least 32 bytes. Settings shows: "SECRET_KEY is shorter than 32 bytes. Set it to a random value of at least 32 bytes, for example the output of `openssl rand -hex 32`, or remove it so Soulful generates one. Changing SECRET_KEY ends every session and makes the stored Navidrome passwords unreadable: each user is asked to sign in again once."
+  - `SECRET_KEY` is unset (Soulbeet then generates a key) or at least 32 bytes. A shorter one is not used at all: Soulbeet signs sessions with the key in `secret.key` instead. Settings shows: "SECRET_KEY is shorter than 32 bytes, so Soulbeet does not use it and signs sessions with the key stored in secret.key next to the database. Remove SECRET_KEY, or set it to a random value of at least 32 bytes, for example the output of `openssl rand -hex 32`. Setting a new SECRET_KEY ends every session and makes the stored Navidrome passwords unreadable: each user is asked to sign in again once."
   - The seeded `admin` account no longer has the password `admin`. Settings shows: "The seeded admin account still has the password 'admin'. Change it in Settings > Users."
 
 Two environment variables concern Claude:
@@ -397,7 +397,7 @@ The sign-in started but did not finish. Two causes are common: Soulbeet's token 
 Claude's endpoints answer a refusal as `{"error": code, "message": text}`.
 
 - `mcp_disabled` (404): "Claude (MCP) access is turned off: MCP=off is set", or "Claude (MCP) access is turned off: MCP is set to '{value}', which is neither on nor off". Set `MCP=on` or remove it.
-- `mcp_unavailable` (503): "Claude (MCP) access stays off until the security checks in Settings pass", with `reasons`: `weak_secret_key` and `default_admin_password`, each with the text quoted under [Requirements](#requirements). Fix what Settings > Config lists under Security Checks.
+- `mcp_unavailable` (503): "Claude (MCP) access stays off until the security checks in Settings pass". The answer does not say which check fails: an admin sees that in Settings > Config under Security Checks, with the texts quoted under [Requirements](#requirements). Fix what it lists.
 - `address_unreadable` (400): "Cannot tell this request's address: {problem}", where the problem is one of "The request names no host (Forwarded host=, X-Forwarded-Host or Host)", "'{value}' is not a valid host", "'{value}' is not http or https", "The address must not contain a user name or password", "The address must not have a path: Soulful cannot run under a sub-path", or "PUBLIC_URL is not usable: {problem}". Fix the proxy header or `PUBLIC_URL` it names.
 - `https_required` (403): "Soulful derived the address {address} for this request. Claude connects only over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: proto=https), or set PUBLIC_URL." The answer also gives `derived_base`, `host_from` and `scheme_from`.
 - `origin_not_allowed` (403): "Requests from {origin} are not accepted". A request to `/mcp` came with an `Origin` that is plain http and neither Soulbeet's own address nor loopback, or that is not an origin at all (`null`). Claude is not affected; this guards against DNS rebinding.
@@ -639,6 +639,7 @@ What exposing Soulbeet for Claude adds:
 The release that adds Claude (MCP) access changes these on the first start:
 
 - `MCP` is on unless you set it off, but the endpoints stay closed until the Security Checks in Settings > Config pass.
+- A `SECRET_KEY` under 32 bytes is no longer used, nor the key built into earlier versions for installs without `SECRET_KEY`: Soulbeet signs sessions with the key it generates in `secret.key`. Everyone is signed out once; stored Navidrome passwords are stored again under the new key on that start.
 - A browser tab left open across the upgrade cannot read a Deletion History row of reason `cleanup` until it reloads.
 - The checks' messages no longer name file paths, in Settings > Library ("Kept by auto-delete") and in import notes.
 - Turning on **Allow deleting music** for an app asks first, with the text quoted under [Connected apps](#connected-apps).

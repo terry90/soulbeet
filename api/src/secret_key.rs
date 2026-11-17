@@ -1,6 +1,9 @@
 //! The key that signs sessions and encrypts stored Navidrome passwords:
-//! `SECRET_KEY` when it is set, else a key generated on first start and kept
-//! in `secret.key` next to the database.
+//! `SECRET_KEY` when it is set to at least 32 bytes, else a key generated on
+//! first start and kept in `secret.key` next to the database. A shorter
+//! `SECRET_KEY` signs nothing: the placeholders earlier versions shipped
+//! (`secret`, `a_secret_key`, `change-me-in-production`) are all shorter, and
+//! anyone who knows a key can sign a session for any user.
 
 use std::fs;
 use std::io::Write;
@@ -10,8 +13,14 @@ use std::sync::OnceLock;
 
 pub const KEY_FILE_NAME: &str = "secret.key";
 
-/// A key shorter than this keeps OAuth and `/mcp` closed.
+/// A `SECRET_KEY` shorter than this is not used, and keeps OAuth and `/mcp`
+/// closed until it is removed or replaced.
 const MIN_KEY_BYTES: usize = 32;
+
+/// The key earlier versions used when `SECRET_KEY` was not set. It is public,
+/// so it only reads passwords stored under it, to store them again under the
+/// key in use.
+const BUILT_IN_KEY: &str = "secret";
 
 /// Random bytes in a generated key.
 const GENERATED_KEY_BYTES: usize = 32;
@@ -27,11 +36,6 @@ impl SecretKey {
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
-
-    /// A key someone set that is shorter than 32 bytes.
-    pub fn is_weak(&self) -> bool {
-        self.0.len() < MIN_KEY_BYTES
-    }
 }
 
 /// Where the key came from, for the startup log.
@@ -42,25 +46,44 @@ pub enum KeySource {
     Generated(PathBuf),
 }
 
-/// The key: `env` (a non-empty `SECRET_KEY`) when given, else the one stored
-/// next to the database file `database_url` names, generated and stored there
-/// on first use. A relative database path is read against `base`, the working
-/// directory at startup. Fails, naming the file, when the stored key cannot be
-/// read or a new one cannot be written.
-pub fn resolve(
-    env: Option<&str>,
-    base: &Path,
-    database_url: &str,
-) -> Result<(SecretKey, KeySource), String> {
-    if let Some(value) = env.filter(|v| !v.is_empty()) {
-        return Ok((SecretKey::new(value.to_string()), KeySource::Environment));
-    }
+/// The key in use, and the keys stored passwords may still be encrypted
+/// under.
+pub struct Resolved {
+    pub key: SecretKey,
+    pub source: KeySource,
+    /// A `SECRET_KEY` that is set and shorter than 32 bytes, so not used.
+    pub short_env: Option<SecretKey>,
+}
+
+/// The key: `env` (a non-empty `SECRET_KEY`) when it holds at least 32
+/// bytes, else the one stored next to the database file `database_url`
+/// names, generated and stored there on first use. A relative database path
+/// is read against `base`, the working directory at startup. Fails, naming
+/// the file, when the stored key cannot be read or a new one cannot be
+/// written.
+pub fn resolve(env: Option<&str>, base: &Path, database_url: &str) -> Result<Resolved, String> {
+    let env = env.filter(|v| !v.is_empty()).map(str::to_string);
+    let short_env = match env {
+        Some(value) if value.len() >= MIN_KEY_BYTES => {
+            return Ok(Resolved {
+                key: SecretKey::new(value),
+                source: KeySource::Environment,
+                short_env: None,
+            })
+        }
+        short => short.map(SecretKey::new),
+    };
     let dir = key_dir(base, database_url)?;
     let path = dir.join(KEY_FILE_NAME);
-    match read_stored(&path)? {
-        Some(key) => Ok((key, KeySource::File(path))),
-        None => create(&dir, path),
-    }
+    let (key, source) = match read_stored(&path)? {
+        Some(key) => (key, KeySource::File(path)),
+        None => create(&dir, path)?,
+    };
+    Ok(Resolved {
+        key,
+        source,
+        short_env,
+    })
 }
 
 /// The key stored at `path`, `None` when there is no such file.
@@ -150,30 +173,55 @@ fn write_and_link(temp: &Path, path: &Path, value: &str) -> std::io::Result<()> 
     fs::hard_link(temp, path)
 }
 
-static KEY: OnceLock<SecretKey> = OnceLock::new();
+/// What `load` resolved at startup.
+struct Loaded {
+    key: SecretKey,
+    /// Keys stored passwords may be encrypted under from before: the short
+    /// `SECRET_KEY`, when one is set, and the built-in key.
+    earlier: Vec<SecretKey>,
+    short_env: bool,
+}
+
+static LOADED: OnceLock<Loaded> = OnceLock::new();
 
 /// Loads the key once at startup. The database file comes from
 /// `DATABASE_URL`; a relative one sits in the working directory.
 pub fn load() -> Result<(), String> {
-    if KEY.get().is_some() {
+    if LOADED.get().is_some() {
         return Ok(());
     }
     let env = std::env::var("SECRET_KEY").ok();
-    let (key, source) = resolve(
+    let resolved = resolve(
         env.as_deref(),
         Path::new("."),
         crate::config::CONFIG.database_url(),
     )?;
-    match source {
+    if resolved.short_env.is_some() {
+        tracing::warn!(
+            "SECRET_KEY is shorter than {MIN_KEY_BYTES} bytes, so it is not used. Remove it, or set \
+             it to a random value of at least {MIN_KEY_BYTES} bytes."
+        );
+    }
+    match &resolved.source {
         KeySource::Environment => tracing::info!("Using SECRET_KEY from the environment"),
         KeySource::File(path) => tracing::info!("Using the secret key stored in {}", path.display()),
         KeySource::Generated(path) => tracing::info!(
-            "SECRET_KEY is not set: generated a secret key and stored it in {}. Back it up with the database.",
+            "Generated a secret key and stored it in {}. Back it up with the database.",
             path.display()
         ),
     }
+    let short_env = resolved.short_env.is_some();
+    let earlier = resolved
+        .short_env
+        .into_iter()
+        .chain([SecretKey::new(BUILT_IN_KEY.to_string())])
+        .collect();
     // A concurrent first load stored the same key from the same file.
-    let _ = KEY.set(key);
+    let _ = LOADED.set(Loaded {
+        key: resolved.key,
+        earlier,
+        short_env,
+    });
     Ok(())
 }
 
@@ -190,10 +238,25 @@ fn key_dir(base: &Path, database_url: &str) -> Result<PathBuf, String> {
     file.parent().map(Path::to_path_buf).ok_or_else(no_file)
 }
 
+fn loaded() -> &'static Loaded {
+    LOADED
+        .get()
+        .expect("the secret key is loaded at startup, before requests are served")
+}
+
 /// The key loaded at startup.
 pub fn current() -> &'static SecretKey {
-    KEY.get()
-        .expect("the secret key is loaded at startup, before requests are served")
+    &loaded().key
+}
+
+/// The keys stored passwords may still be encrypted under.
+pub fn earlier() -> &'static [SecretKey] {
+    &loaded().earlier
+}
+
+/// Whether a `SECRET_KEY` shorter than 32 bytes is set, and so not used.
+pub fn short_env_key_set() -> bool {
+    loaded().short_env
 }
 
 #[cfg(test)]
@@ -211,16 +274,21 @@ mod tests {
     #[test]
     fn a_key_is_generated_once_and_read_back() {
         let dir = tempfile::tempdir().unwrap();
-        let (first, source) = resolve(None, dir.path(), DB).unwrap();
+        let Resolved {
+            key: first, source, ..
+        } = resolve(None, dir.path(), DB).unwrap();
         let path = dir.path().join(KEY_FILE_NAME);
         assert_eq!(source, KeySource::Generated(path.clone()));
-        assert!(!first.is_weak());
         assert_eq!(first.as_bytes().len(), 2 * GENERATED_KEY_BYTES);
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(entries(dir.path()), vec![KEY_FILE_NAME.to_string()]);
 
-        let (second, source) = resolve(None, dir.path(), DB).unwrap();
+        let Resolved {
+            key: second,
+            source,
+            ..
+        } = resolve(None, dir.path(), DB).unwrap();
         assert_eq!(source, KeySource::File(path));
         assert_eq!(second.as_bytes(), first.as_bytes());
         assert_eq!(stored(dir.path()).trim().as_bytes(), first.as_bytes());
@@ -229,8 +297,8 @@ mod tests {
     #[test]
     fn two_installs_get_different_keys() {
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (ka, _) = resolve(None, a.path(), DB).unwrap();
-        let (kb, _) = resolve(None, b.path(), DB).unwrap();
+        let ka = resolve(None, a.path(), DB).unwrap().key;
+        let kb = resolve(None, b.path(), DB).unwrap().key;
         assert_ne!(ka.as_bytes(), kb.as_bytes());
     }
 
@@ -242,9 +310,10 @@ mod tests {
             "stored-key-of-at-least-32-bytes!!",
         )
         .unwrap();
-        let (key, source) = resolve(Some("e".repeat(40).as_str()), dir.path(), DB).unwrap();
-        assert_eq!(source, KeySource::Environment);
-        assert_eq!(key.as_bytes(), "e".repeat(40).as_bytes());
+        let resolved = resolve(Some("e".repeat(40).as_str()), dir.path(), DB).unwrap();
+        assert_eq!(resolved.source, KeySource::Environment);
+        assert_eq!(resolved.key.as_bytes(), "e".repeat(40).as_bytes());
+        assert!(resolved.short_env.is_none());
 
         let empty = tempfile::tempdir().unwrap();
         resolve(Some("e".repeat(40).as_str()), empty.path(), DB).unwrap();
@@ -254,17 +323,30 @@ mod tests {
     #[test]
     fn an_empty_environment_key_counts_as_unset() {
         let dir = tempfile::tempdir().unwrap();
-        let (_, source) = resolve(Some(""), dir.path(), DB).unwrap();
-        assert!(matches!(source, KeySource::Generated(_)));
+        let resolved = resolve(Some(""), dir.path(), DB).unwrap();
+        assert!(matches!(resolved.source, KeySource::Generated(_)));
+        assert!(resolved.short_env.is_none());
     }
 
     #[test]
-    fn a_short_key_someone_set_is_weak() {
+    fn a_short_key_someone_set_signs_nothing() {
+        // The placeholders earlier READMEs and compose files shipped, and any
+        // other key under 32 bytes: the stored key is used instead.
         let dir = tempfile::tempdir().unwrap();
-        let weak = |v: &str| resolve(Some(v), dir.path(), DB).unwrap().0.is_weak();
-        assert!(weak("secret"));
-        assert!(weak(&"a".repeat(31)));
-        assert!(!weak(&"a".repeat(32)));
+        let stored = resolve(None, dir.path(), DB).unwrap().key;
+        let short = "a".repeat(31);
+        for value in ["secret", "a_secret_key", "change-me-in-production", &short] {
+            let resolved = resolve(Some(value), dir.path(), DB).unwrap();
+            assert_eq!(resolved.key.as_bytes(), stored.as_bytes(), "{value}");
+            assert!(matches!(resolved.source, KeySource::File(_)), "{value}");
+            assert_eq!(
+                resolved.short_env.map(|k| k.as_bytes().to_vec()),
+                Some(value.as_bytes().to_vec())
+            );
+        }
+        let long = resolve(Some(&"a".repeat(32)), dir.path(), DB).unwrap();
+        assert_eq!(long.source, KeySource::Environment);
+        assert_eq!(long.key.as_bytes(), "a".repeat(32).as_bytes());
     }
 
     #[test]
@@ -325,13 +407,13 @@ mod tests {
             ("sqlite:soulbeet.db", base.path().to_path_buf()),
             ("sqlite:sub/dir/x.db", base.path().join("sub/dir")),
         ] {
-            let (key, source) = resolve(None, base.path(), url).unwrap();
+            let Resolved { key, source, .. } = resolve(None, base.path(), url).unwrap();
             let path = dir.join(KEY_FILE_NAME);
             assert_eq!(source, KeySource::Generated(path.clone()), "{url}");
             assert_eq!(stored(&dir).trim().as_bytes(), key.as_bytes(), "{url}");
-            let (again, source) = resolve(None, base.path(), url).unwrap();
-            assert_eq!(source, KeySource::File(path), "{url}");
-            assert_eq!(again.as_bytes(), key.as_bytes(), "{url}");
+            let again = resolve(None, base.path(), url).unwrap();
+            assert_eq!(again.source, KeySource::File(path), "{url}");
+            assert_eq!(again.key.as_bytes(), key.as_bytes(), "{url}");
         }
     }
 

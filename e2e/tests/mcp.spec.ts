@@ -1,12 +1,14 @@
 import { expect, test } from '@playwright/test';
 import { registerUser, uniqueUser } from '../helpers/app.js';
 
-test('the connection endpoints say why they are closed', async ({ request }) => {
+test('the connection endpoints say they are closed, not why', async ({ request }) => {
   const r = await request.get('/.well-known/oauth-protected-resource/mcp');
   expect(r.status()).toBe(503);
   const body = await r.json();
-  expect(body.error).toBe('mcp_unavailable');
-  expect(body.reasons.map((x: { code: string }) => x.code)).toContain('weak_secret_key');
+  expect(body).toEqual({
+    error: 'mcp_unavailable',
+    message: 'Claude (MCP) access stays off until the security checks in Settings pass',
+  });
   expect(r.headers()['cache-control']).toBe('no-store');
 });
 

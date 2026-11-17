@@ -57,6 +57,7 @@ fn main() {
                 dioxus::logger::tracing::error!("{e}");
                 std::process::exit(1);
             }
+            api::services::store_passwords_under_the_current_key().await;
             api::ledger::start_server_ledger();
             api::core::playlists::fill::start();
             api::core::index::start();
