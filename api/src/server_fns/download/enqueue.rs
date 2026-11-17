@@ -395,7 +395,7 @@ fn sort_claim(
         .iter()
         .partition(|(_, running)| running.target == batch.target);
     let held = match batch.duplicates {
-        DuplicateRule::Guarded => EnqueueStatus::AlreadyRunning,
+        DuplicateRule::Guarded | DuplicateRule::GuardedForApp(_) => EnqueueStatus::AlreadyRunning,
         DuplicateRule::Skip | DuplicateRule::Replace(_) => {
             EnqueueStatus::Failed(file_taken_by_another_download())
         }

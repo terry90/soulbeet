@@ -232,11 +232,12 @@ Deletion is off for every app until its owner turns on **Allow deleting music** 
 - delete songs you confirmed: `preview_delete_tracks` checks up to 25 songs and says for each whether it may be deleted and, if not, why, with a confirmation token for exactly the songs it allows; Claude shows you the preview and asks; `delete_tracks` with that token deletes them after your yes. `find_duplicates` finds songs your library holds more than once, to preview;
 - replace a library copy while it downloads a better one: `ensure_in_library`'s `replace_existing` takes the token of a preview with reason `replaced`, and the previewed copies are deleted once the new copy is imported, within 24 hours;
 - run your rating sync (`sync_ratings`) with its auto-delete: when you turned auto-delete on, the songs you rated 1 star are deleted;
-- keep a discovery track (`promote_discovery_track`) that replaces an earlier copy of the song in your library.
+- keep a discovery track (`promote_discovery_track`) that replaces an earlier copy of the song in your library;
+- decide an import the web page started (`resolve_import`) that replaces an earlier copy in your library.
 
-The last two delete without a preview. They count against the same daily limit and appear in the deletion history under the app's name.
+The last three delete without a preview. They count against the same daily limit and appear in the deletion history under the app's name.
 
-Without the switch, `preview_delete_tracks` and `delete_tracks` answer `permission_not_granted` with "Deleting music is turned off for this app" and the user action "Allow deleting music for this app" in "Settings > Users > Connected apps"; `ensure_in_library` refuses `replace_existing` the same way; `sync_ratings` skips auto-delete (the 6-hourly sync does it); `promote_discovery_track` replaces no earlier copy and ends `import_already_in_library`.
+Without the switch, `preview_delete_tracks` and `delete_tracks` answer `permission_not_granted` with "Deleting music is turned off for this app" and the user action "Allow deleting music for this app" in "Settings > Users > Connected apps"; `ensure_in_library` refuses `replace_existing` the same way; `sync_ratings` skips auto-delete (the 6-hourly sync does it); `promote_discovery_track` and `resolve_import` replace no earlier copy and end `import_already_in_library`.
 
 Some changes are refused to every app, whether or not its deletion switch is on, because they would let a later sync delete files without a preview:
 

@@ -15,6 +15,7 @@ pub(crate) use rows::import_failure;
 
 use crate::auth::UserId;
 use crate::core::delete_guard::{Guard, Origin, ReplaceSet};
+use crate::core::discovery::Replace;
 use crate::ledger::{
     self, DuplicateRule, ImportDone, IndexWait, JobEvent, Replacement, SlotResult, StoredImport,
 };
@@ -125,6 +126,26 @@ impl Duplicates {
                 actor: user.clone(),
                 set: set.clone(),
             },
+            DuplicateRule::GuardedForApp(grant_id) => Duplicates::Guarded {
+                actor: user.clone(),
+                origin: Origin::Mcp {
+                    grant_id: grant_id.clone(),
+                },
+            },
+        }
+    }
+
+    /// How a connected app's decision on an import kept with these duplicates treats earlier
+    /// copies: one the web UI's rule kept removes them only as `replace` says, as the app's
+    /// deletions or never (beets skips what the library has). Every other rule already is an
+    /// app's, or removes nothing.
+    pub(crate) fn for_app(self, replace: Replace) -> Duplicates {
+        match (self, replace) {
+            (Duplicates::Guarded { actor, .. }, Replace::Guarded(origin)) => {
+                Duplicates::Guarded { actor, origin }
+            }
+            (Duplicates::Guarded { .. }, Replace::Never) => Duplicates::Skip,
+            (other, _) => other,
         }
     }
 }
@@ -151,6 +172,10 @@ impl ImportJob {
             duplicates: match &self.duplicates {
                 Duplicates::Skip => DuplicateRule::Skip,
                 Duplicates::Replace { set, .. } => DuplicateRule::Replace(set.clone()),
+                Duplicates::Guarded {
+                    origin: Origin::Mcp { grant_id },
+                    ..
+                } => DuplicateRule::GuardedForApp(grant_id.clone()),
                 Duplicates::Guarded { .. } | Duplicates::AsConfigured => DuplicateRule::Guarded,
             },
             last_run: self.last_run.as_deref().cloned(),
@@ -1837,6 +1862,49 @@ mod tests {
             old.duplicates,
             DuplicateRule::Guarded,
             "a row stored before the rule was kept"
+        );
+    }
+
+    #[test]
+    fn an_app_decides_a_web_page_import_only_within_its_switch_across_a_restart() {
+        let ui = || Duplicates::Guarded {
+            actor: alice(),
+            origin: Origin::Ui,
+        };
+        let as_app = Replace::Guarded(Origin::Mcp {
+            grant_id: "g1".into(),
+        });
+        assert!(matches!(ui().for_app(Replace::Never), Duplicates::Skip));
+        let decided = ui().for_app(as_app.clone());
+        assert!(
+            matches!(&decided, Duplicates::Guarded { actor, origin: Origin::Mcp { grant_id } }
+                if *actor == alice() && grant_id == "g1"),
+            "{decided:?}"
+        );
+        // An MCP job's own rule is already the app's.
+        assert!(matches!(
+            Duplicates::Skip.for_app(as_app),
+            Duplicates::Skip
+        ));
+
+        let job = ImportJob {
+            duplicates: decided,
+            ..owned(
+                job(PathBuf::from("/dl/X [1f2e3d4c]/01.flac"), Path::new("/music")),
+                &alice(),
+                &["a"],
+            )
+        };
+        let stored = job.stored().unwrap();
+        assert_eq!(stored.duplicates, DuplicateRule::GuardedForApp("g1".into()));
+        let rebuilt = ImportJob::from_stored(
+            serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap(),
+            alice(),
+        );
+        assert!(
+            matches!(&rebuilt.duplicates, Duplicates::Guarded { origin: Origin::Mcp { grant_id }, .. } if grant_id == "g1"),
+            "{:?}",
+            rebuilt.duplicates
         );
     }
 

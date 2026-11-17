@@ -15,6 +15,7 @@ use super::runner::Acquire;
 use super::{job_not_found, job_view, JobView};
 use crate::auth::UserCtx;
 use crate::core::database_failure;
+use crate::core::discovery::Replace;
 use crate::import_queue::{files_gone, nothing_to_retry, FileLeft, ImportJob};
 use crate::ledger::JobState;
 
@@ -184,8 +185,10 @@ pub(crate) async fn import_choices(
 }
 
 /// `decision` on the kept import of `ctx`'s job `job` (`slot` as `import_choices` takes it),
-/// through the import queue: a retry with the choice, or the discard dismiss_job makes, which
-/// deletes only Soulful's own kept copy. Either takes the kept import first, so one decision
+/// through the import queue, by a connected app: a retry with the choice, or the discard
+/// dismiss_job makes, which deletes only Soulful's own kept copy. A retry of an import the web
+/// UI's rule kept removes an earlier library copy only as `replace` says, so the app deletes
+/// nothing past its own switch, its day's room or its name in the history. Either takes the kept import first, so one decision
 /// already taken refuses the next with nothing_to_retry, the import gone. The decision made
 /// answers the job as it is after it, whose import then runs on its own; a refusal carries `kept`
 /// and the job as read after it, and is `changed` when it changed the job (the kept files were
@@ -196,6 +199,7 @@ pub(crate) async fn resolve(
     job: &str,
     slot: Option<u32>,
     decision: Decision,
+    replace: Replace,
 ) -> Result<Decided, Refused> {
     let (_, item) = waiting(acquire, ctx, job, slot, "resolve_import").await?;
     let choice = match decision {
@@ -209,7 +213,7 @@ pub(crate) async fn resolve(
     };
     let (queue, user) = (&acquire.queue, ctx.id());
     let decided = match choice {
-        Some(choice) => queue.retry(&user, &item, choice).await.map(|()| vec![]),
+        Some(choice) => (queue.retry_for_app(&user, &item, choice, replace).await).map(|()| vec![]),
         None => (queue.discard(&user, &item).await).map(|discarded| discarded.files_left),
     };
     match decided {
@@ -371,7 +375,7 @@ mod tests {
     use super::*;
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
-        kept_album_job, kept_track_job_with, no_match_with_files,
+        kept_album_job, kept_track_job_by, kept_track_job_with, no_match_with_files,
     };
     use crate::core::test_ctx;
     use crate::ledger::{store, JobState};
@@ -440,8 +444,8 @@ mod tests {
         let job = kept_track_job_with(&acq, &effects, no_match_with_files(2)).await;
         let ctx = test_ctx("alice");
         let (a, b) = tokio::join!(
-            resolve(&acq, &ctx, &job, None, Decision::AsIs),
-            resolve(&acq, &ctx, &job, None, Decision::Discard)
+            resolve(&acq, &ctx, &job, None, Decision::AsIs, Replace::Never),
+            resolve(&acq, &ctx, &job, None, Decision::Discard, Replace::Never)
         );
         // Whichever takes the kept import first wins; the other is refused the same way in
         // either order.
@@ -491,7 +495,7 @@ mod tests {
         // Restored after a restart from a row kept before runs were: no run is known.
         let second = import_choices(&acq, &ctx, &job, Some(1)).await.unwrap();
         assert_eq!((second.tasks, second.output_tail), (None, None));
-        let view = resolve(&acq, &ctx, &job, Some(1), Decision::Discard)
+        let view = resolve(&acq, &ctx, &job, Some(1), Decision::Discard, Replace::Never)
             .await
             .unwrap()
             .job
@@ -517,7 +521,7 @@ mod tests {
         );
         assert!(!shown.changed);
         assert_eq!(shown.refused_tool, Some("get_import_choices"));
-        let decided = resolve(&acq, &ctx, &job, None, Decision::AsIs)
+        let decided = resolve(&acq, &ctx, &job, None, Decision::AsIs, Replace::Never)
             .await
             .unwrap_err();
         let (failure, facts) = failed(&decided);
@@ -537,8 +541,8 @@ mod tests {
         let job = kept_track_job_with(&acq, &effects, no_match_with_files(2)).await;
         let ctx = test_ctx("alice");
         let (discarded, retried) = tokio::join!(
-            resolve(&acq, &ctx, &job, None, Decision::Discard),
-            resolve(&acq, &ctx, &job, None, Decision::Retry)
+            resolve(&acq, &ctx, &job, None, Decision::Discard, Replace::Never),
+            resolve(&acq, &ctx, &job, None, Decision::Retry, Replace::Never)
         );
         assert_eq!(
             discarded.unwrap().job.unwrap().job.state,
@@ -556,6 +560,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_app_deciding_a_web_page_import_replaces_an_earlier_copy_only_as_its_deletion() {
+        use crate::core::delete_guard::Origin;
+        use crate::ledger::DuplicateRule;
+        use soulbeet::DuplicateRun;
+
+        let as_app = Replace::Guarded(Origin::Mcp {
+            grant_id: "g1".into(),
+        });
+        for (replace, run) in [
+            // Without the switch beets skips what the library has: the copy stays.
+            (Replace::Never, DuplicateRun::Skip),
+            (as_app, DuplicateRun::ReportRemovals),
+        ] {
+            let (acq, effects) = Acquire::for_alice().await;
+            let job = kept_track_job_by(
+                &acq,
+                &effects,
+                no_match_with_files(2),
+                &DuplicateRule::Guarded,
+            )
+            .await;
+            assert_eq!(
+                effects.importer().duplicate_runs(),
+                vec![DuplicateRun::ReportRemovals]
+            );
+            resolve(&acq, &test_ctx("alice"), &job, None, Decision::AsIs, replace)
+                .await
+                .unwrap();
+            for _ in 0..500 {
+                if effects.importer().calls() == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(effects.importer().duplicate_runs()[1], run);
+        }
+    }
+
+    #[tokio::test]
     async fn a_musicbrainz_link_to_the_wrong_entity_keeps_the_import() {
         let (acq, effects) = Acquire::for_alice().await;
         let job = kept_track_job_with(&acq, &effects, no_match_with_files(0)).await;
@@ -567,6 +610,7 @@ mod tests {
             Decision::MusicBrainz(
                 "https://musicbrainz.org/release/6a09041b-0f79-3278-88d9-0552dd28d37f".into(),
             ),
+            Replace::Never,
         )
         .await
         .unwrap_err();

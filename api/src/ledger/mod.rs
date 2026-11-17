@@ -153,6 +153,10 @@ pub enum DuplicateRule {
     /// A replacing MCP job's (D9): beets reports every duplicate, and only the previewed copies
     /// of `set` are deleted, for the app that confirmed them, until it runs out.
     Replace(ReplaceSet),
+    /// An import the web UI's rule kept for a decision that a connected app with deletion on
+    /// decided (grant id): removals through the delete guard as that app's deletions. Never a
+    /// batch's rule.
+    GuardedForApp(String),
 }
 
 impl DuplicateRule {

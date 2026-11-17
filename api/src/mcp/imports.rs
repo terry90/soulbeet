@@ -17,6 +17,9 @@ use super::refs::request_key_schema;
 use super::server::{common_codes, ToolSpec};
 use super::McpCaller;
 use crate::connection::ConnectionState;
+use crate::core::delete_guard::Origin;
+use shared::navidrome::DAILY_APP_DELETIONS;
+use crate::core::discovery::Replace;
 use crate::core::jobs::decide::{import_choices, resolve, Decision, ImportChoices, Refused, Why};
 use crate::core::jobs::retry::RetryAnswer;
 use crate::core::jobs::runner::Acquire;
@@ -57,7 +60,7 @@ pub(crate) const RESOLVE_IMPORT: ToolSpec = ToolSpec {
     title: "Decide an import",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Decides the import a job waiting for an import decision (needs_decision) kept, with choice: retry (beets matches again on its own), as_is (the files are imported with their own tags), candidate (one of get_import_choices' candidates, by its data_source and id), musicbrainz (the MusicBrainz recording, for a track job, or release, for an album job, given as an MBID or a musicbrainz.org link), or discard (deletes the downloaded copy Soulful kept, never a library file, and dismisses the job's slots waiting for it; a file it could not delete stays on disk, listed in files_left as dismiss_job lists it, and the slots are dismissed all the same). musicbrainz and as_is work without candidates, so a recording found with search_music can always be applied. slot as get_import_choices takes it. Answers the job's full document, as get_jobs gives it; the import then runs, so follow it with get_jobs. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; the job's slots fail), import_choice_invalid (a candidate beets did not find, a MusicBrainz link to the wrong entity), already_running (a call with this request_key still runs).")
+        format!("Decides the import a job waiting for an import decision (needs_decision) kept, with choice: retry (beets matches again on its own), as_is (the files are imported with their own tags), candidate (one of get_import_choices' candidates, by its data_source and id), musicbrainz (the MusicBrainz recording, for a track job, or release, for an album job, given as an MBID or a musicbrainz.org link), or discard (deletes the downloaded copy Soulful kept, never a library file, and dismisses the job's slots waiting for it; a file it could not delete stays on disk, listed in files_left as dismiss_job lists it, and the slots are dismissed all the same). musicbrainz and as_is work without candidates, so a recording found with search_music can always be applied. An import the web page started that would replace an earlier library copy of the music replaces it only with deletion switched on for this app, as this app's deletion (counted in the {DAILY_APP_DELETIONS} tracks a day connected apps may delete and named in the deletion history); without the switch the copy stays and the job ends import_already_in_library. slot as get_import_choices takes it. Answers the job's full document, as get_jobs gives it; the import then runs, so follow it with get_jobs. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; the job's slots fail), import_choice_invalid (a candidate beets did not find, a MusicBrainz link to the wrong entity), already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["job_id", "choice"], "properties": {"job_id": {"type": "string", "minLength": 1}, "slot": {"type": "integer", "minimum": 0}, "choice": {"enum": ["retry", "as_is", "candidate", "musicbrainz", "discard"]}, "data_source": {"type": "string", "minLength": 1}, "id": {"type": "string", "minLength": 1}, "musicbrainz": {"type": "string", "minLength": 1}, "#,
@@ -292,8 +295,15 @@ pub(crate) async fn resolve_import(
     } = read;
     let on = JobTool::of("resolve_import", state, caller);
     let again = args.same_call();
+    // An earlier copy goes only as this app's deletion, when it may delete.
+    let replace = match caller.allow_delete {
+        true => Replace::Guarded(Origin::Mcp {
+            grant_id: caller.grant_id.clone(),
+        }),
+        false => Replace::Never,
+    };
     let work = async move {
-        match resolve(&on.acquire, &on.caller.ctx, &job_id, slot, decision).await {
+        match resolve(&on.acquire, &on.caller.ctx, &job_id, slot, decision, replace).await {
             Ok(decided) => {
                 let answered = match decided.job {
                     Ok(view) => RetryAnswer::Applied(Box::new(view)),

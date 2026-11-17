@@ -5,6 +5,7 @@
 use super::choice::{files_gone, nothing_to_retry, resolve};
 use super::{Duplicates, ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
+use crate::core::discovery::Replace;
 use crate::ledger::{self, JobEvent};
 use shared::download::{ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
@@ -207,6 +208,31 @@ impl ImportQueue {
         item: &str,
         choice: ImportChoice,
     ) -> Result<(), ImportRefusal> {
+        self.retry_with(user, item, choice, |duplicates| duplicates)
+            .await
+    }
+
+    /// `retry` decided by a connected app, which removes earlier copies only as `replace` says
+    /// (`Duplicates::for_app`).
+    pub(crate) async fn retry_for_app(
+        &self,
+        user: &UserId,
+        item: &str,
+        choice: ImportChoice,
+        replace: Replace,
+    ) -> Result<(), ImportRefusal> {
+        self.retry_with(user, item, choice, |duplicates| duplicates.for_app(replace))
+            .await
+    }
+
+    /// `retry`, the kept import's duplicates rule passed through `rule`.
+    async fn retry_with(
+        &self,
+        user: &UserId,
+        item: &str,
+        choice: ImportChoice,
+        rule: impl FnOnce(Duplicates) -> Duplicates,
+    ) -> Result<(), ImportRefusal> {
         let job = {
             // A finish recording what it kept cannot be split by the take.
             let _emit = self.shared.emit_lock.lock().await;
@@ -215,9 +241,11 @@ impl ImportQueue {
                 .retries
                 .take(user, item, |job| resolve(&choice, job))?;
             self.shared.dismiss(dropped);
+            let job = Arc::unwrap_or_clone(job);
             ImportJob {
                 choice,
-                ..Arc::unwrap_or_clone(job)
+                duplicates: rule(job.duplicates.clone()),
+                ..job
             }
         };
         if !job.holds_audio().await {

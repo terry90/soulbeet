@@ -834,7 +834,18 @@ pub(crate) fn no_match_with_files(candidates: u16) -> ImportResult {
 pub(crate) async fn kept_track_job_with(
     acq: &Acquire,
     effects: &TestEffects,
+    result: ImportResult,
+) -> String {
+    kept_track_job_by(acq, effects, result, &DuplicateRule::Skip).await
+}
+
+/// `kept_track_job_with`, its import treating earlier copies by `rule` (the web page's is
+/// Guarded).
+pub(crate) async fn kept_track_job_by(
+    acq: &Acquire,
+    effects: &TestEffects,
     mut result: ImportResult,
+    rule: &DuplicateRule,
 ) -> String {
     let title = "Song Number 1";
     let job = downloading_track_job_with(acq, title, auto_options()).await;
@@ -851,7 +862,7 @@ pub(crate) async fn kept_track_job_with(
         vec![row],
         &acq.download_base.join("library"),
         &alice(),
-        &DuplicateRule::Skip,
+        rule,
         &acq.download_base,
     );
     acq.queue.submit(import).await.wait().await;
