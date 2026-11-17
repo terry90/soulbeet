@@ -188,11 +188,7 @@ pub(crate) async fn show(
         app_host: client_id_host.as_deref().unwrap_or(&redirect_host),
         client_name: pending.client.client_name.as_deref(),
         redirect_host: &redirect_host,
-        loopback_only: pending
-            .client
-            .redirect_uris
-            .iter()
-            .all(|r| is_loopback_uri(r)),
+        returns_to_loopback: is_loopback_uri(redirect_uri),
         username: &user.username,
         request_id: &request_id,
     })
@@ -1025,6 +1021,43 @@ mod tests {
             "This app runs on a computer (it returns to 127.0.0.1). Allow it only if you started it yourself."
         ));
         assert!(!page.contains("It calls itself"));
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_loopback_address_gets_the_warning_whatever_else_is_registered() {
+        let (db, app) = app().await;
+        insert_dcr_in(
+            &db,
+            "dcr_mixed",
+            &NewClient {
+                client_name: None,
+                redirect_uris: vec![
+                    "https://claude.ai/api/mcp/auth_callback".into(),
+                    "http://localhost:4000/cb".into(),
+                ],
+            },
+            0,
+            DCR_CAP,
+        )
+        .await
+        .unwrap();
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let warning = "This app runs on a computer (it returns to localhost).";
+        let q = query_with(&[
+            ("client_id", Some("dcr_mixed")),
+            ("redirect_uri", Some("http://localhost:4000/cb")),
+        ]);
+        let (status, _, page) =
+            get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains(warning), "{page}");
+        let q = query_with(&[
+            ("client_id", Some("dcr_mixed")),
+            ("redirect_uri", Some("https://claude.ai/api/mcp/auth_callback")),
+        ]);
+        let (status, _, page) = get(app, &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!page.contains("This app runs on a computer"), "{page}");
     }
 
     /// A database, the documents the router fetches (Claude Code's id answers

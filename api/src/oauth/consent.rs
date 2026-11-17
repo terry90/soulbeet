@@ -47,8 +47,8 @@ pub(crate) struct ConsentView<'a> {
     pub client_name: Option<&'a str>,
     /// The host the answer goes to, without port.
     pub redirect_host: &'a str,
-    /// Every registered redirect URI is loopback.
-    pub loopback_only: bool,
+    /// The answer goes to a loopback redirect URI: an app on a computer.
+    pub returns_to_loopback: bool,
     pub username: &'a str,
     pub request_id: &'a str,
 }
@@ -75,7 +75,7 @@ pub(crate) fn consent_page(view: &ConsentView) -> Response {
     body.push_str(&format!(
         "<p>When you answer, Soulful sends you back to {redirect}.</p>\n"
     ));
-    if view.loopback_only {
+    if view.returns_to_loopback {
         body.push_str(&format!(
             "<p class=\"warning\">This app runs on a computer (it returns to {redirect}). Allow \
              it only if you started it yourself.</p>\n"
