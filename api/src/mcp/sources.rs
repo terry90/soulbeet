@@ -77,10 +77,10 @@ pub(crate) const GET_SOURCES: ToolSpec = ToolSpec {
     title: "Read a source search",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Reads a search find_sources started: its state, what it read and its candidates, a page at a time. Takes search_id, wait_seconds (0 to 180) to wait for a running search, limit and cursor. Failure codes: {common}, unknown_handle (no such search for this user), expired_handle (older than 24 hours), search_stopped (the search of a cancelled job), server_restarted (Soulbeet restarted while the search ran), and the search's own failure codes as find_sources lists them.")
+        format!("Reads a search find_sources started: its state, what it read and its candidates, a page at a time. Takes search_id, wait_seconds (0 to 30) to wait for a running search, limit and cursor. Failure codes: {common}, unknown_handle (no such search for this user), expired_handle (older than 24 hours), search_stopped (the search of a cancelled job), server_restarted (Soulbeet restarted while the search ran), and the search's own failure codes as find_sources lists them.")
     },
     input_schema: concat!(
-        r#"{"type": "object", "additionalProperties": false, "required": ["search_id"], "properties": {"search_id": {"type": "string", "minLength": 1}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 180}, "#,
+        r#"{"type": "object", "additionalProperties": false, "required": ["search_id"], "properties": {"search_id": {"type": "string", "minLength": 1}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 30}, "#,
         page_schema!(),
         "}}"
     ),
@@ -248,7 +248,7 @@ pub(crate) async fn get_sources(
     answer(
         async {
             let search_id = args.string("search_id")?;
-            let wait = args.opt_u32("wait_seconds", 0, 180)?.unwrap_or(0);
+            let wait = args.opt_u32("wait_seconds", 0, 30)?.unwrap_or(0);
             let page = Page::read(&args, json!({"search_id": search_id}))?;
             args.finish()?;
             let stored = wait::until(
@@ -373,7 +373,7 @@ fn continue_call(search_id: &str, cursor: &str) -> NextCall {
 fn read_later(search_id: &str) -> NextCall {
     NextCall::new(
         "get_sources",
-        json!({"search_id": search_id, "wait_seconds": 60}),
+        json!({"search_id": search_id, "wait_seconds": 30}),
     )
 }
 
@@ -950,7 +950,7 @@ mod tests {
         let search_id = pending["search_id"].as_str().unwrap().to_string();
         assert_eq!(
             pending["next"],
-            json!([{"tool": "get_sources", "args": {"search_id": search_id, "wait_seconds": 60}}])
+            json!([{"tool": "get_sources", "args": {"search_id": search_id, "wait_seconds": 30}}])
         );
         effects.stub().script_polls(vec![Ok(search_result(
             "search",
@@ -967,7 +967,7 @@ mod tests {
                 app.clone(),
                 &token,
                 "get_sources",
-                json!({"search_id": search_id, "wait_seconds": 120}),
+                json!({"search_id": search_id, "wait_seconds": 30}),
             )
             .await,
         );
@@ -1141,7 +1141,7 @@ mod tests {
         );
         assert_eq!(
             error["next"][0],
-            json!({"tool": "get_sources", "args": {"search_id": ids[0], "wait_seconds": 60}})
+            json!({"tool": "get_sources", "args": {"search_id": ids[0], "wait_seconds": 30}})
         );
         assert_eq!(effects.stub().specs().len(), 1);
         // Refused before a search started: the key is free for the same call later.

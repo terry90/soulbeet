@@ -38,7 +38,7 @@ pub(crate) fn next_calls(
     if !view.stranded && job.state.moves_on_its_own() {
         next.push(NextCall::new(
             "get_jobs",
-            json!({"job_ids": [id], "detail": "full", "wait_seconds": 60,
+            json!({"job_ids": [id], "detail": "full", "wait_seconds": 30,
                 "wait_for": "any_change"}),
         ));
     }
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&next).unwrap(),
             json!([{"tool": "get_jobs",
-                "args": {"job_ids": [job], "detail": "full", "wait_seconds": 60, "wait_for": "any_change"}},
+                "args": {"job_ids": [job], "detail": "full", "wait_seconds": 30, "wait_for": "any_change"}},
                 {"tool": "cancel_job", "args": {"job_id": job}}])
         );
     }

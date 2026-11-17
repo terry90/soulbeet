@@ -66,7 +66,7 @@ The proxy must:
 - **Set the forwarded headers itself, and never pass on the ones a client sent.** Soulbeet reads the first `Forwarded` element and the first `X-Forwarded-*` value, so a client that sends its own would choose the address Soulbeet issues tokens for. Each example below overwrites or removes them. Where a proxy cannot promise that, set `PUBLIC_URL`, and the headers are not read.
 - **Send the public host and the https scheme**, through `Host` or `X-Forwarded-Host`, and `X-Forwarded-Proto: https`.
 - **Not buffer `text/event-stream` answers.** Soulbeet sends them with `X-Accel-Buffering: no`.
-- **Let one answer take 300 seconds.** A tool call can wait up to 180 seconds on the server, and Claude allows a call 240 seconds. Clients on protocol 2025-11-25 or older, which per Claude's documentation includes claude.ai, get the response headers at once and a keep-alive every 15 seconds while a tool waits. Clients on protocol 2026-07-28 get no byte until the tool answers.
+- **Let one answer take 60 seconds.** A tool call can wait up to 30 seconds on the server and then read for up to 20, so an answer comes within 50 seconds. That fits the 60 second read timeout most proxies have by default. Clients on protocol 2025-11-25 or older, which per Claude's documentation includes claude.ai, get the response headers at once and a keep-alive every 15 seconds while a tool waits. Clients on protocol 2026-07-28 get no byte until the tool answers.
 - **Pass WebSocket upgrades**, for the web app's live download updates.
 
 Each example serves `music.example.com` and sends requests to Soulbeet at `soulbeet:9765`.
@@ -155,7 +155,7 @@ Leave `httpHostHeader` unset, so the public name reaches Soulbeet as `Host`; the
 
 Two Cloudflare limits:
 
-- Cloudflare answers 524 when the origin sends nothing for 125 seconds. Clients on protocol 2026-07-28 get no byte until a tool answers, so for them a wait longer than about 120 seconds can end in a 524 while the work goes on in Soulbeet. Clients on 2025-11-25 or older get a keep-alive every 15 seconds and are not affected.
+- Cloudflare answers 524 when the origin sends nothing for 125 seconds. Soulbeet answers a tool call within about 50 seconds, so this limit is not reached.
 - WAF and bot rules must let Claude's addresses, `160.79.104.0/21`, through.
 
 ## Check the address
@@ -301,7 +301,7 @@ What each tool does, in the order Claude sees them. Every tool answers one JSON 
 - `find_sources`: searches Soulseek through slskd for a track or an album and ranks what it finds; searches run one at a time for the whole server.
 - `get_sources`: reads a search `find_sources` started, a page at a time.
 - `get_jobs`: shows jobs by id or by batch: state, current download, earlier attempts, import, and the calls that can be made next.
-- `get_batch`: follows a batch, and can wait up to 180 seconds for a change; for a batch with a playlist, how far the playlist is.
+- `get_batch`: follows a batch, and can wait up to 30 seconds for a change; for a batch with a playlist, how far the playlist is.
 - `list_batches`: the user's batches, newest first, so a new chat finds earlier work.
 - `ensure_in_library`: the main way to get music: for up to 50 tracks or albums, says which the library has and starts a job for each other one, all in one batch, optionally filling a playlist as jobs finish.
 - `retry_job`: tries a job again with the same source later, the next source, a new search, a new wait for Navidrome, or after rejecting a wrong result.
@@ -356,7 +356,7 @@ Soulbeet's limits:
 | Source searches from apps | one at a time on the whole server; 3 waiting per user |
 | Sources tried per track | 4 by default, at most 10 (`max_attempts`) |
 | `find_sources` wait | 45 seconds, then `get_sources` |
-| Waits (`wait_seconds`) | up to 180 seconds per call |
+| Waits (`wait_seconds`) | up to 30 seconds per call |
 | Navidrome lookups after a wait | 20 seconds per call in all; the rest fail `navidrome_unreachable` in `library_songs_failure` |
 | One answer | 60,000 characters; one job document 45,000 |
 | `find_in_library` | 100 references per call |
@@ -382,7 +382,7 @@ Soulbeet's limits:
 | Refreshes | 10 a minute per connection |
 | Client metadata fetches | 10 a minute per user |
 
-Claude's own limits: a tool call may take 240 seconds, and a result about 150,000 characters.
+Claude's own limits: claude.ai was seen to drop a tool call after 90 seconds (November 2026), and a result about 150,000 characters.
 
 ## Troubleshooting
 
@@ -619,7 +619,7 @@ The delete tools:
 
 Proxies and Claude:
 
-28. Behind Cloudflare, clients on protocol 2026-07-28 get no byte until a tool answers, so a wait longer than about 120 seconds can end in Cloudflare's 524 after 125 seconds while the work goes on.
+28. A tool call waits at most 30 seconds for running work, since claude.ai was seen to drop a call after 90 seconds and many proxies end a silent answer after 60. Claude follows long work by calling again.
 29. `get_tag_tracks` (tracks of a genre or tag from Last.fm or ListenBrainz) is not built.
 
 ## Security

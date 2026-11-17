@@ -353,11 +353,11 @@ test('the Christmas playlist is filled through every injected failure by followi
     // Job id to the failure codes acted on.
     const acted = new Map<string, string[]>();
     for (let round = 0; ; round++) {
-      expect(round, 'get_batch rounds').toBeLessThan(40);
+      expect(round, 'get_batch rounds').toBeLessThan(240);
       const b = (await a.ok('get_batch', {
         batch_id: batchId,
         since: cursor,
-        wait_seconds: 180,
+        wait_seconds: 30,
         wait_for: 'needs_action',
       })) as Batch;
       cursor = b.cursor;
@@ -471,10 +471,10 @@ test('the Christmas playlist is filled through every injected failure by followi
     const jobId = nth(ensured.results, 0).job_id as string;
     let job: JobDoc | undefined;
     for (let round = 0; job === undefined; round++) {
-      expect(round, 'get_batch rounds').toBeLessThan(3);
+      expect(round, 'get_batch rounds').toBeLessThan(18);
       const b = (await a.ok('get_batch', {
         batch_id: ensured.batch_id,
-        wait_seconds: 180,
+        wait_seconds: 30,
         wait_for: 'needs_action',
       })) as Batch;
       job = b.needs_action.find((j) => j.job_id === jobId);
@@ -698,13 +698,13 @@ test('the Christmas playlist is filled through every injected failure by followi
     })) as Items & { batch_id: string };
     const replaceJob = nth(ensured.results, 0);
     expect(replaceJob.status).toBe('job_created');
-    // One download of a seeded track and its import take well under one 180 s wait; four bound
+    // One download of a seeded track and its import can outlast one 30 s wait; twenty-four bound
     // a slow CI runner at 12 minutes, under the test's 20.
     for (let round = 0; ; round++) {
-      expect(round, 'get_batch rounds').toBeLessThan(4);
+      expect(round, 'get_batch rounds').toBeLessThan(24);
       const b = (await a.ok('get_batch', {
         batch_id: ensured.batch_id,
-        wait_seconds: 180,
+        wait_seconds: 30,
         wait_for: 'all_terminal',
       })) as Batch;
       if (b.all_terminal) break;

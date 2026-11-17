@@ -7,8 +7,10 @@ use shared::failure::Failure;
 
 use crate::ledger::Ledger;
 
-/// The longest wait a call takes, leaving a margin under Claude's 240 second call limit.
-pub(crate) const MAX_WAIT: Duration = Duration::from_secs(180);
+/// The longest wait a call takes. With the 20 seconds a call may then read for, an answer comes
+/// within 50 seconds: under the 60 second read timeout common reverse proxies have by default,
+/// and under the 90 seconds after which claude.ai was seen to drop a call (2026-11-17).
+pub(crate) const MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// Reads with `read` until `ready` holds for what it read, reading again on every ledger
 /// change, or until `wait` (at most MAX_WAIT) has passed: the last read either way.

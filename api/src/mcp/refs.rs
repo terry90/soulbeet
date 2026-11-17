@@ -133,7 +133,7 @@ macro_rules! page_schema {
 /// The properties of a call that waits for running work to change (design 10.4).
 macro_rules! wait_schema {
     () => {
-        r#""wait_seconds": {"type": "integer", "minimum": 0, "maximum": 180}, "wait_for": {"enum": ["any_change", "needs_action", "all_terminal"]}"#
+        r#""wait_seconds": {"type": "integer", "minimum": 0, "maximum": 30}, "wait_for": {"enum": ["any_change", "needs_action", "all_terminal"]}"#
     };
 }
 

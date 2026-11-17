@@ -355,7 +355,7 @@ async fn run(
         .map(|batch_id| {
             NextCall::new(
                 "get_batch",
-                json!({"batch_id": batch_id, "wait_seconds": 180, "wait_for": "needs_action"}),
+                json!({"batch_id": batch_id, "wait_seconds": 30, "wait_for": "needs_action"}),
             )
         })
         .collect();
@@ -942,7 +942,7 @@ mod tests {
         let batch_id = doc["batch_id"].as_str().unwrap();
         assert_eq!(
             doc["next"][0]["args"],
-            json!({"batch_id": batch_id, "wait_seconds": 180, "wait_for": "needs_action"})
+            json!({"batch_id": batch_id, "wait_seconds": 30, "wait_for": "needs_action"})
         );
         assert_eq!(doc["results"][1]["fuzzy_matches"], json!([]));
         // One batch, labelled with the one item that needed a job, holding that job.
@@ -2169,7 +2169,7 @@ mod tests {
                 app,
                 &token,
                 "get_batch",
-                json!({"batch_id": batch, "wait_seconds": 180, "wait_for": "needs_action"}),
+                json!({"batch_id": batch, "wait_seconds": 30, "wait_for": "needs_action"}),
             )
             .await,
         );
@@ -2466,7 +2466,7 @@ mod tests {
         );
         assert_eq!(
             doc["next"],
-            json!([{"tool": "get_batch", "args": {"batch_id": batch_id, "wait_seconds": 180,
+            json!([{"tool": "get_batch", "args": {"batch_id": batch_id, "wait_seconds": 30,
                 "wait_for": "needs_action"}}])
         );
         let playlist_state = || async {
