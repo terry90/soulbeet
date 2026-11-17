@@ -353,10 +353,11 @@ fn track_answer(
     use FailureCode::*;
     let next = match failure.code {
         UnknownHandle | ExpiredHandle => Some(NextCall::new("get_discovery", json!({}))),
-        ImportFilesGone | ImportAlreadyInLibrary => Some(NextCall::new(
-            "remove_discovery_track",
-            json!({"track_id": track_id}),
-        )),
+        // It deletes the staged file: the user says yes first, as for any deletion offered.
+        ImportFilesGone | ImportAlreadyInLibrary => Some(
+            NextCall::new("remove_discovery_track", json!({"track_id": track_id}))
+                .with("requires_user_confirmation", json!(true)),
+        ),
         _ => None,
     };
     let facts = Map::from_iter([("track_id".to_string(), json!(track_id))]);
@@ -703,7 +704,8 @@ mod tests {
             (
                 Some("import_files_gone"),
                 &json!({"track_id": "t1"}),
-                &json!([{"tool": "remove_discovery_track", "args": {"track_id": "t1"}}])
+                &json!([{"tool": "remove_discovery_track", "args": {"track_id": "t1"},
+                    "requires_user_confirmation": true}])
             )
         );
         let error = &document(
@@ -806,7 +808,8 @@ mod tests {
             (error["code"].as_str(), &error["next"]),
             (
                 Some("import_already_in_library"),
-                &json!([{"tool": "remove_discovery_track", "args": {"track_id": "t1"}}])
+                &json!([{"tool": "remove_discovery_track", "args": {"track_id": "t1"},
+                    "requires_user_confirmation": true}])
             )
         );
         assert_eq!(effects.imports()[0].2, Replace::Never);
