@@ -27,7 +27,7 @@ use crate::core::jobs::{
 };
 use crate::core::library::SongFacts;
 use crate::core::sources::{self, Candidate, DroppedByFilter, SearchProgress};
-use crate::ledger::store::AttemptRecord;
+use crate::ledger::store::{AttemptRecord, StoredSearch};
 use crate::ledger::{JobKind, JobState, Replacement, ReplacementOutcome, SlotResult, StoredSpec};
 use crate::services::DEFAULT_DOWNLOAD_BACKEND;
 
@@ -621,7 +621,27 @@ fn job_search_facts(view: &JobView) -> Map<String, Value> {
         return search_facts(None, &StoredSpec::default(), &DroppedByFilter::default());
     };
     let spec = search.spec.clone().unwrap_or_default();
-    let (stats, dropped) = match SearchProgress::of(search) {
+    let (stats, dropped) = job_search_read(view, search);
+    search_facts(stats.as_ref(), &spec, &dropped)
+}
+
+/// Whether the job's own filters dropped files of its search: a search without them could find
+/// what this one dropped.
+pub(crate) fn job_filters_dropped(view: &JobView) -> bool {
+    let Some(search) = &view.search else {
+        return false;
+    };
+    let (_, d) = job_search_read(view, search);
+    d.format + d.bitrate + d.not_lossless + d.queue_length > 0
+}
+
+/// The stats of `view`'s search `search` and what the job's filters and excluded sources
+/// dropped of it; nothing dropped while it runs or after it failed.
+fn job_search_read(
+    view: &JobView,
+    search: &StoredSearch,
+) -> (Option<SearchStats>, DroppedByFilter) {
+    match SearchProgress::of(search) {
         SearchProgress::Done(groups, stats) => {
             let kept = sources::view(
                 &search.id,
@@ -634,8 +654,7 @@ fn job_search_facts(view: &JobView) -> Map<String, Value> {
         }
         SearchProgress::Failed(_, stats) => (stats, DroppedByFilter::default()),
         SearchProgress::Running => (None, DroppedByFilter::default()),
-    };
-    search_facts(stats.as_ref(), &spec, &dropped)
+    }
 }
 
 /// The facts of `slot`'s failed transfer (design 10.2): the attempt its row is of, the file and

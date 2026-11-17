@@ -1157,6 +1157,58 @@ mod tests {
 
     // On the real clock: the search polls once, after 2 s.
     #[tokio::test]
+    async fn a_job_whose_filters_dropped_every_file_is_offered_the_search_without_them() {
+        use crate::ledger::SourceFilters;
+        use crate::server_fns::download::test_support::{group, item};
+        use shared::download::FileFacts;
+        let (db, acq, effects, token) = jobs_app().await;
+        let mp3 = shared::download::DownloadableItem {
+            facts: FileFacts {
+                extension: Some("mp3".into()),
+                bitrate_kbps: Some(320),
+                ..FileFacts::default()
+            },
+            ..item("peer_b", "O Holy Night", "b/03.mp3")
+        };
+        effects.stub().script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            vec![group("peer_b", vec![mp3], 0.85)],
+        ))]);
+        let lossless = crate::ledger::JobOptions {
+            filters: SourceFilters {
+                lossless_only: true,
+                ..Default::default()
+            },
+            ..auto_options()
+        };
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", lossless).await;
+        drive(&acq, &test_ctx("alice"), &job).await;
+        let doc = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "get_jobs",
+                json!({"job_ids": [job]}),
+            )
+            .await,
+        );
+        let failure = &doc["jobs"][0]["failure"];
+        assert_eq!(failure["code"], "search_all_filtered", "{doc}");
+        // Not the same search again: without the filters, then other words.
+        assert_eq!(
+            failure["next"],
+            json!([{"tool": "retry_job", "args": {"job_id": job, "mode": "new_search",
+                    "formats": []}},
+                {"tool": "retry_job", "args": {"job_id": job, "mode": "new_search"},
+                    "needs": ["query_text"]},
+                {"tool": "dismiss_job", "args": {"job_id": job}}]),
+            "{doc}"
+        );
+    }
+
+    // On the real clock: the search polls once, after 2 s.
+    #[tokio::test]
     async fn a_job_whose_search_found_nothing_shows_what_the_search_read() {
         let (db, acq, effects, token) = jobs_app().await;
         effects.stub().script_polls(vec![Ok(SearchResult {
@@ -1198,7 +1250,8 @@ mod tests {
             (doc["jobs"][0]["state"].as_str(), &failure["next"]),
             (
                 Some("failed"),
-                &json!([{"tool": "retry_job", "args": {"job_id": job, "mode": "new_search"}},
+                &json!([{"tool": "retry_job", "args": {"job_id": job, "mode": "new_search"},
+                        "needs": ["query_text"]},
                     {"tool": "dismiss_job", "args": {"job_id": job}}])
             )
         );

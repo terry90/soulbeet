@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 
 use super::contract::NextCall;
-use super::facts::candidate_document;
+use super::facts::{candidate_document, job_filters_dropped};
 use crate::core::deletion::SONGS_PER_TOKEN;
 use crate::core::jobs::decide::kept_imports;
 use crate::core::jobs::{allowed, job_failure, slot_failure, JobView, RetryMode, Untried};
@@ -80,7 +80,7 @@ pub(crate) fn next_calls(
         ];
         for mode in modes {
             if allowed(view, untried, mode) {
-                next.push(retry_call(view, untried, mode, failure.as_ref()));
+                next.extend(retry_calls(view, untried, mode, failure.as_ref()));
             }
         }
     }
@@ -136,19 +136,20 @@ fn leftover_previews(view: &JobView) -> Vec<NextCall> {
 
 /// retry_job in `mode` for the job, with its deciding facts: same_source the wait its failure
 /// asks for, next_source how many untried candidates are left and the best one, new_search after
-/// a failed search the wait that search's failure asks for.
-fn retry_call(
+/// a failed search the wait that search's failure asks for. A search that found nothing usable
+/// says another query is needed (`needs` query_text), after the same search without the job's
+/// filters when they dropped files, as find_sources offers them: the same search again would
+/// end the same way.
+fn retry_calls(
     view: &JobView,
     untried: &Untried,
     mode: RetryMode,
     failure: Option<&Failure>,
-) -> NextCall {
-    let call = NextCall::new(
-        "retry_job",
-        json!({"job_id": view.job.id, "mode": mode.as_str()}),
-    );
+) -> Vec<NextCall> {
+    let args = json!({"job_id": view.job.id, "mode": mode.as_str()});
+    let call = NextCall::new("retry_job", args.clone());
     let wait = failure.and_then(|f| f.retry_after_seconds);
-    match mode {
+    let call = match mode {
         RetryMode::SameSource => call.with("retry_after_seconds", json!(wait)),
         RetryMode::NextSource => {
             let wanted = view.search.as_ref().map_or(&view.job.wanted, |s| &s.query);
@@ -156,14 +157,24 @@ fn retry_call(
             call.with("untried_candidates", json!(untried.candidates.len()))
                 .with("best_candidate", json!(best))
         }
-        RetryMode::NewSearch => match (failure, wait) {
-            (Some(f), Some(wait)) if f.stage == Stage::SourceSearch => {
+        RetryMode::NewSearch => match failure {
+            Some(f) if f.stage == Stage::SourceSearch && f.retry == RetryAdvice::OtherQuery => {
+                let mut unfiltered = args;
+                // Any filter given replaces the job's: none is left.
+                unfiltered["formats"] = json!([]);
+                let unfiltered = job_filters_dropped(view)
+                    .then(|| NextCall::new("retry_job", unfiltered));
+                let other = call.with("needs", json!(["query_text"]));
+                return unfiltered.into_iter().chain([other]).collect();
+            }
+            Some(f) if f.stage == Stage::SourceSearch && wait.is_some() => {
                 call.with("retry_after_seconds", json!(wait))
             }
             _ => call,
         },
         RetryMode::IndexOnly | RetryMode::RejectResult => call,
-    }
+    };
+    vec![call]
 }
 
 #[cfg(test)]
