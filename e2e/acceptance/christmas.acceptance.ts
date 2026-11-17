@@ -642,8 +642,13 @@ test('the Christmas playlist is filled through every injected failure by followi
     expect(listFilesRecursive(folder.hostPath).filter((f) => basename(f).includes('In the Bleak Midwinter'))).toEqual(
       [],
     );
-    const titles = libraryItems(folder.name).map((i) => i.title);
-    expect([titles.includes('In the Bleak Midwinter'), titles.includes('O Holy Night')]).toEqual([false, true]);
+    // delete_tracks queues the beets forget on the folder's import worker and does not wait for it.
+    await expect
+      .poll(() => {
+        const titles = libraryItems(folder.name).map((i) => i.title);
+        return [titles.includes('In the Bleak Midwinter'), titles.includes('O Holy Night')];
+      })
+      .toEqual([false, true]);
 
     // The same token again: used, and next points at the history, which names the app.
     const reused = await a.call(yes.tool, yes.args);
