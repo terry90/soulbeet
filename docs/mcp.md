@@ -641,6 +641,7 @@ The release that adds Claude (MCP) access changes these on the first start:
 
 - `MCP` is on unless you set it off, but the endpoints stay closed until the Security Checks in Settings > Config pass.
 - A `SECRET_KEY` under 32 bytes is no longer used, nor the key built into earlier versions for installs without `SECRET_KEY`: Soulbeet signs sessions with the key it generates in `secret.key`. Everyone is signed out once; stored Navidrome passwords are stored again under the new key on that start.
+- `NAVIDROME_MUSIC_PATH` now names where Soulbeet sees the root of Navidrome's default library, not Navidrome's own path. If you set it for an earlier version, change it to the path inside the Soulbeet container, or remove it. While it names no folder Soulbeet can see, the startup log and Settings > Library > Deletion Checks say so, and every deletion in that library is refused with `delete_path_unresolved`.
 - A browser tab left open across the upgrade cannot read a Deletion History row of reason `cleanup` until it reloads.
 - The checks' messages no longer name file paths, in Settings > Library ("Kept by auto-delete") and in import notes.
 - Turning on **Allow deleting music** for an app asks first, with the text quoted under [Connected apps](#connected-apps).

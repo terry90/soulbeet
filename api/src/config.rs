@@ -238,6 +238,11 @@ impl AppConfig {
         self.navidrome_music_path.as_deref()
     }
 
+    /// Why NAVIDROME_MUSIC_PATH cannot be used, when it is set and no folder here.
+    pub fn navidrome_music_path_problem(&self) -> Option<String> {
+        navidrome_music_path_problem(self.navidrome_music_path())
+    }
+
     /// Who can create accounts.
     pub fn registration(&self) -> RegistrationMode {
         self.registration
@@ -255,6 +260,20 @@ impl AppConfig {
             false => ImportMode::Singleton,
         }
     }
+}
+
+/// Why `path`, the NAVIDROME_MUSIC_PATH set, cannot be used: it is no folder here. Earlier
+/// versions read it as Navidrome's own path of its library, which is often not one here.
+#[cfg(feature = "server")]
+fn navidrome_music_path_problem(path: Option<&Path>) -> Option<String> {
+    let path = path.filter(|p| !p.is_dir())?;
+    Some(format!(
+        "NAVIDROME_MUSIC_PATH is {}, which is not a folder Soulbeet can see. It names where \
+         Soulbeet sees the root of Navidrome's default library (earlier versions read it as \
+         Navidrome's own path). Until it names that folder or is removed, no song of that \
+         library is deleted or replaced: auto-delete keeps every one.",
+        path.display()
+    ))
 }
 
 #[cfg(feature = "server")]
@@ -282,6 +301,25 @@ mod tests {
         assert_eq!(public_url_problem(None), None);
         let good = BaseUrl::parse("https://music.example.com");
         assert_eq!(public_url_problem(Some(&good)), None);
+    }
+
+    #[test]
+    fn a_navidrome_music_path_that_is_no_folder_here_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(navidrome_music_path_problem(None), None);
+        assert_eq!(navidrome_music_path_problem(Some(dir.path())), None);
+        let missing = dir.path().join("media/music");
+        let problem = navidrome_music_path_problem(Some(&missing)).unwrap();
+        assert!(
+            problem.starts_with(&format!(
+                "NAVIDROME_MUSIC_PATH is {}, which is not a folder Soulbeet can see.",
+                missing.display()
+            )),
+            "{problem}"
+        );
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        assert!(navidrome_music_path_problem(Some(&file)).is_some());
     }
 
     #[test]

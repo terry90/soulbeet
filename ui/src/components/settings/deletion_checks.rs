@@ -1,4 +1,4 @@
-use api::{get_deletion_blocks, get_unreadable_listeners};
+use api::{get_deletion_blocks, get_navidrome_music_path_problem, get_unreadable_listeners};
 use dioxus::prelude::*;
 use shared::navidrome::{BlockedDeletion, UnreadableListener};
 
@@ -6,10 +6,18 @@ use super::panel::{LoadError, Loading, Panel, SectionTitle};
 use crate::auth::use_auth;
 use crate::friendly_error;
 
-/// What auto-delete kept and why; for admins also the accounts the deletion check cannot read.
+/// What auto-delete kept and why; for admins also a NAVIDROME_MUSIC_PATH that is no folder and
+/// the accounts the deletion check cannot read.
 #[component]
 pub fn DeletionChecksPanel() -> Element {
     let auth = use_auth();
+    let music_path = use_resource(move || async move {
+        if auth.is_admin() {
+            auth.call(get_navidrome_music_path_problem()).await.ok().flatten()
+        } else {
+            None
+        }
+    });
     let mut kept = use_resource(move || async move { auth.call(get_deletion_blocks()).await });
     let mut unreadable = use_resource(move || async move {
         if auth.is_admin() {
@@ -21,6 +29,7 @@ pub fn DeletionChecksPanel() -> Element {
 
     rsx! {
         Panel { title: "Deletion Checks",
+            MusicPathProblem { problem: music_path.read().clone().flatten() }
             match &*kept.read() {
                 None => rsx! { Loading {} },
                 Some(Err(e)) => rsx! {
@@ -36,6 +45,15 @@ pub fn DeletionChecksPanel() -> Element {
                 Some(Ok(None)) => rsx! {},
                 Some(Ok(Some(l))) => rsx! { UnreadableList { listeners: l.clone() } },
             }
+        }
+    }
+}
+
+#[component]
+fn MusicPathProblem(problem: Option<String>) -> Element {
+    rsx! {
+        if let Some(problem) = problem {
+            p { class: "text-sm font-mono text-yellow-400 mb-4", "{problem}" }
         }
     }
 }
@@ -99,6 +117,21 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn a_music_path_problem_is_shown_when_there_is_one() {
+        let render = |problem: Option<String>| {
+            let mut dom = VirtualDom::new_with_props(
+                |problem: Option<String>| rsx! { MusicPathProblem { problem } },
+                problem,
+            );
+            dom.rebuild_in_place();
+            dioxus_ssr::render(&dom)
+        };
+        assert!(render(Some("NAVIDROME_MUSIC_PATH is /media/music".into()))
+            .contains("NAVIDROME_MUSIC_PATH is /media/music"));
+        assert!(!render(None).contains("NAVIDROME_MUSIC_PATH"));
     }
 
     #[test]

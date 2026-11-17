@@ -72,6 +72,9 @@ fn main() {
             api::security::check_seeded_admin().await;
             api::folder_policy::log_folder_conflicts().await;
             api::models::user::log_username_collisions().await;
+            if let Some(problem) = api::config::CONFIG.navidrome_music_path_problem() {
+                dioxus::logger::tracing::warn!("{problem}");
+            }
             for reason in api::security::gate_reasons() {
                 dioxus::logger::tracing::warn!("MCP stays off: {}", reason.message);
             }

@@ -61,6 +61,13 @@ pub async fn get_unreadable_listeners() -> Result<Vec<UnreadableListener>, Serve
         .map_err(|e| failure_error(database_failure(Stage::Delete, e)))
 }
 
+/// Why NAVIDROME_MUSIC_PATH keeps deletions in Navidrome's default library from finding their
+/// files, when it does.
+#[get("/api/navidrome/music-path-problem", _: AdminSession)]
+pub async fn get_navidrome_music_path_problem() -> Result<Option<String>, ServerFnError> {
+    Ok(crate::config::CONFIG.navidrome_music_path_problem())
+}
+
 /// Check if the Soulbeet player in Navidrome has ReportRealPath enabled.
 /// Returns Some(true) if enabled, Some(false) if disabled, None if player not found yet.
 #[cfg(feature = "server")]
