@@ -55,21 +55,41 @@ const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Whether a socket upgrade may come from the page its `Origin` names: a
 /// page on the host and port the request was sent to, so a page opened at
-/// any of Soulful's addresses works, whatever `PUBLIC_URL` pins. The scheme
-/// is not compared, since a proxy may end TLS. A request with no `Origin`
-/// is not from a browser page, so no other site can be riding on the user's
-/// cookie.
+/// any of Soulbeet's addresses works, or on the address `public_url` (a
+/// usable `PUBLIC_URL`) declares, for a proxy that cannot pass the public
+/// name. The scheme is not compared, since a proxy may end TLS. A request
+/// with no `Origin` is not from a browser page, so no other site can be
+/// riding on the user's cookie. A refusal says which addresses were compared.
 #[cfg(feature = "server")]
-pub(crate) fn origin_allowed(headers: &HeaderMap, uri: &Uri) -> Result<bool, BaseUrlError> {
+pub(crate) fn origin_allowed(
+    headers: &HeaderMap,
+    uri: &Uri,
+    public_url: Option<&BaseUrl>,
+) -> Result<Result<(), String>, BaseUrlError> {
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
-        return Ok(true);
+        return Ok(Ok(()));
     };
+    let page = origin.to_str().ok().and_then(|o| BaseUrl::parse(o).ok());
+    if page
+        .as_ref()
+        .is_some_and(|page| public_url.is_some_and(|pin| page.same_host(pin)))
+    {
+        return Ok(Ok(()));
+    }
     let addressed = crate::base_url::addressed_to(headers, uri)?;
-    Ok(origin
-        .to_str()
-        .ok()
-        .and_then(|o| BaseUrl::parse(o).ok())
-        .is_some_and(|o| o.same_host(&addressed)))
+    if page.as_ref().is_some_and(|page| page.same_host(&addressed)) {
+        return Ok(Ok(()));
+    }
+    let shown = String::from_utf8_lossy(origin.as_bytes()).into_owned();
+    let pin = match public_url {
+        Some(pin) => format!("PUBLIC_URL names {}", pin.host_str()),
+        None => "PUBLIC_URL is not set".to_string(),
+    };
+    Ok(Err(format!(
+        "its page is at {shown}, the request was sent to {} and {pin}. A reverse proxy must pass \
+         the public name in Host or X-Forwarded-Host, or PUBLIC_URL must name it",
+        addressed.host_str()
+    )))
 }
 
 /// Whether the socket's token still gives `user` a session: not signed out,
@@ -107,10 +127,11 @@ pub async fn download_updates_ws(
 ) -> Result<Websocket<(), DownloadEvent>, ServerFnError> {
     let user = auth.0.id();
 
-    let allowed = origin_allowed(&headers, &uri)
+    let public_url = crate::config::CONFIG.public_url().and_then(|p| p.as_ref().ok());
+    let allowed = origin_allowed(&headers, &uri, public_url)
         .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
-    if !allowed {
-        warn!("Refused a download updates socket for user {user} from another origin");
+    if let Err(why) = allowed {
+        warn!("Refused a download updates socket for user {user}: {why}");
         return Err(forbidden_error(
             "Download updates can only be opened from Soulful's own page",
         ));
@@ -312,7 +333,8 @@ mod tests {
                     )
                 })
                 .collect();
-            origin_allowed(&headers, &Uri::from_static("/api/downloads/updates"))
+            origin_allowed(&headers, &Uri::from_static("/api/downloads/updates"), None)
+                .map(|allowed| allowed.is_ok())
         };
         let host = ("host", "music.example.com");
 
@@ -366,6 +388,46 @@ mod tests {
             allowed(&[("origin", "https://music.example.com")]),
             Err(BaseUrlError::MissingHost)
         );
+    }
+
+    #[test]
+    fn a_page_at_the_public_url_may_open_the_socket_through_a_proxy_that_drops_the_name() {
+        use axum::http::{HeaderName, HeaderValue};
+        let headers = |pairs: &[(&str, &str)]| -> HeaderMap {
+            pairs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                        HeaderValue::from_str(v).unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let uri = Uri::from_static("/api/downloads/updates");
+        // nginx without `proxy_set_header Host $host` sends its upstream name.
+        let proxied = headers(&[
+            ("host", "soulbeet:9765"),
+            ("origin", "https://music.example.com"),
+        ]);
+        let pin = BaseUrl::parse("https://music.example.com").unwrap();
+        assert_eq!(origin_allowed(&proxied, &uri, Some(&pin)), Ok(Ok(())));
+        assert_eq!(
+            origin_allowed(&proxied, &uri, None),
+            Ok(Err("its page is at https://music.example.com, the request was sent to \
+                 soulbeet:9765 and PUBLIC_URL is not set. A reverse proxy must pass the public \
+                 name in Host or X-Forwarded-Host, or PUBLIC_URL must name it"
+                .to_string()))
+        );
+        let other = BaseUrl::parse("https://other.example.com").unwrap();
+        let refused = origin_allowed(&proxied, &uri, Some(&other)).unwrap().unwrap_err();
+        assert!(refused.contains("PUBLIC_URL names other.example.com"), "{refused}");
+        // The page's own address still works with PUBLIC_URL set elsewhere.
+        let lan = headers(&[
+            ("host", "192.168.1.5:9765"),
+            ("origin", "http://192.168.1.5:9765"),
+        ]);
+        assert_eq!(origin_allowed(&lan, &uri, Some(&pin)), Ok(Ok(())));
     }
 
     #[tokio::test]
