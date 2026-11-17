@@ -325,6 +325,7 @@ pub(crate) async fn answer(
     };
     match answer_in(
         &state.db,
+        state.key,
         &user.user_id,
         &check,
         request_id,
@@ -642,7 +643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allowing_sends_a_single_use_code_with_state_and_issuer() {
+    async fn allowing_sends_a_code_with_state_and_issuer_and_a_double_click_the_same() {
         let (db, app) = app().await;
         let cookie = signed_in(&db, "u1", "alice").await;
         let (_, _, page) = get(
@@ -699,18 +700,30 @@ mod tests {
             )
         );
         assert!((before + 60..=before + 61).contains(&row.6), "{}", row.6);
+        // A double click sends the form again: the browser follows only this answer, so it is
+        // the same redirect, with no second code.
+        let (status, again, _) = post_form(
+            app.clone(),
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(redirect_of(&again), redirect_of(&headers));
+        assert_eq!(count(&db, "oauth_codes").await, 1);
+        // The other answer after this one is refused.
         let (status, _, page) = post_form(
             app,
             "/oauth/authorize",
             Some(&cookie),
-            &[("request", &id), ("decision", "allow")],
+            &[("request", &id), ("decision", "deny")],
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(page.contains(
             "This sign-in request expired or was already used. Start the connection again from the app."
         ));
-        assert_eq!(count(&db, "oauth_codes").await, 1);
     }
 
     #[tokio::test]
@@ -985,12 +998,13 @@ mod tests {
                 ])
             )
         );
+        // The answered request stays for a repeat of its answer only.
         assert_eq!(
             (
                 count(&db, "oauth_codes").await,
                 count(&db, "oauth_requests").await
             ),
-            (0, 0)
+            (0, 1)
         );
     }
 

@@ -34,6 +34,18 @@ pub(crate) fn valid_verifier(verifier: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~'))
 }
 
+/// The authorization code an Allow of consent request `request_id` issues: an HMAC-SHA256 of
+/// the request id under `key`, in unpadded base64url. The request id is a secret only the
+/// signed-in browser holds, so a repeat of the answer rebuilds the same code and no code is ever
+/// stored in the clear.
+pub(crate) fn code_for(key: &SecretKey, request_id: &str) -> String {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes a key of any length");
+    mac.update(b"soulful-oauth-code\0");
+    mac.update(request_id.as_bytes());
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
 /// The (access, refresh) pair that replaces refresh token `refresh`: each an
 /// HMAC-SHA256 of `refresh` under `key` with its own label, in unpadded
 /// base64url (D3). A repeat of `refresh` recomputes the same pair, so no

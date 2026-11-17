@@ -5,12 +5,17 @@ use sqlx::{SqliteConnection, SqliteExecutor, SqlitePool};
 
 use super::cimd::ClientDocument;
 use super::clients::{redirect_uris_from_db, upsert_cimd_in, ClientKind, KnownClient};
-use super::secrets::{hash, new_secret};
+use super::secrets::{code_for, hash};
+use crate::secret_key::SecretKey;
 
 /// How long the consent page can be answered, in seconds (D4).
 pub(crate) const REQUEST_LIFETIME: i64 = 600;
 /// How long a code can be redeemed, in seconds (D4).
 pub(crate) const CODE_LIFETIME: i64 = 60;
+/// How long an answered request answers the same answer again from the session that gave it,
+/// in seconds: a double click sends the form twice, and the browser follows only the second
+/// answer's redirect.
+pub(crate) const REPEAT_WINDOW: i64 = 30;
 /// Most unanswered requests a user has at once; storing one more drops the
 /// oldest.
 const PENDING_PER_USER: i64 = 20;
@@ -134,25 +139,63 @@ type RequestRow = (
     String,
 );
 
-/// The request once: deleted as it is read; None when unknown, another user's or expired.
+/// The request once, answered with `answer` by the session `session_id` as it is read: it then
+/// stays only REPEAT_WINDOW longer, for `answered_request_in`. None when unknown, another user's,
+/// expired or answered already.
 pub(crate) async fn take_request_in<'e>(
     db: impl SqliteExecutor<'e>,
     id: &str,
     user_id: &str,
+    session_id: &str,
+    answer: &str,
     now: i64,
 ) -> Result<Option<PendingRequest>, String> {
     let row: Option<RequestRow> = sqlx::query_as(
-        "DELETE FROM oauth_requests WHERE id_hash = ? AND user_id = ? AND expires_at > ? \
+        "UPDATE oauth_requests SET answer = ?, answered_session = ?, expires_at = ? \
+         WHERE id_hash = ? AND user_id = ? AND expires_at > ? AND answer IS NULL \
          RETURNING user_id, client_id, client_kind, client_name, client_redirect_uris, \
          redirect_uri, state, code_challenge, scope, resource",
     )
+    .bind(answer)
+    .bind(session_id)
+    .bind(now + REPEAT_WINDOW)
     .bind(hash(id))
     .bind(user_id)
     .bind(now)
     .fetch_optional(db)
     .await
     .map_err(|e| e.to_string())?;
-    let Some((
+    row.map(pending_of).transpose()
+}
+
+/// The request `id` the session `session_id` answered with `answer` within REPEAT_WINDOW.
+async fn answered_request_in<'e>(
+    db: impl SqliteExecutor<'e>,
+    id: &str,
+    user_id: &str,
+    session_id: &str,
+    answer: &str,
+    now: i64,
+) -> Result<Option<PendingRequest>, String> {
+    let row: Option<RequestRow> = sqlx::query_as(
+        "SELECT user_id, client_id, client_kind, client_name, client_redirect_uris, \
+         redirect_uri, state, code_challenge, scope, resource FROM oauth_requests \
+         WHERE id_hash = ? AND user_id = ? AND answer = ? AND answered_session = ? \
+           AND expires_at > ?",
+    )
+    .bind(hash(id))
+    .bind(user_id)
+    .bind(answer)
+    .bind(session_id)
+    .bind(now)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    row.map(pending_of).transpose()
+}
+
+fn pending_of(row: RequestRow) -> Result<PendingRequest, String> {
+    let (
         user_id,
         client_id,
         kind,
@@ -163,11 +206,8 @@ pub(crate) async fn take_request_in<'e>(
         code_challenge,
         scope,
         resource,
-    )) = row
-    else {
-        return Ok(None);
-    };
-    Ok(Some(PendingRequest {
+    ) = row;
+    Ok(PendingRequest {
         user_id,
         client: KnownClient {
             client_id,
@@ -180,7 +220,7 @@ pub(crate) async fn take_request_in<'e>(
         code_challenge,
         scope,
         resource,
-    }))
+    })
 }
 
 /// Stores `code` for `req`'s user, client, redirect URI, challenge, scope and
@@ -220,24 +260,51 @@ pub(crate) enum Answered {
 
 /// Takes `user_id`'s request `id` and answers it, in one BEGIN IMMEDIATE
 /// transaction that first checks the session: Allow stores a CIMD client
-/// as its document read (the code's client must exist) and issues a code.
+/// as its document read (the code's client must exist) and issues the code
+/// `code_for(key, id)`. The same answer from the same session within
+/// REPEAT_WINDOW answers as the first did, while its code is not redeemed:
+/// a double click gets the redirect the first answer's was abandoned for.
 pub(crate) async fn answer_in(
     db: &SqlitePool,
+    key: &SecretKey,
     user_id: &str,
     check: &SessionCheck,
     id: &str,
     allow: bool,
     now: i64,
 ) -> Result<Answered, Refused> {
+    let answer = if allow { "allow" } else { "deny" };
+    let session = &check.session_id;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     if !still_signed_in(&mut tx, user_id, check).await? {
         return Err(Refused::SessionEnded);
     }
-    let Some(pending) = take_request_in(&mut *tx, id, user_id, now)
+    let taken = take_request_in(&mut *tx, id, user_id, session, answer, now)
         .await
-        .map_err(Refused::Database)?
-    else {
-        return Ok(Answered::Gone);
+        .map_err(Refused::Database)?;
+    let Some(pending) = taken else {
+        let repeat = answered_request_in(&mut *tx, id, user_id, session, answer, now)
+            .await
+            .map_err(Refused::Database)?;
+        return Ok(match repeat {
+            None => Answered::Gone,
+            Some(pending) if !allow => Answered::Denied(pending),
+            Some(pending) => {
+                let code = code_for(key, id);
+                let unused: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM oauth_codes \
+                     WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?)",
+                )
+                .bind(hash(&code))
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await?;
+                match unused {
+                    true => Answered::Allowed(pending, code),
+                    false => Answered::Gone,
+                }
+            }
+        });
     };
     if !allow {
         tx.commit().await?;
@@ -253,7 +320,7 @@ pub(crate) async fn answer_in(
             .await
             .map_err(Refused::Database)?;
     }
-    let code = new_secret();
+    let code = code_for(key, id);
     store_code_in(&mut *tx, &code, &pending, now)
         .await
         .map_err(Refused::Database)?;
@@ -265,7 +332,7 @@ pub(crate) async fn answer_in(
 mod tests {
     use super::*;
     use crate::connection::test_util::{
-        add_user, behind_a_writer, count, fresh_session, CHALLENGE, CLAUDE_CALLBACK,
+        add_user, behind_a_writer, count, fresh_session, test_key, CHALLENGE, CLAUDE_CALLBACK,
     };
     use crate::db::test_db;
 
@@ -296,7 +363,7 @@ mod tests {
         store_request_in(&db, &fresh_session(), "r2", &request("u1"), 1_000)
             .await
             .unwrap();
-        let taken = take_request_in(&db, "r1", "u1", 1_000 + REQUEST_LIFETIME - 1)
+        let taken = take_request_in(&db, "r1", "u1", "fresh-session", "allow", 1_000 + REQUEST_LIFETIME - 1)
             .await
             .unwrap()
             .expect("answerable until its last second");
@@ -308,11 +375,12 @@ mod tests {
             ),
             ("dcr_test", ClientKind::Dcr, CLAUDE_CALLBACK)
         );
-        assert!(take_request_in(&db, "r2", "u1", 1_000 + REQUEST_LIFETIME)
+        assert!(take_request_in(&db, "r2", "u1", "fresh-session", "allow", 1_000 + REQUEST_LIFETIME)
             .await
             .unwrap()
             .is_none());
-        // The expired request goes with the user's next one.
+        // The expired request goes with the user's next one; the answered one stays
+        // REPEAT_WINDOW after its answer.
         store_request_in(
             &db,
             &fresh_session(),
@@ -322,7 +390,17 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(count(&db, "oauth_requests").await, 1);
+        assert_eq!(count(&db, "oauth_requests").await, 2);
+        store_request_in(
+            &db,
+            &fresh_session(),
+            "r4",
+            &request("u1"),
+            1_000 + REQUEST_LIFETIME - 1 + REPEAT_WINDOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&db, "oauth_requests").await, 2);
     }
 
     #[tokio::test]
@@ -339,8 +417,8 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(count(&db, "oauth_requests").await, PENDING_PER_USER + 1);
-        assert!(take_request_in(&db, "r0", "u1", 0).await.unwrap().is_none());
-        assert!(take_request_in(&db, "bob's", "u2", 0)
+        assert!(take_request_in(&db, "r0", "u1", "fresh-session", "allow", 0).await.unwrap().is_none());
+        assert!(take_request_in(&db, "bob's", "u2", "fresh-session", "allow", 0)
             .await
             .unwrap()
             .is_some());
@@ -382,7 +460,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            answer_in(&db, "u1", &fresh_session(), "r1", true, 0).await,
+            answer_in(&db, test_key(), "u1", &fresh_session(), "r1", true, 0).await,
             Err(Refused::SessionEnded)
         ));
         assert_eq!(
@@ -403,7 +481,7 @@ mod tests {
             Err(Refused::SessionEnded)
         );
         assert!(matches!(
-            answer_in(&db, "u1", &other, "r1", true, 0).await,
+            answer_in(&db, test_key(), "u1", &other, "r1", true, 0).await,
             Err(Refused::SessionEnded)
         ));
         assert_eq!(
@@ -426,11 +504,11 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            answer_in(&db, "u1", &fresh_session(), "deny", false, 0).await,
+            answer_in(&db, test_key(), "u1", &fresh_session(), "deny", false, 0).await,
             Ok(Answered::Denied(_))
         ));
         let Ok(Answered::Allowed(pending, code)) =
-            answer_in(&db, "u1", &fresh_session(), "allow", true, 0).await
+            answer_in(&db, test_key(), "u1", &fresh_session(), "allow", true, 0).await
         else {
             panic!("allow issues a code");
         };
@@ -441,9 +519,42 @@ mod tests {
                 .fetch_one(&db)
                 .await
                 .unwrap();
-        assert_eq!((stored, count(&db, "oauth_requests").await), (1, 0));
+        assert_eq!(stored, 1);
+        // A second submit of the same answer by the same session (a double click) answers the
+        // same, within REPEAT_WINDOW and while the code is unused.
+        let Ok(Answered::Allowed(_, again)) =
+            answer_in(&db, test_key(), "u1", &fresh_session(), "allow", true, 10).await
+        else {
+            panic!("the repeat gets the same redirect");
+        };
+        assert_eq!(again, code);
         assert!(matches!(
-            answer_in(&db, "u1", &fresh_session(), "allow", true, 0).await,
+            answer_in(&db, test_key(), "u1", &fresh_session(), "deny", false, 10).await,
+            Ok(Answered::Denied(_))
+        ));
+        assert_eq!(count(&db, "oauth_codes").await, 1, "no second code");
+        // Another answer, another session, or too late: gone.
+        let other = SessionCheck {
+            session_id: "other-session".into(),
+            ..fresh_session()
+        };
+        for (check, allow, at) in [
+            (fresh_session(), false, 10),
+            (other, true, 10),
+            (fresh_session(), true, REPEAT_WINDOW),
+        ] {
+            assert!(matches!(
+                answer_in(&db, test_key(), "u1", &check, "allow", allow, at).await,
+                Ok(Answered::Gone)
+            ));
+        }
+        // Once the code is redeemed, a repeat is gone too.
+        sqlx::query("UPDATE oauth_codes SET used_at = 5")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            answer_in(&db, test_key(), "u1", &fresh_session(), "allow", true, 10).await,
             Ok(Answered::Gone)
         ));
     }
@@ -465,7 +576,7 @@ mod tests {
         let answered = behind_a_writer(&db, {
             let db = db.clone();
             async move {
-                answer_in(&db, "u1", &fresh_session(), "r1", true, 0)
+                answer_in(&db, test_key(), "u1", &fresh_session(), "r1", true, 0)
                     .await
                     .map(|answered| matches!(answered, Answered::Allowed(..)))
             }

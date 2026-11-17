@@ -422,7 +422,7 @@ Soulbeet's sign-in and consent pages show these texts:
 - "Soulful does not know this app. Start the connection again from the app."
 - "This app asked to return to an address it did not register."
 - "Your Soulful session ended. Start the connection again from the app."
-- "This sign-in request expired or was already used. Start the connection again from the app." A sign-in request lasts 10 minutes.
+- "This sign-in request expired or was already used. Start the connection again from the app." A sign-in request lasts 10 minutes. Clicking Allow (or Deny) twice is fine: for 30 seconds the same answer from the same browser goes back to the app the same way.
 - "Soulful did not understand the answer. Start the connection again from the app."
 - "Soulful's database is unavailable. Start the connection again from the app."
 - "This app sent {parameter} more than once. Start the connection again from the app."
