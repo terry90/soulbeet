@@ -15,7 +15,7 @@ services:
       - "9765:9765"
     environment:
       - DATABASE_URL=sqlite:/data/soulbeet.db
-      - SECRET_KEY=e2e-secret-key
+      - SECRET_KEY=e2e-secret-key-0123456789abcdefghijklmnop
       - REGISTRATION=open
       - DOWNLOAD_PATH=/downloads
       - BEETS_CONFIG=/app/beets-e2e.yaml
@@ -38,7 +38,7 @@ services:
       - "9766:9765"
     environment:
       - DATABASE_URL=sqlite:/data/soulbeet.db
-      - SECRET_KEY=e2e-secret-key
+      - SECRET_KEY=e2e-secret-key-0123456789abcdefghijklmnop
       - REGISTRATION=open
       - DOWNLOAD_PATH=/downloads
       - BEETS_CONFIG=/config/config.yaml

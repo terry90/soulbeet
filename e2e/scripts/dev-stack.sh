@@ -100,7 +100,7 @@ up() {
 
   (cd "$SERVER_DIR" && \
     DATABASE_URL="sqlite:$RUNTIME/data/soulbeet.db" \
-    SECRET_KEY="e2e-secret-key" \
+    SECRET_KEY="e2e-secret-key-0123456789abcdefghijklmnop" \
     REGISTRATION=open \
     DOWNLOAD_PATH="$RUNTIME/downloads" \
     BEETS_CONFIG="$E2E_DIR/.fixtures/beets-e2e.yaml" \
@@ -112,7 +112,7 @@ up() {
 
   (cd "$SERVER_DIR" && \
     DATABASE_URL="sqlite:$RUNTIME/data/user90.db" \
-    SECRET_KEY="e2e-secret-key" \
+    SECRET_KEY="e2e-secret-key-0123456789abcdefghijklmnop" \
     REGISTRATION=open \
     DOWNLOAD_PATH="$RUNTIME/downloads" \
     BEETS_CONFIG="$RUNTIME/user90-config/config.yaml" \
