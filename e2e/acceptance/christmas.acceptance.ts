@@ -481,8 +481,9 @@ test('the Christmas playlist is filled through every injected failure by followi
     }
     expect(job.failure).toMatchObject({ code: 'search_no_results', stage: 'source_search', retry: 'other_query' });
     expect(nextStep(followerView(job))).toMatchObject({ kind: 'stuck' });
-    const dismiss = job.next.find((n) => n.tool === 'dismiss_job') as NextCall;
-    expect((await a.ok(dismiss.tool, dismiss.args)).state).toBe('dismissed');
+    const dismiss = job.next.find((n) => n.tool === 'dismiss_job');
+    expect(dismiss, JSON.stringify(job)).toBeDefined();
+    expect((await a.ok(dismiss!.tool, dismiss!.args)).state).toBe('dismissed');
   });
 
   await test.step('another user sees none of it', async () => {
@@ -575,15 +576,18 @@ test('the Christmas playlist is filled through every injected failure by followi
 
     // Only the owner has the switch: an admin sees her app, and can disconnect it, but not allow it to delete.
     const adminContext = await browser.newContext();
-    const adminPage = await adminContext.newPage();
-    await loginViaUi(adminPage, { username: 'admin', password: mcpAdminPassword });
-    await openSettings(adminPage);
-    await adminPage.getByRole('button', { name: 'Users' }).click();
-    const aliceApp = adminPage.getByRole('listitem').filter({ hasText: `(${alice.username})` });
-    await expect(aliceApp).toContainText('127.0.0.1');
-    await expect(aliceApp.getByRole('button', { name: 'Disconnect' })).toBeVisible();
-    await expect(adminPage.getByRole('checkbox', { name: 'Allow deleting music' })).toHaveCount(0);
-    await adminContext.close();
+    try {
+      const adminPage = await adminContext.newPage();
+      await loginViaUi(adminPage, { username: 'admin', password: mcpAdminPassword });
+      await openSettings(adminPage);
+      await adminPage.getByRole('button', { name: 'Users' }).click();
+      const aliceApp = adminPage.getByRole('listitem').filter({ hasText: `(${alice.username})` });
+      await expect(aliceApp).toContainText('127.0.0.1');
+      await expect(aliceApp.getByRole('button', { name: 'Disconnect' })).toBeVisible();
+      await expect(adminPage.getByRole('checkbox', { name: 'Allow deleting music' })).toHaveCount(0);
+    } finally {
+      await adminContext.close();
+    }
 
     // One blocked, one allowed: a partial answer whose token covers the allowed song only.
     const preview = await a.call('preview_delete_tracks', { song_ids: [holyId, bleakId], reason: 'cleanup' });
@@ -604,7 +608,7 @@ test('the Christmas playlist is filled through every injected failure by followi
         stage: 'delete',
         retry: 'not_retryable',
         message: 'Another listener rated, starred or kept this track in a playlist',
-        facts: { song_id: holyId, verdict: 'blocked' },
+        facts: { song_id: holyId, verdict: 'blocked', song: { title: 'O Holy Night' } },
         // Asking again cannot help: only the other listener can change it.
         next: [],
       },
@@ -694,6 +698,8 @@ test('the Christmas playlist is filled through every injected failure by followi
     })) as Items & { batch_id: string };
     const replaceJob = nth(ensured.results, 0);
     expect(replaceJob.status).toBe('job_created');
+    // One download of a seeded track and its import take well under one 180 s wait; four bound
+    // a slow CI runner at 12 minutes, under the test's 20.
     for (let round = 0; ; round++) {
       expect(round, 'get_batch rounds').toBeLessThan(4);
       const b = (await a.ok('get_batch', {
@@ -730,6 +736,9 @@ test('the Christmas playlist is filled through every injected failure by followi
     const inPlaylist = await a.call('preview_delete_tracks', { song_ids: [goodKingId], reason: 'cleanup' });
     expect(inPlaylist.isError).toBe(true);
     const kept = inPlaylist.doc as Items & { confirmation_token: string | null; will_delete: string[] };
+    // A preview of one blocked song is still partial, its one entry the blocked one.
+    expect(kept.error).toMatchObject({ code: 'partial', retry: 'per_item' });
+    expect(nth(kept.results, 0)).toMatchObject({ index: 0, ok: false });
     const keptError = nth(kept.results, 0).error;
     expect([keptError?.code, keptError?.message, kept.confirmation_token, kept.will_delete]).toEqual([
       'delete_blocked_by_other_user',
@@ -744,6 +753,8 @@ test('the Christmas playlist is filled through every injected failure by followi
     const starred = await a.call('preview_delete_tracks', { song_ids: [coventryId], reason: 'cleanup' });
     expect(starred.isError).toBe(true);
     const s = starred.doc as Items & { confirmation_token: string | null; will_delete: string[] };
+    expect(s.error).toMatchObject({ code: 'partial', retry: 'per_item' });
+    expect(nth(s.results, 0)).toMatchObject({ index: 0, ok: false });
     expect([nth(s.results, 0).error?.code, s.confirmation_token, s.will_delete]).toEqual([
       'delete_blocked_by_other_user',
       null,

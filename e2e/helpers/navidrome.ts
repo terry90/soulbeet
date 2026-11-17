@@ -37,10 +37,14 @@ export async function subsonicAs(
   const query = subsonicAuth(user);
   for (const [name, value] of Object.entries(params)) query.set(name, value);
   const response = await fetch(`${navidromeUrl}/rest/${method}?${query}`);
-  const body = (await response.json()) as { 'subsonic-response': Record<string, unknown> };
-  const answer = body['subsonic-response'];
-  if (response.status !== 200 || answer.status !== 'ok') {
-    throw new Error(`Subsonic ${method} as ${user.username}: ${response.status} ${JSON.stringify(answer)}`);
+  // Read as text first: a proxy's or a server's error page is not JSON, and its status and body say why.
+  const text = await response.text();
+  if (response.status !== 200) {
+    throw new Error(`Subsonic ${method} as ${user.username}: ${response.status} ${text}`);
+  }
+  const answer = (JSON.parse(text) as { 'subsonic-response': Record<string, unknown> })['subsonic-response'];
+  if (answer.status !== 'ok') {
+    throw new Error(`Subsonic ${method} as ${user.username}: ${JSON.stringify(answer)}`);
   }
   return answer;
 }

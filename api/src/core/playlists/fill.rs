@@ -207,8 +207,9 @@ pub(crate) enum JobSongs {
 /// What `user`'s job `job` ended with. A done job is Listed when Navidrome listed every import of
 /// it, else a Lookup of every file it imported. A failed job whose failed slots are all
 /// duplicates (import_already_in_library) is a Lookup of those copies and of what its other
-/// slots imported; with any other failed slot, or failed before any slot had a result (its
-/// search found nothing, or its downloads never started), it waits, as it can be tried again.
+/// slots imported; with any other failed slot (a download that failed before it had a result
+/// among them), or failed before any slot had a result (its search found nothing), it waits, as
+/// it can be tried again.
 pub(crate) async fn songs_of_job(
     db: &SqlitePool,
     user: &UserId,
@@ -438,7 +439,7 @@ mod tests {
     use crate::core::jobs::job_already_running;
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
-        auto_options, batch_of_downloads, duplicate_track_job, mcp_track_job,
+        auto_options, batch_of_downloads, downloading_track_job, duplicate_track_job, mcp_track_job,
         playlist_batch_of_running, settle_done,
     };
     use crate::core::playlists::{playlist_not_found, NotEditable};
@@ -686,6 +687,26 @@ mod tests {
             songs_of_job(&acq.db, &alice(), &job).await.unwrap(),
             JobSongs::Waiting,
             "no slot yet: a new search can still bring its song"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_whose_download_failed_before_any_result_keeps_its_place_waiting() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        // Its download started and failed: the slot is there, failed, with no result.
+        let job = downloading_track_job(&acq).await;
+        acq.ledger.record(crate::ledger::JobEvent::Ended {
+            job: job.clone(),
+            state: JobState::Failed,
+            failure: Some(server_restarted_search()),
+        });
+        acq.ledger.settled().await;
+        let tracks = store::tracks_of(&acq.db, &job).await.unwrap();
+        assert!(!tracks.is_empty() && tracks.iter().all(|t| t.result.is_none()));
+        assert_eq!(
+            songs_of_job(&acq.db, &alice(), &job).await.unwrap(),
+            JobSongs::Waiting,
+            "its download failed: a retry can still bring its song"
         );
     }
 
