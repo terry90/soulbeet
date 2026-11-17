@@ -60,7 +60,8 @@ pub struct Resolved {
 /// names, generated and stored there on first use. A relative database path
 /// is read against `base`, the working directory at startup. Fails, naming
 /// the file, when the stored key cannot be read or a new one cannot be
-/// written.
+/// written; the failure says to set `SECRET_KEY`, or, when the one set is
+/// too short, to set it to at least 32 bytes.
 pub fn resolve(env: Option<&str>, base: &Path, database_url: &str) -> Result<Resolved, String> {
     let env = env.filter(|v| !v.is_empty()).map(str::to_string);
     let short_env = match env {
@@ -73,11 +74,12 @@ pub fn resolve(env: Option<&str>, base: &Path, database_url: &str) -> Result<Res
         }
         short => short.map(SecretKey::new),
     };
-    let dir = key_dir(base, database_url)?;
+    let set_key = set_key(short_env.is_some());
+    let dir = key_dir(base, database_url, &set_key)?;
     let path = dir.join(KEY_FILE_NAME);
-    let (key, source) = match read_stored(&path)? {
+    let (key, source) = match read_stored(&path, &set_key)? {
         Some(key) => (key, KeySource::File(path)),
-        None => create(&dir, path)?,
+        None => create(&dir, path, &set_key)?,
     };
     Ok(Resolved {
         key,
@@ -86,8 +88,22 @@ pub fn resolve(env: Option<&str>, base: &Path, database_url: &str) -> Result<Res
     })
 }
 
-/// The key stored at `path`, `None` when there is no such file.
-fn read_stored(path: &Path) -> Result<Option<SecretKey>, String> {
+/// What a startup failure offers in place of the key file, after "set":
+/// `SECRET_KEY`, or a longer one when the one set is too short to be used.
+fn set_key(short_env: bool) -> String {
+    if short_env {
+        format!(
+            "SECRET_KEY to a random value of at least {MIN_KEY_BYTES} bytes (the SECRET_KEY set \
+             is too short, so it is not used)"
+        )
+    } else {
+        "SECRET_KEY".to_string()
+    }
+}
+
+/// The key stored at `path`, `None` when there is no such file. A failure
+/// offers to set `set_key`.
+fn read_stored(path: &Path, set_key: &str) -> Result<Option<SecretKey>, String> {
     match fs::read_to_string(path) {
         Ok(stored) => {
             let value = stored.trim();
@@ -95,7 +111,7 @@ fn read_stored(path: &Path) -> Result<Option<SecretKey>, String> {
                 return Err(format!(
                     "The secret key file {} is empty. Restore it from a backup, delete it to \
                      generate a new key (everyone is signed out and stored Navidrome passwords \
-                     must be entered again), or set SECRET_KEY.",
+                     must be entered again), or set {set_key}.",
                     path.display()
                 ));
             }
@@ -103,7 +119,7 @@ fn read_stored(path: &Path) -> Result<Option<SecretKey>, String> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!(
-            "Cannot read the secret key file {}: {e}. Fix its permissions or set SECRET_KEY.",
+            "Cannot read the secret key file {}: {e}. Fix its permissions or set {set_key}.",
             path.display()
         )),
     }
@@ -111,22 +127,25 @@ fn read_stored(path: &Path) -> Result<Option<SecretKey>, String> {
 
 /// Generates a key and stores it at `path`, in `dir`. When another start
 /// stored one there first, that key is read and used instead, so every
-/// process runs with the key the file holds.
-fn create(dir: &Path, path: PathBuf) -> Result<(SecretKey, KeySource), String> {
+/// process runs with the key the file holds. A failure offers to set
+/// `set_key`.
+fn create(dir: &Path, path: PathBuf, set_key: &str) -> Result<(SecretKey, KeySource), String> {
     let value = generate()?;
     match store(dir, &path, &value) {
         Ok(()) => Ok((SecretKey::new(value), KeySource::Generated(path))),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_stored(&path)? {
-            Some(key) => Ok((key, KeySource::File(path))),
-            None => Err(format!(
-                "The secret key file {} was removed right after another start created it. \
-                 Start again or set SECRET_KEY.",
-                path.display()
-            )),
-        },
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match read_stored(&path, set_key)? {
+                Some(key) => Ok((key, KeySource::File(path))),
+                None => Err(format!(
+                    "The secret key file {} was removed right after another start created it. \
+                 Start again or set {set_key}.",
+                    path.display()
+                )),
+            }
+        }
         Err(e) => Err(format!(
             "Cannot write the secret key file {}: {e}. Make its directory writable or set \
-             SECRET_KEY.",
+             {set_key}.",
             path.display()
         )),
     }
@@ -228,12 +247,12 @@ pub fn load() -> Result<(), String> {
 }
 
 /// The directory of the database file `database_url` names, a relative one
-/// read against `base`.
-fn key_dir(base: &Path, database_url: &str) -> Result<PathBuf, String> {
+/// read against `base`. A failure offers to set `set_key`.
+fn key_dir(base: &Path, database_url: &str, set_key: &str) -> Result<PathBuf, String> {
     let no_file = || {
         format!(
             "DATABASE_URL '{database_url}' names no database file to keep the secret key next \
-             to. Set SECRET_KEY."
+             to. Set {set_key}."
         )
     };
     let file = base.join(crate::db::database_file(database_url).ok_or_else(no_file)?);
@@ -385,19 +404,45 @@ mod tests {
     }
 
     #[test]
+    fn a_short_key_set_where_no_key_file_can_be_kept_is_named_too_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("data");
+        fs::create_dir(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500)).unwrap();
+        let unwritable = resolve(Some("change-me-in-production"), &blocked, DB).err();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        let no_file = resolve(
+            Some("change-me-in-production"),
+            dir.path(),
+            "sqlite::memory:",
+        );
+        let too_short = "SECRET_KEY to a random value of at least 32 bytes (the SECRET_KEY set \
+                         is too short, so it is not used).";
+        for err in [unwritable.unwrap(), no_file.err().unwrap()] {
+            assert!(err.ends_with(too_short), "{err}");
+        }
+        // Without SECRET_KEY, the failure offers to set one.
+        let unset = resolve(None, dir.path(), "sqlite::memory:").err().unwrap();
+        assert!(unset.ends_with(". Set SECRET_KEY."), "{unset}");
+    }
+
+    #[test]
     fn the_key_sits_next_to_the_database_file() {
         let here = Path::new(".");
         assert_eq!(
-            key_dir(here, "sqlite:/data/soulbeet.db").unwrap(),
+            key_dir(here, "sqlite:/data/soulbeet.db", "SECRET_KEY").unwrap(),
             PathBuf::from("/data")
         );
         // The default DATABASE_URL: the key sits in the working directory.
-        assert_eq!(key_dir(here, "sqlite:soulbeet.db").unwrap(), here);
         assert_eq!(
-            key_dir(here, "sqlite:sub/dir/x.db").unwrap(),
+            key_dir(here, "sqlite:soulbeet.db", "SECRET_KEY").unwrap(),
+            here
+        );
+        assert_eq!(
+            key_dir(here, "sqlite:sub/dir/x.db", "SECRET_KEY").unwrap(),
             PathBuf::from("./sub/dir")
         );
-        assert!(key_dir(here, "sqlite::memory:")
+        assert!(key_dir(here, "sqlite::memory:", "SECRET_KEY")
             .unwrap_err()
             .contains("Set SECRET_KEY"));
     }
@@ -438,7 +483,7 @@ mod tests {
         let winner = "w".repeat(64);
         fs::write(&path, format!("{winner}\n")).unwrap();
 
-        let (key, source) = create(dir.path(), path.clone()).unwrap();
+        let (key, source) = create(dir.path(), path.clone(), "SECRET_KEY").unwrap();
 
         assert_eq!(source, KeySource::File(path));
         assert_eq!(key.as_bytes(), winner.as_bytes());
