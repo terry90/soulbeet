@@ -11,6 +11,7 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use tokio::task::JoinHandle;
 
 use super::args::Args;
+use super::time;
 use super::contract::{answer, failed, upstream_error, NextCall, ToolError};
 use super::facts::{candidate_document, search_facts};
 use super::keys::{keyed, request_key, Keyed};
@@ -343,7 +344,7 @@ async fn search_answer(
     let mut fields = Map::new();
     fields.insert("search_id".into(), json!(id));
     fields.insert("state".into(), json!("done"));
-    fields.insert("expires_at".into(), json!(stored.expires_at));
+    fields.insert("expires_at".into(), time::unix(stored.expires_at));
     fields.extend(search_facts(stats.as_ref(), &spec, &view.dropped_by_filter));
     // Room for `next`: its cursor is never longer than the one at the page's end.
     let longest =

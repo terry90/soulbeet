@@ -20,6 +20,7 @@ use soulbeet::{DownloadBackend, ImportedItem};
 use super::contract::{error_object, NextCall, ToolError};
 use super::next::next_calls;
 use super::paging::{chars, leave_out, length, Keep};
+use super::time;
 use crate::core::delete_guard::quota::enable_deletion;
 use crate::core::jobs::{
     current_attempt, failed_slot, job_failure, job_filters, picked_file, shown_row, JobView,
@@ -346,8 +347,8 @@ pub(crate) fn job_document(
     doc.insert("wanted".into(), reference_of(job.kind, &job.wanted));
     doc.insert("state".into(), json!(job.state.as_str()));
     doc.insert("folder_id".into(), json!(job.folder.id));
-    doc.insert("created_at".into(), json!(job.created_at));
-    doc.insert("updated_at".into(), json!(job.updated_at));
+    doc.insert("created_at".into(), time::unix(job.created_at));
+    doc.insert("updated_at".into(), time::unix(job.updated_at));
     doc.insert(
         "failure".into(),
         failure_document(view, wanted, next.clone(), deletion_enabled),
@@ -374,7 +375,7 @@ pub(crate) fn job_document(
         .map(|entry| {
             let mut fields = Map::new();
             fields.insert("seq".into(), json!(entry.seq));
-            fields.insert("at".into(), json!(entry.at));
+            fields.insert("at".into(), time::unix(entry.at));
             fields.insert("stage".into(), json!(entry.stage));
             fields.insert("event".into(), json!(entry.event));
             for (name, value) in &entry.facts {
@@ -551,8 +552,8 @@ fn tried_entry(slot: u32, attempt: &AttemptRecord) -> Value {
         "extension": file.and_then(|f| f.facts.extension.as_deref()).map(cut),
         "bitrate_kbps": file.and_then(|f| f.facts.bitrate_kbps),
         "size_bytes": file.and_then(|f| f.size),
-        "started_at": attempt.started_at,
-        "ended_at": attempt.ended_at,
+        "started_at": attempt.started_at.map(time::unix),
+        "ended_at": attempt.ended_at.map(time::unix),
         "code": failure.map(|f| f.code),
         "message": failure.map(|f| cut(&f.message)),
         "retry": failure.map(|f| f.retry),
@@ -760,10 +761,10 @@ fn index_document(slot: &SlotView) -> Value {
     );
     match &slot.index_wait {
         Some(wait) if slot.state == JobState::Indexing || failed => json!({
-            "import_finished_at": wait.since,
+            "import_finished_at": time::unix(wait.since),
             "library_path": cut(&wait.library.display().to_string()),
             "scan_requested": wait.baseline.is_some(),
-            "last_scan_seen": wait.checked,
+            "last_scan_seen": wait.checked.map(time::at),
         }),
         _ => Value::Null,
     }
@@ -1103,11 +1104,11 @@ mod tests {
         let index = &doc["slots"][0]["index"];
         assert_eq!(
             (
-                index["import_finished_at"].as_i64(),
+                index["import_finished_at"].as_str(),
                 index["scan_requested"].as_bool(),
                 &index["last_scan_seen"]
             ),
-            (Some(0), Some(false), &Value::Null),
+            (Some("1970-01-01T00:00:00Z"), Some(false), &Value::Null),
             "{doc}"
         );
         assert!(index["library_path"].is_string());

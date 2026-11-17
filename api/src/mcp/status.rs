@@ -18,6 +18,7 @@ use soulbeet::navidrome::ScanStatus;
 use sqlx::SqlitePool;
 
 use super::args::Args;
+use super::time;
 use super::contract::{failed, success, ToolError};
 use super::paging::fit_whole;
 use super::McpCaller;
@@ -367,7 +368,7 @@ fn read<T>(fact: Option<&Result<T, Failure>>, value: impl Fn(&T) -> Value) -> (V
 /// read so far while a scan runs (navidrome scanner/controller.go,
 /// `Status`), so each is its own field, `null` in the other state.
 fn scan_document(scan: &ScanStatus) -> Value {
-    let last_scan = (scan.last_scan != go_zero_time()).then(|| scan.last_scan.to_rfc3339());
+    let last_scan = (scan.last_scan != go_zero_time()).then(|| time::at(scan.last_scan));
     let error = (!scan.error.is_empty()).then_some(scan.error.as_str());
     let (songs, files_scanned) = match scan.scanning {
         false => (Some(scan.count), None),
@@ -417,7 +418,7 @@ mod tests {
                              "detail": "A plugin may be waiting on the network or for input."}]},
                 "navidrome": {"connected": true, "failure": null, "admin": false, "admin_failure": null, "can_trigger_scan": false,
                               "scan": {"scanning": false, "songs": 1342, "files_scanned": null,
-                                       "last_scan": "2026-11-14T21:03:11.519322+00:00", "error": null},
+                                       "last_scan": "2026-11-14T21:03:11Z", "error": null},
                               "scan_failure": null},
                 "folders": [{"folder_id": "f1", "name": "Music", "path": "/music/alice", "shared": false, "default": true, "free_bytes": 1000,
                              "free_space_failure": null, "in_navidrome": "listed"}],

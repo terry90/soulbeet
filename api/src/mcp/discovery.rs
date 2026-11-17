@@ -10,6 +10,7 @@ use shared::navidrome::{
 use shared::recommendation::DiscoveryProfile;
 
 use super::args::Args;
+use super::time;
 use super::contract::{answer, failed, success, upstream_error, NextCall, ToolError};
 use super::keys::{keyed, request_key, Keyed};
 use super::paging::{leave_out, length, Keep, RESULT_MAX_CHARS};
@@ -152,8 +153,8 @@ fn overview_fields(o: &Overview) -> Map<String, Value> {
                 "album": cut(&track.album),
                 "song_id": track.song_id,
                 "rating": track.rating,
-                "created_at": track.created_at,
-                "expires_at": expires_at(track, &lifetimes).map(|t| t.to_rfc3339()),
+                "created_at": time::text(&track.created_at),
+                "expires_at": expires_at(track, &lifetimes).map(time::at),
             })
         })
         .collect();
@@ -162,7 +163,7 @@ fn overview_fields(o: &Overview) -> Map<String, Value> {
         "enabled": s.discovery_enabled,
         "folder": folder,
         "promote_threshold": s.discovery_promote_threshold,
-        "last_generated_at": s.discovery_last_generated_at,
+        "last_generated_at": s.discovery_last_generated_at.as_deref().map(time::text),
         "profiles": profiles,
         "run": o.run.as_ref().map(run_fields),
         "pending": pending,
@@ -206,8 +207,8 @@ fn run_fields(p: &DiscoveryProgress) -> Value {
         .collect();
     json!({
         "status": status,
-        "started_at": p.started_at,
-        "completed_at": p.completed_at,
+        "started_at": p.started_at.as_deref().map(time::text),
+        "completed_at": p.completed_at.as_deref().map(time::text),
         "profiles": profiles,
         "result": p.result,
         "failure": p.failure,
@@ -440,7 +441,7 @@ mod tests {
                 doc["pending"][0]["track_id"].as_str(),
                 doc["pending"][0]["expires_at"].as_str()
             ),
-            (Some(1), Some("t1"), Some("2026-11-22T20:00:00+00:00"))
+            (Some(1), Some("t1"), Some("2026-11-22T20:00:00Z"))
         );
         assert_eq!(
             (doc["folder"]["folder_id"].as_str(), doc["run"].is_null()),

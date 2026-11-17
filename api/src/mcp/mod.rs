@@ -40,6 +40,7 @@ pub(crate) mod settings;
 mod sources;
 pub(crate) mod status;
 pub(crate) mod sync;
+mod time;
 mod wait;
 
 const NO_TOKEN: &str = "No access token was sent";

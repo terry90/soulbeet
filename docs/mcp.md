@@ -272,7 +272,7 @@ The full list is under [Known limits](#known-limits).
 
 ## Tools
 
-What each tool does, in the order Claude sees them. Every tool answers one JSON document, and a failure has a stable code (see [Error codes](#error-codes)).
+What each tool does, in the order Claude sees them. Every tool answers one JSON document, and a failure has a stable code (see [Error codes](#error-codes)). Every time a tool answers or takes is RFC 3339 in UTC to the second, such as `2026-11-15T10:00:00Z`.
 
 ### Status and settings
 

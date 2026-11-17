@@ -17,6 +17,7 @@ use super::jobs::{
 use super::paging::{chars, fit, fit_whole, longest_fitting, Page};
 use super::refs::{page_schema, wait_schema};
 use super::server::{common_codes, ToolSpec};
+use super::time;
 use super::{wait, McpCaller};
 use crate::connection::ConnectionState;
 use crate::core::database_failure;
@@ -188,7 +189,7 @@ async fn batch_document(
         "batch_id": batch.id,
         "label": label_of(batch),
         "origin": batch.origin,
-        "created_at": batch.created_at,
+        "created_at": time::unix(batch.created_at),
         "summary": summary,
         "cursor": cursor,
         "all_terminal": all_terminal,
@@ -329,7 +330,7 @@ fn batch_summary(batch: &BatchRecord) -> Value {
         "batch_id": batch.id,
         "label": label_of(batch),
         "origin": batch.origin,
-        "created_at": batch.created_at,
+        "created_at": time::unix(batch.created_at),
         "summary": batch.counts,
         "unfinished": unfinished,
     })

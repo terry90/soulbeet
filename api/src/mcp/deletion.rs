@@ -9,6 +9,7 @@ use shared::navidrome::{DeletionReason, DeletionReview, DAILY_APP_DELETIONS};
 use soulbeet::navidrome::NativePlaylist;
 
 use super::args::Args;
+use super::time;
 use super::contract::{
     answer, error_object, failed, items, items_text, upstream_error, ItemResult, Items, NextCall,
     ToolError,
@@ -257,7 +258,7 @@ fn preview_answer(args: &Args, reason: DeletionReason, p: Preview) -> CallToolRe
     let Value::Object(fields) = json!({
         "reason": reason.as_str(),
         "confirmation_token": token.map(|t| &t.secret),
-        "expires_at": token.map(|t| t.expires_at.to_rfc3339()),
+        "expires_at": token.map(|t| time::at(t.expires_at)),
         "will_delete": token.map_or(&[][..], |t| &t.song_ids[..]),
         "daily_limit": {"limit": DAILY_APP_DELETIONS, "used_last_24h": p.used_today},
         "next": next,
@@ -594,8 +595,8 @@ async fn get_deletion_history(
 fn deletion_fields(d: &DeletionReview) -> Result<Value, String> {
     let deleted_at = chrono::NaiveDateTime::parse_from_str(&d.created_at, "%Y-%m-%d %H:%M:%S")
         .map_err(|e| format!("Unreadable deletion time {}: {e}", d.created_at))?
-        .and_utc()
-        .to_rfc3339();
+        .and_utc();
+    let deleted_at = time::at(deleted_at);
     let cut_text = |text: &str| cut_json(text.to_string(), TEXT_MAX_CHARS);
     Ok(json!({
         "song_id": d.song_id,

@@ -7,6 +7,7 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, User
 use shared::recommendation::DiscoveryProfile;
 
 use super::args::Args;
+use super::time;
 use super::contract::NextCall;
 use super::contract::{answer, failed, invalid_value, success, upstream_error, ToolError};
 use super::keys::{keyed, request_key, Keyed};
@@ -64,7 +65,7 @@ pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<Strin
             "playlist_names": playlist_names,
             "playlist_ids": playlist_ids,
             "promote_threshold": s.discovery_promote_threshold,
-            "last_generated_at": s.discovery_last_generated_at,
+            "last_generated_at": s.discovery_last_generated_at.as_deref().map(time::text),
         },
     }) else {
         unreachable!("an object literal is an object");
