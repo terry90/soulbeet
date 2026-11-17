@@ -1882,15 +1882,15 @@ mod tests {
             "{decided:?}"
         );
         // An MCP job's own rule is already the app's.
-        assert!(matches!(
-            Duplicates::Skip.for_app(as_app),
-            Duplicates::Skip
-        ));
+        assert!(matches!(Duplicates::Skip.for_app(as_app), Duplicates::Skip));
 
         let job = ImportJob {
             duplicates: decided,
             ..owned(
-                job(PathBuf::from("/dl/X [1f2e3d4c]/01.flac"), Path::new("/music")),
+                job(
+                    PathBuf::from("/dl/X [1f2e3d4c]/01.flac"),
+                    Path::new("/music"),
+                ),
                 &alice(),
                 &["a"],
             )

@@ -728,7 +728,10 @@ impl JobTool {
             }
             Ok(RetryAnswer::InvalidInput { field, expected }) => {
                 let ToolError { failure, facts, .. } = invalid_value(self.tool, field, &expected);
-                (false, Err(self.refusal(job, failure, facts, None, None).await))
+                (
+                    false,
+                    Err(self.refusal(job, failure, facts, None, None).await),
+                )
             }
             Err(f) => (false, Err(upstream_error(f, Map::new(), again))),
         };
@@ -795,7 +798,10 @@ fn repeats(call: &NextCall, refused: &NextCall) -> bool {
     let (Value::Object(args), Value::Object(given)) = (&call.args, &refused.args) else {
         return false;
     };
-    call.tool == refused.tool && args.iter().all(|(name, value)| given.get(name) == Some(value))
+    call.tool == refused.tool
+        && args
+            .iter()
+            .all(|(name, value)| given.get(name) == Some(value))
 }
 
 /// `result` with `files_left` in a `files_left` field of its fields, or of its error's facts,
@@ -1316,9 +1322,8 @@ mod tests {
         fail_slot(&acq, &first, stopped.clone()).await;
         // A call that waited for nothing is followed by one that waits.
         let app0 = app_of(&db, &acq);
-        let unwaited = document(
-            &call_tool(app0, &token, "get_jobs", json!({"job_ids": [second]})).await,
-        );
+        let unwaited =
+            document(&call_tool(app0, &token, "get_jobs", json!({"job_ids": [second]})).await);
         assert_eq!(
             unwaited["next"],
             json!([{"tool": "get_jobs", "args": {"job_ids": [second],
@@ -1552,7 +1557,11 @@ mod tests {
         let after = document(&call_tool(app, &token, "get_jobs", call).await)["change_cursor"]
             .as_i64()
             .unwrap();
-        assert_eq!(after - before, 1, "bob's changes do not show in alice's cursor");
+        assert_eq!(
+            after - before,
+            1,
+            "bob's changes do not show in alice's cursor"
+        );
     }
 
     #[tokio::test]
@@ -1749,7 +1758,11 @@ mod tests {
         let existing = vec![item.clone(), item.clone(), item];
         let (songs, failure) =
             super::listed_songs(&navi, library.path(), &existing, deadline).await;
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(songs.is_empty());
         let failure = failure.unwrap();
         assert_eq!(

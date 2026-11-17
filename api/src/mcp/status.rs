@@ -18,9 +18,9 @@ use soulbeet::navidrome::ScanStatus;
 use sqlx::SqlitePool;
 
 use super::args::Args;
-use super::time;
 use super::contract::{failed, success, ToolError};
 use super::paging::fit_whole;
+use super::time;
 use super::McpCaller;
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;

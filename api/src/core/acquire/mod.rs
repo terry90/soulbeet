@@ -608,7 +608,10 @@ mod tests {
         let failed = discard_files(&files, &base).await;
 
         assert_eq!(
-            failed.iter().map(|(p, e)| (p.clone(), e.kind())).collect::<Vec<_>>(),
+            failed
+                .iter()
+                .map(|(p, e)| (p.clone(), e.kind()))
+                .collect::<Vec<_>>(),
             files
                 .iter()
                 .map(|f| (f.clone(), std::io::ErrorKind::PermissionDenied))

@@ -585,9 +585,16 @@ mod tests {
                 effects.importer().duplicate_runs(),
                 vec![DuplicateRun::ReportRemovals]
             );
-            resolve(&acq, &test_ctx("alice"), &job, None, Decision::AsIs, replace)
-                .await
-                .unwrap();
+            resolve(
+                &acq,
+                &test_ctx("alice"),
+                &job,
+                None,
+                Decision::AsIs,
+                replace,
+            )
+            .await
+            .unwrap();
             for _ in 0..500 {
                 if effects.importer().calls() == 2 {
                     break;

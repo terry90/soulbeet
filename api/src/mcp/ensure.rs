@@ -2348,7 +2348,11 @@ mod tests {
             json!([{"tool": "list_playlists", "args": {}}])
         );
         // The batch's downloads go into no playlist, and the answer says so.
-        assert_eq!(error["facts"]["batch_fills_playlist"], json!(false), "{error}");
+        assert_eq!(
+            error["facts"]["batch_fills_playlist"],
+            json!(false),
+            "{error}"
+        );
         assert!(
             error["message"].as_str().unwrap().ends_with(
                 "The batch's downloads are not added to a playlist: once get_batch shows its \

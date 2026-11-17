@@ -353,9 +353,10 @@ mod tests {
             let forged = create_token_with(&set, SEEDED_ADMIN_ID, 0).unwrap();
             assert!(load_session(Some(&forged), &db, &set).await.is_ok());
 
-            let in_use = crate::secret_key::resolve(Some(placeholder), dir.path(), "sqlite:soulbeet.db")
-                .unwrap()
-                .key;
+            let in_use =
+                crate::secret_key::resolve(Some(placeholder), dir.path(), "sqlite:soulbeet.db")
+                    .unwrap()
+                    .key;
             let err = load_session(Some(&forged), &db, &in_use).await.unwrap_err();
             assert_eq!(err.0, StatusCode::UNAUTHORIZED, "{placeholder}");
         }

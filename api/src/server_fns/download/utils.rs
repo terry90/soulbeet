@@ -320,8 +320,7 @@ mod tests {
         std::fs::create_dir_all(&album).unwrap();
         std::fs::write(album.join("track_639097129778484198.mp3"), b"x").unwrap();
 
-        let resolved =
-            resolve_adopted(r"music\Album\track.mp3", &base, &HashSet::new()).unwrap();
+        let resolved = resolve_adopted(r"music\Album\track.mp3", &base, &HashSet::new()).unwrap();
         assert!(resolved.ends_with("track_639097129778484198.mp3"));
 
         std::fs::remove_dir_all(&base).unwrap();

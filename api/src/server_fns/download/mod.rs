@@ -127,7 +127,9 @@ pub async fn download_updates_ws(
 ) -> Result<Websocket<(), DownloadEvent>, ServerFnError> {
     let user = auth.0.id();
 
-    let public_url = crate::config::CONFIG.public_url().and_then(|p| p.as_ref().ok());
+    let public_url = crate::config::CONFIG
+        .public_url()
+        .and_then(|p| p.as_ref().ok());
     let allowed = origin_allowed(&headers, &uri, public_url)
         .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
     if let Err(why) = allowed {
@@ -414,14 +416,21 @@ mod tests {
         assert_eq!(origin_allowed(&proxied, &uri, Some(&pin)), Ok(Ok(())));
         assert_eq!(
             origin_allowed(&proxied, &uri, None),
-            Ok(Err("its page is at https://music.example.com, the request was sent to \
+            Ok(Err(
+                "its page is at https://music.example.com, the request was sent to \
                  soulbeet:9765 and PUBLIC_URL is not set. A reverse proxy must pass the public \
                  name in Host or X-Forwarded-Host, or PUBLIC_URL must name it"
-                .to_string()))
+                    .to_string()
+            ))
         );
         let other = BaseUrl::parse("https://other.example.com").unwrap();
-        let refused = origin_allowed(&proxied, &uri, Some(&other)).unwrap().unwrap_err();
-        assert!(refused.contains("PUBLIC_URL names other.example.com"), "{refused}");
+        let refused = origin_allowed(&proxied, &uri, Some(&other))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            refused.contains("PUBLIC_URL names other.example.com"),
+            "{refused}"
+        );
         // The page's own address still works with PUBLIC_URL set elsewhere.
         let lan = headers(&[
             ("host", "192.168.1.5:9765"),

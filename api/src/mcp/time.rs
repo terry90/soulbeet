@@ -40,8 +40,14 @@ mod tests {
     fn every_stored_form_answers_the_same_way() {
         assert_eq!(unix(1_763_200_800), json!("2025-11-15T10:00:00Z"));
         assert_eq!(text("2025-11-15 10:00:00"), json!("2025-11-15T10:00:00Z"));
-        assert_eq!(text("2025-11-15T11:00:00+01:00"), json!("2025-11-15T10:00:00Z"));
-        assert_eq!(text("2025-11-15T10:00:00.250Z"), json!("2025-11-15T10:00:00Z"));
+        assert_eq!(
+            text("2025-11-15T11:00:00+01:00"),
+            json!("2025-11-15T10:00:00Z")
+        );
+        assert_eq!(
+            text("2025-11-15T10:00:00.250Z"),
+            json!("2025-11-15T10:00:00Z")
+        );
         assert_eq!(text("yesterday"), Value::Null);
         assert_eq!(unix(i64::MAX), Value::Null);
     }

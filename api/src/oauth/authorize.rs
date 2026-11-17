@@ -927,7 +927,9 @@ mod tests {
         let (status, _, page) =
             get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(page.contains("Connect claude.ai to Soulbeet") && !page.contains("It calls itself"));
+        assert!(
+            page.contains("Connect claude.ai to Soulbeet") && !page.contains("It calls itself")
+        );
         let (status, _, _) = post_form(
             app,
             "/oauth/authorize",
@@ -1067,7 +1069,10 @@ mod tests {
         assert!(page.contains(warning), "{page}");
         let q = query_with(&[
             ("client_id", Some("dcr_mixed")),
-            ("redirect_uri", Some("https://claude.ai/api/mcp/auth_callback")),
+            (
+                "redirect_uri",
+                Some("https://claude.ai/api/mcp/auth_callback"),
+            ),
         ]);
         let (status, _, page) = get(app, &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK);

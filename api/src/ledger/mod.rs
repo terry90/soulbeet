@@ -97,7 +97,10 @@ impl JobState {
     /// or indexing. A job needing a source choice or an import decision waits for a person.
     pub fn moves_on_its_own(self) -> bool {
         use JobState::*;
-        matches!(self, Searching | Queued | Downloading | Importing | Indexing)
+        matches!(
+            self,
+            Searching | Queued | Downloading | Importing | Indexing
+        )
     }
 }
 

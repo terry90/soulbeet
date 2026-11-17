@@ -204,7 +204,9 @@ pub fn load() -> Result<(), String> {
     }
     match &resolved.source {
         KeySource::Environment => tracing::info!("Using SECRET_KEY from the environment"),
-        KeySource::File(path) => tracing::info!("Using the secret key stored in {}", path.display()),
+        KeySource::File(path) => {
+            tracing::info!("Using the secret key stored in {}", path.display())
+        }
         KeySource::Generated(path) => tracing::info!(
             "Generated a secret key and stored it in {}. Back it up with the database.",
             path.display()

@@ -439,8 +439,8 @@ mod tests {
     use crate::core::jobs::job_already_running;
     use crate::core::jobs::runner::Acquire;
     use crate::core::jobs::test_support::{
-        auto_options, batch_of_downloads, downloading_track_job, duplicate_track_job, mcp_track_job,
-        playlist_batch_of_running, settle_done,
+        auto_options, batch_of_downloads, downloading_track_job, duplicate_track_job,
+        mcp_track_job, playlist_batch_of_running, settle_done,
     };
     use crate::core::playlists::{playlist_not_found, NotEditable};
     use crate::core::sources::server_restarted_search;

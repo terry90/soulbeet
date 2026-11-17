@@ -1020,11 +1020,18 @@ mod tests {
         let (db, first) = refreshable().await;
         let mut refresh = first.clone();
         for n in 0..ROTATED_KEPT + 5 {
-            refresh = refresh_in(&db, test_key(), &refresh, "dcr_c", RESOURCE, T + 100 * (n + 1))
-                .await
-                .unwrap()
-                .refresh_token
-                .unwrap();
+            refresh = refresh_in(
+                &db,
+                test_key(),
+                &refresh,
+                "dcr_c",
+                RESOURCE,
+                T + 100 * (n + 1),
+            )
+            .await
+            .unwrap()
+            .refresh_token
+            .unwrap();
         }
         let rotated: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM oauth_tokens WHERE kind = 'refresh' AND rotated_at IS NOT NULL",

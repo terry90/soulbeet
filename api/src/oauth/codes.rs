@@ -363,10 +363,17 @@ mod tests {
         store_request_in(&db, &fresh_session(), "r2", &request("u1"), 1_000)
             .await
             .unwrap();
-        let taken = take_request_in(&db, "r1", "u1", "fresh-session", "allow", 1_000 + REQUEST_LIFETIME - 1)
-            .await
-            .unwrap()
-            .expect("answerable until its last second");
+        let taken = take_request_in(
+            &db,
+            "r1",
+            "u1",
+            "fresh-session",
+            "allow",
+            1_000 + REQUEST_LIFETIME - 1,
+        )
+        .await
+        .unwrap()
+        .expect("answerable until its last second");
         assert_eq!(
             (
                 taken.client.client_id.as_str(),
@@ -375,10 +382,17 @@ mod tests {
             ),
             ("dcr_test", ClientKind::Dcr, CLAUDE_CALLBACK)
         );
-        assert!(take_request_in(&db, "r2", "u1", "fresh-session", "allow", 1_000 + REQUEST_LIFETIME)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(take_request_in(
+            &db,
+            "r2",
+            "u1",
+            "fresh-session",
+            "allow",
+            1_000 + REQUEST_LIFETIME
+        )
+        .await
+        .unwrap()
+        .is_none());
         // The expired request goes with the user's next one; the answered one stays
         // REPEAT_WINDOW after its answer.
         store_request_in(
@@ -417,11 +431,18 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(count(&db, "oauth_requests").await, PENDING_PER_USER + 1);
-        assert!(take_request_in(&db, "r0", "u1", "fresh-session", "allow", 0).await.unwrap().is_none());
-        assert!(take_request_in(&db, "bob's", "u2", "fresh-session", "allow", 0)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            take_request_in(&db, "r0", "u1", "fresh-session", "allow", 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            take_request_in(&db, "bob's", "u2", "fresh-session", "allow", 0)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     async fn bump_credentials(db: &SqlitePool, user_id: &str) {

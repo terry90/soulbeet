@@ -162,8 +162,8 @@ fn retry_calls(
                 let mut unfiltered = args;
                 // Any filter given replaces the job's: none is left.
                 unfiltered["formats"] = json!([]);
-                let unfiltered = job_filters_dropped(view)
-                    .then(|| NextCall::new("retry_job", unfiltered));
+                let unfiltered =
+                    job_filters_dropped(view).then(|| NextCall::new("retry_job", unfiltered));
                 let other = call.with("needs", json!(["query_text"]));
                 return unfiltered.into_iter().chain([other]).collect();
             }

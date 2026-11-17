@@ -121,7 +121,11 @@ async fn file_under_root(
         Ok(canonical) => canonical,
         Err(e) => {
             let root_gone = path_unresolved(NO_LIBRARY_ROOT);
-            return Ok(Err(root_gone.with_cause(Service::Filesystem, None, e.to_string())));
+            return Ok(Err(root_gone.with_cause(
+                Service::Filesystem,
+                None,
+                e.to_string(),
+            )));
         }
     };
     let canonical = match tokio::fs::canonicalize(&local).await {

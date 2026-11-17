@@ -371,9 +371,9 @@ pub async fn store_passwords_under_the_current_key() {
     let key = crate::secret_key::current();
     match passwords_under_current_key_in(&crate::db::DB, key, crate::secret_key::earlier()).await {
         Ok(0) => {}
-        Ok(n) => tracing::info!(
-            "Stored {n} Navidrome password(s) again under the secret key in use"
-        ),
+        Ok(n) => {
+            tracing::info!("Stored {n} Navidrome password(s) again under the secret key in use")
+        }
         Err(e) => tracing::warn!(
             "Could not store Navidrome passwords again under the secret key in use: {e}"
         ),
@@ -387,12 +387,11 @@ pub(crate) async fn passwords_under_current_key_in(
     key: &crate::secret_key::SecretKey,
     earlier: &[crate::secret_key::SecretKey],
 ) -> Result<usize, String> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, navidrome_token FROM users WHERE navidrome_token IS NOT NULL",
-    )
-    .fetch_all(db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, navidrome_token FROM users WHERE navidrome_token IS NOT NULL")
+            .fetch_all(db)
+            .await
+            .map_err(|e| e.to_string())?;
     let mut stored = 0;
     for (id, token) in rows {
         if crate::crypto::decrypt(key, &token).is_ok() {
@@ -586,22 +585,39 @@ mod tests {
             }
         };
         let current_token = crate::crypto::encrypt(&current, "pw-current").unwrap();
-        add("built-in", Some(crate::crypto::encrypt(&earlier[1], "pw-built-in").unwrap())).await;
-        add("short", Some(crate::crypto::encrypt(&earlier[0], "pw-short").unwrap())).await;
+        add(
+            "built-in",
+            Some(crate::crypto::encrypt(&earlier[1], "pw-built-in").unwrap()),
+        )
+        .await;
+        add(
+            "short",
+            Some(crate::crypto::encrypt(&earlier[0], "pw-short").unwrap()),
+        )
+        .await;
         add("current", Some(current_token.clone())).await;
-        add("other", Some(crate::crypto::encrypt(&SecretKey::new("o".repeat(40)), "pw").unwrap())).await;
+        add(
+            "other",
+            Some(crate::crypto::encrypt(&SecretKey::new("o".repeat(40)), "pw").unwrap()),
+        )
+        .await;
         add("unlinked", None).await;
 
-        assert_eq!(passwords_under_current_key_in(&db, &current, &earlier).await, Ok(2));
+        assert_eq!(
+            passwords_under_current_key_in(&db, &current, &earlier).await,
+            Ok(2)
+        );
 
         let token = |id: &'static str| {
             let db = db.clone();
             async move {
-                sqlx::query_scalar::<_, Option<String>>("SELECT navidrome_token FROM users WHERE id = ?")
-                    .bind(id)
-                    .fetch_one(&db)
-                    .await
-                    .unwrap()
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT navidrome_token FROM users WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap()
             }
         };
         for (id, password) in [("built-in", "pw-built-in"), ("short", "pw-short")] {
@@ -612,7 +628,10 @@ mod tests {
         assert!(crate::crypto::decrypt(&current, &token("other").await.unwrap()).is_err());
         assert_eq!(token("unlinked").await, None);
         // Nothing is left to store again.
-        assert_eq!(passwords_under_current_key_in(&db, &current, &earlier).await, Ok(0));
+        assert_eq!(
+            passwords_under_current_key_in(&db, &current, &earlier).await,
+            Ok(0)
+        );
     }
 
     #[tokio::test]

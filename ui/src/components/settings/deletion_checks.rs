@@ -13,7 +13,10 @@ pub fn DeletionChecksPanel() -> Element {
     let auth = use_auth();
     let music_path = use_resource(move || async move {
         if auth.is_admin() {
-            auth.call(get_navidrome_music_path_problem()).await.ok().flatten()
+            auth.call(get_navidrome_music_path_problem())
+                .await
+                .ok()
+                .flatten()
         } else {
             None
         }

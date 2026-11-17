@@ -18,12 +18,12 @@ use super::server::{common_codes, ToolSpec};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::delete_guard::Origin;
-use shared::navidrome::DAILY_APP_DELETIONS;
 use crate::core::discovery::Replace;
 use crate::core::jobs::decide::{import_choices, resolve, Decision, ImportChoices, Refused, Why};
 use crate::core::jobs::retry::RetryAnswer;
 use crate::core::jobs::runner::Acquire;
 use crate::core::jobs::untried;
+use shared::navidrome::DAILY_APP_DELETIONS;
 
 const GET_IMPORT_CHOICES_ARGS: &[&str] = &["job_id", "slot"];
 
@@ -303,7 +303,16 @@ pub(crate) async fn resolve_import(
         false => Replace::Never,
     };
     let work = async move {
-        match resolve(&on.acquire, &on.caller.ctx, &job_id, slot, decision, replace).await {
+        match resolve(
+            &on.acquire,
+            &on.caller.ctx,
+            &job_id,
+            slot,
+            decision,
+            replace,
+        )
+        .await
+        {
             Ok(decided) => {
                 let answered = match decided.job {
                     Ok(view) => RetryAnswer::Applied(Box::new(view)),

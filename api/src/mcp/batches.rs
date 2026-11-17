@@ -464,9 +464,7 @@ mod tests {
         });
         acq.ledger.settled().await;
         let app = app_of(&db, &acq);
-        let doc = document(
-            &call_tool(app, &token, "get_batch", json!({"batch_id": batch})).await,
-        );
+        let doc = document(&call_tool(app, &token, "get_batch", json!({"batch_id": batch})).await);
         assert_eq!(
             doc["summary"],
             json!({"failed": 1, "needs_decision": 1}),

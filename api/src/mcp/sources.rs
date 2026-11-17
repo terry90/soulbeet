@@ -11,7 +11,6 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use tokio::task::JoinHandle;
 
 use super::args::Args;
-use super::time;
 use super::contract::{answer, failed, upstream_error, NextCall, ToolError};
 use super::facts::{candidate_document, search_facts};
 use super::keys::{keyed, request_key, Keyed};
@@ -21,6 +20,7 @@ use super::refs::{
     wanted, REFERENCE_FIELDS,
 };
 use super::server::{common_codes, ToolSpec};
+use super::time;
 use super::{wait, McpCaller};
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
