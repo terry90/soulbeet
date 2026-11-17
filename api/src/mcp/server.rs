@@ -661,6 +661,23 @@ mod tests {
     }
 
     #[test]
+    fn the_user_docs_list_every_tool() {
+        let docs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/mcp.md"))
+            .unwrap();
+        let section = docs
+            .split("\n## Tools\n")
+            .nth(1)
+            .expect("docs/mcp.md has a Tools section");
+        let section = section.split("\n## ").next().unwrap();
+        let listed: Vec<&str> = section
+            .lines()
+            .filter_map(|l| l.strip_prefix("- `"))
+            .filter_map(|l| l.split('`').next())
+            .collect();
+        assert_eq!(listed, TOOLS.iter().map(|t| t.name).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn the_registry_holds_every_tool_once_with_its_hints() {
         let registered: Vec<(&str, bool, bool, bool, bool)> = TOOLS
             .iter()

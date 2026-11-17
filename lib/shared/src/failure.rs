@@ -560,6 +560,37 @@ mod tests {
     }
 
     #[test]
+    fn the_user_docs_list_every_failure_code() {
+        let docs =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/mcp.md"))
+                .unwrap();
+        let section = docs
+            .split("\n## Error codes\n")
+            .nth(1)
+            .expect("docs/mcp.md has an Error codes section");
+        let section = section.split("\n## ").next().unwrap();
+        assert_eq!(
+            section.lines().find(|l| l.starts_with('|')),
+            Some("| Code | Stage | What it means | What to do |"),
+            "the table starts with its header, whose first cell is not a code"
+        );
+        let listed: Vec<&str> = section
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|l| l.split('`').next())
+            .collect();
+        assert!(
+            !listed.contains(&"code") && !listed.contains(&"Code"),
+            "the header row is not read as a code"
+        );
+        let unique: std::collections::BTreeSet<&str> = listed.iter().copied().collect();
+        assert_eq!(listed.len(), unique.len(), "a code is listed twice");
+        let codes: std::collections::BTreeSet<&str> =
+            FailureCode::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(unique, codes);
+    }
+
+    #[test]
     fn a_failure_serializes_like_the_tool_contract() {
         let f = Failure::new(
             FailureCode::TransferRejectedNotShared,
