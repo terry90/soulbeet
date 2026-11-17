@@ -605,7 +605,8 @@ test('the Christmas playlist is filled through every injected failure by followi
         retry: 'not_retryable',
         message: 'Another listener rated, starred or kept this track in a playlist',
         facts: { song_id: holyId, verdict: 'blocked' },
-        next: [{ tool: 'preview_delete_tracks', args: { song_ids: [holyId], reason: 'cleanup' } }],
+        // Asking again cannot help: only the other listener can change it.
+        next: [],
       },
     });
     // It names no one and no file.
