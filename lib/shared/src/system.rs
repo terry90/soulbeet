@@ -11,9 +11,6 @@ pub enum NavidromeStatus {
     InvalidCredentials,
     /// Navidrome was unreachable at login time. Existing token may still work.
     Offline,
-    /// ReportRealPath is not enabled on the Soulbeet player in Navidrome.
-    /// Path resolution and auto-delete features will not work correctly.
-    MissingReportRealPath,
     /// No Navidrome auth has been attempted yet (fresh account).
     #[default]
     Unknown,
@@ -25,13 +22,12 @@ impl NavidromeStatus {
             Self::Connected => "connected",
             Self::InvalidCredentials => "invalid_credentials",
             Self::Offline => "offline",
-            Self::MissingReportRealPath => "missing_report_real_path",
             Self::Unknown => "unknown",
         }
     }
 
     pub fn is_connected(&self) -> bool {
-        matches!(self, Self::Connected | Self::MissingReportRealPath)
+        matches!(self, Self::Connected)
     }
 }
 
@@ -48,7 +44,6 @@ impl std::str::FromStr for NavidromeStatus {
             "connected" => Ok(Self::Connected),
             "invalid_credentials" => Ok(Self::InvalidCredentials),
             "offline" => Ok(Self::Offline),
-            "missing_report_real_path" => Ok(Self::MissingReportRealPath),
             _ => Ok(Self::Unknown),
         }
     }

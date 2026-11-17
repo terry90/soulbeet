@@ -21,7 +21,7 @@ pub fn navidrome_hint(health: &SystemHealth, status: NavidromeStatus) -> Option<
         }
     }
     match status {
-        NavidromeStatus::Connected | NavidromeStatus::MissingReportRealPath => None,
+        NavidromeStatus::Connected => None,
         NavidromeStatus::InvalidCredentials => {
             Some("Your username was not found in Navidrome".to_string())
         }

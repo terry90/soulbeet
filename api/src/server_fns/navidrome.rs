@@ -20,8 +20,6 @@ use crate::models::deletion_review::DeletionReviewRow;
 #[cfg(feature = "server")]
 use crate::models::navidrome_read_failure::NavidromeReadFailureRow;
 #[cfg(feature = "server")]
-use crate::services::navidrome_client_for_user;
-#[cfg(feature = "server")]
 use crate::{AdminSession, AuthSession};
 #[cfg(feature = "server")]
 use shared::failure::Stage;
@@ -66,16 +64,6 @@ pub async fn get_unreadable_listeners() -> Result<Vec<UnreadableListener>, Serve
 #[get("/api/navidrome/music-path-problem", _: AdminSession)]
 pub async fn get_navidrome_music_path_problem() -> Result<Option<String>, ServerFnError> {
     Ok(crate::config::CONFIG.navidrome_music_path_problem())
-}
-
-/// Check if the Soulbeet player in Navidrome has ReportRealPath enabled.
-/// Returns Some(true) if enabled, Some(false) if disabled, None if player not found yet.
-#[cfg(feature = "server")]
-pub async fn check_report_real_path(user_id: &str) -> Result<Option<bool>, String> {
-    let client = navidrome_client_for_user(user_id).await?;
-    let players = client.get_players().await.map_err(|e| e.to_string())?;
-    let soulbeet = players.iter().find(|p| p.client == "Soulbeet");
-    Ok(soulbeet.map(|p| p.report_real_path))
 }
 
 #[get("/api/navidrome/library-stats", auth: AuthSession)]

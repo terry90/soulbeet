@@ -165,6 +165,7 @@ The release that adds admin roles changes a few things on the first start:
 -   **A generated secret key replaces the built-in one and any short one.** An install that ran without `SECRET_KEY` used a key built into Soulbeet, and earlier example files set short placeholders such as `a_secret_key` or `change-me-in-production`. Anyone who knows such a key can sign themselves in as any user, so Soulbeet no longer signs with the built-in key or with any `SECRET_KEY` under 32 bytes: on the first start it generates a key and stores it in `secret.key` next to the database. Everyone is signed out once. Stored Navidrome passwords are stored again under the new key on that start, so nobody has to enter theirs again. Back up `secret.key` with the database from now on, and remove a short `SECRET_KEY` (Security Checks lists it until you do). An install that sets a `SECRET_KEY` of at least 32 bytes keeps it.
 -   **`NAVIDROME_MUSIC_PATH` names Soulbeet's own path now.** Earlier versions read it as the path Navidrome uses for its music. It now names where Soulbeet sees the root of Navidrome's default library. If you set it before, change it to the path inside the Soulbeet container (for example `/music/common` when Navidrome's library is `/media/music/common` and Soulbeet mounts `/media/music` at `/music`), or remove it. While it names no folder Soulbeet can see, the startup log and Settings > Library > Deletion Checks say so, and no song of that library is deleted or replaced.
 -   **Behind a reverse proxy, the live Downloads panel needs the public name.** The download updates socket now opens only from Soulbeet's own page: the page's address must match the address the request was sent to, or `PUBLIC_URL`. A proxy must pass the public name in `Host` (nginx: `proxy_set_header Host $host;`) or `X-Forwarded-Host`, or `PUBLIC_URL` must be set to it. Otherwise the Downloads panel stays empty and the log says "Refused a download updates socket" with both addresses.
+-   **Navidrome's ReportRealPath is no longer used.** Deletion and the rating sync find files from Navidrome's library paths. You can leave the player setting as it is; a "ReportRealPath not enabled" status is cleared on the first start.
 -   **Usernames ignore letter case.** Accounts whose names differ only in letter case (`bob` and `Bob`) cannot sign in. The startup log lists them; an admin deletes the ones that are not used in Settings > Users.
 -   **Signing out ends the session on the server**, so a copied cookie stops working too. Your other devices stay signed in.
 -   **Registration is closed.** `REGISTRATION` now defaults to `navidrome` with `NAVIDROME_URL` set and to `admin` without it. Set `REGISTRATION=open` to keep the old behaviour.
@@ -272,9 +273,7 @@ Discovery generates personalized playlists from your scrobble history and pushes
 
 #### Navidrome Configuration
 
-1. **Enable ReportRealPath** for the Soulbeet player. Go to your Navidrome instance > Settings > Players (e.g. `https://your-navidrome/app/#/player`), find the Soulbeet player entry, and enable "Report Real Path". Without this, rating sync and auto-delete cannot resolve file paths.
-
-2. Your Soulbeet folder paths must point to the same physical directories that Navidrome's music library uses. The mount paths inside each container can differ (e.g. Soulbeet at `/music`, Navidrome at `/media/music`), as long as they map to the same files on the host.
+Your Soulbeet folder paths must point to the same physical directories that Navidrome's music library uses. The mount paths inside each container can differ (e.g. Soulbeet at `/music`, Navidrome at `/media/music`), as long as they map to the same files on the host. Soulbeet learns where each Navidrome library is from the files it imports; set `NAVIDROME_MUSIC_PATH` to where Soulbeet sees Navidrome's default library to give it that root from the start.
 
 #### Soulbeet Configuration
 
@@ -293,7 +292,7 @@ Discovery generates personalized playlists from your scrobble history and pushes
 
 #### Auto-Delete
 
-When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from disk during rating sync. This requires ReportRealPath to be enabled in Navidrome so Soulbeet receives the actual file path. For shared folders (multiple users), a track is only deleted if the average rating across all users is 1 or below.
+When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from disk during rating sync. Soulbeet finds each track's file from Navidrome's library path, so it needs the library root (learned from imports, or `NAVIDROME_MUSIC_PATH`). A track another listener rated above 1 star, starred or keeps in a playlist is kept, and so is any track Soulbeet cannot check; Settings > Library > Deletion Checks lists what was kept and why. [docs/mcp.md, "What every deletion checks"](docs/mcp.md#what-every-deletion-checks) lists every check.
 
 ### Connecting Claude (MCP)
 

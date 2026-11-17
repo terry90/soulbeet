@@ -931,20 +931,6 @@ impl NavidromeClient {
 
         resp.json().await.map_err(parse)
     }
-
-    /// List all players visible to the authenticated user via Navidrome's native API.
-    /// Non-admin users only see their own players.
-    pub async fn get_players(&self) -> Result<Vec<PlayerInfo>> {
-        let url = self.base_url.join("api/player")?;
-
-        let resp = self.native_request(self.client.get(url)).await?;
-
-        if !resp.status().is_success() {
-            return Err(native_failure("Get players", resp).await);
-        }
-
-        resp.json().await.map_err(parse)
-    }
 }
 
 /// A native track row (model.PlaylistTrack, model/playlist.go:224-229) as its place and song: the

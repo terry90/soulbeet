@@ -430,11 +430,6 @@ fn NavidromeBanner() -> Element {
             "NAVIDROME",
             "Unreachable. Discovery and rating sync paused.",
         ),
-        NavidromeStatus::MissingReportRealPath => (
-            "bg-yellow-500",
-            "NAVIDROME",
-            "ReportRealPath is not enabled on the Soulbeet player. Path features and auto-delete won't work. Enable it in Navidrome > Settings > Players.",
-        ),
         _ => return rsx! {},
     };
 

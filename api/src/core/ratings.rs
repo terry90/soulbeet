@@ -1229,7 +1229,6 @@ mod tests {
             .await;
         let rated = |id: &str, rating: u8, size: u64| SubsonicSong {
             // The Subsonic path names no file of this machine.
-            path: Some("Marrow Choir/Explore/03.flac".into()),
             size: Some(size),
             ..subsonic_song(id, "O Holy Night", Some(rating))
         };

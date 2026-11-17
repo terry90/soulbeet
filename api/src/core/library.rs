@@ -25,8 +25,8 @@ use crate::models::navidrome_library::NavidromeLibraryRow;
 /// (D7). The rating, star and play count are the caller's own; Navidrome
 /// sends 0 for "none" (model/annotation.go:6-12), and so does this.
 /// `path` is relative to the song's library, and only a native record has
-/// it: a Subsonic child's is made up, or absolute with ReportRealPath
-/// (server/subsonic/helpers.go:227-231).
+/// it: a Subsonic child's is made up, or absolute when the player reports
+/// real paths (server/subsonic/helpers.go:227-231), so it is not read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SongFacts {
     pub song_id: String,

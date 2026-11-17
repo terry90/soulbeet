@@ -228,8 +228,6 @@ pub struct SubsonicSong {
     #[serde(default)]
     pub duration: Option<u32>,
     #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
     pub user_rating: Option<u8>,
     #[serde(default)]
     pub play_count: Option<u32>,
@@ -371,20 +369,10 @@ impl SubsonicAlbum {
     }
 }
 
-/// A player registered with Navidrome (native API: GET /api/player).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlayerInfo {
-    pub id: String,
-    pub name: String,
-    pub client: String,
-    pub report_real_path: bool,
-}
-
 /// A song from Navidrome's native API (GET /api/song), as the logged-in user sees it
 /// (model/mediafile.go, model/annotation.go).
 /// The `path` field is the raw `media_file.path` from the database,
-/// relative to the library root (not transformed by ReportRealPath).
+/// relative to the library root.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSong {

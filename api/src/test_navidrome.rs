@@ -492,7 +492,6 @@ pub(crate) fn subsonic_song(id: &str, title: &str, rating: Option<u8>) -> Subson
         album_id: Some("al1".into()),
         genre: None,
         duration: None,
-        path: None,
         user_rating: rating,
         play_count: None,
         starred: None,

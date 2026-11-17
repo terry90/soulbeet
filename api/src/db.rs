@@ -54,6 +54,8 @@ pub(crate) mod test_db {
     pub const DELETION_AUDIT: i64 = 20261116000004;
     pub const MCP_JOBS: i64 = 20261117000000;
     pub const DELETE_TOOLS: i64 = 20261120000000;
+    pub const USER_CHANGE_NUMBERS: i64 = 20261123000000;
+    pub const REPORT_REAL_PATH_STATUS: i64 = 20261124000000;
 
     async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
@@ -471,6 +473,62 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_user_marked_for_report_real_path_is_connected() {
+        let db = test_db::migrated_before(test_db::REPORT_REAL_PATH_STATUS).await;
+        insert_user(&db, "u1", "bob").await;
+        insert_user(&db, "u2", "carol").await;
+        for (id, status) in [("u1", "missing_report_real_path"), ("u2", "offline")] {
+            sqlx::query("UPDATE users SET navidrome_status = ? WHERE id = ?")
+                .bind(status)
+                .bind(id)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        test_db::apply(&db, test_db::REPORT_REAL_PATH_STATUS).await;
+        let statuses: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, navidrome_status FROM users WHERE id IN ('u1', 'u2') ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                ("u1".to_string(), "connected".to_string()),
+                ("u2".to_string(), "offline".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_jobs_user_change_number_starts_at_its_change_number() {
+        let db = test_db::migrated_before(test_db::USER_CHANGE_NUMBERS).await;
+        insert_user(&db, "u1", "bob").await;
+        insert_folder(&db, "u1", "/music/bob").await;
+        sqlx::query(
+            "INSERT INTO batches (id, user_id, origin, created_at) VALUES ('b1', 'u1', 'ui', 7)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, user_id, folder_id, created_at, updated_at, wanted, \
+             import_mode, state, batch_id, kind, changed_seq) \
+             VALUES ('j1', 'u1', '/music/bob', 7, 7, '{}', 'album', 'done', 'b1', 'album', 41)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        test_db::apply(&db, test_db::USER_CHANGE_NUMBERS).await;
+        let seq: i64 = sqlx::query_scalar("SELECT user_seq FROM jobs WHERE id = 'j1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(seq, 41);
     }
 
     #[tokio::test]

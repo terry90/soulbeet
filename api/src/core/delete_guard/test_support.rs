@@ -322,7 +322,6 @@ impl Listeners for FakeNavidrome {
                 album_id: (!s.minimal.contains(&user)).then_some(album_id),
                 genre: None,
                 duration: None,
-                path: None,
                 user_rating: (song.rating > 0).then_some(song.rating),
                 play_count: None,
                 starred: s
