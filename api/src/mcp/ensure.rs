@@ -583,6 +583,46 @@ fn leave_out(error: &mut ToolError, step: &'static str) -> bool {
     left_out
 }
 
+/// The job that already wants a recording, in full.
+fn wanting_job(job_id: &str) -> NextCall {
+    NextCall::new("get_jobs", json!({"job_ids": [job_id], "detail": "full"}))
+}
+
+/// The user's batches, for a user holding the most unfinished jobs allowed: following them is
+/// what frees room.
+fn batches_to_follow() -> NextCall {
+    NextCall::new("list_batches", json!({}))
+}
+
+/// A refusal of a download_source call that was to make a job, with what it offers instead of
+/// the same call: the job that already wants the recording, or the user's batches when they
+/// hold the most unfinished jobs. Any other answer is given back.
+fn new_job_refused(
+    answered: Result<RetryAnswer, Failure>,
+) -> Result<ToolError, Result<RetryAnswer, Failure>> {
+    let Ok(RetryAnswer::Refused(failure, facts) | RetryAnswer::Unavailable(failure, facts)) =
+        &answered
+    else {
+        return Err(answered);
+    };
+    let next = match (failure.code, facts.get("job_id").and_then(Value::as_str)) {
+        (FailureCode::AlreadyRunning, Some(job_id)) => wanting_job(job_id),
+        (FailureCode::RateLimited, _) => batches_to_follow(),
+        _ => return Err(answered),
+    };
+    let Ok(RetryAnswer::Refused(failure, facts) | RetryAnswer::Unavailable(failure, facts)) =
+        answered
+    else {
+        unreachable!("matched above");
+    };
+    Ok(ToolError {
+        failure,
+        facts,
+        tried: vec![],
+        next: vec![next],
+    })
+}
+
 /// One item's entry. A refused one offers what follows its failure: the job that already wants
 /// the recording, the user's batches when they hold the most jobs allowed, else this call for that
 /// item alone when the same source can answer later (D13).
@@ -600,10 +640,7 @@ fn item_result(item: EnsureItem, given: &Value, call: &Value) -> ItemResult {
             failure,
             facts,
         } => {
-            let next = vec![NextCall::new(
-                "get_jobs",
-                json!({"job_ids": [job_id], "detail": "full"}),
-            )];
+            let next = vec![wanting_job(&job_id)];
             return ItemResult::Failed(ToolError {
                 failure,
                 facts,
@@ -613,7 +650,7 @@ fn item_result(item: EnsureItem, given: &Value, call: &Value) -> ItemResult {
         }
         EnsureItem::Refused(failure, facts) => {
             let next = match failure.code {
-                FailureCode::RateLimited => vec![NextCall::new("list_batches", json!({}))],
+                FailureCode::RateLimited => vec![batches_to_follow()],
                 _ => {
                     let mut alone = call.clone();
                     alone["items"] = json!([given]);
@@ -768,6 +805,10 @@ pub(crate) async fn download_source(
             Ok(RetryAnswer::Unavailable(failure, facts)) if facts.contains_key("folders") => {
                 Keyed::Released(failed(with_folders(failure, facts, &given)))
             }
+            answered if job.is_none() => match new_job_refused(answered) {
+                Ok(refused) => Keyed::Released(failed(refused)),
+                Err(answered) => on.answer(None, answered, again).await,
+            },
             answered => on.answer(job.as_deref(), answered, again).await,
         }
     };
@@ -1478,6 +1519,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_job_past_the_limit_is_told_to_follow_the_batches() {
+        let (db, acq, _, token) = jobs_app().await;
+        let job = choosing_track_job(&acq).await;
+        let candidate = candidate_of(&acq, &job, "peer_b").await;
+        // With the job waiting for a choice, the most allowed.
+        batch_of_searches(&acq, MCP_UNFINISHED_JOBS_PER_USER as usize - 1).await;
+        let error = document(
+            &call_tool(
+                app_of(&db, &acq),
+                &token,
+                "download_source",
+                json!({"candidate_id": candidate, "folder_id": "alice-folder",
+                    "reference": {"artist": "Marrow Choir", "title": "Adeste Fideles"}}),
+            )
+            .await,
+        )["error"]
+            .clone();
+        assert_eq!(error["code"], "rate_limited", "{error}");
+        // Not the same call at once, which the limit refuses again.
+        assert_eq!(error["next"], json!([{"tool": "list_batches", "args": {}}]));
+    }
+
+    #[tokio::test]
     async fn a_user_with_the_most_unfinished_jobs_is_told_to_follow_them() {
         let (db, acq, _, token) = jobs_app().await;
         batch_of_searches(&acq, MCP_UNFINISHED_JOBS_PER_USER as usize).await;
@@ -2027,6 +2091,11 @@ mod tests {
             (error["code"].as_str(), error["facts"]["job_id"].as_str()),
             (Some("already_running"), Some(job.as_str())),
             "{error}"
+        );
+        // That job is what to follow, as ensure_in_library offers it.
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "get_jobs", "args": {"job_ids": [job], "detail": "full"}}])
         );
         let other = json!({"artist": "Marrow Choir", "title": "Adeste Fideles"});
         let doc = document(
