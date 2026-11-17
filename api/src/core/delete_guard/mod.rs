@@ -2133,7 +2133,7 @@ mod tests {
     async fn a_root_the_file_cannot_prove_is_not_learned_and_the_check_refuses() {
         let no_file = (
             FailureCode::DeletePathUnresolved,
-            "No file at this song's path".to_string(),
+            "No folder at this song's library root".to_string(),
         );
         // Navidrome read an earlier write of the file: another modification time.
         let earlier: chrono::DateTime<chrono::Utc> =
@@ -2313,7 +2313,7 @@ mod tests {
             (f.code, f.message.as_str()),
             (
                 FailureCode::DeletePathUnresolved,
-                "No file at this song's path"
+                "No folder at this song's library root"
             )
         );
         assert_eq!(
@@ -3261,7 +3261,7 @@ mod tests {
             .check_file(&lib.alice(), &item, &library, &[])
             .await
             .unwrap_err();
-        assert_eq!(f.message, "No file at this song's path");
+        assert_eq!(f.message, "No folder at this song's library root");
         assert!(x.exists());
     }
 }

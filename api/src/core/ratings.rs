@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 use crate::auth::{UserCtx, UserId};
 use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
+use crate::core::delete_guard::paths::NO_LIBRARY_ROOT;
 use crate::core::delete_guard::{paths, pending_track_of, song_not_found};
 use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin, Verdict};
 use crate::core::discovery::{is_not_pending, promote, DiscoveryEffects, NotDone, Replace};
@@ -262,9 +263,10 @@ async fn rating_refusal(
 
 /// `f`, the guard's failure to read or place the rated song's file while the user has pending
 /// discovery tracks, as a rating's failure: at the stage of set_rating's library reads. A file
-/// Soulful cannot place (delete_path_unresolved, the guard's reason kept in the message) also
-/// says what the user can fix: the music folder as Soulful sees it does not match Navidrome's
-/// library path, or Soulful finds no file there.
+/// Soulful cannot place (delete_path_unresolved) keeps the guard's reason and says what the user
+/// can do: when Soulful sees no folder at the song's library root, make the music folder match
+/// Navidrome's library path; for any other reason (the file missing, moved behind a link, of
+/// another size), rate the song in Navidrome.
 fn unplaced(f: Failure) -> Failure {
     let f = Failure {
         stage: Stage::LibraryCheck,
@@ -273,8 +275,26 @@ fn unplaced(f: Failure) -> Failure {
     if f.code != FailureCode::DeletePathUnresolved {
         return f;
     }
+    let (fix, action) = match f.message.as_str() {
+        NO_LIBRARY_ROOT => (
+            "Make Navidrome's music folder readable by Soulful at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library, or rate the song yourself in Navidrome.",
+            UserAction::new(
+                UserActionCode::ConfigureNavidrome,
+                "Make Navidrome's music folder readable by Soulful at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library",
+                "Soulful's environment",
+            ),
+        ),
+        _ => (
+            "Rate the song yourself in Navidrome.",
+            UserAction::new(
+                UserActionCode::RateInNavidrome,
+                "Rate the song yourself in Navidrome",
+                "Navidrome",
+            ),
+        ),
+    };
     let message = format!(
-        "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot find the song's file in the music folder at the path Navidrome's library gives for it. {}. Make Navidrome's music folder readable by Soulful at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library, or rate the song yourself in Navidrome.",
+        "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot place the song's file. {}. {fix}",
         f.message
     );
     Failure {
@@ -282,11 +302,7 @@ fn unplaced(f: Failure) -> Failure {
         ..f
     }
     .with_message(message)
-    .with_user_action(UserAction::new(
-        UserActionCode::ConfigureNavidrome,
-        "Make Navidrome's music folder readable by Soulful at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library",
-        "Soulful's environment",
-    ))
+    .with_user_action(action)
 }
 
 /// A failed write of `target`: Navidrome's "data not found" (Subsonic 70) is the target gone.
@@ -1029,21 +1045,34 @@ mod tests {
                 RetryAdvice::NeedsUser
             )
         );
+        // The library is here and the file is gone: the guard's reason, and the rating is the
+        // user's to make in Navidrome; no setting of Soulful's would find the file.
         assert_eq!(
             f.message,
-            "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot find the song's file in the music folder at the path Navidrome's library gives for it. No file at this song's path. Make Navidrome's music folder readable by Soulful at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library, or rate the song yourself in Navidrome."
+            "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot place the song's file. No file at this song's path. Rate the song yourself in Navidrome."
         );
         assert_eq!(
             f.user_action,
             Some(UserAction::new(
-                UserActionCode::ConfigureNavidrome,
-                "Make Navidrome's music folder readable by Soulful at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library",
-                "Soulful's environment",
+                UserActionCode::RateInNavidrome,
+                "Rate the song yourself in Navidrome",
+                "Navidrome",
             ))
         );
         let shown = serde_json::to_string(f).unwrap();
         assert!(!shown.contains(lib.root.to_str().unwrap()), "{shown}");
         assert!(!shown.contains("03.flac"), "{shown}");
+        // No folder where the library's root should be: the music folder or
+        // NAVIDROME_MUSIC_PATH is wrong, which the user can fix.
+        let root_gone = unplaced(crate::core::delete_guard::path_unresolved(NO_LIBRARY_ROOT));
+        assert_eq!(
+            root_gone.message,
+            "Soulful cannot tell this song from your pending discovery tracks, so it does not rate it: it cannot place the song's file. No folder at this song's library root. Make Navidrome's music folder readable by Soulful at Navidrome's library path or set NAVIDROME_MUSIC_PATH to where Soulful sees Navidrome's default library, or rate the song yourself in Navidrome."
+        );
+        assert_eq!(
+            root_gone.user_action.map(|a| a.code),
+            Some(UserActionCode::ConfigureNavidrome)
+        );
         // So is a record of the song that cannot be read, at the same stage.
         lib.fake
             .unreadable("alice", || NavidromeLookupError::NotLinked);

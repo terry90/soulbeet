@@ -91,6 +91,11 @@ pub(super) async fn local_file_learning(
     }
 }
 
+/// Why a song's file cannot be found when the root of its library is no folder on this
+/// machine: where Soulful looks for Navidrome's library is wrong, which NAVIDROME_MUSIC_PATH
+/// or the music folder's mount fixes.
+pub(crate) const NO_LIBRARY_ROOT: &str = "No folder at this song's library root";
+
 /// local_file_in's checks: Err for a refusal, Ok(Err) when no file is under the song's root.
 async fn file_under_root(
     db: &SqlitePool,
@@ -114,7 +119,10 @@ async fn file_under_root(
     };
     let canonical_root = match tokio::fs::canonicalize(&root).await {
         Ok(canonical) => canonical,
-        Err(e) => return Ok(Err(no_file(e))),
+        Err(e) => {
+            let root_gone = path_unresolved(NO_LIBRARY_ROOT);
+            return Ok(Err(root_gone.with_cause(Service::Filesystem, None, e.to_string())));
+        }
     };
     let canonical = match tokio::fs::canonicalize(&local).await {
         Ok(canonical) => canonical,
@@ -668,7 +676,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(moved.code, FailureCode::DeletePathUnresolved);
-        assert_eq!(moved.message, "No file at this song's path");
+        assert_eq!(moved.message, "No folder at this song's library root");
     }
 
     #[tokio::test]
@@ -708,7 +716,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .message,
-            "No file at this song's path"
+            "No folder at this song's library root"
         );
     }
 
