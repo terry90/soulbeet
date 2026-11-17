@@ -21,9 +21,12 @@ test('open the MCP instance', async ({ page }) => {
   // A run against this instance already opened it.
   if (first.status() === 200) return;
   expect(first.status()).toBe(503);
-  expect(((await first.json()) as { reasons: { code: string }[] }).reasons.map((r) => r.code)).toEqual([
-    'default_admin_password',
-  ]);
+  // An anonymous caller is not told which check fails; the 200 after the new admin password
+  // below shows it was the only one.
+  expect(await first.json()).toEqual({
+    error: 'mcp_unavailable',
+    message: 'Claude (MCP) access stays off until the security checks in Settings pass',
+  });
 
   // Navidrome is slower to start than the app, and every test after this one signs in through it.
   await expect
