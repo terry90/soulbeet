@@ -243,7 +243,6 @@ pub enum RetryAdvice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
-    Auth,
     Input,
     Metadata,
     LibraryCheck,
@@ -265,7 +264,6 @@ pub enum Service {
     Navidrome,
     Musicbrainz,
     Lastfm,
-    Listenbrainz,
     Filesystem,
     /// Soulful's own settings database.
     Database,
@@ -398,7 +396,6 @@ failure_codes! {
     ImportAsIsMissingTags => "import_as_is_missing_tags",
     ImportChoiceInvalid => "import_choice_invalid",
     ImportFilesGone => "import_files_gone",
-    ImportPartial => "import_partial",
     IndexNotFoundAfterScan => "index_not_found_after_scan",
     IndexNoScanPossible => "index_no_scan_possible",
     ScanFailed => "scan_failed",
@@ -446,7 +443,7 @@ mod tests {
     /// `sources_exhausted`, `result_rejected` and `search_stopped`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 85] = [
+    const NAMES: [&str; 84] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -506,7 +503,6 @@ mod tests {
         "import_as_is_missing_tags",
         "import_choice_invalid",
         "import_files_gone",
-        "import_partial",
         "index_not_found_after_scan",
         "index_no_scan_possible",
         "scan_failed",

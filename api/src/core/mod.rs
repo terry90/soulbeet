@@ -56,7 +56,6 @@ pub(crate) fn logged(f: &Failure) -> String {
         Service::Navidrome => "navidrome",
         Service::Musicbrainz => "musicbrainz",
         Service::Lastfm => "lastfm",
-        Service::Listenbrainz => "listenbrainz",
         Service::Filesystem => "filesystem",
         Service::Database => "database",
         Service::Soulful => "soulful",

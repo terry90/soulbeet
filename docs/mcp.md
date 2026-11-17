@@ -524,7 +524,6 @@ The ones you are most likely to see:
 | `import_as_is_missing_tags` | `import` | An as-is import was refused: some files lack artist and title tags (and album, in album mode). | Choose a match instead. |
 | `import_choice_invalid` | `input`, `import` | The chosen candidate is not one beets found, or a MusicBrainz link names the wrong kind of entry. | Choose again. |
 | `import_files_gone` | `import` | The downloaded files kept for the decision were deleted. | Dismiss the job, or download again. |
-| `import_partial` | none | Not sent by this version of Soulbeet. | Nothing. |
 | `index_not_found_after_scan` | `index` | Navidrome scanned after the import and does not list the file. | Check that a Navidrome library holds the folder (`in_navidrome`), then retry with `index_only`. |
 | `index_no_scan_possible` | `index` | Navidrome has not scanned for 10 minutes since the import, and this account cannot start a scan. User action `enable_indexing`. | Make the Navidrome account an admin, turn on Navidrome's file watcher, or set a scan schedule. |
 | `scan_failed` | `index` | Navidrome's scan failed. | Try again later. |
@@ -575,7 +574,7 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 
 ## Failure causes
 
-A failure's `cause.service` names whose answer `cause.raw` holds: `slskd`, `beets`, `navidrome`, `musicbrainz`, `lastfm`, `listenbrainz`, `filesystem`, `database` (Soulbeet's own settings database), or `soulful` (Soulbeet's own words about what it found wrong, or lines it could not read from a service). `cause.status` is the service's status code when it gave one.
+A failure's `cause.service` names whose answer `cause.raw` holds: `slskd`, `beets`, `navidrome`, `musicbrainz`, `lastfm`, `filesystem`, `database` (Soulbeet's own settings database), or `soulful` (Soulbeet's own words about what it found wrong, or lines it could not read from a service). `cause.status` is the service's status code when it gave one.
 
 ## Known limits
 
