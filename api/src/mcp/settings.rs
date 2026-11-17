@@ -206,7 +206,8 @@ fn promote_threshold_refused() -> Failure {
     .with_user_action(UserAction::new(
         UserActionCode::ChangeDiscoverySettings,
         "Change the discovery promote threshold yourself",
-        "Soulful Settings > Library > Discovery",
+        // Its own row of the Library tab, below the Discovery block.
+        "Soulful Settings > Library",
     ))
 }
 
@@ -603,12 +604,14 @@ mod tests {
                 json!({"discovery_promote_threshold": 1, "request_key": "k"}),
                 "Only you can change the discovery promote threshold, in Soulful's Settings: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
                 "Change the discovery promote threshold yourself",
+                "Soulful Settings > Library",
             ),
             (
                 "discovery_folder_id",
                 json!({"discovery_folder_id": "f1", "request_key": "k"}),
                 "Only you can change the discovery folder, in Soulful's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
                 "Change the discovery folder yourself",
+                "Soulful Settings > Library > Discovery",
             ),
         ];
         for allow_delete in [0, 1] {
@@ -618,7 +621,7 @@ mod tests {
                 .await
                 .unwrap();
             // The same key each time: nothing was saved, so each refusal let it go.
-            for (field, call, message, what) in &calls {
+            for (field, call, message, what, place) in &calls {
                 let result = call_tool(app.clone(), &token, "update_settings", call.clone()).await;
                 let error = &document(&result)["error"];
                 assert_eq!(
@@ -638,7 +641,7 @@ mod tests {
                 );
                 assert_eq!(
                     error["user_action"],
-                    json!({"code": "change_discovery_settings", "what": what, "where": "Soulful Settings > Library > Discovery"}),
+                    json!({"code": "change_discovery_settings", "what": what, "where": place}),
                     "{field}, allow_delete {allow_delete}"
                 );
                 assert_eq!(

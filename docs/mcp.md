@@ -571,7 +571,7 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 | `add_folder` | "Add a library folder", or "Choose a discovery folder" | "Settings > Library", or "Settings > Library > Discovery" |
 | `rate_in_navidrome` | "Rate the song 1 star yourself in Navidrome", or "Rate the song yourself in Navidrome" | "Navidrome" |
 | `enable_auto_delete` | "Turn on auto-delete yourself" | "Soulful Settings > Library" |
-| `change_discovery_settings` | "Change the discovery promote threshold yourself", or "Change the discovery folder yourself" | "Soulful Settings > Library > Discovery" |
+| `change_discovery_settings` | "Change the discovery promote threshold yourself", or "Change the discovery folder yourself" | "Soulful Settings > Library" (the threshold), or "Soulful Settings > Library > Discovery" (the folder) |
 
 ## Failure causes
 
