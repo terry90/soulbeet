@@ -69,7 +69,7 @@ pub(crate) const CREATE_PLAYLIST: ToolSpec = ToolSpec {
     title: "Create a playlist",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Creates a static Navidrome playlist owned by this user with the given songs in the given order, then reads it back from Navidrome. song_ids are Navidrome song ids (find_in_library, search_library, get_playlist), at most 1000; the list may be empty. Returns the playlist as Navidrome lists it. Playlist ids stay valid until the playlist is deleted; song ids while the file stays in the library. A repeat with the same request_key returns the first result. Takes a few seconds. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome does not list some song ids for this user, or their files are missing; facts name them and next repeats the call without them), playlist_name_taken (this user already has a playlist with that name; pass allow_duplicate_name to make another), playlist_tracks_not_written, playlist_not_written (a comment or public flag Navidrome answered but does not show), playlist_not_found (the playlist went before its comment or public flag was written), already_running (a call with this request_key still runs). A create that failed once its request was sent may have made the playlist: next offers list_playlists to look for it rather than the same call.")
+        format!("Creates a static Navidrome playlist owned by this user with the given songs in the given order, then reads it back from Navidrome. song_ids are Navidrome song ids (find_in_library, search_library, get_playlist), at most 1000; the list may be empty. Returns the playlist as Navidrome lists it. Playlist ids stay valid until the playlist is deleted; song ids while the file stays in the library. A repeat with the same request_key returns the first result. Takes a few seconds. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome does not list some song ids for this user, or their files are missing; facts name them and next repeats the call without them), playlist_name_taken (this user already has a playlist with that name; next offers each with get_playlist, then the call with allow_duplicate_name to make another), playlist_tracks_not_written, playlist_not_written (a comment or public flag Navidrome answered but does not show), playlist_not_found (the playlist went before its comment or public flag was written), already_running (a call with this request_key still runs). A create that failed once its request was sent may have made the playlist: next offers list_playlists to look for it rather than the same call.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 255}, "song_ids": {"type": "array", "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 500}}, "comment": {"type": "string", "maxLength": 2000}, "public": {"type": "boolean"}, "allow_duplicate_name": {"type": "boolean"}, "#,
@@ -576,7 +576,10 @@ pub(crate) fn refusal_error(
         PlaylistRefusal::NameTaken { name, existing } => {
             fact("name", json!(cut_json(name.clone(), TEXT_MAX_CHARS)));
             fact("existing_playlist_ids", json!(existing));
-            vec![args.call_with(json!({"allow_duplicate_name": true}))]
+            // The playlists of that name first: one may be the playlist meant.
+            (existing.iter().map(|id| Some(get_playlist_call(id))))
+                .chain([args.call_with(json!({"allow_duplicate_name": true}))])
+                .collect()
         }
         PlaylistRefusal::SongsNotPresent {
             unknown,
@@ -1033,9 +1036,11 @@ mod tests {
             error["facts"],
             json!({"playlist_id": null, "name": "Advent", "existing_playlist_ids": ["p-old"]})
         );
+        // The playlist of that name first: it may be the one meant.
         assert_eq!(
             error["next"],
-            json!([{"tool": "create_playlist", "args": {"name": "Advent", "song_ids": [HOLY.0], "allow_duplicate_name": true}}])
+            json!([{"tool": "get_playlist", "args": {"playlist_id": "p-old"}},
+                {"tool": "create_playlist", "args": {"name": "Advent", "song_ids": [HOLY.0], "allow_duplicate_name": true}}])
         );
     }
 
@@ -1636,7 +1641,7 @@ mod tests {
         assert_eq!(
             (e.next.len(), e.failure.message.as_str()),
             (
-                0,
+                1,
                 "You already have a playlist with this name. The call is too large to offer again in next."
             )
         );

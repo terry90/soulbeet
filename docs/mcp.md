@@ -530,7 +530,7 @@ The ones you are most likely to see:
 | `scan_failed` | `index` | Navidrome's scan failed. | Try again later. |
 | `playlist_not_found` | `playlist` | No such playlist, or another user's private one. | List the playlists again. |
 | `playlist_not_owner` | `playlist` | Only the owner of the playlist can change it. | Make a copy of your own. |
-| `playlist_name_taken` | `playlist` | You already have a playlist with this name. | Another name, or `allow_duplicate_name`. |
+| `playlist_name_taken` | `playlist` | You already have a playlist with this name. `facts.existing_playlist_ids` names them, and `next` offers each before a second playlist of the name. | Use the existing playlist, another name, or `allow_duplicate_name`. |
 | `playlist_tracks_not_written` | `playlist` | Navidrome does not list the playlist's songs as they were written. | Read the playlist and try again. |
 | `playlist_not_written` | `playlist` | Navidrome answered a change of name, comment, public flag or a delete, but does not show it. | Read the playlist and try again. |
 | `playlist_changed` | `playlist`, `input` | A position given no longer holds the song given. | Read the playlist again. |
