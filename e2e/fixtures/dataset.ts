@@ -605,8 +605,11 @@ function carolShares(
   sampleRate: number | null,
   bitDepth: number | null,
 ): PeerShare[] {
-  return albumShares(root, release, format, bitRate, sampleRate, bitDepth).filter((_, i) =>
-    positions.includes(i + 1),
+  const wanted = new Set(
+    release.tracks.filter((track) => positions.includes(track.position)).map((track) => track.mbid),
+  );
+  return albumShares(root, release, format, bitRate, sampleRate, bitDepth).filter((share) =>
+    wanted.has(share.recordingMbid),
   );
 }
 

@@ -73,9 +73,17 @@ export function proxyFromEnv(env: NodeJS.ProcessEnv): TcpProxy | null {
     throw new Error('NAVIDROME_PROXY_PORT and NAVIDROME_UPSTREAM must be set together');
   }
   const split = upstream.lastIndexOf(':');
-  const upstreamPort = Number(upstream.slice(split + 1));
-  if (split <= 0 || !Number.isInteger(upstreamPort) || !Number.isInteger(Number(port))) {
+  const upstreamPort = portNumber(upstream.slice(split + 1));
+  const listenPort = portNumber(port);
+  if (split <= 0 || upstreamPort === null || listenPort === null) {
     throw new Error(`NAVIDROME_UPSTREAM must be host:port and NAVIDROME_PROXY_PORT a port, got "${upstream}" and "${port}"`);
   }
-  return new TcpProxy(Number(port), upstream.slice(0, split), upstreamPort);
+  return new TcpProxy(listenPort, upstream.slice(0, split), upstreamPort);
+}
+
+/** A port given as text: digits only, 1 to 65535; null for anything else, the empty text included. */
+function portNumber(text: string): number | null {
+  if (!/^\d+$/.test(text)) return null;
+  const port = Number(text);
+  return port >= 1 && port <= 65535 ? port : null;
 }

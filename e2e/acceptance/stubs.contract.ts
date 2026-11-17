@@ -33,6 +33,11 @@ async function finalState(username: string, filename: string): Promise<Row> {
 }
 const fenwick = (n: string) => `Music\\FLAC\\Fenwick Carol Singers\\Carols at Fenwick\\${n}.flac`;
 
+// A run cut off before afterAll left the stubs as it had them (carol_busy's one rejection used up).
+test.beforeAll(async () => {
+  await resetStubs();
+});
+
 test.afterAll(async () => {
   await resetStubs();
   await removeStubDownloads(DESTINATION);
@@ -98,7 +103,9 @@ test('the Navidrome proxy refuses connections while down', async () => {
 });
 
 test('the stub refuses to remove anything but one directory name', async () => {
-  // fetch resolves "." and ".." segments (even as %2e) before sending, so only names with a separator reach the stub.
+  // "." and ".." (even as %2e) never reach the handler over HTTP: fetch resolves them before
+  // sending, and the stub's router resolves them again when it parses the URL (router.ts). So
+  // only names with a separator can be sent, and those are what is tested.
   for (const bad of ['a%2Fb', 'a%5Cb', '%2F']) {
     const r = await fetch(`${slskdControlUrl}/_control/downloads/${bad}`, { method: 'DELETE' });
     expect(r.status, bad).toBe(400);

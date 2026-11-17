@@ -79,7 +79,7 @@ export async function removeStubDownloads(destination: string): Promise<void> {
     `${slskdControlUrl}/_control/downloads/${encodeURIComponent(destination)}`,
     { method: 'DELETE' },
   );
-  if (!response.ok) {
+  if (response.status !== 200) {
     throw new Error(`control downloads failed: ${response.status} ${await response.text()}`);
   }
 }
