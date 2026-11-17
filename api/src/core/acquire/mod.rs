@@ -389,10 +389,12 @@ pub(crate) fn spawn_monitor(ctx: &UserCtx, mut monitor: DownloadMonitor) {
 
 /// Deletes `files`, a job's own downloaded files, and prunes the folders
 /// they leave empty up to `base`; a file already gone still has its folder
-/// pruned. Nothing but these files is deleted: a folder may hold other
-/// downloads. A file whose folder is not inside `base`, symlinks resolved, is
-/// never touched: it is not a download. The paths it could not delete, with
-/// the OS error: a file gone already is one, with `NotFound`.
+/// pruned, or, when that folder is gone too, the nearest folder above it that
+/// is left. Nothing but these files is deleted: a folder may hold other
+/// downloads. A file whose folder (or nearest folder left) is not inside
+/// `base`, symlinks resolved, is never touched: it is not a download. The
+/// paths it could not delete, with the OS error: a file gone already is one,
+/// with `NotFound`.
 pub(crate) async fn discard_files(
     files: &[PathBuf],
     base: &Path,
@@ -409,20 +411,26 @@ pub(crate) async fn discard_files(
         }
     };
     for file in files {
-        let (folder, name) = match download_in(file, &real_base).await {
-            Ok(found) => found,
+        let folder = match download_in(file, &real_base).await {
+            Ok(Download::At { folder, name }) => {
+                if let Err(e) = tokio::fs::remove_file(folder.join(&name)).await {
+                    let gone = e.kind() == std::io::ErrorKind::NotFound;
+                    failed.push((file.clone(), e));
+                    if !gone {
+                        continue;
+                    }
+                }
+                folder
+            }
+            Ok(Download::FolderGone { gone, nearest }) => {
+                failed.push((file.clone(), gone));
+                nearest
+            }
             Err(e) => {
                 failed.push((file.clone(), e));
                 continue;
             }
         };
-        if let Err(e) = tokio::fs::remove_file(folder.join(&name)).await {
-            let gone = e.kind() == std::io::ErrorKind::NotFound;
-            failed.push((file.clone(), e));
-            if !gone {
-                continue;
-            }
-        }
         if let Err(e) = crate::server_fns::cleanup_empty_ancestors(&folder, &real_base).await {
             failed.push((folder, e));
         }
@@ -430,12 +438,25 @@ pub(crate) async fn discard_files(
     failed
 }
 
-/// The real folder and the name of `file`, a download: refused unless the
-/// folder's real path is `real_base` or inside it and the name is a plain one.
-async fn download_in(
-    file: &Path,
-    real_base: &Path,
-) -> std::io::Result<(PathBuf, std::ffi::OsString)> {
+/// Where a download is on disk.
+enum Download {
+    /// The real path of its folder, and its name.
+    At {
+        folder: PathBuf,
+        name: std::ffi::OsString,
+    },
+    /// Its folder is gone (`gone`, `NotFound`); `nearest` is the real path of the nearest
+    /// folder above it that is left.
+    FolderGone {
+        gone: std::io::Error,
+        nearest: PathBuf,
+    },
+}
+
+/// Where `file`, a download, is: refused unless the real path of its folder,
+/// or of the nearest folder above it left when that one is gone, is
+/// `real_base` or inside it, and the name is a plain one.
+async fn download_in(file: &Path, real_base: &Path) -> std::io::Result<Download> {
     let outside = || {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -445,11 +466,33 @@ async fn download_in(
     let (Some(parent), Some(name)) = (file.parent(), file.file_name()) else {
         return Err(outside());
     };
-    let folder = tokio::fs::canonicalize(parent).await?;
-    if !folder.starts_with(real_base) {
-        return Err(outside());
+    let inside = |real: PathBuf| match real.starts_with(real_base) {
+        true => Ok(real),
+        false => Err(outside()),
+    };
+    let gone = match tokio::fs::canonicalize(parent).await {
+        Ok(folder) => {
+            return Ok(Download::At {
+                folder: inside(folder)?,
+                name: name.to_os_string(),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => e,
+        Err(e) => return Err(e),
+    };
+    for above in parent.ancestors().skip(1) {
+        match tokio::fs::canonicalize(above).await {
+            Ok(nearest) => {
+                return Ok(Download::FolderGone {
+                    gone,
+                    nearest: inside(nearest)?,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
-    Ok((folder, name.to_os_string()))
+    Err(gone)
 }
 
 /// The search's groups without the picked files, best score first, empty
@@ -588,6 +631,37 @@ mod tests {
             "a gone file's empty folder is pruned"
         );
         assert!(base.exists());
+    }
+
+    #[tokio::test]
+    async fn discarding_a_file_whose_folder_is_gone_prunes_the_nearest_folder_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("dl");
+        // The album's disc folder is gone; the album folder is left, empty.
+        let album = base.join("Y [2e3d4c5b]");
+        let file = album.join("CD1/01.flac");
+        std::fs::create_dir_all(&album).unwrap();
+        // Outside the download folder, an empty folder above a gone one stays.
+        let library = tmp.path().join("music/bob");
+        let outside = library.join("Gone/01.flac");
+        std::fs::create_dir_all(&library).unwrap();
+
+        let failed: Vec<(PathBuf, std::io::ErrorKind)> =
+            (discard_files(&[file.clone(), outside.clone()], &base)
+                .await
+                .into_iter())
+            .map(|(path, e)| (path, e.kind()))
+            .collect();
+
+        assert_eq!(
+            failed,
+            vec![
+                (file, std::io::ErrorKind::NotFound),
+                (outside, std::io::ErrorKind::PermissionDenied)
+            ]
+        );
+        assert!(!album.exists(), "the empty album folder is pruned");
+        assert!(base.exists() && library.exists());
     }
 
     #[tokio::test]
