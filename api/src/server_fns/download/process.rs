@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::utils::{file_id, resolve_download_path, resolve_in_destination, FileId, Unresolved};
+use super::utils::{file_id, resolve_adopted, resolve_in_destination, FileId, Unresolved};
 use crate::auth::UserId;
 use crate::import_queue::{Duplicates, ImportJob, JobOwner};
 use crate::ledger::DuplicateRule;
@@ -21,8 +21,8 @@ const FILE_RESOLVE_INITIAL_DELAY_MS: u64 = 500;
 /// Find a finished download on disk, retrying with exponential backoff:
 /// slskd can report completion before the file is visible through a shared
 /// volume mount. `destination` is the batch folder the file was enqueued
-/// into; `None` (a transfer this batch did not enqueue) falls back to
-/// searching the whole download folder. Files in `claimed` were already
+/// into; `None` (a transfer this batch adopted) is looked for where slskd
+/// saves a transfer without a batch folder (`resolve_adopted`). Files in `claimed` were already
 /// handed off and are never returned; the file found is added to it. The
 /// lock is held only while one attempt looks, never across a wait. When no
 /// attempt finds one, the last says why.
@@ -73,9 +73,7 @@ pub fn find_on_disk(
     let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
     let path = match destination {
         Some(destination) => resolve_in_destination(filename, base, destination, &claimed)?,
-        None => resolve_download_path(filename, base)
-            .map(PathBuf::from)
-            .ok_or(Unresolved::NotOnDisk)?,
+        None => resolve_adopted(filename, base, &claimed)?,
     };
     let id = file_id(&path).ok_or(Unresolved::NotOnDisk)?;
     match claimed.insert(id) {

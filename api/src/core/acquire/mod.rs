@@ -390,30 +390,66 @@ pub(crate) fn spawn_monitor(ctx: &UserCtx, mut monitor: DownloadMonitor) {
 /// Deletes `files`, a job's own downloaded files, and prunes the folders
 /// they leave empty up to `base`; a file already gone still has its folder
 /// pruned. Nothing but these files is deleted: a folder may hold other
-/// downloads. The paths it could not delete, with the OS error: a file gone already is one, with
-/// `NotFound`.
+/// downloads. A file whose folder is not inside `base`, symlinks resolved, is
+/// never touched: it is not a download. The paths it could not delete, with
+/// the OS error: a file gone already is one, with `NotFound`.
 pub(crate) async fn discard_files(
     files: &[PathBuf],
     base: &Path,
 ) -> Vec<(PathBuf, std::io::Error)> {
     let mut failed = Vec::new();
+    let real_base = match tokio::fs::canonicalize(base).await {
+        Ok(real) => real,
+        Err(e) => {
+            let kind = e.kind();
+            return files
+                .iter()
+                .map(|f| (f.clone(), std::io::Error::new(kind, e.to_string())))
+                .collect();
+        }
+    };
     for file in files {
-        match tokio::fs::remove_file(file).await {
-            Ok(()) => {}
+        let (folder, name) = match download_in(file, &real_base).await {
+            Ok(found) => found,
             Err(e) => {
-                let gone = e.kind() == std::io::ErrorKind::NotFound;
                 failed.push((file.clone(), e));
-                if !gone {
-                    continue;
-                }
+                continue;
+            }
+        };
+        if let Err(e) = tokio::fs::remove_file(folder.join(&name)).await {
+            let gone = e.kind() == std::io::ErrorKind::NotFound;
+            failed.push((file.clone(), e));
+            if !gone {
+                continue;
             }
         }
-        let folder = file.parent().unwrap_or(base);
-        if let Err(e) = crate::server_fns::cleanup_empty_ancestors(folder, base).await {
-            failed.push((folder.to_path_buf(), e));
+        if let Err(e) = crate::server_fns::cleanup_empty_ancestors(&folder, &real_base).await {
+            failed.push((folder, e));
         }
     }
     failed
+}
+
+/// The real folder and the name of `file`, a download: refused unless the
+/// folder's real path is `real_base` or inside it and the name is a plain one.
+async fn download_in(
+    file: &Path,
+    real_base: &Path,
+) -> std::io::Result<(PathBuf, std::ffi::OsString)> {
+    let outside = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("not inside the download folder {}", real_base.display()),
+        )
+    };
+    let (Some(parent), Some(name)) = (file.parent(), file.file_name()) else {
+        return Err(outside());
+    };
+    let folder = tokio::fs::canonicalize(parent).await?;
+    if !folder.starts_with(real_base) {
+        return Err(outside());
+    }
+    Ok((folder, name.to_os_string()))
 }
 
 /// The search's groups without the picked files, best score first, empty
@@ -552,6 +588,33 @@ mod tests {
             "a gone file's empty folder is pruned"
         );
         assert!(base.exists());
+    }
+
+    #[tokio::test]
+    async fn discarding_never_deletes_a_file_outside_the_download_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("dl");
+        let library = tmp.path().join("music/bob/Album");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("01.flac"), b"bob's").unwrap();
+        std::os::unix::fs::symlink(&library, base.join("Linked")).unwrap();
+
+        let files = [
+            library.join("01.flac"),
+            base.join("../music/bob/Album/01.flac"),
+            base.join("Linked/01.flac"),
+        ];
+        let failed = discard_files(&files, &base).await;
+
+        assert_eq!(
+            failed.iter().map(|(p, e)| (p.clone(), e.kind())).collect::<Vec<_>>(),
+            files
+                .iter()
+                .map(|f| (f.clone(), std::io::ErrorKind::PermissionDenied))
+                .collect::<Vec<_>>()
+        );
+        assert!(library.join("01.flac").exists());
     }
 
     #[test]

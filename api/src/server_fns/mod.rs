@@ -102,15 +102,17 @@ pub fn rate_limited_error<E: std::fmt::Display>(e: E) -> ServerFnError {
 /// Remove `dir` if empty, then each empty parent above it, stopping below
 /// `root`. `root` itself is never removed, and a `dir` outside `root` is left
 /// alone, so the walk can never climb out of the tree the caller owns (the
-/// download directory, a library folder, a Discovery profile).
+/// download directory, a library folder, a Discovery profile). Both are
+/// compared by their real paths, so neither `..` nor a symlink leads out.
 #[cfg(feature = "server")]
 pub async fn cleanup_empty_ancestors(
     dir: &std::path::Path,
     root: &std::path::Path,
 ) -> Result<(), std::io::Error> {
-    let mut dir = dir;
-    while dir != root && dir.starts_with(root) {
-        if tokio::fs::read_dir(dir)
+    let root = tokio::fs::canonicalize(root).await?;
+    let mut dir = tokio::fs::canonicalize(dir).await?;
+    while dir != root && dir.starts_with(&root) {
+        if tokio::fs::read_dir(&dir)
             .await?
             .next_entry()
             .await?
@@ -118,9 +120,9 @@ pub async fn cleanup_empty_ancestors(
         {
             break;
         }
-        tokio::fs::remove_dir(dir).await?;
+        tokio::fs::remove_dir(&dir).await?;
         match dir.parent() {
-            Some(parent) => dir = parent,
+            Some(parent) => dir = parent.to_path_buf(),
             None => break,
         }
     }
@@ -204,7 +206,17 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         cleanup_empty_ancestors(&outside, &root).await.unwrap();
+        assert!(outside.exists());
 
+        // Lexically under the root, really outside it.
+        let stepped = root.join("../elsewhere/empty");
+        cleanup_empty_ancestors(&stepped, &root).await.unwrap();
+        assert!(outside.exists());
+
+        std::os::unix::fs::symlink(base.path().join("elsewhere"), root.join("link")).unwrap();
+        cleanup_empty_ancestors(&root.join("link/empty"), &root)
+            .await
+            .unwrap();
         assert!(outside.exists());
     }
 }
