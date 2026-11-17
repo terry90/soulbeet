@@ -16,6 +16,7 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::auth::UserCtx;
 use crate::core::library::{navidrome_failure, SongFacts};
+use crate::core::time;
 
 pub mod fill;
 
@@ -79,8 +80,8 @@ pub struct PlaylistFacts {
     pub public: bool,
     pub song_count: u32,
     pub duration_s: u32,
-    pub created: String,
-    pub changed: String,
+    pub created: Option<String>,
+    pub changed: Option<String>,
 }
 
 /// A playlist entry: its 0-based place among all of the playlist's tracks,
@@ -109,8 +110,8 @@ pub(crate) fn facts(p: &SubsonicPlaylist, username: &str) -> PlaylistFacts {
         public: p.public,
         song_count: p.song_count,
         duration_s: p.duration,
-        created: p.created.clone(),
-        changed: p.changed.clone(),
+        created: time::navidrome(&p.created),
+        changed: time::navidrome(&p.changed),
     }
 }
 

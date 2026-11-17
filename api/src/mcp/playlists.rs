@@ -805,7 +805,7 @@ mod tests {
             first["playlist"],
             json!({"playlist_id": "9fR2kLm4NpQ7sT1vW3xY5z", "name": "Christmas", "comment": "traditional",
                 "owner": "alice", "owned": true, "public": true, "song_count": 2, "duration_s": 526,
-                "created": "2026-11-15T09:12:03.418Z", "changed": "2026-11-15T09:14:47.002Z"})
+                "created": "2026-11-15T09:12:03Z", "changed": "2026-11-15T09:14:47Z"})
         );
         let e = &first["entries"][0];
         assert_eq!(
@@ -962,7 +962,7 @@ mod tests {
             doc,
             json!({"ok": true, "playlist_id": ADVENT, "name": "Advent", "comment": null, "owner": "alice",
                 "owned": true, "public": false, "song_count": 1, "duration_s": 263,
-                "created": "2026-11-15T09:00:00.123456Z", "changed": "2026-11-15T09:00:04.5Z",
+                "created": "2026-11-15T09:00:00Z", "changed": "2026-11-15T09:00:04Z",
                 "song_ids": [HOLY.0], "song_ids_omitted": null, "hidden_entries_dropped": 0})
         );
     }
@@ -1243,7 +1243,7 @@ mod tests {
             doc,
             json!({"ok": true, "playlist_id": ADVENT, "name": "Advent", "comment": "Carols", "owner": "alice",
                 "owned": true, "public": true, "song_count": 1, "duration_s": 263,
-                "created": "2026-11-15T09:00:00.123456Z", "changed": "2026-11-15T09:00:04.5Z"})
+                "created": "2026-11-15T09:00:00Z", "changed": "2026-11-15T09:00:04Z"})
         );
         // Now gone: the list to pick another from.
         let error = &document(

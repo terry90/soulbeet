@@ -482,11 +482,13 @@ async fn download_in(file: &Path, real_base: &Path) -> std::io::Result<Download>
     };
     for above in parent.ancestors().skip(1) {
         match tokio::fs::canonicalize(above).await {
+            // A file already gone under a folder outside the download folder is gone all the
+            // same; nothing is pruned there.
             Ok(nearest) => {
-                return Ok(Download::FolderGone {
-                    gone,
-                    nearest: inside(nearest)?,
-                })
+                return match nearest.starts_with(real_base) {
+                    true => Ok(Download::FolderGone { gone, nearest }),
+                    false => Err(gone),
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -657,7 +659,7 @@ mod tests {
             failed,
             vec![
                 (file, std::io::ErrorKind::NotFound),
-                (outside, std::io::ErrorKind::PermissionDenied)
+                (outside, std::io::ErrorKind::NotFound)
             ]
         );
         assert!(!album.exists(), "the empty album folder is pruned");
