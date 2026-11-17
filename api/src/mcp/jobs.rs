@@ -10,7 +10,7 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::download::DownloadProgress;
 use shared::failure::{cut_chars, Failure, RetryAdvice, Stage, TEXT_MAX_CHARS};
-use soulbeet::navidrome::NavidromeClient;
+use soulbeet::navidrome::{NavidromeClient, NavidromeError};
 use soulbeet::ImportedItem;
 use sqlx::SqlitePool;
 use tracing::warn;
@@ -476,12 +476,13 @@ pub(crate) async fn read_now(
     if found.is_empty() {
         return reads;
     }
+    let deadline = tokio::time::Instant::now() + LIBRARY_READ_WAIT;
     let songs: Vec<(Option<Vec<SongFacts>>, Option<Failure>)> =
         match navidrome_for(navidrome, ctx, Stage::LibraryCheck).await {
             Ok(navi) => {
                 join_all(found.iter().map(|(i, _, existing)| async {
                     let library = Path::new(&views[*i].job.folder.path);
-                    let (songs, failure) = listed_songs(&navi, library, existing).await;
+                    let (songs, failure) = listed_songs(&navi, library, existing, deadline).await;
                     (Some(songs), failure)
                 }))
                 .await
@@ -494,19 +495,33 @@ pub(crate) async fn read_now(
     reads
 }
 
+/// How long the library lookups of one call may take in all: with the backend's own answers
+/// (LIVE_READ_WAIT) they keep a call that waited MAX_WAIT under Claude's 240 second limit.
+const LIBRARY_READ_WAIT: Duration = Duration::from_secs(20);
+
 /// The songs Navidrome lists for each of `existing`, items in the library folder `library`:
-/// those found, and the failure of the first lookup that failed, the others looked up still.
+/// those found, and the failure of the first lookup that failed, the others looked up still
+/// until `deadline`, after which none is: a stalled Navidrome fails the rest as unreachable.
 async fn listed_songs(
     navi: &NavidromeClient,
     library: &Path,
     existing: &[ImportedItem],
+    deadline: tokio::time::Instant,
 ) -> (Vec<SongFacts>, Option<Failure>) {
     let (mut songs, mut failure) = (Vec::new(), None);
     for item in existing {
-        match library_songs(navi, library, item).await {
-            Ok(found) => songs.extend(found.iter().map(SongFacts::from)),
-            Err(e) => {
+        match tokio::time::timeout_at(deadline, library_songs(navi, library, item)).await {
+            Ok(Ok(found)) => songs.extend(found.iter().map(SongFacts::from)),
+            Ok(Err(e)) => {
                 failure.get_or_insert_with(|| navidrome_failure(Stage::LibraryCheck, &e));
+            }
+            Err(_) => {
+                let late = NavidromeError::Transport(format!(
+                    "no answer within {} seconds",
+                    LIBRARY_READ_WAIT.as_secs()
+                ));
+                failure.get_or_insert_with(|| navidrome_failure(Stage::LibraryCheck, &late));
+                break;
             }
         }
     }
@@ -1600,6 +1615,53 @@ mod tests {
                 &json!("next_source"),
                 &json!("new_search")
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn library_lookups_past_the_calls_deadline_fail_as_unreachable() {
+        use soulbeet::navidrome::NavidromeClientBuilder;
+        // A Navidrome that takes the connection and never answers.
+        let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let navi = NavidromeClientBuilder::new()
+            .base_url(&format!("http://{}", stalled.local_addr().unwrap()))
+            .username("alice")
+            .password("secret")
+            .build()
+            .unwrap();
+        let item = ImportedItem {
+            path: "Marrow Choir/Winter Songs/03 - O Holy Night.flac".into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            beets_id: None,
+            release_mbid: None,
+            album: "Winter Songs".into(),
+            match_per_mille: None,
+        };
+        let library = tempfile::tempdir().unwrap();
+        let file = library.path().join(&item.path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"flac").unwrap();
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        let existing = vec![item.clone(), item.clone(), item];
+        let (songs, failure) =
+            super::listed_songs(&navi, library.path(), &existing, deadline).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(songs.is_empty());
+        let failure = failure.unwrap();
+        assert_eq!(
+            (failure.code, failure.retry, failure.stage),
+            (
+                FailureCode::NavidromeUnreachable,
+                RetryAdvice::SameSourceLater,
+                Stage::LibraryCheck
+            )
+        );
+        assert_eq!(
+            failure.cause.unwrap().raw,
+            "Navidrome request failed: no answer within 20 seconds"
         );
     }
 

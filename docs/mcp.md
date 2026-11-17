@@ -357,6 +357,7 @@ Soulbeet's limits:
 | Sources tried per track | 4 by default, at most 10 (`max_attempts`) |
 | `find_sources` wait | 45 seconds, then `get_sources` |
 | Waits (`wait_seconds`) | up to 180 seconds per call |
+| Navidrome lookups after a wait | 20 seconds per call in all; the rest fail `navidrome_unreachable` in `library_songs_failure` |
 | One answer | 60,000 characters; one job document 45,000 |
 | `find_in_library` | 100 references per call |
 | `ensure_in_library` | 50 items per call |
