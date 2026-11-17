@@ -80,7 +80,7 @@ pub(crate) const GET_JOBS: ToolSpec = ToolSpec {
     title: "Show jobs",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Shows jobs by job_ids, or by batch_id and states. Summary detail gives each job's state and failure code; full detail gives the current download with live bytes, speed, place in the source's queue and whether the source is online, earlier attempts with their failures (tried), the timeline, what beets applied and Navidrome lists (or, while Navidrome has not listed it yet, when the import ended and whether a scan was asked for; get_status says whether Navidrome is scanning), and next: the calls that can be made for the job now. A full document longer than {JOB_DOCUMENT_MAX_CHARS} characters leaves items out whole, the oldest timeline entries and earlier attempts first, then the last items of each import, then each import's library_songs_failure cause.raw (its facts.omitted naming it), then the last items of missing_titles, of results and of slots, each list's {{list}}_omitted counting them. wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action: needs_source_choice, needs_decision or failed; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Each answer has change_cursor: pass it as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to it. Job ids stay valid 30 days after the job ends. Failure codes: {common}, unknown_handle (a job id this user has no job for; facts.unknown_job_ids names them).")
+        format!("Shows jobs by job_ids, or by batch_id and states. Summary detail gives each job's state and failure code; full detail gives the current download with live bytes, speed, place in the source's queue and whether the source is online, earlier attempts with their failures (tried), the timeline, what beets applied and Navidrome lists (or, while Navidrome has not listed it yet, when the import ended and whether a scan was asked for; get_status says whether Navidrome is scanning), and next: the calls that can be made for the job now. A full document longer than {JOB_DOCUMENT_MAX_CHARS} characters leaves items out whole, the oldest timeline entries and earlier attempts first, then the last items of each import, then each import's library_songs_failure cause.raw (its facts.omitted naming it), then the last items of missing_titles, of results and of slots, each list's {{list}}_omitted counting them. wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action: needs_source_choice, needs_decision or failed; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Each answer has change_cursor: pass it as since, so a wait does not end again for what was already seen; while a job is searching, queued, downloading, importing or indexing, next offers this call again with since set to it (and a 60 second wait for any_change when this call waited for nothing); a job waiting for a source choice or an import decision changes only once you act, through its own next. Job ids stay valid 30 days after the job ends. Failure codes: {common}, unknown_handle (a job id this user has no job for; facts.unknown_job_ids names them).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"job_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1}}, "batch_id": {"type": "string", "minLength": 1}, "states": {"type": "array", "items": {"enum": ["searching", "queued", "downloading", "importing", "indexing", "done", "needs_source_choice", "needs_decision", "failed", "cancelled", "dismissed"]}}, "detail": {"enum": ["summary", "full"]}, "since": {"type": "integer", "minimum": 0}, "#,
@@ -280,9 +280,11 @@ pub(crate) async fn get_jobs(
             }
             let more = records.len() > call.page.offset + call.page.limit;
             let cursor = records.iter().map(|job| job.changed_seq).max().unwrap_or(0);
-            // A job stranded until the next start does not change before it.
+            // Only a job that moves on its own changes without the caller: a job stranded until
+            // the next start does not change before it, one waiting for a person not before
+            // they act.
             let unfinished = (records.iter())
-                .any(|job| !job.state.is_terminal() && !acquire.ledger.stranded(&job.id));
+                .any(|job| job.state.moves_on_its_own() && !acquire.ledger.stranded(&job.id));
             let mut fields = Map::new();
             fields.insert("change_cursor".into(), json!(cursor));
             let mut again = args.as_value();
@@ -290,7 +292,7 @@ pub(crate) async fn get_jobs(
                 // A page cursor names a place in the listing as this answer read it.
                 given.remove("cursor");
             }
-            let follow = unfinished.then(|| since_call("get_jobs", again, cursor));
+            let follow = unfinished.then(|| since_call("get_jobs", again, cursor, JOB_FOLLOW));
             fields.insert("next".into(), json!(follow.iter().collect::<Vec<_>>()));
             let page = (records.into_iter())
                 .skip(call.page.offset)
@@ -315,11 +317,45 @@ pub(crate) async fn get_jobs(
     )
 }
 
+/// The wait a follow call takes when the call it follows gave none: a job's own (the job
+/// documents' get_jobs entry), and a batch's (ensure_in_library's get_batch entry).
+pub(crate) struct FollowWait {
+    pub seconds: u32,
+    pub wait_for: &'static str,
+}
+
+pub(crate) const JOB_FOLLOW: FollowWait = FollowWait {
+    seconds: 60,
+    wait_for: "any_change",
+};
+
+pub(crate) const BATCH_FOLLOW: FollowWait = FollowWait {
+    seconds: 180,
+    wait_for: "needs_action",
+};
+
 /// `tool` called again with `args` (the arguments given), `since` set to `cursor`: the call that
-/// follows unfinished jobs past what an answer showed.
-pub(crate) fn since_call(tool: &'static str, mut args: Value, cursor: i64) -> NextCall {
+/// follows unfinished jobs past what an answer showed. A call that waited for nothing is followed
+/// by one that waits as `wait` says, so following it never asks again at once for what did not
+/// change.
+pub(crate) fn since_call(
+    tool: &'static str,
+    mut args: Value,
+    cursor: i64,
+    wait: FollowWait,
+) -> NextCall {
     if let Value::Object(given) = &mut args {
         given.insert("since".into(), json!(cursor));
+        let waited = given
+            .get("wait_seconds")
+            .and_then(Value::as_u64)
+            .is_some_and(|secs| secs > 0);
+        if !waited {
+            given.insert("wait_seconds".into(), json!(wait.seconds));
+            given
+                .entry("wait_for")
+                .or_insert_with(|| json!(wait.wait_for));
+        }
     }
     NextCall::new(tool, args)
 }
@@ -1175,6 +1211,17 @@ mod tests {
             "Cancelled on request",
         );
         fail_slot(&acq, &first, stopped.clone()).await;
+        // A call that waited for nothing is followed by one that waits.
+        let app0 = app_of(&db, &acq);
+        let unwaited = document(
+            &call_tool(app0, &token, "get_jobs", json!({"job_ids": [second]})).await,
+        );
+        assert_eq!(
+            unwaited["next"],
+            json!([{"tool": "get_jobs", "args": {"job_ids": [second],
+                "since": unwaited["change_cursor"], "wait_seconds": 60, "wait_for": "any_change"}}]),
+            "{unwaited}"
+        );
         let call = json!({"job_ids": [first, second], "wait_seconds": 120,
             "wait_for": "needs_action"});
         let seen = document(&call_tool(app.clone(), &token, "get_jobs", call.clone()).await);

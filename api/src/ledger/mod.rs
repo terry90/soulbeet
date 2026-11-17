@@ -92,6 +92,13 @@ impl JobState {
     pub fn is_terminal(self) -> bool {
         TERMINAL.contains(&self)
     }
+
+    /// A state the job leaves without anyone acting: searching, queued, downloading, importing
+    /// or indexing. A job needing a source choice or an import decision waits for a person.
+    pub fn moves_on_its_own(self) -> bool {
+        use JobState::*;
+        matches!(self, Searching | Queued | Downloading | Importing | Indexing)
+    }
 }
 
 /// The state of a job whose slots are in `slots` (D6). `slots` is never empty.

@@ -11,7 +11,9 @@ use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_M
 use super::args::Args;
 use super::contract::{answer, error_object, invalid_value, upstream_error, NextCall, ToolError};
 use super::facts::{job_document, Detail, ReadNow};
-use super::jobs::{needs_action, read_now, since_call, untried_of, Since, WaitFor, MAX_JOB_IDS};
+use super::jobs::{
+    needs_action, read_now, since_call, untried_of, Since, WaitFor, BATCH_FOLLOW, MAX_JOB_IDS,
+};
 use super::paging::{chars, fit, fit_whole, longest_fitting, Page};
 use super::refs::{page_schema, wait_schema};
 use super::server::{common_codes, ToolSpec};
@@ -32,7 +34,7 @@ pub(crate) const GET_BATCH: ToolSpec = ToolSpec {
     title: "Follow a batch",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Pass the last answer's cursor as since, so a wait does not end again for what was already seen; while a job is unfinished, next offers this call again with since set to the cursor. Work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). For a batch ensure_in_library made with a playlist, playlist gives its playlist_id, how many items are settled in it (placed, or ended with nothing to place), how many are waiting (items whose jobs are not finished, or failed: a job failed for good keeps its place waiting until it is retried or dismissed), the failure of the last fill that failed (null once one succeeds; one whose retry is neither same_source_later nor needs_user stops the fill), and hidden_entries_dropped, the entries of libraries this user cannot see that the fill dropped when it placed songs between others and so rewrote the list. Failure codes: {common}, unknown_handle.")
+        format!("Follows a batch ensure_in_library or download_source started. Returns counts per state, the jobs changed since the cursor (since) in summary, and full detail with next for jobs that need action (needs_source_choice, needs_decision, failed). wait_seconds (0 to 180) waits on the server until wait_for holds: any_change (a job changed after since, or without since after the call came), needs_action (a job needs action; with since, one that changed after it) or all_terminal (every job is done, failed, cancelled or dismissed); needs_action also ends when every job is. Pass the last answer's cursor as since, so a wait does not end again for what was already seen; while a job is searching, queued, downloading, importing or indexing, next offers this call again with since set to the cursor (and a 180 second wait for needs_action when this call waited for nothing); a job waiting for a source choice or an import decision changes only once you act, through its own next in needs_action. Work goes on whether or not anyone asks. A 40 track list with 28 downloads takes 20 to 60 minutes and about 10 to 20 calls with wait_for needs_action. Batch ids stay valid while any of their jobs is kept (30 days after it ends). For a batch ensure_in_library made with a playlist, playlist gives its playlist_id, how many items are settled in it (placed, or ended with nothing to place), how many are waiting (items whose jobs are not finished, or failed: a job failed for good keeps its place waiting until it is retried or dismissed), the failure of the last fill that failed (null once one succeeds; one whose retry is neither same_source_later nor needs_user stops the fill), and hidden_entries_dropped, the entries of libraries this user cannot see that the fill dropped when it placed songs between others and so rewrote the list. Failure codes: {common}, unknown_handle.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["batch_id"], "properties": {"batch_id": {"type": "string", "minLength": 1}, "since": {"type": "integer", "minimum": 0}, "#,
@@ -153,10 +155,11 @@ async fn batch_document(
     }
     let cursor = jobs.iter().map(|job| job.changed_seq).max().unwrap_or(0);
     let all_terminal = jobs.iter().all(|job| job.state.is_terminal());
-    // A job stranded until the next start does not change before it.
+    // Only a job that moves on its own changes without the caller: a job stranded until the
+    // next start does not change before it, one waiting for a person not before they act.
     let moving = (jobs.iter())
-        .any(|job| !job.state.is_terminal() && !state.acquire.ledger.stranded(&job.id));
-    let follow = moving.then(|| since_call("get_batch", again, cursor));
+        .any(|job| job.state.moves_on_its_own() && !state.acquire.ledger.stranded(&job.id));
+    let follow = moving.then(|| since_call("get_batch", again, cursor, BATCH_FOLLOW));
     let shown = (jobs.iter())
         .filter(|job| job.changed_seq > since || needs_action(job.state))
         .cloned()
@@ -368,6 +371,12 @@ mod tests {
             "{first}"
         );
         let cursor = first["cursor"].clone();
+        // A call that waited for nothing is followed by one that waits.
+        assert_eq!(
+            first["next"],
+            json!([{"tool": "get_batch", "args": {"batch_id": batch, "since": cursor,
+                "wait_seconds": 180, "wait_for": "needs_action"}}])
+        );
         let wait = tokio::spawn({
             let (app, token, batch, cursor) =
                 (app.clone(), token.clone(), batch.clone(), cursor.clone());
@@ -438,6 +447,34 @@ mod tests {
                     "wait_seconds": 180, "wait_for": "needs_action"}}])
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_batch_whose_only_unfinished_job_waits_for_a_decision_is_not_followed() {
+        let (db, acq, _, token) = jobs_app().await;
+        let (batch, jobs) = batch_of_downloads(&acq, 2).await;
+        denied(&acq, &jobs[0]).await;
+        let row = (crate::core::jobs::test_support::view_of(&acq, &jobs[1]).await).slots[0]
+            .row
+            .clone()
+            .unwrap();
+        acq.ledger.record(JobEvent::Slots {
+            state: JobState::NeedsDecision,
+            rows: vec![row],
+        });
+        acq.ledger.settled().await;
+        let app = app_of(&db, &acq);
+        let doc = document(
+            &call_tool(app, &token, "get_batch", json!({"batch_id": batch})).await,
+        );
+        assert_eq!(
+            doc["summary"],
+            json!({"failed": 1, "needs_decision": 1}),
+            "{doc}"
+        );
+        // Nothing changes until the user decides: no wait to follow, the job's own next acts.
+        assert_eq!(doc["next"], json!([]), "{doc}");
+        assert_eq!(doc["needs_action"][1]["job_id"], json!(jobs[1]), "{doc}");
     }
 
     /// The transfer of `job` was denied, no source left.

@@ -35,12 +35,7 @@ pub(crate) fn next_calls(
     let id = &job.id;
     let mcp = job.origin == BatchOrigin::Mcp;
     let mut next = Vec::new();
-    if !view.stranded
-        && matches!(
-            job.state,
-            Searching | Queued | Downloading | Importing | Indexing
-        )
-    {
+    if !view.stranded && job.state.moves_on_its_own() {
         next.push(NextCall::new(
             "get_jobs",
             json!({"job_ids": [id], "detail": "full", "wait_seconds": 60,
