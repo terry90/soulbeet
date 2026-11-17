@@ -95,7 +95,11 @@ pub struct JobRecord {
     pub excluded_sources: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The ledger's change number of the job's last change, over every user's jobs.
     pub changed_seq: i64,
+    /// The job's last change counted over its user's jobs alone: what the job tools show and
+    /// take (cursor, since), so no user learns how much other users' jobs change.
+    pub user_seq: i64,
     /// The failure of a job that failed before it had a slot (its tracklist or its search).
     pub failure: Option<Failure>,
     /// Its current pick's send is recorded (a monitor batch or a backend request): the files are
@@ -125,6 +129,7 @@ struct JobRow {
     created_at: i64,
     updated_at: i64,
     changed_seq: i64,
+    user_seq: i64,
     failure: Option<String>,
     sent: bool,
 }
@@ -134,10 +139,18 @@ const JOB_SELECT: &str = "SELECT j.id, j.user_id, u.username, u.role, j.folder_i
             f.user_id AS folder_owner, f.name AS folder_name, f.path AS folder_path, \
             f.shared AS folder_shared, j.batch_id, b.origin, j.kind, j.wanted, j.options, \
             j.state, j.search_id, j.excluded_sources, j.created_at, j.updated_at, \
-            j.changed_seq, j.failure, \
+            j.changed_seq, j.user_seq, j.failure, \
             j.monitor_batch_id IS NOT NULL OR j.request IS NOT NULL AS sent \
      FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
      JOIN batches b ON b.id = j.batch_id";
+
+/// The change number of `user`'s last job change (`JobRecord::user_seq`), 0 before any.
+pub async fn last_change_of(db: &SqlitePool, user: &UserId) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COALESCE(MAX(user_seq), 0) FROM jobs WHERE user_id = ?")
+        .bind(user.to_string())
+        .fetch_one(db)
+        .await
+}
 
 /// `user`'s job `id`, or None for an unknown id or another user's.
 pub async fn job_record(
@@ -216,6 +229,7 @@ fn job_of(row: JobRow) -> Result<JobRecord, sqlx::Error> {
         created_at: row.created_at,
         updated_at: row.updated_at,
         changed_seq: row.changed_seq,
+        user_seq: row.user_seq,
         failure: row.failure.as_deref().map(json).transpose()?,
         sent: row.sent,
     })

@@ -1076,8 +1076,12 @@ impl Writer {
         .await?
         .rows_affected();
         self.pending.freed_place |= freed > 0;
+        // user_seq counts the job's user's changes alone: the job tools show it, never changed_seq.
         sqlx::query(
-            "UPDATE jobs SET state = COALESCE(?, state), changed_seq = ?, updated_at = ? WHERE id = ?",
+            "UPDATE jobs SET state = COALESCE(?, state), changed_seq = ?, updated_at = ?, \
+             user_seq = (SELECT COALESCE(MAX(o.user_seq), 0) + 1 FROM jobs o \
+                         WHERE o.user_id = jobs.user_id) \
+             WHERE id = ?",
         )
         .bind(state)
         .bind(seq)

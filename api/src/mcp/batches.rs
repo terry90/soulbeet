@@ -87,15 +87,14 @@ pub(crate) async fn get_batch(
     answer(
         async {
             let batch_id = args.string("batch_id")?;
-            // A change number, compared with the jobs' changed_seq.
+            // A change number, compared with the jobs' user_seq.
             let since = args.opt_u32("since", 0, u32::MAX)?;
             let (wait, wait_for) = WaitFor::read(&args)?;
             args.finish()?;
             let acquire = &state.acquire;
-            let since = match since {
-                Some(seq) => Since::Given(seq.into()),
-                None => Since::Now(*acquire.ledger.changes().borrow()),
-            };
+            let given = since.map(i64::from);
+            let since = (Since::of(given, &acquire.db, &caller.ctx).await)
+                .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
             let select = JobSelect::Filter {
                 batch_id: Some(batch_id.clone()),
                 states: vec![],
@@ -138,7 +137,7 @@ pub(crate) async fn get_batch(
 }
 
 /// The batch's fields: its jobs counted by state from `jobs`, the cursor (the highest
-/// changed_seq of its jobs), the jobs changed since `since` and the jobs that need action, the
+/// user_seq of its jobs), the jobs changed since `since` and the jobs that need action, the
 /// last two read in full. While a job is unfinished, `next` offers the call `again` (the
 /// arguments given) with the cursor as its `since`.
 async fn batch_document(
@@ -153,7 +152,7 @@ async fn batch_document(
     for job in &jobs {
         *summary.entry(job.state.as_str()).or_default() += 1;
     }
-    let cursor = jobs.iter().map(|job| job.changed_seq).max().unwrap_or(0);
+    let cursor = jobs.iter().map(|job| job.user_seq).max().unwrap_or(0);
     let all_terminal = jobs.iter().all(|job| job.state.is_terminal());
     // Only a job that moves on its own changes without the caller: a job stranded until the
     // next start does not change before it, one waiting for a person not before they act.
@@ -161,16 +160,16 @@ async fn batch_document(
         .any(|job| job.state.moves_on_its_own() && !state.acquire.ledger.stranded(&job.id));
     let follow = moving.then(|| since_call("get_batch", again, cursor, BATCH_FOLLOW));
     let shown = (jobs.iter())
-        .filter(|job| job.changed_seq > since || needs_action(job.state))
+        .filter(|job| job.user_seq > since || needs_action(job.state))
         .cloned()
         .collect();
     let acquire = &state.acquire;
     let views = views_of(&acquire.db, &acquire.ledger, &caller.ctx, shown).await?;
     let untried = untried_of(&acquire.db, &views).await?;
     let mut changed: Vec<(&JobView, &Untried)> = (views.iter().zip(&untried))
-        .filter(|(v, _)| v.job.changed_seq > since)
+        .filter(|(v, _)| v.job.user_seq > since)
         .collect();
-    changed.sort_by_key(|(v, _)| Reverse(v.job.changed_seq));
+    changed.sort_by_key(|(v, _)| Reverse(v.job.user_seq));
     let deletion_enabled = caller.allow_delete;
     let playlist = (playlist_of(&acquire.db, &batch.id, &caller.ctx.id()).await)
         .map_err(|e| database_failure(Stage::Input, e))?;

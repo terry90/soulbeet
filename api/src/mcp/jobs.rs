@@ -32,6 +32,7 @@ use super::server::{common_codes, ToolSpec};
 use super::{wait, McpCaller};
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
+use crate::core::database_failure;
 use crate::core::index::library_songs;
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::retry::{cancel, dismiss, retry, NewSearchArgs, RetryAnswer};
@@ -42,7 +43,7 @@ use crate::core::jobs::{
 };
 use crate::core::library::{navidrome_failure, navidrome_for, SongFacts};
 use crate::import_queue::FileLeft;
-use crate::ledger::store::JobRecord;
+use crate::ledger::store::{last_change_of, JobRecord};
 use crate::ledger::{JobState, SlotResult};
 
 const GET_JOBS_ARGS: &[&str] = &[
@@ -117,16 +118,16 @@ impl WaitFor {
         Ok((Duration::from_secs(wait.into()), wait_for))
     }
 
-    /// Over the selected jobs: AnyChange when one's changed_seq is above `since`; NeedsAction
-    /// when one needs action, past a given `since` only one whose changed_seq is above it, or
+    /// Over the selected jobs: AnyChange when one's user_seq is above `since`; NeedsAction
+    /// when one needs action, past a given `since` only one whose user_seq is above it, or
     /// when all are terminal; AllTerminal when all are.
     pub(crate) fn holds(self, jobs: &[JobRecord], since: Since) -> bool {
         let all_terminal = || jobs.iter().all(|job| job.state.is_terminal());
         match self {
-            WaitFor::AnyChange => jobs.iter().any(|job| job.changed_seq > since.seq()),
+            WaitFor::AnyChange => jobs.iter().any(|job| job.user_seq > since.seq()),
             WaitFor::NeedsAction => {
                 let unseen = |job: &JobRecord| match since {
-                    Since::Given(seq) => job.changed_seq > seq,
+                    Since::Given(seq) => job.user_seq > seq,
                     Since::Now(_) => true,
                 };
                 jobs.iter()
@@ -138,13 +139,29 @@ impl WaitFor {
     }
 }
 
-/// The change number a wait compares the jobs' changed_seq with.
+/// The change number a wait compares the jobs' user_seq with: counted over the caller's jobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Since {
     /// The caller's: the jobs as they were then are seen.
     Given(i64),
-    /// The ledger's when the call came, the caller naming none: no job is seen.
+    /// The caller's last change when the call came, the caller naming none: no job is seen.
     Now(i64),
+}
+
+impl Since {
+    /// `given`, else the caller's last change now.
+    pub(crate) async fn of(
+        given: Option<i64>,
+        db: &SqlitePool,
+        ctx: &UserCtx,
+    ) -> Result<Since, Failure> {
+        match given {
+            Some(seq) => Ok(Since::Given(seq)),
+            None => (last_change_of(db, &ctx.id()).await)
+                .map(Since::Now)
+                .map_err(|e| database_failure(Stage::Input, e)),
+        }
+    }
 }
 
 impl Since {
@@ -256,11 +273,8 @@ pub(crate) async fn get_jobs(
         async {
             let call = read_call(&args)?;
             let acquire = &state.acquire;
-            let since = match call.since {
-                Some(seq) => Since::Given(seq),
-                None => Since::Now(*acquire.ledger.changes().borrow()),
-            };
             let failed = |f| upstream_error(f, Map::new(), args.same_call());
+            let since = (Since::of(call.since, &acquire.db, &caller.ctx).await).map_err(failed)?;
             // The wait and the page read records; only the page's jobs are read in full.
             let records = wait::until(
                 &acquire.ledger,
@@ -279,7 +293,7 @@ pub(crate) async fn get_jobs(
                 return Err(unknown_jobs(&args, &call.select, unknown));
             }
             let more = records.len() > call.page.offset + call.page.limit;
-            let cursor = records.iter().map(|job| job.changed_seq).max().unwrap_or(0);
+            let cursor = records.iter().map(|job| job.user_seq).max().unwrap_or(0);
             // Only a job that moves on its own changes without the caller: a job stranded until
             // the next start does not change before it, one waiting for a person not before
             // they act.
@@ -1497,14 +1511,48 @@ mod tests {
         assert!(!WaitFor::AnyChange.holds(&[], now));
         assert!(WaitFor::NeedsAction.holds(&[], now) && WaitFor::AllTerminal.holds(&[], now));
         let one = records(vec![running.clone()]).await;
-        let seen = Since::Given(one[0].changed_seq);
+        let seen = Since::Given(one[0].user_seq);
         assert!(!WaitFor::AnyChange.holds(&one, seen) && WaitFor::AnyChange.holds(&one, now));
         assert!(!WaitFor::NeedsAction.holds(&one, now) && !WaitFor::AllTerminal.holds(&one, now));
         let both = records(vec![running, failed]).await;
         assert!(WaitFor::NeedsAction.holds(&both, now));
-        let failure_seen = Since::Given(both.iter().map(|j| j.changed_seq).max().unwrap());
+        let failure_seen = Since::Given(both.iter().map(|j| j.user_seq).max().unwrap());
         assert!(!WaitFor::NeedsAction.holds(&both, failure_seen));
         assert!(!WaitFor::AllTerminal.holds(&both, now));
+    }
+
+    #[tokio::test]
+    async fn the_cursor_counts_only_the_callers_own_job_changes() {
+        let (db, acq, _, token) = jobs_app().await;
+        let mine = downloading_track_job(&acq).await;
+        let app = app_of(&db, &acq);
+        let call = json!({"job_ids": [mine]});
+        let before = document(&call_tool(app.clone(), &token, "get_jobs", call.clone()).await)
+            ["change_cursor"]
+            .as_i64()
+            .unwrap();
+        // bob's downloads change many times.
+        folder_of(&acq.db, "bob").await;
+        for _ in 0..3 {
+            let bobs = track_job_of(&acq, "bob").await;
+            acq.ledger.record(JobEvent::Ended {
+                job: bobs,
+                state: JobState::Cancelled,
+                failure: None,
+            });
+        }
+        acq.ledger.settled().await;
+        // One change of alice's own.
+        acq.ledger.record(JobEvent::Ended {
+            job: mine.clone(),
+            state: JobState::Cancelled,
+            failure: None,
+        });
+        acq.ledger.settled().await;
+        let after = document(&call_tool(app, &token, "get_jobs", call).await)["change_cursor"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(after - before, 1, "bob's changes do not show in alice's cursor");
     }
 
     #[tokio::test]
