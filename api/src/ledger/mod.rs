@@ -333,7 +333,7 @@ const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 
 pub const KEY_KEPT_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// A request key as a write tool takes it: one user's, through one app (grant), for one tool.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RequestKey {
     pub user: UserId,
     pub grant_id: String,

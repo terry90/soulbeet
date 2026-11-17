@@ -1,9 +1,10 @@
 //! Request keys (design 10.3): a write call repeated with the same `request_key` answers the
 //! first call's result instead of acting again.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use futures::FutureExt;
 
@@ -22,6 +23,22 @@ use crate::oauth::secrets::hash;
 /// This process, in the reservations it makes: a reservation of another process was cut off
 /// when that process stopped, and its key is free again.
 static INSTANCE: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+
+/// Keys whose call ended in this process while the database refused both to store its result
+/// and to let the key go: their rows still read as running, which they are not.
+static UNRELEASED: LazyLock<Mutex<HashSet<RequestKey>>> = LazyLock::new(Default::default);
+
+/// Lets `key` go after its call ended without a stored result, or remembers that it could not.
+async fn release(ledger: &crate::ledger::Ledger, key: &RequestKey) {
+    if ledger.release_key(key, &INSTANCE).await.is_err() {
+        // The writer logged why.
+        unreleased().insert(key.clone());
+    }
+}
+
+fn unreleased() -> std::sync::MutexGuard<'static, HashSet<RequestKey>> {
+    UNRELEASED.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The schema's bound on a request key.
 const KEY_MAX_CHARS: usize = 200;
@@ -100,10 +117,23 @@ where
         key,
     };
     let now = chrono::Utc::now().timestamp();
-    let reserved = acquire
+    let call_hash = hash(&call.to_string());
+    let mut reserved = acquire
         .ledger
-        .reserve_key(&key, &hash(&call.to_string()), &INSTANCE, now)
+        .reserve_key(&key, &call_hash, &INSTANCE, now)
         .await;
+    // A reservation of this process whose call ended: let go now, then taken afresh.
+    if matches!(reserved, Ok(KeyReservation::Running)) && unreleased().contains(&key) {
+        reserved = match acquire.ledger.release_key(&key, &INSTANCE).await {
+            Ok(()) => {
+                unreleased().remove(&key);
+                (acquire.ledger)
+                    .reserve_key(&key, &call_hash, &INSTANCE, now)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+    }
     match reserved {
         Err(e) => failed(ToolError {
             failure: database_failure(Stage::Input, e),
@@ -132,7 +162,7 @@ where
                     Ok(answered) => answered,
                     Err(panic) => {
                         // Nothing is stored for the key: it is let go, and the panic goes on.
-                        let _ = ledger.release_key(&key, &INSTANCE).await;
+                        release(&ledger, &key).await;
                         std::panic::resume_unwind(panic);
                     }
                 };
@@ -153,7 +183,7 @@ where
                 // The writer logs a write it could not make; the caller gets the result either
                 // way.
                 if !stored {
-                    let _ = ledger.release_key(&key, &INSTANCE).await;
+                    release(&ledger, &key).await;
                 }
                 result
             }))
@@ -351,6 +381,36 @@ mod tests {
             .await
             .unwrap();
         // Not left running: the same call with the same key runs again.
+        let ran = call_k1(&acquire, &caller, async { Keyed::Kept(answer("second")) }).await;
+        assert_eq!(text_of(&ran), text_of(&answer("second")));
+    }
+
+    #[tokio::test]
+    async fn a_key_the_database_would_not_let_go_is_free_once_it_can() {
+        let db = crate::db::test_db::migrated().await;
+        let (caller, acquire) = alice_on(db.clone()).await;
+        // The database refuses to store the result and to let the key go.
+        for (name, event) in [
+            ("refuse_results", "UPDATE OF document"),
+            ("refuse_release", "DELETE"),
+        ] {
+            sqlx::query(&format!(
+                "CREATE TRIGGER {name} BEFORE {event} ON request_keys \
+                 BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END"
+            ))
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let first = call_k1(&acquire, &caller, async { Keyed::Kept(answer("first")) }).await;
+        assert_eq!(text_of(&first), text_of(&answer("first")));
+        for name in ["refuse_results", "refuse_release"] {
+            sqlx::query(&format!("DROP TRIGGER {name}"))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        // The call ended: the same call with the same key runs again, not "still running".
         let ran = call_k1(&acquire, &caller, async { Keyed::Kept(answer("second")) }).await;
         assert_eq!(text_of(&ran), text_of(&answer("second")));
     }
