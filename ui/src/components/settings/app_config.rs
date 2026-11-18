@@ -110,6 +110,7 @@ pub fn ConnectionStatusPanel() -> Element {
                         NavidromeStatus::Connected => ("bg-blue-400", "Connected"),
                         NavidromeStatus::InvalidCredentials => ("bg-beet-accent", "User not found in Navidrome"),
                         NavidromeStatus::Offline => ("bg-gray-500", "Server unreachable"),
+                        NavidromeStatus::NotLinked => ("bg-beet-accent", "Not connected: log in once with your Navidrome password"),
                         NavidromeStatus::Unknown => ("bg-gray-500", "Not configured"),
                     };
                     rsx! {

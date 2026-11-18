@@ -21,6 +21,11 @@ services:
       - BEETS_CONFIG=/app/beets-e2e.yaml
       - MUSICBRAINZ_HOST=stubs:5050
       - NAVIDROME_URL=http://navidrome:4533
+      - OIDC_ISSUER_URL=http://stubs:5070
+      - OIDC_CLIENT_ID=soulbeet-e2e
+      - OIDC_CLIENT_SECRET=e2e-oidc-secret
+      - OIDC_REDIRECT_URL=http://127.0.0.1:9765/api/auth/oidc/callback
+      - OIDC_PROVIDER_NAME=Stub ID
     volumes:
       - ./.runtime/downloads:/downloads
       - ./.runtime/music:/music
@@ -57,8 +62,11 @@ services:
     ports:
       - "5030:5030"
       - "5050:5050"
+      - "5070:5070"
     environment:
       - SLSKD_API_KEY=e2e-slskd-api-key
+      - OIDC_ISSUER=http://stubs:5070
+      - OIDC_BROWSER_URL=http://127.0.0.1:5070
     volumes:
       - ./.fixtures/audio:/e2e/.fixtures/audio:ro
       - ./.runtime/downloads:/downloads

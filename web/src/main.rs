@@ -16,8 +16,8 @@ use ui::{
     SettingsProvider, StatusAction, StatusBanner,
 };
 use views::{
-    leave_login, DashboardPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage, SettingsPage,
-    SettingsTab, SettingsTabRequest,
+    leave_login, DashboardPage, LoginErrorPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage,
+    SettingsPage, SettingsTab, SettingsTabRequest,
 };
 
 mod auth;
@@ -33,6 +33,8 @@ pub enum Route {
         LoginPage {},
         #[route("/login/return?:..return_to")]
         LoginReturnPage { return_to: ReturnTo },
+        #[route("/login/error/:code")]
+        LoginErrorPage { code: String },
 
         #[layout(WebNavbar)]
             #[route("/")]
@@ -88,6 +90,7 @@ fn main() {
                 .merge(api::connection::router(
                     api::connection::ConnectionState::live(),
                 ))
+                .merge(api::oidc::router())
                 .layer(CookieManagerLayer::new()))
         });
     }
@@ -124,11 +127,14 @@ fn AuthGuard() -> Element {
     let current = use_route::<Route>();
 
     use_effect(move || match (auth.is_logged_in(), &current) {
-        (false, Route::LoginPage {} | Route::LoginReturnPage { .. }) => {}
+        (
+            false,
+            Route::LoginPage {} | Route::LoginReturnPage { .. } | Route::LoginErrorPage { .. },
+        ) => {}
         (false, _) => {
             nav.replace(Route::LoginPage {});
         }
-        (true, Route::LoginPage {}) => leave_login(nav, None),
+        (true, Route::LoginPage {} | Route::LoginErrorPage { .. }) => leave_login(nav, None),
         // Back to the request that asked for sign-in
         (true, Route::LoginReturnPage { return_to }) => leave_login(nav, return_to.accepted()),
         (true, _) => {}
@@ -400,6 +406,11 @@ fn NavidromeBanner() -> Element {
             "bg-beet-accent",
             "NAVIDROME",
             "Credentials mismatch. Log in with your Navidrome password to reconnect.",
+        ),
+        NavidromeStatus::NotLinked => (
+            "bg-beet-accent",
+            "NAVIDROME",
+            "Not connected. Log in once with your Navidrome password to use discovery and rating sync.",
         ),
         NavidromeStatus::Offline => (
             "bg-gray-500",

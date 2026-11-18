@@ -26,6 +26,8 @@ pub mod models;
 #[cfg(feature = "server")]
 pub mod oauth;
 #[cfg(feature = "server")]
+pub mod oidc;
+#[cfg(feature = "server")]
 pub mod secret_key;
 pub mod security;
 pub mod services;

@@ -165,6 +165,7 @@ mod tests {
             navidrome_status: "unknown".into(),
             role,
             credentials_version,
+            oidc_subject: None,
         }
     }
 

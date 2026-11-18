@@ -26,6 +26,9 @@ pub fn navidrome_hint(health: &SystemHealth, status: NavidromeStatus) -> Option<
             Some("Your username was not found in Navidrome".to_string())
         }
         NavidromeStatus::Unknown => Some("Navidrome credentials not configured".to_string()),
+        NavidromeStatus::NotLinked => {
+            Some("Log in once with your Navidrome password to connect it".to_string())
+        }
         NavidromeStatus::Offline => None,
     }
 }
@@ -75,7 +78,7 @@ pub fn SystemStatus(health: SystemHealth, navidrome_status: NavidromeStatus) -> 
 
     let user_not_linked = matches!(
         navidrome_status,
-        NavidromeStatus::InvalidCredentials | NavidromeStatus::Unknown
+        NavidromeStatus::InvalidCredentials | NavidromeStatus::Unknown | NavidromeStatus::NotLinked
     );
 
     rsx! {

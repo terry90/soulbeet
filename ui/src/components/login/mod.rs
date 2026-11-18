@@ -10,6 +10,12 @@ type LoginCallback = Callback<(String, String), Pin<Box<dyn Future<Output = Resu
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
     login: LoginCallback,
+    /// Name of the single sign-on provider, when one is configured
+    sso_provider: Option<String>,
+    /// Why the last single sign-on attempt failed
+    sso_error: Option<String>,
+    /// The authorize request to go back to once signed in
+    return_to: Option<String>,
 }
 
 #[component]
@@ -17,6 +23,12 @@ pub fn Login(props: Props) -> Element {
     let mut username = use_signal(|| "".to_string());
     let mut password = use_signal(|| "".to_string());
     let mut error = use_signal(|| "".to_string());
+    // A failed password attempt replaces the single sign-on error.
+    let shown_error = if error().is_empty() {
+        props.sso_error.clone().unwrap_or_default()
+    } else {
+        error()
+    };
 
     let handle_login = move || {
         let user = username.read().to_string();
@@ -84,7 +96,7 @@ pub fn Login(props: Props) -> Element {
               }
             }
 
-            if !error().is_empty() {
+            if !shown_error.is_empty() {
               div { class: "p-3 bg-red-500/10 border border-red-500/50 rounded text-red-400 text-sm font-mono flex items-center gap-2",
                 svg {
                   class: "w-4 h-4",
@@ -98,7 +110,7 @@ pub fn Login(props: Props) -> Element {
                     d: "M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z",
                   }
                 }
-                "{error}"
+                "{shown_error}"
               }
             }
 
@@ -117,6 +129,27 @@ pub fn Login(props: Props) -> Element {
                   stroke_width: "2",
                   d: "M14 5l7 7m0 0l-7 7m7-7H3",
                 }
+              }
+            }
+          }
+
+          if let Some(provider) = props.sso_provider {
+            div { class: "flex items-center gap-3 my-6",
+              div { class: "flex-1 h-px bg-white/10" }
+              span { class: "text-xs font-mono text-gray-500 uppercase tracking-widest", "or" }
+              div { class: "flex-1 h-px bg-white/10" }
+            }
+            // A native form, not a link: the router would handle a link
+            // inside the app, and this must be a full page load so the
+            // server can redirect to the provider.
+            form { method: "get", action: api::auth::OIDC_LOGIN_PATH,
+              if let Some(back) = props.return_to {
+                input { "type": "hidden", name: "return_to", value: "{back}" }
+              }
+              button {
+                class: "w-full retro-btn flex justify-center items-center gap-2",
+                "type": "submit",
+                "Sign in with {provider}"
               }
             }
           }

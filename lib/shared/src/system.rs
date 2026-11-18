@@ -14,6 +14,10 @@ pub enum NavidromeStatus {
     /// No Navidrome auth has been attempted yet (fresh account).
     #[default]
     Unknown,
+    /// Navidrome is configured but this account has no Navidrome password
+    /// yet: it signed up through single sign-on. One password sign-in with
+    /// the Navidrome credentials connects it.
+    NotLinked,
 }
 
 impl NavidromeStatus {
@@ -23,6 +27,7 @@ impl NavidromeStatus {
             Self::InvalidCredentials => "invalid_credentials",
             Self::Offline => "offline",
             Self::Unknown => "unknown",
+            Self::NotLinked => "not_linked",
         }
     }
 
@@ -44,6 +49,7 @@ impl std::str::FromStr for NavidromeStatus {
             "connected" => Ok(Self::Connected),
             "invalid_credentials" => Ok(Self::InvalidCredentials),
             "offline" => Ok(Self::Offline),
+            "not_linked" => Ok(Self::NotLinked),
             _ => Ok(Self::Unknown),
         }
     }

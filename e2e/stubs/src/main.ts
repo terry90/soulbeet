@@ -1,8 +1,9 @@
-// Entry point: boots the slskd double and the MusicBrainz double.
+// Entry point: boots the slskd, MusicBrainz and OpenID Connect doubles.
 
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MbControl, createMusicBrainzServer } from './mb-server.js';
+import { createOidcServer } from './oidc-server.js';
 import { createSlskdServer } from './slskd-server.js';
 import { SlskdState } from './slskd-state.js';
 import { proxyFromEnv } from './tcp-proxy.js';
@@ -15,6 +16,11 @@ const apiKey = process.env.SLSKD_API_KEY ?? 'e2e-slskd-api-key';
 const audioDir = resolve(process.env.AUDIO_DIR ?? join(e2eRoot, '.fixtures', 'audio'));
 const downloadsDir = resolve(process.env.DOWNLOADS_DIR ?? join(e2eRoot, '.runtime', 'downloads'));
 const enqueueLatencyMs = Number(process.env.ENQUEUE_LATENCY_MS ?? 150);
+// Not 5060: browsers refuse that port (SIP).
+const oidcPort = Number(process.env.OIDC_PORT ?? 5070);
+// The app and the browser reach the stub on different hosts in compose.
+const oidcIssuer = process.env.OIDC_ISSUER ?? `http://127.0.0.1:${oidcPort}`;
+const oidcBrowserUrl = process.env.OIDC_BROWSER_URL ?? oidcIssuer;
 
 const state = new SlskdState(audioDir, downloadsDir, undefined, enqueueLatencyMs);
 setInterval(() => state.tick(), 200).unref();
@@ -35,10 +41,21 @@ mb.listen(mbPort, '0.0.0.0', () => {
   console.log(`[mb] listening on :${mbPort}`);
 });
 
+const oidc = createOidcServer({
+  issuer: oidcIssuer,
+  browserUrl: oidcBrowserUrl,
+  clientId: 'soulbeet-e2e',
+  clientSecret: 'e2e-oidc-secret',
+});
+oidc.listen(oidcPort, '0.0.0.0', () => {
+  console.log(`[oidc] listening on :${oidcPort} (issuer ${oidcIssuer})`);
+});
+
 // Keep the tick interval from holding the process open on shutdown but make
 // sure the servers do hold it open.
 process.on('SIGTERM', () => {
   slskd.close();
   mb.close();
+  oidc.close();
   process.exit(0);
 });

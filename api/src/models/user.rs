@@ -33,6 +33,9 @@ pub struct User {
     pub role: Role,
     #[serde(skip)]
     pub credentials_version: i64,
+    /// The OpenID Connect subject this account signs in as, once linked
+    #[serde(skip)]
+    pub oidc_subject: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -78,6 +81,11 @@ pub enum NameMatch {
     /// None of them can sign in until an admin deletes the extra ones.
     Several,
 }
+
+/// The `password_hash` of an account without a password. It is no hash, so
+/// no password matches it.
+#[cfg(feature = "server")]
+const NO_PASSWORD: &str = "";
 
 /// What the triggers of the username migration raise for a taken name.
 #[cfg(feature = "server")]
@@ -335,6 +343,69 @@ impl User {
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// The account linked to an OpenID Connect subject.
+    pub(crate) async fn find_by_oidc_subject_in(
+        db: &SqlitePool,
+        subject: &str,
+    ) -> Result<Option<User>, String> {
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE oidc_subject = ?")
+            .bind(subject)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Links an account that has no OpenID Connect subject yet to `subject`.
+    /// False when the account is gone or already linked. Like a first link
+    /// to Navidrome, it ends the account's other sessions: someone else can
+    /// now sign in to it.
+    pub(crate) async fn link_oidc_subject_in(
+        db: &SqlitePool,
+        id: &str,
+        subject: &str,
+    ) -> Result<bool, String> {
+        let done = sqlx::query(
+            "UPDATE users SET oidc_subject = ?, credentials_version = credentials_version + 1 \
+             WHERE id = ? AND oidc_subject IS NULL",
+        )
+        .bind(subject)
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// Creates an account that signs in through OpenID Connect. It has no
+    /// password, so the password form stays closed to it until one is set in
+    /// Settings > Users or by a Navidrome sign-in.
+    pub(crate) async fn create_oidc_in(
+        db: &SqlitePool,
+        username: &str,
+        subject: &str,
+    ) -> Result<User, UserChangeError> {
+        sqlx::query_as::<_, User>(
+            "INSERT INTO users (id, username, password_hash, navidrome_status, changelog_seen, \
+             role, oidc_subject) VALUES (?, ?, ?, ?, ?, CASE WHEN EXISTS (SELECT 1 FROM users \
+             WHERE role = 'admin') THEN 'user' ELSE 'admin' END, ?) RETURNING *",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(username)
+        .bind(NO_PASSWORD)
+        .bind(shared::system::NavidromeStatus::Unknown.as_str())
+        .bind(shared::changelog::running_version().to_string())
+        .bind(subject)
+        .fetch_one(db)
+        .await
+        .map_err(change_error)
+    }
+
+    /// The account has a password of its own; one created through single
+    /// sign-on has none until it is given one.
+    pub fn has_password(&self) -> bool {
+        self.password_hash != NO_PASSWORD
     }
 
     pub async fn get_connected_users() -> Result<Vec<User>, String> {
@@ -620,6 +691,7 @@ mod tests {
             navidrome_status: "unknown".into(),
             role: Role::User,
             credentials_version: 3,
+            oidc_subject: None,
         };
         let json = serde_json::to_value(user).unwrap();
         assert!(json.get("navidrome_token").is_none() && json.get("credentials_version").is_none());

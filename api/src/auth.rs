@@ -81,6 +81,70 @@ pub struct AuthResponse {
     pub rename_allowed: bool,
 }
 
+/// Starts an OpenID Connect sign-in (a full page navigation, not a fetch).
+pub const OIDC_LOGIN_PATH: &str = "/api/auth/oidc/login";
+/// Where the OpenID Connect provider sends the browser back.
+pub const OIDC_CALLBACK_PATH: &str = "/api/auth/oidc/callback";
+
+/// How the login page offers to sign in.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub struct LoginOptions {
+    /// Name of the OpenID Connect provider, when single sign-on is set up
+    pub sso_provider: Option<String>,
+}
+
+/// Why a single sign-on attempt failed, passed to the login page as
+/// `/login/error/<code>`. Details go to the server log, not to the browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsoError {
+    /// Anything the user cannot fix: see the server log
+    Failed,
+    /// The provider refused (the user cancelled, or is not allowed)
+    Denied,
+    /// No account of that name and auto-registration is off
+    NotRegistered,
+    /// The account of that name is linked to another identity
+    Conflict,
+    /// Single sign-on is not configured
+    Disabled,
+}
+
+impl SsoError {
+    pub fn code(self) -> &'static str {
+        match self {
+            SsoError::Failed => "failed",
+            SsoError::Denied => "denied",
+            SsoError::NotRegistered => "not_registered",
+            SsoError::Conflict => "conflict",
+            SsoError::Disabled => "disabled",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            SsoError::Failed,
+            SsoError::Denied,
+            SsoError::NotRegistered,
+            SsoError::Conflict,
+            SsoError::Disabled,
+        ]
+        .into_iter()
+        .find(|e| e.code() == code)
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            SsoError::Failed => "Single sign-on failed. The server log has the details.",
+            SsoError::Denied => "Single sign-on was cancelled or refused by the provider.",
+            SsoError::NotRegistered => {
+                "No Soulbeet account for this user. Ask an admin to create it."
+            }
+            SsoError::Conflict => "This username is linked to another single sign-on identity.",
+            SsoError::Disabled => "Single sign-on is not configured on this server.",
+        }
+    }
+}
+
 #[cfg(feature = "server")]
 use crate::secret_key::SecretKey;
 #[cfg(feature = "server")]

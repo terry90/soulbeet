@@ -1,4 +1,4 @@
-use crate::auth::AuthResponse;
+use crate::auth::{AuthResponse, LoginOptions};
 use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
@@ -128,6 +128,15 @@ pub(crate) fn registration_refusal(mode: RegistrationMode) -> Option<&'static st
             Some("Accounts are created by signing in with your Navidrome account.")
         }
     }
+}
+
+/// What the login page offers besides the password form. Public: it is read
+/// before anyone signs in.
+#[get("/api/auth/options")]
+pub async fn get_login_options() -> Result<LoginOptions, ServerFnError> {
+    Ok(LoginOptions {
+        sso_provider: CONFIG.oidc().map(|oidc| oidc.provider_name.clone()),
+    })
 }
 
 #[post("/api/auth/register")]
@@ -295,6 +304,9 @@ pub(crate) struct ExistingAccount {
     pub linked: bool,
     /// The submitted password also verifies against the row's own hash.
     pub local_password_ok: bool,
+    /// The row has no password of its own: it was created by a single
+    /// sign-on, whose provider vouched for the same name.
+    pub passwordless: bool,
 }
 
 /// What a Navidrome-verified login does to the Soulful account of that name.
@@ -330,6 +342,7 @@ pub(crate) fn navidrome_login_plan<R>(
             ExistingAccount {
                 linked: true,
                 local_password_ok,
+                ..
             },
         )) => LoginPlan::Refresh {
             row,
@@ -339,16 +352,11 @@ pub(crate) fn navidrome_login_plan<R>(
             row,
             ExistingAccount {
                 linked: false,
-                local_password_ok: true,
+                local_password_ok,
+                passwordless,
             },
-        )) => LoginPlan::Link(row),
-        Some((
-            _,
-            ExistingAccount {
-                linked: false,
-                local_password_ok: false,
-            },
-        )) => LoginPlan::RefuseUnlinked,
+        )) if local_password_ok || passwordless => LoginPlan::Link(row),
+        Some((_, ExistingAccount { linked: false, .. })) => LoginPlan::RefuseUnlinked,
     }
 }
 
@@ -384,6 +392,7 @@ pub(crate) async fn apply_navidrome_login(
         let account = ExistingAccount {
             linked: u.navidrome_token.is_some(),
             local_password_ok: u.password_matches(password),
+            passwordless: !u.has_password(),
         };
         (u, account)
     });
@@ -412,6 +421,12 @@ pub(crate) async fn apply_navidrome_login(
         }
         LoginPlan::Link(user) => {
             User::link_navidrome_in(db, &user.id, encrypted_password, connected).await?;
+            // An account made by a single sign-on takes the Navidrome
+            // password, so it still signs in while Navidrome is down.
+            if !user.has_password() {
+                User::update_password_in(db, &user.id, password).await?;
+                security::note_password_set(&user.id, password);
+            }
             user.id
         }
         LoginPlan::Refresh {
@@ -936,8 +951,26 @@ mod tests {
             ExistingAccount {
                 linked,
                 local_password_ok,
+                passwordless: false,
             },
         ))
+    }
+
+    #[test]
+    fn a_name_made_by_single_sign_on_links_to_navidrome() {
+        // No password of its own: the provider vouched for the name.
+        let sso_only = Some((
+            (),
+            ExistingAccount {
+                linked: false,
+                local_password_ok: false,
+                passwordless: true,
+            },
+        ));
+        assert_eq!(
+            navidrome_login_plan(sso_only, RegistrationMode::Admin),
+            LoginPlan::Link(())
+        );
     }
 
     #[test]
@@ -1010,6 +1043,21 @@ mod tests {
             LoginOutcome::SignedIn(user) => user,
             other => panic!("expected a sign-in, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_navidrome_sign_in_connects_an_account_made_by_single_sign_on() {
+        let db = test_db::migrated().await;
+        User::create_oidc_in(&db, "bob", "sub-bob").await.unwrap();
+        let bob = signed_in(
+            apply_navidrome_login(&db, "Bob", "navidrome-pw", "enc", RegistrationMode::Admin)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(bob.navidrome_token.as_deref(), Some("enc"));
+        assert_eq!(bob.oidc_subject.as_deref(), Some("sub-bob"));
+        // It keeps the Navidrome password for when Navidrome is down.
+        assert!(bob.password_matches("navidrome-pw"));
     }
 
     #[tokio::test]

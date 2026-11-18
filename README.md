@@ -182,15 +182,48 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `MCP` | `on` or `off`, in any case, for the OAuth and `/mcp` endpoints MCP clients use; any other value turns them off and logs a warning | `on` (unset) |
 | `NAVIDROME_MUSIC_PATH` | Optional. Where Soulbeet sees the root of Navidrome's default library. Set it when Soulbeet mounts that library at another path than Navidrome does (e.g. Navidrome at `/music`, Soulbeet at `/media/music`): deletion checks, the rating sync and the MCP tools use it to find Navidrome's songs on disk. Without it, Soulbeet learns where each library is from the files it imports | |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
+| `OIDC_ISSUER_URL` | Issuer of your OpenID Connect provider. Setting it turns on single sign-on (see below) | |
+| `OIDC_CLIENT_ID` | Client ID registered at the provider | |
+| `OIDC_CLIENT_SECRET` | Client secret. Leave unset for a public client (PKCE only) | |
+| `OIDC_REDIRECT_URL` | This instance's callback, `https://<your soulbeet>/api/auth/oidc/callback` | `PUBLIC_URL` + `/api/auth/oidc/callback` |
+| `OIDC_PROVIDER_NAME` | Name on the login button ("Sign in with ...") | `SSO` |
+| `OIDC_SCOPES` | Scopes to request (`openid` is always added) | `openid profile email` |
+| `OIDC_USERNAME_CLAIM` | ID token claim used as the Soulbeet username | `preferred_username` |
+| `OIDC_AUTO_REGISTER` | Create an account on first sign-in when none has that username | `false` with `REGISTRATION=admin`, else `true` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
-**Note**: For an account linked to Navidrome, Navidrome decides: if it rejects your credentials, the sign-in is refused. Only while Navidrome cannot be reached (or `NAVIDROME_URL` is not set) does Soulbeet check the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. Accounts not linked to Navidrome sign in with their Soulbeet password. A Navidrome login only takes over an existing Soulbeet account that is already linked to Navidrome or whose Soulbeet password is the same.
+**Note**: For an account linked to Navidrome, Navidrome decides: if it rejects your credentials, the sign-in is refused. Only while Navidrome cannot be reached (or `NAVIDROME_URL` is not set) does Soulbeet check the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. Accounts not linked to Navidrome sign in with their Soulbeet password. A Navidrome login only takes over an existing Soulbeet account that is already linked to Navidrome, whose Soulbeet password is the same, or that was created by single sign-on and has no password yet.
 
 **Note**: Usernames are unique without regard to letter case, so `Bob` and `bob` are the same name.
 
 **Note**: Users who are not admins can only add library folders inside a root an admin approved in Settings > Library, never at the root itself.
 
 **Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. Scrobble credentials (Last.fm API key, ListenBrainz token) are configured per-user in Settings > Library.
+
+### Single Sign-On (OpenID Connect)
+
+Soulbeet can sign users in through an OpenID Connect provider such as [Pocket ID](https://pocket-id.org), Authelia, Authentik or Keycloak. The login page then shows a **Sign in with ...** button next to the password form, which keeps working.
+
+1.  At your provider, create a client with the callback URL `https://<your soulbeet>/api/auth/oidc/callback`. Soulbeet always sends PKCE, so the client can be public (no secret) if the provider allows it.
+2.  Set the variables, for example:
+    ```yaml
+    environment:
+      - PUBLIC_URL=https://soulbeet.example.com
+      - OIDC_ISSUER_URL=https://id.example.com
+      - OIDC_CLIENT_ID=<client id>
+      - OIDC_CLIENT_SECRET=<client secret>
+      - OIDC_PROVIDER_NAME=Pocket ID
+    ```
+    Without `PUBLIC_URL`, set `OIDC_REDIRECT_URL` to the callback URL.
+3.  Restart. A configuration error is logged at startup and leaves single sign-on off.
+
+How accounts are matched:
+
+-   The first sign-in looks for the account named by `OIDC_USERNAME_CLAIM` (ignoring letter case, like every sign-in) and links it to the provider's user (its `sub`). Later sign-ins use that link, so renaming the user at the provider does not change accounts. Linking signs the account out of its other sessions. Only use a provider you trust to decide usernames: whoever it calls `admin` gets the `admin` account.
+-   With no account of that name, one is created as a plain user, unless `REGISTRATION=admin` (or `OIDC_AUTO_REGISTER=false`). Restrict who may sign in at the provider (Pocket ID: allowed user groups on the client).
+-   With `OIDC_USERNAME_CLAIM=email`, an address the provider marks as unverified is refused.
+-   **Navidrome**: an account created through single sign-on has no password and no Navidrome password yet, and a banner says so. Log in once with your Navidrome username and password to connect it; both ways of signing in then reach the same account. Use the same username in Navidrome and at the provider.
+-   Signing in from an MCP client's authorization page goes back to it afterwards, as a password sign-in does.
 
 ### Upgrading to roles and folder roots
 

@@ -2,7 +2,8 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
-use api::login;
+use api::auth::SsoError;
+use api::{get_login_options, login};
 use dioxus::prelude::*;
 use ui::{login_failure_message, Login};
 
@@ -60,7 +61,41 @@ pub(crate) fn leave_login(navigator: dioxus::router::Navigator, return_to: Optio
 /// Signs in; `AuthGuard` then sees the session and leaves the page.
 #[component]
 pub fn LoginPage() -> Element {
+    rsx! {
+        LoginView { sso_error: None, return_to: None }
+    }
+}
+
+/// The login page on the way to an app's request; `AuthGuard` reads the
+/// request from the route. A single sign-on carries it to the provider and
+/// back.
+#[component]
+pub fn LoginReturnPage(return_to: ReturnTo) -> Element {
+    let return_to = return_to.accepted().map(str::to_owned);
+    rsx! {
+        LoginView { sso_error: None, return_to }
+    }
+}
+
+/// `/login/error/<code>`: where the server sends a failed single sign-on.
+#[component]
+pub fn LoginErrorPage(code: String) -> Element {
+    let sso_error = SsoError::from_code(&code).map(|e| e.message().to_string());
+    rsx! {
+        LoginView { sso_error, return_to: None }
+    }
+}
+
+#[component]
+fn LoginView(sso_error: Option<String>, return_to: Option<String>) -> Element {
     let mut auth = use_auth();
+    // A server that cannot answer just shows no single sign-on button.
+    let options = use_resource(get_login_options);
+    let sso_provider = options
+        .read()
+        .as_ref()
+        .and_then(|o| o.as_ref().ok())
+        .and_then(|o| o.sso_provider.clone());
 
     let login = use_callback(move |(username, password): (String, String)|
         -> Pin<Box<dyn Future<Output = Result<(), String>>>>
@@ -77,15 +112,6 @@ pub fn LoginPage() -> Element {
     });
 
     rsx! {
-        Login { login }
-    }
-}
-
-/// The login page on the way to an app's request; `AuthGuard` reads the
-/// request from the route.
-#[component]
-pub fn LoginReturnPage(return_to: ReturnTo) -> Element {
-    rsx! {
-        LoginPage {}
+        Login { login, sso_provider, sso_error, return_to }
     }
 }

@@ -117,7 +117,10 @@ pub fn DiscoveryOverview() -> Element {
         div { class: "space-y-4",
             h3 { class: "text-sm font-semibold text-white", "Discovery" }
 
-            if matches!(nav_status, NavidromeStatus::InvalidCredentials | NavidromeStatus::Unknown) {
+            if matches!(
+                nav_status,
+                NavidromeStatus::InvalidCredentials | NavidromeStatus::Unknown | NavidromeStatus::NotLinked
+            ) {
                 p { class: "text-xs font-mono text-beet-accent",
                     "Your username is not linked to Navidrome. Discovery playlists and rating sync require a matching Navidrome account."
                 }
