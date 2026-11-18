@@ -5,52 +5,17 @@ use shared::system::{AvailableBackends, SystemHealth};
 use shared::system::BackendInfo;
 
 #[cfg(feature = "server")]
+use crate::config::CONFIG;
+#[cfg(feature = "server")]
 use crate::services::{
     available_download_backends, available_importers, available_metadata_providers,
-    download_backend, evict_navidrome_client, navidrome_client_for_user,
 };
 #[cfg(feature = "server")]
-use crate::AuthSession;
-#[cfg(feature = "server")]
-use dioxus::logger::tracing::debug;
+use crate::{AdminSession, AuthSession};
 
 #[get("/api/system/health", auth: AuthSession)]
 pub async fn get_system_health() -> Result<SystemHealth, ServerFnError> {
-    #[cfg(feature = "server")]
-    {
-        let downloader_online = match download_backend(None).await {
-            Ok(backend) => backend.health_check().await,
-            Err(_) => false,
-        };
-
-        let importer = crate::importer_health::snapshot().await;
-
-        let navidrome_online = match navidrome_client_for_user(&auth.0.sub).await {
-            Ok(client) => match client.ping().await {
-                Ok(()) => true,
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("Circuit breaker open") {
-                        debug!(
-                            "Evicted stale Navidrome client for user {} after circuit-breaker-open ping",
-                            auth.0.sub
-                        );
-                        evict_navidrome_client(&auth.0.sub).await;
-                    }
-                    false
-                }
-            },
-            Err(_) => false,
-        };
-
-        Ok(SystemHealth {
-            downloader_online,
-            importer,
-            navidrome_online,
-        })
-    }
-    #[cfg(not(feature = "server"))]
-    Ok(SystemHealth::default())
+    Ok(crate::core::health::system_health(&auth.0).await)
 }
 
 #[get("/api/system/backends", _: AuthSession)]
@@ -83,4 +48,13 @@ pub async fn get_backends() -> Result<AvailableBackends, ServerFnError> {
     }
     #[cfg(not(feature = "server"))]
     Ok(AvailableBackends::default())
+}
+
+#[get("/api/system/security", _: AdminSession)]
+pub async fn get_security_status() -> Result<crate::security::SecurityStatus, ServerFnError> {
+    Ok(crate::security::SecurityStatus {
+        mcp_blocked_by: crate::security::gate_reasons(),
+        sign_in_problem: CONFIG.public_url_problem(),
+        mcp_off: CONFIG.mcp_off().map(str::to_string),
+    })
 }

@@ -1,0 +1,35 @@
+# The MCP acceptance instance (playwright.mcp.config.ts), used on top of
+# compose.e2e.yml. Its secret key is strong, so the security gate opens once
+# setup.mcp.ts changes the seeded admin password. The database lives in a
+# named volume: it survives a restart of the service and is removed with
+# `down -v`. Navidrome is reached through the stubs' proxy, which the suite
+# can take down.
+services:
+  soulbeet-mcp:
+    image: ${SOULBEET_IMAGE:-soulbeet:e2e}
+    ports:
+      - "9767:9765"
+    environment:
+      - DATABASE_URL=sqlite:/data/soulbeet.db
+      - SECRET_KEY=e2e-mcp-secret-key-0123456789abcdefghijkl
+      - DOWNLOAD_PATH=/downloads
+      - BEETS_CONFIG=/app/beets-e2e.yaml
+      - MUSICBRAINZ_HOST=stubs:5050
+      - NAVIDROME_URL=http://stubs:4534
+    volumes:
+      - mcp-data:/data
+      - ./.runtime/downloads:/downloads
+      - ./.runtime/music:/music
+      - ./.fixtures/beets-e2e.yaml:/app/beets-e2e.yaml:ro
+    depends_on:
+      - stubs
+      - navidrome
+  stubs:
+    ports:
+      - "4534:4534"
+    environment:
+      - NAVIDROME_PROXY_PORT=4534
+      - NAVIDROME_UPSTREAM=navidrome:4533
+
+volumes:
+  mcp-data:

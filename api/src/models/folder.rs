@@ -1,6 +1,10 @@
 #[cfg(feature = "server")]
+use crate::auth::Role;
+#[cfg(feature = "server")]
 use crate::db::DB;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "server")]
+use sqlx::SqlitePool;
 #[cfg(feature = "server")]
 use uuid::Uuid;
 
@@ -11,6 +15,17 @@ pub struct Folder {
     pub user_id: String,
     pub name: String,
     pub path: String,
+    pub shared: bool,
+}
+
+/// A folder with its owner's name and role, as the folder rules read it.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct OwnedFolder {
+    #[sqlx(flatten)]
+    pub folder: Folder,
+    pub owner: String,
+    pub owner_role: Role,
 }
 
 #[cfg(feature = "server")]
@@ -32,18 +47,55 @@ impl Folder {
         Ok(folder)
     }
 
+    /// Every folder with its owner, ordered by owner and name.
+    pub(crate) async fn get_all_with_owners_in(
+        db: &SqlitePool,
+    ) -> Result<Vec<OwnedFolder>, String> {
+        sqlx::query_as::<_, OwnedFolder>(
+            "SELECT f.*, u.username AS owner, u.role AS owner_role \
+             FROM folders f JOIN users u ON u.id = f.user_id ORDER BY u.username, f.name",
+        )
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())
+    }
+
     pub async fn get_all_by_user(user_id: &str) -> Result<Vec<Folder>, String> {
-        sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE user_id = ?")
+        Self::get_all_by_user_in(&DB, user_id).await
+    }
+
+    /// In the order the folders were added (`rowid`), so a page of them
+    /// has stable offsets.
+    pub(crate) async fn get_all_by_user_in(
+        db: &SqlitePool,
+        user_id: &str,
+    ) -> Result<Vec<Folder>, String> {
+        sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE user_id = ? ORDER BY rowid")
             .bind(user_id)
-            .fetch_all(&*DB)
+            .fetch_all(db)
             .await
             .map_err(|e| e.to_string())
     }
 
-    pub async fn update(id: &str, name: &str, path: &str) -> Result<(), String> {
+    pub(crate) async fn update_in(
+        db: &SqlitePool,
+        id: &str,
+        name: &str,
+        path: &str,
+    ) -> Result<(), String> {
         sqlx::query("UPDATE folders SET name = ?, path = ? WHERE id = ?")
             .bind(name)
             .bind(path)
+            .bind(id)
+            .execute(db)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub async fn set_shared(id: &str, shared: bool) -> Result<(), String> {
+        sqlx::query("UPDATE folders SET shared = ? WHERE id = ?")
+            .bind(shared)
             .bind(id)
             .execute(&*DB)
             .await
@@ -52,18 +104,26 @@ impl Folder {
     }
 
     pub async fn delete(id: &str) -> Result<(), String> {
+        Self::delete_in(&DB, id).await
+    }
+
+    pub(crate) async fn delete_in(db: &SqlitePool, id: &str) -> Result<(), String> {
         sqlx::query("DELETE FROM folders WHERE id = ?")
             .bind(id)
-            .execute(&*DB)
+            .execute(db)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub async fn get_by_id(id: &str) -> Result<Option<Folder>, String> {
+        Self::get_by_id_in(&DB, id).await
+    }
+
+    pub(crate) async fn get_by_id_in(db: &SqlitePool, id: &str) -> Result<Option<Folder>, String> {
         sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE id = ?")
             .bind(id)
-            .fetch_optional(&*DB)
+            .fetch_optional(db)
             .await
             .map_err(|e| e.to_string())
     }
@@ -104,6 +164,7 @@ fn match_folder<'a>(folders: &'a [Folder], path: &str) -> Option<&'a Folder> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::db::test_db;
 
     #[test]
     fn folder_matching_is_component_wise() {
@@ -112,6 +173,7 @@ mod tests {
             user_id: "u".into(),
             name: "n".into(),
             path: p.into(),
+            shared: false,
         };
         let folders = vec![f("/music/rock"), f("/music/jazz/")];
         assert_eq!(
@@ -124,5 +186,30 @@ mod tests {
         );
         assert!(match_folder(&folders, "/music/rock/../../etc").is_none());
         assert!(match_folder(&folders, "/elsewhere").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_users_folders_come_in_the_order_they_were_added() {
+        let db = test_db::migrated().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1', 'alice', 'x')")
+            .execute(&db)
+            .await
+            .unwrap();
+        for (id, name) in [("fb", "Music"), ("fa", "Archive")] {
+            sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES (?, 'u1', ?, ?)")
+                .bind(id)
+                .bind(name)
+                .bind(format!("/music/{id}"))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let ids: Vec<String> = Folder::get_all_by_user_in(&db, "u1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(ids, ["fb", "fa"]); // neither by id nor by name
     }
 }

@@ -21,6 +21,7 @@ docker-compose.yml
 soulbeet.db
 soulbeet.db-shm
 soulbeet.db-wal
+secret.key
 
 # Documentation & Dev Scripts
 README.md

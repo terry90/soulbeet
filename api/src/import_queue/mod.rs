@@ -3,42 +3,60 @@
 //! instead of reading "Importing".
 
 mod choice;
+mod replace;
 mod retry;
 mod rows;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use choice::Refusal;
-pub use retry::{forget_retries, import_choices_for, retry_import_for};
+pub(crate) use choice::{files_gone, nothing_to_retry};
+pub use retry::{forget_retries, import_choices_for, retry_import_for, Discarded, FileLeft};
+pub(crate) use rows::import_failure;
 
+use crate::auth::UserId;
+use crate::core::delete_guard::{Guard, Origin, ReplaceSet};
+use crate::core::discovery::Replace;
+use crate::ledger::{
+    self, DuplicateRule, ImportDone, IndexWait, JobEvent, Replacement, SlotResult, StoredImport,
+};
 use async_trait::async_trait;
 use futures::FutureExt;
-use shared::download::{DownloadEvent, DownloadProgress, DownloadState, MatchChoices};
+use serde::{Deserialize, Serialize};
+use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, MatchChoices};
+use shared::failure::Failure;
 use soulbeet::audio::{count_audio_files, is_audio_path};
-use soulbeet::{DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter};
+use soulbeet::{
+    DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
+    MusicImporter, SkipReason, SourceFile, TaskCount,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
-use retry::RetryStore;
-use rows::{rows_for_done, rows_with_state};
+use replace::{Removals, Settled};
+use retry::{keeps_retry, skipped_duplicate, RetryStore};
+use rows::{row_with_state, rows_for_done, rows_with_state};
 
 const WORKER_STOPPED: &str = "import worker stopped";
 
 /// Who a job reports to. The rows are already stamped with their batch.
 #[derive(Debug, Clone)]
 pub struct JobOwner {
-    pub username: String,
+    pub user_id: UserId,
     pub rows: Vec<DownloadProgress>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImportJob {
     pub sources: Vec<PathBuf>,
+    /// The downloaded files the job is of, which discarding it deletes: a singleton's file, an
+    /// album's rows' files. Never the rest of an album's folder: with slskd's default layout,
+    /// downloads from remote folders of one name share it, across jobs and users.
+    pub files: Vec<PathBuf>,
     pub target: PathBuf,
     pub mode: ImportMode,
     /// None for discovery and promote, which have no rows.
@@ -51,6 +69,153 @@ pub struct ImportJob {
     pub choice: DriverChoice,
     /// What the last automatic run of these files left to pick from.
     pub choices: Option<Arc<MatchChoices>>,
+    /// What becomes of the library's earlier copy beets finds.
+    pub duplicates: Duplicates,
+    /// What the last run of these files knew; None before the importer first ran them.
+    pub last_run: Option<Arc<KeptRun>>,
+}
+
+/// What the last run of a kept import knew (design 11.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptRun {
+    pub tasks: TaskCount,
+    pub output_tail: String,
+    /// The files with their tags, from the last automatic run: the first KEPT_FILES_MAX.
+    pub files: Vec<SourceFile>,
+    /// How many more files that run read, not kept.
+    #[serde(default)]
+    pub files_left_out: u32,
+}
+
+/// How many files of a run a kept import keeps: their tags are a peer's text, stored with the
+/// import, and an album folder rarely holds more.
+const KEPT_FILES_MAX: usize = 200;
+
+/// How an import treats the library's earlier copy of what it imports.
+#[derive(Debug, Clone)]
+pub enum Duplicates {
+    /// beets acts as configured (discovery staging, section 13).
+    AsConfigured,
+    /// beets reports the removals it wants; the guard decides them for `actor`.
+    Guarded { actor: UserId, origin: Origin },
+    /// beets skips what the library already has (MCP jobs); a skip is not kept for a retry.
+    Skip,
+    /// beets reports every duplicate; the guard deletes only previewed copies, for the app that
+    /// confirmed them (D9).
+    Replace { actor: UserId, set: ReplaceSet },
+}
+
+impl Duplicates {
+    /// The previewed copies a replacing import may delete.
+    fn replace_set(&self) -> Option<&ReplaceSet> {
+        match self {
+            Duplicates::Replace { set, .. } => Some(set),
+            _ => None,
+        }
+    }
+
+    /// How the imports of a batch of `user` with `rule` treat earlier copies.
+    pub fn of(rule: &DuplicateRule, user: &UserId) -> Duplicates {
+        match rule {
+            DuplicateRule::Guarded => Duplicates::Guarded {
+                actor: user.clone(),
+                origin: Origin::Ui,
+            },
+            DuplicateRule::Skip => Duplicates::Skip,
+            DuplicateRule::Replace(set) => Duplicates::Replace {
+                actor: user.clone(),
+                set: set.clone(),
+            },
+            DuplicateRule::GuardedForApp(grant_id) => Duplicates::Guarded {
+                actor: user.clone(),
+                origin: Origin::Mcp {
+                    grant_id: grant_id.clone(),
+                },
+            },
+        }
+    }
+
+    /// How a connected app's decision on an import kept with these duplicates treats earlier
+    /// copies: one the web UI's rule kept removes them only as `replace` says, as the app's
+    /// deletions or never (beets skips what the library has). Every other rule already is an
+    /// app's, or removes nothing.
+    pub(crate) fn for_app(self, replace: Replace) -> Duplicates {
+        match (self, replace) {
+            (Duplicates::Guarded { actor, .. }, Replace::Guarded(origin)) => {
+                Duplicates::Guarded { actor, origin }
+            }
+            (Duplicates::Guarded { .. }, Replace::Never) => Duplicates::Skip,
+            (other, _) => other,
+        }
+    }
+}
+
+impl ImportJob {
+    /// None for a job without an owner (discovery, promote): the ledger keeps only owned jobs.
+    pub fn stored(&self) -> Option<StoredImport> {
+        let owner = self.owner.as_ref()?;
+        Some(StoredImport {
+            sources: self.sources.clone(),
+            files: self.files.clone(),
+            target: self.target.clone(),
+            album: matches!(self.mode, ImportMode::Album),
+            cleanup_root: self.cleanup_root.clone(),
+            choices: self.choices.as_deref().cloned(),
+            choice: self.choice.clone(),
+            // The writer ignores a row without a job, so none is stored.
+            rows: owner
+                .rows
+                .iter()
+                .filter_map(|row| Some((row.job.clone()?, row.clone())))
+                .collect(),
+            // A job with rows is a download or a retry of one, never AsConfigured.
+            duplicates: match &self.duplicates {
+                Duplicates::Skip => DuplicateRule::Skip,
+                Duplicates::Replace { set, .. } => DuplicateRule::Replace(set.clone()),
+                Duplicates::Guarded {
+                    origin: Origin::Mcp { grant_id },
+                    ..
+                } => DuplicateRule::GuardedForApp(grant_id.clone()),
+                Duplicates::Guarded { .. } | Duplicates::AsConfigured => DuplicateRule::Guarded,
+            },
+            last_run: self.last_run.as_deref().cloned(),
+        })
+    }
+
+    /// The job `stored` describes, reporting to `user` through its rows (jobs set). Every
+    /// stored import is a download or a retry, so its earlier copies are treated by its rule
+    /// for `user`.
+    pub fn from_stored(stored: StoredImport, user: UserId) -> ImportJob {
+        ImportJob {
+            duplicates: Duplicates::of(&stored.duplicates, &user),
+            sources: stored.sources,
+            files: stored.files,
+            target: stored.target,
+            mode: match stored.album {
+                true => ImportMode::Album,
+                false => ImportMode::Singleton,
+            },
+            owner: Some(JobOwner {
+                user_id: user,
+                rows: stored
+                    .rows
+                    .into_iter()
+                    .map(|(slot, row)| row.with_job(slot))
+                    .collect(),
+            }),
+            snapshot_target: false,
+            cleanup_root: stored.cleanup_root,
+            choice: stored.choice,
+            choices: stored.choices.map(Arc::new),
+            last_run: stored.last_run.map(Arc::new),
+        }
+    }
+
+    /// Whether the job's sources still hold an audio file to import.
+    pub(crate) async fn holds_audio(&self) -> bool {
+        let sources: Vec<&Path> = self.sources.iter().map(PathBuf::as_path).collect();
+        count_audio_files(&sources).await > 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +227,10 @@ pub struct JobOutcome {
     /// The importer ran. Only then does an automatic run's result say what
     /// can be picked.
     ran: bool,
+    /// What became of each earlier copy the run wanted removed (replace::Settled).
+    replaced: Vec<Replacement>,
+    /// A replacing run's previewed songs whose copy it did not delete (replace::Settled).
+    not_replaced: Vec<String>,
 }
 
 impl JobOutcome {
@@ -71,6 +240,8 @@ impl JobOutcome {
             result,
             new_files: vec![],
             ran: false,
+            replaced: vec![],
+            not_replaced: vec![],
         }
     }
 }
@@ -82,7 +253,7 @@ pub enum JobState {
         position: u32,
     },
     Running,
-    Done(JobOutcome),
+    Done(Box<JobOutcome>),
 }
 
 pub struct ImportHandle {
@@ -93,19 +264,25 @@ impl ImportHandle {
     pub async fn wait(mut self) -> JobOutcome {
         let done = match self.rx.wait_for(|s| matches!(s, JobState::Done(_))).await {
             Ok(state) => match &*state {
-                JobState::Done(outcome) => Some(outcome.clone()),
+                JobState::Done(outcome) => Some(JobOutcome::clone(outcome)),
                 _ => None,
             },
             Err(_) => None,
         };
-        done.unwrap_or_else(|| JobOutcome::of(ImportResult::failed(WORKER_STOPPED.into())))
+        done.unwrap_or_else(|| {
+            JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
+        })
     }
 }
 
 #[async_trait]
 pub trait QueueDeps: Send + Sync {
     async fn importer(&self) -> Result<Arc<dyn MusicImporter>, String>;
-    async fn emit(&self, username: &str, event: DownloadEvent);
+    async fn emit(&self, user: &UserId, event: DownloadEvent);
+    /// Records `event` in the job ledger.
+    fn record(&self, event: JobEvent);
+    /// The guard that decides the removals beets wants.
+    fn guard(&self) -> Guard<'_>;
 }
 
 struct Waiting {
@@ -113,16 +290,36 @@ struct Waiting {
     state: watch::Sender<JobState>,
 }
 
-/// A target's worker and the jobs waiting for it. The entry exists exactly
+/// What a target's worker runs, one at a time.
+enum Work {
+    Import(Box<Waiting>),
+    /// Drops `file` from the target's library.
+    Forget {
+        file: PathBuf,
+        done: oneshot::Sender<ForgetOutcome>,
+    },
+}
+
+impl Work {
+    /// Who the rows of an import belong to. Other work has no rows.
+    fn owner(&self) -> Option<&JobOwner> {
+        match self {
+            Work::Import(waiting) => waiting.job.owner.as_ref(),
+            Work::Forget { .. } => None,
+        }
+    }
+}
+
+/// A target's worker and the work waiting for it. The entry exists exactly
 /// as long as its worker runs.
 struct TargetEntry {
     generation: u64,
     running: bool,
-    queue: VecDeque<Waiting>,
+    queue: VecDeque<Work>,
 }
 
-/// Rows to send, grouped by username in first-seen order.
-type UserRows = Vec<(String, Vec<DownloadProgress>)>;
+/// Rows to send, grouped by user in first-seen order.
+type UserRows = Vec<(UserId, Vec<DownloadProgress>)>;
 
 struct Shared {
     targets: Mutex<HashMap<PathBuf, TargetEntry>>,
@@ -134,6 +331,8 @@ struct Shared {
     retries: RetryStore,
 }
 
+/// A handle on the queue; clones share it.
+#[derive(Clone)]
 pub struct ImportQueue {
     shared: Arc<Shared>,
 }
@@ -155,11 +354,14 @@ impl ImportQueue {
         let key = match canonical_target(&job.target).await {
             Ok(key) => key,
             Err(e) => {
-                let result =
-                    ImportResult::failed(format!("Could not create {}: {e}", job.target.display()));
+                let result = ImportResult::failed(
+                    FailKind::TargetUnwritable,
+                    format!("Could not create {}: {e}", job.target.display()),
+                );
                 let (state, rx) = watch::channel(JobState::Running);
+                // A failure, so no index wait reads the library.
                 self.shared
-                    .finish(&job, JobOutcome::of(result), &state)
+                    .finish(&job.target, &job, JobOutcome::of(result), &state)
                     .await;
                 return ImportHandle { rx };
             }
@@ -167,22 +369,7 @@ impl ImportQueue {
 
         let owner = job.owner.clone();
         let (state, rx) = watch::channel(JobState::Queued { position: 0 });
-        let new_worker = {
-            let mut targets = self.shared.targets();
-            let spawn = !targets.contains_key(&key);
-            let entry = targets.entry(key.clone()).or_insert_with(|| TargetEntry {
-                generation: self.shared.next_generation.fetch_add(1, Ordering::Relaxed),
-                running: false,
-                queue: VecDeque::new(),
-            });
-            let position = u32::from(entry.running) + entry.queue.len() as u32;
-            state.send_replace(JobState::Queued { position });
-            entry.queue.push_back(Waiting { job, state });
-            spawn.then_some(entry.generation)
-        };
-        if let Some(generation) = new_worker {
-            tokio::spawn(work(self.shared.clone(), key, generation));
-        }
+        self.enqueue(key, Work::Import(Box::new(Waiting { job, state })));
 
         if let Some(owner) = owner {
             let _emit = self.shared.emit_lock.lock().await;
@@ -194,11 +381,70 @@ impl ImportQueue {
                 let rows = rows_with_state(&owner.rows, DownloadState::ImportQueued(position));
                 self.shared
                     .deps
-                    .emit(&owner.username, DownloadEvent::Progress(rows))
+                    .emit(&owner.user_id, DownloadEvent::Progress(rows))
                     .await;
             }
         }
         ImportHandle { rx }
+    }
+
+    /// Drops `file` from the library of `library` once the work queued on
+    /// that library before it has run. A library folder that does not exist
+    /// is not created.
+    pub async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
+        let key = match tokio::fs::canonicalize(library).await {
+            Ok(key) => key,
+            Err(e) => {
+                return ForgetOutcome::Failed(format!(
+                    "Could not resolve {}: {e}",
+                    library.display()
+                ))
+            }
+        };
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(
+            key,
+            Work::Forget {
+                file: file.to_path_buf(),
+                done,
+            },
+        );
+        outcome
+            .await
+            .unwrap_or_else(|_| ForgetOutcome::Failed(WORKER_STOPPED.into()))
+    }
+
+    /// Queues `item` on `key`, starting the target's worker if none runs. An
+    /// import's state is set to its position.
+    fn enqueue(&self, key: PathBuf, item: Work) {
+        let new_worker = {
+            let mut targets = self.shared.targets();
+            let spawn = !targets.contains_key(&key);
+            let entry = targets.entry(key.clone()).or_insert_with(|| TargetEntry {
+                generation: self.shared.next_generation.fetch_add(1, Ordering::Relaxed),
+                running: false,
+                queue: VecDeque::new(),
+            });
+            if let Work::Import(waiting) = &item {
+                let position = u32::from(entry.running) + entry.queue.len() as u32;
+                waiting.state.send_replace(JobState::Queued { position });
+                // Under the targets lock, so it reaches the ledger before anything
+                // the worker records for this job.
+                if let Some(mut import) = waiting.job.stored() {
+                    for (_, row) in &mut import.rows {
+                        *row = row_with_state(row.clone(), DownloadState::ImportQueued(position));
+                    }
+                    self.shared
+                        .deps
+                        .record(JobEvent::ImportQueued(Box::new(import)));
+                }
+            }
+            entry.queue.push_back(item);
+            spawn.then_some(entry.generation)
+        };
+        if let Some(generation) = new_worker {
+            tokio::spawn(work(self.shared.clone(), key, generation));
+        }
     }
 }
 
@@ -227,31 +473,51 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
         key: key.clone(),
         generation,
     };
-    while let Some((job, state, moved)) = shared.next_job(&key, generation) {
+    while let Some((item, moved)) = shared.next_work(&key, generation) {
         {
             let _emit = shared.emit_lock.lock().await;
-            if let Some(owner) = &job.owner {
+            if let Some(owner) = item.owner() {
                 let rows = rows_with_state(&owner.rows, DownloadState::Importing);
                 shared
                     .deps
-                    .emit(&owner.username, DownloadEvent::Progress(rows))
+                    .emit(&owner.user_id, DownloadEvent::Progress(rows.clone()))
                     .await;
+                shared.deps.record(JobEvent::Slots {
+                    state: ledger::JobState::Importing,
+                    rows,
+                });
             }
-            for (username, rows) in moved {
-                shared
-                    .deps
-                    .emit(&username, DownloadEvent::Progress(rows))
-                    .await;
+            for (user, rows) in moved {
+                shared.deps.emit(&user, DownloadEvent::Progress(rows)).await;
             }
         }
-        let outcome = AssertUnwindSafe(shared.execute(&key, &job))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| {
-                warn!("Import into {} panicked", key.display());
-                JobOutcome::of(ImportResult::failed(WORKER_STOPPED.into()))
-            });
-        shared.finish(&job, outcome, &state).await;
+        match item {
+            Work::Import(waiting) => {
+                let Waiting { job, state } = *waiting;
+                let outcome = AssertUnwindSafe(shared.execute(&key, &job))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("Import into {} panicked", key.display());
+                        JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
+                    });
+                shared.finish(&key, &job, outcome, &state).await;
+            }
+            Work::Forget { file, done } => {
+                let outcome = AssertUnwindSafe(shared.forget(&key, &file))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Forgetting {} in {} panicked",
+                            file.display(),
+                            key.display()
+                        );
+                        ForgetOutcome::Failed(WORKER_STOPPED.into())
+                    });
+                let _ = done.send(outcome);
+            }
+        }
     }
 }
 
@@ -260,13 +526,9 @@ impl Shared {
         self.targets.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Starts the next job on `key`, or removes the entry when none is left.
+    /// Starts the next work on `key`, or removes the entry when none is left.
     /// Also returns the waiting rows whose position moved up.
-    fn next_job(
-        &self,
-        key: &Path,
-        generation: u64,
-    ) -> Option<(ImportJob, watch::Sender<JobState>, UserRows)> {
+    fn next_work(&self, key: &Path, generation: u64) -> Option<(Work, UserRows)> {
         let mut targets = self.targets();
         let entry = targets
             .get_mut(key)
@@ -275,43 +537,105 @@ impl Shared {
             targets.remove(key);
             return None;
         };
-        // Positions count the running job, so they only move when one ran before.
+        // Positions count the running work, so they only move when some ran before.
         let moved_up = std::mem::replace(&mut entry.running, true);
-        next.state.send_replace(JobState::Running);
+        if let Work::Import(waiting) = &next {
+            waiting.state.send_replace(JobState::Running);
+        }
         let mut moved: UserRows = Vec::new();
-        for (i, waiting) in entry.queue.iter().enumerate() {
+        for (i, item) in entry.queue.iter().enumerate() {
+            let Work::Import(waiting) = item else {
+                continue;
+            };
             let position = i as u32 + 1;
             waiting.state.send_replace(JobState::Queued { position });
             if let (true, Some(owner)) = (moved_up, &waiting.job.owner) {
                 let rows = rows_with_state(&owner.rows, DownloadState::ImportQueued(position));
-                match moved.iter_mut().find(|(user, _)| *user == owner.username) {
+                match moved.iter_mut().find(|(user, _)| *user == owner.user_id) {
                     Some((_, user_rows)) => user_rows.extend(rows),
-                    None => moved.push((owner.username.clone(), rows)),
+                    None => moved.push((owner.user_id.clone(), rows)),
                 }
             }
         }
-        Some((next.job, next.state, moved))
+        Some((next, moved))
+    }
+
+    async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
+        match self.deps.importer().await {
+            Ok(importer) => importer.forget(library, file).await,
+            Err(e) => ForgetOutcome::Failed(e),
+        }
     }
 
     async fn execute(&self, target: &Path, job: &ImportJob) -> JobOutcome {
-        let sources: Vec<&Path> = job.sources.iter().map(PathBuf::as_path).collect();
-        if count_audio_files(&sources).await == 0 {
+        if !job.holds_audio().await {
             return JobOutcome::of(ImportResult::nothing_to_import());
         }
+        let sources: Vec<&Path> = job.sources.iter().map(PathBuf::as_path).collect();
         let importer = match self.deps.importer().await {
             Ok(importer) => importer,
-            Err(e) => return JobOutcome::of(ImportResult::failed(e)),
+            Err(e) => return JobOutcome::of(ImportResult::failed(FailKind::Setup, e)),
         };
         if let Some(issue) = crate::importer_health::refusal(importer.as_ref()).await {
-            return JobOutcome::of(ImportResult::refused(issue));
+            return JobOutcome::of(importer.refused(issue));
         }
         let before = match job.snapshot_target {
             true => Some(audio_files_under(target).await),
             false => None,
         };
+        let duplicates = match job.duplicates {
+            Duplicates::AsConfigured => DuplicateRun::AsConfigured,
+            Duplicates::Guarded { .. } => DuplicateRun::ReportRemovals,
+            Duplicates::Skip => DuplicateRun::Skip,
+            Duplicates::Replace { .. } => DuplicateRun::Replace,
+        };
         let result = importer
-            .import(&sources, target, job.mode, &job.choice)
+            .import(&sources, target, job.mode, &job.choice, duplicates)
             .await;
+        let removals = match &job.duplicates {
+            Duplicates::Guarded { actor, origin } => Some((actor, Removals::Guarded(origin))),
+            Duplicates::Replace { actor, set } => Some((
+                actor,
+                Removals::Previewed {
+                    set,
+                    now: crate::oauth::now_unix(),
+                },
+            )),
+            Duplicates::AsConfigured | Duplicates::Skip => None,
+        };
+        let Settled {
+            result,
+            replaced,
+            not_replaced,
+        } = match removals {
+            Some((actor, removals)) if !result.removals.is_empty() => {
+                // The import's own jobs want what it replaces.
+                let mut exempt: Vec<String> = job
+                    .owner
+                    .iter()
+                    .flat_map(|owner| &owner.rows)
+                    .filter_map(|row| Some(row.job.as_ref()?.job.clone()))
+                    .collect();
+                exempt.sort();
+                exempt.dedup();
+                replace::settle_removals(
+                    &self.deps.guard(),
+                    importer.as_ref(),
+                    actor,
+                    removals,
+                    &exempt,
+                    target,
+                    result,
+                )
+                .await
+            }
+            // Nothing to settle: a replacing job's previewed copies all stay.
+            _ => Settled {
+                result,
+                replaced: vec![],
+                not_replaced: replace::not_replaced(job.duplicates.replace_set(), &[]),
+            },
+        };
         let new_files = match before {
             Some(before) => {
                 let mut new: Vec<PathBuf> = audio_files_under(target)
@@ -328,10 +652,28 @@ impl Shared {
             result,
             new_files,
             ran: true,
+            replaced,
+            not_replaced,
         }
     }
 
-    async fn finish(&self, job: &ImportJob, outcome: JobOutcome, state: &watch::Sender<JobState>) {
+    /// Records the dropped slots of kept imports as dismissed.
+    fn dismiss(&self, slots: Vec<JobSlot>) {
+        if !slots.is_empty() {
+            self.deps.record(JobEvent::Dismiss(slots));
+        }
+    }
+
+    /// Ends `job`, imported into `library` (its canonical target): cleans up,
+    /// keeps it for a retry when its outcome says so, and sends and records
+    /// its rows.
+    async fn finish(
+        &self,
+        library: &Path,
+        job: &ImportJob,
+        outcome: JobOutcome,
+        state: &watch::Sender<JobState>,
+    ) {
         match &outcome.result.outcome {
             ImportOutcome::Imported { .. } => {
                 info!(
@@ -348,15 +690,25 @@ impl Shared {
                 outcome.result
             ),
         }
+        let keep = keeps_retry(&outcome.result.outcome, &job.duplicates);
+        // Every owned download job has a cleanup root (`process::import_job`). A promote has
+        // none: with Skip, its staged file stays where it is and the track goes back to pending.
         if let Some(root) = &job.cleanup_root {
-            // beets moves the files out but leaves their folders behind.
-            for source in &job.sources {
-                let dir = match job.mode {
-                    ImportMode::Album => Some(source.as_path()),
-                    ImportMode::Singleton => source.parent(),
-                };
-                if let Some(dir) = dir {
-                    let _ = crate::server_fns::cleanup_empty_ancestors(dir, root).await;
+            if skipped_duplicate(&outcome.result.outcome, &job.duplicates) {
+                // No retry imports what the library has: the copy is Soulful's own download.
+                for (path, e) in crate::core::acquire::discard_files(&job.files, root).await {
+                    warn!("Could not delete the duplicate {}: {e}", path.display());
+                }
+            } else {
+                // beets moves the files out but leaves their folders behind.
+                for source in &job.sources {
+                    let dir = match job.mode {
+                        ImportMode::Album => Some(source.as_path()),
+                        ImportMode::Singleton => source.parent(),
+                    };
+                    if let Some(dir) = dir {
+                        let _ = crate::server_fns::cleanup_empty_ancestors(dir, root).await;
+                    }
                 }
             }
         }
@@ -367,20 +719,119 @@ impl Shared {
             (DriverChoice::Auto, true) => outcome.result.choices.clone().map(Arc::new),
             _ => job.choices.clone(),
         };
+        let last_run = match outcome.ran {
+            true => Some(Arc::new(last_run(job, &outcome.result))),
+            false => job.last_run.clone(),
+        };
         let job = Arc::new(ImportJob {
             choices,
+            last_run,
             ..job.clone()
         });
-        // Stored before the rows go out, so their Retry button always finds it.
-        self.retries.record(&job, &outcome.result);
+        // Stored before the rows go out, so their Retry button always finds
+        // it, and under the lock, so the ledger hears what the store did in
+        // the order the store did it.
         let _emit = self.emit_lock.lock().await;
+        let dropped = self.retries.record(&job, keep);
         if let Some(owner) = &job.owner {
             let rows = rows_for_done(&owner.rows, &job, &outcome);
+            if let Some(import) = job.stored() {
+                let done = ledger_end(library, import, rows.clone(), &outcome, keep);
+                self.deps.record(JobEvent::ImportDone(Box::new(done)));
+            }
             self.deps
-                .emit(&owner.username, DownloadEvent::Progress(rows))
+                .emit(&owner.user_id, DownloadEvent::Progress(rows))
                 .await;
         }
-        state.send_replace(JobState::Done(outcome));
+        self.dismiss(dropped);
+        state.send_replace(JobState::Done(Box::new(outcome)));
+    }
+}
+
+/// What a run of `job` that ended with `result` knew: its tasks and output, and the files an
+/// automatic run read, which a chosen run (beets reads no files for it) keeps from before.
+fn last_run(job: &ImportJob, result: &ImportResult) -> KeptRun {
+    let (files, files_left_out) = match (&job.choice, &job.last_run) {
+        (DriverChoice::Auto, _) => {
+            let left_out = result.files.len().saturating_sub(KEPT_FILES_MAX);
+            let kept = result.files.iter().take(KEPT_FILES_MAX).cloned().collect();
+            (kept, u32::try_from(left_out).unwrap_or(u32::MAX))
+        }
+        (_, Some(before)) => (before.files.clone(), before.files_left_out),
+        (_, None) => (Vec::new(), 0),
+    };
+    KeptRun {
+        tasks: result.tasks,
+        output_tail: result.output_tail.clone(),
+        files,
+        files_left_out,
+    }
+}
+
+/// How `import` ended for the ledger, its `rows` sent: the state its slots go
+/// to after `done`'s outcome, kept for a retry when `keep`, the index wait of an
+/// import into `library`, and each slot's result, an imported one with what the run
+/// replaced.
+fn ledger_end(
+    library: &Path,
+    import: StoredImport,
+    rows: Vec<DownloadProgress>,
+    done: &JobOutcome,
+    keep: bool,
+) -> ImportDone {
+    let outcome = &done.result.outcome;
+    let (next, index) = match (outcome, import.sources.first()) {
+        // An import that ran had a source.
+        (ImportOutcome::Imported { items, .. }, Some(first)) if !items.is_empty() => (
+            ledger::JobState::Indexing,
+            Some(IndexWait {
+                import: first.display().to_string(),
+                library: library.to_path_buf(),
+                items: items.clone(),
+                since: chrono::Utc::now().timestamp(),
+                baseline: None,
+                checked: None,
+            }),
+        ),
+        // beets left no report of what it imported (D14).
+        (ImportOutcome::Imported { .. }, _) => (ledger::JobState::Done, None),
+        _ if keep => (ledger::JobState::NeedsDecision, None),
+        _ => (ledger::JobState::Failed, None),
+    };
+    let results = match outcome {
+        ImportOutcome::Imported {
+            untagged, items, ..
+        } => import
+            .rows
+            .iter()
+            .map(|(slot, _)| {
+                let result = SlotResult::Imported {
+                    applied: items.clone(),
+                    untagged: *untagged,
+                    listed: None,
+                    replaced: done.replaced.clone(),
+                    not_replaced: done.not_replaced.clone(),
+                };
+                (slot.clone(), result)
+            })
+            .collect(),
+        // Only a duplicate that is not kept ends with what the library has.
+        ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing }) if !keep => import
+            .rows
+            .iter()
+            .map(|(slot, _)| {
+                let existing = existing.clone();
+                (slot.clone(), SlotResult::AlreadyInLibrary { existing })
+            })
+            .collect(),
+        _ => vec![],
+    };
+    ImportDone {
+        import,
+        rows,
+        next,
+        index,
+        results,
     }
 }
 
@@ -413,11 +864,18 @@ pub async fn canonical_target(target: &Path) -> std::io::Result<PathBuf> {
     tokio::fs::canonicalize(target).await
 }
 
-/// Imports one file into a library folder and waits for it (promote).
-pub async fn import_to_library(src: &Path, target: &Path) -> Result<(), String> {
+/// Imports one file into a library folder and waits for it (promote), treating an earlier
+/// copy by `duplicates`. Ok when the file imported, its warnings logged since no row shows
+/// them, else the outcome's failure.
+pub async fn import_to_library(
+    src: &Path,
+    target: &Path,
+    duplicates: Duplicates,
+) -> Result<(), Failure> {
     let outcome = IMPORT_QUEUE
         .submit(ImportJob {
             sources: vec![src.to_path_buf()],
+            files: vec![src.to_path_buf()],
             target: target.to_path_buf(),
             mode: ImportMode::Singleton,
             owner: None,
@@ -425,14 +883,25 @@ pub async fn import_to_library(src: &Path, target: &Path) -> Result<(), String> 
             cleanup_root: None,
             choice: DriverChoice::Auto,
             choices: None,
+            duplicates,
+            last_run: None,
         })
         .await
         .wait()
         .await;
-    match outcome.result.outcome {
-        ImportOutcome::Imported { .. } => Ok(()),
-        _ => Err(outcome.result.to_string()),
+    if let Some(failure) = import_failure(&outcome.result) {
+        return Err(failure);
     }
+    if let ImportOutcome::Imported { warnings, .. } = &outcome.result.outcome {
+        for note in warnings {
+            warn!(
+                "Promote of {} into {}: {note}",
+                src.display(),
+                target.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 struct LiveDeps;
@@ -443,8 +912,16 @@ impl QueueDeps for LiveDeps {
         crate::services::music_importer(None).await
     }
 
-    async fn emit(&self, username: &str, event: DownloadEvent) {
-        crate::globals::send_user_event(username, event).await;
+    async fn emit(&self, user: &UserId, event: DownloadEvent) {
+        crate::globals::send_user_event(user, event).await;
+    }
+
+    fn record(&self, event: JobEvent) {
+        ledger::LEDGER.record(event);
+    }
+
+    fn guard(&self) -> Guard<'_> {
+        Guard::live()
     }
 }
 
@@ -453,10 +930,17 @@ pub static IMPORT_QUEUE: LazyLock<ImportQueue> =
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{broken, row, RecordingDeps, StubImporter};
+    use super::choice::{files_gone, nothing_to_retry};
+    use super::test_support::{
+        alice, bob, broken, candidate, imported, no_match, row, track_choices, RecordingDeps,
+        StubImporter,
+    };
     use super::*;
-    use shared::download::DownloadState;
-    use soulbeet::{ImportOutcome, SkipReason};
+    use crate::core::delete_guard::test_support::{library_verdict, wanted, Library};
+    use crate::core::deletion::REPLACE_CONSENT_SECS;
+    use crate::ledger::ReplacementOutcome;
+    use shared::download::{DownloadState, ImportChoice, JobSlot};
+    use soulbeet::{ForgetOutcome, ImportOutcome, ImportedItem, SkipReason, SourceFile, TaskCount};
     use std::time::Duration;
 
     pub(super) fn queue(
@@ -477,7 +961,8 @@ mod tests {
 
     pub(super) fn job(source: PathBuf, target: &Path) -> ImportJob {
         ImportJob {
-            sources: vec![source],
+            sources: vec![source.clone()],
+            files: vec![source],
             target: target.to_path_buf(),
             mode: ImportMode::Singleton,
             owner: None,
@@ -485,13 +970,25 @@ mod tests {
             cleanup_root: None,
             choice: DriverChoice::Auto,
             choices: None,
+            duplicates: Duplicates::AsConfigured,
+            last_run: None,
         }
     }
 
-    pub(super) fn owned(mut job: ImportJob, username: &str, items: &[&str]) -> ImportJob {
+    /// `job` reporting to `user` through a row per item, row `i` in slot `i` of job "j1".
+    pub(super) fn owned(mut job: ImportJob, user: &UserId, items: &[&str]) -> ImportJob {
         job.owner = Some(JobOwner {
-            username: username.into(),
-            rows: items.iter().map(|i| row(i)).collect(),
+            user_id: user.clone(),
+            rows: items
+                .iter()
+                .zip(0..)
+                .map(|(item, slot)| {
+                    row(item).with_job(JobSlot {
+                        job: "j1".into(),
+                        slot,
+                    })
+                })
+                .collect(),
         });
         job
     }
@@ -526,6 +1023,195 @@ mod tests {
         let order: Vec<PathBuf> = stub.seen().into_iter().map(|(s, _)| s[0].clone()).collect();
         assert_eq!(order, sources);
         assert_eq!(stub.max_active(), 1);
+    }
+
+    #[tokio::test]
+    async fn library_imports_report_removals_and_staging_imports_keep_beets_handling() {
+        let stub = Arc::new(StubImporter::new());
+        let lib = Library::new().await;
+        let queue = ImportQueue::new(RecordingDeps::with_guard(
+            stub.clone(),
+            lib.db.clone(),
+            lib.fake.clone(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let src = file(dir.path(), "in/01.flac");
+        for duplicates in [
+            Duplicates::Guarded {
+                actor: lib.alice(),
+                origin: Origin::Ui,
+            },
+            Duplicates::AsConfigured,
+        ] {
+            finish(
+                queue
+                    .submit(ImportJob {
+                        duplicates,
+                        ..job(src.clone(), &dir.path().join("lib"))
+                    })
+                    .await,
+            )
+            .await;
+        }
+        assert_eq!(
+            stub.duplicate_runs(),
+            vec![DuplicateRun::ReportRemovals, DuplicateRun::AsConfigured]
+        );
+    }
+
+    /// The import's own job wants the track it replaces, and does not keep it.
+    #[tokio::test]
+    async fn a_library_import_settles_its_removals_for_the_jobs_it_works_for() {
+        let stub = Arc::new(StubImporter::new());
+        let lib = Library::new().await;
+        lib.job(
+            "j1",
+            "alice-music",
+            "importing",
+            wanted("Marrow Choir", "O Holy Night", None),
+        )
+        .await;
+        let queue = ImportQueue::new(RecordingDeps::with_guard(
+            stub.clone(),
+            lib.db.clone(),
+            lib.fake.clone(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let target = lib.root.join("music/alice");
+        stub.script(ImportResult {
+            removals: vec![soulbeet::WantedRemoval {
+                existing: vec![soulbeet::ImportedItem {
+                    path: "A/x.flac".into(),
+                    recording_mbid: None,
+                    artist: "Marrow Choir".into(),
+                    title: "O Holy Night".into(),
+                    album: "Winter Songs".into(),
+                    beets_id: None,
+                    release_mbid: None,
+                    match_per_mille: None,
+                }],
+                imported: vec![(7, "Zzqx Artist/a.flac".into())],
+            }],
+            ..imported()
+        });
+        let guarded = ImportJob {
+            duplicates: Duplicates::Guarded {
+                actor: lib.alice(),
+                origin: Origin::Ui,
+            },
+            ..owned(
+                job(file(dir.path(), "in/01.flac"), &target),
+                &lib.alice(),
+                &["a"],
+            )
+        };
+        let outcome = finish(queue.submit(guarded).await).await;
+        let ImportOutcome::Imported { warnings, .. } = outcome.result.outcome else {
+            panic!("{:?}", outcome.result)
+        };
+        assert_eq!(
+            warnings,
+            vec!["replaced the library's earlier copy A/x.flac".to_string()]
+        );
+        assert!(!target.join("A/x.flac").exists());
+        assert_eq!(
+            stub.relocations(),
+            vec![(std::fs::canonicalize(&target).unwrap(), vec![7])]
+        );
+    }
+
+    /// The earlier item `A/x.flac` the library holds of "O Holy Night", as beets reports it.
+    fn holy_night() -> ImportedItem {
+        ImportedItem {
+            path: "A/x.flac".into(),
+            recording_mbid: None,
+            artist: "Marrow Choir".into(),
+            title: "O Holy Night".into(),
+            album: "Winter Songs".into(),
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replacing_job_runs_beets_with_replace_and_survives_a_restart() {
+        let stub = Arc::new(StubImporter::new());
+        let lib = Library::new().await;
+        lib.app("g1", "alice", true).await;
+        let checked = library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
+        let set = ReplaceSet {
+            grant_id: "g1".into(),
+            files: vec![checked.previewed()],
+            expires_at: crate::oauth::now_unix() + REPLACE_CONSENT_SECS,
+        };
+        let deps = RecordingDeps::with_guard(stub.clone(), lib.db.clone(), lib.fake.clone());
+        let queue = ImportQueue::new(deps.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let target = lib.root.join("music/alice");
+        let replacing = |item: &str| ImportJob {
+            duplicates: Duplicates::Replace {
+                actor: lib.alice(),
+                set: set.clone(),
+            },
+            ..owned(
+                job(file(dir.path(), &format!("in/{item}.flac")), &target),
+                &lib.alice(),
+                &[item],
+            )
+        };
+        let stored = replacing("a").stored().unwrap();
+        assert_eq!(stored.duplicates, DuplicateRule::Replace(set.clone()));
+        // What the restore after a restart does with the stored row.
+        let rebuilt = ImportJob::from_stored(stored, lib.alice());
+        assert!(
+            matches!(&rebuilt.duplicates, Duplicates::Replace { actor, set: kept } if *actor == lib.alice() && *kept == set),
+            "{:?}",
+            rebuilt.duplicates
+        );
+        stub.script(ImportResult {
+            removals: vec![soulbeet::WantedRemoval {
+                existing: vec![holy_night()],
+                imported: vec![(7, "Zzqx Artist/a.flac".into())],
+            }],
+            ..imported()
+        });
+        finish(queue.submit(rebuilt).await).await;
+        assert_eq!(stub.duplicate_runs(), vec![DuplicateRun::Replace]);
+        assert!(!target.join("A/x.flac").exists());
+        let Some(JobEvent::ImportDone(done)) = deps.ledger_events().pop() else {
+            panic!("{:?}", deps.ledger_events())
+        };
+        assert!(
+            matches!(&done.results[..], [(_, SlotResult::Imported { replaced, not_replaced, .. })]
+                if *replaced == vec![Replacement { existing: vec![holy_night()], outcome: ReplacementOutcome::Replaced }]
+                    && not_replaced.is_empty()),
+            "{:?}",
+            done.results
+        );
+        // An import beets found no duplicate for replaces nothing and lists the previewed song.
+        stub.script(imported());
+        finish(queue.submit(replacing("b")).await).await;
+        let Some(JobEvent::ImportDone(done)) = deps.ledger_events().pop() else {
+            panic!("{:?}", deps.ledger_events())
+        };
+        assert!(
+            matches!(&done.results[..], [(_, SlotResult::Imported { replaced, not_replaced, .. })]
+                if replaced.is_empty() && *not_replaced == vec!["s1".to_string()]),
+            "{:?}",
+            done.results
+        );
+        let old: StoredImport = serde_json::from_value(serde_json::json!({
+            "sources": ["/dl/a.flac"], "target": "/music", "album": false,
+            "cleanup_root": null, "choices": null, "choice": "auto", "rows": [],
+            "duplicates": "skip"
+        }))
+        .unwrap();
+        assert_eq!(
+            old.duplicates,
+            DuplicateRule::Skip,
+            "a row of step 9's shape"
+        );
     }
 
     #[tokio::test]
@@ -567,7 +1253,11 @@ mod tests {
         let mut handles = vec![slow];
         for name in ["a", "b", "c"] {
             let source = file(tmp.path(), &format!("dl/{name}.flac"));
-            handles.push(queue.submit(owned(job(source, &lib), "u", &[name])).await);
+            handles.push(
+                queue
+                    .submit(owned(job(source, &lib), &alice(), &[name]))
+                    .await,
+            );
         }
         for handle in handles {
             finish(handle).await;
@@ -576,7 +1266,7 @@ mod tests {
         use DownloadState::{ImportQueued, Imported, Importing};
         let s = |item: &str, state: DownloadState| (item.to_string(), state);
         assert_eq!(
-            deps.progress_for("u"),
+            deps.progress_for(&alice()),
             vec![
                 vec![s("a", ImportQueued(1))],
                 vec![s("b", ImportQueued(2))],
@@ -618,7 +1308,7 @@ mod tests {
         let first = finish(queue.submit(job(source.clone(), &lib)).await).await;
         assert_eq!(
             first.result,
-            ImportResult::failed("import worker stopped".into())
+            ImportResult::failed(FailKind::Beets, "import worker stopped".into())
         );
 
         let second = finish(queue.submit(job(source, &lib)).await).await;
@@ -718,6 +1408,563 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_import_reports_to_the_owners_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(ImportResult::failed(
+            FailKind::Beets,
+            "beets exited with code 1".into(),
+        ));
+        let alice = alice();
+        let failing = owned(
+            job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
+            &alice,
+            &["a"],
+        );
+        finish(queue.submit(failing).await).await;
+
+        assert!(!deps.progress_for(&alice).is_empty());
+        assert!(deps.progress_for(&UserId::new("alice")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_forget_waits_for_the_import_running_on_its_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new().held());
+        let queue = Arc::new(queue);
+        let handle = queue
+            .submit(job(file(dir.path(), "src/a.flac"), &dir.path().join("lib")))
+            .await;
+        let forget = tokio::spawn({
+            let (queue, lib) = (queue.clone(), dir.path().join("lib"));
+            async move { queue.forget(&lib, &lib.join("x.flac")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(stub.forgets().is_empty());
+        stub.release(1);
+        handle.wait().await;
+        assert_eq!(forget.await.unwrap(), ForgetOutcome::Removed);
+        let lib = std::fs::canonicalize(dir.path().join("lib")).unwrap();
+        assert_eq!(
+            stub.forgets(),
+            vec![(lib.clone(), dir.path().join("lib/x.flac"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forget_answers_what_the_importer_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        stub.script_forget(ForgetOutcome::NotInLibrary);
+        assert_eq!(
+            queue.forget(dir.path(), &dir.path().join("x.flac")).await,
+            ForgetOutcome::NotInLibrary
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forget_on_a_missing_library_fails_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let lib = dir.path().join("lib");
+        assert!(matches!(
+            queue.forget(&lib, &lib.join("x.flac")).await,
+            ForgetOutcome::Failed(_)
+        ));
+        assert!(!lib.exists());
+        assert!(stub.forgets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_owned_import_tells_the_ledger_it_queued_and_how_it_ended() {
+        use crate::ledger::JobState as LedgerState;
+        let tmp = tempfile::tempdir().unwrap();
+        let no_items = ImportResult {
+            outcome: ImportOutcome::Imported {
+                untagged: false,
+                warnings: vec![],
+                items: vec![],
+                failure: None,
+            },
+            ..imported()
+        };
+        let ImportOutcome::Imported { items, .. } = imported().outcome else {
+            unreachable!()
+        };
+        let slot = JobSlot {
+            job: "j1".into(),
+            slot: 0,
+        };
+        let applied = |applied: Vec<ImportedItem>| {
+            vec![(
+                slot.clone(),
+                SlotResult::Imported {
+                    applied,
+                    untagged: false,
+                    listed: None,
+                    replaced: vec![],
+                    not_replaced: vec![],
+                },
+            )]
+        };
+        for (scripted, next, results) in [
+            (imported(), LedgerState::Indexing, applied(items)),
+            (no_items, LedgerState::Done, applied(vec![])),
+            (no_match(2), LedgerState::NeedsDecision, vec![]),
+            (
+                ImportResult::nothing_to_import(),
+                LedgerState::Failed,
+                vec![],
+            ),
+        ] {
+            let (queue, stub, deps) = queue(StubImporter::new());
+            stub.script(scripted);
+            let lib = tmp.path().join(format!("lib-{}", next.as_str()));
+            finish(
+                queue
+                    .submit(owned(
+                        job(file(tmp.path(), "dl/a.flac"), &lib),
+                        &alice(),
+                        &["a"],
+                    ))
+                    .await,
+            )
+            .await;
+            let events = deps.ledger_events();
+            assert!(
+                matches!(&events[0], JobEvent::ImportQueued(import) if import.rows[0].0 == slot),
+                "{events:?}"
+            );
+            assert!(
+                matches!(&events[1], JobEvent::Slots { state: LedgerState::Importing, rows }
+                    if rows[0].job.as_ref() == Some(&slot) && rows[0].state == DownloadState::Importing),
+                "{events:?}"
+            );
+            let JobEvent::ImportDone(done) = &events[2] else {
+                panic!("{events:?}")
+            };
+            assert_eq!(done.next, next);
+            assert_eq!(done.results, results);
+            assert_eq!(
+                done.index
+                    .as_ref()
+                    .map(|w| (w.library.clone(), w.items.len())),
+                (next == LedgerState::Indexing).then(|| (std::fs::canonicalize(&lib).unwrap(), 1))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kept_import_restored_after_a_restart_can_be_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let kept = owned(
+            job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        let stored = kept.stored().expect("an owned job is stored");
+        assert_eq!(
+            queue.restore(ImportJob::from_stored(stored, alice())).await,
+            Ok(())
+        );
+        assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stub.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await
+            }
+        })
+        .await
+        .expect("the restored import ran");
+    }
+
+    #[tokio::test]
+    async fn a_kept_import_whose_files_are_gone_is_not_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, _, _) = queue(StubImporter::new());
+        let gone = owned(
+            job(tmp.path().join("dl/a.flac"), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        let refused = queue
+            .restore(ImportJob::from_stored(gone.stored().unwrap(), alice()))
+            .await
+            .unwrap_err();
+        assert_eq!(refused, files_gone());
+        assert_eq!(
+            queue.import_choices(&alice(), "a").unwrap_err(),
+            nothing_to_retry()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kept_import_remembers_its_last_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let source = file(tmp.path(), "dl/X [1f2e3d4c]/01 - Song Number 1.flac");
+        let read = SourceFile {
+            path: source.clone(),
+            artist: "Zzqx Artist".into(),
+            title: "Song Number 1".into(),
+            album: "Qzz Album".into(),
+            track: Some(1),
+            length_secs: Some(214),
+        };
+        stub.script(ImportResult {
+            choices: Some(track_choices(vec![candidate("FakeSrc", "w1")])),
+            files: vec![read.clone()],
+            ..no_match(1)
+        });
+        let kept = owned(job(source, &tmp.path().join("lib")), &alice(), &["a"]);
+        finish(queue.submit(kept).await).await;
+        let automatic = KeptRun {
+            tasks: TaskCount {
+                imported: 0,
+                total: 1,
+            },
+            output_tail: "skipped tail".into(),
+            files: vec![read.clone()],
+            files_left_out: 0,
+        };
+        // None while a retry has the import.
+        let last_run = |queue: &ImportQueue| {
+            let job = queue.kept(&alice(), "a").ok()?;
+            job.last_run.as_deref().cloned()
+        };
+        assert_eq!(last_run(&queue), Some(automatic));
+
+        // A pick reads no files: the automatic run's stay, with the pick's own tail.
+        stub.script(ImportResult {
+            output_tail: "pick tail".into(),
+            ..ImportResult::failed(
+                FailKind::ChoiceInvalid,
+                "FakeSrc has no recording w1".into(),
+            )
+        });
+        let pick = ImportChoice::Candidate {
+            data_source: "FakeSrc".into(),
+            id: "w1".into(),
+        };
+        queue.retry(&alice(), "a", pick).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while last_run(&queue).is_none_or(|run| run.output_tail != "pick tail") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pick ran and was kept");
+        let picked = KeptRun {
+            tasks: TaskCount::default(),
+            output_tail: "pick tail".into(),
+            files: vec![read],
+            files_left_out: 0,
+        };
+        assert_eq!(last_run(&queue), Some(picked.clone()));
+
+        // Stored and read back after a restart, it keeps the run.
+        let job = queue.kept(&alice(), "a").unwrap();
+        let rebuilt = ImportJob::from_stored(job.stored().unwrap(), alice());
+        assert_eq!(rebuilt.last_run.as_deref(), Some(&picked));
+    }
+
+    #[tokio::test]
+    async fn clearing_a_kept_row_dismisses_its_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(no_match(1));
+        finish(
+            queue
+                .submit(owned(
+                    job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
+                    &alice(),
+                    &["a"],
+                ))
+                .await,
+        )
+        .await;
+        queue.forget_retries(&alice(), &["a".to_string()]);
+        assert_eq!(
+            deps.ledger_events().last(),
+            Some(&JobEvent::Dismiss(vec![JobSlot {
+                job: "j1".into(),
+                slot: 0
+            }]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skipped_duplicate_of_an_mcp_job_is_not_kept_and_its_copy_is_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        let existing = ImportedItem {
+            path: "Zzqx Artist/Qzz Album/01 Song Number 1.mp3".into(),
+            recording_mbid: Some("dfeb96a7-f78a-4b04-93ce-c39e28c9a173".into()),
+            artist: "Zzqx Artist".into(),
+            title: "Song Number 1".into(),
+            beets_id: Some(7),
+            release_mbid: None,
+            album: "Qzz Album".into(),
+            match_per_mille: None,
+        };
+        stub.script(ImportResult {
+            outcome: ImportOutcome::Skipped(SkipReason::AlreadyInLibrary {
+                existing: vec![existing.clone()],
+            }),
+            ..imported()
+        });
+        let source = file(tmp.path(), "dl/X [1f2e3d4c]/01.flac");
+        let mut job = owned(
+            job(source.clone(), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        job.duplicates = Duplicates::Skip;
+        job.cleanup_root = Some(tmp.path().join("dl"));
+        finish(queue.submit(job).await).await;
+
+        assert_eq!(stub.duplicate_runs(), vec![DuplicateRun::Skip]);
+        assert!(!source.exists() && !tmp.path().join("dl/X [1f2e3d4c]").exists());
+        assert!(tmp.path().join("dl").exists());
+        assert_eq!(
+            queue.import_choices(&alice(), "a").unwrap_err(),
+            nothing_to_retry()
+        );
+        let last = deps.rows_for(&alice()).pop().unwrap();
+        assert!(!last[0].retryable, "{last:?}");
+        let Some(JobEvent::ImportDone(done)) = deps.ledger_events().pop() else {
+            panic!("{:?}", deps.ledger_events())
+        };
+        assert_eq!(
+            (done.next, done.index, done.results),
+            (
+                ledger::JobState::Failed,
+                None,
+                vec![(
+                    JobSlot {
+                        job: "j1".into(),
+                        slot: 0
+                    },
+                    SlotResult::AlreadyInLibrary {
+                        existing: vec![existing]
+                    }
+                )]
+            )
+        );
+    }
+
+    /// A guarded job beets skipped as a duplicate stays kept, its files in place.
+    #[tokio::test]
+    async fn a_skipped_duplicate_of_a_guarded_job_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(ImportResult {
+            outcome: ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing: vec![] }),
+            ..imported()
+        });
+        let source = file(tmp.path(), "dl/X [1f2e3d4c]/01.flac");
+        let mut job = owned(
+            job(source.clone(), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        job.duplicates = Duplicates::of(&DuplicateRule::Guarded, &alice());
+        job.cleanup_root = Some(tmp.path().join("dl"));
+        finish(queue.submit(job).await).await;
+
+        assert!(source.exists());
+        assert!(queue.import_choices(&alice(), "a").is_ok());
+        let Some(JobEvent::ImportDone(done)) = deps.ledger_events().pop() else {
+            panic!("{:?}", deps.ledger_events())
+        };
+        assert_eq!(
+            (done.next, done.results),
+            (ledger::JobState::NeedsDecision, vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discarded_kept_import_is_gone_for_a_retry_and_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(no_match(2));
+        let source = file(tmp.path(), "dl/X [1f2e3d4c]/a.flac");
+        let mut kept = owned(
+            job(source.clone(), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        kept.cleanup_root = Some(tmp.path().join("dl"));
+        finish(queue.submit(kept).await).await;
+
+        assert_eq!(
+            queue.discard(&bob(), "a").await.unwrap_err(),
+            nothing_to_retry()
+        );
+        let discarded = queue.discard(&alice(), "a").await.unwrap();
+        assert_eq!(discarded.job.sources, vec![source.clone()]);
+        assert_eq!(discarded.files_left, vec![]);
+        assert!(!source.exists() && !tmp.path().join("dl/X [1f2e3d4c]").exists());
+        assert!(tmp.path().join("dl").exists());
+        assert_eq!(
+            deps.ledger_events().pop(),
+            Some(JobEvent::Dismiss(vec![JobSlot {
+                job: "j1".into(),
+                slot: 0
+            }]))
+        );
+        assert_eq!(
+            queue
+                .retry(&alice(), "a", ImportChoice::Auto)
+                .await
+                .unwrap_err(),
+            nothing_to_retry()
+        );
+        assert_eq!(
+            queue.discard(&alice(), "a").await.unwrap_err(),
+            nothing_to_retry()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kept_mcp_import_rebuilt_after_a_restart_still_skips_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let source = file(tmp.path(), "dl/a.flac");
+        let mut job = owned(job(source, &tmp.path().join("lib")), &alice(), &["a"]);
+        job.duplicates = Duplicates::Skip;
+        let stored = job.stored().unwrap();
+        assert_eq!(stored.duplicates, DuplicateRule::Skip);
+        // What the restore after a restart does with the stored row.
+        queue
+            .restore(ImportJob::from_stored(stored, alice()))
+            .await
+            .unwrap();
+        queue
+            .retry(&alice(), "a", ImportChoice::Auto)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stub.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await
+            }
+        })
+        .await
+        .expect("the restored import ran");
+        assert_eq!(stub.duplicate_runs(), vec![DuplicateRun::Skip]);
+
+        let old: StoredImport = serde_json::from_value(serde_json::json!({
+            "sources": ["/dl/a.flac"], "target": "/music", "album": false,
+            "cleanup_root": null, "choices": null, "choice": "auto", "rows": []
+        }))
+        .unwrap();
+        assert_eq!(
+            old.duplicates,
+            DuplicateRule::Guarded,
+            "a row stored before the rule was kept"
+        );
+    }
+
+    #[test]
+    fn an_app_decides_a_web_page_import_only_within_its_switch_across_a_restart() {
+        let ui = || Duplicates::Guarded {
+            actor: alice(),
+            origin: Origin::Ui,
+        };
+        let as_app = Replace::Guarded(Origin::Mcp {
+            grant_id: "g1".into(),
+        });
+        assert!(matches!(ui().for_app(Replace::Never), Duplicates::Skip));
+        let decided = ui().for_app(as_app.clone());
+        assert!(
+            matches!(&decided, Duplicates::Guarded { actor, origin: Origin::Mcp { grant_id } }
+                if *actor == alice() && grant_id == "g1"),
+            "{decided:?}"
+        );
+        // An MCP job's own rule is already the app's.
+        assert!(matches!(Duplicates::Skip.for_app(as_app), Duplicates::Skip));
+
+        let job = ImportJob {
+            duplicates: decided,
+            ..owned(
+                job(
+                    PathBuf::from("/dl/X [1f2e3d4c]/01.flac"),
+                    Path::new("/music"),
+                ),
+                &alice(),
+                &["a"],
+            )
+        };
+        let stored = job.stored().unwrap();
+        assert_eq!(stored.duplicates, DuplicateRule::GuardedForApp("g1".into()));
+        let rebuilt = ImportJob::from_stored(
+            serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap(),
+            alice(),
+        );
+        assert!(
+            matches!(&rebuilt.duplicates, Duplicates::Guarded { origin: Origin::Mcp { grant_id }, .. } if grant_id == "g1"),
+            "{:?}",
+            rebuilt.duplicates
+        );
+    }
+
+    #[test]
+    fn a_stored_import_rebuilds_the_same_job() {
+        let mut original = owned(
+            job(PathBuf::from("/dl/X [1f2e3d4c]"), Path::new("/music")),
+            &alice(),
+            &["a", "b"],
+        );
+        original.mode = ImportMode::Album;
+        // A retry the user chose a match for.
+        original.choice = DriverChoice::Pick {
+            data_source: "MusicBrainz".into(),
+            id: "c2b1f1c4-6c7f-4a77-8a44-4c3e0b8a9b11".into(),
+        };
+        let rebuilt = ImportJob::from_stored(original.stored().unwrap(), alice());
+        assert!(
+            matches!(&rebuilt.duplicates, Duplicates::Guarded { actor, origin: Origin::Ui } if *actor == alice()),
+            "{:?}",
+            rebuilt.duplicates
+        );
+        assert_eq!(
+            (
+                &rebuilt.sources,
+                &rebuilt.target,
+                rebuilt.mode,
+                &rebuilt.cleanup_root,
+                &rebuilt.choice
+            ),
+            (
+                &original.sources,
+                &original.target,
+                original.mode,
+                &original.cleanup_root,
+                &original.choice
+            )
+        );
+        let rows = |j: ImportJob| {
+            j.owner
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|r| (r.item, r.job))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(rebuilt), rows(original));
+        assert!(owned(
+            job(PathBuf::from("/dl/a.flac"), Path::new("/music")),
+            &alice(),
+            &[]
+        )
+        .stored()
+        .is_some());
+        assert!(job(PathBuf::from("/dl/a.flac"), Path::new("/music"))
+            .stored()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn a_closed_handle_reads_as_failed() {
         let (tx, rx) = watch::channel(JobState::Running);
         drop(tx);
@@ -726,7 +1973,7 @@ mod tests {
 
         assert_eq!(
             outcome.result,
-            ImportResult::failed("import worker stopped".into())
+            ImportResult::failed(FailKind::Beets, "import worker stopped".into())
         );
         assert!(outcome.new_files.is_empty());
     }

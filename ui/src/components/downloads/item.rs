@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use dioxus::prelude::*;
-use shared::download::{DownloadProgress, DownloadState, ImportChoice};
+use shared::download::{DownloadProgress, DownloadState, ImportChoice, IndexState};
 
 use super::picker::{ChoicesLoader, MatchPicker};
 use super::Failure;
@@ -93,6 +93,31 @@ fn reason(row: &DownloadProgress) -> Option<(&'static str, &str)> {
     row.error.as_deref().map(|note| (class, note))
 }
 
+/// The row's note line: its reason, else why the last cancel was refused.
+fn note<'a>(
+    row: &'a DownloadProgress,
+    cancel_refusal: Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
+    reason(row).or_else(|| cancel_refusal.map(|refusal| ("text-red-400", refusal)))
+}
+
+/// An imported row's line on Navidrome and its text class: whether it lists the file yet, or why
+/// not.
+fn index_line(row: &DownloadProgress) -> Option<(&'static str, &str)> {
+    if row.state != DownloadState::Imported {
+        return None;
+    }
+    Some(match row.index.as_ref()? {
+        IndexState::Waiting => ("text-gray-300", "Waiting for Navidrome"),
+        IndexState::Listed => ("text-gray-300", "In Navidrome"),
+        IndexState::Failed(failure) => ("text-yellow-400", failure.message.as_str()),
+    })
+}
+
+/// Cancels the row's transfer. Resolves to why the server refused, if it did.
+pub type CancelHandler =
+    Callback<DownloadProgress, Pin<Box<dyn Future<Output = Result<(), String>>>>>;
+
 /// Imports the row's item again the way the choice says. Resolves to Ok once
 /// the server accepted it.
 pub type ImportHandler =
@@ -111,16 +136,10 @@ fn shows_retry(row: &DownloadProgress) -> bool {
     ) && row.retryable
 }
 
-/// A kept row whose last automatic import recorded matches can also import
-/// as-is or with a picked match.
-fn shows_choices(row: &DownloadProgress) -> bool {
-    shows_retry(row) && row.can_choose_import
-}
-
 #[component]
 pub fn DownloadItem(
     file: DownloadProgress,
-    on_cancel: EventHandler<DownloadProgress>,
+    on_cancel: CancelHandler,
     on_import: ImportHandler,
     on_load_choices: ChoicesLoader,
 ) -> Element {
@@ -129,9 +148,12 @@ pub fn DownloadItem(
     let mut busy = use_signal(|| false);
     // Why the picker's last load or pick failed, shown in the picker.
     let mut picker_notice = use_signal(|| None::<String>);
+    // Why the last cancel was refused, on the note line.
+    let mut cancel_refusal = use_signal(|| None::<String>);
     use_effect(use_reactive(&file.state, move |_| {
         busy.set(false);
         picker_notice.set(None);
+        cancel_refusal.set(None);
     }));
     let item = file.item.clone();
     let import = use_callback(move |choice: ImportChoice| {
@@ -152,7 +174,8 @@ pub fn DownloadItem(
     });
 
     let state = &file.state;
-    let note = reason(&file);
+    let refusal = cancel_refusal();
+    let note = note(&file, refusal.as_deref());
     let is_cancellable = matches!(state, DownloadState::Queued | DownloadState::InProgress);
     let Badge {
         title: status_text,
@@ -198,7 +221,10 @@ pub fn DownloadItem(
                   title: "Cancel download",
                   onclick: move |evt: Event<MouseData>| {
                       evt.stop_propagation();
-                      on_cancel.call(file_clone.clone());
+                      let file = file_clone.clone();
+                      spawn(async move {
+                          cancel_refusal.set(on_cancel.call(file).await.err());
+                      });
                   },
                   "\u{00d7}"
                 }
@@ -239,6 +265,9 @@ pub fn DownloadItem(
         if let Some((note_class, note)) = note {
           div { class: "text-xs {note_class} mt-1 break-words", "{note}" }
         }
+        if let Some((index_class, index)) = index_line(&file) {
+          div { class: "text-xs {index_class} font-mono mt-1 break-words", "{index}" }
+        }
         if let (true, Some(kept)) = (file.retryable, &file.local_path) {
           div { class: "text-xs text-gray-500 font-mono mt-1 break-all", "Kept in {kept}" }
         }
@@ -250,12 +279,10 @@ pub fn DownloadItem(
         if shows_retry(&file) {
           div { class: "mt-2 flex flex-wrap gap-2",
             RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::Auto), "Retry import" }
-            if shows_choices(&file) {
-              RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::AsIs), "Import as-is" }
-            }
+            RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::AsIs), "Import as-is" }
           }
         }
-        if shows_choices(&file) {
+        if shows_retry(&file) {
           MatchPicker {
             item: file.item.clone(),
             busy: busy(),
@@ -310,6 +337,7 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::download::MatchChoices;
 
     fn row(state: DownloadState, kept: Option<&str>) -> DownloadProgress {
         DownloadProgress {
@@ -359,6 +387,24 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_cancel_shows_on_the_note_line() {
+        let running = row(DownloadState::InProgress, None);
+        assert_eq!(
+            note(&running, Some("Download not found")),
+            Some(("text-red-400", "Download not found"))
+        );
+        assert_eq!(note(&running, None), None);
+        let failed = DownloadProgress {
+            error: Some("beets exited with code 1".into()),
+            ..row(DownloadState::Failed("x".into()), None)
+        };
+        assert_eq!(
+            note(&failed, Some("Download not found")),
+            Some(("text-red-400", "beets exited with code 1"))
+        );
+    }
+
+    #[test]
     fn retry_shows_only_for_kept_import_failures() {
         assert!(shows_retry(&row(
             DownloadState::ImportSkipped,
@@ -377,26 +423,71 @@ mod tests {
         assert!(!shows_retry(&nothing_kept));
     }
 
+    fn render(file: DownloadProgress) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |file: DownloadProgress| {
+                let on_cancel: CancelHandler = Callback::new(|_: DownloadProgress| {
+                    Box::pin(async { Ok(()) }) as Pin<Box<dyn Future<Output = Result<(), String>>>>
+                });
+                let on_import: ImportHandler = Callback::new(|_: (String, ImportChoice)| {
+                    Box::pin(async { Ok(()) }) as Pin<Box<dyn Future<Output = Result<(), Failure>>>>
+                });
+                let on_load_choices: ChoicesLoader = Callback::new(|_: String| {
+                    Box::pin(async { Err(Failure::OnRow) })
+                        as Pin<Box<dyn Future<Output = Result<MatchChoices, Failure>>>>
+                });
+                rsx! { DownloadItem { file, on_cancel, on_import, on_load_choices } }
+            },
+            file,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
     #[test]
-    fn choices_show_only_on_kept_rows_with_matches() {
-        let with_choices = |state| DownloadProgress {
-            can_choose_import: true,
-            ..row(state, Some("/dl/X"))
-        };
-        assert!(shows_choices(&with_choices(DownloadState::ImportSkipped)));
-        // A failed pick keeps the matches.
-        assert!(shows_choices(&with_choices(DownloadState::Failed(
-            "MusicBrainz has no recording x".into()
-        ))));
-        assert!(!shows_choices(&with_choices(DownloadState::Importing)));
-        assert!(!shows_choices(&row(
+    fn an_imported_row_says_whether_navidrome_lists_it() {
+        let failure = shared::failure::Failure::new(
+            shared::failure::FailureCode::IndexNotFoundAfterScan,
+            shared::failure::Stage::Index,
+            shared::failure::RetryAdvice::NotRetryable,
+            "Navidrome scanned the library after this import and does not list the file",
+        );
+        for (index, text) in [
+            (IndexState::Waiting, "Waiting for Navidrome"),
+            (IndexState::Listed, "In Navidrome"),
+            (
+                IndexState::Failed(failure.clone()),
+                failure.message.as_str(),
+            ),
+        ] {
+            let html = render(DownloadProgress {
+                index: Some(index),
+                ..row(DownloadState::Imported, None)
+            });
+            assert!(html.contains(text), "{html}");
+        }
+        let html = render(row(DownloadState::Imported, None));
+        assert!(!html.contains("Navidrome"), "{html}");
+    }
+
+    #[test]
+    fn a_kept_row_offers_every_import_action() {
+        for state in [
             DownloadState::ImportSkipped,
-            Some("/dl/X")
-        )));
-        let nothing_kept = DownloadProgress {
-            retryable: false,
-            ..with_choices(DownloadState::ImportSkipped)
-        };
-        assert!(!shows_choices(&nothing_kept));
+            DownloadState::Failed("beets exited with code 1".into()),
+        ] {
+            let html = render(row(state.clone(), Some("/dl/X")));
+            assert!(html.contains("Retry import"), "{html}");
+            assert!(html.contains("Import as-is"), "{html}");
+            assert!(html.contains("Show matches"), "{html}");
+
+            let gone = DownloadProgress {
+                retryable: false,
+                ..row(state, Some("/dl/X"))
+            };
+            let html = render(gone);
+            assert!(!html.contains("Import as-is"), "{html}");
+            assert!(!html.contains("Show matches"), "{html}");
+        }
     }
 }

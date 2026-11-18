@@ -1,11 +1,13 @@
 //! Importer health for the startup check, the health poll and the gates. The
 //! importer keeps the cached result; these only decide when to check again.
 
-use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
+use shared::failure::Failure;
+use shared::system::{HealthLevel, ImporterHealth};
 use soulbeet::MusicImporter;
 use std::sync::Once;
 use tracing::error;
 
+use crate::import_queue::import_failure;
 use crate::services::music_importer;
 
 static STARTUP_PROBE: Once = Once::new();
@@ -44,14 +46,19 @@ pub async fn snapshot() -> ImporterHealth {
     health
 }
 
-/// The issue that blocks imports, from the cached health only.
-pub async fn broken_issue() -> Option<HealthIssue> {
-    music_importer(None)
-        .await
-        .ok()?
-        .health()
-        .blocking_issue()
-        .cloned()
+/// The failure a job would end with because `importer` is broken, from its
+/// cached health: `import_failure(&importer.refused(issue.title))`. None when
+/// nothing blocks imports.
+pub fn blocking_failure_of(importer: &dyn MusicImporter) -> Option<Failure> {
+    let health = importer.health();
+    let issue = health.blocking_issue()?;
+    import_failure(&importer.refused(issue.title.clone()))
+}
+
+/// `blocking_failure_of` the default importer; None when there is no importer
+/// to ask.
+pub async fn blocking_failure() -> Option<Failure> {
+    blocking_failure_of(music_importer(None).await.ok()?.as_ref())
 }
 
 /// Why `importer` must not run a job, if it must not. A Broken importer is
@@ -74,8 +81,11 @@ pub async fn refusal(importer: &dyn MusicImporter) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::library::DuplicateReport;
-    use soulbeet::{DriverChoice, ImportMode, ImportResult};
+    use shared::failure::{FailureCode, RetryAdvice, Stage};
+    use shared::system::HealthIssue;
+    use soulbeet::{
+        DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportResult, Relocation,
+    };
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -110,10 +120,17 @@ mod tests {
             _: &Path,
             _: ImportMode,
             _: &DriverChoice,
+            _: DuplicateRun,
         ) -> ImportResult {
             unreachable!()
         }
-        async fn find_duplicates(&self, _: &[&Path]) -> Result<DuplicateReport, String> {
+        async fn relocate(&self, _: &Path, _: &[u64]) -> Relocation {
+            unreachable!()
+        }
+        fn refused(&self, _: String) -> ImportResult {
+            unreachable!()
+        }
+        async fn forget(&self, _: &Path, _: &Path) -> ForgetOutcome {
             unreachable!()
         }
         fn health(&self) -> ImporterHealth {
@@ -143,6 +160,25 @@ mod tests {
             issues,
             facts: vec![],
         }
+    }
+
+    #[test]
+    fn a_broken_importer_refuses_with_its_own_failure() {
+        use crate::import_queue::test_support::{broken, ready, StubImporter};
+        let stub = StubImporter::new();
+        stub.set_health(broken());
+        let f = blocking_failure_of(&stub).expect("a broken importer blocks");
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::ImporterBroken,
+                Stage::Import,
+                RetryAdvice::NeedsUser,
+                "No metadata source plugin loaded"
+            )
+        );
+        stub.set_health(ready());
+        assert_eq!(blocking_failure_of(&stub), None);
     }
 
     #[tokio::test]

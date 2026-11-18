@@ -77,25 +77,42 @@ pub enum DiscoveryProfile {
     Adventurous,
 }
 
+impl DiscoveryProfile {
+    /// Every profile, in the order Settings shows them.
+    pub const ALL: [DiscoveryProfile; 3] = [
+        DiscoveryProfile::Conservative,
+        DiscoveryProfile::Balanced,
+        DiscoveryProfile::Adventurous,
+    ];
+
+    /// The profiles' names, in that order, as the settings maps and lists write them.
+    pub const NAMES: [&'static str; 3] = [
+        Self::ALL[0].name(),
+        Self::ALL[1].name(),
+        Self::ALL[2].name(),
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            DiscoveryProfile::Conservative => "Conservative",
+            DiscoveryProfile::Balanced => "Balanced",
+            DiscoveryProfile::Adventurous => "Adventurous",
+        }
+    }
+}
+
 impl std::fmt::Display for DiscoveryProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DiscoveryProfile::Conservative => write!(f, "Conservative"),
-            DiscoveryProfile::Balanced => write!(f, "Balanced"),
-            DiscoveryProfile::Adventurous => write!(f, "Adventurous"),
-        }
+        f.write_str(self.name())
     }
 }
 
 impl std::str::FromStr for DiscoveryProfile {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "Conservative" => Ok(DiscoveryProfile::Conservative),
-            "Balanced" => Ok(DiscoveryProfile::Balanced),
-            "Adventurous" => Ok(DiscoveryProfile::Adventurous),
-            _ => Err(format!("Unknown discovery profile: {}", s)),
-        }
+        (Self::ALL.into_iter())
+            .find(|p| p.name() == s)
+            .ok_or_else(|| format!("Unknown discovery profile: {}", s))
     }
 }
 

@@ -7,109 +7,64 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "server")]
 use tracing::warn;
 
-/// Resolve the download path from a slskd filename to an actual filesystem path.
+/// Find the file of a finished transfer the batch adopted: one it did not
+/// enqueue, so slskd saved it with no batch folder of the batch's. That is
+/// where slskd's default Subdirectory pattern `${SOURCE_DIRECTORY}` puts it,
+/// `<download_base>/<remote parent directory>/<file>` (the file alone when the
+/// remote name has no directory), the parent sanitized as slskd sanitizes a
+/// folder name, and is looked for there as [`resolve_in_destination`] looks in
+/// a batch folder. Nothing else in the download folder is searched: it holds
+/// every batch's and every user's downloads.
 ///
-/// slskd receives remote Soulseek paths (e.g. `music\Artist\Album\track.flac`) and stores
-/// downloads locally using only the last 2 path components: `<download_dir>/Album/track.flac`.
-/// It also replaces invalid filename characters with `_` and may append a timestamp suffix
-/// (e.g. `_639097129778484198`) to avoid collisions.
-///
-/// This function replicates slskd's path resolution logic and falls back to progressively
-/// fuzzier matching strategies.
-///
-/// # Arguments
-/// * `filename` - The slskd filename (remote Soulseek path, may contain Windows-style backslashes)
-/// * `download_base` - The base download directory
-///
-/// # Returns
-/// * `Some(path)` - The resolved path if the file exists
-/// * `None` - If the file cannot be found
+/// A remote name is the peer's text. One that is absolute, starts with a
+/// drive, or steps through `.` or `..` names nothing here, and only a regular
+/// file strictly inside the download folder, symlinks resolved, is returned.
 #[cfg(feature = "server")]
-pub fn resolve_download_path(filename: &str, download_base: &Path) -> Option<String> {
-    // Normalize path separators (Windows -> Unix)
-    let filename_str = filename.replace('\\', "/");
-    let path = Path::new(&filename_str);
-    let components: Vec<&str> = filename_str.split('/').filter(|s| !s.is_empty()).collect();
-
-    if components.is_empty() {
-        warn!("Empty filename provided for path resolution");
-        return None;
+pub fn resolve_adopted(
+    filename: &str,
+    download_base: &Path,
+    exclude: &HashSet<FileId>,
+) -> Result<PathBuf, Unresolved> {
+    let normalized = filename.replace('\\', "/");
+    let components: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    if !is_plain_remote_name(&normalized, &components) {
+        warn!("Refusing to look for the remote file '{filename}': its name leaves its own folder");
+        return Err(Unresolved::NotOnDisk);
     }
-
-    // Strategy 1: the layout Soulful pins at enqueue time (batch destination =
-    // sanitized parent directory), which is also slskd's default pattern:
-    // <downloads>/<directory>/<filename>. The basename is sanitized by slskd
-    // with its host OS's invalid set, so both variants are tried.
-    if components.len() >= 2 {
-        let dir_part = sanitize_filename(components[components.len() - 2]);
-        let album_dir = download_base.join(&dir_part);
-        for file_part in basename_candidates(components[components.len() - 1]) {
-            let candidate = album_dir.join(&file_part);
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
-            }
-
-            // slskd appends _<ticks> when a file with the same name already exists.
-            // Search the expected album directory for files whose stem starts with ours.
-            if let Some(found) = find_file_by_stem(&album_dir, &file_part) {
-                return Some(found.to_string_lossy().to_string());
-            }
-        }
-    } else {
-        // Single component (just a filename)
-        for file_part in basename_candidates(components[0]) {
-            let candidate = download_base.join(&file_part);
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
-            }
-        }
+    let folder = match components.as_slice() {
+        [.., parent, _] => sanitize_filename(parent),
+        _ => String::new(),
+    };
+    let path = resolve_in_destination(&normalized, download_base, &folder, exclude)?;
+    if !is_inside(&path, download_base) {
+        warn!(
+            "Refusing {}: it is not a file inside the download folder {}",
+            path.display(),
+            download_base.display()
+        );
+        return Err(Unresolved::NotOnDisk);
     }
+    Ok(path)
+}
 
-    // Strategy 2: Try the full path relative to download base (handles setups
-    // where slskd preserves the full remote directory structure)
-    let full_relative = download_base.join(&filename_str);
-    if full_relative.exists() {
-        return Some(full_relative.to_string_lossy().to_string());
-    }
+/// Whether a remote name, with `/` separators, is a relative path of plain
+/// names: not absolute, no drive, no `.` or `..` step.
+#[cfg(feature = "server")]
+fn is_plain_remote_name(normalized: &str, components: &[&str]) -> bool {
+    let drive = |c: &str| c.len() == 2 && c.ends_with(':') && c.as_bytes()[0].is_ascii_alphabetic();
+    !components.is_empty()
+        && !normalized.starts_with('/')
+        && !components.first().is_some_and(|c| drive(c))
+        && !components.iter().any(|c| *c == "." || *c == "..")
+}
 
-    // Strategy 3: Try with @@username prefix stripped
-    if let Some(first) = components.first() {
-        if first.starts_with("@@") && components.len() > 1 {
-            let without_user = components[1..].join("/");
-            let candidate = download_base.join(&without_user);
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
-            }
-        }
-    }
-
-    // Strategy 4: Try last 3 components (artist/album/track)
-    if components.len() >= 3 {
-        let len = components.len();
-        let three_level = components[len - 3..].join("/");
-        let candidate = download_base.join(&three_level);
-        if candidate.exists() {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-    }
-
-    // Strategy 5: Recursive search with fuzzy stem matching
-    // Handles unusual path structures and collision-suffixed filenames
-    if let Some(file_name) = path.file_name() {
-        let file_name_str = file_name.to_string_lossy();
-        let sanitized = sanitize_filename(&file_name_str);
-        if let Some(found) = find_file_recursive_fuzzy(download_base, &sanitized) {
-            return Some(found.to_string_lossy().to_string());
-        }
-    }
-
-    // Could not find the file
-    warn!(
-        "Could not resolve download path for '{}' in '{}'",
-        filename,
-        download_base.display()
-    );
-    None
+/// Whether `path` is a regular file (not a link) whose real path is strictly
+/// inside the real path of `base`.
+#[cfg(feature = "server")]
+fn is_inside(path: &Path, base: &Path) -> bool {
+    let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
+    let real = (std::fs::canonicalize(path), std::fs::canonicalize(base));
+    regular && matches!(real, (Ok(p), Ok(b)) if p != b && p.starts_with(&b))
 }
 
 /// A file's identity on disk, independent of its name: beets can move a
@@ -135,6 +90,17 @@ pub fn file_id(path: &Path) -> Option<FileId> {
     })
 }
 
+/// Why no file was found for a finished download.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unresolved {
+    /// No file by its name is where Soulful looks.
+    NotOnDisk,
+    /// Files by its name are there, but each was already handed off for
+    /// another download.
+    Claimed,
+}
+
 /// Find a finished download in its batch folder `base/destination`.
 ///
 /// slskd keeps the remote basename (sanitized) and, when that name is already
@@ -148,20 +114,30 @@ pub fn resolve_in_destination(
     base: &Path,
     destination: &str,
     exclude: &HashSet<FileId>,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, Unresolved> {
     let normalized = filename.replace('\\', "/");
-    let remote_name = normalized.rsplit('/').find(|s| !s.is_empty())?;
+    let remote_name = normalized
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .ok_or(Unresolved::NotOnDisk)?;
     let folder = base.join(destination);
     let names = basename_candidates(remote_name);
 
-    let usable =
-        |path: &PathBuf| path.is_file() && file_id(path).is_some_and(|id| !exclude.contains(&id));
-    if let Some(plain) = names.iter().map(|n| folder.join(n)).find(usable) {
-        return Some(plain);
+    let mut excluded = false;
+    let mut usable = |path: &PathBuf| match path.is_file().then(|| file_id(path)).flatten() {
+        Some(id) if exclude.contains(&id) => {
+            excluded = true;
+            false
+        }
+        id => id.is_some(),
+    };
+    if let Some(plain) = names.iter().map(|n| folder.join(n)).find(&mut usable) {
+        return Ok(plain);
     }
 
     let mut copies: Vec<PathBuf> = std::fs::read_dir(&folder)
-        .ok()?
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
@@ -169,11 +145,15 @@ pub fn resolve_in_destination(
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| names.iter().any(|want| is_ticks_copy(n, want)))
         })
-        .filter(usable)
         .collect();
     // Equal-width ticks, so name order is age order.
     copies.sort();
-    copies.into_iter().next()
+    let copy = copies.into_iter().find(&mut usable);
+    match (copy, excluded) {
+        (Some(copy), _) => Ok(copy),
+        (None, true) => Err(Unresolved::Claimed),
+        (None, false) => Err(Unresolved::NotOnDisk),
+    }
 }
 
 /// Whether `name` is slskd's renamed copy of `original`: `<stem>_<18 digits><ext>`.
@@ -209,90 +189,6 @@ fn basename_candidates(name: &str) -> Vec<String> {
     }
 }
 
-/// Search a specific directory for a file whose stem matches the expected filename,
-/// allowing for slskd's collision-avoidance suffix (_<ticks> before the extension).
-///
-/// For example, if we expect `track.flac`, this will also match `track_639097129778484198.flac`.
-#[cfg(feature = "server")]
-fn find_file_by_stem(dir: &Path, expected_filename: &str) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-
-    let expected_stem = Path::new(expected_filename)
-        .file_stem()?
-        .to_string_lossy()
-        .to_lowercase();
-    let expected_ext = Path::new(expected_filename)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase());
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let name = path.file_name()?.to_string_lossy().to_lowercase();
-
-        // Exact match (case-insensitive)
-        if name == expected_filename.to_lowercase() {
-            return Some(path);
-        }
-
-        // Check for collision suffix: stem starts with expected stem, same extension
-        let file_stem = path.file_stem()?.to_string_lossy().to_lowercase();
-        let file_ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
-
-        if file_ext == expected_ext
-            && file_stem.starts_with(&*expected_stem)
-            && file_stem[expected_stem.len()..].starts_with('_')
-        {
-            // Verify the suffix after the underscore is numeric (ticks)
-            let suffix = &file_stem[expected_stem.len() + 1..];
-            if suffix.chars().all(|c| c.is_ascii_digit()) {
-                return Some(path);
-            }
-        }
-    }
-
-    None
-}
-
-/// Recursively search for a file, matching by stem prefix to handle collision suffixes.
-#[cfg(feature = "server")]
-fn find_file_recursive_fuzzy(dir: &Path, expected_filename: &str) -> Option<PathBuf> {
-    const MAX_DEPTH: usize = 5;
-
-    fn search(dir: &Path, expected_filename: &str, depth: usize) -> Option<PathBuf> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-
-        // First try stem-based matching in this directory
-        if let Some(found) = find_file_by_stem(dir, expected_filename) {
-            return Some(found);
-        }
-
-        // Recurse into subdirectories
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return None,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = search(&path, expected_filename, depth + 1) {
-                    return Some(found);
-                }
-            }
-        }
-
-        None
-    }
-
-    search(dir, expected_filename, 0)
-}
-
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
@@ -314,7 +210,8 @@ mod tests {
         std::fs::create_dir_all(&album).unwrap();
         std::fs::write(album.join("AC_ DC - 01.mp3"), b"x").unwrap();
 
-        let resolved = resolve_download_path(r"music\Album\AC: DC - 01.mp3", &base).unwrap();
+        let resolved =
+            resolve_adopted(r"music\Album\AC: DC - 01.mp3", &base, &HashSet::new()).unwrap();
         assert!(resolved.ends_with("AC_ DC - 01.mp3"));
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -328,7 +225,8 @@ mod tests {
         std::fs::create_dir_all(&album).unwrap();
         std::fs::write(album.join("AC: DC - 01.mp3"), b"x").unwrap();
 
-        let resolved = resolve_download_path(r"music\Album\AC: DC - 01.mp3", &base).unwrap();
+        let resolved =
+            resolve_adopted(r"music\Album\AC: DC - 01.mp3", &base, &HashSet::new()).unwrap();
         assert!(resolved.ends_with("AC: DC - 01.mp3"));
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -355,7 +253,7 @@ mod tests {
         claimed.insert(file_id(&second).unwrap());
         assert_eq!(
             resolve_in_destination(r"music\A\01.flac", &base, "F", &claimed),
-            None
+            Err(Unresolved::Claimed)
         );
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -373,7 +271,7 @@ mod tests {
         let claimed = HashSet::from([file_id(&path).unwrap()]);
         assert_eq!(
             resolve_in_destination("01.flac", &base, "F", &claimed),
-            None
+            Err(Unresolved::Claimed)
         );
 
         std::fs::remove_file(&path).unwrap();
@@ -381,7 +279,7 @@ mod tests {
 
         assert_eq!(
             resolve_in_destination("01.flac", &base, "F", &claimed),
-            Some(path)
+            Ok(path)
         );
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -401,11 +299,15 @@ mod tests {
         let claimed = HashSet::new();
         assert_eq!(
             resolve_in_destination("01.flac", &base, "F", &claimed),
-            Some(folder.join("01_639097129778484198.flac"))
+            Ok(folder.join("01_639097129778484198.flac"))
         );
         assert_eq!(
             resolve_in_destination("02.flac", &base, "F", &claimed),
-            None
+            Err(Unresolved::NotOnDisk)
+        );
+        assert_eq!(
+            resolve_in_destination("01.flac", &base, "missing", &claimed),
+            Err(Unresolved::NotOnDisk)
         );
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -418,9 +320,79 @@ mod tests {
         std::fs::create_dir_all(&album).unwrap();
         std::fs::write(album.join("track_639097129778484198.mp3"), b"x").unwrap();
 
-        let resolved = resolve_download_path(r"music\Album\track.mp3", &base).unwrap();
+        let resolved = resolve_adopted(r"music\Album\track.mp3", &base, &HashSet::new()).unwrap();
         assert!(resolved.ends_with("track_639097129778484198.mp3"));
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn an_adopted_name_that_leaves_its_folder_names_no_file() {
+        // The peer's name points at a file that exists outside the download
+        // folder: an absolute path, a drive, or steps up through `..`.
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("downloads");
+        let library = root.path().join("music/bob/Album");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("x.flac"), b"bob's").unwrap();
+        // What strategy 1 would also find for a plain name of the same parent.
+        std::fs::create_dir_all(base.join("Album")).unwrap();
+        let none = HashSet::new();
+
+        let absolute = format!("{}", library.join("x.flac").display());
+        for name in [
+            absolute.as_str(),
+            r"..\music\bob\Album\x.flac",
+            "../music/bob/Album/x.flac",
+            r"Album\..\..\music\bob\Album\x.flac",
+            r"C:\music\Album\x.flac",
+            "./Album/x.flac",
+            r"..\x.flac",
+        ] {
+            assert_eq!(
+                resolve_adopted(name, &base, &none),
+                Err(Unresolved::NotOnDisk),
+                "{name}"
+            );
+        }
+        assert!(library.join("x.flac").exists());
+    }
+
+    #[test]
+    fn an_adopted_file_is_looked_for_only_where_slskd_saves_it() {
+        // Another batch's folder holds a file of the same name: an adopted
+        // transfer never takes it, nor one through a link out of the folder.
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("downloads");
+        let other = base.join("Live [1a2b3c4d]");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("01 - Intro.flac"), b"bob's").unwrap();
+        let none = HashSet::new();
+        assert_eq!(
+            resolve_adopted(r"music\Live\01 - Intro.flac", &base, &none),
+            Err(Unresolved::NotOnDisk)
+        );
+
+        let outside = root.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("02.flac"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("Linked")).unwrap();
+        assert_eq!(
+            resolve_adopted(r"music\Linked\02.flac", &base, &none),
+            Err(Unresolved::NotOnDisk)
+        );
+
+        std::fs::create_dir_all(base.join("Live")).unwrap();
+        std::fs::write(base.join("Live/01 - Intro.flac"), b"mine").unwrap();
+        assert_eq!(
+            resolve_adopted(r"music\Live\01 - Intro.flac", &base, &none),
+            Ok(base.join("Live/01 - Intro.flac"))
+        );
+        std::fs::write(base.join("03.flac"), b"x").unwrap();
+        assert_eq!(
+            resolve_adopted("03.flac", &base, &none),
+            Ok(base.join("").join("03.flac"))
+        );
     }
 }

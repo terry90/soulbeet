@@ -6,13 +6,17 @@ mod runner;
 
 pub use probe::{python_from_shebang, resolve_on_path};
 pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
-pub use shared::library::{DuplicateGroup, DuplicateReport, LibraryTrack};
 
 use crate::audio::count_audio_files;
-use crate::{DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter};
+use crate::{
+    DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
+    MusicImporter, Relocation,
+};
 use classify::{parse_run_log, Classifier};
 use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
 use report::Report;
+pub use report::{duplicate_note, DuplicateNote};
+use shared::failure::{UserAction, UserActionCode};
 use shared::system::ImporterHealth;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -70,6 +74,90 @@ impl BeetsImporter {
         // The state stays consistent even if a holder panicked: every write is
         // a plain field assignment.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One import run, before `with_own_action`.
+    async fn run_import(
+        &self,
+        sources: &[&Path],
+        target: &Path,
+        mode: ImportMode,
+        choice: &DriverChoice,
+        duplicates: DuplicateRun,
+    ) -> ImportResult {
+        let s = &self.settings;
+        let Some(python) = s.python.as_deref() else {
+            return ImportResult::failed(
+                FailKind::Setup,
+                "Cannot determine the Python that runs beet. Set BEETS_PYTHON.".into(),
+            );
+        };
+        // beets prompts instead of creating a missing library db directory.
+        if let Err(e) = tokio::fs::create_dir_all(target).await {
+            return ImportResult::failed(
+                FailKind::TargetUnwritable,
+                format!("Could not create library folder {}: {e}", target.display()),
+            );
+        }
+        let submitted = count_audio_files(sources).await;
+        let (run_log, report_file) = match (TempFile::create("log"), TempFile::create("json")) {
+            (Ok(log), Ok(report)) => (log, report),
+            (Err(e), _) | (_, Err(e)) => {
+                return ImportResult::failed(
+                    FailKind::Setup,
+                    format!("Could not create the beets run files: {e}"),
+                )
+            }
+        };
+        // -A leaves no marker in beets' output.
+        let autotag_off = *choice == DriverChoice::AsIs
+            || self.state().report.as_ref().is_some_and(|r| !r.autotag);
+
+        info!(
+            "beets import into {} ({mode:?}, {choice:?}, {duplicates:?}): {:?}",
+            target.display(),
+            sources
+        );
+        let started = Instant::now();
+        let mut classifier = Classifier::new(mode, target, submitted, autotag_off);
+        let beet_args = import_args(s, sources, target, mode, &run_log.0);
+        let spec = RunSpec {
+            program: python,
+            args: driver_args(&report_file.0, duplicates, choice, beet_args),
+            limits: s.limits,
+        };
+        let run = run_beet(spec, &mut |stream, line| classifier.feed(stream, line)).await;
+        let entries = match tokio::fs::read_to_string(&run_log.0).await {
+            Ok(text) => parse_run_log(&text),
+            Err(e) => {
+                warn!("Could not read beets run log {}: {e}", run_log.0.display());
+                Vec::new()
+            }
+        };
+        drop(run_log);
+        let report = read_report(&run.end, &report_file.0).await;
+        drop(report_file);
+
+        let result = classifier.finish(&run.end, &s.limits, &entries, run.tail);
+        let result = match report {
+            Some(report) => report.apply(result, mode, choice, target),
+            None => result,
+        };
+        info!(
+            "beets import into {} {} after {:.1}s: {result}",
+            target.display(),
+            outcome_kind(&result.outcome),
+            started.elapsed().as_secs_f64()
+        );
+        if matches!(
+            result.outcome,
+            ImportOutcome::Failed { .. }
+                | ImportOutcome::TimedOut { .. }
+                | ImportOutcome::LookupFailed { .. }
+        ) {
+            warn!("beets output tail:\n{}", result.output_tail);
+        }
+        result
     }
 }
 
@@ -135,8 +223,19 @@ fn import_args(
 }
 
 /// Runs import.py, which runs beets' own CLI with `beet_args`.
-fn driver_args(report: &Path, choice: &DriverChoice, beet_args: Vec<OsString>) -> Vec<OsString> {
+fn driver_args(
+    report: &Path,
+    duplicates: DuplicateRun,
+    choice: &DriverChoice,
+    beet_args: Vec<OsString>,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["-P".into(), "-c".into(), IMPORT_PY.into(), report.into()];
+    args.push(match duplicates {
+        DuplicateRun::AsConfigured => "as-configured".into(),
+        DuplicateRun::ReportRemovals => "report-removals".into(),
+        DuplicateRun::Skip => "skip".into(),
+        DuplicateRun::Replace => "replace".into(),
+    });
     match choice {
         DriverChoice::Auto => args.push("auto".into()),
         DriverChoice::AsIs => args.push("asis".into()),
@@ -147,6 +246,44 @@ fn driver_args(report: &Path, choice: &DriverChoice, beet_args: Vec<OsString>) -
     args.push("--".into());
     args.extend(beet_args);
     args
+}
+
+/// `result` with what a person does about it, for the failures only a person
+/// can fix: beets' own setup, and a full disk. The action quotes the result's
+/// text.
+fn with_own_action(result: ImportResult) -> ImportResult {
+    let action = match &result.outcome {
+        ImportOutcome::Failed {
+            kind: FailKind::Setup,
+            ..
+        } => fix_beets(&result.to_string()),
+        // Once there is space, the same files import.
+        ImportOutcome::Failed {
+            kind: FailKind::DiskFull,
+            ..
+        } => free_disk_space(&result.to_string()),
+        _ => return result,
+    };
+    result.with_user_action(action)
+}
+
+/// What a person fixes in the beets setup, `problem` saying what is wrong.
+fn fix_beets(problem: &str) -> UserAction {
+    UserAction::new(
+        UserActionCode::FixImporter,
+        format!("Fix the beets setup: {problem}"),
+        "Settings > Config",
+    )
+}
+
+/// Space for what beets could not write, which `message`, the row's text,
+/// names.
+fn free_disk_space(message: &str) -> UserAction {
+    UserAction::new(
+        UserActionCode::FreeDiskSpace,
+        format!("Free disk space: {message}"),
+        "The disk that holds the path in the message",
+    )
 }
 
 fn outcome_kind(outcome: &ImportOutcome) -> &'static str {
@@ -176,80 +313,25 @@ impl MusicImporter for BeetsImporter {
         target: &Path,
         mode: ImportMode,
         choice: &DriverChoice,
+        duplicates: DuplicateRun,
     ) -> ImportResult {
-        let s = &self.settings;
-        let Some(python) = s.python.as_deref() else {
-            return ImportResult::failed(
-                "Cannot determine the Python that runs beet. Set BEETS_PYTHON.".into(),
-            );
-        };
-        // beets prompts instead of creating a missing library db directory.
-        if let Err(e) = tokio::fs::create_dir_all(target).await {
-            return ImportResult::failed(format!(
-                "Could not create library folder {}: {e}",
-                target.display()
-            ));
-        }
-        let submitted = count_audio_files(sources).await;
-        let (run_log, report_file) = match (TempFile::create("log"), TempFile::create("json")) {
-            (Ok(log), Ok(report)) => (log, report),
-            (Err(e), _) | (_, Err(e)) => {
-                return ImportResult::failed(format!("Could not create the beets run files: {e}"))
-            }
-        };
-        // -A leaves no marker in beets' output.
-        let autotag_off = *choice == DriverChoice::AsIs
-            || self.state().report.as_ref().is_some_and(|r| !r.autotag);
-
-        info!(
-            "beets import into {} ({mode:?}, {choice:?}): {:?}",
-            target.display(),
-            sources
-        );
-        let started = Instant::now();
-        let mut classifier = Classifier::new(mode, submitted, autotag_off);
-        let beet_args = import_args(s, sources, target, mode, &run_log.0);
-        let spec = RunSpec {
-            program: python,
-            args: driver_args(&report_file.0, choice, beet_args),
-            limits: s.limits,
-        };
-        let run = run_beet(spec, &mut |stream, line| classifier.feed(stream, line)).await;
-        let entries = match tokio::fs::read_to_string(&run_log.0).await {
-            Ok(text) => parse_run_log(&text),
-            Err(e) => {
-                warn!("Could not read beets run log {}: {e}", run_log.0.display());
-                Vec::new()
-            }
-        };
-        drop(run_log);
-        let report = read_report(&run.end, &report_file.0).await;
-        drop(report_file);
-
-        let result = classifier.finish(&run.end, &s.limits, &entries, run.tail);
-        let result = match report {
-            Some(report) => report.apply(result, mode, choice),
-            None => result,
-        };
-        info!(
-            "beets import into {} {} after {:.1}s: {result}",
-            target.display(),
-            outcome_kind(&result.outcome),
-            started.elapsed().as_secs_f64()
-        );
-        if matches!(
-            result.outcome,
-            ImportOutcome::Failed { .. }
-                | ImportOutcome::TimedOut { .. }
-                | ImportOutcome::LookupFailed { .. }
-        ) {
-            warn!("beets output tail:\n{}", result.output_tail);
-        }
-        result
+        with_own_action(
+            self.run_import(sources, target, mode, choice, duplicates)
+                .await,
+        )
     }
 
-    async fn find_duplicates(&self, libraries: &[&Path]) -> Result<DuplicateReport, String> {
-        library::find_duplicates_across_libraries(&self.settings, libraries).await
+    async fn relocate(&self, library: &Path, item_ids: &[u64]) -> Relocation {
+        library::move_items(&self.settings, library, item_ids).await
+    }
+
+    fn refused(&self, issue: String) -> ImportResult {
+        let action = fix_beets(&issue);
+        ImportResult::refused(issue).with_user_action(action)
+    }
+
+    async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
+        library::forget_item(&self.settings, library, file).await
     }
 
     fn health(&self) -> ImporterHealth {
@@ -360,7 +442,7 @@ mod tests {
     /// Writes an executable script. A child process writes it, so no fd in
     /// this process ever has it open for writing: a fork from another test
     /// thread would inherit such an fd and exec would fail with ETXTBSY.
-    async fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    pub(super) async fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         let mut child = tokio::process::Command::new("/bin/sh")
             .arg("-c")
@@ -501,7 +583,7 @@ mod tests {
         {"data_source": "MusicBrainz", "id": "dfeb96a7-f78a-4b04-93ce-c39e28c9a173",
          "artist": "Radiohead", "title": "Karma Police", "album": null, "year": null,
          "country": null, "disambig": null, "per_mille": 714, "differs": ["length"],
-         "length": 263}]}], "pick_missing": false, "refused": null}"#;
+         "length": 263}]}], "pick_missing": false, "refused": null, "duplicates": [], "items": []}"#;
 
     fn file_name(path: &str) -> String {
         Path::new(path)
@@ -536,9 +618,24 @@ mod tests {
                 ],
             ),
         ] {
-            for mode in [ImportMode::Singleton, ImportMode::Album] {
+            for (mode, duplicates, token) in [
+                (
+                    ImportMode::Singleton,
+                    DuplicateRun::AsConfigured,
+                    "as-configured",
+                ),
+                (
+                    ImportMode::Album,
+                    DuplicateRun::ReportRemovals,
+                    "report-removals",
+                ),
+                (ImportMode::Singleton, DuplicateRun::Skip, "skip"),
+                (ImportMode::Singleton, DuplicateRun::Replace, "replace"),
+            ] {
                 stage(d, SKIPPED);
-                let result = importer.import(&[&src], &target, mode, &choice).await;
+                let result = importer
+                    .import(&[&src], &target, mode, &choice, duplicates)
+                    .await;
                 assert_eq!(
                     result.outcome,
                     ImportOutcome::Skipped(SkipReason::NoMatch {
@@ -557,8 +654,9 @@ mod tests {
                 );
                 assert!(!report.exists(), "report left behind");
 
-                let after = 4 + words.len();
-                assert_eq!(args[4..after], words[..]);
+                assert_eq!(args[4], token);
+                let after = 5 + words.len();
+                assert_eq!(args[5..after], words[..]);
                 assert_eq!(args[after], "--");
 
                 let beet_args = &args[after + 1..];
@@ -619,6 +717,7 @@ mod tests {
                 &d.join("lib"),
                 ImportMode::Singleton,
                 &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert_eq!(result.to_string(), "No close match (2 candidates)");
@@ -637,6 +736,7 @@ mod tests {
                 &d.join("lib"),
                 ImportMode::Singleton,
                 &DriverChoice::AsIs,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert_eq!(result.choices, None);
@@ -659,7 +759,9 @@ mod tests {
                 stdout: "",
                 stderr: "Sending event: import_task_created\n\
                          soulbeet: MusicBrainz has no single match for dfeb96a7 (0 found)\n",
-                report: Some(r#"{"tasks": [], "pick_missing": true, "refused": null}"#),
+                report: Some(
+                    r#"{"tasks": [], "pick_missing": true, "refused": null, "duplicates": [], "items": []}"#,
+                ),
                 ..SKIPPED
             },
         );
@@ -669,11 +771,13 @@ mod tests {
                 &d.join("lib"),
                 ImportMode::Singleton,
                 &pick,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert_eq!(
             result.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::ChoiceInvalid,
                 message: format!("MusicBrainz has no recording {id}")
             }
         );
@@ -693,21 +797,37 @@ mod tests {
             d,
             DriverRun {
                 stderr: "Sending event: import_task_created\nSending event: item_imported\n",
-                report: Some(r#"{"tasks": [], "pick_missing": false, "refused": null}"#),
+                report: Some(
+                    r#"{"tasks": [], "pick_missing": false, "refused": null, "duplicates": [], "items": []}"#,
+                ),
                 ..Default::default()
             },
         );
         let result = importer
-            .import(&[&src], &lib, ImportMode::Singleton, &DriverChoice::AsIs)
+            .import(
+                &[&src],
+                &lib,
+                ImportMode::Singleton,
+                &DriverChoice::AsIs,
+                DuplicateRun::AsConfigured,
+            )
             .await;
         assert_eq!(result.to_string(), "Imported as-is (untagged)");
         let result = importer
-            .import(&[&src], &lib, ImportMode::Singleton, &DriverChoice::Auto)
+            .import(
+                &[&src],
+                &lib,
+                ImportMode::Singleton,
+                &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
+            )
             .await;
         assert_eq!(result.to_string(), "Imported");
 
         let why = "Import as-is needs artist and title tags, and 1 file lacks them: a.mp3";
-        let refused = format!(r#"{{"tasks": [], "pick_missing": false, "refused": "{why}"}}"#);
+        let refused = format!(
+            r#"{{"tasks": [], "pick_missing": false, "refused": "{why}", "duplicates": [], "items": []}}"#
+        );
         stage(
             d,
             DriverRun {
@@ -717,11 +837,18 @@ mod tests {
             },
         );
         let result = importer
-            .import(&[&src], &lib, ImportMode::Singleton, &DriverChoice::AsIs)
+            .import(
+                &[&src],
+                &lib,
+                ImportMode::Singleton,
+                &DriverChoice::AsIs,
+                DuplicateRun::AsConfigured,
+            )
             .await;
         assert_eq!(
             result.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::AsIsMissingTags,
                 message: why.into()
             }
         );
@@ -744,6 +871,7 @@ mod tests {
                     &d.join("lib"),
                     ImportMode::Singleton,
                     &DriverChoice::Auto,
+                    DuplicateRun::AsConfigured,
                 )
                 .await;
             assert_eq!(result.outcome, no_match, "{report:?}");
@@ -758,7 +886,7 @@ mod tests {
         let path = dir.path().join("report.json");
         tokio::fs::write(
             &path,
-            r#"{"tasks": [], "pick_missing": false, "refused": null}"#,
+            r#"{"tasks": [], "pick_missing": false, "refused": null, "duplicates": [], "items": []}"#,
         )
         .await
         .unwrap();
@@ -790,11 +918,13 @@ mod tests {
                 &d.join("lib"),
                 ImportMode::Album,
                 &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert_eq!(
             result.outcome,
             ImportOutcome::Failed {
+                kind: FailKind::Setup,
                 message: "Cannot determine the Python that runs beet. Set BEETS_PYTHON.".into()
             }
         );
@@ -815,6 +945,7 @@ mod tests {
                 &target,
                 ImportMode::Album,
                 &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
             )
             .await;
         assert!(target.is_dir());
@@ -826,8 +957,16 @@ mod tests {
                 &blocked,
                 ImportMode::Album,
                 &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
             )
             .await;
+        assert!(matches!(
+            result.outcome,
+            ImportOutcome::Failed {
+                kind: FailKind::TargetUnwritable,
+                ..
+            }
+        ));
         let text = result.to_string();
         assert!(
             text.starts_with(&format!(
@@ -930,17 +1069,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_library_passes_the_library_dir_and_skips_prompt_noise() {
+    async fn forgetting_reads_the_item_through_prompt_noise_and_passes_the_library_dir() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let beet = script(
             d,
             "beet",
             &format!(
-                "printf '%s\\n' \"$@\" > '{}/args.txt'; \
-                 echo 'Enter the code: @@sb@@/m/a.flac|||A|||T|||Al|||AA'; \
-                 echo noise; \
-                 echo '@@sb@@/m/b.flac|||B|||T2|||Al|||AA'",
+                "echo \"$*\" >> '{}/args.txt'; \
+                 case \" $* \" in *\" ls \"*) echo 'Enter the code: @@sb@@7'; echo noise;; esac",
                 d.display()
             ),
         )
@@ -950,20 +1087,26 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join(".beets_library.db"), "").unwrap();
 
-        let tracks = library::query_library(&s, &root).await.unwrap();
+        let outcome = library::forget_item(&s, &root, Path::new("/m/a.flac")).await;
 
-        let args = lines(&d.join("args.txt"));
-        let at = args.iter().position(|a| a == "-d").expect("no -d");
-        assert_eq!(args[at + 1], root.to_string_lossy());
-        assert_eq!(tracks.len(), 2);
-        let paths: Vec<&str> = tracks.iter().map(|t| t.path.as_str()).collect();
-        assert_eq!(paths, ["/m/a.flac", "/m/b.flac"]);
-        assert_eq!(tracks[1].artist, "B");
-        assert_eq!(tracks[1].album_artist, "AA");
+        assert!(matches!(outcome, ForgetOutcome::Removed), "{outcome:?}");
+        let calls = lines(&d.join("args.txt"));
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1].contains(" remove ") && calls[1].ends_with("id:7"),
+            "{}",
+            calls[1]
+        );
+        for call in &calls {
+            assert!(
+                call.contains(&format!("-d {}", root.display())),
+                "no -d root in {call}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn query_library_retries_once_when_the_db_is_locked() {
+    async fn forgetting_retries_once_when_the_db_is_locked() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let beet = script(
@@ -972,7 +1115,7 @@ mod tests {
             &format!(
                 "if [ ! -e '{d}/locked-once' ]; then : > '{d}/locked-once'; \
                    echo 'database access error: database is locked' >&2; exit 1; fi; \
-                 echo '@@sb@@/m/a.flac|||A|||T|||Al|||AA'",
+                 case \" $* \" in *\" ls \"*) echo '@@sb@@7';; esac",
                 d = d.display()
             ),
         )
@@ -980,17 +1123,94 @@ mod tests {
         let s = settings(d, beet, None);
         std::fs::write(d.join(".beets_library.db"), "").unwrap();
 
-        let tracks = library::query_library(&s, d).await.unwrap();
-        assert_eq!(tracks.len(), 1);
+        let outcome = library::forget_item(&s, d, Path::new("/m/a.flac")).await;
+        assert!(matches!(outcome, ForgetOutcome::Removed), "{outcome:?}");
     }
 
+    /// beets words what a person does about its own setup and a full disk,
+    /// quoting the row's text; it has nothing to ask for other failures.
+    #[test]
+    fn a_setup_failure_and_a_full_disk_say_what_to_do() {
+        let start = "Could not start beets: No such file or directory (os error 2)";
+        let setup = with_own_action(ImportResult::failed(FailKind::Setup, start.into()));
+        assert_eq!(
+            setup.user_action,
+            Some(UserAction::new(
+                UserActionCode::FixImporter,
+                format!("Fix the beets setup: {start}"),
+                "Settings > Config",
+            ))
+        );
+
+        let full =
+            "Error: No space left on device while copying /src/01.flac to /music/A/B/01.flac";
+        let mut disk = ImportResult::failed(FailKind::DiskFull, full.into());
+        disk.tasks = crate::TaskCount {
+            imported: 1,
+            total: 3,
+        };
+        let disk = with_own_action(disk);
+        assert_eq!(
+            disk.user_action,
+            Some(UserAction::new(
+                UserActionCode::FreeDiskSpace,
+                format!("Free disk space: {full} (1 of 3 imported)"),
+                "The disk that holds the path in the message",
+            ))
+        );
+
+        for (kind, message) in [
+            (FailKind::Beets, "beets exited with code 1"),
+            (
+                FailKind::TargetUnwritable,
+                "Error: Permission denied while creating /music/A",
+            ),
+        ] {
+            let result = with_own_action(ImportResult::failed(kind, message.into()));
+            assert_eq!(result.user_action, None, "{kind:?}");
+        }
+    }
+
+    /// The production path: `import` and `refused` carry beets' action.
     #[tokio::test]
-    async fn query_library_without_a_db_is_empty() {
+    async fn an_import_beets_cannot_run_asks_for_the_beets_setup() {
         let dir = tempfile::tempdir().unwrap();
-        let s = settings(dir.path(), PathBuf::from("/nonexistent/beet"), None);
-        assert!(library::query_library(&s, dir.path())
-            .await
-            .unwrap()
-            .is_empty());
+        let importer = BeetsImporter::new(settings(
+            dir.path(),
+            PathBuf::from("/nonexistent/beet"),
+            None,
+        ));
+        let result = importer
+            .import(
+                &[dir.path()],
+                dir.path(),
+                ImportMode::Album,
+                &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
+            )
+            .await;
+        assert_eq!(
+            result.user_action.map(|a| a.what),
+            Some(
+                "Fix the beets setup: Cannot determine the Python that runs beet. Set BEETS_PYTHON."
+                    .to_string()
+            )
+        );
+
+        let refused = importer.refused("No metadata source plugin loaded".into());
+        assert_eq!(
+            refused.outcome,
+            ImportOutcome::Refused {
+                issue: "No metadata source plugin loaded".into()
+            }
+        );
+        assert_eq!(
+            refused.user_action,
+            Some(UserAction::new(
+                UserActionCode::FixImporter,
+                "Fix the beets setup: No metadata source plugin loaded",
+                "Settings > Config",
+            ))
+        );
     }
 }

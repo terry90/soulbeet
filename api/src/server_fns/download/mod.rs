@@ -4,27 +4,27 @@ use serde::{Deserialize, Serialize};
 use shared::download::{
     DownloadEvent, DownloadableItem, ImportChoice, MatchChoices, QueuedDownload,
 };
-#[cfg(feature = "server")]
-use shared::download::{DownloadProgress, EnqueueStatus};
 
 #[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
+#[cfg(feature = "server")]
+use shared::download::DownloadProgress;
 #[cfg(feature = "server")]
 use tokio::sync::broadcast;
 
 #[cfg(feature = "server")]
 use crate::{
-    server_fns::{refusal_error, refusal_error_with, server_error},
+    base_url::{BaseUrl, BaseUrlError},
+    server_fns::{failure_error, forbidden_error, import_refusal_error, refusal_error},
     AuthSession,
 };
+#[cfg(feature = "server")]
+use axum::http::{HeaderMap, Uri};
+#[cfg(feature = "server")]
+use tower_cookies::Cookies;
 
 #[cfg(feature = "server")]
-use crate::globals::{
-    cleanup_stale_channels, get_or_create_user_channel, register_user_task, unregister_user_task,
-    USER_CHANNELS,
-};
-#[cfg(feature = "server")]
-use crate::services::download_backend;
+use crate::globals::{cleanup_stale_channels, USER_CHANNELS};
 
 // Local modules
 pub mod auto_download;
@@ -47,74 +47,155 @@ pub mod utils;
 pub(crate) mod test_support;
 
 #[cfg(feature = "server")]
-use self::enqueue::{
-    deliver, enqueue_request, failed_reason, stopped_rows, RequestEnqueue, Watcher,
-};
-#[cfg(feature = "server")]
-use self::monitor::{DownloadMonitor, WatchedTransfer};
-#[cfg(feature = "server")]
-use crate::transfer_registry::{BatchRef, TransferOwner};
-#[cfg(feature = "server")]
-use soulbeet::{error::SoulseekError, DownloadBackend};
-#[cfg(feature = "server")]
-use std::sync::Arc;
+use crate::auth::UserId;
 
-/// Name for a manual download's batch: the album its items share, or the
-/// first item's title when they span albums.
+/// How often an open download socket checks that its session still counts.
 #[cfg(feature = "server")]
-fn manual_batch_label(items: &[DownloadableItem]) -> String {
-    match items.split_first() {
-        Some((first, rest))
-            if !first.album.trim().is_empty() && rest.iter().all(|i| i.album == first.album) =>
-        {
-            first.album.clone()
-        }
-        Some((first, _)) => first.title.clone(),
-        None => String::new(),
+const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether a socket upgrade may come from the page its `Origin` names: a
+/// page on the host and port the request was sent to, so a page opened at
+/// any of Soulbeet's addresses works, or on the address `public_url` (a
+/// usable `PUBLIC_URL`) declares, for a proxy that cannot pass the public
+/// name. The scheme is not compared, since a proxy may end TLS. A request
+/// with no `Origin` is not from a browser page, so no other site can be
+/// riding on the user's cookie. A refusal says which addresses were compared.
+#[cfg(feature = "server")]
+pub(crate) fn origin_allowed(
+    headers: &HeaderMap,
+    uri: &Uri,
+    public_url: Option<&BaseUrl>,
+) -> Result<Result<(), String>, BaseUrlError> {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return Ok(Ok(()));
+    };
+    let page = origin.to_str().ok().and_then(|o| BaseUrl::parse(o).ok());
+    if page
+        .as_ref()
+        .is_some_and(|page| public_url.is_some_and(|pin| page.same_host(pin)))
+    {
+        return Ok(Ok(()));
     }
+    let addressed = crate::base_url::addressed_to(headers, uri)?;
+    if page.as_ref().is_some_and(|page| page.same_host(&addressed)) {
+        return Ok(Ok(()));
+    }
+    let shown = String::from_utf8_lossy(origin.as_bytes()).into_owned();
+    let pin = match public_url {
+        Some(pin) => format!("PUBLIC_URL names {}", pin.host_str()),
+        None => "PUBLIC_URL is not set".to_string(),
+    };
+    Ok(Err(format!(
+        "its page is at {shown}, the request was sent to {} and {pin}. A reverse proxy must pass \
+         the public name in Host or X-Forwarded-Host, or PUBLIC_URL must name it",
+        addressed.host_str()
+    )))
 }
 
-/// Name for an auto download's batch: the picked group's title, which a
-/// track search leaves empty since no album was searched for, else the same
-/// name a manual download of its items gets.
+/// Whether the socket's token still gives `user` a session: not signed out,
+/// no credential change since, the account still there.
 #[cfg(feature = "server")]
-fn auto_batch_label(group: &shared::download::DownloadableGroup) -> String {
-    if group.title.trim().is_empty() {
-        manual_batch_label(&group.items)
-    } else {
-        group.title.clone()
-    }
+pub(crate) async fn session_still_valid(
+    token: Option<&str>,
+    db: &sqlx::SqlitePool,
+    key: &crate::secret_key::SecretKey,
+    user: &UserId,
+) -> bool {
+    super::guard::load_session(token, db, key)
+        .await
+        .is_ok_and(|ctx| ctx.id() == *user)
+}
+
+/// What a new download socket sends before the live events: the build frame when the client
+/// asked for it (a bundle older than the frame does not ask: it cannot decode the variant and
+/// would reconnect on every try), then the rows of the user's unfinished files when there are any.
+#[cfg(feature = "server")]
+fn first_frames(build_frame: Option<bool>, rows: Vec<DownloadProgress>) -> Vec<DownloadEvent> {
+    let build = (build_frame == Some(true))
+        .then(|| DownloadEvent::Build(crate::build_id::BUILD_ID.to_string()));
+    let rows = (!rows.is_empty()).then_some(DownloadEvent::Progress(rows));
+    build.into_iter().chain(rows).collect()
 }
 
 /// WebSocket endpoint for real-time download updates.
 /// Uses WebSocket instead of HTTP streaming for more reliable delivery.
-#[get("/api/downloads/updates", auth: AuthSession)]
+/// A client that passes `build_frame=true` gets `DownloadEvent::Build` first.
+#[get("/api/downloads/updates?build_frame", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn download_updates_ws(
+    build_frame: Option<bool>,
     options: WebSocketOptions,
 ) -> Result<Websocket<(), DownloadEvent>, ServerFnError> {
-    let username = auth.0.username;
+    let user = auth.0.id();
+
+    let public_url = crate::config::CONFIG
+        .public_url()
+        .and_then(|p| p.as_ref().ok());
+    let allowed = origin_allowed(&headers, &uri, public_url)
+        .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
+    if let Err(why) = allowed {
+        warn!("Refused a download updates socket for user {user}: {why}");
+        return Err(forbidden_error(
+            "Download updates can only be opened from Soulbeet's own page",
+        ));
+    }
+    let token = cookies
+        .get(crate::AUTH_COOKIE_NAME)
+        .map(|c| c.value().to_string());
 
     let rx = {
         let map = USER_CHANNELS.read().await;
-        if let Some(channel) = map.get(&username) {
+        if let Some(channel) = map.get(&user) {
             channel.sender.subscribe()
         } else {
             drop(map);
             let mut map = USER_CHANNELS.write().await;
             let channel = map
-                .entry(username.clone())
+                .entry(user.clone())
                 .or_insert_with(crate::globals::UserChannel::new);
             channel.sender.subscribe()
         }
     };
 
+    // Read after subscribing, so a row sent from here on arrives live; one sent both ways is the
+    // same row twice, which the panel's map keeps once. The ledger is written behind the sends,
+    // so a change sent just before the subscribe can be missing from this read too: the panel
+    // then shows the slot's stored row until its next one.
+    let rows = match crate::ledger::store::open_rows(&crate::db::DB, &user).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("Could not read the unfinished downloads of user {user}: {e}");
+            Vec::new()
+        }
+    };
+
     Ok(options.on_upgrade(move |mut socket| async move {
         let mut rx = rx;
-        info!("WebSocket connected for user: {}", username);
+        info!("WebSocket connected for user: {}", user);
+        for frame in first_frames(build_frame, rows) {
+            // A client already gone ends the loop below at its first receive.
+            let _ = socket.send(frame).await;
+        }
+        let mut recheck = tokio::time::interval_at(
+            tokio::time::Instant::now() + SESSION_RECHECK,
+            SESSION_RECHECK,
+        );
 
         loop {
             // handle both broadcast messages and potential socket closure
             tokio::select! {
+                _ = recheck.tick() => {
+                    let valid = session_still_valid(
+                        token.as_deref(),
+                        &crate::db::DB,
+                        crate::secret_key::current(),
+                        &user,
+                    )
+                    .await;
+                    if !valid {
+                        info!("WebSocket closed for user {}: the session ended", user);
+                        break;
+                    }
+                }
                 result = rx.recv() => {
                     match result {
                         Ok(downloads) => {
@@ -145,7 +226,7 @@ pub async fn download_updates_ws(
             }
         }
 
-        info!("WebSocket disconnected for user: {}", username);
+        info!("WebSocket disconnected for user: {}", user);
 
         // Trigger cleanup of stale channels periodically
         cleanup_stale_channels().await;
@@ -156,51 +237,14 @@ pub async fn download_updates_ws(
 pub struct CancelDownloadRequest {
     pub id: String,
     pub source: String,
-    pub item: String,
     pub backend: Option<String>,
 }
 
 #[post("/api/downloads/cancel", auth: AuthSession)]
 pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnError> {
-    let username = auth.0.username;
-
-    let backend = download_backend(req.backend.as_deref())
+    crate::core::acquire::cancel(&auth.0, req.backend.as_deref(), &req.source, &req.id)
         .await
-        .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
-
-    backend
-        .cancel_download(&req.source, &req.id, false)
-        .await
-        .map_err(server_error)?;
-
-    info!(
-        "User {} cancelled download {} from {}",
-        username, req.id, req.source
-    );
-
-    // Send cancelled state to UI via broadcast channel
-    let (tx, _) = get_or_create_user_channel(&username).await;
-    let cancelled = DownloadProgress {
-        id: req.id,
-        source: req.source,
-        item: req.item,
-        size: 0,
-        transferred: 0,
-        state: shared::download::DownloadState::Cancelled,
-        percent: 0.0,
-        speed: 0.0,
-        error: None,
-        backend: req.backend,
-        batch_id: None,
-        batch_label: None,
-        local_path: None,
-        import_output: None,
-        retryable: false,
-        can_choose_import: false,
-    };
-    let _ = tx.send(DownloadEvent::Progress(vec![cancelled]));
-
-    Ok(())
+        .map_err(failure_error)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,307 +253,233 @@ pub struct DownloadRequest {
     pub target_folder: String,
     #[serde(default)]
     pub backend: Option<String>,
+    /// The search the items were picked from.
+    pub search_id: String,
 }
 
 #[post("/api/downloads/queue", auth: AuthSession)]
 pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, ServerFnError> {
-    let username = auth.0.username;
-
-    if let Some(issue) = crate::importer_health::broken_issue().await {
-        return Err(refusal_error(issue.title));
-    }
-    let folder =
-        crate::models::folder::Folder::find_for_user_by_path(&auth.0.sub, &req.target_folder)
-            .await
-            .map_err(server_error)?
-            .ok_or_else(|| refusal_error("Folder not found"))?;
-
-    let target_path_buf = std::path::Path::new(&folder.path).to_path_buf();
-    if let Err(e) = tokio::fs::create_dir_all(&target_path_buf).await {
-        return Err(server_error(format!(
-            "Failed to create target directory: {}",
-            e
-        )));
-    }
-
-    let backend = download_backend(req.backend.as_deref())
+    let folder = crate::core::folders::owned_at(&auth.0, &req.target_folder)
         .await
-        .map_err(|e| server_error(format!("download backend not available: {}", e)))?;
-    let fresh = BatchRef::new(
-        TransferOwner {
-            user_id: auth.0.sub.clone(),
-            batch_id: uuid::Uuid::new_v4().to_string(),
-        },
-        manual_batch_label(&req.items),
-        target_path_buf,
-    );
-    let queued = queue_detached(backend, req.items, fresh, username, req.backend)
-        .await
-        .map_err(server_error)?;
-    match queued {
-        Queued { error: Some(e), .. } => Err(server_error(e)),
-        Queued {
-            refusal: Some(reason),
-            ..
-        } => Err(refusal_error(reason)),
-        Queued { results, .. } => Ok(results),
-    }
-}
-
-/// What a manual request's enqueue came to.
-#[cfg(feature = "server")]
-#[derive(Debug)]
-struct Queued {
-    results: Vec<QueuedDownload>,
-    error: Option<SoulseekError>,
-    /// Nothing was enqueued, for this reason.
-    refusal: Option<&'static str>,
-}
-
-/// Runs `queue_and_watch` as its own task. Registry keys are claimed from
-/// its start, and the client may disconnect at any await and drop the
-/// handler: dropping the task's handle does not stop it, so the request
-/// always gets as far as a monitor or a release.
-#[cfg(feature = "server")]
-async fn queue_detached(
-    backend: Arc<dyn DownloadBackend>,
-    items: Vec<DownloadableItem>,
-    fresh: BatchRef,
-    username: String,
-    backend_id: Option<String>,
-) -> Result<Queued, tokio::task::JoinError> {
-    tokio::spawn(queue_and_watch(backend, items, fresh, username, backend_id)).await
-}
-
-/// Claims and enqueues a manual request's files, shows their rows, and hands
-/// the enqueued ones to a monitor: the running batch's when the request
-/// joined one, else a new one.
-#[cfg(feature = "server")]
-async fn queue_and_watch(
-    backend: Arc<dyn DownloadBackend>,
-    items: Vec<DownloadableItem>,
-    fresh: BatchRef,
-    username: String,
-    backend_id: Option<String>,
-) -> Queued {
-    let enq = enqueue_request(&backend, items, fresh).await;
-    let refusal = enq.refusal();
-    let RequestEnqueue {
-        batch,
-        results,
-        watcher,
-        error,
-        ..
-    } = enq;
-
-    let (tx, _) = get_or_create_user_channel(&username).await;
-    let row = |p: DownloadProgress| {
-        let mut p = p.with_batch(batch.owner.batch_id.clone(), batch.label.clone());
-        p.backend = backend_id.clone();
-        p
-    };
-
-    let failed_entries: Vec<DownloadProgress> = results
-        .iter()
-        .filter_map(|d| {
-            let reason = failed_reason(&d.status)?;
-            Some(row(DownloadProgress::failed(
-                d.id.clone(),
-                d.source.clone(),
-                d.item.clone(),
-                reason.to_string(),
-            )))
-        })
-        .collect();
-    if !failed_entries.is_empty() {
-        let _ = tx.send(DownloadEvent::Progress(failed_entries));
-    }
-
-    let enqueued: Vec<QueuedDownload> = results
-        .iter()
-        .filter(|d| d.status == EnqueueStatus::Enqueued)
-        .cloned()
-        .collect();
-
-    // Send initial "Queued" state immediately so UI shows the downloads right away
-    let queued_entries: Vec<DownloadProgress> = enqueued
-        .iter()
-        .map(|d| {
-            row(DownloadProgress::queued(
-                d.id.clone(),
-                d.source.clone(),
-                d.item.clone(),
-                d.size,
-            ))
-        })
-        .collect();
-    if !queued_entries.is_empty() {
-        let _ = tx.send(DownloadEvent::Progress(queued_entries));
-    }
-
-    match watcher {
-        Watcher::Joined(reservation) => {
-            info!(
-                "Added {} downloads to running batch {}",
-                enqueued.len(),
-                batch.owner.batch_id
-            );
-            let lost = deliver(reservation, &enqueued, &backend, &batch).await;
-            if !lost.is_empty() {
-                let _ = tx.send(DownloadEvent::Progress(stopped_rows(&lost, &batch)));
-            }
-        }
-        Watcher::Own if enqueued.is_empty() && batch.inbox.close_if_idle() => {}
-        // Starts empty when nothing was enqueued but another request joined
-        // the batch while this one was enqueueing.
-        Watcher::Own => {
-            info!(
-                "Started monitoring downloads: {:?}",
-                enqueued.iter().map(|d| &d.item).collect::<Vec<_>>()
-            );
-            let transfers = enqueued.iter().map(WatchedTransfer::from).collect();
-            let task_username = username.clone();
-            let task_cancellation = register_user_task(&username).await;
-            tokio::spawn(async move {
-                let mut monitor = DownloadMonitor::new(
-                    transfers,
-                    batch.target.clone(),
-                    tx,
-                    task_cancellation,
-                    task_username.clone(),
-                    batch,
-                );
-                monitor.run().await;
-                unregister_user_task(&task_username).await;
-            });
-        }
-    }
-
-    Queued {
-        results,
-        error,
-        refusal,
-    }
+        .map_err(failure_error)?;
+    crate::core::acquire::download(
+        &auth.0,
+        &folder,
+        req.items,
+        req.backend.as_deref(),
+        &req.search_id,
+    )
+    .await
+    .map_err(failure_error)
 }
 
 /// Imports a failed or skipped row again, from the job kept for it, the way
 /// `choice` says.
 #[post("/api/downloads/retry-import", auth: AuthSession)]
 pub async fn retry_import(item: String, choice: ImportChoice) -> Result<(), ServerFnError> {
-    crate::import_queue::retry_import_for(&auth.0.username, &item, choice)
+    crate::import_queue::retry_import_for(&auth.0.id(), &item, choice)
         .await
-        .map_err(kept_import_refusal)
+        .map_err(import_refusal_error)
 }
 
 /// The matches a skipped row can be imported with.
 #[post("/api/downloads/import-choices", auth: AuthSession)]
 pub async fn import_choices(item: String) -> Result<MatchChoices, ServerFnError> {
-    crate::import_queue::import_choices_for(&auth.0.username, &item).map_err(kept_import_refusal)
-}
-
-/// A refused retry or matches request, with what stays kept for the row.
-#[cfg(feature = "server")]
-fn kept_import_refusal(refusal: crate::import_queue::Refusal) -> ServerFnError {
-    refusal_error_with(refusal.message, refusal.kept)
+    crate::import_queue::import_choices_for(&auth.0.id(), &item).map_err(import_refusal_error)
 }
 
 /// Drops the stored imports of rows the user cleared.
 #[post("/api/downloads/forget-retries", auth: AuthSession)]
 pub async fn forget_import_retries(items: Vec<String>) -> Result<(), ServerFnError> {
-    crate::import_queue::forget_retries(&auth.0.username, &items);
+    crate::import_queue::forget_retries(&auth.0.id(), &items);
     Ok(())
 }
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use test_support::item;
 
     #[test]
-    fn auto_label_is_the_group_title_else_its_items_name() {
-        let mut group = shared::download::DownloadableGroup {
-            source: "p".to_string(),
-            group_id: "g".to_string(),
-            title: "Glass Atlas".to_string(),
-            artist: None,
-            item_count: 1,
-            total_size: 0,
-            items: vec![item("p", "Northern Line", "1.flac")],
-            quality: "flac".to_string(),
-            score: 1.0,
+    fn a_socket_opens_with_the_build_then_the_unfinished_rows() {
+        let row = DownloadProgress::queued("t-1".into(), "peer_a".into(), "01.flac".into(), 100);
+        let kinds = |frames: Vec<DownloadEvent>| {
+            frames
+                .into_iter()
+                .map(|f| match f {
+                    DownloadEvent::Build(id) => {
+                        format!("build {}", id == crate::build_id::BUILD_ID)
+                    }
+                    DownloadEvent::Progress(rows) => format!("rows {}", rows.len()),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
         };
-        assert_eq!(auto_batch_label(&group), "Glass Atlas");
-
-        // A track search: no album was searched for, so neither the group
-        // nor its items name one.
-        group.title = String::new();
-        group.items[0].album = String::new();
-        assert_eq!(auto_batch_label(&group), "Northern Line");
+        assert_eq!(
+            kinds(first_frames(Some(true), vec![row.clone()])),
+            vec!["build true", "rows 1"]
+        );
+        assert_eq!(kinds(first_frames(None, vec![row])), vec!["rows 1"]);
+        assert!(first_frames(Some(false), vec![]).is_empty());
     }
 
     #[test]
-    fn manual_label_is_the_shared_album_else_the_first_title() {
-        let same_album = vec![item("p", "One", "1.flac"), item("p", "Two", "2.flac")];
-        assert_eq!(manual_batch_label(&same_album), "Come Over");
+    fn only_pages_on_the_address_the_socket_was_asked_at_may_open_it() {
+        use axum::http::{HeaderName, HeaderValue};
+        let allowed = |pairs: &[(&str, &str)]| {
+            let headers: HeaderMap = pairs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                        HeaderValue::from_str(v).unwrap(),
+                    )
+                })
+                .collect();
+            origin_allowed(&headers, &Uri::from_static("/api/downloads/updates"), None)
+                .map(|allowed| allowed.is_ok())
+        };
+        let host = ("host", "music.example.com");
 
-        let mut mixed = same_album.clone();
-        mixed[1].album = "Other".to_string();
-        assert_eq!(manual_batch_label(&mixed), "One");
+        assert_eq!(
+            allowed(&[host, ("origin", "https://music.example.com")]),
+            Ok(true)
+        );
+        assert_eq!(
+            allowed(&[host, ("origin", "https://evil.example")]),
+            Ok(false)
+        );
+        assert_eq!(
+            allowed(&[host, ("origin", "https://music.example.com:8443")]),
+            Ok(false)
+        );
+        assert_eq!(allowed(&[host, ("origin", "null")]), Ok(false));
+        // Not a browser page: nothing to compare, and no address needed.
+        assert_eq!(allowed(&[]), Ok(true));
+        // A page opened at a LAN address talks to that address; PUBLIC_URL
+        // takes no part.
+        assert_eq!(
+            allowed(&[
+                ("host", "192.168.1.5:9765"),
+                ("origin", "http://192.168.1.5:9765")
+            ]),
+            Ok(true)
+        );
+        // http://nas:9765 typed in the browser: the host derives https.
+        assert_eq!(
+            allowed(&[("host", "nas:9765"), ("origin", "http://nas:9765")]),
+            Ok(true)
+        );
+        // Behind a proxy, the forwarded host is the one the page was on.
+        assert_eq!(
+            allowed(&[
+                ("host", "soulful:9765"),
+                ("x-forwarded-host", "music.example.com"),
+                ("origin", "https://music.example.com"),
+            ]),
+            Ok(true)
+        );
+        assert_eq!(
+            allowed(&[
+                ("host", "soulful:9765"),
+                ("forwarded", "host=music.example.com;proto=https"),
+                ("origin", "http://soulful:9765"),
+            ]),
+            Ok(false)
+        );
+        assert_eq!(
+            allowed(&[("origin", "https://music.example.com")]),
+            Err(BaseUrlError::MissingHost)
+        );
+    }
 
-        let mut no_album = same_album;
-        for i in &mut no_album {
-            i.album = " ".to_string();
-        }
-        assert_eq!(manual_batch_label(&no_album), "One");
+    #[test]
+    fn a_page_at_the_public_url_may_open_the_socket_through_a_proxy_that_drops_the_name() {
+        use axum::http::{HeaderName, HeaderValue};
+        let headers = |pairs: &[(&str, &str)]| -> HeaderMap {
+            pairs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                        HeaderValue::from_str(v).unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let uri = Uri::from_static("/api/downloads/updates");
+        // nginx without `proxy_set_header Host $host` sends its upstream name.
+        let proxied = headers(&[
+            ("host", "soulbeet:9765"),
+            ("origin", "https://music.example.com"),
+        ]);
+        let pin = BaseUrl::parse("https://music.example.com").unwrap();
+        assert_eq!(origin_allowed(&proxied, &uri, Some(&pin)), Ok(Ok(())));
+        assert_eq!(
+            origin_allowed(&proxied, &uri, None),
+            Ok(Err(
+                "its page is at https://music.example.com, the request was sent to \
+                 soulbeet:9765 and PUBLIC_URL is not set. A reverse proxy must pass the public \
+                 name in Host or X-Forwarded-Host, or PUBLIC_URL must name it"
+                    .to_string()
+            ))
+        );
+        let other = BaseUrl::parse("https://other.example.com").unwrap();
+        let refused = origin_allowed(&proxied, &uri, Some(&other))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            refused.contains("PUBLIC_URL names other.example.com"),
+            "{refused}"
+        );
+        // The page's own address still works with PUBLIC_URL set elsewhere.
+        let lan = headers(&[
+            ("host", "192.168.1.5:9765"),
+            ("origin", "http://192.168.1.5:9765"),
+        ]);
+        assert_eq!(origin_allowed(&lan, &uri, Some(&pin)), Ok(Ok(())));
     }
 
     #[tokio::test]
-    async fn a_request_dropped_mid_enqueue_still_hands_its_transfers_over() {
-        use crate::transfer_registry::TransferRegistry;
-        use test_support::{batch, key, ScriptedOutcome, StubBackend};
+    async fn the_socket_session_ends_with_the_session() {
+        use crate::models::revoked_session::RevokedSession;
+        use crate::secret_key::SecretKey;
 
-        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
-        let (reached, release) = stub.hold_downloads();
-        let backend: Arc<dyn DownloadBackend> = stub.clone();
-        let running = batch("Come Over");
-        TransferRegistry::global().claim(&[key(&backend, "p", "1.flac")], &running);
-        let fresh = BatchRef::new(
-            TransferOwner {
-                user_id: running.owner.user_id.clone(),
-                batch_id: uuid::Uuid::new_v4().to_string(),
-            },
-            "Come Over".to_string(),
-            running.target.clone(),
-        );
-        let items = vec![item("p", "One", "1.flac"), item("p", "Two", "2.flac")];
+        let db = crate::db::test_db::migrated().await;
+        let key = SecretKey::new("k".repeat(32));
+        let ann = crate::models::user::User::create_in(&db, "ann", "pw")
+            .await
+            .unwrap();
+        let id = UserId::new(&ann.id);
+        let token = crate::auth::create_token(&key, &ann.id, 0).unwrap();
+        let valid = |t: &str| {
+            let (db, key, id, t) = (db.clone(), &key, id.clone(), t.to_string());
+            async move { session_still_valid(Some(&t), &db, key, &id).await }
+        };
+        assert!(valid(&token).await);
+        assert!(!session_still_valid(None, &db, &key, &id).await);
+        assert!(!session_still_valid(Some(&token), &db, &key, &UserId::new("other")).await);
 
-        // The handler is dropped while slskd is still answering the enqueue,
-        // as when the client disconnects.
-        let handler = tokio::spawn(queue_detached(
-            backend,
-            items,
-            fresh,
-            "detached-request".to_string(),
-            None,
-        ));
-        reached.notified().await;
-        handler.abort();
-        assert!(handler.await.unwrap_err().is_cancelled());
-        release.notify_one();
+        // Signed out.
+        let jti = crate::auth::verify_token(&key, &token).unwrap().jti;
+        RevokedSession::revoke_in(&db, &jti, i64::MAX, 0)
+            .await
+            .unwrap();
+        assert!(!valid(&token).await);
 
-        let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let slots = running.inbox.take();
-                if !slots.is_empty() {
-                    break slots;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the enqueued transfer never reached the running batch");
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].filename, "2.flac");
-        assert_eq!(delivered[0].transfer_id, "t-2.flac");
+        // Password changed.
+        let token = crate::auth::create_token(&key, &ann.id, 0).unwrap();
+        assert!(valid(&token).await);
+        crate::models::user::User::update_password_in(&db, &ann.id, "new")
+            .await
+            .unwrap();
+        assert!(!valid(&token).await);
+
+        // Account deleted.
+        let token = crate::auth::create_token(&key, &ann.id, 1).unwrap();
+        assert!(valid(&token).await);
+        crate::models::user::User::delete_in(&db, &ann.id)
+            .await
+            .unwrap();
+        assert!(!valid(&token).await);
     }
 }

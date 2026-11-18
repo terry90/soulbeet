@@ -4,7 +4,8 @@
 import type { Server } from 'node:http';
 import type { PeerBehavior } from '../../fixtures/dataset.js';
 import { createStubServer, sendEmpty, sendJson, sendText } from './router.js';
-import type { BatchEnqueueBody, SlskdState } from './slskd-state.js';
+import type { TcpProxy } from './tcp-proxy.js';
+import { parseGuid, type BatchEnqueueBody, type SlskdState } from './slskd-state.js';
 
 const VALID_BEHAVIORS: PeerBehavior[] = [
   'happy',
@@ -15,9 +16,16 @@ const VALID_BEHAVIORS: PeerBehavior[] = [
   'offline',
   'enqueueoffline',
   'partialenqueue',
+  'rejects',
+  'busyonce',
+  'slow',
 ];
 
-export function createSlskdServer(state: SlskdState, apiKey: string): Server {
+export function createSlskdServer(
+  state: SlskdState,
+  apiKey: string,
+  navidrome: TcpProxy | null,
+): Server {
   return createStubServer({
     name: 'slskd',
     intercept: ({ req, res, url }) => {
@@ -48,6 +56,20 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
           sendJson(res, 200, {
             server: { address: 'vps.slsknet.org:2271', isConnected: true, isLoggedIn: true },
             version: { full: '0.99.0-e2e' },
+          }),
+      },
+      {
+        // The part of slskd's options soulbeet reads: the download retry
+        // limit, slskd's default (Core/Options.cs:997).
+        method: 'GET',
+        pattern: '/api/v0/options',
+        handler: ({ res }) =>
+          sendJson(res, 200, {
+            transfers: {
+              download: {
+                retry: { attempts: 3, delay: 5000, maxDelay: 60000, partial: 'resume' },
+              },
+            },
           }),
       },
 
@@ -86,7 +108,14 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
             sendEmpty(res, 404);
             return;
           }
-          sendJson(res, 200, record.responses);
+          sendJson(res, 200, state.searchResponses(record));
+        },
+      },
+      {
+        method: 'PUT',
+        pattern: '/api/v0/searches/:id',
+        handler: ({ res, params }) => {
+          sendEmpty(res, state.cancelSearch(params.id as string) ? 200 : 404);
         },
       },
       {
@@ -132,13 +161,64 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
         },
       },
       {
+        // slskd looks the transfer up by id alone and answers it whatever
+        // its removed flag (TransfersController.cs:549-573,
+        // DownloadService.cs:688-704).
+        method: 'GET',
+        pattern: '/api/v0/transfers/downloads/:username/:id',
+        handler: ({ res, params }) => {
+          const id = parseGuid(params.id as string);
+          if (id === null) {
+            sendEmpty(res, 400);
+            return;
+          }
+          const transfer = state.downloadJson(id);
+          if (transfer === null) {
+            sendEmpty(res, 404);
+            return;
+          }
+          sendJson(res, 200, transfer);
+        },
+      },
+      {
         method: 'DELETE',
         pattern: '/api/v0/transfers/downloads/:username/:id',
         handler: ({ res, params, url }) => {
           const remove = url.searchParams.get('remove') === 'true';
-          const ok = state.cancel(params.username as string, params.id as string, remove);
-          sendEmpty(res, ok ? 204 : 404);
+          const id = parseGuid(params.id as string);
+          if (id === null) {
+            sendEmpty(res, 400);
+            return;
+          }
+          state.cancel(id, remove);
+          sendEmpty(res, 204);
         },
+      },
+      {
+        method: 'GET',
+        pattern: '/api/v0/transfers/downloads/:username/:id/position',
+        handler: ({ res, params }) => {
+          const id = parseGuid(params.id as string);
+          if (id === null) {
+            sendEmpty(res, 400);
+            return;
+          }
+          const result = state.placeInQueue(id);
+          if (result.status === 404) {
+            sendEmpty(res, 404);
+            return;
+          }
+          // [Produces("application/json")] writes the 500's text as a JSON string.
+          sendJson(res, result.status, result.body);
+        },
+      },
+
+      // ---- users ----------------------------------------------------------
+      {
+        method: 'GET',
+        pattern: '/api/v0/users/:username/status',
+        handler: ({ res, params }) =>
+          sendJson(res, 200, state.userStatusJson(params.username as string)),
       },
 
       // ---- control API (specs only, not part of slskd) --------------------
@@ -172,6 +252,32 @@ export function createSlskdServer(state: SlskdState, apiKey: string): Server {
         handler: ({ res, body }) => {
           state.outage = (body as { down?: boolean })?.down === true;
           sendJson(res, 200, { ok: true, outage: state.outage });
+        },
+      },
+      {
+        method: 'POST',
+        pattern: '/_control/navidrome',
+        handler: async ({ res, body }) => {
+          if (navidrome === null) {
+            sendJson(res, 404, {
+              error: 'no Navidrome proxy runs in this stub (NAVIDROME_PROXY_PORT is unset)',
+            });
+            return;
+          }
+          const down = (body as { down?: boolean })?.down === true;
+          await navidrome.setDown(down);
+          sendJson(res, 200, { ok: true, down });
+        },
+      },
+      {
+        method: 'DELETE',
+        pattern: '/_control/downloads/:destination',
+        handler: ({ res, params }) => {
+          if (!state.removeDestination(params.destination as string)) {
+            sendJson(res, 400, { error: 'destination must be one directory name' });
+            return;
+          }
+          sendJson(res, 200, { ok: true });
         },
       },
       {

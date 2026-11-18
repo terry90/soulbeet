@@ -1,6 +1,9 @@
 use api::{create_user_folder, delete_folder, get_user_folders, update_folder};
 use dioxus::prelude::*;
 
+use super::panel::{
+    ListRow, LoadError, Loading, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS,
+};
 use crate::auth::use_auth;
 use crate::{friendly_error, FieldLook, TextInput};
 
@@ -169,26 +172,12 @@ pub fn FolderManager() -> Element {
 
     rsx! {
         div { class: "space-y-6",
-        div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
-            h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Manage Music Folders" }
-
-            // Local Messages
-            if !error().is_empty() {
-                div { class: "mb-4 p-4 bg-red-900/20 border border-red-500/50 rounded text-red-400 font-mono text-sm",
-                    "{error}"
-                }
-            }
-            if !success_msg().is_empty() {
-                div { class: "mb-4 p-4 bg-green-900/20 border border-green-500/50 rounded text-green-400 font-mono text-sm",
-                    "{success_msg}"
-                }
-            }
+        Panel { title: "Manage Music Folders",
+            Messages { error: error(), success: success_msg() }
 
             div { class: "grid grid-cols-1 md:grid-cols-2 gap-4 mb-4",
                 div {
-                    label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
-                        "Folder Name (e.g., 'Music/Common')"
-                    }
+                    label { class: LABEL_CLASS, "Folder Name (e.g., 'Music/Common')" }
                     TextInput {
                         value: folder_name(),
                         oninput: move |v| folder_name.set(v),
@@ -196,9 +185,7 @@ pub fn FolderManager() -> Element {
                     }
                 }
                 div {
-                    label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
-                        "Folder Path"
-                    }
+                    label { class: LABEL_CLASS, "Folder Path" }
                     TextInput {
                         value: folder_path(),
                         oninput: move |v| folder_path.set(v),
@@ -210,9 +197,7 @@ pub fn FolderManager() -> Element {
             button { class: "retro-btn mb-6 rounded", onclick: handle_add_folder, "Add Folder" }
 
             // Existing Folders List
-            h3 { class: "text-lg font-bold mb-2 text-white font-display border-b border-white/10 pb-2",
-                "Existing Folders"
-            }
+            SectionTitle { title: "Existing Folders" }
             if folders.read().is_empty() {
                 p { class: "text-gray-500 font-mono italic", "No folders added yet." }
             } else {
@@ -227,7 +212,7 @@ pub fn FolderManager() -> Element {
                                 let id_delete = folder.id.clone();
                                 let id_update = folder.id.clone();
                                 rsx! {
-                                    li { class: "bg-white/5 border border-white/5 p-3 rounded hover:border-beet-accent/30 transition-colors",
+                                    ListRow {
                                         if editing_folder_id() == Some(folder.id.clone()) {
                                             div { class: "flex flex-col gap-2",
                                                 TextInput {
@@ -272,7 +257,7 @@ pub fn FolderManager() -> Element {
                                                         "Edit"
                                                     }
                                                     button {
-                                                        class: "text-xs font-mono text-gray-400 hover:text-red-400 transition-colors underline decoration-dotted",
+                                                        class: REMOVE_BUTTON_CLASS,
                                                         onclick: move |_| handle_delete_folder(id_delete.clone()),
                                                         "Delete"
                                                     }
@@ -288,23 +273,11 @@ pub fn FolderManager() -> Element {
         }
 
         // Library Settings
-        div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10 mt-6",
-            h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "Library Settings" }
-
+        Panel { title: "Library Settings",
             match &*settings_resource.read() {
-                None => rsx! {
-                    div { class: "animate-pulse text-gray-400 font-mono", "Loading..." }
-                },
-                Some(Err(e)) => {
-                    let msg = friendly_error(e);
-                    rsx! {
-                        div { class: "text-red-400 text-sm font-mono mb-3", "{msg}" }
-                        button {
-                            class: "text-xs font-mono text-gray-400 hover:text-white underline decoration-dotted cursor-pointer",
-                            onclick: move |_| settings_resource.restart(),
-                            "Retry"
-                        }
-                    }
+                None => rsx! { Loading {} },
+                Some(Err(e)) => rsx! {
+                    LoadError { message: friendly_error(e), on_retry: move |_| settings_resource.restart() }
                 },
                 Some(Ok(_)) => rsx! {
                 div { class: "space-y-4",
@@ -349,7 +322,7 @@ pub fn FolderManager() -> Element {
                             if discovery_enabled() {
                                 // Folder selector
                                 div { class: "p-3 bg-beet-dark rounded border border-white/10",
-                                    label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider", "Download Folder" }
+                                    label { class: LABEL_CLASS, "Download Folder" }
                                     if folders.read().is_empty() {
                                         p { class: "text-gray-500 font-mono text-sm italic", "No folders configured. Add a folder above first." }
                                     } else {
@@ -519,7 +492,7 @@ pub fn FolderManager() -> Element {
                         p { class: "text-sm text-white font-medium mb-2", "Last.fm" }
                         div { class: "space-y-3",
                             div {
-                                label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider", "Username" }
+                                label { class: LABEL_CLASS, "Username" }
                                 input {
                                     class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
                                     value: "{lastfm_username}",
@@ -535,7 +508,7 @@ pub fn FolderManager() -> Element {
                                 }
                             }
                             div {
-                                label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider", "API Key" }
+                                label { class: LABEL_CLASS, "API Key" }
                                 input {
                                     class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
                                     value: "{lastfm_api_key}",

@@ -1,7 +1,8 @@
 pub mod download;
-pub mod library;
+pub mod failure;
 pub mod metadata;
 pub mod navidrome;
+pub mod oauth;
 pub mod recommendation;
 pub mod slskd;
 pub mod system;

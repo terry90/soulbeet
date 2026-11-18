@@ -1,12 +1,15 @@
 use dioxus::logger::tracing::{info, warn};
-use shared::download::{DownloadProgress, DownloadState};
+use shared::download::DownloadProgress;
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction};
 use soulbeet::{DriverChoice, ImportMode};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::utils::{file_id, resolve_download_path, resolve_in_destination, FileId};
-use crate::import_queue::{ImportJob, JobOwner};
+use super::utils::{file_id, resolve_adopted, resolve_in_destination, FileId, Unresolved};
+use crate::auth::UserId;
+use crate::import_queue::{Duplicates, ImportJob, JobOwner};
+use crate::ledger::DuplicateRule;
 
 /// Maximum number of retries when waiting for a downloaded file to appear on disk.
 /// With exponential backoff (500ms, 1s, 2s, 4s, 8s), this covers ~15.5s total.
@@ -18,61 +21,91 @@ const FILE_RESOLVE_INITIAL_DELAY_MS: u64 = 500;
 /// Find a finished download on disk, retrying with exponential backoff:
 /// slskd can report completion before the file is visible through a shared
 /// volume mount. `destination` is the batch folder the file was enqueued
-/// into; `None` (a transfer this batch did not enqueue) falls back to
-/// searching the whole download folder. Files in `claimed` were already
+/// into; `None` (a transfer this batch adopted) is looked for where slskd
+/// saves a transfer without a batch folder (`resolve_adopted`). Files in `claimed` were already
 /// handed off and are never returned; the file found is added to it. The
-/// lock is held only while one attempt looks, never across a wait.
+/// lock is held only while one attempt looks, never across a wait. When no
+/// attempt finds one, the last says why.
 pub async fn resolve_on_disk(
     filename: &str,
     base: &Path,
     destination: Option<&str>,
     claimed: &Mutex<HashSet<FileId>>,
-) -> Option<PathBuf> {
-    let attempt = || {
-        let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
-        let path = match destination {
-            Some(destination) => resolve_in_destination(filename, base, destination, &claimed),
-            None => resolve_download_path(filename, base).map(PathBuf::from),
-        }?;
-        let id = file_id(&path)?;
-        claimed.insert(id).then_some(path)
+) -> Result<PathBuf, Unresolved> {
+    let attempt = || find_on_disk(filename, base, destination, claimed);
+    let mut why = match attempt() {
+        Ok(path) => return Ok(path),
+        Err(why) => why,
     };
-    if let Some(path) = attempt() {
-        return Some(path);
-    }
 
     let mut delay_ms = FILE_RESOLVE_INITIAL_DELAY_MS;
     for retry in 1..=FILE_RESOLVE_MAX_RETRIES {
         warn!(
-            "File not found on disk (attempt {}), retrying in {}ms: {}",
-            retry, delay_ms, filename
+            "No file to hand off ({:?}, attempt {}), retrying in {}ms: {}",
+            why, retry, delay_ms, filename
         );
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
-        if let Some(path) = attempt() {
-            info!(
-                "File appeared on disk after {}ms wait: {}",
-                delay_ms, filename
-            );
-            return Some(path);
+        match attempt() {
+            Ok(path) => {
+                info!(
+                    "File appeared on disk after {}ms wait: {}",
+                    delay_ms, filename
+                );
+                return Ok(path);
+            }
+            Err(again) => why = again,
         }
 
         delay_ms *= 2;
     }
 
-    None
+    Err(why)
+}
+
+/// One look of `resolve_on_disk`, without waiting for the file to appear.
+pub fn find_on_disk(
+    filename: &str,
+    base: &Path,
+    destination: Option<&str>,
+    claimed: &Mutex<HashSet<FileId>>,
+) -> Result<PathBuf, Unresolved> {
+    let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
+    let path = match destination {
+        Some(destination) => resolve_in_destination(filename, base, destination, &claimed)?,
+        None => resolve_adopted(filename, base, &claimed)?,
+    };
+    let id = file_id(&path).ok_or(Unresolved::NotOnDisk)?;
+    match claimed.insert(id) {
+        true => Ok(path),
+        false => Err(Unresolved::Claimed),
+    }
 }
 
 /// Row text for a finished download whose file was not found on disk.
 const UNRESOLVED: &str = "Could not resolve file path";
 
-/// The Failed row of a finished download whose file was not found.
-pub fn unresolved_row(row: DownloadProgress) -> DownloadProgress {
-    DownloadProgress {
-        state: DownloadState::Failed(UNRESOLVED.into()),
-        error: Some(UNRESOLVED.into()),
-        ..row
-    }
+/// The Failed row of a finished download whose file `resolve_on_disk` did
+/// not find under `base`, the download folder, for the reason `why`.
+///
+/// The backend reported the file complete and `resolve_on_disk` already
+/// waited out a slow mount. With no file by its name there, the backend
+/// saves somewhere else than `base` shows, or Soulful cannot read there: a
+/// person fixes that. With every such file handed off for another download
+/// of the batch, Soulful matched the files wrongly, which no folder setting
+/// fixes. Downloading it again ends the same way in both cases.
+pub fn unresolved_row(row: DownloadProgress, base: &Path, why: Unresolved) -> DownloadProgress {
+    let failure = Failure::new(
+        FailureCode::FileNotFoundAfterDownload,
+        Stage::FileLookup,
+        RetryAdvice::NotRetryable,
+        UNRESOLVED,
+    );
+    let failure = match why {
+        Unresolved::NotOnDisk => failure.with_user_action(UserAction::fix_download_path(base)),
+        Unresolved::Claimed => failure,
+    };
+    row.failed_with(failure)
 }
 
 /// A finished slot whose file was found on disk. `destination` is the batch
@@ -83,28 +116,48 @@ pub struct ResolvedSlot {
     pub destination: Option<String>,
 }
 
-/// An import of `source` reporting to `username` through `rows`, which are
-/// already stamped with their batch.
+/// What a finished download gave to import.
+pub enum Downloaded {
+    /// One file, imported on its own.
+    File(PathBuf),
+    /// An album's folder, imported whole, and the files its rows downloaded into it: the
+    /// folder may hold other downloads' files too.
+    Album {
+        folder: PathBuf,
+        files: Vec<PathBuf>,
+    },
+}
+
+/// An import of `downloaded` reporting to `user` through `rows`, which are
+/// already stamped with their batch, treating earlier copies by the batch's
+/// `duplicates` rule.
 pub fn import_job(
-    source: PathBuf,
-    mode: ImportMode,
+    downloaded: Downloaded,
     rows: Vec<DownloadProgress>,
     target: &Path,
-    username: &str,
+    user: &UserId,
+    duplicates: &DuplicateRule,
     base: &Path,
 ) -> ImportJob {
+    let (sources, files, mode) = match downloaded {
+        Downloaded::File(file) => (vec![file.clone()], vec![file], ImportMode::Singleton),
+        Downloaded::Album { folder, files } => (vec![folder], files, ImportMode::Album),
+    };
     ImportJob {
-        sources: vec![source],
+        sources,
+        files,
         target: target.to_path_buf(),
         mode,
         owner: Some(JobOwner {
-            username: username.to_string(),
+            user_id: user.clone(),
             rows,
         }),
         snapshot_target: false,
         cleanup_root: Some(base.to_path_buf()),
         choice: DriverChoice::Auto,
         choices: None,
+        duplicates: Duplicates::of(duplicates, user),
+        last_run: None,
     }
 }
 
@@ -114,40 +167,135 @@ pub fn import_job(
 pub fn album_jobs(
     resolved: Vec<ResolvedSlot>,
     target: &Path,
-    username: &str,
+    user: &UserId,
+    duplicates: &DuplicateRule,
     base: &Path,
 ) -> Vec<ImportJob> {
-    let mut albums: Vec<(PathBuf, Vec<DownloadProgress>)> = Vec::new();
+    // Each folder, its rows and their files.
+    type Album = (PathBuf, Vec<DownloadProgress>, Vec<PathBuf>);
+    let mut albums: Vec<Album> = Vec::new();
     let mut jobs = Vec::new();
     for slot in resolved {
         match slot.destination {
             Some(destination) => {
                 let folder = base.join(destination);
-                match albums.iter_mut().find(|(f, _)| *f == folder) {
-                    Some((_, rows)) => rows.push(slot.row),
-                    None => albums.push((folder, vec![slot.row])),
+                match albums.iter_mut().find(|(f, _, _)| *f == folder) {
+                    Some((_, rows, files)) => {
+                        rows.push(slot.row);
+                        files.push(slot.path);
+                    }
+                    None => albums.push((folder, vec![slot.row], vec![slot.path])),
                 }
             }
             None => jobs.push(import_job(
-                slot.path,
-                ImportMode::Singleton,
+                Downloaded::File(slot.path),
                 vec![slot.row],
                 target,
-                username,
+                user,
+                duplicates,
                 base,
             )),
         }
     }
-    let album_jobs = albums
-        .into_iter()
-        .map(|(folder, rows)| import_job(folder, ImportMode::Album, rows, target, username, base));
+    let album_jobs = albums.into_iter().map(|(folder, rows, files)| {
+        import_job(
+            Downloaded::Album { folder, files },
+            rows,
+            target,
+            user,
+            duplicates,
+            base,
+        )
+    });
     album_jobs.chain(jobs).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::delete_guard::Origin;
     use crate::import_queue::test_support::row;
+    use shared::download::DownloadState;
+    use shared::failure::UserActionCode;
+
+    #[test]
+    fn unresolved_row_fails_with_file_not_found_after_download() {
+        let failed = unresolved_row(row("a"), Path::new("/downloads"), Unresolved::NotOnDisk);
+
+        assert_eq!(failed.state, DownloadState::Failed(UNRESOLVED.into()));
+        assert_eq!(failed.error.as_deref(), Some(UNRESOLVED));
+        let f = failed.failure.expect("a failure");
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::FileNotFoundAfterDownload,
+                Stage::FileLookup,
+                RetryAdvice::NotRetryable,
+                UNRESOLVED
+            )
+        );
+        let action = f.user_action.expect("a person fixes the download folder");
+        assert_eq!(action.code, UserActionCode::FixDownloadPath);
+        assert!(action.what.contains("/downloads"), "{}", action.what);
+    }
+
+    /// The file is there but went to another download: the row reads as
+    /// before, and no folder setting is asked for.
+    #[test]
+    fn a_file_another_download_took_asks_for_no_folder_fix() {
+        let failed = unresolved_row(row("a"), Path::new("/downloads"), Unresolved::Claimed);
+
+        assert_eq!(failed.error.as_deref(), Some(UNRESOLVED));
+        let f = failed.failure.expect("a failure");
+        assert_eq!(
+            (f.code, f.stage, f.retry),
+            (
+                FailureCode::FileNotFoundAfterDownload,
+                Stage::FileLookup,
+                RetryAdvice::NotRetryable
+            )
+        );
+        assert_eq!(f.user_action, None);
+    }
+
+    #[test]
+    fn import_job_takes_the_batchs_duplicates_rule() {
+        let user = UserId::new("u");
+        let job_for = |rule: &DuplicateRule| {
+            import_job(
+                Downloaded::File(PathBuf::from("/dl/X [12345678]/a.flac")),
+                vec![row("a")],
+                Path::new("/music"),
+                &user,
+                rule,
+                Path::new("/dl"),
+            )
+        };
+        assert!(matches!(
+            job_for(&DuplicateRule::Skip).duplicates,
+            Duplicates::Skip
+        ));
+        assert!(matches!(
+            job_for(&DuplicateRule::Guarded).duplicates,
+            Duplicates::Guarded { actor, origin: Origin::Ui } if actor == user
+        ));
+        let resolved = |destination: Option<&str>| ResolvedSlot {
+            row: row("a"),
+            path: PathBuf::from("/dl/X [12345678]/a.flac"),
+            destination: destination.map(str::to_string),
+        };
+        let albums = album_jobs(
+            vec![resolved(Some("X [12345678]")), resolved(None)],
+            Path::new("/music"),
+            &user,
+            &DuplicateRule::Skip,
+            Path::new("/dl"),
+        );
+        assert_eq!(albums.len(), 2);
+        assert!(albums
+            .iter()
+            .all(|job| matches!(job.duplicates, Duplicates::Skip)));
+    }
 
     #[test]
     fn an_album_imports_its_batch_folder_once_and_adopted_files_alone() {
@@ -170,34 +318,63 @@ mod tests {
             },
         ];
 
-        let jobs: Vec<(Vec<PathBuf>, ImportMode, Vec<String>)> =
-            album_jobs(resolved, Path::new("/music"), "u", Path::new("/dl"))
-                .into_iter()
-                .map(|job| {
-                    assert_eq!(job.cleanup_root.as_deref(), Some(Path::new("/dl")));
-                    assert_eq!(job.target, Path::new("/music"));
-                    let owner = job.owner.unwrap();
-                    assert_eq!(owner.username, "u");
-                    let items = owner.rows.into_iter().map(|r| r.item).collect();
-                    (job.sources, job.mode, items)
-                })
-                .collect();
+        type Shown = (Vec<PathBuf>, Vec<PathBuf>, ImportMode, Vec<String>);
+        let jobs: Vec<Shown> = album_jobs(
+            resolved,
+            Path::new("/music"),
+            &UserId::new("u"),
+            &DuplicateRule::Guarded,
+            Path::new("/dl"),
+        )
+        .into_iter()
+        .map(|job| {
+            assert_eq!(job.cleanup_root.as_deref(), Some(Path::new("/dl")));
+            assert_eq!(job.target, Path::new("/music"));
+            let owner = job.owner.unwrap();
+            assert_eq!(owner.user_id, UserId::new("u"));
+            let items = owner.rows.into_iter().map(|r| r.item).collect();
+            (job.sources, job.files, job.mode, items)
+        })
+        .collect();
 
+        // An album's own files are its rows' files, not whatever else its folder holds.
         assert_eq!(
             jobs,
             vec![
                 (
                     vec![PathBuf::from("/dl/X [12345678]")],
+                    vec![
+                        PathBuf::from("/dl/X [12345678]/a.flac"),
+                        PathBuf::from("/dl/X [12345678]/b_639097129778484198.flac")
+                    ],
                     ImportMode::Album,
                     vec!["a".to_string(), "b".to_string()]
                 ),
                 (
+                    vec![PathBuf::from("/dl/Other/f.flac")],
                     vec![PathBuf::from("/dl/Other/f.flac")],
                     ImportMode::Singleton,
                     vec!["adopted".to_string()]
                 ),
             ]
         );
+    }
+
+    /// A transfer the batch did not enqueue is looked for in the whole
+    /// download folder; a file found there that went to another download is
+    /// claimed, not missing.
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_file_another_download_took_is_claimed() {
+        let base = tempfile::tempdir().unwrap();
+        let album = base.path().join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01.flac"), b"x").unwrap();
+        let claimed = Mutex::new(HashSet::from([file_id(&album.join("01.flac")).unwrap()]));
+
+        let found = resolve_on_disk(r"music\Album\01.flac", base.path(), None, &claimed).await;
+        assert_eq!(found, Err(Unresolved::Claimed));
+        let found = resolve_on_disk(r"music\Album\02.flac", base.path(), None, &claimed).await;
+        assert_eq!(found, Err(Unresolved::NotOnDisk));
     }
 
     #[tokio::test]
@@ -214,10 +391,11 @@ mod tests {
             &Mutex::new(HashSet::new()),
         )
         .await;
-        assert_eq!(found, Some(folder.join("01.flac")));
+        assert_eq!(found, Ok(folder.join("01.flac")));
     }
 
-    #[tokio::test]
+    // Paused: the retries' backoff passes at once.
+    #[tokio::test(start_paused = true)]
     async fn a_resolved_file_is_claimed_and_not_returned_twice() {
         let base = tempfile::tempdir().unwrap();
         let folder = base.path().join("X [12345678]");
@@ -227,12 +405,14 @@ mod tests {
         let claimed = Mutex::new(HashSet::new());
 
         let first = resolve_on_disk("a/01.flac", base.path(), Some("X [12345678]"), &claimed);
-        assert_eq!(first.await, Some(folder.join("01.flac")));
+        assert_eq!(first.await, Ok(folder.join("01.flac")));
         let second = resolve_on_disk("b/01.flac", base.path(), Some("X [12345678]"), &claimed);
-        assert_eq!(
-            second.await,
-            Some(folder.join("01_639097129778484198.flac"))
-        );
+        assert_eq!(second.await, Ok(folder.join("01_639097129778484198.flac")));
         assert_eq!(claimed.lock().unwrap().len(), 2);
+
+        let third = resolve_on_disk("c/01.flac", base.path(), Some("X [12345678]"), &claimed);
+        assert_eq!(third.await, Err(Unresolved::Claimed));
+        let other = resolve_on_disk("c/02.flac", base.path(), Some("X [12345678]"), &claimed);
+        assert_eq!(other.await, Err(Unresolved::NotOnDisk));
     }
 }

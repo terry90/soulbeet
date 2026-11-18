@@ -2,9 +2,6 @@ use dioxus::prelude::*;
 use shared::navidrome::{DiscoveryConfig, DiscoveryTrack};
 
 #[cfg(feature = "server")]
-use shared::navidrome::DiscoveryStatus;
-
-#[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
 
 #[cfg(feature = "server")]
@@ -37,7 +34,9 @@ async fn update_progress(
 }
 
 #[cfg(feature = "server")]
-use crate::import_queue::{ImportJob, IMPORT_QUEUE};
+use crate::auth::UserId;
+#[cfg(feature = "server")]
+use crate::import_queue::{Duplicates, ImportJob, IMPORT_QUEUE};
 #[cfg(feature = "server")]
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 #[cfg(feature = "server")]
@@ -46,24 +45,58 @@ use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
 use crate::server_fns::download::enqueue::{
-    enqueue_claimed, failed_reason, transfer_key, OTHER_USER,
+    enqueue_claimed, held_failure, not_enqueued_failure, transfer_key,
 };
 #[cfg(feature = "server")]
 use crate::server_fns::download::failover::{self, SourcePool};
 #[cfg(feature = "server")]
-use crate::server_fns::download::monitor::{transfer_by_id, FAILED_STATE_CONFIRM};
+use crate::server_fns::download::monitor::{
+    read_pending_retry, transfer_by_id, FAILED_STATE_CONFIRM,
+};
 #[cfg(feature = "server")]
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
 #[cfg(feature = "server")]
 use crate::AuthSession;
 
 #[cfg(feature = "server")]
-use super::{refusal_error, server_error};
+use super::{failure_error, server_error};
+#[cfg(feature = "server")]
+use crate::core::discovery::{
+    choose_discovery_folder, claim_run, current_progress, discovery_disabled,
+    discovery_folder_required, generation_running, parse_profiles, promote, remove_in, start_in,
+    DiscoveryEffects, Replace,
+};
+#[cfg(feature = "server")]
+use crate::core::{database_failure, target_unwritable};
+#[cfg(feature = "server")]
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+#[cfg(feature = "server")]
+use shared::navidrome::DiscoveryProgress;
+
+/// The discovery folder the user's settings name no longer exists.
+#[cfg(feature = "server")]
+fn discovery_folder_not_found() -> Failure {
+    Failure::new(
+        FailureCode::FolderRequired,
+        Stage::Input,
+        RetryAdvice::NeedsUser,
+        "Discovery folder not found",
+    )
+    .with_user_action(choose_discovery_folder())
+}
+
+/// A database error of a generation run, shown as the database's own text.
+#[cfg(feature = "server")]
+fn run_database_failure(stage: Stage, e: String) -> Failure {
+    database_failure(stage, &e).with_message(e)
+}
 
 /// Get the current user's discovery configuration
 #[get("/api/discovery/config", auth: AuthSession)]
 pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
-    let settings = UserSettings::get(&auth.0.sub).await.map_err(server_error)?;
+    let settings = UserSettings::get(&auth.0.user_id)
+        .await
+        .map_err(server_error)?;
     let folder_name = if let Some(ref fid) = settings.discovery_folder_id {
         Folder::get_by_id(fid).await.ok().flatten().map(|f| f.name)
     } else {
@@ -88,7 +121,9 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
 /// Get discovery tracks for the current user's configured folder
 #[get("/api/discovery/tracks", auth: AuthSession)]
 pub async fn get_discovery_tracks() -> Result<Vec<DiscoveryTrack>, ServerFnError> {
-    let settings = UserSettings::get(&auth.0.sub).await.map_err(server_error)?;
+    let settings = UserSettings::get(&auth.0.user_id)
+        .await
+        .map_err(server_error)?;
     if let Some(ref folder_id) = settings.discovery_folder_id {
         DiscoveryTrackRow::get_by_folder(folder_id)
             .await
@@ -105,195 +140,108 @@ pub struct TrackActionRequest {
 
 #[post("/api/discovery/promote", auth: AuthSession)]
 pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    let track = DiscoveryTrackRow::get_by_id(&req.track_id)
-        .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("Track not found"))?;
-
-    let folder = Folder::get_by_id(&track.folder_id)
-        .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("Folder not found"))?;
-
-    if folder.user_id != auth.0.sub {
-        return Err(server_error("Not authorized to modify this track"));
-    }
-
-    use super::navidrome::PromoteError;
-    super::navidrome::promote_discovery_track_internal(&req.track_id, &auth.0.sub)
-        .await
-        .map_err(|e| match e {
-            PromoteError::Refused(reason) => refusal_error(reason),
-            PromoteError::Failed(e) => server_error(e),
-        })
+    let effects: Arc<dyn DiscoveryEffects> = Arc::new(LiveDiscovery);
+    let replace = Replace::Guarded(crate::core::delete_guard::Origin::Ui);
+    promote(
+        &crate::db::DB,
+        &effects,
+        &auth.0.id(),
+        &req.track_id,
+        replace,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|n| failure_error(n.into_failure()))
 }
 
 #[post("/api/discovery/remove", auth: AuthSession)]
 pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    #[cfg(feature = "server")]
-    use crate::models::discovery_history::DiscoveryHistoryRow;
-
-    let track = DiscoveryTrackRow::get_by_id(&req.track_id)
+    remove_in(&crate::db::DB, &auth.0.id(), &req.track_id)
         .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("Track not found"))?;
-
-    let folder = Folder::get_by_id(&track.folder_id)
-        .await
-        .map_err(server_error)?
-        .ok_or_else(|| server_error("Folder not found"))?;
-
-    if folder.user_id != auth.0.sub {
-        return Err(server_error("Not authorized to modify this track"));
-    }
-
-    let path = std::path::Path::new(&track.path);
-    if path.exists() {
-        tokio::fs::remove_file(path)
-            .await
-            .map_err(|e| server_error(format!("Failed to delete: {}", e)))?;
-        // Clean up empty Artist/Album/ dirs left by beets
-        if let Some(parent) = path.parent() {
-            let profile_root = folder.discovery_profile_path(&track.profile);
-            let _ =
-                super::cleanup_empty_ancestors(parent, std::path::Path::new(&profile_root)).await;
-        }
-    }
-
-    DiscoveryTrackRow::update_status(&req.track_id, &DiscoveryStatus::Removed)
-        .await
-        .map_err(server_error)?;
-
-    if let Err(e) =
-        DiscoveryHistoryRow::update_outcome(&auth.0.sub, &track.artist, &track.title, "removed")
-            .await
-    {
-        warn!(
-            "Failed to update history for removed track '{}': {}",
-            track.title, e
-        );
-    }
-
-    info!("Removed discovery track: {}", track.title);
-    Ok(())
+        .map(|_| ())
+        .map_err(|n| failure_error(n.into_failure()))
 }
 
 #[post("/api/discovery/start-generation", auth: AuthSession)]
 pub async fn start_discovery_generation() -> Result<(), ServerFnError> {
-    use shared::navidrome::{DiscoveryProgress, GenerationStatus, ProfilePhase, ProfileProgress};
-
-    let user_id = auth.0.sub.clone();
-
-    // Check if already running
-    {
-        let progress = crate::globals::DISCOVERY_PROGRESS.read().await;
-        if let Some(p) = progress.get(&user_id) {
-            if !p.is_terminal() {
-                return Err(server_error("Discovery generation already in progress"));
-            }
-        }
-    }
-
-    // Read settings to get profile list for initial progress state
-    let settings = UserSettings::get(&user_id).await.map_err(server_error)?;
-    if !settings.discovery_enabled {
-        return Err(server_error("Discovery is not enabled"));
-    }
-    let selected_profiles = parse_profiles(&settings.discovery_profiles);
-    let track_counts = settings.parse_track_counts();
-    let folder_id = settings
-        .discovery_folder_id
-        .as_ref()
-        .ok_or_else(|| server_error("No download folder configured for discovery"))?;
-
-    // Determine which profiles need tracks (skip those already at target)
-    let mut profile_entries = Vec::new();
-    for profile in &selected_profiles {
-        let profile_name = profile.to_string();
-        let target = track_counts.get(&profile_name).copied().unwrap_or(10) as usize;
-        let existing =
-            DiscoveryTrackRow::get_pending_by_folder_and_profile(folder_id, &profile_name)
-                .await
-                .map(|v| v.len())
-                .unwrap_or(0);
-        let phase = if target.saturating_sub(existing) == 0 {
-            ProfilePhase::Skipped
-        } else {
-            ProfilePhase::Waiting
-        };
-        profile_entries.push(ProfileProgress {
-            profile: profile_name,
-            phase,
-            current: 0,
-            total: 0,
-        });
-    }
-
-    // Write initial progress BEFORE spawn (prevents race with first poll)
-    {
-        let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
-        map.insert(
-            user_id.clone(),
-            DiscoveryProgress {
-                status: GenerationStatus::Running,
-                profiles: profile_entries,
-                started_at: Some(chrono::Utc::now().to_rfc3339()),
-                ..Default::default()
-            },
-        );
-    }
-
-    // Spawn background task
-    let uid = user_id.clone();
-    tokio::spawn(async move {
-        match generate_discovery_playlist_internal(&uid).await {
-            Ok(result) => {
-                let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
-                if let Some(p) = map.get_mut(&uid) {
-                    p.status = GenerationStatus::Complete;
-                    p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    for pp in &mut p.profiles {
-                        if pp.phase != ProfilePhase::Skipped {
-                            pp.phase = ProfilePhase::Done;
-                            pp.current = pp.total;
-                        }
-                    }
-                    p.result = Some(result);
-                }
-            }
-            Err(e) => {
-                let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
-                if let Some(p) = map.get_mut(&uid) {
-                    p.status = GenerationStatus::Error;
-                    p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    p.error = Some(e.to_string());
-                }
-            }
-        }
-    });
-
-    Ok(())
+    start_in(&crate::db::DB, &LiveDiscovery, &auth.0)
+        .await
+        .map(|_| ())
+        .map_err(failure_error)
 }
 
 #[get("/api/discovery/progress", auth: AuthSession)]
 pub async fn get_discovery_progress(
 ) -> Result<Option<shared::navidrome::DiscoveryProgress>, ServerFnError> {
-    let progress = crate::globals::DISCOVERY_PROGRESS.read().await;
-    match progress.get(&auth.0.sub) {
-        Some(p) => {
-            // Return None for terminal states older than 5 minutes
-            if p.is_terminal() {
-                if let Some(ref completed_at) = p.completed_at {
-                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(completed_at) {
-                        if chrono::Utc::now().signed_duration_since(ts).num_minutes() > 5 {
-                            return Ok(None);
+    let progress = LiveDiscovery.current(&auth.0.id()).await;
+    Ok(progress.and_then(|p| current_progress(&p, chrono::Utc::now())))
+}
+
+/// Discovery as the running server does it: runs in `DISCOVERY_PROGRESS`, the generation in
+/// its own task, imports through the library's import queue.
+#[cfg(feature = "server")]
+pub(crate) struct LiveDiscovery;
+
+#[cfg(feature = "server")]
+#[async_trait::async_trait]
+impl DiscoveryEffects for LiveDiscovery {
+    async fn claim(&self, user: &UserId, progress: DiscoveryProgress) -> Result<(), Failure> {
+        let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+        claim_run(&mut map, &user.to_string(), progress)
+    }
+
+    async fn current(&self, user: &UserId) -> Option<DiscoveryProgress> {
+        let map = crate::globals::DISCOVERY_PROGRESS.read().await;
+        map.get(&user.to_string()).cloned()
+    }
+
+    fn generate(&self, user: &UserId) {
+        use shared::navidrome::{GenerationStatus, ProfilePhase};
+
+        let uid = user.to_string();
+        tokio::spawn(async move {
+            match generate_discovery_playlist_internal(&uid).await {
+                Ok(result) => {
+                    let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+                    if let Some(p) = map.get_mut(&uid) {
+                        p.status = GenerationStatus::Complete;
+                        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        for pp in &mut p.profiles {
+                            if pp.phase != ProfilePhase::Skipped {
+                                pp.phase = ProfilePhase::Done;
+                                pp.current = pp.total;
+                            }
                         }
+                        p.result = Some(result);
+                    }
+                }
+                Err(e) => {
+                    let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+                    if let Some(p) = map.get_mut(&uid) {
+                        p.status = GenerationStatus::Error;
+                        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        p.failure = Some(e);
                     }
                 }
             }
-            Ok(Some(p.clone()))
-        }
-        None => Ok(None),
+        });
+    }
+
+    async fn import(
+        &self,
+        src: &std::path::Path,
+        target: &std::path::Path,
+        actor: &UserId,
+        replace: Replace,
+    ) -> Result<(), Failure> {
+        let duplicates = match replace {
+            Replace::Guarded(origin) => Duplicates::Guarded {
+                actor: actor.clone(),
+                origin,
+            },
+            Replace::Never => Duplicates::Skip,
+        };
+        crate::import_queue::import_to_library(src, target, duplicates).await
     }
 }
 
@@ -317,6 +265,9 @@ struct QueuedTrack {
     /// When this track's transfer was first seen failed, cleared the moment
     /// it is seen in any other state.
     failing_since: Option<tokio::time::Instant>,
+    /// When this track's transfer was first seen as a failed attempt slskd
+    /// will retry (`read_pending_retry`).
+    retry_pending_since: Option<tokio::time::Instant>,
     /// Alternate peers for this track, and how many have been tried.
     pool: SourcePool,
 }
@@ -340,14 +291,23 @@ enum Outcome {
     Cancelled,
 }
 
+/// Whether a discovery transfer in `state` delivered its file.
+#[cfg(feature = "server")]
+fn succeeded(state: &shared::download::DownloadState) -> bool {
+    use shared::download::DownloadState as DS;
+    matches!(state, DS::Completed | DS::Imported | DS::ImportSkipped)
+}
+
 /// Settle one poll of slskd's transfer list against the tracks still pending.
 ///
 /// `pending` and `failed` hold transfer ids. Finished transfers leave
 /// `pending`; a failed one retries from the track's next-best peer, moving
 /// the track's key and transfer id to it, and only lands in `failed` once
 /// the track is out of peers. A cancellation is a decision rather than a
-/// peer problem, so it fails without a retry. A track that settles without
-/// a file gives up its key.
+/// peer problem, so it fails without a retry: one slskd shows, and one its
+/// user asked for through the transfer registry, which is cancelled here
+/// unless it already finished. A track that settles without a file gives up
+/// its key.
 ///
 /// A failure counts only once it has persisted for `FAILED_STATE_CONFIRM`,
 /// the same window `DownloadMonitor` applies. slskd 0.26 retries failed
@@ -363,21 +323,41 @@ async fn settle_poll(
     failed: &mut std::collections::HashSet<String>,
     backend: &Arc<dyn soulbeet::DownloadBackend>,
 ) {
+    let registry = TransferRegistry::global();
     let mut newly_done: Vec<(usize, String, Outcome)> = Vec::new();
     for (idx, qt) in queued.iter_mut().enumerate() {
         if !pending.contains(&qt.transfer_id) {
             continue;
         }
-        let Some(dl) = transfer_by_id(downloads, &qt.key.peer, &qt.transfer_id) else {
+        let listed = transfer_by_id(downloads, &qt.key.peer, &qt.transfer_id);
+        if registry.is_cancelled(&qt.key, &qt.batch.owner)
+            && !listed.is_some_and(|dl| succeeded(&dl.state))
+        {
+            info!(
+                "Discovery: '{}' - {} cancelled on request",
+                qt.artist, qt.track
+            );
+            if let Err(e) = backend
+                .cancel_download(&qt.key.peer, &qt.transfer_id, false)
+                .await
+            {
+                warn!(
+                    "Failed to cancel transfer {} in slskd: {}",
+                    qt.transfer_id, e
+                );
+            }
+            newly_done.push((idx, qt.transfer_id.clone(), Outcome::Cancelled));
+            continue;
+        }
+        let Some(dl) = listed else {
             continue;
         };
+        let dl = read_pending_retry(dl, &mut qt.retry_pending_since);
         if !matches!(dl.state, shared::download::DownloadState::Failed(_)) {
             qt.failing_since = None;
         }
         match &dl.state {
-            shared::download::DownloadState::Completed
-            | shared::download::DownloadState::Imported
-            | shared::download::DownloadState::ImportSkipped => {
+            state if succeeded(state) => {
                 newly_done.push((idx, qt.transfer_id.clone(), Outcome::Succeeded));
             }
             shared::download::DownloadState::Failed(_) => {
@@ -395,7 +375,6 @@ async fn settle_poll(
         }
     }
 
-    let registry = TransferRegistry::global();
     for (idx, id, outcome) in newly_done {
         pending.remove(&id);
         let qt = &mut queued[idx];
@@ -406,30 +385,44 @@ async fn settle_poll(
                 registry.release(&qt.key, &qt.batch.owner);
                 failed.insert(id);
             }
-            Outcome::Failed => match qt.pool.enqueue_next(0, backend, &qt.batch).await {
-                Some(next) => {
-                    info!(
-                        "Discovery: '{}' - {} failed from {}, retrying from {}",
-                        qt.artist, qt.track, qt.key.peer, next.source
+            Outcome::Failed => {
+                let next = qt.pool.enqueue_next(0, backend, &qt.batch).await;
+                for refused in &next.refused {
+                    warn!(
+                        "Discovery: '{}' - {} failover source {} refused: {}: {}",
+                        qt.artist,
+                        qt.track,
+                        refused.candidate.source,
+                        refused.failure.code.as_str(),
+                        refused.failure.message
                     );
-                    // The new peer serves this track under its own remote
-                    // path and transfer id, so the whole identity moves at
-                    // once, and the fresh transfer starts with no failure
-                    // recorded.
-                    let dead = std::mem::replace(
-                        &mut qt.key,
-                        transfer_key(backend.id(), &next.source, &next.item),
-                    );
-                    registry.release(&dead, &qt.batch.owner);
-                    qt.transfer_id = next.id.clone();
-                    qt.failing_since = None;
-                    pending.insert(next.id);
                 }
-                None => {
-                    registry.release(&qt.key, &qt.batch.owner);
-                    failed.insert(id);
+                match next.queued {
+                    Some((_, next)) => {
+                        info!(
+                            "Discovery: '{}' - {} failed from {}, retrying from {}",
+                            qt.artist, qt.track, qt.key.peer, next.source
+                        );
+                        // The new peer serves this track under its own remote
+                        // path and transfer id, so the whole identity moves at
+                        // once, a cancel asked for meanwhile with it, and the
+                        // fresh transfer starts with no failure recorded.
+                        let dead = std::mem::replace(
+                            &mut qt.key,
+                            transfer_key(backend.id(), &next.source, &next.item),
+                        );
+                        registry.hand_over(&dead, &qt.key, &qt.batch.owner);
+                        qt.transfer_id = next.id.clone();
+                        qt.failing_since = None;
+                        qt.retry_pending_since = None;
+                        pending.insert(next.id);
+                    }
+                    None => {
+                        registry.release(&qt.key, &qt.batch.owner);
+                        failed.insert(id);
+                    }
                 }
-            },
+            }
         }
     }
 }
@@ -437,7 +430,7 @@ async fn settle_poll(
 #[cfg(feature = "server")]
 pub async fn generate_discovery_playlist_internal(
     user_id: &str,
-) -> Result<shared::navidrome::GenerationResult, String> {
+) -> Result<shared::navidrome::GenerationResult, Failure> {
     use crate::models::deletion_review::DeletionReviewRow;
     use crate::models::discovery_candidate::DiscoveryCandidateRow;
     use crate::models::discovery_history::DiscoveryHistoryRow;
@@ -453,44 +446,54 @@ pub async fn generate_discovery_playlist_internal(
             .clone()
     };
     let Ok(_guard) = user_lock.try_lock() else {
-        return Err("Discovery generation already in progress".to_string());
+        return Err(generation_running());
     };
 
-    let settings = UserSettings::get(user_id).await?;
+    let settings = UserSettings::get(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
     if !settings.discovery_enabled {
-        return Err("Discovery is not enabled".to_string());
+        return Err(discovery_disabled());
     }
     let folder_id = settings
         .discovery_folder_id
         .as_ref()
-        .ok_or("No download folder configured for discovery")?;
+        .ok_or_else(discovery_folder_required)?;
     let folder = Folder::get_by_id(folder_id)
-        .await?
-        .ok_or("Discovery folder not found")?;
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?
+        .ok_or_else(discovery_folder_not_found)?;
 
     // Shown as the run's error, so the user sees why nothing was imported.
-    if let Some(issue) = crate::importer_health::broken_issue().await {
-        return Err(issue.title);
+    if let Some(failure) = crate::importer_health::blocking_failure().await {
+        return Err(failure);
     }
 
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
     let track_counts = settings.parse_track_counts();
 
-    let backend = download_backend(None).await?;
+    let backend = download_backend(None)
+        .await
+        .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))?;
 
     // Create per-profile subdirectories under Discovery/
     for profile in &selected_profiles {
         let profile_dir = folder.discovery_profile_path(&profile.to_string());
-        tokio::fs::create_dir_all(&profile_dir)
-            .await
-            .map_err(|e| format!("Failed to create Discovery/{} dir: {}", profile, e))?;
+        tokio::fs::create_dir_all(&profile_dir).await.map_err(|e| {
+            target_unwritable(
+                &e,
+                format!("Failed to create Discovery/{} dir: {}", profile, e),
+            )
+        })?;
     }
 
     // Build the "already seen" set for deduplication
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Past discovery suggestions
-    let history_keys = DiscoveryHistoryRow::get_suggested_keys(user_id).await?;
+    let history_keys = DiscoveryHistoryRow::get_suggested_keys(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
     info!(
         "Loaded {} tracks from discovery history",
         history_keys.len()
@@ -498,21 +501,16 @@ pub async fn generate_discovery_playlist_internal(
     seen.extend(history_keys);
 
     // Past deletions (user doesn't want these back)
-    let deletions = DeletionReviewRow::get_history(user_id, 1000).await?;
-    let deletion_count = deletions.len();
-    for d in &deletions {
-        seen.insert(format!(
-            "{}:{}",
-            d.artist.to_lowercase(),
-            d.title.to_lowercase()
-        ));
-    }
-    info!("Added {} deleted tracks to exclusion set", deletion_count);
+    let disliked = DeletionReviewRow::disliked_keys(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
+    info!("Added {} deleted tracks to exclusion set", disliked.len());
+    seen.extend(disliked);
 
     let mut total_downloads = 0u32;
     let mut all_profile_stats: Vec<ProfileGenerationStats> = Vec::new();
     // Set when the importer broke during the run and stopped it.
-    let mut importer_issue: Option<String> = None;
+    let mut importer_issue: Option<Failure> = None;
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
@@ -573,7 +571,9 @@ pub async fn generate_discovery_playlist_internal(
             // Over-fetch candidates (3x) to survive search/download/import attrition
             let fetch_count = (remaining as f64 * 3.0).ceil() as u32;
             let mut candidates =
-                DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count).await?;
+                DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count)
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Input, e))?;
 
             if candidates.is_empty() {
                 if _attempt == 0 {
@@ -595,7 +595,8 @@ pub async fn generate_discovery_playlist_internal(
                     }
                     candidates =
                         DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count)
-                            .await?;
+                            .await
+                            .map_err(|e| run_database_failure(Stage::Input, e))?;
                 }
                 if candidates.is_empty() {
                     info!("{}: no more candidates available", profile_name);
@@ -603,9 +604,9 @@ pub async fn generate_discovery_playlist_internal(
                 }
             }
 
-            if let Some(issue) = crate::importer_health::broken_issue().await {
-                warn!("Discovery for {user_id} skipped: {}", issue.title);
-                importer_issue = Some(issue.title);
+            if let Some(failure) = crate::importer_health::blocking_failure().await {
+                warn!("Discovery for {user_id} skipped: {}", failure.message);
+                importer_issue = Some(failure);
                 break;
             }
 
@@ -651,7 +652,8 @@ pub async fn generate_discovery_playlist_internal(
                     release_mbid: None,
                 }];
 
-                let search_id = match backend.start_search(None, &search_tracks).await {
+                let spec = shared::download::SearchSpec::of(None, search_tracks);
+                let search_id = match backend.start_search(&spec).await {
                     Ok(id) => id,
                     Err(e) => {
                         warn!(
@@ -666,7 +668,8 @@ pub async fn generate_discovery_playlist_internal(
                             &candidate.artist,
                             &candidate.track,
                         )
-                        .await?;
+                        .await
+                        .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
                         continue;
                     }
                 };
@@ -715,7 +718,8 @@ pub async fn generate_discovery_playlist_internal(
                         &candidate.artist,
                         &candidate.track,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
                     continue;
                 }
                 stats.search_hits += 1;
@@ -725,11 +729,12 @@ pub async fn generate_discovery_playlist_internal(
                 ranked_items.truncate(failover::MAX_SOURCES_PER_TRACK);
                 let track_batch = BatchRef::new(
                     TransferOwner {
-                        user_id: user_id.to_string(),
+                        user_id: UserId::new(user_id),
                         batch_id: uuid::Uuid::new_v4().to_string(),
                     },
                     format!("{} - {}", candidate.artist, candidate.track),
                     std::path::PathBuf::from(folder.discovery_profile_path(&profile_name)),
+                    soulbeet::ImportMode::Singleton,
                 );
                 // Discovery watches its own transfers, so nothing may join it.
                 track_batch.inbox.close();
@@ -739,23 +744,22 @@ pub async fn generate_discovery_playlist_internal(
                     let claim = TransferRegistry::global()
                         .claim(std::slice::from_ref(&transfer), &track_batch);
                     if claim.claimed.is_empty() {
-                        let owner = if claim.other_user.is_empty() {
-                            "already downloading for this user"
-                        } else {
-                            OTHER_USER
-                        };
                         info!(
                             "Download source {} skipped for '{}' - {}: {}",
                             attempt_idx + 1,
                             candidate.artist,
                             candidate.track,
-                            owner
+                            held_failure(&claim, &track_batch).message
                         );
                         stats.downloads_failed += 1;
                         continue;
                     }
+                    // Discovery keeps no ledger, so nothing reads its request back.
+                    let request = backend.new_request();
                     let download_results =
-                        match enqueue_claimed(&backend, vec![item.clone()], &track_batch).await {
+                        match enqueue_claimed(&backend, vec![item.clone()], &track_batch, &request)
+                            .await
+                        {
                             Ok(r) => r,
                             Err(e) => {
                                 if attempt_idx + 1 < ranked_items.len() {
@@ -791,6 +795,7 @@ pub async fn generate_discovery_playlist_internal(
                             key: transfer,
                             batch: track_batch.clone(),
                             failing_since: None,
+                            retry_pending_since: None,
                             // Start the pool at the source that actually
                             // enqueued: earlier entries were already tried and
                             // rejected in this loop, and must not be retried.
@@ -802,23 +807,20 @@ pub async fn generate_discovery_playlist_internal(
                             &candidate.artist,
                             &candidate.track,
                         )
-                        .await?;
+                        .await
+                        .map_err(|e| run_database_failure(Stage::Enqueue, e))?;
                         downloaded = true;
                         break;
                     }
                     // This source refused the file in its response
                     stats.downloads_failed += 1;
                     if attempt_idx + 1 < ranked_items.len() {
-                        let reason = download_results
-                            .iter()
-                            .find_map(|dl| failed_reason(&dl.status))
-                            .unwrap_or("nothing enqueued");
                         info!(
                             "Download source {} refused '{}' - {} ({}), trying next",
                             attempt_idx + 1,
                             candidate.artist,
                             candidate.track,
-                            reason
+                            not_enqueued_failure(&download_results).message
                         );
                     }
                 }
@@ -830,7 +832,8 @@ pub async fn generate_discovery_playlist_internal(
                         &candidate.artist,
                         &candidate.track,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Enqueue, e))?;
                 }
             }
 
@@ -952,8 +955,8 @@ pub async fn generate_discovery_playlist_internal(
                 )
                 .await;
                 let src = match resolved {
-                    Some(p) => p,
-                    None => {
+                    Ok(p) => p,
+                    Err(_) => {
                         warn!(
                             "Could not find downloaded file for '{}' - {} (slskd: {})",
                             qt.artist, qt.track, qt.key.filename
@@ -967,6 +970,7 @@ pub async fn generate_discovery_playlist_internal(
                 let outcome = IMPORT_QUEUE
                     .submit(ImportJob {
                         sources: vec![src.clone()],
+                        files: vec![src.clone()],
                         target: discovery_target.clone(),
                         mode: soulbeet::ImportMode::Singleton,
                         owner: None,
@@ -974,6 +978,9 @@ pub async fn generate_discovery_playlist_internal(
                         cleanup_root: Some(download_base.clone()),
                         choice: soulbeet::DriverChoice::Auto,
                         choices: None,
+                        // Discovery's staging keeps its own rules (section 13).
+                        duplicates: Duplicates::AsConfigured,
+                        last_run: None,
                     })
                     .await
                     .wait()
@@ -996,7 +1003,8 @@ pub async fn generate_discovery_playlist_internal(
                         // would download it again. Only genuine failures
                         // stay eligible for rediscovery.
                         DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_name)
-                            .await?;
+                            .await
+                            .map_err(|e| run_database_failure(Stage::Import, e))?;
                         continue;
                     }
                     DiscoveryImport::Failed => {
@@ -1029,12 +1037,15 @@ pub async fn generate_discovery_playlist_internal(
                         folder_id,
                         &profile_name,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Import, e))?;
                 }
                 // Recorded here, not at enqueue: discovery history is the
                 // permanent exclusion set, and a track killed by a bad peer
                 // must stay available to suggest again.
-                DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_name).await?;
+                DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_name)
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Import, e))?;
                 stats.imports_succeeded += 1;
                 profile_downloads += 1;
             }
@@ -1060,27 +1071,14 @@ pub async fn generate_discovery_playlist_internal(
         all_profile_stats.push(stats);
     }
 
-    UserSettings::update_discovery_last_generated(user_id).await?;
+    UserSettings::update_discovery_last_generated(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Import, e))?;
 
     // Trigger a Navidrome scan then wait for it to finish so playlists can be created.
     if total_downloads > 0 {
         if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
-            if let Err(e) = navi.start_scan().await {
-                warn!("Failed to trigger Navidrome scan: {}", e);
-            } else {
-                info!(
-                    "Triggered Navidrome library scan after {} discovery imports",
-                    total_downloads
-                );
-                // Wait for scan to complete (poll every 3s, max 2 min)
-                for _ in 0..40u32 {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                    match navi.get_scan_status().await {
-                        Ok(false) => break,
-                        Ok(true) => continue,
-                        Err(_) => break,
-                    }
-                }
+            if scan_imports(&navi, total_downloads).await {
                 // Create/update smart playlists now that tracks are indexed
                 if let Err(e) = reconcile_discovery_playlists(user_id).await {
                     warn!("Playlist reconciliation after generation failed: {}", e);
@@ -1096,6 +1094,51 @@ pub async fn generate_discovery_playlist_internal(
         total_imported: total_downloads,
         profiles: all_profile_stats,
     })
+}
+
+/// Starts a Navidrome scan of `imported` new tracks and waits up to two
+/// minutes for it to end. Returns whether the scan was started.
+///
+/// The scan runs in a goroutine and startScan answers at once, so "not
+/// scanning" alone can be read before it begins: the wait is for a scan that
+/// ended after the one recorded before it. When that cannot be read the scan
+/// is still started, only not waited for.
+#[cfg(feature = "server")]
+async fn scan_imports(navi: &soulbeet::navidrome::NavidromeClient, imported: u32) -> bool {
+    let before = match navi.get_scan_status().await {
+        Ok(status) => Some(status.last_scan),
+        Err(e) => {
+            warn!("Failed to read Navidrome scan status, not waiting for the scan: {e}");
+            None
+        }
+    };
+    if let Err(e) = navi.start_scan().await {
+        warn!("Failed to trigger Navidrome scan: {}", e);
+        return false;
+    }
+    info!(
+        "Triggered Navidrome library scan after {} discovery imports",
+        imported
+    );
+    let Some(before) = before else {
+        return true;
+    };
+    // Poll every 3s, at most 2 min
+    for _ in 0..40u32 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        match navi.get_scan_status().await {
+            Ok(status) if status.ended_after(before) => {
+                if !status.error.is_empty() {
+                    warn!("Navidrome scan reported an error: {}", status.error);
+                }
+                info!("Navidrome scan ended after {} items", status.count);
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    true
 }
 
 /// Create or update smart playlists in Navidrome for each discovery profile.
@@ -1203,7 +1246,7 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
 
 #[post("/api/discovery/generate-recommendations", auth: AuthSession)]
 pub async fn generate_recommendations() -> Result<u32, ServerFnError> {
-    generate_recommendations_internal(&auth.0.sub)
+    generate_recommendations_internal(&auth.0.user_id)
         .await
         .map_err(server_error)
 }
@@ -1224,9 +1267,9 @@ fn classify_discovery(outcome: &soulbeet::ImportOutcome) -> DiscoveryImport {
     use soulbeet::{ImportOutcome, SkipReason};
     match outcome {
         ImportOutcome::Imported { .. } => DiscoveryImport::Imported,
-        ImportOutcome::Skipped(SkipReason::NoMatch { .. } | SkipReason::AlreadyInLibrary) => {
-            DiscoveryImport::Permanent
-        }
+        ImportOutcome::Skipped(
+            SkipReason::NoMatch { .. } | SkipReason::AlreadyInLibrary { .. },
+        ) => DiscoveryImport::Permanent,
         ImportOutcome::Skipped(SkipReason::NothingToImport)
         | ImportOutcome::LookupFailed { .. }
         | ImportOutcome::Failed { .. }
@@ -1236,41 +1279,25 @@ fn classify_discovery(outcome: &soulbeet::ImportOutcome) -> DiscoveryImport {
 }
 
 /// Deletes a download discovery could not import (it has no retry) and
-/// prunes the folder it leaves empty.
+/// prunes the folder it leaves empty, logging what it could not delete.
 #[cfg(feature = "server")]
 async fn discard_download(src: &std::path::Path, download_base: &std::path::Path) {
-    let _ = tokio::fs::remove_file(src).await;
-    if let Some(dir) = src.parent() {
-        let _ = super::cleanup_empty_ancestors(dir, download_base).await;
+    let files = [src.to_path_buf()];
+    for (path, e) in crate::core::acquire::discard_files(&files, download_base).await {
+        tracing::warn!(
+            "Could not delete the discovery download {}: {e}",
+            path.display()
+        );
     }
-}
-
-#[cfg(feature = "server")]
-fn parse_profiles(s: &str) -> Vec<shared::recommendation::DiscoveryProfile> {
-    let mut profiles = Vec::new();
-    for part in s.split(',') {
-        if let Ok(p) = part.trim().parse() {
-            profiles.push(p);
-        }
-    }
-    if profiles.is_empty() {
-        profiles.push(shared::recommendation::DiscoveryProfile::default());
-    }
-    profiles
 }
 
 #[cfg(feature = "server")]
 pub async fn generate_recommendations_internal(user_id: &str) -> Result<u32, String> {
     use shared::recommendation::DiscoveryProfile;
 
-    let profiles = [
-        DiscoveryProfile::Conservative,
-        DiscoveryProfile::Balanced,
-        DiscoveryProfile::Adventurous,
-    ];
     let mut total = 0u32;
 
-    for profile in &profiles {
+    for profile in &DiscoveryProfile::ALL {
         match generate_recommendations_for_user(user_id, *profile).await {
             Ok(count) => total += count,
             Err(e) => {
@@ -1417,7 +1444,7 @@ pub async fn get_engine_report() -> Result<String, ServerFnError> {
     {
         use crate::models::engine_report::EngineReportRow;
         // Try new history table first, fall back to legacy user_profiles.last_report
-        let rows = EngineReportRow::get_history(&auth.0.sub, 1)
+        let rows = EngineReportRow::get_history(&auth.0.user_id, 1)
             .await
             .map_err(server_error)?;
         if let Some(row) = rows.into_iter().next() {
@@ -1427,7 +1454,7 @@ pub async fn get_engine_report() -> Result<String, ServerFnError> {
         }
         // Legacy fallback
         use crate::models::user_profile::UserProfileRow;
-        let report_json = UserProfileRow::get_report(&auth.0.sub)
+        let report_json = UserProfileRow::get_report(&auth.0.user_id)
             .await
             .map_err(server_error)?;
         match report_json {
@@ -1456,7 +1483,7 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
     #[cfg(feature = "server")]
     {
         use crate::models::engine_report::EngineReportRow;
-        let rows = EngineReportRow::get_history(&auth.0.sub, 30)
+        let rows = EngineReportRow::get_history(&auth.0.user_id, 30)
             .await
             .map_err(server_error)?;
         let mut entries = Vec::new();
@@ -1482,17 +1509,90 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use super::{settle_poll, QueuedTrack, FAILED_STATE_CONFIRM};
+    use super::{
+        discovery_folder_not_found, run_database_failure, scan_imports, settle_poll, QueuedTrack,
+        FAILED_STATE_CONFIRM,
+    };
+    use crate::core::discovery::{
+        discovery_disabled, discovery_folder_required, generation_running,
+    };
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
+    use crate::server_fns::download::monitor::RETRY_PENDING_FOR;
     use crate::server_fns::download::test_support::{
-        batch, item, transfer, ScriptedOutcome, StubBackend,
+        batch, item, transfer, Cancel, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::download::{DownloadProgress, DownloadState, DownloadableItem};
+    use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserActionCode};
     use soulbeet::DownloadBackend;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    #[test]
+    fn discovery_refusals_keep_their_text() {
+        use FailureCode::*;
+        use RetryAdvice::*;
+        for (f, code, retry, message) in [
+            (
+                generation_running(),
+                AlreadyRunning,
+                NotRetryable,
+                "Discovery generation already in progress",
+            ),
+            (
+                discovery_disabled(),
+                InvalidInput,
+                NotRetryable,
+                "Discovery is not enabled",
+            ),
+            (
+                discovery_folder_required(),
+                FolderRequired,
+                NeedsUser,
+                "No download folder configured for discovery",
+            ),
+            (
+                discovery_folder_not_found(),
+                FolderRequired,
+                NeedsUser,
+                "Discovery folder not found",
+            ),
+        ] {
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message.as_str()),
+                (code, Stage::Input, retry, message)
+            );
+        }
+        for f in [discovery_folder_required(), discovery_folder_not_found()] {
+            let action = f.user_action.unwrap();
+            assert_eq!(
+                (action.code, action.what.as_str(), action.where_.as_str()),
+                (
+                    UserActionCode::AddFolder,
+                    "Choose a discovery folder",
+                    "Settings > Library > Discovery"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_database_failure_keeps_the_database_text_at_its_stage() {
+        use shared::failure::{Cause, Service};
+        let raw = "error returned from database: (code: 5) database is locked";
+        let f = run_database_failure(Stage::SourceSearch, raw.to_string());
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::SettingsUnreadable,
+                Stage::SourceSearch,
+                RetryAdvice::SameSourceLater,
+                raw
+            )
+        );
+        assert_eq!(f.cause, Some(Cause::new(Service::Database, None, raw)));
+    }
 
     #[test]
     fn classify_discovery_keeps_config_failures_out_of_history() {
@@ -1505,6 +1605,8 @@ mod tests {
                 ImportOutcome::Imported {
                     untagged: false,
                     warnings: vec![],
+                    items: vec![],
+                    failure: None,
                 },
                 DiscoveryImport::Imported,
             ),
@@ -1513,7 +1615,7 @@ mod tests {
                 DiscoveryImport::Permanent,
             ),
             (
-                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary),
+                ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing: vec![] }),
                 DiscoveryImport::Permanent,
             ),
             (
@@ -1529,6 +1631,7 @@ mod tests {
             ),
             (
                 ImportOutcome::Failed {
+                    kind: soulbeet::FailKind::Beets,
                     message: "beets exited with code 1".into(),
                 },
                 DiscoveryImport::Failed,
@@ -1569,6 +1672,7 @@ mod tests {
             key,
             batch,
             failing_since: None,
+            retry_pending_since: None,
             pool: SourcePool::single(items),
         }
     }
@@ -1866,5 +1970,160 @@ mod tests {
         assert!(queued[0].failing_since.is_none());
         assert_eq!(pending, pending_of(&queued));
         assert!(failed_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pending_retry_held_past_its_bound_moves_to_the_next_peer() {
+        let backend = stub();
+        let mut queued = vec![queued_track(
+            vec![
+                item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+                item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+            ],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+        already_confirmed_failing(&mut queued[0]);
+        queued[0].retry_pending_since = Some(tokio::time::Instant::from_std(
+            std::time::Instant::now()
+                .checked_sub(RETRY_PENDING_FOR)
+                .expect("monotonic clock younger than the retry window"),
+        ));
+        let row = DownloadProgress {
+            pending_retry: Some(Failure::new(
+                FailureCode::TransferConnectionFailed,
+                Stage::Transfer,
+                RetryAdvice::OtherSource,
+                "Connection reset by peer",
+            )),
+            ..live("peer_a", "a/07 - Wake Up.flac")
+        };
+
+        settle_poll(&mut queued, &[row], &mut pending, &mut failed_ids, &backend).await;
+
+        assert_eq!(queued[0].pool.attempts_used(0), 2);
+    }
+
+    #[tokio::test]
+    async fn a_track_its_user_cancels_is_cancelled_and_not_retried() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let mut queued = vec![queued_track(
+            vec![
+                item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+                item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+            ],
+            &backend,
+        )];
+        let registry = TransferRegistry::global();
+        let own = queued[0].key.clone();
+        assert!(registry.request_cancel(&own, &queued[0].batch.owner.user_id));
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+
+        settle_poll(
+            &mut queued,
+            &[live("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed_ids,
+            &backend,
+        )
+        .await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-a/07 - Wake Up.flac")]
+        );
+        assert!(pending.is_empty());
+        assert!(failed_ids.contains("t-a/07 - Wake Up.flac"));
+        assert_eq!(queued[0].pool.attempts_used(0), 1, "no other peer");
+        assert!(registry.may_adopt(&own, &batch("Y").owner));
+    }
+
+    #[tokio::test]
+    async fn a_track_cancelled_after_its_transfer_finished_is_still_imported() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let mut queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        assert!(TransferRegistry::global()
+            .request_cancel(&queued[0].key, &queued[0].batch.owner.user_id));
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+
+        settle_poll(
+            &mut queued,
+            &[completed("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed_ids,
+            &backend,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(failed_ids.is_empty(), "it settled as done");
+        assert!(stub.cancelled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_asked_for_during_a_tracks_failover_follows_it() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let mut queued = vec![queued_track(
+            vec![
+                item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+                item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+            ],
+            &backend,
+        )];
+        let registry = TransferRegistry::global();
+        let first = queued[0].key.clone();
+        let user = queued[0].batch.owner.user_id.clone();
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+        already_confirmed_failing(&mut queued[0]);
+        let (reached, release) = stub.hold_downloads();
+        let cancel = async {
+            reached.notified().await; // the failover's enqueue is in flight
+            assert!(registry.request_cancel(&first, &user));
+            release.notify_one();
+        };
+
+        let dead = [failed("peer_a", "a/07 - Wake Up.flac")];
+        tokio::join!(
+            settle_poll(&mut queued, &dead, &mut pending, &mut failed_ids, &backend,),
+            cancel
+        );
+        assert_eq!(queued[0].key.peer, "peer_b");
+        settle_poll(
+            &mut queued,
+            &[live("peer_b", "b/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed_ids,
+            &backend,
+        )
+        .await;
+
+        assert!(stub
+            .cancelled()
+            .contains(&Cancel::only("peer_b", "t-b/07 - Wake Up.flac")));
+        assert!(pending.is_empty());
+        assert!(failed_ids.contains("t-b/07 - Wake Up.flac"));
+    }
+
+    #[tokio::test]
+    async fn a_scan_status_that_cannot_be_read_still_starts_the_scan() {
+        // getLastScanTime's `Internal Error` (server/subsonic/library_scanning.go:16-21); the scan
+        // is accepted.
+        let navi = crate::test_navidrome::NavidromeStub::start();
+        navi.answer(
+            "/rest/getScanStatus",
+            &[r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Internal Error"}}}"#],
+        );
+        assert!(scan_imports(&navi.client(), 3).await);
+        assert_eq!(navi.asked(), vec!["/rest/getScanStatus", "/rest/startScan"]);
     }
 }

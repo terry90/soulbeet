@@ -104,9 +104,11 @@ test('surfaces a mid-transfer error and recovers on retry', async ({ context, pa
 });
 
 test('rides out slskd auto-retry of a failed transfer', async ({ context, page }) => {
-  // slskd 0.26 retries failed downloads itself: the transfer briefly shows
+  // slskd retries a failed download that soulbeet reads as final (its retry
+  // limit was raised after soulbeet read it): the transfer briefly shows
   // "Completed, Errored", then re-queues and succeeds. The monitor must not
-  // act on the transient failure; the proof is that the file still imports.
+  // act on a failure shorter than its confirm window; the proof is that the
+  // file still imports.
   await setPeerBehavior('collector_01', 'retryflap');
   await setPeerBehavior('mp3_hoarder', 'offline');
   const { folder } = await freshSession(context, page, 'fail-retryflap');

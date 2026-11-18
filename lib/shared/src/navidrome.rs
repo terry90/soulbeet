@@ -24,7 +24,50 @@ pub struct DeletionReview {
     pub album: String,
     pub path: Option<String>,
     pub rating: Option<u8>,
+    pub reason: DeletionReason,
     pub created_at: String,
+    /// What started the deletion: "ui", "auto" or "mcp" (a connected app).
+    #[serde(default)]
+    pub origin: String,
+    /// The connected app's host, for an app's deletion.
+    #[serde(default)]
+    pub client: Option<String>,
+}
+
+/// Deletions per user in any 24 hours through connected apps (design 13, D4).
+pub const DAILY_APP_DELETIONS: u32 = 100;
+
+/// Why a file was deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionReason {
+    /// Its listener rated it down.
+    Disliked,
+    /// A new copy of it was imported.
+    Replaced,
+    /// Its listener asked to have it removed.
+    Cleanup,
+}
+
+impl DeletionReason {
+    /// Every reason's name, in variant order; as_str and parse read it.
+    pub const NAMES: &'static [&'static str] = &["disliked", "replaced", "cleanup"];
+
+    const ALL: [DeletionReason; 3] = [
+        DeletionReason::Disliked,
+        DeletionReason::Replaced,
+        DeletionReason::Cleanup,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+
+    /// The reason named `text`, None for a name NAMES does not hold.
+    pub fn parse(text: &str) -> Option<DeletionReason> {
+        let at = Self::NAMES.iter().position(|name| *name == text)?;
+        Some(Self::ALL[at])
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -59,6 +102,8 @@ pub enum DiscoveryStatus {
     Pending,
     Promoting,
     Promoted,
+    /// Claimed for removal: its staged file is being deleted.
+    Removing,
     Removed,
 }
 
@@ -68,6 +113,7 @@ impl std::fmt::Display for DiscoveryStatus {
             DiscoveryStatus::Pending => write!(f, "Pending"),
             DiscoveryStatus::Promoting => write!(f, "Promoting"),
             DiscoveryStatus::Promoted => write!(f, "Promoted"),
+            DiscoveryStatus::Removing => write!(f, "Removing"),
             DiscoveryStatus::Removed => write!(f, "Removed"),
         }
     }
@@ -80,6 +126,7 @@ impl std::str::FromStr for DiscoveryStatus {
             "Pending" => Ok(DiscoveryStatus::Pending),
             "Promoting" => Ok(DiscoveryStatus::Promoting),
             "Promoted" => Ok(DiscoveryStatus::Promoted),
+            "Removing" => Ok(DiscoveryStatus::Removing),
             "Removed" => Ok(DiscoveryStatus::Removed),
             _ => Err(format!("Unknown discovery status: {}", s)),
         }
@@ -124,12 +171,35 @@ pub struct ProfileGenerationStats {
     pub imports_file_missing: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// A Soulful account whose Navidrome ratings the delete guard could not read, so deletions
+/// are refused until a read succeeds. Shown to admins only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnreadableListener {
+    pub username: String,
+    /// What the last failed read gave.
+    pub error: String,
+    /// When reads of this account started failing (SQLite `datetime('now')`, UTC).
+    pub since: String,
+}
+
+/// A track auto-delete kept at the user's last rating sync, and why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BlockedDeletion {
+    pub title: String,
+    pub artist: String,
+    /// The guard's refusal.
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct SyncResult {
     pub deleted_tracks: u32,
     pub promoted_tracks: u32,
     pub removed_tracks: u32,
     pub total_songs_scanned: u32,
+    /// The 1-star tracks auto-delete kept.
+    #[serde(default)]
+    pub kept_tracks: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -184,7 +254,9 @@ pub struct DiscoveryProgress {
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub result: Option<GenerationResult>,
-    pub error: Option<String>,
+    /// Why the run failed or could not go on, when its status is `Error`.
+    #[serde(default)]
+    pub failure: Option<crate::failure::Failure>,
 }
 
 impl DiscoveryProgress {
@@ -193,5 +265,30 @@ impl DiscoveryProgress {
             self.status,
             GenerationStatus::Complete | GenerationStatus::Error
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_reason_reads_back_from_its_name() {
+        for name in DeletionReason::NAMES {
+            let reason = DeletionReason::parse(name).unwrap();
+            assert_eq!(reason.as_str(), *name);
+            // The wire name is the same.
+            assert_eq!(serde_json::to_value(reason).unwrap(), *name);
+        }
+        assert_eq!(DeletionReason::parse("because"), None);
+    }
+
+    #[test]
+    fn progress_from_an_older_server_reads_without_a_failure() {
+        let p: DiscoveryProgress = serde_json::from_value(serde_json::json!({
+            "status": "Error", "profiles": [], "started_at": null, "completed_at": null,
+            "result": null, "error": "Discovery is not enabled" }))
+        .unwrap();
+        assert_eq!(p.failure, None);
     }
 }

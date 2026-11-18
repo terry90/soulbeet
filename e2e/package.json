@@ -8,12 +8,14 @@
 		"fixtures": "tsx fixtures/generate.ts",
 		"stubs": "tsx stubs/src/main.ts",
 		"test": "playwright test",
+		"test:mcp": "playwright test -c playwright.mcp.config.ts",
 		"test:headed": "playwright test --headed",
 		"report": "playwright show-report"
 	},
 	"devDependencies": {
 		"@eslint/js": "^9.39.0",
-		"@playwright/test": "^1.60.0",
+		"@modelcontextprotocol/sdk": "1.32.2",
+		"@playwright/test": "^1.65.1",
 		"@types/node": "^22.19.0",
 		"eslint": "^9.39.0",
 		"tsx": "^4.20.0",

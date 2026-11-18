@@ -15,7 +15,10 @@ use ui::{
     AutoDownloadSignal, Downloads, HealthProvider, Layout, Navbar, SearchPrefill, SearchReset,
     SettingsProvider,
 };
-use views::{DashboardPage, LoginPage, SearchPage, SettingsPage, SettingsTab, SettingsTabRequest};
+use views::{
+    leave_login, DashboardPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage, SettingsPage,
+    SettingsTab, SettingsTabRequest,
+};
 
 mod auth;
 mod views;
@@ -28,6 +31,8 @@ pub enum Route {
     #[layout(AuthGuard)]
         #[route("/login")]
         LoginPage {},
+        #[route("/login/return?:..return_to")]
+        LoginReturnPage { return_to: ReturnTo },
 
         #[layout(WebNavbar)]
             #[route("/")]
@@ -47,12 +52,43 @@ fn main() {
         use tower_cookies::CookieManagerLayer;
 
         dioxus::serve(|| async move {
+            // Nothing may sign a session or read a stored password without it.
+            if let Err(e) = api::secret_key::load() {
+                dioxus::logger::tracing::error!("{e}");
+                std::process::exit(1);
+            }
+            api::services::store_passwords_under_the_current_key().await;
+            api::ledger::start_server_ledger();
+            api::core::playlists::fill::start();
+            api::core::index::start();
+            // Reads the unfinished jobs before the router below takes a request.
+            api::core::reconcile::start().await;
             // Start background cleanup task for user channels
             api::globals::start_channel_cleanup_task();
+            api::oauth::start_prune_task();
             // Check the beets config in the background; never awaited here.
             api::importer_health::start_startup_probe();
 
-            Ok(dioxus::server::router(App).layer(CookieManagerLayer::new()))
+            api::security::check_seeded_admin().await;
+            api::folder_policy::log_folder_conflicts().await;
+            api::models::user::log_username_collisions().await;
+            if let Some(problem) = api::config::CONFIG.navidrome_music_path_problem() {
+                dioxus::logger::tracing::warn!("{problem}");
+            }
+            for reason in api::security::gate_reasons() {
+                dioxus::logger::tracing::warn!("MCP stays off: {}", reason.message);
+            }
+
+            // Only the app's pages get the framing header: the consent
+            // page sets its own policy.
+            Ok(dioxus::server::router(App)
+                .layer(axum::middleware::map_response(
+                    api::connection::deny_framing,
+                ))
+                .merge(api::connection::router(
+                    api::connection::ConnectionState::live(),
+                ))
+                .layer(CookieManagerLayer::new()))
         });
     }
 
@@ -87,18 +123,15 @@ fn AuthGuard() -> Element {
     let nav = use_navigator();
     let current = use_route::<Route>();
 
-    use_effect(move || {
-        let is_logged_in = auth.is_logged_in();
-
-        // If not logged in AND we're not already on /login -> go to login
-        if !is_logged_in && !matches!(current, Route::LoginPage {}) {
+    use_effect(move || match (auth.is_logged_in(), &current) {
+        (false, Route::LoginPage {} | Route::LoginReturnPage { .. }) => {}
+        (false, _) => {
             nav.replace(Route::LoginPage {});
         }
-
-        // If logged in and on /login -> go to home
-        if is_logged_in && matches!(current, Route::LoginPage {}) {
-            nav.replace(Route::SearchPage {});
-        }
+        (true, Route::LoginPage {}) => leave_login(nav, None),
+        // Back to the request that asked for sign-in
+        (true, Route::LoginReturnPage { return_to }) => leave_login(nav, return_to.accepted()),
+        (true, _) => {}
     });
 
     rsx! {
@@ -124,33 +157,57 @@ fn WebNavbar() -> Element {
     let mut auto_download_signal = use_signal(|| None::<shared::download::AutoDownloadEvent>);
     use_context_provider(|| AutoDownloadSignal(auto_download_signal));
 
+    // Set once the server names another build than this bundle's.
+    #[allow(unused_mut)] // mutated in websocket callback (web feature only)
+    let mut outdated = use_signal(|| false);
+
     #[cfg(feature = "web")]
     use_resilient_websocket(
-        || api::download_updates_ws(WebSocketOptions::new()),
-        move |event: DownloadEvent| match event {
-            DownloadEvent::Progress(data) => {
-                let mut map = downloads.write();
-                for file in data {
-                    map.insert(file.item.clone(), file);
+        || api::download_updates_ws(Some(true), WebSocketOptions::new()),
+        move |event: DownloadEvent| {
+            // This bundle may misread what another build sends.
+            if *outdated.peek() {
+                return;
+            }
+            match event {
+                DownloadEvent::Progress(data) => {
+                    let mut map = downloads.write();
+                    for file in data {
+                        map.insert(file.item.clone(), file);
+                    }
                 }
-            }
-            DownloadEvent::Replaced {
-                previous_item,
-                entry,
-            } => {
-                let mut map = downloads.write();
-                map.remove(&previous_item);
-                map.insert(entry.item.clone(), entry);
-            }
-            DownloadEvent::AutoDownload(auto_event) => {
-                auto_download_signal.set(Some(auto_event));
+                DownloadEvent::Replaced {
+                    previous_item,
+                    entry,
+                } => {
+                    let mut map = downloads.write();
+                    map.remove(&previous_item);
+                    map.insert(entry.item.clone(), *entry);
+                }
+                DownloadEvent::AutoDownload(auto_event) => {
+                    auto_download_signal.set(Some(auto_event));
+                }
+                DownloadEvent::Build(server_build) => {
+                    if !api::build_id::is_current(&server_build) {
+                        outdated.set(true);
+                    }
+                }
             }
         },
     );
 
+    // Set while the server could not end the session: the user is still
+    // signed in.
+    let mut logout_error = use_signal(|| None::<String>);
     let logout = move |_| {
         spawn(async move {
-            auth.logout().await;
+            let failed = auth.logout().await.err();
+            logout_error.set(failed.map(|e| {
+                format!(
+                    "Sign-out failed, you are still signed in. {}",
+                    ui::friendly_error(&e)
+                )
+            }));
         });
     };
 
@@ -255,8 +312,33 @@ fn WebNavbar() -> Element {
                 }
             }
 
+            if outdated() {
+                StatusBanner {
+                    dot_class: "bg-beet-accent",
+                    label: "UPDATE",
+                    message: "Soulbeet was updated. Reload this page.".to_string(),
+                    button {
+                        class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted cursor-pointer",
+                        onclick: |_| {
+                            if let Some(window) = web_sys::window() {
+                                let _ = window.location().reload();
+                            }
+                        },
+                        "Reload"
+                    }
+                }
+            }
             ImporterBanner {}
             NavidromeBanner {}
+            if let Some(message) = logout_error() {
+                StatusBanner { dot_class: "bg-beet-accent", label: "SIGN-OUT", message,
+                    button {
+                        class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted cursor-pointer",
+                        onclick: logout,
+                        "Try again"
+                    }
+                }
+            }
 
             main { class: "px-4 sm:px-6 lg:px-8 flex-grow flex flex-col relative overflow-y-auto w-full py-8 no-scrollbar",
                 Outlet::<Route> {}
@@ -348,11 +430,6 @@ fn NavidromeBanner() -> Element {
             "NAVIDROME",
             "Unreachable. Discovery and rating sync paused.",
         ),
-        NavidromeStatus::MissingReportRealPath => (
-            "bg-yellow-500",
-            "NAVIDROME",
-            "ReportRealPath is not enabled on the Soulbeet player. Path features and auto-delete won't work. Enable it in Navidrome > Settings > Players.",
-        ),
         _ => return rsx! {},
     };
 
@@ -386,5 +463,49 @@ fn NavidromeBanner() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SENT: &str =
+        "/login/return?return_to=%2Foauth%2Fauthorize%3Fclient_id%3Ddcr_e2e%26state%3Da%2526b";
+    const BACK: &str = "/oauth/authorize?client_id=dcr_e2e&state=a%26b";
+
+    fn return_to_of(route: &Route) -> Option<&str> {
+        match route {
+            Route::LoginReturnPage { return_to } => return_to.accepted(),
+            other => panic!("not the login return page: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_login_return_route_carries_the_request_exactly() {
+        let route: Route = SENT.parse().unwrap();
+        assert_eq!(return_to_of(&route), Some(BACK));
+        // The router replaces the address with this when it differs, so it
+        // must keep the request as sent.
+        assert_eq!(route.to_string(), SENT);
+        assert_eq!(
+            route.to_string(),
+            shared::oauth::login_return_location(BACK)
+        );
+    }
+
+    #[test]
+    fn a_request_off_the_authorize_path_is_carried_but_refused() {
+        let sent = shared::oauth::login_return_location("//evil.example/oauth/authorize");
+        let route: Route = sent.parse().unwrap();
+        assert_eq!(return_to_of(&route), None);
+        assert_eq!(route.to_string(), sent);
+    }
+
+    #[test]
+    fn the_plain_login_route_keeps_its_bare_address() {
+        let route: Route = "/login".parse().unwrap();
+        assert_eq!(route, Route::LoginPage {});
+        assert_eq!(route.to_string(), "/login");
     }
 }

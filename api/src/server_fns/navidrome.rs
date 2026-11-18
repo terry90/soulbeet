@@ -1,480 +1,75 @@
 use dioxus::prelude::*;
-use shared::navidrome::{DeletionReview, LibraryStats, SyncResult};
+use shared::navidrome::{
+    BlockedDeletion, DeletionReview, LibraryStats, SyncResult, UnreadableListener,
+};
 
 #[cfg(feature = "server")]
-use dioxus::logger::tracing::{info, warn};
-
+use super::{failure_error, server_error};
+#[cfg(feature = "server")]
+use crate::core::database_failure;
+#[cfg(feature = "server")]
+use crate::core::index::ServerNavidrome;
+#[cfg(feature = "server")]
+use crate::core::library;
+#[cfg(feature = "server")]
+use crate::core::ratings::{self, AutoDeletePermit};
+#[cfg(feature = "server")]
+use crate::models::deletion_block::DeletionBlockRow;
 #[cfg(feature = "server")]
 use crate::models::deletion_review::DeletionReviewRow;
 #[cfg(feature = "server")]
-use crate::models::discovery_history::DiscoveryHistoryRow;
+use crate::models::navidrome_read_failure::NavidromeReadFailureRow;
 #[cfg(feature = "server")]
-use crate::models::discovery_playlist::DiscoveryTrackRow;
+use crate::{AdminSession, AuthSession};
 #[cfg(feature = "server")]
-use crate::models::user_settings::UserSettings;
-#[cfg(feature = "server")]
-use crate::services::navidrome_client_for_user;
-#[cfg(feature = "server")]
-use crate::AuthSession;
-#[cfg(feature = "server")]
-use shared::navidrome::DiscoveryStatus;
-
-#[cfg(feature = "server")]
-use super::server_error;
+use shared::failure::Stage;
 
 #[post("/api/navidrome/sync-ratings", auth: AuthSession)]
 pub async fn sync_ratings() -> Result<SyncResult, ServerFnError> {
-    sync_ratings_internal(&auth.0.sub)
-        .await
-        .map_err(server_error)
-}
-
-#[cfg(feature = "server")]
-pub async fn sync_ratings_internal(user_id: &str) -> Result<SyncResult, String> {
-    let client = navidrome_client_for_user(user_id).await?;
-    let songs = client
-        .get_all_songs_with_ratings()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let total_songs_scanned = songs.len() as u32;
-
-    let user_settings = UserSettings::get(user_id).await?;
-    let promote_threshold = user_settings.discovery_promote_threshold;
-    let auto_delete = user_settings.auto_delete_enabled;
-
-    let folders = crate::models::folder::Folder::get_all_by_user(user_id)
-        .await
-        .unwrap_or_default();
-
-    let mut real_path_failures = 0u32;
-    let mut deleted_tracks = 0u32;
-    let mut promoted_tracks = 0u32;
-    let mut removed_tracks = 0u32;
-    let mut skipped_veto = 0u32;
-    let mut skipped_not_found = 0u32;
-
-    let pending_discovery_tracks = if let Some(ref fid) = user_settings.discovery_folder_id {
-        DiscoveryTrackRow::get_pending_by_folder(fid).await?
-    } else {
-        vec![]
-    };
-
-    for song in &songs {
-        // Auto-delete 1-star tracks (when enabled)
-        if auto_delete {
-            if let Some(rating) = song.user_rating {
-                if rating == 1 {
-                    let shared_veto = song.average_rating.map(|avg| avg > 1.0).unwrap_or(false);
-                    if shared_veto {
-                        info!(
-                            "Auto-delete skipped (shared veto, avg={:.1}): {} - {}",
-                            song.average_rating.unwrap_or(0.0),
-                            song.artist.as_deref().unwrap_or("?"),
-                            song.title
-                        );
-                        skipped_veto += 1;
-                    } else if let Some(ref path_str) = song.path {
-                        // A pending discovery track is deleted by the
-                        // discovery branch below instead, which also marks
-                        // its row Removed and records the outcome. Skip only
-                        // the library delete: `continue`ing the whole song
-                        // here jumped over that branch, so a 1-star pending
-                        // track was never removed at all (#77).
-                        let is_discovery = pending_discovery_tracks.iter().any(|dt| {
-                            dt.song_id.as_deref() == Some(&song.id)
-                                || std::path::Path::new(&dt.path)
-                                    .file_name()
-                                    .map(|f| f.to_ascii_lowercase())
-                                    == std::path::Path::new(path_str)
-                                        .file_name()
-                                        .map(|f| f.to_ascii_lowercase())
-                        });
-                        if !is_discovery {
-                            // Navidrome stores relative paths from its library
-                            // root. Resolve to a local absolute path by trying
-                            // each user folder.
-                            if let Some(local_path) = resolve_navidrome_path(path_str, &folders) {
-                                let path = std::path::Path::new(&local_path);
-                                if let Err(e) = tokio::fs::remove_file(path).await {
-                                    warn!("Auto-delete failed for {}: {}", path.display(), e);
-                                } else {
-                                    let library_root = folders
-                                        .iter()
-                                        .map(|f| std::path::Path::new(&f.path))
-                                        .find(|root| path.starts_with(root));
-                                    if let (Some(parent), Some(root)) =
-                                        (path.parent(), library_root)
-                                    {
-                                        let _ = super::cleanup_empty_ancestors(parent, root).await;
-                                    }
-                                    DeletionReviewRow::upsert(
-                                        &song.id,
-                                        &song.title,
-                                        song.artist.as_deref().unwrap_or("Unknown"),
-                                        song.album.as_deref().unwrap_or("Unknown"),
-                                        Some(&local_path),
-                                        Some(rating),
-                                        user_id,
-                                    )
-                                    .await?;
-                                    deleted_tracks += 1;
-                                }
-                            } else {
-                                real_path_failures += 1;
-                                skipped_not_found += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check discovery track promotion/removal
-        if let Some(user_rating) = song.user_rating {
-            // Match by song_id first (exact), then by filename (fuzzy).
-            // song_id is authoritative when set by reconciliation.
-            let matching_track = pending_discovery_tracks.iter().find(|dt| {
-                if let Some(ref dt_song_id) = dt.song_id {
-                    return dt_song_id == &song.id;
-                }
-                // Fallback: match by filename when song_id isn't set yet
-                if let Some(ref song_path) = song.path {
-                    let song_fn = std::path::Path::new(song_path)
-                        .file_name()
-                        .map(|f| f.to_ascii_lowercase());
-                    let dt_fn = std::path::Path::new(&dt.path)
-                        .file_name()
-                        .map(|f| f.to_ascii_lowercase());
-                    return song_fn.is_some() && song_fn == dt_fn;
-                }
-                false
-            });
-
-            if let Some(track) = matching_track {
-                if user_rating >= promote_threshold {
-                    if let Err(e) = promote_discovery_track_internal(&track.id, user_id).await {
-                        warn!("Failed to promote track {}: {}", track.title, e);
-                    } else {
-                        promoted_tracks += 1;
-                    }
-                } else if user_rating == 1 {
-                    if let Err(e) = remove_discovery_track_internal(&track.id).await {
-                        warn!("Failed to remove track {}: {}", track.title, e);
-                    } else {
-                        info!(
-                            "Removed discovery track: {} - {} (rating 1)",
-                            track.artist, track.title
-                        );
-                        if let Err(e) = DiscoveryHistoryRow::update_outcome(
-                            user_id,
-                            &track.artist,
-                            &track.title,
-                            "removed",
-                        )
-                        .await
-                        {
-                            warn!(
-                                "Failed to update history for removed track '{}': {}",
-                                track.title, e
-                            );
-                        }
-                        removed_tracks += 1;
-                    }
-                }
-            }
-        }
+    let report =
+        (ratings::sync(&auth.0, AutoDeletePermit::Allowed).await).map_err(failure_error)?;
+    // SyncResult has no room for it, and a sync whose kept tracks Settings does not list did
+    // not succeed.
+    match report.kept_not_stored {
+        Some(f) => Err(failure_error(f)),
+        None => Ok(report.counts()),
     }
-
-    if !auto_delete {
-        info!("Auto-delete is disabled for this user");
-    } else if skipped_veto > 0 || skipped_not_found > 0 {
-        info!(
-            "Auto-delete: {} skipped (shared veto), {} skipped (file not found)",
-            skipped_veto, skipped_not_found
-        );
-        if real_path_failures > 0 {
-            warn!(
-                "Auto-delete: {} tracks could not be resolved to a local file. \
-                 Ensure your folder paths in Soulbeet match the Navidrome library root.",
-                real_path_failures
-            );
-        }
-    }
-    info!(
-        "Ratings sync complete: {} songs scanned, {} deleted, {} promoted, {} removed",
-        total_songs_scanned, deleted_tracks, promoted_tracks, removed_tracks
-    );
-
-    Ok(SyncResult {
-        deleted_tracks,
-        promoted_tracks,
-        removed_tracks,
-        total_songs_scanned,
-    })
 }
 
 #[get("/api/navidrome/deletion-history", auth: AuthSession)]
 pub async fn get_deletion_history() -> Result<Vec<DeletionReview>, ServerFnError> {
-    DeletionReviewRow::get_history(&auth.0.sub, 50)
+    DeletionReviewRow::history(&auth.0.user_id, 50)
         .await
         .map_err(server_error)
 }
 
-/// Check if the Soulbeet player in Navidrome has ReportRealPath enabled.
-/// Returns Some(true) if enabled, Some(false) if disabled, None if player not found yet.
-#[cfg(feature = "server")]
-pub async fn check_report_real_path(user_id: &str) -> Result<Option<bool>, String> {
-    let client = navidrome_client_for_user(user_id).await?;
-    let players = client.get_players().await.map_err(|e| e.to_string())?;
-    let soulbeet = players.iter().find(|p| p.client == "Soulbeet");
-    Ok(soulbeet.map(|p| p.report_real_path))
+/// The tracks auto-delete kept at the caller's last rating sync, and why.
+#[get("/api/navidrome/deletion-blocks", auth: AuthSession)]
+pub async fn get_deletion_blocks() -> Result<Vec<BlockedDeletion>, ServerFnError> {
+    DeletionBlockRow::for_user_in(&crate::db::DB, &auth.0.user_id)
+        .await
+        .map_err(|e| failure_error(database_failure(Stage::Delete, e)))
 }
 
-/// Resolve a Navidrome relative path to a local absolute path.
-///
-/// Navidrome stores paths relative to its library root (e.g.
-/// "Artist/Album/track.flac"). We try prepending each user folder
-/// path and return the first one that exists on disk.
-///
-/// When direct resolution fails and NAVIDROME_MUSIC_PATH is set,
-/// falls back to prefix substitution for Docker deployments where
-/// Navidrome sees different mount points than Soulful.
-#[cfg(feature = "server")]
-fn resolve_navidrome_path(
-    navidrome_path: &str,
-    folders: &[crate::models::folder::Folder],
-) -> Option<String> {
-    let rel = std::path::Path::new(navidrome_path);
+/// The accounts the delete guard cannot read, which keeps every file they might have rated.
+#[get("/api/navidrome/unreadable-listeners", _: AdminSession)]
+pub async fn get_unreadable_listeners() -> Result<Vec<UnreadableListener>, ServerFnError> {
+    NavidromeReadFailureRow::all_in(&crate::db::DB)
+        .await
+        .map_err(|e| failure_error(database_failure(Stage::Delete, e)))
+}
 
-    // 1. Path exists as-is (same machine, same mounts)
-    if rel.is_absolute() && rel.exists() {
-        return Some(navidrome_path.to_string());
-    }
-
-    // 2. Relative path -- prepend each folder root
-    if !rel.is_absolute() {
-        for folder in folders {
-            let candidate = std::path::PathBuf::from(&folder.path).join(rel);
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
-            }
-        }
-    }
-
-    // 3. Docker prefix swap: Navidrome sees /media/music, Soulful sees /music.
-    //    Replace the Navidrome prefix with the local root (parent of folder paths).
-    let navi_prefix = std::env::var("NAVIDROME_MUSIC_PATH").ok()?;
-    let navi_prefix = navi_prefix.trim_end_matches('/');
-
-    if !navidrome_path.starts_with(navi_prefix) {
-        return None;
-    }
-    let rest = &navidrome_path[navi_prefix.len()..];
-    if !rest.is_empty() && !rest.starts_with('/') {
-        return None;
-    }
-
-    let local_root = folders
-        .first()
-        .and_then(|f| std::path::Path::new(&f.path).parent())
-        .map(|p| p.to_string_lossy().to_string())?;
-
-    let resolved = format!("{}{}", local_root, rest);
-    if std::path::Path::new(&resolved).exists() {
-        return Some(resolved);
-    }
-
-    None
+/// Why NAVIDROME_MUSIC_PATH keeps deletions in Navidrome's default library from finding their
+/// files, when it does.
+#[get("/api/navidrome/music-path-problem", _: AdminSession)]
+pub async fn get_navidrome_music_path_problem() -> Result<Option<String>, ServerFnError> {
+    Ok(crate::config::CONFIG.navidrome_music_path_problem())
 }
 
 #[get("/api/navidrome/library-stats", auth: AuthSession)]
 pub async fn get_library_stats() -> Result<LibraryStats, ServerFnError> {
-    let client = navidrome_client_for_user(&auth.0.sub)
+    let client = library::navidrome_for(&ServerNavidrome, &auth.0, Stage::LibraryCheck)
         .await
-        .map_err(server_error)?;
-    let songs = client
-        .get_all_songs_with_ratings()
-        .await
-        .map_err(server_error)?;
-
-    let albums = client.get_all_albums().await.map_err(server_error)?;
-
-    let total_tracks = songs.len() as u32;
-    let mut rated_tracks = 0u32;
-    let mut rating_sum = 0.0f64;
-    let mut rating_distribution = [0u32; 5];
-    let mut genres: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut artists: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for song in &songs {
-        if let Some(artist) = &song.artist {
-            artists.insert(artist.to_lowercase());
-        }
-        if let Some(genre) = &song.genre {
-            if !genre.is_empty() {
-                *genres.entry(genre.clone()).or_default() += 1;
-            }
-        }
-        if let Some(rating) = song.user_rating {
-            if (1..=5).contains(&rating) {
-                rated_tracks += 1;
-                rating_sum += rating as f64;
-                rating_distribution[(rating - 1) as usize] += 1;
-            }
-        }
-    }
-
-    let average_rating = if rated_tracks > 0 {
-        rating_sum / rated_tracks as f64
-    } else {
-        0.0
-    };
-
-    let mut genre_vec: Vec<(String, u32)> = genres.into_iter().collect();
-    genre_vec.sort_by(|a, b| b.1.cmp(&a.1));
-    genre_vec.truncate(20);
-
-    Ok(LibraryStats {
-        total_tracks,
-        rated_tracks,
-        unrated_tracks: total_tracks - rated_tracks,
-        average_rating,
-        rating_distribution,
-        total_albums: albums.len() as u32,
-        total_artists: artists.len() as u32,
-        genres: genre_vec,
-    })
-}
-
-/// Why a promote did not happen.
-#[cfg(feature = "server")]
-#[derive(Debug)]
-pub(crate) enum PromoteError {
-    /// Written for the user: the track's state or the import outcome.
-    Refused(String),
-    /// Internal, such as a database error.
-    Failed(String),
-}
-
-#[cfg(feature = "server")]
-impl std::fmt::Display for PromoteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PromoteError::Refused(m) | PromoteError::Failed(m) => f.write_str(m),
-        }
-    }
-}
-
-#[cfg(feature = "server")]
-impl From<String> for PromoteError {
-    fn from(e: String) -> Self {
-        PromoteError::Failed(e)
-    }
-}
-
-#[cfg(feature = "server")]
-impl From<&str> for PromoteError {
-    fn from(e: &str) -> Self {
-        PromoteError::Failed(e.to_string())
-    }
-}
-
-/// Promotes in its own task, so the status and history updates always follow
-/// the import even when the request that started it goes away while the
-/// import waits in the library's queue.
-#[cfg(feature = "server")]
-pub(crate) async fn promote_discovery_track_internal(
-    track_id: &str,
-    user_id: &str,
-) -> Result<(), PromoteError> {
-    let (track_id, user_id) = (track_id.to_string(), user_id.to_string());
-    tokio::spawn(async move { promote_detached(&track_id, &user_id).await })
-        .await
-        .unwrap_or_else(|e| Err(PromoteError::Failed(format!("Promote stopped: {e}"))))
-}
-
-#[cfg(feature = "server")]
-async fn promote_detached(track_id: &str, user_id: &str) -> Result<(), PromoteError> {
-    use crate::models::discovery_history::DiscoveryHistoryRow;
-    use crate::models::folder::Folder;
-
-    // CAS guard: only one caller can promote a given track
-    if !DiscoveryTrackRow::try_set_promoting(track_id).await? {
-        return Err(PromoteError::Refused(
-            "Track is no longer pending (already promoted, removed, or being promoted)".to_string(),
-        ));
-    }
-
-    let track = DiscoveryTrackRow::get_by_id(track_id)
-        .await?
-        .ok_or("Discovery track not found")?;
-
-    let folder = Folder::get_by_id(&track.folder_id)
-        .await?
-        .ok_or("Folder not found")?;
-
-    let src = std::path::PathBuf::from(&track.path);
-    if !src.exists() {
-        // File missing -- revert to Pending so expiry can handle it
-        let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
-        warn!("Promote of '{}': {} is gone", track.title, track.path);
-        return Err(PromoteError::Refused(
-            "The downloaded file is gone".to_string(),
-        ));
-    }
-
-    let target = std::path::PathBuf::from(&folder.path);
-    if let Err(outcome) = crate::import_queue::import_to_library(&src, &target).await {
-        // Import failed -- revert to Pending
-        let _ = DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Pending).await;
-        return Err(PromoteError::Refused(outcome));
-    }
-
-    if let Some(parent) = src.parent() {
-        let profile_root = folder.discovery_profile_path(&track.profile);
-        let _ = super::cleanup_empty_ancestors(parent, std::path::Path::new(&profile_root)).await;
-    }
-
-    DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Promoted).await?;
-
-    if let Err(e) =
-        DiscoveryHistoryRow::update_outcome(user_id, &track.artist, &track.title, "promoted").await
-    {
-        warn!(
-            "Failed to update history for promoted track '{}': {}",
-            track.title, e
-        );
-    }
-
-    info!(
-        "Promoted discovery track: {} -> {}",
-        track.title, folder.path
-    );
-    Ok(())
-}
-
-#[cfg(feature = "server")]
-async fn remove_discovery_track_internal(track_id: &str) -> Result<(), String> {
-    let track = DiscoveryTrackRow::get_by_id(track_id)
-        .await?
-        .ok_or("Discovery track not found")?;
-
-    let path = std::path::Path::new(&track.path);
-    if path.exists() {
-        tokio::fs::remove_file(path)
-            .await
-            .map_err(|e| format!("Failed to delete file: {}", e))?;
-        let folder = crate::models::folder::Folder::get_by_id(&track.folder_id).await;
-        if let (Some(parent), Ok(Some(folder))) = (path.parent(), folder) {
-            let profile_root = folder.discovery_profile_path(&track.profile);
-            let _ =
-                super::cleanup_empty_ancestors(parent, std::path::Path::new(&profile_root)).await;
-        }
-    }
-
-    DiscoveryTrackRow::update_status(track_id, &DiscoveryStatus::Removed).await?;
-
-    info!("Removed discovery track: {}", track.title);
-    Ok(())
+        .map_err(failure_error)?;
+    library::stats(&client).await.map_err(failure_error)
 }

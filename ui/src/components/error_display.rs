@@ -24,7 +24,7 @@ pub fn friendly_error(error: &ServerFnError) -> String {
             }
         }
         ServerFnError::ServerError {
-            code: api::REFUSAL_CODE,
+            code: api::REFUSAL_CODE | api::FORBIDDEN_CODE,
             message,
             ..
         } => message.clone(),
@@ -35,6 +35,19 @@ pub fn friendly_error(error: &ServerFnError) -> String {
             "Could not reach the server. Check your connection.".to_string()
         }
         _ => "Something went wrong. Try again.".to_string(),
+    }
+}
+
+/// What the login form shows: the server's own words for a refusal or a
+/// sign-in limit, and one fixed text for everything else.
+pub fn login_failure_message(error: &ServerFnError) -> String {
+    match error {
+        ServerFnError::ServerError {
+            code: api::REFUSAL_CODE | api::RATE_LIMITED_CODE,
+            message,
+            ..
+        } => message.clone(),
+        _ => "Invalid username or password".to_string(),
     }
 }
 
@@ -72,11 +85,45 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_shows_its_message() {
+        assert_eq!(
+            friendly_error(&server_error(403, "Only an admin can do this")),
+            "Only an admin can do this"
+        );
+    }
+
+    #[test]
     fn raw_server_errors_stay_generic() {
         let e = server_error(
             500,
             "error returned from database: (code: 14) unable to open",
         );
         assert_eq!(friendly_error(&e), "Something went wrong. Try again.");
+    }
+
+    #[test]
+    fn login_failures_show_refusals_and_hide_the_rest() {
+        assert_eq!(
+            login_failure_message(&server_error(
+                429,
+                "Too many failed sign-ins on this server. Try again in 5 seconds."
+            )),
+            "Too many failed sign-ins on this server. Try again in 5 seconds."
+        );
+        assert_eq!(
+            login_failure_message(&server_error(
+                409,
+                "There is no Soulbeet account named 'x'. An admin creates accounts in Settings > Users."
+            )),
+            "There is no Soulbeet account named 'x'. An admin creates accounts in Settings > Users."
+        );
+        assert_eq!(
+            login_failure_message(&server_error(401, "Invalid username or password")),
+            "Invalid username or password"
+        );
+        assert_eq!(
+            login_failure_message(&server_error(500, "database locked")),
+            "Invalid username or password"
+        );
     }
 }

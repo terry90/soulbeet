@@ -3,7 +3,7 @@
 // flag strings) as implemented in the slskd C# source.
 
 import { randomUUID } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { extname, join } from 'node:path';
 import {
@@ -46,8 +46,19 @@ interface SearchRecord {
   startedAt: Date;
   /** epoch ms after which the search reports complete */
   completeAtMs: number;
+  /** set by slskd's cancel call while the search ran */
+  cancelled: boolean;
   responses: SearchResponseJson[];
 }
+
+/**
+ * How long after a search completes its responses stay unreadable. slskd
+ * saves the Completed state from the stateChanged callback with no
+ * responses (Search/Extensions.cs:135-149) and writes them in a second
+ * update once the search task returns (Search/SearchService.cs:357-361),
+ * so a reader that polls in between sees isComplete and an empty list.
+ */
+const RESPONSES_LAG_MS = 700;
 
 interface TransferStep {
   afterMs: number;
@@ -77,10 +88,16 @@ interface TransferRecord {
   /** ghost transfers are accepted but never show up in listings */
   hidden: boolean;
   removed: boolean;
+  /** id of the batch enqueue that made it (Transfer.BatchId, slskd 0.26) */
+  batchId: string;
+  /** what the last position request answered (Transfer.PlaceInQueue), null until asked */
+  placeInQueue: number | null;
   plan: TransferStep[];
   /** number of plan steps already applied */
   applied: number;
   delivered: boolean;
+  /** how far the one-file-per-peer wait pushed this plan back */
+  shiftMs: number;
 }
 
 export interface BatchEnqueueBody {
@@ -120,6 +137,31 @@ const HAPPY_STEPS: TransferStep[] = [
   { afterMs: 7300, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
 ];
 
+// A transfer connection that closes mid-file: Soulseek.NET 10.0.2 Connection.cs:651,686 and
+// SoulseekClient.cs:3396, stored in Completed, Errored (SoulseekClient.cs:3519-3527).
+const DROPPED_CONNECTION = 'Transfer failed: Read error: Remote connection closed';
+
+/**
+ * A refused request: Soulseek.NET stores "Transfer rejected: {reason}" in Completed, Rejected
+ * (SoulseekClient.cs#L3308-L3310, #L3481-L3484); slskd never retries a rejection
+ * (DownloadService.cs:1394-1398).
+ */
+function rejectedSteps(reason: string): TransferStep[] {
+  return [
+    { afterMs: 0, state: 'Queued, Locally', percent: 0 },
+    { afterMs: 100, state: 'Requested', percent: 0, attempts: 1 },
+    {
+      afterMs: 2600,
+      state: 'Completed, Rejected',
+      percent: 0,
+      exception: `Transfer rejected: ${reason}`,
+    },
+  ];
+}
+
+/** slskd's queue-full reason (Application.cs:763-766). */
+const QUEUE_FULL = rejectedSteps('Too many files');
+
 /** Behaviors whose enqueue is accepted and whose transfers follow a plan. */
 type EnqueueableBehavior = Exclude<PeerBehavior, 'offline' | 'enqueueoffline'>;
 
@@ -137,16 +179,18 @@ const BEHAVIOR_PLANS: Record<EnqueueableBehavior, TransferStep[]> = {
       afterMs: 4000,
       state: 'Completed, Errored',
       percent: 31,
-      exception: 'Connection reset by peer',
+      exception: DROPPED_CONNECTION,
       attempts: 3,
     },
   ],
-  // slskd 0.26 auto-retry: a failed attempt is briefly persisted as
-  // "Completed, Errored" before onRetry re-queues the transfer. The failed
-  // dwell (2s) must stay under the monitor's FAILED_STATE_CONFIRM window
-  // (4s) so a correct monitor rides the flap out and imports the file; a
-  // monitor acting on a single failed sighting abandons the transfer and
-  // the import assertion in the spec fails.
+  // A failed sighting slskd replaces with a retry that soulbeet cannot read
+  // as one: an attempt fails at the retry limit the options route reports
+  // (3), and slskd retries anyway because its limit was raised after
+  // soulbeet read it. The failed dwell (2s) must stay under the
+  // monitor's FAILED_STATE_CONFIRM window (4s) so a correct monitor rides
+  // it out and imports the file; a monitor acting on a single failed
+  // sighting abandons the transfer and the import assertion in the spec
+  // fails.
   retryflap: [
     { afterMs: 0, state: 'Queued, Locally', percent: 0 },
     { afterMs: 100, state: 'Requested', percent: 0, attempts: 1 },
@@ -156,11 +200,25 @@ const BEHAVIOR_PLANS: Record<EnqueueableBehavior, TransferStep[]> = {
       afterMs: 5300,
       state: 'Completed, Errored',
       percent: 40,
-      exception: 'Connection reset by peer',
+      exception: DROPPED_CONNECTION,
+      attempts: 3,
     },
-    { afterMs: 7300, state: 'Queued, Locally', percent: 40, attempts: 2 },
+    { afterMs: 7300, state: 'Queued, Locally', percent: 40, attempts: 4 },
     { afterMs: 9000, state: 'InProgress', percent: 80 },
     { afterMs: 10500, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
+  ],
+  rejects: rejectedSteps('File not shared.'),
+  // The first transfer of a peer is refused by createBatch (QUEUE_FULL); the later ones follow this plan.
+  busyonce: HAPPY_STEPS,
+  // Holds a transfer in progress long enough for the suite to restart Soulful.
+  slow: [
+    { afterMs: 0, state: 'Queued, Locally', percent: 0 },
+    { afterMs: 100, state: 'Requested', percent: 0 },
+    { afterMs: 2600, state: 'Queued, Remotely', percent: 0 },
+    { afterMs: 3400, state: 'Initializing', percent: 0 },
+    { afterMs: 5900, state: 'InProgress', percent: 24 },
+    { afterMs: 90000, state: 'InProgress', percent: 71 },
+    { afterMs: 91000, state: 'Completed, Succeeded', percent: 100, deliverFile: true },
   ],
   stall: [
     { afterMs: 0, state: 'Queued, Locally', percent: 0 },
@@ -197,21 +255,36 @@ function dotnetTicks(): string {
   return String(sinceEpoch + 621_355_968_000_000_000n);
 }
 
-/** Guid.Parse for the hyphenated and the bare 32-digit forms. */
-function parseGuid(text: string): string | null {
-  const match = /^([0-9a-f]{8})-?([0-9a-f]{4})-?([0-9a-f]{4})-?([0-9a-f]{4})-?([0-9a-f]{12})$/i.exec(
-    text,
-  );
+/**
+ * Guid.TryParse: trims, takes 32 hex digits or the 8-4-4-4-12 form, either
+ * one bare or inside braces or parentheses. Returns the lowercase hyphenated
+ * form, null when .NET would not parse it.
+ */
+export function parseGuid(text: string): string | null {
+  const trimmed = text.trim();
+  const wrapped = /^\{(.*)\}$/s.exec(trimmed) ?? /^\((.*)\)$/s.exec(trimmed);
+  const inner = wrapped ? (wrapped[1] as string) : trimmed;
+  const match =
+    /^([0-9a-f]{8})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{12})$/i.exec(inner) ??
+    /^([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$/i.exec(inner);
   return match ? match.slice(1).join('-').toLowerCase() : null;
 }
 
 export class SlskdState {
   private searches = new Map<string, SearchRecord>();
   private transfers: TransferRecord[] = [];
+  /**
+   * Peer username to the id of the transfer sending that peer's file now. A
+   * Soulseek.NET uploader sends one file at a time per downloading user
+   * (MaximumConcurrentUploadsPerUser = 1, Soulseek.NET 10.0.2
+   * src/Options/SoulseekClientOptions.cs:322; SoulseekClient.cs:4346). The
+   * stub is one slskd, so one downloader: the slot is keyed by the peer.
+   */
+  private slotHolder = new Map<string, string>();
   private behaviors = new Map<string, PeerBehavior>();
   private fileSizes = new Map<string, number>();
   private nextToken = 1000;
-  /** peers whose one-off partialenqueue rejection already fired */
+  /** peers whose one-off rejection (partialenqueue, busyonce) already fired */
   private rejectedOnce = new Set<string>();
   private batchIds = new Set<string>();
   private enqueuesInFlight = 0;
@@ -244,6 +317,7 @@ export class SlskdState {
   reset(): void {
     this.searches.clear();
     this.transfers = [];
+    this.slotHolder.clear();
     this.resetBehaviors();
     this.rejectedOnce.clear();
     this.batchIds.clear();
@@ -285,6 +359,7 @@ export class SlskdState {
       token: this.nextToken++,
       startedAt: new Date(),
       completeAtMs: Date.now() + this.searchCompleteAfterMs,
+      cancelled: false,
       responses: this.buildResponses(searchText),
     };
     this.searches.set(record.id, record);
@@ -302,13 +377,39 @@ export class SlskdState {
     return this.searches.delete(id);
   }
 
+  /**
+   * SearchesController.Cancel: false (404) for a search slskd does not hold,
+   * else true (200) whether or not it still ran. A running search ends as
+   * Completed, Cancelled, its responses written as for any other end.
+   */
+  cancelSearch(id: string): boolean {
+    const record = this.searches.get(id);
+    if (!record) {
+      return false;
+    }
+    const now = Date.now();
+    if (now < record.completeAtMs) {
+      record.completeAtMs = now;
+      record.cancelled = true;
+    }
+    return true;
+  }
+
+  /** The responses slskd serves for the search: none until it wrote them. */
+  searchResponses(record: SearchRecord): SearchResponseJson[] {
+    return Date.now() >= record.completeAtMs + RESPONSES_LAG_MS ? record.responses : [];
+  }
+
   searchJson(record: SearchRecord): Record<string, unknown> {
     const isComplete = Date.now() >= record.completeAtMs;
+    // A search left to run ends when no response came for searchTimeout
+    // (Soulseek.NET SearchStates: Completed | TimedOut).
+    const ended = record.cancelled ? 'Completed, Cancelled' : 'Completed, TimedOut';
     return {
       id: record.id,
       searchText: record.searchText,
       token: record.token,
-      state: isComplete ? 'Completed, Succeeded' : 'InProgress',
+      state: isComplete ? ended : 'InProgress',
       isComplete,
       startedAt: record.startedAt.toISOString(),
       endedAt: isComplete ? new Date(record.completeAtMs).toISOString() : null,
@@ -451,7 +552,6 @@ export class SlskdState {
     }
     this.batchIds.add(id);
 
-    const plan = BEHAVIOR_PLANS[behavior];
     const now = Date.now();
     const enqueued: Array<Record<string, unknown>> = [];
     const failures: Array<{ filename: string; message: string }> = [];
@@ -476,6 +576,11 @@ export class SlskdState {
         failures.push({ filename, message: 'Error: Enqueue rejected by peer' });
         continue;
       }
+      let plan = BEHAVIOR_PLANS[behavior];
+      if (behavior === 'busyonce' && !this.rejectedOnce.has(username)) {
+        this.rejectedOnce.add(username);
+        plan = QUEUE_FULL;
+      }
       // Real slskd creates the record in "Queued, Locally"
       // (DownloadService.EnqueueAsync), then the download task overwrites the
       // state with Soulseek.NET's own progression starting at "Requested".
@@ -495,9 +600,12 @@ export class SlskdState {
         destination,
         hidden: behavior === 'ghost',
         removed: false,
+        batchId: id,
+        placeInQueue: null,
         plan: plan.map((step) => ({ ...step })),
         applied: 1,
         delivered: false,
+        shiftMs: 0,
       };
       this.transfers.push(transfer);
       // The new record supersedes the finished ones for the same file.
@@ -531,17 +639,51 @@ export class SlskdState {
   /** Advance every transfer along its behavior plan; called on a short timer. */
   tick(): void {
     const now = Date.now();
-    for (const transfer of this.transfers) {
-      const elapsed = now - transfer.requestedAtMs;
-      while (transfer.applied < transfer.plan.length) {
-        const step = transfer.plan[transfer.applied] as TransferStep;
-        if (elapsed < step.afterMs) {
-          break;
+    // Oldest request first; Array.sort is stable, so insertion order breaks ties.
+    const ordered = [...this.transfers].sort((a, b) => a.requestedAtMs - b.requestedAtMs);
+    let slotFreed = true;
+    // A slot released by one transfer goes to the next waiting one in the same tick.
+    while (slotFreed) {
+      slotFreed = false;
+      for (const transfer of ordered) {
+        if (transfer.state === 'Completed, Cancelled') {
+          continue;
         }
-        transfer.applied++;
-        this.applyStep(transfer, step);
+        while (transfer.applied < transfer.plan.length) {
+          const step = transfer.plan[transfer.applied] as TransferStep;
+          if (now - transfer.requestedAtMs - transfer.shiftMs < step.afterMs) {
+            break;
+          }
+          if (step.state === 'Initializing' || step.state === 'InProgress') {
+            const holder = this.slotHolder.get(transfer.username);
+            if (holder !== undefined && holder !== transfer.id) {
+              break;
+            }
+            if (holder === undefined) {
+              this.slotHolder.set(transfer.username, transfer.id);
+              transfer.shiftMs = now - transfer.requestedAtMs - step.afterMs;
+            }
+          }
+          transfer.applied++;
+          this.applyStep(transfer, step);
+          if (this.releaseSlot(transfer)) {
+            slotFreed = true;
+          }
+        }
       }
     }
+  }
+
+  /** Free the peer's slot when this transfer holds it and has completed. */
+  private releaseSlot(transfer: TransferRecord): boolean {
+    if (
+      transfer.state.startsWith('Completed') &&
+      this.slotHolder.get(transfer.username) === transfer.id
+    ) {
+      this.slotHolder.delete(transfer.username);
+      return true;
+    }
+    return false;
   }
 
   private applyStep(transfer: TransferRecord, step: TransferStep): void {
@@ -597,19 +739,26 @@ export class SlskdState {
     console.log(`[slskd] delivered ${target}`);
   }
 
-  cancel(username: string, id: string, remove: boolean): boolean {
-    const transfer = this.transfers.find((t) => t.username === username && t.id === id);
+  /**
+   * slskd 0.26 CancelDownloadAsync (TransfersController.cs:91-121): both
+   * lookups go by id alone and an unknown id is a no-op. `remove` only
+   * flags a record that was already Completed (DownloadService.cs:960-1031).
+   */
+  cancel(id: string, remove: boolean): void {
+    const transfer = this.transfers.find((t) => t.id === id);
     if (!transfer) {
-      return false;
+      return;
     }
-    if (!transfer.state.startsWith('Completed')) {
+    const wasCompleted = transfer.state.startsWith('Completed');
+    if (!wasCompleted) {
       transfer.state = 'Completed, Cancelled';
       transfer.endedAtMs = Date.now();
+      transfer.exception = 'The operation was canceled.';
+      this.releaseSlot(transfer);
     }
-    if (remove) {
+    if (remove && wasCompleted) {
       transfer.removed = true;
     }
-    return true;
   }
 
   transferJson(transfer: TransferRecord): Record<string, unknown> {
@@ -617,7 +766,7 @@ export class SlskdState {
     const averageSpeed = transfer.state === 'InProgress' ? 250000 : 0;
     // slskd 0.26 wire shape: no startOffset (property dropped) and no
     // stateDescription ([JsonIgnore] upstream), null fields omitted
-    // entirely (WhenWritingNull), removed and attempts serialized.
+    // entirely (WhenWritingNull), removed, attempts and batchId serialized.
     // elapsedTime appears once startedAt is set, remainingTime once
     // averageSpeed is non-zero (computed properties on slskd's Transfer).
     const json: Record<string, unknown> = {
@@ -634,7 +783,11 @@ export class SlskdState {
       percentComplete: transfer.percentComplete,
       attempts: transfer.attempts,
       removed: transfer.removed,
+      batchId: transfer.batchId,
     };
+    if (transfer.placeInQueue !== null) {
+      json.placeInQueue = transfer.placeInQueue;
+    }
     if (transfer.enqueuedAtMs) {
       json.enqueuedAt = new Date(transfer.enqueuedAtMs).toISOString();
     }
@@ -652,6 +805,50 @@ export class SlskdState {
       json.exception = transfer.exception;
     }
     return json;
+  }
+
+  /**
+   * GET /api/v0/transfers/downloads/{username}/{id}: the transfer with that
+   * id, removed or not, or null for one slskd never listed.
+   */
+  downloadJson(id: string): Record<string, unknown> | null {
+    const transfer = this.transfers.find((t) => t.id === id && !t.hidden);
+    return transfer ? this.transferJson(transfer) : null;
+  }
+
+  /**
+   * GET /api/v0/transfers/downloads/{username}/{id}/position
+   * (TransfersController.cs:584-617, DownloadService.cs:711-729): slskd asks
+   * the peer and stores the answer on the record. A transfer queued at the
+   * peer gets its 1-based place among that peer's transfers queued there; an
+   * id slskd never listed is a 404. A transfer that ended is no longer
+   * active: Soulseek.NET's TransferNotFoundException
+   * (SoulseekClient.cs:1643-1646), which slskd answers as 500. One still
+   * active but not queued at the peer (on its way, or being sent) is asked
+   * of the peer, whose client answers no place for a file it does not queue
+   * (PeerMessageHandler.cs:422-440): the wait for one times out
+   * (Waiter.cs:161), also a 500.
+   */
+  placeInQueue(id: string): Reply {
+    const transfer = this.transfers.find((t) => t.id === id && !t.hidden);
+    if (!transfer) {
+      return { status: 404, body: null };
+    }
+    if (transfer.state.startsWith('Completed')) {
+      return {
+        status: 500,
+        body: `A download of ${transfer.filename} from user ${transfer.username} is not active`,
+      };
+    }
+    if (transfer.state !== 'Queued, Remotely') {
+      return { status: 500, body: 'The wait timed out after 5000 milliseconds' };
+    }
+    const place =
+      this.transfers
+        .filter((t) => t.username === transfer.username && t.state === 'Queued, Remotely')
+        .indexOf(transfer) + 1;
+    transfer.placeInQueue = place;
+    return { status: 200, body: place };
   }
 
   /** GET /api/v0/transfers/downloads shape: user -> directories -> files. */
@@ -701,6 +898,28 @@ export class SlskdState {
         files: files.map((t) => this.transferJson(t)),
       })),
     };
+  }
+
+  /**
+   * GET /api/v0/users/{username}/status (UsersController.cs:253-278): an
+   * offline peer, and a user the dataset does not know, read Offline.
+   */
+  userStatusJson(username: string): { isPrivileged: false; presence: 'Online' | 'Offline' } {
+    const behavior = this.behaviorOf(username);
+    const offline =
+      !peers.some((p) => p.username === username) ||
+      behavior === 'offline' ||
+      behavior === 'enqueueoffline';
+    return { isPrivileged: false, presence: offline ? 'Offline' : 'Online' };
+  }
+
+  /** Removes a batch destination directory the stub delivered into; false for anything but one directory name. */
+  removeDestination(name: string): boolean {
+    if (name === '' || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
+      return false;
+    }
+    rmSync(join(this.downloadsDir, name), { recursive: true, force: true });
+    return true;
   }
 
   /** Debug/control snapshot for specs. */

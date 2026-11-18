@@ -8,12 +8,14 @@
 //! decide *when* a transfer has definitively failed.
 
 use shared::download::{DownloadableGroup, DownloadableItem, EnqueueStatus, QueuedDownload};
+use shared::failure::{Failure, Stage};
 use soulbeet::DownloadBackend;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
-use super::enqueue::{enqueue_claimed, transfer_key};
+use super::enqueue::{enqueue_claimed, held_failure, not_enqueued_failure, transfer_key};
 use crate::transfer_registry::{BatchRef, TransferRegistry};
 
 /// Sources tried per track before it is declared failed: the peer picked at
@@ -22,10 +24,26 @@ use crate::transfer_registry::{BatchRef, TransferRegistry};
 /// 2.5 minutes.
 pub const MAX_SOURCES_PER_TRACK: usize = 4;
 
+/// An alternate `enqueue_next` took from a slot and could not enqueue.
+pub struct RefusedAlternate {
+    pub candidate: DownloadableItem,
+    pub failure: Failure,
+}
+
+/// What `enqueue_next` did with a slot.
+pub struct NextSource {
+    /// The accepted alternate and its download. `None` when the slot is out
+    /// of sources or budget.
+    pub queued: Option<(DownloadableItem, QueuedDownload)>,
+    /// Every alternate refused before it, in the order tried.
+    pub refused: Vec<RefusedAlternate>,
+}
+
 /// Alternates and attempt budget for one track.
 struct Slot {
     alternates: VecDeque<DownloadableItem>,
     used: usize,
+    max: usize,
 }
 
 /// Ranked alternate sources for every track in a batch, indexed by slot.
@@ -43,35 +61,46 @@ impl SourcePool {
     /// and that slot simply gets no alternates.
     ///
     /// `rest` must already be in descending score order, which is how
-    /// `auto_download` sorts it. Matching is by normalized title, never by
-    /// filename: the same track has a completely different remote path on
-    /// each peer.
-    pub fn from_tracks(tracks: &[Option<DownloadableItem>], rest: &[DownloadableGroup]) -> Self {
-        let slots = tracks
-            .iter()
-            .map(|track| {
-                let alternates = match track {
-                    Some(track) => {
-                        let wanted = shared::recommendation::normalize_for_matching(&track.title);
-                        rest.iter()
-                            .flat_map(|group| group.items.iter())
-                            .filter(|candidate| {
-                                shared::recommendation::normalize_for_matching(&candidate.title)
-                                    == wanted
-                            })
-                            .cloned()
-                            .collect()
-                    }
-                    None => VecDeque::new(),
-                };
-                Slot {
-                    alternates,
-                    used: 1,
-                }
-            })
-            .collect();
+    /// `auto_download` sorts it.
+    pub fn from_tracks(
+        tracks: &[Option<DownloadableItem>],
+        rest: &[DownloadableGroup],
+        max_sources: usize,
+    ) -> Self {
+        let mut pool = Self { slots: Vec::new() };
+        for track in tracks {
+            let alternates = match track {
+                Some(track) => alternates_for(track, rest),
+                None => Vec::new(),
+            };
+            pool.push_slot(alternates, max_sources);
+        }
+        pool
+    }
 
-        Self { slots }
+    /// Adds a slot after the last; its transfer counts as its first of
+    /// `max_sources` sources.
+    pub fn push_slot(&mut self, alternates: Vec<DownloadableItem>, max_sources: usize) {
+        self.slots.push(Slot {
+            alternates: alternates.into(),
+            used: 1,
+            max: max_sources,
+        });
+    }
+
+    /// A pool resumed after a restart: per slot its untried alternates, the
+    /// sources it used and its own cap.
+    pub fn resumed(slots: Vec<(Vec<DownloadableItem>, usize, usize)>) -> Self {
+        Self {
+            slots: slots
+                .into_iter()
+                .map(|(alternates, used, max)| Slot {
+                    alternates: alternates.into(),
+                    used,
+                    max,
+                })
+                .collect(),
+        }
     }
 
     /// Single track, N ranked sources. `items[0]` is the source already
@@ -82,8 +111,14 @@ impl SourcePool {
             slots: vec![Slot {
                 alternates,
                 used: 1,
+                max: MAX_SOURCES_PER_TRACK,
             }],
         }
+    }
+
+    /// How many slots the pool has.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
     }
 
     /// How many sources this slot has consumed, including the original.
@@ -91,13 +126,28 @@ impl SourcePool {
         self.slots.get(slot).map(|s| s.used).unwrap_or(0)
     }
 
-    /// Next alternate for this slot, or `None` once the budget is spent, the
-    /// alternates run out, or the slot does not exist.
+    /// The most sources this slot may use, or the default cap for a slot that
+    /// does not exist.
+    pub fn max_sources(&self, slot: usize) -> usize {
+        self.slots
+            .get(slot)
+            .map_or(MAX_SOURCES_PER_TRACK, |s| s.max)
+    }
+
+    /// Whether `take_next` would give this slot an alternate: the slot exists, has budget left
+    /// and an alternate.
+    pub fn has_next(&self, slot: usize) -> bool {
+        self.slots
+            .get(slot)
+            .is_some_and(|s| s.used < s.max && !s.alternates.is_empty())
+    }
+
+    /// Next alternate for this slot, or `None` when `has_next` says there is none.
     pub fn take_next(&mut self, slot: usize) -> Option<DownloadableItem> {
-        let slot = self.slots.get_mut(slot)?;
-        if slot.used >= MAX_SOURCES_PER_TRACK {
+        if !self.has_next(slot) {
             return None;
         }
+        let slot = self.slots.get_mut(slot)?;
         let item = slot.alternates.pop_front()?;
         slot.used += 1;
         Some(item)
@@ -109,43 +159,100 @@ impl SourcePool {
     /// slot runs dry. The accepted alternate's key stays claimed by `batch`.
     /// A refused alternate still costs the slot a source, so three dead peers
     /// in a row spend the whole budget without a transfer ever being
-    /// attempted. `None` means the slot is out of sources or budget.
+    /// attempted. Every refused alternate comes back with its failure.
     pub async fn enqueue_next(
         &mut self,
         slot: usize,
         backend: &Arc<dyn DownloadBackend>,
         batch: &BatchRef,
-    ) -> Option<QueuedDownload> {
-        while let Some(item) = self.take_next(slot) {
-            let source = item.source.clone();
-            let key = transfer_key(backend.id(), &item.source, &item.id);
-            if TransferRegistry::global()
-                .claim(&[key], batch)
-                .claimed
-                .is_empty()
-            {
-                warn!(
-                    "Failover source {} skipped: another batch is downloading {}",
-                    source, item.id
-                );
-                continue;
-            }
-            match enqueue_claimed(backend, vec![item], batch).await {
-                Ok(queued) => {
-                    if let Some(ok) = queued
-                        .into_iter()
-                        .find(|d| d.status == EnqueueStatus::Enqueued)
-                    {
-                        info!("Failover enqueued {} from {}", ok.item, ok.source);
-                        return Some(ok);
-                    }
-                    warn!("Failover source {} refused the enqueue", source);
-                }
-                Err(e) => warn!("Failover enqueue to {} failed: {}", source, e),
-            }
-        }
-        None
+    ) -> NextSource {
+        self.enqueue_next_noting(
+            slot,
+            backend,
+            batch,
+            |_, _| std::future::ready(Ok(())),
+            |_, _| {},
+        )
+        .await
     }
+
+    /// `enqueue_next`, awaiting `sending` with each alternate and the backend
+    /// request it goes in before it is sent to the backend, and calling
+    /// `refusing` with each refused alternate and its failure before the next
+    /// one is tried. When `sending` fails, that alternate is refused with its
+    /// failure and not sent, and no other is tried.
+    pub async fn enqueue_next_noting<F, Noted, R>(
+        &mut self,
+        slot: usize,
+        backend: &Arc<dyn DownloadBackend>,
+        batch: &BatchRef,
+        mut sending: F,
+        mut refusing: R,
+    ) -> NextSource
+    where
+        F: FnMut(&DownloadableItem, &str) -> Noted,
+        Noted: Future<Output = Result<(), Failure>>,
+        R: FnMut(&DownloadableItem, &Failure),
+    {
+        let mut refused = Vec::new();
+        let mut refuse = |candidate: DownloadableItem, failure: Failure| {
+            refusing(&candidate, &failure);
+            refused.push(RefusedAlternate { candidate, failure });
+        };
+        while let Some(item) = self.take_next(slot) {
+            let key = transfer_key(backend.id(), &item.source, &item.id);
+            let registry = TransferRegistry::global();
+            let claim = registry.claim(std::slice::from_ref(&key), batch);
+            let failure = if claim.claimed.is_empty() {
+                held_failure(&claim, batch)
+            } else {
+                let request = backend.new_request();
+                if let Err(failure) = sending(&item, &request).await {
+                    registry.release(&key, &batch.owner);
+                    refuse(item, failure);
+                    break;
+                }
+                match enqueue_claimed(backend, vec![item.clone()], batch, &request).await {
+                    Ok(queued) => {
+                        if let Some(ok) =
+                            queued.iter().find(|d| d.status == EnqueueStatus::Enqueued)
+                        {
+                            info!("Failover enqueued {} from {}", ok.item, ok.source);
+                            return NextSource {
+                                queued: Some((item, ok.clone())),
+                                refused,
+                            };
+                        }
+                        not_enqueued_failure(&queued)
+                    }
+                    Err(e) => e.failure(Stage::Enqueue, e.to_string()),
+                }
+            };
+            refuse(item, failure);
+        }
+        NextSource {
+            queued: None,
+            refused,
+        }
+    }
+}
+
+/// The items of `rest` offering `track` (same normalized title), in `rest`'s
+/// order. `rest` must be sorted by descending score, so the best group comes
+/// first. Matching is by title, never by filename: the same track has a
+/// completely different remote path on each peer.
+pub fn alternates_for(
+    track: &DownloadableItem,
+    rest: &[DownloadableGroup],
+) -> Vec<DownloadableItem> {
+    let wanted = shared::recommendation::normalize_for_matching(&track.title);
+    rest.iter()
+        .flat_map(|group| group.items.iter())
+        .filter(|candidate| {
+            shared::recommendation::normalize_for_matching(&candidate.title) == wanted
+        })
+        .cloned()
+        .collect()
 }
 
 /// Line the accepted downloads up with the tracks they came from, in the
@@ -158,34 +265,43 @@ impl SourcePool {
 /// Feeding `items` straight to `from_tracks` would hand slot N the alternates
 /// of a different track.
 ///
-/// Matching keys on both `id` and `source`: `QueuedDownload::item` is the
-/// item's `id` verbatim, both being the remote filename, and the same
-/// filename can be offered by more than one peer. A download that matches no
-/// item stays `None` so the slots after it keep their index.
+/// A download that matches no item (`item_index`) stays `None` so the slots
+/// after it keep their index.
 pub fn align_pool_tracks(
     queued: &[QueuedDownload],
     items: &[DownloadableItem],
 ) -> Vec<Option<DownloadableItem>> {
     queued
         .iter()
-        .map(|d| {
-            items
-                .iter()
-                .find(|item| item.id == d.item && item.source == d.source)
-                .cloned()
-        })
+        .map(|d| item_index(d, items).map(|at| items[at].clone()))
         .collect()
+}
+
+/// The index in `items` of the item `queued` was enqueued from (same id and
+/// source). Matching keys on both: `QueuedDownload::item` is the item's `id`
+/// verbatim, both being the remote filename, and the same filename can be
+/// offered by more than one peer.
+pub fn item_index<'a>(
+    queued: &QueuedDownload,
+    items: impl IntoIterator<Item = &'a DownloadableItem>,
+) -> Option<usize> {
+    items
+        .into_iter()
+        .position(|item| item.id == queued.item && item.source == queued.source)
 }
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::server_fns::download::enqueue::{ALREADY_MINE, ANOTHER_FOLDER, NOTHING_ENQUEUED};
     use crate::server_fns::download::test_support::{
-        batch, group, item, key, ScriptedOutcome, StubBackend,
+        batch, group, item, key, same_user_into, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::download::DownloadableItem;
+    use shared::failure::{FailureCode, RetryAdvice};
     use soulbeet::DownloadBackend;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     fn queued(source: &str, item: &str) -> QueuedDownload {
@@ -232,7 +348,7 @@ mod tests {
             0.9,
         )];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         let next = pool.take_next(0).expect("alternate for slot 0");
         assert_eq!(next.source, "Cornflake9026");
     }
@@ -246,10 +362,25 @@ mod tests {
             group("peer_d", vec![item("peer_d", "Wake Up", "d.flac")], 0.7),
         ];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_b".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_c".into()));
         assert_eq!(pool.take_next(0).map(|i| i.source), Some("peer_d".into()));
+        assert!(pool.take_next(0).is_none());
+    }
+
+    #[test]
+    fn a_resumed_pool_keeps_its_budget() {
+        // Three sources used: one more is left of MAX_SOURCES_PER_TRACK, not two.
+        let mut pool = SourcePool::resumed(vec![(
+            vec![
+                item("peer_c", "One", "c/01.flac"),
+                item("peer_d", "One", "d/01.flac"),
+            ],
+            3,
+            MAX_SOURCES_PER_TRACK,
+        )]);
+        assert_eq!(pool.take_next(0).map(|i| i.id), Some("c/01.flac".into()));
         assert!(pool.take_next(0).is_none());
     }
 
@@ -335,6 +466,18 @@ mod tests {
     }
 
     #[test]
+    fn item_index_finds_the_item_of_the_same_file_from_the_same_peer() {
+        assert_eq!(
+            item_index(&queued("peer_a", "dirB/02.flac"), &searched()),
+            Some(1)
+        );
+        assert_eq!(
+            item_index(&queued("peer_b", "dirB/02.flac"), &searched()),
+            None
+        );
+    }
+
+    #[test]
     fn from_tracks_slots_follow_the_given_order() {
         // The enqueue order is not the search order: slskd returns its enqueue
         // results grouped by peer, so slot 0 here is
@@ -353,7 +496,7 @@ mod tests {
             Some(item("peer_a", "Come Over", "a-come-over.flac")),
         ];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert_eq!(
             pool.take_next(0).map(|i| i.id),
             Some("b-wake-up.flac".to_string())
@@ -383,7 +526,7 @@ mod tests {
             Some(item("peer_a", "Come Over", "a-come-over.flac")),
         ];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert_eq!(
             pool.take_next(0).map(|i| i.id),
             Some("b-wake-up.flac".to_string())
@@ -404,7 +547,7 @@ mod tests {
             0.9,
         )];
 
-        let mut pool = SourcePool::from_tracks(&tracks, &rest);
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert!(pool.take_next(0).is_none());
     }
 
@@ -430,6 +573,58 @@ mod tests {
         assert!(pool.take_next(9).is_none());
     }
 
+    #[test]
+    fn each_slot_keeps_its_own_cap() {
+        let rest = vec![
+            group("peer_b", vec![item("peer_b", "One", "b/01.flac")], 0.9),
+            group("peer_c", vec![item("peer_c", "One", "c/01.flac")], 0.8),
+        ];
+        let mut pool =
+            SourcePool::from_tracks(&[Some(item("peer_a", "One", "a/01.flac"))], &rest, 1);
+        assert_eq!(
+            pool.take_next(0),
+            None,
+            "a slot with one source has no failover"
+        );
+        pool.push_slot(
+            vec![
+                item("peer_b", "One", "b/01.flac"),
+                item("peer_c", "One", "c/01.flac"),
+            ],
+            2,
+        );
+        assert_eq!(pool.max_sources(0), 1);
+        assert_eq!(pool.max_sources(1), 2);
+        assert_eq!(pool.take_next(1).map(|i| i.source), Some("peer_b".into()));
+        assert_eq!(pool.take_next(1), None);
+    }
+
+    #[test]
+    fn a_pushed_slot_offers_its_own_alternates() {
+        let mut pool = SourcePool::from_tracks(
+            &[Some(item("peer_a", "One", "a/01.flac"))],
+            &[group(
+                "peer_b",
+                vec![item("peer_b", "One", "b/01.flac")],
+                0.9,
+            )],
+            MAX_SOURCES_PER_TRACK,
+        );
+        pool.push_slot(
+            vec![item("peer_c", "Two", "c/02.flac")],
+            MAX_SOURCES_PER_TRACK,
+        );
+        assert_eq!(pool.attempts_used(1), 1);
+        assert_eq!(
+            pool.take_next(1).map(|i| i.id),
+            Some("c/02.flac".to_string())
+        );
+        assert_eq!(
+            pool.take_next(0).map(|i| i.id),
+            Some("b/01.flac".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn enqueues_the_next_alternate() {
         let items = vec![
@@ -439,9 +634,10 @@ mod tests {
         let mut pool = SourcePool::single(items);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
 
-        let queued = pool
+        let (_, queued) = pool
             .enqueue_next(0, &backend, &batch("X"))
             .await
+            .queued
             .expect("enqueued");
         assert_eq!(queued.source, "peer_b");
     }
@@ -458,9 +654,10 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> =
             StubBackend::new(vec![ScriptedOutcome::Rejected, ScriptedOutcome::Enqueued]);
 
-        let queued = pool
+        let (_, queued) = pool
             .enqueue_next(0, &backend, &batch("X"))
             .await
+            .queued
             .expect("enqueued");
         assert_eq!(queued.source, "peer_c");
     }
@@ -479,9 +676,10 @@ mod tests {
             ScriptedOutcome::Enqueued,
         ]);
 
-        let queued = pool
+        let (_, queued) = pool
             .enqueue_next(0, &backend, &batch("X"))
             .await
+            .queued
             .expect("enqueued");
         assert_eq!(queued.source, "peer_c");
     }
@@ -499,10 +697,15 @@ mod tests {
             ScriptedOutcome::Enqueued,
         ]);
 
-        let queued = pool
+        let (candidate, queued) = pool
             .enqueue_next(0, &backend, &batch("X"))
             .await
+            .queued
             .expect("enqueued");
+        assert_eq!(
+            (candidate.source.as_str(), candidate.id.as_str()),
+            ("peer_c", "c.flac")
+        );
         assert_eq!(queued.source, "peer_c");
         assert_eq!(queued.id, "t-c.flac");
         assert_eq!(pool.attempts_used(0), 3);
@@ -520,6 +723,7 @@ mod tests {
 
         pool.enqueue_next(0, &backend, &batch("X"))
             .await
+            .queued
             .expect("enqueued");
         assert_eq!(stub.destinations(), vec!["X [12345678]".to_string()]);
     }
@@ -539,9 +743,10 @@ mod tests {
         let mine = batch("X");
         let someone_else = batch("Y").owner;
 
-        let queued = pool
+        let (_, queued) = pool
             .enqueue_next(0, &backend, &mine)
             .await
+            .queued
             .expect("enqueued");
 
         assert_eq!(queued.source, "peer_c");
@@ -570,12 +775,13 @@ mod tests {
         let other = batch("Other");
         TransferRegistry::global().claim(&[key(&backend, "peer_b", "b.flac")], &other);
 
-        let queued = pool
-            .enqueue_next(0, &backend, &batch("X"))
-            .await
-            .expect("enqueued");
+        let next = pool.enqueue_next(0, &backend, &batch("X")).await;
 
-        assert_eq!(queued.source, "peer_c");
+        assert_eq!(next.queued.expect("enqueued").1.source, "peer_c");
+        assert_eq!(
+            next.refused[0].failure.code,
+            FailureCode::AlreadyInFlightOtherUser
+        );
         assert_eq!(stub.destinations().len(), 1, "peer_b was never asked");
         assert!(
             TransferRegistry::global().may_adopt(&key(&backend, "peer_b", "b.flac"), &other.owner)
@@ -591,7 +797,11 @@ mod tests {
         let mut pool = SourcePool::single(items);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Rejected]);
 
-        assert!(pool.enqueue_next(0, &backend, &batch("X")).await.is_none());
+        assert!(pool
+            .enqueue_next(0, &backend, &batch("X"))
+            .await
+            .queued
+            .is_none());
     }
 
     #[tokio::test]
@@ -611,7 +821,146 @@ mod tests {
             ScriptedOutcome::Rejected,
         ]);
 
-        assert!(pool.enqueue_next(0, &backend, &batch("X")).await.is_none());
+        assert!(pool
+            .enqueue_next(0, &backend, &batch("X"))
+            .await
+            .queued
+            .is_none());
         assert_eq!(pool.attempts_used(0), MAX_SOURCES_PER_TRACK);
+    }
+
+    #[tokio::test]
+    async fn enqueue_next_reports_every_refused_alternate() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+            item("peer_c", "Wake Up", "c.flac"),
+            item("peer_d", "Wake Up", "d.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![
+            ScriptedOutcome::Rejected,
+            ScriptedOutcome::TransportError,
+            ScriptedOutcome::Enqueued,
+        ]);
+        let next = pool.enqueue_next(0, &backend, &batch("X")).await;
+        assert_eq!(next.queued.unwrap().1.source, "peer_d");
+        let refused: Vec<(&str, FailureCode)> = next
+            .refused
+            .iter()
+            .map(|r| (r.candidate.source.as_str(), r.failure.code))
+            .collect();
+        assert_eq!(
+            refused,
+            vec![
+                ("peer_b", FailureCode::PeerOffline),
+                ("peer_c", FailureCode::BackendResponseUnreadable)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_next_codes_alternates_the_same_user_already_holds() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+            item("peer_c", "Wake Up", "c.flac"),
+            item("peer_d", "Wake Up", "d.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let mine = batch("X");
+        TransferRegistry::global().claim(
+            &[key(&backend, "peer_b", "b.flac")],
+            &same_user_into(&mine, PathBuf::from("/other-library")),
+        );
+        TransferRegistry::global().claim(
+            &[key(&backend, "peer_c", "c.flac")],
+            &same_user_into(&mine, PathBuf::from("/music")),
+        );
+        let next = pool.enqueue_next(0, &backend, &mine).await;
+        assert_eq!(next.queued.unwrap().1.source, "peer_d");
+        let refused: Vec<(&str, FailureCode, &str)> = next
+            .refused
+            .iter()
+            .map(|r| {
+                (
+                    r.candidate.source.as_str(),
+                    r.failure.code,
+                    r.failure.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            refused,
+            vec![
+                (
+                    "peer_b",
+                    FailureCode::AlreadyInFlightOtherFolder,
+                    ANOTHER_FOLDER
+                ),
+                ("peer_c", FailureCode::AlreadyRunning, ALREADY_MINE)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alternate_the_backend_answers_nothing_for_is_refused_as_nothing_enqueued() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Unanswered]);
+
+        let next = pool.enqueue_next(0, &backend, &batch("X")).await;
+
+        assert!(next.queued.is_none());
+        let f = &next.refused[0].failure;
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::EnqueueFailed,
+                Stage::Enqueue,
+                RetryAdvice::OtherSource,
+                NOTHING_ENQUEUED
+            )
+        );
+        assert!(TransferRegistry::global()
+            .may_adopt(&key(&backend, "peer_b", "b.flac"), &batch("Y").owner));
+    }
+
+    #[tokio::test]
+    async fn every_alternate_refused_is_reported_when_none_is_accepted() {
+        let items = vec![
+            item("peer_a", "Wake Up", "a.flac"),
+            item("peer_b", "Wake Up", "b.flac"),
+            item("peer_c", "Wake Up", "c.flac"),
+        ];
+        let mut pool = SourcePool::single(items);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![
+            ScriptedOutcome::AlreadyInFlight,
+            ScriptedOutcome::Rejected,
+        ]);
+        let next = pool.enqueue_next(0, &backend, &batch("X")).await;
+        assert!(next.queued.is_none());
+        let refused: Vec<(&str, &str, FailureCode)> = next
+            .refused
+            .iter()
+            .map(|r| {
+                (
+                    r.candidate.source.as_str(),
+                    r.candidate.id.as_str(),
+                    r.failure.code,
+                )
+            })
+            .collect();
+        assert_eq!(
+            refused,
+            vec![
+                ("peer_b", "b.flac", FailureCode::EnqueueFailed),
+                ("peer_c", "c.flac", FailureCode::PeerOffline)
+            ]
+        );
     }
 }

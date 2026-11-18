@@ -1,8 +1,12 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use shared::{
-    download::{DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult},
-    library::DuplicateReport,
-    metadata::{Album, AlbumWithTracks, SearchResult as MetadataSearchResult, Track},
+    download::{
+        DownloadProgress, DownloadableItem, MatchChoices, QueuedDownload, SearchResult, SearchSpec,
+        SkipKind, SourcePresence,
+    },
+    failure::{Failure, UserAction},
+    metadata::{AlbumWithTracks, Provider, SearchResult as MetadataSearchResult},
     recommendation::{
         ArtistPopularity, CandidateSet, Listen, ProfileConfig, RankedArtist, RankedTrack,
         SignalReport, SimilarArtist, SimilarTrack, TimePeriod, UserMusicProfile, WeightedTag,
@@ -10,14 +14,15 @@ use shared::{
     system::ImporterHealth,
 };
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::Result;
+use crate::MetadataError;
 
 #[async_trait]
 pub trait MetadataProvider: Send + Sync {
-    fn id(&self) -> &'static str;
+    fn id(&self) -> Provider;
     fn name(&self) -> &'static str;
 
     async fn search_albums(
@@ -25,16 +30,16 @@ pub trait MetadataProvider: Send + Sync {
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<MetadataSearchResult>>;
+    ) -> std::result::Result<Vec<MetadataSearchResult>, MetadataError>;
 
     async fn search_tracks(
         &self,
         artist: Option<&str>,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<MetadataSearchResult>>;
+    ) -> std::result::Result<Vec<MetadataSearchResult>, MetadataError>;
 
-    async fn get_album(&self, id: &str) -> Result<AlbumWithTracks>;
+    async fn get_album(&self, id: &str) -> std::result::Result<AlbumWithTracks, MetadataError>;
 }
 
 #[async_trait]
@@ -42,14 +47,20 @@ pub trait DownloadBackend: Send + Sync {
     fn id(&self) -> &'static str;
     fn name(&self) -> &'static str;
 
-    async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String>;
+    async fn start_search(&self, spec: &SearchSpec) -> Result<String>;
     async fn poll_search(&self, search_id: &str) -> Result<SearchResult>;
+    /// A fresh id for one `download` call, drawn before the call so the caller can store it
+    /// first. Opaque to the caller.
+    fn new_request(&self) -> String;
     /// Enqueue `items` into `destination`, a folder under the backend's
-    /// download directory shared by every item of the call.
+    /// download directory shared by every item of the call. `request` is
+    /// one `new_request` gave, for this call only: every transfer the call
+    /// makes is listed with it as `DownloadProgress::request`.
     async fn download(
         &self,
         items: Vec<DownloadableItem>,
         destination: &str,
+        request: &str,
     ) -> Result<Vec<QueuedDownload>>;
     /// Transfers held for the given peers. Scoped rather than global: the
     /// backend's full list grows with its whole history, and every caller
@@ -60,8 +71,19 @@ pub trait DownloadBackend: Send + Sync {
     /// needs peers outside the batch: adopting a file retried from a source
     /// nobody is tracking.
     async fn get_downloads(&self) -> Result<Vec<DownloadProgress>>;
+    /// The transfer `source` holds under `id`, as `get_downloads_for` reads it; None when the backend no longer has it.
+    async fn get_download(&self, source: &str, id: &str) -> Result<Option<DownloadProgress>>;
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()>;
-    async fn health_check(&self) -> bool;
+    /// The transfer's place in the source's queue, asked of the source now; None when the
+    /// backend no longer has the transfer.
+    async fn queue_position(&self, source: &str, id: &str) -> Result<Option<u32>>;
+    /// Whether the source is online now.
+    async fn source_status(&self, source: &str) -> Result<SourcePresence>;
+    /// Ends a running search early; its next poll reads what it found so far.
+    async fn stop_search(&self, search_id: &str) -> Result<()>;
+    /// Ok when the backend can take work now; else why not, as a failure
+    /// with the backend's own answer as its cause.
+    async fn health_check(&self) -> std::result::Result<(), Failure>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +92,10 @@ pub enum ImportMode {
     Singleton,
 }
 
-/// How the importer decides on a match.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How the importer decides on a match. Kept with an import the ledger stores, so a restart
+/// runs it as the user chose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DriverChoice {
     /// As a quiet import does: apply a strong match, skip the rest.
     Auto,
@@ -81,11 +105,89 @@ pub enum DriverChoice {
     Pick { data_source: String, id: String },
 }
 
+/// How a run handles the duplicates beets finds in the library: as beets' config says, with a
+/// `remove` reported instead of made, skipped whatever the config says, or each reported as a
+/// removal whatever the config says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateRun {
+    /// beets acts as configured.
+    AsConfigured,
+    /// beets keeps the earlier copy and reports the removal it wanted.
+    ReportRemovals,
+    /// beets skips a task whose music the library already has, whatever its config says.
+    Skip,
+    /// beets keeps every earlier copy and reports each as a wanted removal, whatever its config
+    /// says.
+    Replace,
+}
+
+/// One beets task's wanted removal: the earlier items beets would have deleted, and the items
+/// the task imported once their files were in place (empty when they never were).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WantedRemoval {
+    /// As `ImportedItem` names a library item: the path relative to the library folder.
+    pub existing: Vec<ImportedItem>,
+    /// Each imported item's id and where beets stored it, relative to the library folder when
+    /// inside it.
+    pub imported: Vec<(u64, PathBuf)>,
+}
+
+/// What a relocate did with the items it was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relocation {
+    /// Each item the importer could be read for after the move, with the path its file has now:
+    /// relative to the library folder when inside it, else as the importer gives it.
+    pub now: Vec<(u64, PathBuf)>,
+    /// Why the move is not done: the importer failed to move the items, moved one out of the
+    /// library, or could not be read for one (whose id is then not in `now`).
+    pub failure: Option<Failure>,
+}
+
+/// One library item, as beets stored it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedItem {
+    /// Relative to the library folder when inside it, else absolute.
+    pub path: PathBuf,
+    /// The MusicBrainz recording beets stored (mb_trackid); None when it stored none.
+    pub recording_mbid: Option<String>,
+    pub artist: String,
+    pub title: String,
+    /// beets' item id; None for an item not read from beets.
+    #[serde(default)]
+    pub beets_id: Option<u64>,
+    /// The MusicBrainz release beets stored (mb_albumid); None when it stored none.
+    #[serde(default)]
+    pub release_mbid: Option<String>,
+    /// Empty for a waiting import stored before the album was reported.
+    #[serde(default)]
+    pub album: String,
+    /// How close the match beets applied was to the files, in thousandths, as a candidate's
+    /// `per_mille`; None when beets applied none (an as-is import, an item already in the
+    /// library) or the item was not read from beets.
+    #[serde(default)]
+    pub match_per_mille: Option<u16>,
+}
+
+/// One file of an import, with the tags beets read from it before matching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFile {
+    pub path: PathBuf,
+    pub artist: String,
+    pub title: String,
+    pub album: String,
+    pub track: Option<u32>,
+    pub length_secs: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportOutcome {
     Imported {
         untagged: bool,
         warnings: Vec<String>,
+        items: Vec<ImportedItem>,
+        /// The first step after the import that failed, as `warnings` also says (a new copy that
+        /// could not be moved into place), typed for the row.
+        failure: Option<Failure>,
     },
     Skipped(SkipReason),
     LookupFailed {
@@ -93,6 +195,7 @@ pub enum ImportOutcome {
         message: String,
     },
     Failed {
+        kind: FailKind,
         message: String,
     },
     TimedOut {
@@ -105,9 +208,27 @@ pub enum ImportOutcome {
     },
 }
 
+/// What a `Failed` import outcome went wrong with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailKind {
+    /// beets ran and failed, or the import worker stopped.
+    Beets,
+    /// The importer could not be set up or started.
+    Setup,
+    TargetUnwritable,
+    /// The disk beets writes to is full.
+    DiskFull,
+    AsIsMissingTags,
+    ChoiceInvalid,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    AlreadyInLibrary,
+    /// The library has it. `existing` holds the items beets found, when it reported the skip
+    /// with them; empty when only the run log said so.
+    AlreadyInLibrary {
+        existing: Vec<ImportedItem>,
+    },
     /// No candidate was close enough. The count is the number of candidates
     /// beets weighed, when every task in the run saw the same number.
     NoMatch {
@@ -116,13 +237,25 @@ pub enum SkipReason {
     NothingToImport,
 }
 
+impl From<&SkipReason> for SkipKind {
+    fn from(reason: &SkipReason) -> Self {
+        match reason {
+            SkipReason::AlreadyInLibrary { .. } => SkipKind::AlreadyInLibrary,
+            SkipReason::NoMatch { candidates } => SkipKind::NoMatch {
+                candidates: *candidates,
+            },
+            SkipReason::NothingToImport => SkipKind::NothingToImport,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutKind {
     Idle(Duration),
     Total(Duration),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskCount {
     pub imported: u32,
     pub total: u32,
@@ -137,6 +270,15 @@ pub struct ImportResult {
     /// What a user can pick from after an automatic import skipped its only
     /// task for want of a close match.
     pub choices: Option<MatchChoices>,
+    /// What a person must do before these files can import, when only a
+    /// person can fix what went wrong. The importer words it, since it names
+    /// the importer's own setup.
+    pub user_action: Option<UserAction>,
+    /// The removals beets wanted in a `DuplicateRun::ReportRemovals` or `Replace` run, one per task.
+    pub removals: Vec<WantedRemoval>,
+    /// The files of every task an automatic run recorded, in task order, each tag cut to
+    /// `shared::failure::TEXT_MAX_CHARS` characters, since a peer chose them.
+    pub files: Vec<SourceFile>,
 }
 
 impl ImportResult {
@@ -146,6 +288,9 @@ impl ImportResult {
             output_tail: String::new(),
             tasks: TaskCount::default(),
             choices: None,
+            user_action: None,
+            removals: vec![],
+            files: vec![],
         }
     }
 
@@ -153,12 +298,17 @@ impl ImportResult {
         Self::without_run(ImportOutcome::Refused { issue })
     }
 
-    pub fn failed(message: String) -> Self {
-        Self::without_run(ImportOutcome::Failed { message })
+    pub fn failed(kind: FailKind, message: String) -> Self {
+        Self::without_run(ImportOutcome::Failed { kind, message })
     }
 
     pub fn nothing_to_import() -> Self {
         Self::without_run(ImportOutcome::Skipped(SkipReason::NothingToImport))
+    }
+
+    pub fn with_user_action(mut self, action: UserAction) -> Self {
+        self.user_action = Some(action);
+        self
     }
 }
 
@@ -182,7 +332,9 @@ fn clip(s: &str, chars: usize) -> &str {
 impl fmt::Display for ImportOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ImportOutcome::Imported { untagged, warnings } => {
+            ImportOutcome::Imported {
+                untagged, warnings, ..
+            } => {
                 f.write_str(if *untagged {
                     "Imported as-is (untagged)"
                 } else {
@@ -190,8 +342,17 @@ impl fmt::Display for ImportOutcome {
                 })?;
                 warnings.iter().try_for_each(|w| write!(f, "; {w}"))
             }
-            ImportOutcome::Skipped(SkipReason::AlreadyInLibrary) => {
-                f.write_str("Already in library")
+            ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { existing }) => {
+                f.write_str("Already in library")?;
+                if !existing.is_empty() {
+                    let files = existing
+                        .iter()
+                        .map(|i| i.path.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(f, ": {files}")?;
+                }
+                Ok(())
             }
             ImportOutcome::Skipped(SkipReason::NoMatch {
                 candidates: Some(1),
@@ -210,7 +371,7 @@ impl fmt::Display for ImportOutcome {
             ImportOutcome::LookupFailed { source, message } => {
                 write!(f, "Lookup failed in {source}: {message}")
             }
-            ImportOutcome::Failed { message } => f.write_str(message),
+            ImportOutcome::Failed { message, .. } => f.write_str(message),
             ImportOutcome::TimedOut {
                 limit: TimeoutKind::Idle(d),
                 last_line: Some(line),
@@ -247,6 +408,17 @@ impl fmt::Display for ImportResult {
     }
 }
 
+/// What became of a request to drop one file from a library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetOutcome {
+    Removed,
+    /// The library holds no item at that path, or the folder has no library.
+    NotInLibrary,
+    /// Several items have that path; none was removed.
+    Several(usize),
+    Failed(String),
+}
+
 #[async_trait]
 pub trait MusicImporter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -258,12 +430,20 @@ pub trait MusicImporter: Send + Sync {
         target: &Path,
         mode: ImportMode,
         choice: &DriverChoice,
+        duplicates: DuplicateRun,
     ) -> ImportResult;
 
-    async fn find_duplicates(
-        &self,
-        libraries: &[&Path],
-    ) -> std::result::Result<DuplicateReport, String>;
+    /// Moves the items with `item_ids` of the library of `library` to the paths the importer
+    /// gives them, then reads where each item's file is, also when the move failed.
+    async fn relocate(&self, library: &Path, item_ids: &[u64]) -> Relocation;
+
+    /// The result of a job not run because of `issue`, the title of one of
+    /// this importer's blocking health issues.
+    fn refused(&self, issue: String) -> ImportResult;
+
+    /// Removes the item at exactly `file` from the library of `library`,
+    /// leaving the file alone.
+    async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome;
 
     /// The last known health, without waiting. `Checking` before the first check.
     fn health(&self) -> ImporterHealth;
@@ -274,81 +454,6 @@ pub trait MusicImporter: Send + Sync {
     /// Whether what the last check depended on has changed since. True before
     /// the first check, false while one is running.
     async fn health_stale(&self) -> bool;
-}
-
-pub struct FallbackMetadataProvider {
-    providers: Vec<Box<dyn MetadataProvider>>,
-}
-
-impl FallbackMetadataProvider {
-    pub fn new(providers: Vec<Box<dyn MetadataProvider>>) -> Self {
-        Self { providers }
-    }
-}
-
-#[async_trait]
-impl MetadataProvider for FallbackMetadataProvider {
-    fn id(&self) -> &'static str {
-        "fallback"
-    }
-
-    fn name(&self) -> &'static str {
-        "Fallback"
-    }
-
-    async fn search_albums(
-        &self,
-        artist: Option<&str>,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<MetadataSearchResult>> {
-        for provider in &self.providers {
-            match provider.search_albums(artist, query, limit).await {
-                Ok(results) if !results.is_empty() => return Ok(results),
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!("{} failed: {}", provider.name(), e);
-                    continue;
-                }
-            }
-        }
-        Ok(vec![])
-    }
-
-    async fn search_tracks(
-        &self,
-        artist: Option<&str>,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<MetadataSearchResult>> {
-        for provider in &self.providers {
-            match provider.search_tracks(artist, query, limit).await {
-                Ok(results) if !results.is_empty() => return Ok(results),
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!("{} failed: {}", provider.name(), e);
-                    continue;
-                }
-            }
-        }
-        Ok(vec![])
-    }
-
-    async fn get_album(&self, id: &str) -> Result<AlbumWithTracks> {
-        for provider in &self.providers {
-            match provider.get_album(id).await {
-                Ok(album) => return Ok(album),
-                Err(e) => {
-                    tracing::warn!("{} failed: {}", provider.name(), e);
-                    continue;
-                }
-            }
-        }
-        Err(crate::error::SoulseekError::Api {
-            status: 404,
-            message: "Album not found".to_string(),
-        })
-    }
 }
 
 #[async_trait]

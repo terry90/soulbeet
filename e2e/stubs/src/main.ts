@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { MbControl, createMusicBrainzServer } from './mb-server.js';
 import { createSlskdServer } from './slskd-server.js';
 import { SlskdState } from './slskd-state.js';
+import { proxyFromEnv } from './tcp-proxy.js';
 
 const e2eRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -18,7 +19,13 @@ const enqueueLatencyMs = Number(process.env.ENQUEUE_LATENCY_MS ?? 150);
 const state = new SlskdState(audioDir, downloadsDir, undefined, enqueueLatencyMs);
 setInterval(() => state.tick(), 200).unref();
 
-const slskd = createSlskdServer(state, apiKey);
+const navidromeProxy = proxyFromEnv(process.env);
+if (navidromeProxy) {
+  await navidromeProxy.start();
+  console.log(`[navidrome-proxy] listening on :${process.env.NAVIDROME_PROXY_PORT}`);
+}
+
+const slskd = createSlskdServer(state, apiKey, navidromeProxy);
 slskd.listen(slskdPort, '0.0.0.0', () => {
   console.log(`[slskd] listening on :${slskdPort} (downloads -> ${downloadsDir})`);
 });

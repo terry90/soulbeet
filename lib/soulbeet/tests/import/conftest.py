@@ -130,11 +130,13 @@ class Beets:
         self.runs += 1
         return Run(proc, runlog)
 
-    def driver(self, *choice, sources=(), singleton=False, env=None):
+    def driver(
+        self, *choice, sources=(), singleton=False, duplicates="as-configured", env=None
+    ):
         """Runs import.py and returns the Run with its parsed report."""
         report = self.root / f"report{self.runs}.json"
         args = self.beet_args(*sources, singleton=singleton)
-        argv = [sys.executable, "-P", "-c", DRIVER_SRC, str(report), *choice]
+        argv = [sys.executable, "-P", "-c", DRIVER_SRC, str(report), duplicates, *choice]
         run = self._run([*argv, "--", *args], env)
         run.report = strict_json(report.read_bytes()) if report.exists() else None
         return run
@@ -144,24 +146,31 @@ class Beets:
         args = self.beet_args(*sources, singleton=singleton)
         return self._run([sys.executable, "-P", "-m", "beets", *args], env)
 
-    def library(self):
-        """(title, artist, album, mb_trackid, path relative to music) per item."""
-        out = subprocess.run(
+    def beet(self, *args):
+        """Runs `beet args...` on the library and returns the finished process."""
+        return subprocess.run(
             [
                 sys.executable, "-P", "-m", "beets",
                 "-c", str(self.config),
                 "-l", str(self.music / ".beets_library.db"),
                 "-d", str(self.music),
-                "ls", "-f", "$title\t$artist\t$album\t$mb_trackid\t$path",
+                *args,
             ],
             capture_output=True,
             text=True,
             env=self._env(),
             cwd=self.root,
             check=True,
-        ).stdout
+        )
+
+    def ls(self, fmt, *query):
+        """The lines `beet ls -f fmt query...` prints for the library."""
+        return self.beet("ls", "-f", fmt, *query).stdout.splitlines()
+
+    def library(self):
+        """(title, artist, album, mb_trackid, path relative to music) per item."""
         rows = []
-        for line in out.splitlines():
+        for line in self.ls("$title\t$artist\t$album\t$mb_trackid\t$path"):
             title, artist, album, trackid, path = line.split("\t")
             relative = str(Path(path).relative_to(self.music))
             rows.append((title, artist, album, trackid, relative))

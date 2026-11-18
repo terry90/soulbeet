@@ -37,6 +37,10 @@ jobs:
       - name: Test the workspace
         run: cargo test --workspace --features server,dioxus/server --lib --locked
 
+      # The routes live in the web binary, which --lib leaves out.
+      - name: Test the web routes
+        run: cargo test -p web --features server,dioxus/server --bins --locked
+
       # Without feature unification from the other crates, to catch missing features.
       - name: Test soulbeet on its own
         run: cargo test -p soulbeet --lib --locked

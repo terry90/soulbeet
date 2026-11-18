@@ -1,3 +1,4 @@
+use super::SourceChoices;
 use dioxus::prelude::*;
 use shared::download::DownloadableGroup;
 
@@ -5,6 +6,8 @@ use shared::download::DownloadableGroup;
 pub struct FallbackToastData {
     pub id: String,
     pub track_name: String,
+    /// The stored search `results` came from.
+    pub search_id: String,
     pub results: Vec<DownloadableGroup>,
 }
 
@@ -12,7 +15,7 @@ pub struct FallbackToastData {
 pub struct FallbackToastProps {
     pub toast: FallbackToastData,
     #[props(into)]
-    pub on_pick_source: EventHandler<Vec<DownloadableGroup>>,
+    pub on_pick_source: EventHandler<SourceChoices>,
     #[props(into)]
     pub on_dismiss: EventHandler<String>,
 }
@@ -25,7 +28,10 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
     let toast_id = toast.id.clone();
     let toast_id_pick = toast.id.clone();
     let track_name = toast.track_name.clone();
-    let results = toast.results.clone();
+    let choices = SourceChoices {
+        search_id: toast.search_id.clone(),
+        groups: toast.results.clone(),
+    };
 
     rsx! {
         div { class: "bg-beet-panel border border-white/10 rounded-lg shadow-2xl p-4 relative",
@@ -58,7 +64,7 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
             p {
                 class: "text-xs text-beet-leaf font-mono cursor-pointer hover:underline mt-1",
                 onclick: move |_| {
-                    on_pick_source.call(results.clone());
+                    on_pick_source.call(choices.clone());
                     on_dismiss.call(toast_id_pick.clone());
                 },
                 "Pick a source manually"

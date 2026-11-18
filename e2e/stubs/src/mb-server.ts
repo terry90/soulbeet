@@ -76,18 +76,19 @@ function weakHit(hit: RecordingHit): RecordingHit {
 
 /**
  * Parses the Lucene subset the two clients emit: `field:"phrase"` pairs
- * (musicbrainz_rs) and `field:(escaped terms)` groups (beets), joined with
- * AND or whitespace.
+ * whose `"` and `\` are escaped (Soulful) and `field:(escaped terms)`
+ * groups (beets), joined with AND or whitespace.
  */
 function parseLucene(query: string): { fields: Map<string, string>; freeText: string[] } {
   const fields = new Map<string, string>();
-  const fieldPattern = /([a-z]+):(?:"([^"]*)"|\(([^)]*)\)|(\S+))/gi;
+  const fieldPattern = /([a-z]+):(?:"((?:[^"\\]|\\.)*)"|\(([^)]*)\)|(\S+))/gi;
   let match: RegExpExecArray | null;
   const consumed: string[] = [];
   while ((match = fieldPattern.exec(query)) !== null) {
     const key = (match[1] ?? '').toLowerCase();
     const value = match[2] ?? match[3] ?? match[4] ?? '';
-    // beets escapes Lucene metacharacters with backslashes; undo that.
+    // beets escapes Lucene metacharacters, and Soulful a phrase's quote and
+    // backslash, with backslashes; undo that.
     fields.set(key, value.replace(/\\(.)/g, '$1').toLowerCase().trim());
     consumed.push(match[0] as string);
   }
@@ -108,6 +109,25 @@ function matchesText(haystack: string, needle: string | undefined): boolean {
     return true;
   }
   return haystack.toLowerCase().includes(needle);
+}
+
+/** The fixture artists whose name holds the query's `artist` field. */
+function searchArtists(query: string): FixtureRelease[] {
+  const { fields, freeText } = parseLucene(query);
+  const name = fields.get('artist') ?? (freeText.length > 0 ? freeText.join(' ') : undefined);
+  const seen = new Set<string>();
+  return releases.filter((release) => {
+    if (name === undefined || !matchesText(release.artist, name) || seen.has(release.artistMbid)) {
+      return false;
+    }
+    seen.add(release.artistMbid);
+    return true;
+  });
+}
+
+/** The fixture releases holding the recording `mbid`. */
+function releasesOfRecording(mbid: string): FixtureRelease[] {
+  return releases.filter((release) => release.tracks.some((track) => track.mbid === mbid));
 }
 
 interface RecordingHit {
@@ -349,6 +369,52 @@ export function createMusicBrainzServer(control: MbControl): Server {
             count: found.length,
             offset: 0,
             'release-groups': found.map((r) => releaseGroupJson(r)),
+          });
+        }),
+      },
+      {
+        method: 'GET',
+        pattern: '/ws/2/artist',
+        handler: served(control, ({ res, url }) => {
+          // An artist search answer (GET /ws/2/artist?query=...): {created, count, offset, artists}.
+          const query = url.searchParams.get('query') ?? '';
+          const limitParam = Number(url.searchParams.get('limit') ?? '25');
+          const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 25;
+          const found = searchArtists(query);
+          console.log(`[mb] artist search "${query}" -> ${found.length}`);
+          sendJson(res, 200, {
+            created: new Date().toISOString(),
+            count: found.length,
+            offset: 0,
+            artists: found.slice(0, limit).map((release) => ({
+              id: release.artistMbid,
+              type: 'Group',
+              'type-id': 'e431f5f6-b5d2-343d-8b36-72607fffb74b',
+              score: 100,
+              name: release.artist,
+              'sort-name': release.artist,
+              'life-span': { ended: null },
+            })),
+          });
+        }),
+      },
+      {
+        method: 'GET',
+        pattern: '/ws/2/release',
+        handler: served(control, ({ res, url }) => {
+          // A release browse by recording (GET /ws/2/release?recording=...&inc=release-groups):
+          // {release-count, release-offset, releases}, each release with its release group.
+          const recording = url.searchParams.get('recording') ?? '';
+          const limitParam = Number(url.searchParams.get('limit') ?? '25');
+          const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 25;
+          const offsetParam = Number(url.searchParams.get('offset') ?? '0');
+          const offset = Number.isFinite(offsetParam) && offsetParam > 0 ? offsetParam : 0;
+          const found = releasesOfRecording(recording);
+          console.log(`[mb] releases of recording ${recording} -> ${found.length}`);
+          sendJson(res, 200, {
+            'release-count': found.length,
+            'release-offset': offset,
+            releases: found.slice(offset, offset + limit).map((release) => releaseJson(release)),
           });
         }),
       },

@@ -1,6 +1,6 @@
-use super::processing;
+use super::{processing, utils::WantedTrack};
 use crate::{
-    error::{Result, SoulseekError},
+    error::{MissingSetting, Result, SoulseekError},
     http::{resolve_docker_url, CircuitBreaker},
     slskd::models::{
         BatchEnqueueOptions, BatchEnqueueRequest, BatchEnqueueResponse, DownloadRequestFile,
@@ -12,7 +12,10 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::{Client, Method, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::{
-    download::EnqueueStatus,
+    download::{EnqueueStatus, SearchSpec, SearchStats, SourcePresence},
+    failure::{
+        Cause, Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
+    },
     metadata::{Album, Track},
     slskd::{AlbumResult, DownloadResponse, FileEntry, FlattenedFiles, SearchState, TrackResult},
 };
@@ -54,10 +57,70 @@ impl Default for DownloadConfig {
 struct SearchContext {
     artist: String,
     album: Option<String>,
-    track_titles: Vec<String>,
+    tracks: Vec<WantedTrack>,
+    /// The text slskd was sent.
+    query_text: String,
+    keep_below_floor: bool,
     start_time: DateTime<Utc>,
     timeout: Duration,
-    seen_response_count: usize,
+    /// slskd was told to stop the search at the deadline.
+    cancelled: bool,
+}
+
+/// What one poll of a search found: the processed albums and what the search
+/// read, both empty while the search is in progress.
+#[derive(Debug)]
+pub struct SearchPoll {
+    pub albums: Vec<AlbumResult>,
+    pub state: SearchState,
+    pub stats: SearchStats,
+}
+
+/// The part of slskd's search record a poll reads (`GET searches/{id}`,
+/// `SearchesController.cs:140`; `Search/Types/Search.cs:52,55`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchStatus {
+    is_complete: bool,
+    response_count: u32,
+}
+
+/// What a poll does after reading a search's status.
+enum PollStep {
+    /// The search ended: read its responses.
+    Read,
+    /// The search runs: look again.
+    Wait,
+    /// The deadline passed: tell slskd to stop the search.
+    Cancel,
+    /// The search kept running after it was cancelled.
+    GiveUp,
+}
+
+/// How long a cancelled search may take to end.
+const CANCEL_GRACE: Duration = Duration::seconds(15);
+
+/// slskd marks a search complete before it writes the responses
+/// (`Search/SearchService.cs:284-285`, then `:359-361`), so an empty answer
+/// to a search that counted responses is read again after this delay.
+const RESPONSES_REREAD_DELAY: StdDuration = StdDuration::from_millis(500);
+/// How many times such an answer is read again before the responses count
+/// as lost.
+const RESPONSES_REREADS: u32 = 6;
+
+/// The step for a search `elapsed` into its `deadline`.
+fn poll_step(complete: bool, elapsed: Duration, deadline: Duration, cancelled: bool) -> PollStep {
+    if complete {
+        PollStep::Read
+    } else if elapsed < deadline {
+        PollStep::Wait
+    } else if !cancelled {
+        PollStep::Cancel
+    } else if elapsed < deadline + CANCEL_GRACE {
+        PollStep::Wait
+    } else {
+        PollStep::GiveUp
+    }
 }
 
 #[derive(Debug)]
@@ -71,6 +134,8 @@ pub struct SoulseekClient {
     rate_limit_window: Duration,
     download_config: DownloadConfig,
     circuit_breaker: Arc<CircuitBreaker>,
+    /// slskd's download retry limit, read on the first listing.
+    retry_limit: tokio::sync::OnceCell<u32>,
 }
 
 #[derive(Default)]
@@ -109,8 +174,21 @@ impl SoulseekClientBuilder {
         self
     }
 
+    /// A builder for the slskd at `url` with `api_key`, as Soulful stores
+    /// them: a setting that is missing or empty is `NotConfigured`.
+    pub fn from_settings(url: Option<String>, api_key: Option<String>) -> Result<Self> {
+        let url = url.ok_or(SoulseekError::NotConfigured(MissingSetting::Url))?;
+        let api_key = api_key.ok_or(SoulseekError::NotConfigured(MissingSetting::ApiKey))?;
+        if url.is_empty() || api_key.is_empty() {
+            return Err(SoulseekError::NotConfigured(MissingSetting::Empty));
+        }
+        Ok(Self::new().base_url(&url).api_key(&api_key))
+    }
+
     pub fn build(self) -> Result<SoulseekClient> {
-        let base_url_str = self.base_url.ok_or(SoulseekError::NotConfigured)?;
+        let base_url_str = self
+            .base_url
+            .ok_or(SoulseekError::NotConfigured(MissingSetting::Url))?;
         let base_url = Url::parse(base_url_str.trim_end_matches('/'))?;
 
         // Build HTTP client with proper timeouts
@@ -134,6 +212,7 @@ impl SoulseekClientBuilder {
             rate_limit_window: Duration::seconds(self.rate_limit_window_seconds.unwrap_or(220)),
             download_config: self.download_config.unwrap_or_default(),
             circuit_breaker: Arc::new(CircuitBreaker::default()),
+            retry_limit: tokio::sync::OnceCell::new(),
         })
     }
 }
@@ -180,6 +259,9 @@ impl SoulseekClient {
                 }
                 Err(e) => {
                     self.circuit_breaker.record_failure().await;
+                    // A failure never holds a request URL (design 10): the URL names the
+                    // slskd host and the peer asked about.
+                    let e = e.without_url();
                     if e.is_timeout() {
                         warn!("Request to {} timed out", endpoint);
                         return Err(SoulseekError::Api {
@@ -287,24 +369,30 @@ impl SoulseekClient {
         Ok(())
     }
 
-    pub async fn start_search(
-        &self,
-        album: Option<Album>,
-        tracks: Vec<Track>,
-        timeout: Duration,
-    ) -> Result<String> {
+    /// The search for `spec`: `spec.text` trimmed when given, else
+    /// `search_text` of its album and tracks, which a search needs either way
+    /// to score what it finds.
+    pub async fn start_search(&self, spec: SearchSpec, timeout: Duration) -> Result<String> {
+        let SearchSpec {
+            album,
+            tracks,
+            text,
+            keep_below_floor,
+        } = spec;
+        let built = search_text(album.as_ref(), &tracks)?;
+        let query = match text.as_deref().map(str::trim) {
+            Some(text) if !text.is_empty() => text.to_string(),
+            _ => built,
+        };
         self.wait_for_rate_limit().await?;
 
-        let track_titles: Vec<String> = tracks.iter().map(|t| t.title.clone()).collect();
-
-        let query = match album {
-            Some(ref album) => match tracks.len() {
-                1 => format!("{} {}", album.artist.trim(), tracks[0].title.trim()),
-                _ => format!("{} {}", album.artist.trim(), album.title.trim()),
-            },
-            // No album, should be a single track search
-            None => format!("{} {}", tracks[0].artist.trim(), tracks[0].title.trim()),
-        };
+        let wanted: Vec<WantedTrack> = tracks
+            .iter()
+            .map(|t| WantedTrack {
+                title: t.title.clone(),
+                duration_s: t.duration_secs(),
+            })
+            .collect();
 
         info!(
             "Starting search for: '{}' with timeout {}ms",
@@ -312,20 +400,7 @@ impl SoulseekClient {
             timeout.num_milliseconds()
         );
 
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SearchRequest<'a> {
-            search_text: &'a str,
-            timeout: i64,
-            filter_responses: bool,
-            minimum_peer_upload_speed: u32,
-        }
-        let request_body = SearchRequest {
-            search_text: &query,
-            timeout: timeout.num_milliseconds(),
-            filter_responses: true,
-            minimum_peer_upload_speed: 10,
-        };
+        let request_body = SearchRequest::new(&query);
 
         #[derive(Deserialize)]
         struct SearchId {
@@ -333,7 +408,14 @@ impl SoulseekClient {
         }
         let search_id_resp: SearchId = self
             .make_request(Method::POST, "searches", Some(&request_body))
-            .await?;
+            .await
+            .map_err(|e| match e {
+                SoulseekError::Api {
+                    status: 400,
+                    message,
+                } => search_refused(message),
+                e => e,
+            })?;
         let search_id = search_id_resp.id;
 
         self.active_searches.lock().await.insert(
@@ -344,10 +426,12 @@ impl SoulseekClient {
                     .as_ref()
                     .map(|a| a.artist.clone())
                     .unwrap_or_else(|| tracks[0].artist.clone()),
-                track_titles,
+                tracks: wanted,
+                query_text: query,
+                keep_below_floor,
                 start_time: Utc::now(),
                 timeout,
-                seen_response_count: 0,
+                cancelled: false,
             },
         );
 
@@ -355,132 +439,151 @@ impl SoulseekClient {
         Ok(search_id)
     }
 
-    pub async fn poll_search(
-        &self,
-        search_id: String,
-    ) -> Result<(Vec<AlbumResult>, bool, SearchState)> {
+    /// One poll of `search_id`, holding for up to 10 seconds while the search
+    /// runs. slskd 0.26 writes the responses only when the search ends
+    /// (`SearchService.cs:359`; `Search/Extensions.cs:135-149` drops them on
+    /// every earlier update), so a poll returns albums only once it ends.
+    /// A search that ended or failed is deleted from slskd.
+    pub async fn poll_search(&self, search_id: String) -> Result<SearchPoll> {
+        let Some(context) = self.active_searches.lock().await.get(&search_id).cloned() else {
+            return Err(SoulseekError::UnknownSearch { search_id });
+        };
+
+        let polled = self.poll_turns(&search_id, context).await;
+        if matches!(&polled, Ok(poll) if poll.state == SearchState::InProgress) {
+            return polled;
+        }
+        self.active_searches.lock().await.remove(&search_id);
+        let _ = self.delete_search(&search_id).await;
+        match &polled {
+            Ok(poll) => info!(
+                "Search {} completed with {} files from slskd",
+                search_id, poll.stats.file_count
+            ),
+            Err(e) => warn!("Search {} failed with error, cleaning up: {}", search_id, e),
+        }
+        polled
+    }
+
+    /// Reads the status of `search_id` and acts on it until the search ends,
+    /// fails or the long poll is over.
+    async fn poll_turns(&self, search_id: &str, mut context: SearchContext) -> Result<SearchPoll> {
         let poll_start = Utc::now();
-        // Long-poll duration: hold the request for up to 10 seconds waiting for new data
         let long_poll_timeout = Duration::seconds(10);
+        let endpoint = format!("searches/{search_id}");
 
         loop {
-            let context = {
-                let guard = self.active_searches.lock().await;
-                guard.get(&search_id).cloned()
-            };
-
-            let context = match context {
-                Some(ctx) => ctx,
-                None => return Ok((vec![], false, SearchState::NotFound)),
-            };
-
-            if (Utc::now() - context.start_time) >= context.timeout {
-                info!("Search timeout reached");
-                self.active_searches.lock().await.remove(&search_id);
-                let _ = self.delete_search(&search_id).await;
-                return Ok((vec![], false, SearchState::Completed));
-            }
-
-            let endpoint = format!("searches/{}/responses", search_id);
-            match self
-                .make_request::<Vec<SearchResponse>, ()>(Method::GET, &endpoint, None)
+            let status: SearchStatus = self
+                .make_request(Method::GET, &endpoint, None::<()>)
                 .await
-            {
-                Ok(current_responses) => {
-                    let total_len = current_responses.len();
-
-                    if total_len > context.seen_response_count {
-                        // Update seen count
-                        {
-                            let mut guard = self.active_searches.lock().await;
-                            if let Some(ctx) = guard.get_mut(&search_id) {
-                                ctx.seen_response_count = total_len;
-                            }
-                        }
-
-                        let track_titles_ref: Vec<&str> =
-                            context.track_titles.iter().map(|s| s.as_str()).collect();
-                        let mut albums = processing::process_search_responses(
-                            &current_responses,
-                            &context.artist,
-                            context.album.as_deref(),
-                            &track_titles_ref,
-                        );
-
-                        albums.sort_by(|a, b| {
-                            b.score
-                                .partial_cmp(&a.score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
+                .map_err(poll_refused)?;
+            let elapsed = Utc::now() - context.start_time;
+            match poll_step(
+                status.is_complete,
+                elapsed,
+                context.timeout,
+                context.cancelled,
+            ) {
+                PollStep::Read => {
+                    return self
+                        .read_responses(search_id, &context, status.response_count)
+                        .await
+                }
+                PollStep::Wait => {
+                    if (Utc::now() - poll_start) > long_poll_timeout {
+                        return Ok(SearchPoll {
+                            albums: Vec::new(),
+                            state: SearchState::InProgress,
+                            stats: SearchStats::default(),
                         });
-
-                        if albums.len() > MAX_SEARCH_RESULTS {
-                            albums.truncate(MAX_SEARCH_RESULTS);
-                            self.active_searches.lock().await.remove(&search_id);
-                            let _ = self.delete_search(&search_id).await;
-                            return Ok((albums, false, SearchState::Completed));
-                        } else {
-                            return Ok((albums, true, SearchState::InProgress));
-                        }
-                    } else {
-                        // No new data. slskd ends a search a short while after
-                        // responses stop arriving; once it reports completion
-                        // there is nothing more to wait for, so return what we
-                        // have instead of spinning until our own 120s timeout.
-                        if self.is_search_complete(&search_id).await {
-                            self.active_searches.lock().await.remove(&search_id);
-                            let _ = self.delete_search(&search_id).await;
-
-                            let track_titles_ref: Vec<&str> =
-                                context.track_titles.iter().map(|s| s.as_str()).collect();
-                            let mut albums = processing::process_search_responses(
-                                &current_responses,
-                                &context.artist,
-                                context.album.as_deref(),
-                                &track_titles_ref,
-                            );
-                            albums.sort_by(|a, b| {
-                                b.score
-                                    .partial_cmp(&a.score)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            albums.truncate(MAX_SEARCH_RESULTS);
-
-                            info!("Search {} completed on slskd side", search_id);
-                            return Ok((albums, false, SearchState::Completed));
-                        }
-
-                        if (Utc::now() - poll_start) > long_poll_timeout {
-                            // Long poll expired, return "no update" but "in progress"
-                            return Ok((vec![], true, SearchState::InProgress));
-                        }
-
-                        // Wait a bit before retrying slskd
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                        continue;
+                    }
+                    tokio::time::sleep(StdDuration::from_secs(1)).await;
+                }
+                PollStep::Cancel => {
+                    info!("Search {} reached its deadline, cancelling it", search_id);
+                    // slskd answers 200 also for a search that ended
+                    // meanwhile (`SearchesController.cs:209-227`).
+                    self.make_request::<(), ()>(Method::PUT, &endpoint, None)
+                        .await
+                        .map_err(poll_refused)?;
+                    context.cancelled = true;
+                    if let Some(ctx) = self.active_searches.lock().await.get_mut(search_id) {
+                        ctx.cancelled = true;
                     }
                 }
-                Err(SoulseekError::Api { status: 404, .. }) => {
-                    self.active_searches.lock().await.remove(&search_id);
-                    info!("Search 404");
-                    return Ok((vec![], false, SearchState::NotFound));
-                }
-                Err(e) => {
-                    // Clean up search context on any error to prevent leaks
-                    self.active_searches.lock().await.remove(&search_id);
-                    let _ = self.delete_search(&search_id).await;
-                    warn!("Search {} failed with error, cleaning up: {}", search_id, e);
-                    return Err(e);
+                PollStep::GiveUp => {
+                    return Err(SoulseekError::SearchNotEnding {
+                        search_id: search_id.to_string(),
+                    })
                 }
             }
         }
     }
 
+    /// The responses of a search slskd completed, counting `response_count`.
+    async fn read_responses(
+        &self,
+        search_id: &str,
+        context: &SearchContext,
+        response_count: u32,
+    ) -> Result<SearchPoll> {
+        let endpoint = format!("searches/{search_id}/responses");
+        let mut rereads = 0;
+        let responses = loop {
+            let responses: Vec<SearchResponse> = self
+                .make_request(Method::GET, &endpoint, None::<()>)
+                .await
+                .map_err(poll_refused)?;
+            if !responses.is_empty() || response_count == 0 {
+                break responses;
+            }
+            if rereads == RESPONSES_REREADS {
+                return Err(SoulseekError::SearchResponsesLost { response_count });
+            }
+            rereads += 1;
+            tokio::time::sleep(RESPONSES_REREAD_DELAY).await;
+        };
+
+        let processing::Processed {
+            mut albums,
+            not_audio,
+            below_floor,
+        } = processing::process_search_responses(
+            &responses,
+            &context.artist,
+            context.album.as_deref(),
+            &context.tracks,
+            context.keep_below_floor,
+        );
+        albums.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        albums.truncate(MAX_SEARCH_RESULTS);
+
+        Ok(SearchPoll {
+            albums,
+            state: SearchState::Completed,
+            stats: SearchStats {
+                query_text: context.query_text.clone(),
+                response_count: responses.len() as u32,
+                file_count: responses.iter().map(|r| r.files.len() as u32).sum(),
+                locked_file_count: responses.iter().map(|r| r.locked_file_count).sum(),
+                not_audio,
+                below_floor,
+            },
+        })
+    }
+
     /// Enqueue `req` into `destination`, a folder under slskd's download
-    /// directory that every file of the call shares.
+    /// directory that every file of the call shares, in slskd batches of the
+    /// request `request` (`shared::slskd::request_batch_id`).
     pub async fn download(
         &self,
         req: Vec<TrackResult>,
         destination: &str,
+        request: &str,
     ) -> Result<Vec<DownloadResponse>> {
         info!(
             "Attempting to download: {} files into {:?}",
@@ -502,7 +605,7 @@ impl SoulseekClient {
             .collect();
 
         let mut results = Vec::new();
-        for batch in plan_batches(wanted, destination, config.batch_size) {
+        for batch in plan_batches(wanted, destination, config.batch_size, request) {
             if batch.index > 0 {
                 debug!("Waiting {}ms before next batch", config.batch_delay_ms);
                 tokio::time::sleep(tokio::time::Duration::from_millis(config.batch_delay_ms)).await;
@@ -550,17 +653,14 @@ impl SoulseekClient {
                 warn!("User '{}' is offline, not retrying", batch.username);
                 return Err(SoulseekError::UserOffline {
                     username: batch.username.clone(),
+                    status: status.as_u16(),
+                    body: resp_text,
                 });
             }
 
             // The batches route only exists since slskd 0.26.
             if status.as_u16() == 404 {
-                return Err(SoulseekError::Api {
-                    status: 404,
-                    message: format!(
-                        "transfers/downloads/batches not found; slskd 0.26 or newer is required ({resp_text})"
-                    ),
-                });
+                return Err(SoulseekError::SlskdTooOld { body: resp_text });
             }
 
             // An earlier attempt created this batch and its answer was lost.
@@ -582,6 +682,20 @@ impl SoulseekClient {
         }
 
         parse_batch_enqueue_response(&batch.username, &batch.files, &resp_text)
+    }
+
+    /// How many attempts slskd makes at a download. Concurrent first callers
+    /// wait for one read; a failed read is tried again on the next call.
+    async fn retry_limit(&self) -> Result<u32> {
+        self.retry_limit
+            .get_or_try_init(|| async {
+                let options: serde_json::Value = self
+                    .make_request(Method::GET, "options", None::<()>)
+                    .await?;
+                retry_limit_from_options(&options)
+            })
+            .await
+            .copied()
     }
 
     /// Every transfer slskd holds, across every peer.
@@ -662,6 +776,20 @@ impl SoulseekClient {
         Self::usable_files(files, errors)
     }
 
+    /// `GET transfers/downloads/{username}/{id}` (`TransfersController.cs:549-573`). None for 404 and
+    /// for a removed record. slskd finds the transfer by id alone; the username only builds the path.
+    pub async fn get_download(&self, username: &str, id: &str) -> Result<Option<FileEntry>> {
+        match self
+            .make_request::<FileEntry, ()>(Method::GET, &download_endpoint(username, id)?, None)
+            .await
+        {
+            Ok(entry) if entry.removed => Ok(None),
+            Ok(entry) => Ok(Some(entry)),
+            Err(SoulseekError::Api { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn cancel_download(
         &self,
         username: &str,
@@ -690,43 +818,108 @@ impl SoulseekClient {
         }
     }
 
-    /// Whether slskd reports the search as finished. A search that slskd no
-    /// longer knows about (404) counts as finished too. Errors are treated as
-    /// "not complete" so polling falls back to its own timeout.
-    async fn is_search_complete(&self, search_id: &str) -> bool {
-        #[derive(Deserialize)]
-        struct SearchStatus {
-            #[serde(rename = "isComplete", default)]
-            is_complete: bool,
-            #[serde(default)]
-            state: String,
-        }
-
-        let endpoint = format!("searches/{search_id}");
+    /// `GET transfers/downloads/{username}/{id}/position` (`TransfersController.cs:584-617`):
+    /// slskd asks the peer now and answers the bare place. None for 404: no such transfer, or
+    /// slskd's blacklist holds the user (`:595-598`, `:610-613`). A failed ask is a 500 whose
+    /// body is the exception's text written as a JSON string (`:56`, `:614-617`); the error
+    /// keeps that text. A transfer between retries or ended answers such a 500, `... is not
+    /// active` (Soulseek.NET `SoulseekClient.cs:1643-1646`).
+    ///
+    /// Soulseek.NET reads the peer's place as a signed int (`PlaceInQueueResponse.cs:36,50`) and
+    /// slskd answers it as it is: a place outside u32, which no peer means, is None, as the
+    /// downloads list reads it. A peer slskd found offline is `UserOffline`
+    /// (`SoulseekClient.cs:3790`).
+    pub async fn get_place_in_queue(&self, username: &str, id: &str) -> Result<Option<u32>> {
+        let endpoint = format!("{}/position", download_endpoint(username, id)?);
         match self
-            .make_request::<SearchStatus, ()>(Method::GET, &endpoint, None)
+            .make_request::<i64, ()>(Method::GET, &endpoint, None)
             .await
         {
-            Ok(status) => status.is_complete || status.state.contains("Completed"),
-            Err(SoulseekError::Api { status: 404, .. }) => true,
-            Err(e) => {
-                debug!("Search state check failed for {}: {}", search_id, e);
-                false
+            Ok(place) => Ok(u32::try_from(place).ok()),
+            Err(SoulseekError::Api { status: 404, .. }) => Ok(None),
+            Err(SoulseekError::Api {
+                status: 500,
+                message,
+            }) => {
+                let body = json_text(message);
+                Err(
+                    match body.to_lowercase().contains("appears to be offline") {
+                        true => SoulseekError::UserOffline {
+                            username: username.to_string(),
+                            status: 500,
+                            body,
+                        },
+                        false => SoulseekError::Api {
+                            status: 500,
+                            message: body,
+                        },
+                    },
+                )
             }
+            Err(e) => Err(e),
         }
     }
 
-    /// Check both slskd connectivity and Soulseek network connection.
-    ///
-    /// Returns Ok(()) if slskd is reachable and connected to Soulseek.
-    /// Returns Err with a descriptive message if either check fails.
-    pub async fn check_connection(&self) -> std::result::Result<(), String> {
+    /// `GET users/{username}/status` (`Users/API/Controllers/UsersController.cs:253-278`),
+    /// `presence` as `UserPresence`'s name (`Program.cs:980`). An offline peer is a 200 saying
+    /// `Offline`; 404 means slskd's blacklist holds the user (`:264-267`), so it is `Blocked`.
+    pub async fn get_user_presence(&self, username: &str) -> Result<SourcePresence> {
+        let endpoint = format!("users/{}/status", path_segment(username)?);
+        match self
+            .make_request::<UserStatus, ()>(Method::GET, &endpoint, None)
+            .await
+        {
+            Ok(status) => Ok(match status.presence {
+                WirePresence::Online => SourcePresence::Online,
+                WirePresence::Away => SourcePresence::Away,
+                WirePresence::Offline => SourcePresence::Offline,
+            }),
+            Err(SoulseekError::Api { status: 404, .. }) => Ok(SourcePresence::Blocked),
+            // The global handler writes the exception's text as a JSON string (Program.cs:1051-1053).
+            Err(SoulseekError::Api {
+                status: 500,
+                message,
+            }) => Err(SoulseekError::Api {
+                status: 500,
+                message: json_text(message),
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `PUT searches/{id}` (`Search/API/Controllers/SearchesController.cs:209-228`): slskd
+    /// cancels the search's token (`SearchService.cs:414-423`), and the search ends
+    /// `Completed, Cancelled` with the responses it had (`SearchService.cs:337-341,359`). 404
+    /// (no such search, `:222-225`) is Ok: nothing runs.
+    /// A search this client polls is marked cancelled, so its deadline does not cancel it again
+    /// and its next polls give it the grace a cancelled search has to end.
+    pub async fn stop_search(&self, search_id: &str) -> Result<()> {
+        let endpoint = format!("searches/{}", path_segment(search_id)?);
+        match self
+            .make_request::<(), ()>(Method::PUT, &endpoint, None)
+            .await
+        {
+            Ok(()) | Err(SoulseekError::Api { status: 404, .. }) => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(context) = self.active_searches.lock().await.get_mut(search_id) {
+            context.cancelled = true;
+        }
+        Ok(())
+    }
+
+    /// Checks that slskd answers and is connected and logged in to the
+    /// Soulseek network; else the failure that says which, with slskd's own
+    /// answer as its cause: a rejected API key is `backend_not_configured`,
+    /// no answer `backend_unreachable`, and so is a slskd that is not
+    /// connected or not logged in.
+    pub async fn check_connection(&self) -> std::result::Result<(), Failure> {
         // First verify slskd is reachable (session endpoint)
         if let Err(e) = self
             .make_request::<serde_json::Value, ()>(Method::GET, "session", None)
             .await
         {
-            return Err(match e {
+            let message = match &e {
                 SoulseekError::Api {
                     status: status @ (401 | 403),
                     ..
@@ -735,42 +928,16 @@ impl SoulseekClient {
                      and any CIDR restriction in slskd's web.authentication.api_keys config."
                 ),
                 other => format!("Cannot reach slskd (session endpoint failed: {other})"),
-            });
+            };
+            return Err(e.failure(Stage::SourceSearch, message));
         }
 
         // Then verify Soulseek network connection via application state
-        #[derive(Deserialize)]
-        struct ServerState {
-            #[serde(rename = "isConnected")]
-            is_connected: bool,
-            #[serde(rename = "isLoggedIn")]
-            is_logged_in: bool,
-        }
-
-        #[derive(Deserialize)]
-        struct AppState {
-            server: ServerState,
-        }
-
         match self
-            .make_request::<AppState, ()>(Method::GET, "application", None)
+            .make_request::<serde_json::Value, ()>(Method::GET, "application", None)
             .await
         {
-            Ok(app_state) => {
-                if !app_state.server.is_connected {
-                    return Err(
-                        "slskd is running but not connected to the Soulseek network. \
-                         Check slskd's connection settings or restart slskd."
-                            .to_string(),
-                    );
-                }
-                if !app_state.server.is_logged_in {
-                    return Err("slskd is connected to Soulseek but not logged in. \
-                         Check slskd's Soulseek username and password."
-                        .to_string());
-                }
-                Ok(())
-            }
+            Ok(state) => server_state_failure(&state["server"]).map_or(Ok(()), Err),
             Err(e) => {
                 warn!("Failed to check slskd application state: {}", e);
                 // If we can reach the session endpoint but not the application endpoint,
@@ -782,6 +949,46 @@ impl SoulseekClient {
     }
 }
 
+/// Why `server`, the `server` member of slskd's `GET application`
+/// (`isConnected`, `isLoggedIn`), keeps slskd from searching; None when it
+/// is connected and logged in, or when the member cannot be read (older
+/// slskd versions are given the benefit of the doubt).
+fn server_state_failure(server: &serde_json::Value) -> Option<Failure> {
+    let flag = |name: &str| server.get(name).and_then(serde_json::Value::as_bool);
+    let (connected, logged_in) = (flag("isConnected")?, flag("isLoggedIn")?);
+    let failure = |retry, message: &str| {
+        Failure::new(
+            FailureCode::BackendUnreachable,
+            Stage::SourceSearch,
+            retry,
+            message,
+        )
+        .with_cause(Service::Slskd, Some(200), server.to_string())
+    };
+    if !connected {
+        return Some(failure(
+            RetryAdvice::SameSourceLater,
+            "slskd is running but not connected to the Soulseek network. \
+             Check slskd's connection settings or restart slskd.",
+        ));
+    }
+    if !logged_in {
+        return Some(
+            failure(
+                RetryAdvice::NeedsUser,
+                "slskd is connected to Soulseek but not logged in. \
+                 Check slskd's Soulseek username and password.",
+            )
+            .with_user_action(UserAction::new(
+                UserActionCode::ConfigureBackend,
+                "Check the Soulseek username and password slskd signs in with",
+                "slskd",
+            )),
+        );
+    }
+    None
+}
+
 /// Everything but unreserved characters, `.` included. Soulseek usernames
 /// are free-form, so a peer called `a/b`, `a\b` or `x?y` would otherwise
 /// re-point the request at a different route.
@@ -790,6 +997,54 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remo
 /// slskd's exact answer for a file it already has an unfinished transfer
 /// of (`DownloadService.EnqueueAsync`).
 const ALREADY_IN_PROGRESS: &str = "Skipped: Already in progress";
+
+/// slskd's 400 to `POST searches`, read from its body: Soulseek.NET's
+/// `DuplicateTokenException` says `An active search with token {token} is
+/// already in progress`, and every other 400 refuses the request itself, an
+/// `ArgumentException` about the query or a field that failed validation
+/// (`SearchesController.cs`).
+fn search_refused(body: String) -> SoulseekError {
+    if body.starts_with("An active search with token ") && body.ends_with(" is already in progress")
+    {
+        SoulseekError::SearchAlreadyRunning { body }
+    } else {
+        SoulseekError::SearchQueryRejected { body }
+    }
+}
+
+/// The text of an error body a `[Produces("application/json")]` controller wrote as a JSON
+/// string; the body as sent when it is not one.
+fn json_text(body: String) -> String {
+    serde_json::from_str(&body).unwrap_or(body)
+}
+
+/// slskd's `Users/Types/Status.cs` as `GET users/{username}/status` writes it.
+#[derive(Deserialize)]
+struct UserStatus {
+    presence: WirePresence,
+}
+
+/// Soulseek.NET's `UserPresence` by name (`src/UserPresence.cs:29-45`).
+#[derive(Deserialize)]
+enum WirePresence {
+    Online,
+    Away,
+    Offline,
+}
+
+/// An error polling a search: reading its status or responses, or cancelling
+/// it. slskd answers 404, with an empty body, only when it has no search with
+/// that id (`SearchesController.GetById`, `GetResponsesById`, `Cancel`);
+/// every other error is kept.
+fn poll_refused(e: SoulseekError) -> SoulseekError {
+    match e {
+        SoulseekError::Api {
+            status: 404,
+            message,
+        } => SoulseekError::SearchGone { body: message },
+        e => e,
+    }
+}
 
 /// `value` as one path segment. URL parsing resolves `.` and `..` as dot
 /// segments even when percent-encoded, so those cannot be sent at all.
@@ -802,15 +1057,37 @@ fn path_segment(value: &str) -> Result<String> {
     Ok(utf8_percent_encode(value, PATH_SEGMENT).to_string())
 }
 
+/// slskd's `transfers.download.retry.attempts` from its `GET options`
+/// answer (`Core/Options.cs:264,913,980,997`, camelCase per
+/// `Program.cs:977-982`), at least 1 (`[Range(1, int.MaxValue)]`, `:996`).
+fn retry_limit_from_options(options: &serde_json::Value) -> Result<u32> {
+    options["transfers"]["download"]["retry"]["attempts"]
+        .as_u64()
+        .and_then(|attempts| u32::try_from(attempts).ok())
+        .filter(|&attempts| attempts > 0)
+        .ok_or_else(|| {
+            SoulseekError::InvalidResponse(
+                "slskd options without transfers.download.retry.attempts".into(),
+            )
+        })
+}
+
 fn user_downloads_endpoint(username: &str) -> Result<String> {
     Ok(format!("transfers/downloads/{}", path_segment(username)?))
 }
 
-fn transfer_endpoint(username: &str, id: &str, remove: bool) -> Result<String> {
+fn download_endpoint(username: &str, id: &str) -> Result<String> {
     Ok(format!(
-        "{}/{}?remove={remove}",
+        "{}/{}",
         user_downloads_endpoint(username)?,
         path_segment(id)?
+    ))
+}
+
+fn transfer_endpoint(username: &str, id: &str, remove: bool) -> Result<String> {
+    Ok(format!(
+        "{}?remove={remove}",
+        download_endpoint(username, id)?
     ))
 }
 
@@ -854,11 +1131,13 @@ impl PendingBatch {
 
 /// Split one call into slskd batches: one user per batch, at most
 /// `batch_size` files each, all into `destination`. Users keep the order of
-/// their first file, and a file asked for twice is sent once.
+/// their first file, and a file asked for twice is sent once. The batches are
+/// numbered in order as batches of `request`.
 fn plan_batches(
     wanted: Vec<(String, DownloadRequestFile)>,
     destination: &str,
     batch_size: usize,
+    request: &str,
 ) -> Vec<PendingBatch> {
     let mut per_user: Vec<(String, Vec<DownloadRequestFile>)> = Vec::new();
     for (username, file) in wanted {
@@ -881,14 +1160,16 @@ fn plan_batches(
             files
                 .chunks(batch_size.max(1))
                 .enumerate()
-                .map(|(index, chunk)| PendingBatch {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    username: username.clone(),
-                    destination: destination.to_string(),
-                    files: chunk.to_vec(),
-                    index,
-                })
+                .map(|(index, chunk)| (username.clone(), index, chunk.to_vec()))
                 .collect::<Vec<_>>()
+        })
+        .zip(0..)
+        .map(|((username, index, files), n)| PendingBatch {
+            id: shared::slskd::request_batch_id(request, n),
+            username,
+            destination: destination.to_string(),
+            files,
+            index,
         })
         .collect()
 }
@@ -907,9 +1188,8 @@ where
     // Cap exponential backoff at 30 seconds to prevent excessive waits
     const MAX_BACKOFF_MS: u64 = 30_000;
 
-    let mut last_error: Option<SoulseekError> = None;
-
-    for attempt in 0..=config.max_retries {
+    let mut attempt = 0;
+    let last_error = loop {
         if attempt > 0 {
             let delay = std::cmp::min(
                 config.retry_base_delay_ms * (1 << (attempt - 1)),
@@ -922,36 +1202,42 @@ where
             tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
         }
 
-        match send(batch).await {
+        let e = match send(batch).await {
             Ok(responses) => return responses,
-            Err(e) => {
-                warn!(
-                    "Batch {} for '{}' attempt {} failed: {}",
-                    batch.index, batch.username, attempt, e
-                );
-                // Stop retrying for non-retryable errors (e.g. user offline)
-                if !e.is_retryable() {
-                    warn!(
-                        "Batch {} for '{}': error is non-retryable, stopping",
-                        batch.index, batch.username
-                    );
-                    return batch.responses(EnqueueStatus::Failed(e.to_string()));
-                }
-                last_error = Some(e);
-            }
+            Err(e) => e,
+        };
+        warn!(
+            "Batch {} for '{}' attempt {} failed: {}",
+            batch.index, batch.username, attempt, e
+        );
+        // Stop retrying for non-retryable errors (e.g. user offline)
+        if !e.is_retryable() {
+            warn!(
+                "Batch {} for '{}': error is non-retryable, stopping",
+                batch.index, batch.username
+            );
+            let failure = e.failure(Stage::Enqueue, e.to_string());
+            return batch.responses(EnqueueStatus::Failed(failure));
         }
-    }
+        if attempt == config.max_retries {
+            break e;
+        }
+        attempt += 1;
+    };
 
-    let error_msg = last_error
-        .map(|e| format!("Failed after {} retries: {}", config.max_retries, e))
-        .unwrap_or_else(|| format!("Failed after {} retries", config.max_retries));
+    let error_msg = format!(
+        "Failed after {} retries: {}",
+        config.max_retries, last_error
+    );
 
     warn!(
         "Batch {} for '{}' failed after all retries: {}",
         batch.index, batch.username, error_msg
     );
 
-    batch.responses(EnqueueStatus::Failed(error_msg))
+    batch.responses(EnqueueStatus::Failed(
+        last_error.failure(Stage::Enqueue, error_msg),
+    ))
 }
 
 /// Answers for a batch slskd already holds (409 on a retried POST): its own
@@ -976,9 +1262,12 @@ fn replayed_batch_responses(batch: &PendingBatch, listing: &[FileEntry]) -> Vec<
                 transfer_id: transfer.map(|t| t.id.clone()),
                 status: match transfer {
                     Some(_) => EnqueueStatus::Enqueued,
-                    None => EnqueueStatus::Failed(
-                        "Not found in slskd after a retried enqueue".to_string(),
-                    ),
+                    None => EnqueueStatus::Failed(Failure::new(
+                        FailureCode::EnqueueFailed,
+                        Stage::Enqueue,
+                        RetryAdvice::SameSourceLater,
+                        "Not found in slskd after a retried enqueue",
+                    )),
                 },
             }
         })
@@ -1012,12 +1301,27 @@ fn parse_batch_enqueue_response(
             let status = match (transfer, failure) {
                 (Some(_), _) => EnqueueStatus::Enqueued,
                 (None, Some(f)) if f.message == ALREADY_IN_PROGRESS => {
-                    EnqueueStatus::AlreadyInFlight
+                    EnqueueStatus::AlreadyInFlight(Cause::new(
+                        Service::Slskd,
+                        None,
+                        f.message.clone(),
+                    ))
                 }
-                (None, Some(f)) => EnqueueStatus::Failed(f.message.clone()),
-                (None, None) => {
-                    EnqueueStatus::Failed("Not reported in slskd enqueue response".to_string())
-                }
+                (None, Some(f)) => EnqueueStatus::Failed(
+                    Failure::new(
+                        FailureCode::EnqueueFailed,
+                        Stage::Enqueue,
+                        RetryAdvice::OtherSource,
+                        f.message.clone(),
+                    )
+                    .with_cause(Service::Slskd, None, f.message.clone()),
+                ),
+                (None, None) => EnqueueStatus::Failed(Failure::new(
+                    FailureCode::EnqueueFailed,
+                    Stage::Enqueue,
+                    RetryAdvice::OtherSource,
+                    "Not reported in slskd enqueue response",
+                )),
             };
 
             DownloadResponse {
@@ -1041,33 +1345,38 @@ impl crate::DownloadBackend for SoulseekClient {
         "Soulseek"
     }
 
-    async fn start_search(&self, album: Option<&Album>, tracks: &[Track]) -> Result<String> {
+    async fn start_search(&self, spec: &SearchSpec) -> Result<String> {
         let timeout = Duration::seconds(120);
-        self.start_search(album.cloned(), tracks.to_vec(), timeout)
-            .await
+        self.start_search(spec.clone(), timeout).await
     }
 
     async fn poll_search(&self, search_id: &str) -> Result<shared::download::SearchResult> {
-        let (results, has_more, state) = self.poll_search(search_id.to_string()).await?;
+        let poll = self.poll_search(search_id.to_string()).await?;
         Ok(shared::download::SearchResult {
             search_id: search_id.to_string(),
-            groups: results.into_iter().map(Into::into).collect(),
-            has_more,
-            state: state.into(),
+            groups: poll.albums.into_iter().map(Into::into).collect(),
+            has_more: poll.state == SearchState::InProgress,
+            state: poll.state.into(),
+            stats: poll.stats,
         })
+    }
+
+    fn new_request(&self) -> String {
+        shared::slskd::request_batch_id(&uuid::Uuid::new_v4().to_string(), 0)
     }
 
     async fn download(
         &self,
         items: Vec<shared::download::DownloadableItem>,
         destination: &str,
+        request: &str,
     ) -> Result<Vec<shared::download::QueuedDownload>> {
         let tracks: Vec<TrackResult> = items
             .into_iter()
             .filter_map(|item| item.to_slskd_track())
             .collect();
 
-        let responses = self.download(tracks, destination).await?;
+        let responses = self.download(tracks, destination, request).await?;
         Ok(responses.into_iter().map(Into::into).collect())
     }
 
@@ -1075,26 +1384,94 @@ impl crate::DownloadBackend for SoulseekClient {
         &self,
         sources: &[String],
     ) -> Result<Vec<shared::download::DownloadProgress>> {
+        let limit = self.retry_limit().await?;
         let entries = self.get_downloads_for_users(sources).await?;
-        Ok(entries.into_iter().map(Into::into).collect())
+        Ok(entries
+            .into_iter()
+            .map(|e| e.into_progress(limit))
+            .collect())
     }
 
     async fn get_downloads(&self) -> Result<Vec<shared::download::DownloadProgress>> {
+        let limit = self.retry_limit().await?;
         let entries = self.get_all_downloads().await?;
-        Ok(entries.into_iter().map(Into::into).collect())
+        Ok(entries
+            .into_iter()
+            .map(|e| e.into_progress(limit))
+            .collect())
+    }
+
+    async fn get_download(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<Option<shared::download::DownloadProgress>> {
+        let limit = self.retry_limit().await?;
+        Ok(self
+            .get_download(source, id)
+            .await?
+            .map(|e| e.into_progress(limit)))
     }
 
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()> {
         self.cancel_download(username, download_id, remove).await
     }
 
-    async fn health_check(&self) -> bool {
-        match self.check_connection().await {
-            Ok(()) => true,
-            Err(msg) => {
-                warn!("Health check failed: {}", msg);
-                false
-            }
+    async fn queue_position(&self, source: &str, id: &str) -> Result<Option<u32>> {
+        self.get_place_in_queue(source, id).await
+    }
+
+    async fn source_status(&self, source: &str) -> Result<SourcePresence> {
+        self.get_user_presence(source).await
+    }
+
+    async fn stop_search(&self, search_id: &str) -> Result<()> {
+        self.stop_search(search_id).await
+    }
+
+    async fn health_check(&self) -> std::result::Result<(), Failure> {
+        self.check_connection().await.inspect_err(|failure| {
+            warn!("Health check failed: {}", failure.message);
+        })
+    }
+}
+
+/// slskd's search inactivity timeout, in milliseconds although slskd's DTO
+/// comment says seconds: `SearchRequest.cs:114` passes it unconverted to
+/// Soulseek.NET's `SearchOptions.SearchTimeout`, which is a millisecond count
+/// (`src/Options/SearchOptions.cs:36,53`). The search ends this long after
+/// the last response.
+const SEARCH_INACTIVITY_MS: u32 = 15_000;
+
+/// The query text for a search: one track names itself, an album names the
+/// album, and a search without an album needs exactly one track.
+fn search_text(album: Option<&Album>, tracks: &[Track]) -> Result<String> {
+    match (album, tracks) {
+        (Some(album), [track]) => Ok(format!("{} {}", album.artist.trim(), track.title.trim())),
+        (Some(album), _) => Ok(format!("{} {}", album.artist.trim(), album.title.trim())),
+        (None, [track]) => Ok(format!("{} {}", track.artist.trim(), track.title.trim())),
+        (None, _) => Err(SoulseekError::NoSearchTarget {
+            tracks: tracks.len(),
+        }),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRequest<'a> {
+    search_text: &'a str,
+    search_timeout: u32,
+    filter_responses: bool,
+    minimum_peer_upload_speed: u32,
+}
+
+impl<'a> SearchRequest<'a> {
+    fn new(search_text: &'a str) -> Self {
+        Self {
+            search_text,
+            search_timeout: SEARCH_INACTIVITY_MS,
+            filter_responses: true,
+            minimum_peer_upload_speed: 10,
         }
     }
 }
@@ -1102,7 +1479,221 @@ impl crate::DownloadBackend for SoulseekClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_http::{serve, Reply, Seen};
     use shared::download::EnqueueStatus;
+    use std::sync::Mutex as StdMutex;
+
+    fn track(artist: &str, title: &str) -> Track {
+        Track {
+            id: String::new(),
+            title: title.into(),
+            artist: artist.into(),
+            album_id: None,
+            album_title: None,
+            release_date: None,
+            duration: None,
+            mbid: None,
+            release_mbid: None,
+        }
+    }
+
+    fn album(artist: &str, title: &str) -> Album {
+        Album {
+            id: String::new(),
+            title: title.into(),
+            artist: artist.into(),
+            release_date: None,
+            mbid: None,
+            cover_url: None,
+            release_types: None,
+        }
+    }
+
+    /// slskd's `GET application` with its server in `state` (a
+    /// `SoulseekClientStates` flags value, `Core/API/DTO/ServerState.cs`).
+    fn application(state: &str, connected: bool, logged_in: bool) -> String {
+        format!(
+            r#"{{"server":{{"address":"vps.slsknet.org:2271","ipEndPoint":null,"state":"{state}","username":"marrow","isConnected":{connected},"isLoggedIn":{logged_in},"isTransitioning":false}}}}"#
+        )
+    }
+
+    /// A client of the slskd at `url`.
+    fn client_at(url: &str) -> SoulseekClient {
+        SoulseekClientBuilder::new()
+            .base_url(url)
+            .api_key("k")
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_got_no_answer_does_not_name_its_url() {
+        // Port 1 on loopback refuses the connection at once.
+        let url = "http://127.0.0.1:1";
+        let file = DownloadRequestFile {
+            filename: "Kowloon\\Come Over\\07 - Wake Up.flac".into(),
+            size: 27_213_250,
+        };
+        let batches = plan_batches(vec![("carol_shares".into(), file)], "Come Over", 50, "r1");
+        let e = (client_at(url).send_download_batch(&batches[0]).await).unwrap_err();
+        let text = e.to_string();
+        assert!(
+            !text.contains("127.0.0.1") && !text.contains(" for url "),
+            "{text}"
+        );
+        // reqwest's text for a refused connection, without " for url (...)".
+        assert_eq!(text, "Request error: error sending request");
+    }
+
+    async fn checked(replies: Vec<Reply>) -> std::result::Result<(), Failure> {
+        let (url, _) = serve(replies);
+        SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap()
+            .check_connection()
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_health_check_says_why_slskd_cannot_take_work() {
+        assert_eq!(
+            checked(vec![
+                ok(""),
+                ok(&application("Connected, LoggedIn", true, true))
+            ])
+            .await,
+            Ok(())
+        );
+
+        let rejected = checked(vec![Reply {
+            status: 401,
+            body: String::new(),
+        }])
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (
+                rejected.code,
+                rejected.retry,
+                rejected.cause.as_ref().map(|c| c.status)
+            ),
+            (
+                FailureCode::BackendNotConfigured,
+                RetryAdvice::NeedsUser,
+                Some(Some(401))
+            )
+        );
+        assert!(rejected
+            .message
+            .starts_with("slskd rejected the API key (HTTP 401)."));
+        assert!(rejected.user_action.is_some());
+
+        let down = checked(vec![Reply {
+            status: 503,
+            body: "Service Unavailable".into(),
+        }])
+        .await
+        .unwrap_err();
+        assert_eq!(down.code, FailureCode::BackendUnreachable);
+        assert!(down
+            .message
+            .starts_with("Cannot reach slskd (session endpoint failed: "));
+        assert_eq!(down.cause.unwrap().raw, "Service Unavailable");
+
+        let offline = application("Disconnected", false, false);
+        let not_connected = checked(vec![ok(""), ok(&offline)]).await.unwrap_err();
+        assert_eq!(
+            (not_connected.code, not_connected.retry),
+            (
+                FailureCode::BackendUnreachable,
+                RetryAdvice::SameSourceLater
+            )
+        );
+        assert!(not_connected
+            .message
+            .starts_with("slskd is running but not connected"));
+        let raw = not_connected.cause.unwrap().raw;
+        assert!(raw.contains(r#""isConnected":false"#), "{raw}");
+
+        let not_logged_in = checked(vec![ok(""), ok(&application("Connected", true, false))])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (not_logged_in.code, not_logged_in.retry),
+            (FailureCode::BackendUnreachable, RetryAdvice::NeedsUser)
+        );
+        assert!(not_logged_in
+            .message
+            .starts_with("slskd is connected to Soulseek but not logged in."));
+        assert_eq!(
+            not_logged_in.user_action.map(|a| a.code),
+            Some(UserActionCode::ConfigureBackend)
+        );
+    }
+
+    #[test]
+    fn the_search_text_names_one_track_or_the_album() {
+        let night = track("Marrow Choir", " O Holy Night ");
+        let silent = track("Marrow Choir", "Silent Night");
+        let winter = album("Marrow Choir ", "Winter Songs");
+        assert_eq!(
+            search_text(None, std::slice::from_ref(&night)).unwrap(),
+            "Marrow Choir O Holy Night"
+        );
+        assert_eq!(
+            search_text(Some(&winter), std::slice::from_ref(&night)).unwrap(),
+            "Marrow Choir O Holy Night"
+        );
+        assert_eq!(
+            search_text(Some(&winter), &[night, silent]).unwrap(),
+            "Marrow Choir Winter Songs"
+        );
+        assert_eq!(
+            search_text(Some(&winter), &[]).unwrap(),
+            "Marrow Choir Winter Songs"
+        );
+    }
+
+    #[test]
+    fn a_search_without_an_album_takes_exactly_one_track() {
+        let two = vec![
+            track("Marrow Choir", "O Holy Night"),
+            track("Marrow Choir", "Silent Night"),
+        ];
+        for tracks in [Vec::new(), two] {
+            let e = search_text(None, &tracks).unwrap_err();
+            assert!(
+                matches!(e, SoulseekError::NoSearchTarget { tracks: n } if n == tracks.len()),
+                "{e:?}"
+            );
+            assert!(!e.is_retryable());
+            let f = e.failure(Stage::SourceSearch, e.to_string());
+            assert_eq!(
+                (f.code, f.retry),
+                (FailureCode::InvalidInput, RetryAdvice::NotRetryable)
+            );
+        }
+        assert_eq!(
+            SoulseekError::NoSearchTarget { tracks: 2 }.to_string(),
+            "A search without an album takes exactly one track, not 2"
+        );
+    }
+
+    #[test]
+    fn the_search_request_sends_slskds_inactivity_timeout_in_milliseconds() {
+        assert_eq!(
+            serde_json::to_value(SearchRequest::new("Marrow Choir O Holy Night")).unwrap(),
+            serde_json::json!({"searchText": "Marrow Choir O Holy Night", "searchTimeout": 15000,
+                               "filterResponses": true, "minimumPeerUploadSpeed": 10})
+        );
+    }
+
+    /// `status` is Failed with this code and message.
+    fn failed_with(status: &EnqueueStatus, code: FailureCode, message: &str) -> bool {
+        matches!(status, EnqueueStatus::Failed(f) if f.code == code && f.message == message)
+    }
 
     fn batch(files: &[&str]) -> Vec<DownloadRequestFile> {
         files
@@ -1167,11 +1758,24 @@ mod tests {
         .unwrap();
         assert_eq!(results[0].status, EnqueueStatus::Enqueued);
         assert_eq!(results[1].filename, r"a\album\2.mp3");
-        assert_eq!(
-            results[1].status,
-            EnqueueStatus::Failed("Error: something broke".into())
-        );
+        assert!(failed_with(
+            &results[1].status,
+            FailureCode::EnqueueFailed,
+            "Error: something broke"
+        ));
         assert_eq!(results[1].transfer_id, None);
+        let EnqueueStatus::Failed(f) = &results[1].status else {
+            unreachable!()
+        };
+        assert_eq!(
+            (f.stage, f.retry),
+            (Stage::Enqueue, RetryAdvice::OtherSource)
+        );
+        let cause = f.cause.as_ref().unwrap();
+        assert_eq!(
+            (cause.service, cause.status, cause.raw.as_str()),
+            (Service::Slskd, None, "Error: something broke")
+        );
     }
 
     #[test]
@@ -1183,10 +1787,11 @@ mod tests {
             &body(&[], &[(r"a\album\1.mp3", "Error: rejected")]),
         )
         .unwrap();
-        assert_eq!(
-            results[0].status,
-            EnqueueStatus::Failed("Error: rejected".into())
-        );
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Error: rejected"
+        ));
     }
 
     #[test]
@@ -1198,7 +1803,14 @@ mod tests {
             &body(&[], &[(r"a\album\1.mp3", "Skipped: Already in progress")]),
         )
         .unwrap();
-        assert_eq!(results[0].status, EnqueueStatus::AlreadyInFlight);
+        assert_eq!(
+            results[0].status,
+            EnqueueStatus::AlreadyInFlight(Cause::new(
+                Service::Slskd,
+                None,
+                "Skipped: Already in progress"
+            ))
+        );
         assert_eq!(results[0].transfer_id, None);
     }
 
@@ -1211,10 +1823,11 @@ mod tests {
             &body(&[], &[(r"a\album\1.mp3", "Already in progress")]),
         )
         .unwrap();
-        assert_eq!(
-            results[0].status,
-            EnqueueStatus::Failed("Already in progress".into())
-        );
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Already in progress"
+        ));
     }
 
     #[test]
@@ -1231,10 +1844,11 @@ mod tests {
     fn file_missing_from_response_is_an_error() {
         let files = batch(&[r"a\album\1.mp3"]);
         let results = parse_batch_enqueue_response("peer", &files, &body(&[], &[])).unwrap();
-        assert_eq!(
-            results[0].status,
-            EnqueueStatus::Failed("Not reported in slskd enqueue response".into())
-        );
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Not reported in slskd enqueue response"
+        ));
     }
 
     #[test]
@@ -1247,7 +1861,11 @@ mod tests {
         })
         .to_string();
         let results = parse_batch_enqueue_response("peer", &files, &body).unwrap();
-        assert_eq!(results[0].status, EnqueueStatus::Failed("Error: x".into()));
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Error: x"
+        ));
     }
 
     #[test]
@@ -1297,6 +1915,41 @@ mod tests {
         assert!(transfer_endpoint("peer", "..", false).is_err());
     }
 
+    /// A request as `new_request` draws one.
+    const REQUEST: &str = "5b1d3c2a-9e4f-4a7b-8c6d-0f1e00000000";
+
+    #[test]
+    fn every_slskd_batch_of_a_request_has_its_own_id_naming_the_request() {
+        let batches = plan_batches(
+            vec![
+                wanted("peer", r"music\A\01.flac"),
+                wanted("other", r"music\A\02.flac"),
+                wanted("peer", r"music\A\03.flac"),
+            ],
+            "A [1]",
+            1,
+            REQUEST,
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| (b.username.as_str(), b.index, b.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("peer", 0, "5b1d3c2a-9e4f-4a7b-8c6d-0f1e00000000"),
+                ("peer", 1, "5b1d3c2a-9e4f-4a7b-8c6d-0f1e00000001"),
+                ("other", 0, "5b1d3c2a-9e4f-4a7b-8c6d-0f1e00000002"),
+            ]
+        );
+        let drawn = crate::DownloadBackend::new_request(
+            &SoulseekClientBuilder::from_settings(Some("http://slskd".into()), Some("k".into()))
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        assert!(drawn.ends_with("00000000") && drawn.len() == 36, "{drawn}");
+    }
+
     fn wanted(username: &str, filename: &str) -> (String, DownloadRequestFile) {
         (
             username.to_string(),
@@ -1316,6 +1969,7 @@ mod tests {
             ],
             "Album A [12345678]",
             3,
+            REQUEST,
         );
 
         assert_eq!(
@@ -1331,7 +1985,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_retried_batch_reuses_its_client_id() {
-        let batches = plan_batches(vec![wanted("peer", r"music\A\01.flac")], "A [1]", 3);
+        let batches = plan_batches(
+            vec![wanted("peer", r"music\A\01.flac")],
+            "A [1]",
+            3,
+            REQUEST,
+        );
         let config = DownloadConfig {
             batch_size: 3,
             batch_delay_ms: 0,
@@ -1362,6 +2021,659 @@ mod tests {
         assert_eq!(sent[0]["id"], sent[1]["id"]);
     }
 
+    #[tokio::test]
+    async fn an_offline_peer_fails_its_batch_at_once_with_peer_offline() {
+        let batches = plan_batches(
+            vec![wanted("peer", r"music\A\01.flac")],
+            "A [1]",
+            3,
+            REQUEST,
+        );
+        let config = DownloadConfig {
+            batch_size: 3,
+            batch_delay_ms: 0,
+            max_retries: 3,
+            retry_base_delay_ms: 0,
+        };
+        let mut sent = 0;
+        let results = retry_batch(&config, &batches[0], |_| {
+            sent += 1;
+            async {
+                Err(SoulseekError::UserOffline {
+                    username: "peer".into(),
+                    status: 404,
+                    body: "User peer appears to be offline".into(),
+                })
+            }
+        })
+        .await;
+        assert_eq!(sent, 1);
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::PeerOffline,
+            "User 'peer' is offline"
+        ));
+        let EnqueueStatus::Failed(f) = &results[0].status else {
+            panic!("not a failure");
+        };
+        let cause = f.cause.as_ref().unwrap();
+        assert_eq!(
+            (cause.status, cause.raw.as_str()),
+            (Some(404), "User peer appears to be offline")
+        );
+    }
+
+    /// slskd's 400 bodies to `POST searches` (`SearchesController.cs`,
+    /// Soulseek.NET 10.0.2 `SearchAsync`).
+    #[test]
+    fn a_refused_search_is_told_apart_by_slskds_answer() {
+        for body in [
+            "Search query must contain at least one non-exclusion term (Parameter 'query')",
+            "Search query must contain at least one non-exclusion term with length greater than 1 (Parameter 'query')",
+            "Search text must not be a null or empty string, or one consisting only of whitespace (Parameter 'query')",
+            "The field SearchText can not be null, empty, or consist of only whitespace",
+        ] {
+            assert!(
+                matches!(search_refused(body.into()), SoulseekError::SearchQueryRejected { body: b } if b == body),
+                "{body}"
+            );
+        }
+        let duplicate = "An active search with token 1234 is already in progress";
+        assert!(matches!(
+            search_refused(duplicate.into()),
+            SoulseekError::SearchAlreadyRunning { body } if body == duplicate
+        ));
+    }
+
+    /// slskd's 404 to a poll is a search it no longer has; other answers
+    /// stay as they were.
+    #[test]
+    fn a_poll_slskd_answers_404_is_a_search_it_no_longer_has() {
+        let gone = poll_refused(SoulseekError::Api {
+            status: 404,
+            message: String::new(),
+        });
+        assert!(matches!(gone, SoulseekError::SearchGone { body } if body.is_empty()));
+        let unavailable = poll_refused(SoulseekError::Api {
+            status: 503,
+            message: "Circuit breaker is open - slskd appears to be unavailable".into(),
+        });
+        assert!(matches!(
+            unavailable,
+            SoulseekError::Api { status: 503, message } if message.starts_with("Circuit breaker is open")
+        ));
+    }
+
+    /// A search this client is not running is an error, never an empty
+    /// result: nothing answered the query.
+    #[tokio::test]
+    async fn polling_a_search_this_client_does_not_run_is_an_error() {
+        let client = SoulseekClientBuilder::new()
+            .base_url("http://127.0.0.1:9")
+            .build()
+            .unwrap();
+        let polled = client.poll_search("gone".to_string()).await;
+        assert!(matches!(
+            polled,
+            Err(SoulseekError::UnknownSearch { search_id }) if search_id == "gone"
+        ));
+    }
+
+    const SEARCH_ID: &str = "3f2b9c1e-7d4a-4b8e-9f0a-1c2d3e4f5a6b";
+
+    /// slskd's search record (`Search/Types/Search.cs:44-63`, nulls omitted
+    /// as `Program.cs:981` configures). `Completed, TimedOut` is
+    /// Soulseek.NET's `Completed | TimedOut`, set when the inactivity timer
+    /// fires (`src/SearchInternal.cs:63,145`).
+    fn status(complete: bool, responses: u32) -> Reply {
+        Reply {
+            status: 200,
+            body: serde_json::json!({
+                "fileCount": responses, "id": SEARCH_ID, "isComplete": complete, "lockedFileCount": 0,
+                "responseCount": responses, "responses": [], "searchText": "Marrow Choir O Holy Night",
+                "startedAt": "2026-11-15T10:00:00.0000000Z",
+                "state": if complete { "Completed, TimedOut" } else { "InProgress" }, "token": 17 })
+            .to_string(),
+        }
+    }
+
+    /// One peer's response (`Response.cs:37-46`, `File.cs:37-46`).
+    fn one_response() -> Reply {
+        Reply {
+            status: 200,
+            body: serde_json::json!([{
+                "fileCount": 1, "hasFreeUploadSlot": true, "lockedFileCount": 0, "lockedFiles": [],
+                "queueLength": 0, "token": 17, "uploadSpeed": 1048576, "username": "carol_shares",
+                "files": [{"bitDepth": 16, "code": 1, "extension": "flac", "isLocked": false, "length": 263,
+                           "filename": "@@kqzbm\\Music\\Marrow Choir\\Winter Songs\\03 - O Holy Night.flac",
+                           "sampleRate": 44100, "size": 28734112}]}])
+            .to_string(),
+        }
+    }
+
+    #[test]
+    fn the_source_with_the_wanted_length_scores_higher() {
+        let mut responses: Vec<SearchResponse> =
+            serde_json::from_str(&one_response().body).unwrap();
+        let other = one_response()
+            .body
+            .replace("carol_shares", "dave_shares")
+            .replace(r#""length":263"#, r#""length":323"#);
+        assert!(other.contains(r#""length":323"#));
+        responses.extend(serde_json::from_str::<Vec<SearchResponse>>(&other).unwrap());
+        let albums = processing::process_search_responses(
+            &responses,
+            "Marrow Choir",
+            Some("Winter Songs"),
+            &[WantedTrack {
+                title: "O Holy Night".into(),
+                duration_s: Some(263),
+            }],
+            false,
+        )
+        .albums;
+        let score = |user: &str| albums.iter().find(|a| a.username == user).unwrap().score;
+        assert!((score("carol_shares") - score("dave_shares") - 0.3 * 3.0 / 13.0).abs() < 1e-9);
+        assert!(score("dave_shares") > 0.7);
+    }
+
+    #[test]
+    fn a_peer_with_a_huge_queue_length_does_not_break_the_search() {
+        let body = one_response()
+            .body
+            .replace(r#""queueLength":0"#, r#""queueLength":4294967295"#);
+        assert!(body.contains("4294967295"));
+        let responses: Vec<SearchResponse> = serde_json::from_str(&body).unwrap();
+        let albums = processing::process_search_responses(
+            &responses,
+            "Marrow Choir",
+            None,
+            &[WantedTrack {
+                title: "O Holy Night".into(),
+                duration_s: None,
+            }],
+            false,
+        )
+        .albums;
+        assert_eq!(albums[0].queue_length, 4_294_967_295);
+        assert_eq!(albums[0].tracks[0].base.queue_length, 4_294_967_295);
+    }
+
+    /// carol_shares as in one_response(), and erin_shares with a file that matches nothing
+    /// wanted, a cover image and two locked files.
+    fn mixed_responses() -> String {
+        let carol: serde_json::Value = serde_json::from_str(&one_response().body).unwrap();
+        let erin = serde_json::json!({
+            "fileCount": 2, "hasFreeUploadSlot": false, "lockedFileCount": 2,
+            "lockedFiles": [{"code": 1, "extension": "flac", "filename": "@@pq7\\Private\\a.flac", "size": 1},
+                            {"code": 1, "extension": "flac", "filename": "@@pq7\\Private\\b.flac", "size": 1}],
+            "queueLength": 12, "token": 17, "uploadSpeed": 52000, "username": "erin_shares",
+            "files": [{"bitRate": 192, "code": 1, "extension": "", "isVariableBitRate": true, "length": 181,
+                       "filename": "@@pq7\\Share\\Misc\\Jingle Bells Remix.mp3", "size": 4345000},
+                      {"code": 1, "extension": "jpg", "filename": "@@pq7\\Share\\Misc\\cover.jpg", "size": 51200}]});
+        serde_json::json!([carol[0], erin]).to_string()
+    }
+
+    #[test]
+    fn a_file_below_the_floor_is_kept_and_flagged_only_when_asked() {
+        let responses: Vec<SearchResponse> = serde_json::from_str(&mixed_responses()).unwrap();
+        let wanted = [WantedTrack {
+            title: "O Holy Night".into(),
+            duration_s: Some(263),
+        }];
+        let strict =
+            processing::process_search_responses(&responses, "Marrow Choir", None, &wanted, false);
+        assert_eq!((strict.not_audio, strict.below_floor), (1, 1));
+        assert_eq!(
+            strict
+                .albums
+                .iter()
+                .map(|a| a.username.as_str())
+                .collect::<Vec<_>>(),
+            vec!["carol_shares"]
+        );
+        let kept =
+            processing::process_search_responses(&responses, "Marrow Choir", None, &wanted, true);
+        let erin = kept
+            .albums
+            .iter()
+            .find(|a| a.username == "erin_shares")
+            .expect("kept");
+        assert!(erin.tracks[0].below_floor);
+        assert!(
+            !kept
+                .albums
+                .iter()
+                .find(|a| a.username == "carol_shares")
+                .unwrap()
+                .tracks[0]
+                .below_floor
+        );
+    }
+
+    #[test]
+    fn an_item_carries_its_file_and_source_facts() {
+        let responses: Vec<SearchResponse> = serde_json::from_str(&mixed_responses()).unwrap();
+        let wanted = [WantedTrack {
+            title: "O Holy Night".into(),
+            duration_s: Some(263),
+        }];
+        let mut albums =
+            processing::process_search_responses(&responses, "Marrow Choir", None, &wanted, true)
+                .albums;
+        albums.sort_by(|a, b| a.username.cmp(&b.username));
+        let carol: shared::download::DownloadableItem = albums[0].tracks[0].clone().into();
+        assert_eq!(
+            carol.facts,
+            shared::download::FileFacts {
+                extension: Some("flac".into()),
+                bitrate_kbps: None,
+                variable_bitrate: None,
+                sample_rate_hz: Some(44100),
+                bit_depth: Some(16),
+                folder_audio_files: Some(1),
+                source_has_free_slot: Some(true),
+                source_upload_speed: Some(1_048_576),
+                source_queue_length: Some(0),
+                backend_facts: serde_json::json!({"declared_extension": "flac"})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            }
+        );
+        assert_eq!(carol.match_score, albums[0].tracks[0].match_score);
+        let erin: shared::download::DownloadableItem = albums[1].tracks[0].clone().into();
+        assert_eq!(
+            (
+                erin.facts.extension.as_deref(),
+                erin.facts.bitrate_kbps,
+                erin.facts.variable_bitrate
+            ),
+            (Some("mp3"), Some(192), Some(true))
+        );
+        assert!(
+            erin.facts.backend_facts.is_empty(),
+            "an empty declared extension is not kept"
+        );
+        assert!(erin.below_floor);
+    }
+
+    #[test]
+    fn slskds_retry_limit_comes_from_its_options() {
+        let options = serde_json::json!({"transfers": {"download": {"retry":
+            {"attempts": 5, "delay": 5000, "maxDelay": 60000, "partial": "resume"}}}});
+        assert_eq!(retry_limit_from_options(&options).unwrap(), 5);
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"transfers": {"download": {"retry": {"attempts": 0}}}}),
+        ] {
+            assert!(matches!(
+                retry_limit_from_options(&bad),
+                Err(SoulseekError::InvalidResponse(_))
+            ));
+        }
+    }
+
+    /// Through the trait, as the monitor and discovery call it. slskd answers an
+    /// empty 404 for a peer it holds no transfer from (`TransfersController.cs:530-533`).
+    #[tokio::test]
+    async fn the_retry_limit_is_read_once_per_client() {
+        let options = r#"{"transfers":{"download":{"retry":{"attempts":3}}}}"#;
+        let none = || Reply {
+            status: 404,
+            body: String::new(),
+        };
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: options.into(),
+            },
+            none(),
+            none(),
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        let sources = ["carol_shares".to_string()];
+        assert!(crate::DownloadBackend::get_downloads_for(&client, &sources)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(crate::DownloadBackend::get_downloads_for(&client, &sources)
+            .await
+            .unwrap()
+            .is_empty());
+        let targets: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.target.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                "/api/v0/options",
+                "/api/v0/transfers/downloads/carol_shares",
+                "/api/v0/transfers/downloads/carol_shares"
+            ]
+        );
+    }
+
+    fn empty() -> Reply {
+        Reply {
+            status: 200,
+            body: "[]".into(),
+        }
+    }
+
+    fn ok(body: &str) -> Reply {
+        Reply {
+            status: 200,
+            body: body.into(),
+        }
+    }
+
+    fn no_content() -> Reply {
+        Reply {
+            status: 204,
+            body: String::new(),
+        }
+    }
+
+    /// A client whose search for O Holy Night by Marrow Choir is running.
+    async fn searching(
+        replies: Vec<Reply>,
+        deadline: Duration,
+    ) -> (SoulseekClient, Arc<StdMutex<Vec<Seen>>>) {
+        let mut all = vec![ok(&format!(r#"{{"id":"{SEARCH_ID}"}}"#))];
+        all.extend(replies);
+        let (url, seen) = serve(all);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        client
+            .start_search(
+                SearchSpec::of(None, vec![track("Marrow Choir", "O Holy Night")]),
+                deadline,
+            )
+            .await
+            .unwrap();
+        (client, seen)
+    }
+
+    #[tokio::test]
+    async fn a_search_sends_the_callers_text_and_says_what_it_read() {
+        let mut replies = vec![ok(&format!(r#"{{"id":"{SEARCH_ID}"}}"#)), status(true, 2)];
+        replies.push(ok(&mixed_responses()));
+        replies.push(no_content());
+        let (url, seen) = serve(replies);
+        // carol's 1 file and erin's 2 (the cover included); the locked ones are counted apart.
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        let spec = SearchSpec {
+            text: Some("  Marrow Choir Holy Night choir ".into()),
+            ..SearchSpec::of(None, vec![track("Marrow Choir", "O Holy Night")])
+        };
+        client
+            .start_search(spec, Duration::seconds(120))
+            .await
+            .unwrap();
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(
+            poll.stats,
+            SearchStats {
+                query_text: "Marrow Choir Holy Night choir".into(),
+                response_count: 2,
+                file_count: 3,
+                locked_file_count: 2,
+                not_audio: 1,
+                below_floor: 1
+            }
+        );
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+        assert_eq!(body["searchText"], "Marrow Choir Holy Night choir");
+    }
+
+    #[tokio::test]
+    async fn blank_caller_text_sends_the_built_text_and_no_target_sends_nothing() {
+        let (url, seen) = serve(vec![ok(&format!(r#"{{"id":"{SEARCH_ID}"}}"#))]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        let wanted = vec![track("Marrow Choir", "O Holy Night")];
+        let blank = SearchSpec {
+            text: Some("   ".into()),
+            ..SearchSpec::of(None, wanted.clone())
+        };
+        client
+            .start_search(blank, Duration::seconds(120))
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+        assert_eq!(body["searchText"], search_text(None, &wanted).unwrap());
+        // Text alone names nothing to score what is found against.
+        let untargeted = SearchSpec {
+            text: Some("Marrow Choir".into()),
+            ..SearchSpec::of(None, vec![])
+        };
+        let e = client
+            .start_search(untargeted, Duration::seconds(120))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, SoulseekError::NoSearchTarget { tracks: 0 }),
+            "{e:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Review focus 1: slskd saves the record as complete before it writes
+    /// the responses (`Search/SearchService.cs:284-285`, then `:359-361`).
+    #[tokio::test]
+    async fn a_search_slskd_completes_before_writing_its_responses_is_read_again() {
+        let (client, seen) = searching(
+            vec![status(true, 1), empty(), one_response(), no_content()],
+            Duration::seconds(120),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(poll.state, SearchState::Completed);
+        assert_eq!(poll.stats.file_count, 1);
+        assert_eq!(poll.albums[0].tracks[0].base.username, "carol_shares");
+        let targets: Vec<(String, String)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| (s.method.clone(), s.target.clone()))
+            .collect();
+        let search = format!("/api/v0/searches/{SEARCH_ID}");
+        assert_eq!(
+            targets,
+            vec![
+                ("POST".into(), "/api/v0/searches".into()),
+                ("GET".into(), search.clone()),
+                ("GET".into(), format!("{search}/responses")),
+                ("GET".into(), format!("{search}/responses")),
+                ("DELETE".into(), search)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_without_responses_is_read_once() {
+        let (client, seen) = searching(
+            vec![status(true, 0), empty(), no_content()],
+            Duration::seconds(120),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(
+            (poll.state, poll.stats.file_count, poll.albums.len()),
+            (SearchState::Completed, 0, 0)
+        );
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    /// slskd leaves a record this way when its final update fails
+    /// (`SearchService.cs:370-374`).
+    #[tokio::test]
+    async fn responses_slskd_counted_but_never_wrote_are_a_lost_search() {
+        let mut replies = vec![status(true, 2)];
+        replies.extend((0..=RESPONSES_REREADS).map(|_| empty()));
+        replies.push(no_content());
+        let (client, _) = searching(replies, Duration::seconds(120)).await;
+        let e = client.poll_search(SEARCH_ID.into()).await.unwrap_err();
+        assert!(
+            matches!(e, SoulseekError::SearchResponsesLost { response_count: 2 }),
+            "{e:?}"
+        );
+        assert_eq!(
+            e.failure(Stage::SourceSearch, "m").code,
+            FailureCode::SearchLost
+        );
+    }
+
+    /// Review focus 4: slskd's inactivity timer restarts at every response,
+    /// so a busy search outlives the deadline.
+    #[tokio::test]
+    async fn a_search_past_its_deadline_is_cancelled_and_its_responses_read() {
+        let (client, seen) = searching(
+            vec![
+                status(false, 1),
+                ok(""),
+                status(true, 1),
+                one_response(),
+                no_content(),
+            ],
+            Duration::zero(),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(
+            (poll.state, poll.stats.file_count),
+            (SearchState::Completed, 1)
+        );
+        let cancel = &seen.lock().unwrap()[2];
+        assert_eq!(
+            (cancel.method.as_str(), cancel.target.as_str()),
+            ("PUT", format!("/api/v0/searches/{SEARCH_ID}").as_str())
+        );
+    }
+
+    /// slskd answers a cancel with an empty 404 only for a search it no longer
+    /// holds (`SearchesController.cs:222-225`; empty because of `Program.cs:973`).
+    #[tokio::test]
+    async fn a_search_slskd_no_longer_holds_at_its_cancel_is_gone() {
+        let (client, seen) = searching(
+            vec![
+                status(false, 1),
+                Reply {
+                    status: 404,
+                    body: String::new(),
+                },
+                Reply {
+                    status: 404,
+                    body: String::new(),
+                },
+            ],
+            Duration::zero(),
+        )
+        .await;
+        let e = client.poll_search(SEARCH_ID.into()).await.unwrap_err();
+        assert!(
+            matches!(e, SoulseekError::SearchGone { ref body } if body.is_empty()),
+            "{e:?}"
+        );
+        let methods: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.method.clone())
+            .collect();
+        assert_eq!(methods, ["POST", "GET", "PUT", "DELETE"]);
+    }
+
+    #[test]
+    fn a_poll_reads_waits_cancels_or_gives_up() {
+        let s = Duration::seconds;
+        let d = s(120);
+        assert!(matches!(poll_step(true, s(500), d, false), PollStep::Read));
+        assert!(matches!(poll_step(false, s(119), d, false), PollStep::Wait));
+        assert!(matches!(
+            poll_step(false, s(120), d, false),
+            PollStep::Cancel
+        ));
+        assert!(matches!(poll_step(false, s(134), d, true), PollStep::Wait));
+        assert!(matches!(
+            poll_step(false, s(135), d, true),
+            PollStep::GiveUp
+        ));
+    }
+
+    #[test]
+    fn settings_slskd_cannot_run_without_are_not_configured() {
+        let set = || Some("x".to_string());
+        for (url, key, missing) in [
+            (None, set(), MissingSetting::Url),
+            (set(), None, MissingSetting::ApiKey),
+            (Some(String::new()), set(), MissingSetting::Empty),
+            (set(), Some(String::new()), MissingSetting::Empty),
+        ] {
+            assert!(matches!(
+                SoulseekClientBuilder::from_settings(url, key),
+                Err(SoulseekError::NotConfigured(m)) if m == missing
+            ));
+        }
+        assert!(SoulseekClientBuilder::from_settings(set(), set()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn spent_retries_keep_the_last_error_and_its_code() {
+        let batches = plan_batches(
+            vec![wanted("peer", r"music\A\01.flac")],
+            "A [1]",
+            3,
+            REQUEST,
+        );
+        let config = DownloadConfig {
+            batch_size: 3,
+            batch_delay_ms: 0,
+            max_retries: 2,
+            retry_base_delay_ms: 0,
+        };
+        let mut sent = 0;
+        let results = retry_batch(&config, &batches[0], |_| {
+            sent += 1;
+            async {
+                Err(SoulseekError::Api {
+                    status: 429,
+                    message: "Only one concurrent operation is permitted. Wait until the previous request completes".into(),
+                })
+            }
+        })
+        .await;
+        assert_eq!(sent, 3);
+        assert!(failed_with(
+            &results[0].status,
+            FailureCode::EnqueueFailed,
+            "Failed after 2 retries: API error: 429 - Only one concurrent operation is permitted. Wait until the previous request completes"
+        ));
+        let EnqueueStatus::Failed(f) = &results[0].status else {
+            unreachable!()
+        };
+        assert_eq!(f.retry, RetryAdvice::SameSourceLater);
+        assert_eq!(f.cause.as_ref().unwrap().status, Some(429));
+    }
+
     fn listed(id: &str, filename: &str, batch_id: Option<&str>) -> FileEntry {
         let mut entry = serde_json::json!({
             "id": id,
@@ -1389,6 +2701,7 @@ mod tests {
             ],
             "A [1]",
             3,
+            REQUEST,
         );
         let ours = batches[0].id.to_uppercase();
         // 01 was enqueued by the attempt whose answer was lost. 02 failed in
@@ -1406,7 +2719,233 @@ mod tests {
 
         assert_eq!(results[0].status, EnqueueStatus::Enqueued);
         assert_eq!(results[0].transfer_id.as_deref(), Some("t-01"));
-        assert!(matches!(results[1].status, EnqueueStatus::Failed(_)));
+        assert!(failed_with(
+            &results[1].status,
+            FailureCode::EnqueueFailed,
+            "Not found in slskd after a retried enqueue"
+        ));
         assert_eq!(results[1].transfer_id, None);
+    }
+
+    #[tokio::test]
+    async fn one_transfer_is_read_until_slskd_no_longer_has_it() {
+        let options = r#"{"transfers":{"download":{"retry":{"attempts":3}}}}"#;
+        let record = |removed: bool| {
+            serde_json::json!({
+                "id": "890f943c-02e1-4d45-af76-d55e3d855684", "username": "peer", "direction": "Download",
+                "filename": "shared\\Artist\\Album\\01. Track.flac", "size": 1024, "state": "InProgress",
+                "requestedAt": "2026-07-19T05:11:22Z", "enqueuedAt": "2026-07-19T05:11:23Z",
+                "startedAt": "2026-07-19T05:11:24Z", "bytesTransferred": 512, "averageSpeed": 250000.0,
+                "attempts": 1, "removed": removed, "bytesRemaining": 512, "percentComplete": 50.0 })
+            .to_string()
+        };
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: options.into(),
+            },
+            Reply {
+                status: 200,
+                body: record(false),
+            },
+            Reply {
+                status: 404,
+                body: String::new(),
+            },
+            Reply {
+                status: 200,
+                body: record(true),
+            },
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        let id = "890f943c-02e1-4d45-af76-d55e3d855684";
+        let row = crate::DownloadBackend::get_download(&client, "peer", id)
+            .await
+            .unwrap()
+            .expect("listed");
+        assert_eq!(
+            (row.state, row.transferred),
+            (shared::download::DownloadState::InProgress, 512)
+        );
+        assert_eq!(
+            crate::DownloadBackend::get_download(&client, "peer", id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            crate::DownloadBackend::get_download(&client, "peer", id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            seen.lock().unwrap()[1].target,
+            format!("/api/v0/transfers/downloads/peer/{id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_transfers_place_is_asked_of_the_peer() {
+        let id = "890f943c-02e1-4d45-af76-d55e3d855684";
+        // TransferNotFoundException's text (Soulseek.NET src/SoulseekClient.cs:1645), answered
+        // as 500 by TransfersController.cs:614 and written as a JSON string (`:56`).
+        let inactive = "A download of @@kqzbm\\Music\\Marrow Choir\\Winter Songs\\03 - O Holy Night.flac from user carol_shares is not active";
+        let (url, seen) = serve(vec![
+            ok("3"),
+            Reply {
+                status: 404,
+                body: String::new(),
+            },
+            Reply {
+                status: 500,
+                body: serde_json::to_string(inactive).unwrap(),
+            },
+            // A peer's place read as a signed int (PlaceInQueueResponse.cs:36,50).
+            ok("-1"),
+            // SoulseekClient.cs:3790.
+            Reply {
+                status: 500,
+                body: serde_json::to_string("User carol_shares appears to be offline").unwrap(),
+            },
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.get_place_in_queue("carol_shares", id).await.unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            client.get_place_in_queue("carol_shares", id).await.unwrap(),
+            None
+        );
+        let err = client
+            .get_place_in_queue("carol_shares", id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SoulseekError::Api { status: 500, message } if message == inactive),
+            "{err:?}"
+        );
+        assert_eq!(
+            client.get_place_in_queue("carol_shares", id).await.unwrap(),
+            None
+        );
+        let err = client
+            .get_place_in_queue("carol_shares", id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SoulseekError::UserOffline { username, status: 500, body }
+                if username == "carol_shares" && body == "User carol_shares appears to be offline"),
+            "{err:?}"
+        );
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            format!("/api/v0/transfers/downloads/carol_shares/{id}/position")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_presence_is_read_and_a_404_is_a_blocked_user() {
+        let (url, seen) = serve(vec![
+            ok(r#"{"isPrivileged":false,"presence":"Away"}"#),
+            ok(r#"{"isPrivileged":true,"presence":"Online"}"#),
+            ok(r#"{"isPrivileged":false,"presence":"Offline"}"#),
+            Reply {
+                status: 404,
+                body: String::new(),
+            },
+            // The Soulseek server did not answer GetStatus in time (SoulseekClient.cs:3866),
+            // written as a JSON string by the global handler (Program.cs:1051-1053).
+            Reply {
+                status: 500,
+                body: serde_json::to_string("The wait timed out after 5000 milliseconds").unwrap(),
+            },
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        for expected in [
+            SourcePresence::Away,
+            SourcePresence::Online,
+            SourcePresence::Offline,
+            SourcePresence::Blocked,
+        ] {
+            assert_eq!(
+                client.get_user_presence("carol_shares").await.unwrap(),
+                expected
+            );
+        }
+        let err = client.get_user_presence("carol_shares").await.unwrap_err();
+        assert!(
+            matches!(&err, SoulseekError::Api { status: 500, message }
+                if message == "The wait timed out after 5000 milliseconds"),
+            "{err:?}"
+        );
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/api/v0/users/carol_shares/status"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_is_stopped_and_one_slskd_no_longer_has_is_no_error() {
+        let (url, seen) = serve(vec![
+            ok(""),
+            Reply {
+                status: 404,
+                body: String::new(),
+            },
+        ]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        client.stop_search(SEARCH_ID).await.unwrap();
+        client.stop_search(SEARCH_ID).await.unwrap();
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            (sent.method.as_str(), sent.target),
+            ("PUT", format!("/api/v0/searches/{SEARCH_ID}"))
+        );
+        assert_eq!(sent.body, "");
+        // An id that is no one path segment is never sent.
+        assert!(client.stop_search("..").await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// A search stopped while this client polls it is given the grace a cancelled search has,
+    /// not cancelled again at its deadline.
+    #[tokio::test]
+    async fn a_stopped_search_is_not_cancelled_again_at_its_deadline() {
+        let (client, seen) = searching(
+            vec![
+                ok(""),
+                status(false, 1),
+                status(true, 1),
+                one_response(),
+                no_content(),
+            ],
+            Duration::zero(),
+        )
+        .await;
+        client.stop_search(SEARCH_ID).await.unwrap();
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(poll.state, SearchState::Completed);
+        let stops = (seen.lock().unwrap().iter())
+            .filter(|sent| sent.method == "PUT")
+            .count();
+        assert_eq!(stops, 1);
     }
 }

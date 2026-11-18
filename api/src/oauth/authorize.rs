@@ -1,0 +1,1305 @@
+//! `GET /oauth/authorize` asks the signed-in user whether an app may use
+//! Soulful; `POST /oauth/authorize` takes the answer and sends the browser
+//! back to the app with a code or with `access_denied`.
+//!
+//! Only the user's answer goes back to the app. Every other refusal is
+//! shown on a page: any https address can be registered, so a redirect on
+//! a bad request would make Soulful an open redirector (RFC 9700 4.11.2).
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::header::RETRY_AFTER;
+use axum::http::{StatusCode, Uri};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::Extension;
+use shared::oauth::{login_return_location, AUTHORIZE_PATH};
+use tower_cookies::Cookies;
+use url::Url;
+
+use super::cimd::{client_id_url, CimdError};
+use super::clients::{find_in, is_loopback_uri, redirect_matches, ClientKind, KnownClient};
+use super::codes::{answer_in, store_request_in, Answered, PendingRequest, Refused, SessionCheck};
+use super::consent::{consent_page, error_page, ConsentView};
+use super::limits::{retry_after_seconds, try_again_in};
+use super::metadata::mcp_url;
+use super::secrets::new_secret;
+use super::{now_unix, resource_matches, Params, OFFLINE_ACCESS, SCOPE};
+use crate::auth::UserCtx;
+use crate::base_url::BaseUrl;
+use crate::connection::{ConnectionState, RequestBase};
+use crate::server_fns::guard::load_session_claims;
+
+const AUTHORIZE_PARAMS: &[&str] = &[
+    "response_type",
+    "client_id",
+    "redirect_uri",
+    "state",
+    "code_challenge",
+    "code_challenge_method",
+    "scope",
+    "resource",
+];
+const ANSWER_PARAMS: &[&str] = &["request", "decision"];
+
+const UNKNOWN_APP: &str =
+    "Soulbeet does not know this app. Start the connection again from the app.";
+const UNREGISTERED_REDIRECT: &str = "This app asked to return to an address it did not register.";
+const SESSION_ENDED: &str = "Your Soulbeet session ended. Start the connection again from the app.";
+const REQUEST_GONE: &str =
+    "This sign-in request expired or was already used. Start the connection again from the app.";
+const NOT_UNDERSTOOD: &str =
+    "Soulbeet did not understand the answer. Start the connection again from the app.";
+const DATABASE_UNAVAILABLE: &str =
+    "Soulbeet's database is unavailable. Start the connection again from the app.";
+
+/// The parameters of `raw` named in `names`, or the page refusing a request
+/// that sent one twice.
+fn read_params(raw: &[u8], names: &[&'static str]) -> Result<Params, Response> {
+    Params::read(raw, names).map_err(|name| {
+        error_page(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "This app sent {name} more than once. Start the connection again from the app."
+            ),
+        )
+    })
+}
+
+/// What the session cookie says about the browser's user.
+enum Session {
+    /// Signed in, with what a later write checks again.
+    SignedIn(UserCtx, SessionCheck),
+    /// No cookie, or one that no longer counts.
+    SignedOut,
+    /// The database could not say.
+    Unavailable,
+}
+
+async fn session(state: &ConnectionState, cookies: &Cookies) -> Session {
+    let token = cookies
+        .get(crate::AUTH_COOKIE_NAME)
+        .map(|c| c.value().to_string());
+    match load_session_claims(token.as_deref(), &state.db, state.key).await {
+        Ok((ctx, claims)) => Session::SignedIn(
+            ctx,
+            SessionCheck {
+                credentials_version: claims.ver,
+                session_id: claims.jti,
+            },
+        ),
+        // load_session_claims has logged the database's failure.
+        Err((StatusCode::INTERNAL_SERVER_ERROR, _)) => Session::Unavailable,
+        Err(_) => Session::SignedOut,
+    }
+}
+
+fn database_unavailable() -> Response {
+    error_page(StatusCode::INTERNAL_SERVER_ERROR, DATABASE_UNAVAILABLE)
+}
+
+pub(crate) async fn show(
+    State(state): State<Arc<ConnectionState>>,
+    Extension(RequestBase(base)): Extension<RequestBase>,
+    cookies: Cookies,
+    uri: Uri,
+) -> Response {
+    let params = match read_params(uri.query().unwrap_or("").as_bytes(), AUTHORIZE_PARAMS) {
+        Ok(params) => params,
+        Err(refused) => return refused,
+    };
+    let (user, check) = match session(&state, &cookies).await {
+        Session::SignedIn(user, check) => (user, check),
+        Session::Unavailable => return database_unavailable(),
+        Session::SignedOut => {
+            let back = match uri.query() {
+                Some(query) => format!("{AUTHORIZE_PATH}?{query}"),
+                None => AUTHORIZE_PATH.to_string(),
+            };
+            return Redirect::to(&login_return_location(&back)).into_response();
+        }
+    };
+    let Some(client_id) = params.get("client_id") else {
+        return error_page(StatusCode::BAD_REQUEST, UNKNOWN_APP);
+    };
+    // A CIMD client is known by its URL's host, a registered one by its
+    // redirect's host (D8).
+    let (client, client_id_host) = if client_id.starts_with("https://") {
+        match document_client(&state, &user, client_id).await {
+            Ok((client, host)) => (client, Some(host)),
+            Err(refused) => return refused,
+        }
+    } else {
+        match find_in(&state.db, client_id).await {
+            Ok(Some(client)) => (client, None),
+            Ok(None) => return error_page(StatusCode::BAD_REQUEST, UNKNOWN_APP),
+            Err(e) => {
+                tracing::error!("Could not read an OAuth client: {e}");
+                return database_unavailable();
+            }
+        }
+    };
+    let redirect = params
+        .get("redirect_uri")
+        .filter(|sent| {
+            client
+                .redirect_uris
+                .iter()
+                .any(|r| redirect_matches(r, sent))
+        })
+        .and_then(|sent| Some((sent, Url::parse(sent).ok()?.host_str()?.to_string())));
+    let Some((redirect_uri, redirect_host)) = redirect else {
+        return error_page(StatusCode::BAD_REQUEST, UNREGISTERED_REDIRECT);
+    };
+    let (scope, code_challenge) = match validate(&params, &base) {
+        Ok(granted) => granted,
+        Err((error, description)) => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "This app sent a request Soulbeet cannot accept ({error}: {description}). \
+                     Start the connection again from the app."
+                ),
+            )
+        }
+    };
+    let request_id = new_secret();
+    let pending = PendingRequest {
+        user_id: user.user_id.clone(),
+        client,
+        redirect_uri: redirect_uri.to_string(),
+        state: params.get("state").map(str::to_string),
+        code_challenge: code_challenge.to_string(),
+        scope,
+        resource: mcp_url(&base),
+    };
+    match store_request_in(&state.db, &check, &request_id, &pending, now_unix()).await {
+        Ok(()) => {}
+        // Signed out or credentials changed while the document was fetched.
+        Err(Refused::SessionEnded) => return error_page(StatusCode::UNAUTHORIZED, SESSION_ENDED),
+        Err(Refused::Database(e)) => {
+            tracing::error!("Could not store an OAuth authorize request: {e}");
+            return database_unavailable();
+        }
+    }
+    consent_page(&ConsentView {
+        app_host: client_id_host.as_deref().unwrap_or(&redirect_host),
+        client_name: pending.client.client_name.as_deref(),
+        redirect_host: &redirect_host,
+        returns_to_loopback: is_loopback_uri(redirect_uri),
+        username: &user.username,
+        request_id: &request_id,
+    })
+}
+
+/// The client a client id URL names, from its document fetched now, and the
+/// URL's host; or the page that says why it cannot be used.
+async fn document_client(
+    state: &ConnectionState,
+    user: &UserCtx,
+    client_id: &str,
+) -> Result<(KnownClient, String), Response> {
+    let unusable = |e: CimdError| {
+        if let CimdError::Fetch(causes) = &e {
+            tracing::warn!("Could not fetch the client metadata at {client_id}: {causes}");
+        }
+        error_page(
+            StatusCode::BAD_REQUEST,
+            &format!("Soulbeet could not use this app's client metadata at {client_id}: {e}"),
+        )
+    };
+    let url = client_id_url(client_id).map_err(unusable)?;
+    if let Err(wait) = state.limits.cimd_fetch.admit(&user.user_id, Instant::now()) {
+        let seconds = retry_after_seconds(wait);
+        let mut refused = error_page(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!(
+                "Too many app sign-ins in a minute. {}",
+                try_again_in(seconds)
+            ),
+        );
+        refused.headers_mut().insert(RETRY_AFTER, seconds.into());
+        return Err(refused);
+    }
+    let doc = state.documents.fetch(&url).await.map_err(unusable)?;
+    let host = url.host_str().expect("an https URL has a host").to_string();
+    let client = KnownClient {
+        client_id: doc.client_id,
+        kind: ClientKind::Cimd,
+        client_name: doc.client_name,
+        redirect_uris: doc.redirect_uris,
+    };
+    Ok((client, host))
+}
+
+/// The granted scope and the code challenge, or the OAuth error code and
+/// description of the first rule the request breaks.
+fn validate<'a>(
+    params: &'a Params,
+    base: &BaseUrl,
+) -> Result<(String, &'a str), (&'static str, String)> {
+    if params.get("response_type") != Some("code") {
+        return Err((
+            "unsupported_response_type",
+            "response_type must be code".into(),
+        ));
+    }
+    let code_challenge = match (
+        params.get("code_challenge"),
+        params.get("code_challenge_method"),
+    ) {
+        (Some(challenge), Some("S256")) => challenge,
+        _ => return Err(("invalid_request", "PKCE with S256 is required".into())),
+    };
+    if !is_s256_challenge(code_challenge) {
+        return Err((
+            "invalid_request",
+            "code_challenge must be 43 base64url characters, an S256 challenge".into(),
+        ));
+    }
+    let requested: Vec<&str> = params
+        .get("scope")
+        .map(|scope| scope.split(' ').collect())
+        .unwrap_or_default();
+    if requested
+        .iter()
+        .any(|s| *s != SCOPE && *s != OFFLINE_ACCESS)
+    {
+        return Err((
+            "invalid_scope",
+            "Soulbeet grants the scopes soulful and offline_access only".into(),
+        ));
+    }
+    if !params
+        .get("resource")
+        .is_some_and(|resource| resource_matches(resource, base))
+    {
+        return Err((
+            "invalid_target",
+            format!("resource must be {}", mcp_url(base)),
+        ));
+    }
+    let scope = if requested.contains(&OFFLINE_ACCESS) {
+        format!("{SCOPE} {OFFLINE_ACCESS}")
+    } else {
+        SCOPE.to_string()
+    };
+    Ok((scope, code_challenge))
+}
+
+/// An S256 challenge is a SHA-256 in unpadded base64url: 43 characters of
+/// `[A-Za-z0-9-_]` (RFC 7636 section 4.2).
+fn is_s256_challenge(challenge: &str) -> bool {
+    challenge.len() == 43
+        && challenge
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+}
+
+pub(crate) async fn answer(
+    State(state): State<Arc<ConnectionState>>,
+    Extension(RequestBase(base)): Extension<RequestBase>,
+    cookies: Cookies,
+    body: Bytes,
+) -> Response {
+    let params = match read_params(&body, ANSWER_PARAMS) {
+        Ok(params) => params,
+        Err(refused) => return refused,
+    };
+    let (user, check) = match session(&state, &cookies).await {
+        Session::SignedIn(user, check) => (user, check),
+        Session::Unavailable => return database_unavailable(),
+        Session::SignedOut => return error_page(StatusCode::UNAUTHORIZED, SESSION_ENDED),
+    };
+    let (Some(request_id), Some(allow)) = (
+        params.get("request"),
+        match params.get("decision") {
+            Some("allow") => Some(true),
+            Some("deny") => Some(false),
+            _ => None,
+        },
+    ) else {
+        return error_page(StatusCode::BAD_REQUEST, NOT_UNDERSTOOD);
+    };
+    match answer_in(
+        &state.db,
+        state.key,
+        &user.user_id,
+        &check,
+        request_id,
+        allow,
+        now_unix(),
+    )
+    .await
+    {
+        Ok(Answered::Gone) => error_page(StatusCode::BAD_REQUEST, REQUEST_GONE),
+        Ok(Answered::Denied(pending)) => back_to_app(
+            &pending,
+            &base,
+            &[
+                ("error", "access_denied"),
+                ("error_description", "The user did not allow the connection"),
+            ],
+        ),
+        Ok(Answered::Allowed(pending, code)) => back_to_app(&pending, &base, &[("code", &code)]),
+        Err(Refused::SessionEnded) => error_page(StatusCode::UNAUTHORIZED, SESSION_ENDED),
+        Err(Refused::Database(e)) => {
+            tracing::error!("Could not answer an OAuth authorize request: {e}");
+            database_unavailable()
+        }
+    }
+}
+
+/// A 303 to the request's redirect URI with `first`, then `state` when the
+/// app sent one and `iss` (RFC 9207), added to its query.
+fn back_to_app(pending: &PendingRequest, base: &BaseUrl, first: &[(&str, &str)]) -> Response {
+    let Ok(mut to) = Url::parse(&pending.redirect_uri) else {
+        tracing::error!("A stored OAuth redirect URI does not parse");
+        return database_unavailable();
+    };
+    {
+        let mut query = to.query_pairs_mut();
+        query.extend_pairs(first);
+        if let Some(state) = &pending.state {
+            query.append_pair("state", state);
+        }
+        query.append_pair("iss", &base.to_string());
+    }
+    Redirect::to(to.as_str()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::Router;
+    use sqlx::SqlitePool;
+    use tower_cookies::CookieManagerLayer;
+    use url::Url;
+
+    use crate::connection::test_util::*;
+    use crate::connection::{router, ConnectionState};
+    use crate::db::test_db;
+    use crate::oauth::cimd::{CimdError, ClientDocument, ClientDocuments};
+    use crate::oauth::clients::{insert_dcr_in, NewClient, DCR_CAP};
+    use crate::oauth::limits::{Limits, WindowLimiter};
+    use crate::oauth::now_unix;
+    use crate::oauth::secrets::hash;
+
+    /// The authorize query a client sends, with `changes` applied (None removes the pair).
+    fn query_with(changes: &[(&'static str, Option<&'static str>)]) -> String {
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("response_type", "code"),
+            ("client_id", "dcr_test"),
+            ("redirect_uri", CLAUDE_CALLBACK),
+            ("state", "a&b"),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("scope", "soulful offline_access"),
+            ("resource", "https://music.example.com/mcp"),
+        ];
+        for &(name, value) in changes {
+            pairs.retain(|(k, _)| *k != name);
+            if let Some(v) = value {
+                pairs.push((name, v));
+            }
+        }
+        url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs)
+            .finish()
+    }
+
+    fn query() -> String {
+        query_with(&[])
+    }
+
+    /// A database holding DCR client dcr_test, and the router with the cookie layer.
+    async fn app() -> (SqlitePool, Router) {
+        let db = test_db::migrated().await;
+        insert_dcr_in(
+            &db,
+            "dcr_test",
+            &NewClient {
+                client_name: Some("<script>alert(1)</script>".into()),
+                redirect_uris: vec![CLAUDE_CALLBACK.into()],
+            },
+            0,
+            DCR_CAP,
+        )
+        .await
+        .unwrap();
+        let app = router(ConnectionState::for_test(db.clone())).layer(CookieManagerLayer::new());
+        (db, app)
+    }
+
+    /// Where a 303 to the app goes: the URL without query, and its pairs in order.
+    fn redirect_of(headers: &HeaderMap) -> (String, Vec<(String, String)>) {
+        let to = Url::parse(headers["location"].to_str().unwrap()).unwrap();
+        (
+            to[..url::Position::AfterPath].to_string(),
+            to.query_pairs().into_owned().collect(),
+        )
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn without_a_session_the_browser_goes_to_sign_in_and_comes_back() {
+        let (_, app) = app().await;
+        let (status, headers, _) = get(app, &format!("/oauth/authorize?{}", query()), None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let location = headers["location"].to_str().unwrap();
+        assert!(
+            location.starts_with("/login/return?return_to="),
+            "{location}"
+        );
+        let back = Url::parse(&format!("https://music.example.com{location}"))
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "return_to")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(back, format!("/oauth/authorize?{}", query()));
+        assert!(back.contains("state=a%26b"));
+        assert_eq!(
+            shared::oauth::accepted_return_to(&back),
+            Some(back.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_app_or_return_address_gets_a_page_not_a_redirect() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        for (change, text) in [
+            (
+                ("client_id", Some("dcr_nobody")),
+                "Soulbeet does not know this app. Start the connection again from the app.",
+            ),
+            (
+                ("client_id", None),
+                "Soulbeet does not know this app. Start the connection again from the app.",
+            ),
+            (
+                ("redirect_uri", Some("https://evil.example/cb")),
+                "This app asked to return to an address it did not register.",
+            ),
+            (
+                ("redirect_uri", None),
+                "This app asked to return to an address it did not register.",
+            ),
+        ] {
+            let (status, headers, page) = get(
+                app.clone(),
+                &format!("/oauth/authorize?{}", query_with(&[change])),
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{change:?}");
+            assert!(headers.get("location").is_none(), "{change:?}");
+            assert!(page.contains(text), "{change:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_parameter_sent_twice_gets_a_page() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let twice = format!(
+            "{}&{}",
+            query(),
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("redirect_uri", "https://evil.example/cb")
+                .finish()
+        );
+        for cookie in [None, Some(cookie.as_str())] {
+            let (status, headers, page) =
+                get(app.clone(), &format!("/oauth/authorize?{twice}"), cookie).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(headers.get("location").is_none());
+            assert!(page.contains(
+                "This app sent redirect_uri more than once. Start the connection again from the app."
+            ));
+        }
+        assert_eq!(count(&db, "oauth_requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn request_errors_are_shown_on_a_page_not_sent_to_the_app() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        for (change, error, description) in [
+            (
+                ("response_type", Some("token")),
+                "unsupported_response_type",
+                "response_type must be code",
+            ),
+            (
+                ("code_challenge", None),
+                "invalid_request",
+                "PKCE with S256 is required",
+            ),
+            (
+                ("code_challenge_method", Some("plain")),
+                "invalid_request",
+                "PKCE with S256 is required",
+            ),
+            (
+                ("code_challenge", Some("abc")),
+                "invalid_request",
+                "code_challenge must be 43 base64url characters, an S256 challenge",
+            ),
+            (
+                // RFC 7636 appendix B's challenge padded, as base64 and not base64url writes it.
+                (
+                    "code_challenge",
+                    Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw+cM="),
+                ),
+                "invalid_request",
+                "code_challenge must be 43 base64url characters, an S256 challenge",
+            ),
+            (
+                ("scope", Some("soulful admin")),
+                "invalid_scope",
+                "Soulbeet grants the scopes soulful and offline_access only",
+            ),
+            (
+                ("resource", Some("https://other.example/mcp")),
+                "invalid_target",
+                "resource must be https://music.example.com/mcp",
+            ),
+            (
+                ("resource", None),
+                "invalid_target",
+                "resource must be https://music.example.com/mcp",
+            ),
+        ] {
+            let (status, headers, page) = get(
+                app.clone(),
+                &format!("/oauth/authorize?{}", query_with(&[change])),
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{change:?}");
+            assert!(headers.get("location").is_none(), "{change:?}");
+            let text = format!(
+                "This app sent a request Soulbeet cannot accept ({error}: {description}). \
+                 Start the connection again from the app."
+            );
+            assert!(page.contains(&text), "{change:?}: {page}");
+        }
+        assert_eq!(count(&db, "oauth_requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn consent_names_the_app_the_redirect_and_the_user() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (status, headers, page) =
+            get(app, &format!("/oauth/authorize?{}", query()), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers["content-security-policy"],
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+        );
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        for text in [
+            "<title>Connect claude.ai to Soulbeet</title>",
+            "claude.ai wants to use Soulbeet as alice.",
+            "It calls itself \"&lt;script&gt;alert(1)&lt;/script&gt;\".",
+            "When you answer, Soulbeet sends you back to claude.ai.",
+            r#"<form method="post" action="/oauth/authorize">"#,
+            r#"<button type="submit" name="decision" value="allow">Allow</button>"#,
+            r#"<button type="submit" name="decision" value="deny">Deny</button>"#,
+        ] {
+            assert!(page.contains(text), "{text}");
+        }
+        assert!(!page.contains("<script>") && !page.contains("runs on a computer"));
+        assert_eq!(request_id_of(&page).len(), 43);
+        assert_eq!(count(&db, "oauth_requests").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_resource_with_uppercase_host_and_default_port_is_this_endpoint() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let q = query_with(&[("resource", Some("https://Music.Example.com:443/mcp"))]);
+        let (status, _, page) = get(app, &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let resource: String = sqlx::query_scalar("SELECT resource FROM oauth_requests")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(resource, "https://music.example.com/mcp");
+    }
+
+    #[tokio::test]
+    async fn allowing_sends_a_code_with_state_and_issuer_and_a_double_click_the_same() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (_, _, page) = get(
+            app.clone(),
+            &format!("/oauth/authorize?{}", query()),
+            Some(&cookie),
+        )
+        .await;
+        let id = request_id_of(&page);
+        let before = now_unix();
+        let (status, headers, _) = post_form(
+            app.clone(),
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (to, got) = redirect_of(&headers);
+        assert_eq!(
+            (to.as_str(), got.len(), got[0].0.as_str()),
+            (CLAUDE_CALLBACK, 3, "code")
+        );
+        let code = &got[0].1;
+        assert_eq!(code.len(), 43);
+        assert_eq!(
+            got[1..],
+            pairs(&[("state", "a&b"), ("iss", "https://music.example.com")])
+        );
+        let row: (String, String, String, String, String, String, i64) = sqlx::query_as(
+            "SELECT user_id, client_id, redirect_uri, code_challenge, scope, resource, expires_at \
+             FROM oauth_codes WHERE code_hash = ?",
+        )
+        .bind(hash(code))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                row.0.as_str(),
+                row.1.as_str(),
+                row.2.as_str(),
+                row.3.as_str(),
+                row.4.as_str(),
+                row.5.as_str()
+            ),
+            (
+                "u1",
+                "dcr_test",
+                CLAUDE_CALLBACK,
+                CHALLENGE,
+                "soulful offline_access",
+                "https://music.example.com/mcp"
+            )
+        );
+        assert!((before + 60..=before + 61).contains(&row.6), "{}", row.6);
+        // A double click sends the form again: the browser follows only this answer, so it is
+        // the same redirect, with no second code.
+        let (status, again, _) = post_form(
+            app.clone(),
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(redirect_of(&again), redirect_of(&headers));
+        assert_eq!(count(&db, "oauth_codes").await, 1);
+        // The other answer after this one is refused.
+        let (status, _, page) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &id), ("decision", "deny")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains(
+            "This sign-in request expired or was already used. Start the connection again from the app."
+        ));
+    }
+
+    #[tokio::test]
+    async fn another_users_session_cannot_answer_the_request() {
+        let (db, app) = app().await;
+        let alice = signed_in(&db, "u1", "alice").await;
+        let bob = signed_in(&db, "u2", "bob").await;
+        let (_, _, page) = get(
+            app.clone(),
+            &format!("/oauth/authorize?{}", query()),
+            Some(&alice),
+        )
+        .await;
+        let id = request_id_of(&page);
+        let (status, _, page) = post_form(
+            app.clone(),
+            "/oauth/authorize",
+            Some(&bob),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains("expired or was already used"));
+        let (status, _, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&alice),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_a_session_is_refused() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (_, _, page) = get(
+            app.clone(),
+            &format!("/oauth/authorize?{}", query()),
+            Some(&cookie),
+        )
+        .await;
+        let (status, _, page) = post_form(
+            app,
+            "/oauth/authorize",
+            None,
+            &[("request", &request_id_of(&page)), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            page.contains("Your Soulbeet session ended. Start the connection again from the app.")
+        );
+        assert_eq!(count(&db, "oauth_requests").await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_other_than_allow_or_deny_keeps_the_request() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (_, _, page) = get(
+            app.clone(),
+            &format!("/oauth/authorize?{}", query()),
+            Some(&cookie),
+        )
+        .await;
+        let id = request_id_of(&page);
+        for answer in [
+            vec![("request", id.as_str()), ("decision", "maybe")],
+            vec![("request", id.as_str())],
+        ] {
+            let (status, headers, page) =
+                post_form(app.clone(), "/oauth/authorize", Some(&cookie), &answer).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{answer:?}");
+            assert!(headers.get("location").is_none(), "{answer:?}");
+            assert!(page.contains(
+                "Soulbeet did not understand the answer. Start the connection again from the app."
+            ));
+        }
+        assert_eq!(count(&db, "oauth_requests").await, 1);
+        let (status, _, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn a_database_failure_while_checking_the_session_is_the_500_page() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (_, _, page) = get(
+            app.clone(),
+            &format!("/oauth/authorize?{}", query()),
+            Some(&cookie),
+        )
+        .await;
+        let id = request_id_of(&page);
+        db.close().await;
+        let (status, _, page) = post_form(
+            app.clone(),
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(page.contains(
+            "Soulbeet&#39;s database is unavailable. Start the connection again from the app."
+        ));
+        let (status, headers, _) =
+            get(app, &format!("/oauth/authorize?{}", query()), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(headers.get("location").is_none());
+    }
+
+    /// Answers Claude Code's document after changing alice's password, as
+    /// a password change that commits while the fetch is in flight.
+    struct ChangedDuringFetch(SqlitePool);
+
+    #[async_trait::async_trait]
+    impl ClientDocuments for ChangedDuringFetch {
+        async fn fetch(&self, _url: &Url) -> Result<ClientDocument, CimdError> {
+            sqlx::query(
+                "UPDATE users SET credentials_version = credentials_version + 1 WHERE id = 'u1'",
+            )
+            .execute(&self.0)
+            .await
+            .unwrap();
+            Ok(claude_code())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_password_change_during_the_document_fetch_ends_the_request() {
+        let db = test_db::migrated().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let app = router(ConnectionState {
+            documents: Arc::new(ChangedDuringFetch(db.clone())),
+            ..ConnectionState::for_test(db.clone())
+        })
+        .layer(CookieManagerLayer::new());
+        let (status, _, page) = get(
+            app,
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("http://localhost:3118/callback")
+            ),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            page.contains("Your Soulbeet session ended. Start the connection again from the app.")
+        );
+        assert_eq!(count(&db, "oauth_requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_session_cannot_answer() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (_, _, page) = get(
+            app.clone(),
+            &format!("/oauth/authorize?{}", query()),
+            Some(&cookie),
+        )
+        .await;
+        let id = request_id_of(&page);
+        let token = cookie.split_once('=').unwrap().1;
+        let claims = crate::auth::verify_token(test_key(), token).unwrap();
+        sqlx::query("INSERT INTO revoked_sessions (jti, expires_at) VALUES (?, 9999999999)")
+            .bind(&claims.jti)
+            .execute(&db)
+            .await
+            .unwrap();
+        let (status, _, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &id), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(count(&db, "oauth_codes").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_metadata_document_without_a_name_is_shown_by_its_host_alone() {
+        let unnamed = ClientDocument {
+            client_name: None,
+            ..claude_code()
+        };
+        let (db, _, app) = cimd_app(Ok(unnamed)).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let q = claude_code_query("http://localhost:3118/callback");
+        let (status, _, page) =
+            get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            page.contains("Connect claude.ai to Soulbeet") && !page.contains("It calls itself")
+        );
+        let (status, _, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &request_id_of(&page)), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let name: Option<String> = sqlx::query_scalar("SELECT client_name FROM oauth_clients")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(name, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_says_only_that_it_failed() {
+        let failed = CimdError::Fetch(
+            "error sending request: dns error: the name resolves only to private or local addresses"
+                .into(),
+        );
+        let (db, _, app) = cimd_app(Err(failed)).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (status, _, page) = get(
+            app,
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("http://localhost:3118/callback")
+            ),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains(
+            "Soulbeet could not use this app&#39;s client metadata at \
+             https://claude.ai/oauth/claude-code-client-metadata: Soulbeet could not fetch it"
+        ));
+        assert!(!page.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn denying_sends_access_denied() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (_, _, page) = get(
+            app.clone(),
+            &format!("/oauth/authorize?{}", query()),
+            Some(&cookie),
+        )
+        .await;
+        let (status, headers, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &request_id_of(&page)), ("decision", "deny")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect_of(&headers),
+            (
+                CLAUDE_CALLBACK.to_string(),
+                pairs(&[
+                    ("error", "access_denied"),
+                    ("error_description", "The user did not allow the connection"),
+                    ("state", "a&b"),
+                    ("iss", "https://music.example.com")
+                ])
+            )
+        );
+        // The answered request stays for a repeat of its answer only.
+        assert_eq!(
+            (
+                count(&db, "oauth_codes").await,
+                count(&db, "oauth_requests").await
+            ),
+            (0, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loopback_only_app_gets_a_warning() {
+        let (db, app) = app().await;
+        insert_dcr_in(
+            &db,
+            "dcr_cli",
+            &NewClient {
+                client_name: None,
+                redirect_uris: vec!["http://127.0.0.1/callback".into()],
+            },
+            0,
+            DCR_CAP,
+        )
+        .await
+        .unwrap();
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let q = query_with(&[
+            ("client_id", Some("dcr_cli")),
+            ("redirect_uri", Some("http://127.0.0.1:50000/callback")),
+        ]);
+        let (status, _, page) = get(app, &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("Connect 127.0.0.1 to Soulbeet"));
+        assert!(page.contains(
+            "This app runs on a computer (it returns to 127.0.0.1). Allow it only if you started it yourself."
+        ));
+        assert!(!page.contains("It calls itself"));
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_loopback_address_gets_the_warning_whatever_else_is_registered() {
+        let (db, app) = app().await;
+        insert_dcr_in(
+            &db,
+            "dcr_mixed",
+            &NewClient {
+                client_name: None,
+                redirect_uris: vec![
+                    "https://claude.ai/api/mcp/auth_callback".into(),
+                    "http://localhost:4000/cb".into(),
+                ],
+            },
+            0,
+            DCR_CAP,
+        )
+        .await
+        .unwrap();
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let warning = "This app runs on a computer (it returns to localhost).";
+        let q = query_with(&[
+            ("client_id", Some("dcr_mixed")),
+            ("redirect_uri", Some("http://localhost:4000/cb")),
+        ]);
+        let (status, _, page) =
+            get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains(warning), "{page}");
+        let q = query_with(&[
+            ("client_id", Some("dcr_mixed")),
+            (
+                "redirect_uri",
+                Some("https://claude.ai/api/mcp/auth_callback"),
+            ),
+        ]);
+        let (status, _, page) = get(app, &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!page.contains("This app runs on a computer"), "{page}");
+    }
+
+    /// A database, the documents the router fetches (Claude Code's id answers
+    /// `doc`), and the router with the cookie layer.
+    async fn cimd_app(
+        doc: Result<ClientDocument, CimdError>,
+    ) -> (SqlitePool, Arc<FixedDocuments>, Router) {
+        let db = test_db::migrated().await;
+        let docs = FixedDocuments::new(vec![(CLAUDE_CODE_ID, doc)]);
+        let state = ConnectionState {
+            documents: docs.clone(),
+            ..ConnectionState::for_test(db.clone())
+        };
+        (db, docs, router(state).layer(CookieManagerLayer::new()))
+    }
+
+    fn claude_code_query(redirect: &'static str) -> String {
+        query_with(&[
+            ("client_id", Some(CLAUDE_CODE_ID)),
+            ("redirect_uri", Some(redirect)),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_metadata_document_app_is_shown_by_its_url_host() {
+        let (db, docs, app) = cimd_app(Ok(claude_code())).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let q = claude_code_query("http://localhost:3118/callback");
+        let (status, _, page) =
+            get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        for text in [
+            "Connect claude.ai to Soulbeet",
+            "It calls itself \"Claude Code\".",
+            "This app runs on a computer (it returns to localhost). Allow it only if you started it yourself.",
+        ] {
+            assert!(page.contains(text), "{text}");
+        }
+        assert_eq!(count(&db, "oauth_clients").await, 0);
+        let (status, headers, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &request_id_of(&page)), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(headers["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("http://localhost:3118/callback?code="));
+        let row: (String, Option<String>, String) = sqlx::query_as(
+            "SELECT kind, client_name, redirect_uris FROM oauth_clients WHERE client_id = ?",
+        )
+        .bind(CLAUDE_CODE_ID)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                "cimd".into(),
+                Some("Claude Code".into()),
+                r#"["http://localhost/callback","http://127.0.0.1/callback"]"#.into()
+            )
+        );
+        assert_eq!(docs.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_authorization_updates_the_stored_document() {
+        let db = test_db::migrated().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let renamed = ClientDocument {
+            client_name: Some("Claude Code 2".into()),
+            ..claude_code()
+        };
+        for doc in [claude_code(), renamed] {
+            let docs = FixedDocuments::new(vec![(CLAUDE_CODE_ID, Ok(doc))]);
+            let app = router(ConnectionState {
+                documents: docs,
+                ..ConnectionState::for_test(db.clone())
+            })
+            .layer(CookieManagerLayer::new());
+            let q = claude_code_query("http://localhost:3118/callback");
+            let (_, _, page) =
+                get(app.clone(), &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+            let (status, _, _) = post_form(
+                app,
+                "/oauth/authorize",
+                Some(&cookie),
+                &[("request", &request_id_of(&page)), ("decision", "allow")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::SEE_OTHER);
+        }
+        let names: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT client_name FROM oauth_clients")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(names, [Some("Claude Code 2".to_string())]);
+        assert_eq!(count(&db, "oauth_codes").await, 2);
+    }
+
+    #[tokio::test]
+    async fn the_document_is_fetched_only_after_sign_in() {
+        let (_, docs, app) = cimd_app(Ok(claude_code())).await;
+        let (status, headers, _) = get(
+            app,
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("http://localhost:3118/callback")
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(headers["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("/login/return?return_to="));
+        assert_eq!(docs.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_document_is_named_on_the_page() {
+        let (db, _, app) = cimd_app(Err(CimdError::Status(404))).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (status, headers, page) = get(
+            app,
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("http://localhost:3118/callback")
+            ),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(headers.get("location").is_none());
+        assert!(page.contains("Soulbeet could not use this app&#39;s client metadata at https://claude.ai/oauth/claude-code-client-metadata: it answered HTTP 404"), "{page}");
+
+        let (db, docs, app) = cimd_app(Ok(claude_code())).await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let (status, _, page) = get(
+            app.clone(),
+            &format!(
+                "/oauth/authorize?{}",
+                claude_code_query("https://evil.example/cb")
+            ),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains("This app asked to return to an address it did not register."));
+        let q = query_with(&[("client_id", Some("https://claude.ai/"))]);
+        let (status, _, page) = get(app, &format!("/oauth/authorize?{q}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page
+            .contains("client metadata at https://claude.ai/: a client id URL must have a path"));
+        assert_eq!(docs.calls(), 1);
+        assert_eq!(count(&db, "oauth_requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_fetches_per_user_are_limited() {
+        let db = test_db::migrated().await;
+        let limits = Limits {
+            cimd_fetch: WindowLimiter::new(1, Duration::from_secs(60)),
+            ..Limits::default()
+        };
+        let docs = FixedDocuments::new(vec![(CLAUDE_CODE_ID, Ok(claude_code()))]);
+        let app = router(ConnectionState {
+            documents: docs.clone(),
+            limits: Arc::new(limits),
+            ..ConnectionState::for_test(db.clone())
+        })
+        .layer(CookieManagerLayer::new());
+        let alice = signed_in(&db, "u1", "alice").await;
+        let bob = signed_in(&db, "u2", "bob").await;
+        let path = format!(
+            "/oauth/authorize?{}",
+            claude_code_query("http://localhost:3118/callback")
+        );
+        let (first, _, _) = get(app.clone(), &path, Some(&alice)).await;
+        let (second, headers, page) = get(app.clone(), &path, Some(&alice)).await;
+        assert_eq!(
+            (first, second),
+            (StatusCode::OK, StatusCode::TOO_MANY_REQUESTS)
+        );
+        let wait: u64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((59..=60).contains(&wait), "{wait}");
+        assert!(page.contains(&format!(
+            "Too many app sign-ins in a minute. Try again in {wait} seconds."
+        )));
+        assert_eq!(docs.calls(), 1);
+        let (other_user, _, _) = get(app, &path, Some(&bob)).await;
+        assert_eq!(other_user, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pending_requests_per_user_are_capped() {
+        let (db, app) = app().await;
+        let cookie = signed_in(&db, "u1", "alice").await;
+        let mut newest = String::new();
+        for _ in 0..25 {
+            let (status, _, page) = get(
+                app.clone(),
+                &format!("/oauth/authorize?{}", query()),
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            newest = request_id_of(&page);
+        }
+        assert_eq!(count(&db, "oauth_requests").await, 20);
+        let (status, _, _) = post_form(
+            app,
+            "/oauth/authorize",
+            Some(&cookie),
+            &[("request", &newest), ("decision", "allow")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+}

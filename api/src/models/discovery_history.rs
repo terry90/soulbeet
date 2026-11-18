@@ -36,7 +36,8 @@ impl DiscoveryHistoryRow {
     }
 
     /// Update the outcome for a track (e.g., promoted, removed, expired).
-    pub async fn update_outcome(
+    pub(crate) async fn update_outcome_in(
+        db: &sqlx::SqlitePool,
         user_id: &str,
         artist: &str,
         track: &str,
@@ -46,7 +47,7 @@ impl DiscoveryHistoryRow {
             "UPDATE discovery_history SET outcome = ? WHERE user_id = ? AND lower(artist) = lower(?) AND lower(track) = lower(?)"
         )
         .bind(outcome).bind(user_id).bind(artist).bind(track)
-        .execute(&*DB).await.map_err(|e| e.to_string())?;
+        .execute(db).await.map_err(|e| e.to_string())?;
         Ok(())
     }
 

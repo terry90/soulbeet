@@ -12,6 +12,7 @@ node_modules
 soulbeet.db
 soulbeet.db-shm
 soulbeet.db-wal
+secret.key
 
 # Env files
 **/.env

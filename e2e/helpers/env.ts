@@ -9,6 +9,12 @@ export const e2eRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 /** Where the browser reaches the app. */
 export const baseUrl = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:9765';
 
+/** The app instance with MCP on (compose.mcp.yml), as the suite reaches it. */
+export const mcpBaseUrl = process.env.E2E_MCP_BASE_URL ?? 'http://127.0.0.1:9767';
+
+/** The stubs' Navidrome proxy as the host reaches it; the app dials it inside compose. */
+export const navidromeProxyUrl = process.env.E2E_NAVIDROME_PROXY_URL ?? 'http://127.0.0.1:4534';
+
 /** A second app instance whose beets config is the one from issue #90. */
 export const user90BaseUrl = process.env.E2E_USER90_BASE_URL ?? 'http://127.0.0.1:9766';
 
@@ -52,5 +58,30 @@ export const shotsDir = process.env.E2E_SHOTS_DIR;
 /** Navidrome-dependent specs only run when the stack includes one. */
 export const navidromeEnabled = process.env.E2E_NAVIDROME === '1';
 
+/** The admin account the first migration seeds. */
+export const seededAdminId = '00000000-0000-0000-0000-000000000000';
+
 export const navidromeAdminUser = 'admin';
 export const navidromeAdminPassword = 'e2e-navidrome-admin';
+
+/** Navidrome itself as the host reaches it, never through the stubs' proxy. */
+export const navidromeUrl = process.env.E2E_NAVIDROME_URL ?? 'http://127.0.0.1:4533';
+
+// The MCP instance runs only in compose (compose.mcp.yml), so what it dials
+// and where it keeps music are constants of the suite.
+
+/** The seeded admin's password once setup.mcp.ts changed it, which opens the MCP gate. */
+export const mcpAdminPassword = 'e2e-mcp-admin-password';
+
+/** slskd as the MCP instance dials it. */
+export const mcpSlskdUrlForApp = 'http://stubs:5030';
+
+/** The music root as the MCP instance sees it (the mount point). */
+export const mcpMusicDirForApp = '/music';
+
+/**
+ * The compose command words for the MCP stack, run from e2e/ (for example
+ * "docker compose -f compose.e2e.yml -f compose.mcp.yml"). Only the restart
+ * helper reads it.
+ */
+export const mcpCompose = process.env.E2E_MCP_COMPOSE;

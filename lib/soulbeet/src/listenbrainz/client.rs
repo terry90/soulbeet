@@ -75,6 +75,7 @@ impl ListenBrainzClient {
             &format!("LB POST {}", path),
         )
         .await
+        .map_err(Into::into)
     }
 
     async fn get_json<T: serde::de::DeserializeOwned + Default>(

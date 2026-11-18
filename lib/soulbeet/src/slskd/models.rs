@@ -10,6 +10,11 @@ pub(crate) struct SearchResponseFile {
     pub length: Option<i32>,
     pub sample_rate: Option<i32>,
     pub bit_depth: Option<i32>,
+    /// What the peer's client wrote (`File.cs:40-46`), often empty.
+    #[serde(default)]
+    pub extension: Option<String>,
+    #[serde(default)]
+    pub is_variable_bit_rate: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -19,7 +24,12 @@ pub(crate) struct SearchResponse {
     pub files: Vec<SearchResponseFile>,
     pub has_free_upload_slot: bool,
     pub upload_speed: i32,
-    pub queue_length: i32,
+    /// A `long` (`Search/Types/Response.cs:45`): a peer may report more than
+    /// 32 bits hold, and one such peer would fail the whole response list.
+    pub queue_length: i64,
+    /// Files the peer shares only with its buddies, listed apart (`Response.cs:43`).
+    #[serde(default)]
+    pub locked_file_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

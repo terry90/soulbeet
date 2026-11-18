@@ -82,12 +82,37 @@ impl DiscoveryTrackRow {
     }
 
     pub async fn get_pending_by_folder(folder_id: &str) -> Result<Vec<DiscoveryTrack>, String> {
+        Self::get_pending_by_folder_in(&DB, folder_id).await
+    }
+
+    /// The Pending tracks of `folder_id`, oldest first.
+    pub(crate) async fn get_pending_by_folder_in(
+        db: &sqlx::SqlitePool,
+        folder_id: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
         let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
             "SELECT * FROM discovery_tracks WHERE folder_id = ? AND status = ? ORDER BY created_at",
         )
         .bind(folder_id)
         .bind(DiscoveryStatus::Pending.to_string())
-        .fetch_all(&*DB)
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Pending tracks in every folder of `user_id`.
+    pub(crate) async fn pending_for_user_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
+        let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
+            "SELECT t.* FROM discovery_tracks t JOIN folders f ON f.id = t.folder_id \
+             WHERE f.user_id = ? AND t.status = ? ORDER BY t.created_at",
+        )
+        .bind(user_id)
+        .bind(DiscoveryStatus::Pending.to_string())
+        .fetch_all(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -97,13 +122,22 @@ impl DiscoveryTrackRow {
         folder_id: &str,
         profile: &str,
     ) -> Result<Vec<DiscoveryTrack>, String> {
+        Self::get_pending_by_folder_and_profile_in(&DB, folder_id, profile).await
+    }
+
+    /// The Pending tracks of `profile` in `folder_id`, oldest first.
+    pub(crate) async fn get_pending_by_folder_and_profile_in(
+        db: &sqlx::SqlitePool,
+        folder_id: &str,
+        profile: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
         let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
             "SELECT * FROM discovery_tracks WHERE folder_id = ? AND profile = ? AND status = ? ORDER BY created_at",
         )
         .bind(folder_id)
         .bind(profile)
         .bind(DiscoveryStatus::Pending.to_string())
-        .fetch_all(&*DB)
+        .fetch_all(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -120,20 +154,31 @@ impl DiscoveryTrackRow {
     }
 
     pub async fn get_by_id(id: &str) -> Result<Option<DiscoveryTrack>, String> {
+        Self::get_by_id_in(&DB, id).await
+    }
+
+    pub(crate) async fn get_by_id_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+    ) -> Result<Option<DiscoveryTrack>, String> {
         let row =
             sqlx::query_as::<_, DiscoveryTrackRow>("SELECT * FROM discovery_tracks WHERE id = ?")
                 .bind(id)
-                .fetch_optional(&*DB)
+                .fetch_optional(db)
                 .await
                 .map_err(|e| e.to_string())?;
         Ok(row.map(Into::into))
     }
 
-    pub async fn update_status(id: &str, status: &DiscoveryStatus) -> Result<(), String> {
+    pub(crate) async fn update_status_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+        status: &DiscoveryStatus,
+    ) -> Result<(), String> {
         sqlx::query("UPDATE discovery_tracks SET status = ? WHERE id = ?")
             .bind(status.to_string())
             .bind(id)
-            .execute(&*DB)
+            .execute(db)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -171,24 +216,44 @@ impl DiscoveryTrackRow {
     /// Atomically set status to Promoting if currently Pending.
     /// Returns Ok(true) if the CAS succeeded (this caller owns the promote),
     /// Ok(false) if another caller already changed the status.
-    pub async fn try_set_promoting(id: &str) -> Result<bool, String> {
+    pub(crate) async fn try_set_promoting_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+    ) -> Result<bool, String> {
         let result = sqlx::query(
             "UPDATE discovery_tracks SET status = 'Promoting' WHERE id = ? AND status = 'Pending'",
         )
         .bind(id)
-        .execute(&*DB)
+        .execute(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(result.rows_affected() == 1)
     }
 
-    /// Reset any tracks stuck in Promoting back to Pending.
-    /// Called once at startup, for a server that stopped mid-promote.
-    pub async fn reset_stale_promoting() -> Result<u64, String> {
+    /// Marks the track Removing if it is Pending (D16): true when this call changed it, false
+    /// when another call holds or ended it.
+    pub(crate) async fn try_set_removing_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+    ) -> Result<bool, String> {
         let result = sqlx::query(
-            "UPDATE discovery_tracks SET status = 'Pending' WHERE status = 'Promoting'",
+            "UPDATE discovery_tracks SET status = 'Removing' WHERE id = ? AND status = 'Pending'",
         )
-        .execute(&*DB)
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Puts every track claimed for a promote or a removal (Promoting, Removing) back to
+    /// Pending. Called once at startup, for a server that stopped while one ran: the expiry or
+    /// a later call then deals with its file.
+    pub(crate) async fn reset_stale_claims_in(db: &sqlx::SqlitePool) -> Result<u64, String> {
+        let result = sqlx::query(
+            "UPDATE discovery_tracks SET status = 'Pending' WHERE status IN ('Promoting', 'Removing')",
+        )
+        .execute(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(result.rows_affected())

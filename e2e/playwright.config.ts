@@ -38,6 +38,7 @@ export default defineConfig({
         /failures\.spec\.ts/,
         /imports\.spec\.ts/,
         /user90\.spec\.ts/,
+        /navidrome\.spec\.ts/,
       ],
       use: { ...devices['Desktop Chrome'] },
     },
@@ -54,10 +55,19 @@ export default defineConfig({
       use: { ...devices['Pixel 7'] },
     },
     {
+      // Changes the seeded admin's password, so it runs while no other spec
+      // signs in as admin.
+      name: 'navidrome',
+      dependencies: ['chromium', 'mobile', 'user90'],
+      testMatch: /navidrome\.spec\.ts/,
+      workers: 1,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
       // Tests that mutate shared stub state (peer behavior, outages) run
       // alone, after everything else.
       name: 'failures',
-      dependencies: ['chromium', 'mobile', 'user90'],
+      dependencies: ['chromium', 'mobile', 'user90', 'navidrome'],
       testMatch: /failures\.spec\.ts/,
       workers: 1,
       use: { ...devices['Desktop Chrome'] },

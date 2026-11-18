@@ -6,13 +6,13 @@ use std::sync::{LazyLock, Once};
 use std::time::Duration;
 
 #[cfg(feature = "server")]
+use crate::auth::UserId;
+#[cfg(feature = "server")]
 use shared::download::DownloadEvent;
 #[cfg(feature = "server")]
 use tokio::sync::{broadcast, RwLock};
 #[cfg(feature = "server")]
-use tokio_util::sync::CancellationToken;
-#[cfg(feature = "server")]
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Interval for cleaning up stale user channels (5 minutes).
 #[cfg(feature = "server")]
@@ -22,11 +22,10 @@ const CHANNEL_CLEANUP_INTERVAL_SECS: u64 = 300;
 #[cfg(feature = "server")]
 const CHANNEL_STALE_THRESHOLD_SECS: u64 = 600;
 
-/// Channel info including the sender and cancellation token for cleanup
+/// A user's download event channel and the count of tasks using it, for cleanup
 #[cfg(feature = "server")]
 pub struct UserChannel {
     pub sender: broadcast::Sender<DownloadEvent>,
-    pub cancellation_token: CancellationToken,
     pub active_tasks: std::sync::atomic::AtomicUsize,
     /// Timestamp of last activity (task registration or message send)
     last_activity: std::sync::atomic::AtomicU64,
@@ -38,7 +37,6 @@ impl UserChannel {
         let (sender, _) = broadcast::channel(100);
         Self {
             sender,
-            cancellation_token: CancellationToken::new(),
             active_tasks: std::sync::atomic::AtomicUsize::new(0),
             last_activity: std::sync::atomic::AtomicU64::new(Self::current_timestamp()),
         }
@@ -88,11 +86,6 @@ impl UserChannel {
     pub fn task_count(&self) -> usize {
         self.active_tasks.load(std::sync::atomic::Ordering::Relaxed)
     }
-
-    /// Cancel all active tasks
-    pub fn cancel_all(&self) {
-        self.cancellation_token.cancel();
-    }
 }
 
 #[cfg(feature = "server")]
@@ -103,7 +96,7 @@ impl Default for UserChannel {
 }
 
 #[cfg(feature = "server")]
-pub static USER_CHANNELS: LazyLock<RwLock<HashMap<String, UserChannel>>> =
+pub static USER_CHANNELS: LazyLock<RwLock<HashMap<UserId, UserChannel>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[cfg(feature = "server")]
@@ -111,48 +104,41 @@ pub static DISCOVERY_PROGRESS: LazyLock<
     RwLock<HashMap<String, shared::navidrome::DiscoveryProgress>>,
 > = LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Get or create a user channel, returning the sender and cancellation token
+/// Get or create a user channel, returning its sender
 #[cfg(feature = "server")]
-pub async fn get_or_create_user_channel(
-    username: &str,
-) -> (broadcast::Sender<DownloadEvent>, CancellationToken) {
+pub async fn get_or_create_user_channel(user: &UserId) -> broadcast::Sender<DownloadEvent> {
     let mut map = USER_CHANNELS.write().await;
-    let channel = map
-        .entry(username.to_string())
-        .or_insert_with(UserChannel::new);
-    (channel.sender.clone(), channel.cancellation_token.clone())
+    let channel = map.entry(user.clone()).or_insert_with(UserChannel::new);
+    channel.sender.clone()
 }
 
 /// Sends to the user's channel as it is now: `cleanup_stale_channels` may
 /// have replaced the one a long-running job saw at its start. Without a
 /// channel nobody is listening, so none is created.
 #[cfg(feature = "server")]
-pub async fn send_user_event(username: &str, event: DownloadEvent) -> bool {
+pub async fn send_user_event(user: &UserId, event: DownloadEvent) -> bool {
     let channels = USER_CHANNELS.read().await;
-    let Some(channel) = channels.get(username) else {
+    let Some(channel) = channels.get(user) else {
         return false;
     };
     channel.touch();
     channel.sender.send(event).is_ok()
 }
 
-/// Register a new task for a user and return the cancellation token
+/// Register a new task for a user
 #[cfg(feature = "server")]
-pub async fn register_user_task(username: &str) -> CancellationToken {
+pub async fn register_user_task(user: &UserId) {
     let mut map = USER_CHANNELS.write().await;
-    let channel = map
-        .entry(username.to_string())
-        .or_insert_with(UserChannel::new);
+    let channel = map.entry(user.clone()).or_insert_with(UserChannel::new);
     channel.add_task();
-    channel.cancellation_token.clone()
 }
 
 /// Unregister a task for a user and clean up if no tasks remain
 #[cfg(feature = "server")]
-pub async fn unregister_user_task(username: &str) {
+pub async fn unregister_user_task(user: &UserId) {
     let should_cleanup = {
         let map = USER_CHANNELS.read().await;
-        if let Some(channel) = map.get(username) {
+        if let Some(channel) = map.get(user) {
             channel.remove_task()
         } else {
             false
@@ -163,11 +149,11 @@ pub async fn unregister_user_task(username: &str) {
     // Note: We keep the channel around for a bit in case new connections come in
     if should_cleanup {
         let map = USER_CHANNELS.read().await;
-        if let Some(channel) = map.get(username) {
+        if let Some(channel) = map.get(user) {
             if channel.sender.receiver_count() == 0 && channel.task_count() == 0 {
                 info!(
                     "User {} has no active tasks or receivers, eligible for cleanup",
-                    username
+                    user
                 );
                 // We don't immediately remove to avoid race conditions
                 // A background cleanup task could periodically clean stale channels
@@ -209,18 +195,18 @@ pub async fn cleanup_stale_progress() {
 #[cfg(feature = "server")]
 pub async fn cleanup_stale_channels() {
     let mut map = USER_CHANNELS.write().await;
-    let stale_users: Vec<String> = map
+    let stale_users: Vec<UserId> = map
         .iter()
         .filter(|(_, channel)| {
             let no_activity = channel.sender.receiver_count() == 0 && channel.task_count() == 0;
             no_activity && channel.is_stale()
         })
-        .map(|(username, _)| username.clone())
+        .map(|(user, _)| user.clone())
         .collect();
 
-    for username in stale_users {
-        info!("Cleaning up stale channel for user: {}", username);
-        map.remove(&username);
+    for user in stale_users {
+        info!("Cleaning up stale channel for user: {}", user);
+        map.remove(&user);
     }
 }
 
@@ -248,14 +234,16 @@ pub fn start_channel_cleanup_task() {
 
         // Start the automation task (sync ratings, discovery)
         tokio::spawn(async {
-            // A promote runs to the end in its own task, so a track can only
-            // be left Promoting by a previous process.
-            match crate::models::discovery_playlist::DiscoveryTrackRow::reset_stale_promoting()
-                .await
+            // A promote or removal runs to its end once started, so a track can only be left
+            // Promoting or Removing by a previous process.
+            match crate::models::discovery_playlist::DiscoveryTrackRow::reset_stale_claims_in(
+                &crate::db::DB,
+            )
+            .await
             {
                 Ok(0) => {}
-                Ok(n) => info!("Reset {n} tracks left Promoting by a previous run"),
-                Err(e) => warn!("Could not reset tracks left Promoting: {e}"),
+                Ok(n) => info!("Reset {n} tracks left Promoting or Removing by a previous run"),
+                Err(e) => warn!("Could not reset tracks left Promoting or Removing: {e}"),
             }
             // Wait 30s for server to be fully ready
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -271,6 +259,7 @@ pub fn start_channel_cleanup_task() {
 
 #[cfg(feature = "server")]
 async fn run_automation() {
+    use crate::core::ratings::AutoDeletePermit;
     use crate::models::user::User;
 
     // Run automation for each connected user
@@ -287,73 +276,28 @@ async fn run_automation() {
         return;
     }
 
-    // 0. Check ReportRealPath configuration for each user
-    for user in &connected_users {
-        match crate::server_fns::navidrome::check_report_real_path(&user.id).await {
-            Ok(Some(true)) => {
-                // ReportRealPath is enabled. If status was MissingReportRealPath, restore to Connected.
-                if user.navidrome_status
-                    == shared::system::NavidromeStatus::MissingReportRealPath.as_str()
-                {
-                    let _ = crate::models::user::User::update_navidrome_token(
-                        &user.id,
-                        user.navidrome_token.as_deref(),
-                        shared::system::NavidromeStatus::Connected.as_str(),
-                    )
-                    .await;
-                    let _ = crate::models::user_settings::UserSettings::reset_navidrome_banner(
-                        &user.id,
-                    )
-                    .await;
-                    info!(
-                        "Automation: ReportRealPath now enabled for user {}",
-                        user.username
-                    );
-                }
-            }
-            Ok(Some(false)) => {
-                warn!(
-                    "ReportRealPath is not enabled on the Soulbeet player for user {}. \
-                     Enable it in Navidrome Settings > Players > Soulbeet > ReportRealPath.",
-                    user.username
-                );
-                if user.navidrome_status
-                    != shared::system::NavidromeStatus::MissingReportRealPath.as_str()
-                {
-                    let _ = crate::models::user::User::update_navidrome_token(
-                        &user.id,
-                        user.navidrome_token.as_deref(),
-                        shared::system::NavidromeStatus::MissingReportRealPath.as_str(),
-                    )
-                    .await;
-                    let _ = crate::models::user_settings::UserSettings::reset_navidrome_banner(
-                        &user.id,
-                    )
-                    .await;
-                }
-            }
-            Ok(None) => {
-                // Soulbeet player not registered yet -- skip, it gets created on first API call
-            }
-            Err(e) => {
-                info!(
-                    "Automation: ReportRealPath check failed for {}: {}",
-                    user.username, e
-                );
-            }
-        }
-    }
-
     // 1. Sync ratings for each connected user
     for user in &connected_users {
         info!("Automation: syncing ratings for user {}...", user.username);
-        match crate::server_fns::navidrome::sync_ratings_internal(&user.id).await {
-            Ok(result) => info!(
-                "Automation: sync complete for {} - {} scanned, {} deletions, {} promoted, {} removed",
-                user.username, result.total_songs_scanned, result.deleted_tracks,
-                result.promoted_tracks, result.removed_tracks
+        let ctx = crate::auth::UserCtx {
+            user_id: user.id.clone(),
+            username: user.username.clone(),
+            role: user.role,
+        };
+        match crate::core::ratings::sync(&ctx, AutoDeletePermit::Allowed).await {
+            Ok(report) => {
+                let result = report.counts();
+                info!(
+                    "Automation: sync complete for {} - {} scanned, {} deletions, {} promoted, {} removed, {} kept",
+                    user.username, result.total_songs_scanned, result.deleted_tracks,
+                    result.promoted_tracks, result.removed_tracks, result.kept_tracks
+                );
+            }
+            Err(f) => info!(
+                "Automation: sync failed for {}: {}",
+                user.username,
+                crate::core::logged(&f)
             ),
-            Err(e) => info!("Automation: sync failed for {}: {}", user.username, e),
         }
     }
 
@@ -394,67 +338,70 @@ async fn run_automation() {
         };
         let lifetime_map = settings.parse_lifetime_days();
         let now = chrono::Utc::now();
-        let folder = crate::models::folder::Folder::get_by_id(folder_id)
-            .await
-            .ok()
-            .flatten();
+        let folder = match crate::models::folder::Folder::get_by_id(folder_id).await {
+            Ok(Some(folder)) => Some(folder),
+            Ok(None) => {
+                warn!(
+                    "Automation: discovery folder {folder_id} of user {} is gone, so no track expires",
+                    user.username
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "Automation: discovery folder {folder_id} of user {} cannot be read, so no track expires: {e}",
+                    user.username
+                );
+                None
+            }
+        };
 
-        // Check each profile's pending tracks and expire those past their lifetime
-        let pending =
-            match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(
-                folder_id,
-            )
-            .await
-            {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-        let mut expired_count = 0u32;
-        for track in &pending {
-            let lifetime_days = lifetime_map.get(&track.profile).copied().unwrap_or(7) as i64;
-            let created =
-                match chrono::DateTime::parse_from_rfc3339(&track.created_at).or_else(|_| {
-                    chrono::NaiveDateTime::parse_from_str(&track.created_at, "%Y-%m-%d %H:%M:%S")
-                        .map(|naive| naive.and_utc().fixed_offset())
-                }) {
-                    Ok(dt) => dt,
+        if let Some(folder) = folder {
+            // Check each profile's pending tracks and expire those past their lifetime
+            let pending =
+                match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(
+                    folder_id,
+                )
+                .await
+                {
+                    Ok(p) => p,
                     Err(_) => continue,
                 };
-            if now.signed_duration_since(created).num_days() < lifetime_days {
-                continue;
-            }
-            // This track has expired
-            let path = std::path::Path::new(&track.path);
-            if path.exists() {
-                let _ = tokio::fs::remove_file(path).await;
-                if let (Some(parent), Some(folder)) = (path.parent(), &folder) {
-                    let profile_root = folder.discovery_profile_path(&track.profile);
-                    let _ = crate::server_fns::cleanup_empty_ancestors(
-                        parent,
-                        std::path::Path::new(&profile_root),
-                    )
-                    .await;
+            let mut expired_count = 0u32;
+            for track in &pending {
+                let Some(expires) = crate::core::discovery::expires_at(track, &lifetime_map) else {
+                    continue;
+                };
+                if now < expires {
+                    continue;
+                }
+                match crate::core::delete_guard::staging::remove_staged_in(
+                    &crate::db::DB,
+                    track,
+                    &folder,
+                    crate::core::delete_guard::staging::StagedOutcome::Expired,
+                )
+                .await
+                {
+                    Ok(()) => expired_count += 1,
+                    Err(f) if crate::core::discovery::is_not_pending(&f) => debug!(
+                        "Automation: {} of user {} is no longer pending, so it does not expire",
+                        track.title, user.username
+                    ),
+                    Err(f) => warn!(
+                        "Automation: could not expire {} for user {}: {}",
+                        track.title,
+                        user.username,
+                        crate::core::logged(&f)
+                    ),
                 }
             }
-            let _ = crate::models::discovery_playlist::DiscoveryTrackRow::update_status(
-                &track.id,
-                &shared::navidrome::DiscoveryStatus::Removed,
-            )
-            .await;
-            let _ = crate::models::discovery_history::DiscoveryHistoryRow::update_outcome(
-                user_id,
-                &track.artist,
-                &track.title,
-                "expired",
-            )
-            .await;
-            expired_count += 1;
-        }
-        if expired_count > 0 {
-            info!(
-                "Automation: expired {} tracks for user {}",
-                expired_count, user.username
-            );
+            if expired_count > 0 {
+                info!(
+                    "Automation: expired {} tracks for user {}",
+                    expired_count, user.username
+                );
+            }
         }
 
         // Refill any gaps (generate_discovery_playlist_internal accounts for existing tracks)
@@ -466,7 +413,10 @@ async fn run_automation() {
                 );
             }
             Ok(_) => {}
-            Err(e) => info!("Automation: refill failed for {}: {}", user.username, e),
+            Err(e) => info!(
+                "Automation: refill failed for {}: {}",
+                user.username, e.message
+            ),
         }
     }
 }

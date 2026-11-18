@@ -1,26 +1,43 @@
 //! A scripted importer and recording deps for the queue's tests.
 
 use super::QueueDeps;
+use crate::auth::UserId;
+use crate::core::delete_guard::test_support::FakeNavidrome;
+use crate::core::delete_guard::Guard;
+use crate::ledger::{JobEvent, Ledger};
 use async_trait::async_trait;
 use shared::download::{
     DownloadEvent, DownloadProgress, DownloadState, MatchCandidate, MatchChoices, MatchKind,
 };
-use shared::library::DuplicateReport;
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::{
-    DriverChoice, ImportMode, ImportOutcome, ImportResult, MusicImporter, SkipReason, TaskCount,
+    DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
+    ImportedItem, MusicImporter, Relocation, SkipReason, TaskCount,
 };
+use sqlx::SqlitePool;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// One file imported, as beets reports it.
 pub fn imported() -> ImportResult {
     ImportResult {
         outcome: ImportOutcome::Imported {
             untagged: false,
             warnings: vec![],
+            items: vec![ImportedItem {
+                path: "Zzqx Artist/a.flac".into(),
+                recording_mbid: None,
+                artist: "Zzqx Artist".into(),
+                title: "a".into(),
+                album: "Qzz Album".into(),
+                beets_id: None,
+                release_mbid: None,
+                match_per_mille: None,
+            }],
+            failure: None,
         },
         output_tail: "imported tail".into(),
         tasks: TaskCount {
@@ -28,6 +45,9 @@ pub fn imported() -> ImportResult {
             total: 1,
         },
         choices: None,
+        user_action: None,
+        removals: vec![],
+        files: vec![],
     }
 }
 
@@ -43,6 +63,9 @@ pub fn no_match(candidates: u32) -> ImportResult {
             total: 1,
         },
         choices: None,
+        user_action: None,
+        removals: vec![],
+        files: vec![],
     }
 }
 
@@ -97,7 +120,9 @@ pub fn row(item: &str) -> DownloadProgress {
     }
 }
 
-/// Answers imports from a script (Imported once it runs out).
+/// Answers imports from a script (Imported once it runs out), forgets with
+/// one answer (Removed unless scripted), and relocates with one answer (that
+/// it moved nothing unless scripted).
 pub struct StubImporter {
     results: Mutex<VecDeque<ImportResult>>,
     delay: Duration,
@@ -111,6 +136,11 @@ pub struct StubImporter {
     max_active: AtomicUsize,
     seen: Mutex<Vec<(Vec<PathBuf>, PathBuf)>>,
     choices: Mutex<Vec<DriverChoice>>,
+    duplicate_runs: Mutex<Vec<DuplicateRun>>,
+    forget_answer: Mutex<ForgetOutcome>,
+    forgets: Mutex<Vec<(PathBuf, PathBuf)>>,
+    relocations: Mutex<Vec<(PathBuf, Vec<u64>)>>,
+    relocate_answer: Mutex<Relocation>,
 }
 
 impl StubImporter {
@@ -127,6 +157,14 @@ impl StubImporter {
             max_active: AtomicUsize::new(0),
             seen: Mutex::new(vec![]),
             choices: Mutex::new(vec![]),
+            duplicate_runs: Mutex::new(vec![]),
+            forget_answer: Mutex::new(ForgetOutcome::Removed),
+            forgets: Mutex::new(vec![]),
+            relocations: Mutex::new(vec![]),
+            relocate_answer: Mutex::new(Relocation {
+                now: vec![],
+                failure: None,
+            }),
         }
     }
 
@@ -161,6 +199,14 @@ impl StubImporter {
         self.results.lock().unwrap().push_back(result);
     }
 
+    pub fn script_forget(&self, outcome: ForgetOutcome) {
+        *self.forget_answer.lock().unwrap() = outcome;
+    }
+
+    pub fn script_relocate(&self, answer: Relocation) {
+        *self.relocate_answer.lock().unwrap() = answer;
+    }
+
     pub fn panic_next(&self) {
         self.panic_next.store(true, Ordering::SeqCst);
     }
@@ -182,9 +228,24 @@ impl StubImporter {
         self.seen.lock().unwrap().clone()
     }
 
+    /// Library and file of every forget, in call order.
+    pub fn forgets(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.forgets.lock().unwrap().clone()
+    }
+
     /// The choice of every import, in call order.
     pub fn choices(&self) -> Vec<DriverChoice> {
         self.choices.lock().unwrap().clone()
+    }
+
+    /// The duplicate handling of every import, in call order.
+    pub fn duplicate_runs(&self) -> Vec<DuplicateRun> {
+        self.duplicate_runs.lock().unwrap().clone()
+    }
+
+    /// Library and item ids of every relocate, in call order.
+    pub fn relocations(&self) -> Vec<(PathBuf, Vec<u64>)> {
+        self.relocations.lock().unwrap().clone()
     }
 
     fn move_into(sources: &[&Path], target: &Path) {
@@ -229,9 +290,11 @@ impl MusicImporter for StubImporter {
         target: &Path,
         _: ImportMode,
         choice: &DriverChoice,
+        duplicates: DuplicateRun,
     ) -> ImportResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.choices.lock().unwrap().push(choice.clone());
+        self.duplicate_runs.lock().unwrap().push(duplicates);
         self.seen.lock().unwrap().push((
             sources.iter().map(|s| s.to_path_buf()).collect(),
             target.to_path_buf(),
@@ -258,8 +321,24 @@ impl MusicImporter for StubImporter {
             .unwrap_or_else(imported)
     }
 
-    async fn find_duplicates(&self, _: &[&Path]) -> Result<DuplicateReport, String> {
-        unreachable!()
+    async fn relocate(&self, library: &Path, item_ids: &[u64]) -> Relocation {
+        self.relocations
+            .lock()
+            .unwrap()
+            .push((library.to_path_buf(), item_ids.to_vec()));
+        self.relocate_answer.lock().unwrap().clone()
+    }
+
+    fn refused(&self, issue: String) -> ImportResult {
+        ImportResult::refused(issue)
+    }
+
+    async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
+        self.forgets
+            .lock()
+            .unwrap()
+            .push((library.to_path_buf(), file.to_path_buf()));
+        self.forget_answer.lock().unwrap().clone()
     }
 
     fn health(&self) -> ImporterHealth {
@@ -275,34 +354,78 @@ impl MusicImporter for StubImporter {
     }
 }
 
-/// Hands out one importer and records every event per username.
+/// Hands out one importer and, when given one, a delete guard; records every event per user id
+/// and every ledger event, and hands the ledger events to a ledger when given one.
 pub struct RecordingDeps {
     importer: Arc<StubImporter>,
-    events: Mutex<Vec<(String, DownloadEvent)>>,
+    guard: Option<(SqlitePool, Arc<FakeNavidrome>)>,
+    events: Mutex<Vec<(UserId, DownloadEvent)>>,
+    ledger: Mutex<Vec<JobEvent>>,
+    into: Option<Ledger>,
 }
 
 impl RecordingDeps {
+    /// Deps whose queue never settles a removal: `guard` panics.
     pub fn new(importer: Arc<StubImporter>) -> Arc<Self> {
+        Self::build(importer, None)
+    }
+
+    /// Deps whose guard checks against `db` and `fake`, with no music path set.
+    pub fn with_guard(
+        importer: Arc<StubImporter>,
+        db: SqlitePool,
+        fake: Arc<FakeNavidrome>,
+    ) -> Arc<Self> {
+        Self::build(importer, Some((db, fake)))
+    }
+
+    /// Deps whose ledger events also reach `ledger`, as the server's reach its ledger.
+    pub fn into_ledger(importer: Arc<StubImporter>, ledger: Ledger) -> Arc<Self> {
         Arc::new(RecordingDeps {
-            importer,
-            events: Mutex::new(vec![]),
+            into: Some(ledger),
+            ..Self::unwrapped(importer, None)
         })
     }
 
-    /// Each Progress event sent to `username`, as (item, state) pairs.
-    pub fn progress_for(&self, username: &str) -> Vec<Vec<(String, DownloadState)>> {
-        self.rows_for(username)
+    fn build(
+        importer: Arc<StubImporter>,
+        guard: Option<(SqlitePool, Arc<FakeNavidrome>)>,
+    ) -> Arc<Self> {
+        Arc::new(Self::unwrapped(importer, guard))
+    }
+
+    fn unwrapped(
+        importer: Arc<StubImporter>,
+        guard: Option<(SqlitePool, Arc<FakeNavidrome>)>,
+    ) -> Self {
+        RecordingDeps {
+            importer,
+            guard,
+            events: Mutex::new(vec![]),
+            ledger: Mutex::new(vec![]),
+            into: None,
+        }
+    }
+
+    /// What the queue recorded in the ledger, in order.
+    pub fn ledger_events(&self) -> Vec<JobEvent> {
+        self.ledger.lock().unwrap().clone()
+    }
+
+    /// Each Progress event sent to `user`, as (item, state) pairs.
+    pub fn progress_for(&self, user: &UserId) -> Vec<Vec<(String, DownloadState)>> {
+        self.rows_for(user)
             .into_iter()
             .map(|rows| rows.into_iter().map(|r| (r.item, r.state)).collect())
             .collect()
     }
 
-    pub fn rows_for(&self, username: &str) -> Vec<Vec<DownloadProgress>> {
+    pub fn rows_for(&self, user: &UserId) -> Vec<Vec<DownloadProgress>> {
         self.events
             .lock()
             .unwrap()
             .iter()
-            .filter(|(user, _)| user == username)
+            .filter(|(owner, _)| owner == user)
             .filter_map(|(_, event)| match event {
                 DownloadEvent::Progress(rows) => Some(rows.clone()),
                 _ => None,
@@ -317,10 +440,31 @@ impl QueueDeps for RecordingDeps {
         Ok(self.importer.clone())
     }
 
-    async fn emit(&self, username: &str, event: DownloadEvent) {
-        self.events
-            .lock()
-            .unwrap()
-            .push((username.to_string(), event));
+    async fn emit(&self, user: &UserId, event: DownloadEvent) {
+        self.events.lock().unwrap().push((user.clone(), event));
     }
+
+    fn record(&self, event: JobEvent) {
+        if let Some(ledger) = &self.into {
+            ledger.record(event.clone());
+        }
+        self.ledger.lock().unwrap().push(event);
+    }
+
+    fn guard(&self) -> Guard<'_> {
+        let (db, fake) = self
+            .guard
+            .as_ref()
+            .expect("this test gives the import queue no delete guard");
+        Guard::new(db, fake.as_ref(), None)
+    }
+}
+
+/// Two users whose ids differ from any display name they could have.
+pub fn alice() -> UserId {
+    UserId::new("id-alice")
+}
+
+pub fn bob() -> UserId {
+    UserId::new("id-bob")
 }

@@ -1,5 +1,9 @@
 use dioxus::prelude::*;
-use ui::settings::{AppConfigManager, FolderManager, PreferencesManager, UserManager};
+use ui::settings::{
+    AccountPanel, AppConfigManager, ConnectedAppsPanel, ConnectionStatusPanel, DeletionChecksPanel,
+    FolderAdminPanel, FolderManager, PreferencesManager, RemoteAccessPanel, SecurityStatusPanel,
+    UserManager,
+};
 
 #[derive(PartialEq, Clone, Copy, Default)]
 pub(crate) enum SettingsTab {
@@ -18,6 +22,7 @@ pub(crate) struct SettingsTabRequest(pub Signal<Option<SettingsTab>>);
 #[component]
 pub fn SettingsPage() -> Element {
     let mut active_tab = use_signal(SettingsTab::default);
+    let auth = crate::auth::use_auth();
     let SettingsTabRequest(mut requested_tab) = use_context();
 
     use_effect(move || {
@@ -70,9 +75,34 @@ pub fn SettingsPage() -> Element {
             div { class: "pt-8",
                 match active_tab() {
                     SettingsTab::Search => rsx! { PreferencesManager {} },
-                    SettingsTab::Library => rsx! { FolderManager {} },
-                    SettingsTab::Users => rsx! { UserManager {} },
-                    SettingsTab::Config => rsx! { AppConfigManager {} },
+                    SettingsTab::Library => rsx! {
+                        div { class: "space-y-8",
+                            FolderManager {}
+                            DeletionChecksPanel {}
+                            if auth.is_admin() {
+                                FolderAdminPanel {}
+                            }
+                        }
+                    },
+                    SettingsTab::Users => rsx! {
+                        div { class: "space-y-8",
+                            AccountPanel {}
+                            ConnectedAppsPanel {}
+                            if auth.is_admin() {
+                                UserManager {}
+                            }
+                        }
+                    },
+                    SettingsTab::Config => rsx! {
+                        div { class: "space-y-8",
+                            if auth.is_admin() {
+                                AppConfigManager {}
+                                SecurityStatusPanel {}
+                                RemoteAccessPanel {}
+                            }
+                            ConnectionStatusPanel {}
+                        }
+                    },
                 }
             }
         }
