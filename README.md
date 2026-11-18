@@ -8,27 +8,63 @@
 [![GitHub License](https://img.shields.io/github/license/terry90/soulbeet)](https://github.com/terry90/soulbeet)
 [![GitHub Repo stars](https://img.shields.io/github/stars/terry90/soulbeet)](https://github.com/terry90/soulbeet)
 
-Soulbeet is a self-hosted music downloader, library manager, and discovery engine. Search for music, download it, and let the app handle everything else: finding the best source, tagging, organizing, and keeping your library clean. Connect your scrobble history and Soulbeet will find new music for you automatically.
+Soulbeet is a self-hosted music downloader, library manager, and discovery engine. Search for music, download it, and let the app handle everything else: finding the best source, tagging, organizing, and keeping your library clean. Connect your scrobble history and Soulbeet will find new music for you automatically. Or skip the UI and ask your AI assistant: Soulbeet is an [MCP server](#mcp-server).
+
+> "Make a Christmas playlist with 30 classics and download the ones I don't have."
 
 Screenshots: [here](./screenshots)
 
 ## Features
 
+- **Ask your AI assistant**: Soulbeet is an MCP server. Connect Claude, ChatGPT or any other MCP client and ask for an album or a whole playlist in plain words. It finds the tracks, downloads what is missing and builds the playlist in Navidrome. See [MCP Server](#mcp-server).
 - **Search & Download**: Find albums and tracks, hit download. Soulbeet picks the best available source from Soulseek, downloads it, tags it with beets, and puts it in your library. No manual file management.
 - **Music Discovery**: Soulbeet analyzes your Last.fm and ListenBrainz history, finds new music through track similarity, artist exploration, collaborative filtering, and genre discovery, downloads the best candidates, and pushes playlists to your Navidrome server. Fully automatic.
 - **Three Discovery Profiles**: Conservative (close to what you know), Balanced, or Adventurous (unfamiliar territory). Run one or all three, each with its own playlist.
 - **Rate & Keep**: Listen in Navidrome. 3+ stars promotes a track to your permanent library, 1 star deletes it. Unrated tracks expire and get replaced with fresh picks.
 - **Multi-user**: Private or shared folders. Each user gets their own discovery profiles, scrobble credentials, and preferences.
 - **Multiple Metadata Providers**: MusicBrainz (albums) or Last.fm (single tracks), selectable per user.
-- **MCP Server**: Connect your AI assistant (Claude, ChatGPT, anything that speaks MCP) and ask for a playlist in plain words. It finds the tracks, downloads what is missing and builds the playlist in Navidrome. See [MCP Server](#mcp-server).
 
 ## How It Works
 
-You search, you click download. Behind the scenes:
+You search and click download, or you ask your assistant. Behind the scenes:
 
 1. **Soulbeet** finds the best source on Soulseek, downloads it through **slskd**, tags and organizes it with **beets**, and puts it in your library.
 2. **Navidrome** picks up the new files and makes them streamable.
 3. For discovery: **Last.fm / ListenBrainz** feed your listening history into the recommendation engine, which finds new tracks, downloads them, and pushes playlists to Navidrome.
+
+## MCP Server
+
+Soulbeet is an MCP server, so any AI assistant that speaks MCP (Claude, ChatGPT, Cursor, your own agent...) can drive it. You ask for music in plain words. The assistant checks your library, searches Soulseek, downloads, imports and builds the Navidrome playlist, and you never open the web UI.
+
+The endpoint is `{your Soulbeet address}/mcp`. It speaks streamable HTTP and signs clients in with OAuth, so there is no API key to copy around.
+
+### Set it up
+
+1. Get Soulbeet running (see [Self-Hosting with Docker](#self-hosting-with-docker)) and serve it over https, at the root of the name: `https://music.example.com` works, `https://example.com/music` does not. Hosted assistants (claude.ai, ChatGPT) connect from their own servers, so for those the address must be public.
+2. Have your reverse proxy send the public host and `X-Forwarded-Proto: https`, or set `PUBLIC_URL`.
+3. Open Settings > Config at that address. The Security Checks must pass (`SECRET_KEY` unset or at least 32 bytes, `admin` password changed), and **Remote access** tells you whether the address is usable.
+4. Add `https://music.example.com/mcp` as a remote MCP server in your client. On claude.ai, for example, that is **Customize > Connectors > Add custom connector**. The client sends you to Soulbeet: sign in and click **Allow**.
+
+Each person connects their own account, and the assistant acts as that person only.
+
+### Use it
+
+Ask in a chat, from your desk or your phone:
+
+- "Make a Christmas playlist with 30 classics and download the ones I don't have."
+- "Get In Rainbows by Radiohead into my library."
+- "How is that batch of downloads going?"
+- "Do I have duplicates in my library?"
+
+Downloads keep running after you close the chat, and a playlist asked for with them keeps filling. Ask about them later in a new chat.
+
+### Deleting music
+
+A connected app cannot delete anything until you tick **Allow deleting music** for it in Settings > Users > Connected apps. With it on, the assistant shows what it would delete and waits for your yes before deleting tracks. It can then also run your rating sync, which deletes your 1-star songs when auto-delete is on. A track another listener rated above 1 star, starred or keeps in a playlist is kept, and the limit is 100 tracks per 24 hours.
+
+To turn the MCP server off, set `MCP=off`.
+
+[docs/mcp.md](docs/mcp.md) has the proxy examples (Caddy, nginx, Traefik, Cloudflare tunnel), every tool, the limits and the error codes. It walks through claude.ai, the client it was tested with.
 
 ## Self-Hosting with Docker
 
@@ -293,40 +329,6 @@ Your Soulbeet folder paths must point to the same physical directories that Navi
 #### Auto-Delete
 
 When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from disk during rating sync. Soulbeet finds each track's file from Navidrome's library path, so it needs the library root (learned from imports, or `NAVIDROME_MUSIC_PATH`). A track another listener rated above 1 star, starred or keeps in a playlist is kept, and so is any track Soulbeet cannot check; Settings > Library > Deletion Checks lists what was kept and why. [docs/mcp.md, "What every deletion checks"](docs/mcp.md#what-every-deletion-checks) lists every check.
-
-### MCP Server
-
-Soulbeet is also an MCP server, so any AI assistant that speaks MCP (Claude, ChatGPT, Cursor, your own agent...) can drive it. Ask for music in plain words and the assistant checks your library, searches Soulseek, downloads, imports and builds the Navidrome playlist.
-
-The endpoint is `{your Soulbeet address}/mcp`. It speaks streamable HTTP and signs clients in with OAuth, so there is no API key to copy around.
-
-#### Set it up
-
-1. Serve Soulbeet over https, at the root of the name: `https://music.example.com` works, `https://example.com/music` does not. Hosted assistants (claude.ai, ChatGPT) connect from their own servers, so for those the address must be public.
-2. Have your reverse proxy send the public host and `X-Forwarded-Proto: https`, or set `PUBLIC_URL`.
-3. Open Settings > Config at that address. The Security Checks must pass (`SECRET_KEY` unset or at least 32 bytes, `admin` password changed), and **Remote access** tells you whether the address is usable.
-4. Add `https://music.example.com/mcp` as a remote MCP server in your client. On claude.ai, for example, that is **Customize > Connectors > Add custom connector**. The client sends you to Soulbeet: sign in and click **Allow**.
-
-Each person connects their own account, and the assistant acts as that person only.
-
-#### Use it
-
-Ask in a chat:
-
-- "Make a Christmas playlist with 30 classics and download the ones I don't have."
-- "Get In Rainbows by Radiohead into my library."
-- "How is that batch of downloads going?"
-- "Do I have duplicates in my library?"
-
-Downloads keep running after you close the chat, and a playlist asked for with them keeps filling. Ask about them later in a new chat.
-
-#### Deleting music
-
-A connected app cannot delete anything until you tick **Allow deleting music** for it in Settings > Users > Connected apps. With it on, the assistant shows what it would delete and waits for your yes before deleting tracks. It can then also run your rating sync, which deletes your 1-star songs when auto-delete is on. A track another listener rated above 1 star, starred or keeps in a playlist is kept, and the limit is 100 tracks per 24 hours.
-
-To turn the MCP server off, set `MCP=off`.
-
-[docs/mcp.md](docs/mcp.md) has the proxy examples (Caddy, nginx, Traefik, Cloudflare tunnel), every tool, the limits and the error codes. It walks through claude.ai, the client it was tested with.
 
 ## Development
 
