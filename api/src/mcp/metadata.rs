@@ -531,7 +531,7 @@ mod tests {
         );
         assert!(
             t.next.is_empty(),
-            "other_query: Claude picks another recording"
+            "other_query: the assistant picks another recording"
         );
         // with_retry, musicbrainz.rs:140-144
         let busy = MetadataError::Unavailable {

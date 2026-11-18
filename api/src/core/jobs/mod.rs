@@ -108,7 +108,7 @@ pub(crate) enum EnsureItem {
     InLibrary {
         song_ids: Vec<String>,
     },
-    /// A job was made; `fuzzy` are the song ids that only fuzzily match, for Claude to judge;
+    /// A job was made; `fuzzy` are the song ids that only fuzzily match, for the assistant to judge;
     /// `replacing` the token songs whose previewed copies it replaces (D9).
     Created {
         job_id: String,
@@ -665,7 +665,7 @@ pub(crate) struct Untried {
 }
 
 impl Untried {
-    /// What next_source takes: the first a job may take without Claude naming it, neither
+    /// What next_source takes: the first a job may take without the assistant naming it, neither
     /// flagged (D5) nor below the floor (`Candidate::automatic`).
     pub(crate) fn best(&self) -> Option<&Candidate> {
         self.candidates.iter().find(|c| c.automatic())

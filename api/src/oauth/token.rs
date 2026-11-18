@@ -511,7 +511,7 @@ mod tests {
             doc,
             json!({"error": "rate_limited", "error_description": format!("Too many token requests for this Soulbeet account. Try again in {wait} seconds.")})
         );
-        // bob's Claude shares alice's client id and is not locked out.
+        // bob's client shares alice's client id and is not locked out.
         assert_eq!(
             token(app, AT_HOST, &code_form(&bobs)).await.0,
             StatusCode::OK

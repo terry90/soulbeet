@@ -390,7 +390,7 @@ mod tests {
     use crate::oauth::now_unix;
     use crate::oauth::secrets::hash;
 
-    /// The authorize query Claude sends, with `changes` applied (None removes the pair).
+    /// The authorize query a client sends, with `changes` applied (None removes the pair).
     fn query_with(changes: &[(&'static str, Option<&'static str>)]) -> String {
         let mut pairs: Vec<(&str, &str)> = vec![
             ("response_type", "code"),

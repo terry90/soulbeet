@@ -5,7 +5,7 @@ use super::panel::{LoadError, Loading, Panel};
 use crate::auth::use_auth;
 use crate::friendly_error;
 
-/// Admin-only panel listing what stops sign-ins and what keeps Claude (MCP)
+/// Admin-only panel listing what stops sign-ins and what keeps MCP
 /// access off.
 #[component]
 pub fn SecurityStatusPanel() -> Element {
@@ -42,12 +42,12 @@ fn SecurityChecks(status: SecurityStatus) -> Element {
         }
         if let Some(why) = status.mcp_off {
             p { class: "text-sm font-mono text-gray-300 mb-3",
-                "Claude (MCP) access is turned off: {why}."
+                "MCP access is turned off: {why}."
             }
         }
         if !status.mcp_blocked_by.is_empty() {
             p { class: "text-sm font-mono text-gray-300 mb-3",
-                "Claude (MCP) access stays off until these are fixed:"
+                "MCP access stays off until these are fixed:"
             }
             ul { class: "list-disc pl-5 space-y-1 text-sm font-mono text-yellow-400",
                 for reason in status.mcp_blocked_by {
@@ -87,7 +87,7 @@ mod tests {
             sign_in_problem: None,
             mcp_off: Some("MCP=off is set".into()),
         });
-        assert!(html.contains("Claude (MCP) access is turned off: MCP=off is set."));
+        assert!(html.contains("MCP access is turned off: MCP=off is set."));
         assert!(!html.contains("All security checks pass."));
         let html = render(SecurityStatus {
             mcp_blocked_by: vec![],
@@ -95,7 +95,7 @@ mod tests {
             mcp_off: Some("MCP is set to 'disabled', which is neither on nor off".into()),
         });
         assert!(html.contains(
-            "Claude (MCP) access is turned off: MCP is set to &#39;disabled&#39;, which is neither on nor off."
+            "MCP access is turned off: MCP is set to &#39;disabled&#39;, which is neither on nor off."
         ));
     }
 
@@ -113,7 +113,7 @@ mod tests {
             }],
             None,
         ));
-        assert!(html.contains("Claude (MCP) access stays off until these are fixed:"));
+        assert!(html.contains("MCP access stays off until these are fixed:"));
         assert!(html.contains("still has the password"));
     }
 
@@ -122,6 +122,6 @@ mod tests {
         let html = render(status(vec![], Some("PUBLIC_URL is not usable: bad.")));
         assert!(html.contains("PUBLIC_URL is not usable: bad."));
         assert!(!html.contains("All security checks pass."));
-        assert!(!html.contains("Claude (MCP) access stays off"));
+        assert!(!html.contains("MCP access stays off"));
     }
 }

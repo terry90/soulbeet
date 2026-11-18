@@ -25,7 +25,7 @@ test('open the MCP instance', async ({ page }) => {
   // below shows it was the only one.
   expect(await first.json()).toEqual({
     error: 'mcp_unavailable',
-    message: 'Claude (MCP) access stays off until the security checks in Settings pass',
+    message: 'MCP access stays off until the security checks in Settings pass',
   });
 
   // Navidrome is slower to start than the app, and every test after this one signs in through it.

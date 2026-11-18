@@ -23,7 +23,7 @@ pub(crate) const REFRESH_LIFETIME: i64 = 60 * 24 * 3600;
 /// pair, in seconds (D4).
 pub(crate) const REFRESH_GRACE: i64 = 60;
 /// Most rotated refresh tokens a grant keeps, the newest: an older one's reuse answers unknown
-/// instead of ending the grant, and still gives no token. Claude's hourly refresh keeps a grant
+/// instead of ending the grant, and still gives no token. A client that refreshes hourly keeps a grant
 /// at about 1,440 rotated tokens in 60 days; this bounds a client that refreshes as fast as the
 /// budgets allow.
 pub(crate) const ROTATED_KEPT: i64 = 100;

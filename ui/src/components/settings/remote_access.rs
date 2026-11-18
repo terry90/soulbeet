@@ -10,7 +10,7 @@ use crate::friendly_error;
 const CELL_CLASS: &str = "px-2 py-1 align-top";
 
 /// Admin-only panel: the address Soulful derives for the page's own request,
-/// what keeps Claude from connecting there, and the latest connection
+/// what keeps MCP clients from connecting there, and the latest connection
 /// requests.
 #[component]
 pub fn RemoteAccessPanel() -> Element {
@@ -138,7 +138,7 @@ mod tests {
             base_problem: None,
             host_from: "host".into(),
             scheme_from: "local_host_is_http".into(),
-            advice: vec!["Claude cannot use this address: it is plain http.".into()],
+            advice: vec!["MCP clients cannot use this address: it is plain http.".into()],
             recent: vec![
                 LoggedRequest {
                     at: 1_800_000_000,
@@ -181,7 +181,7 @@ mod tests {
         for text in [
             "http://192.168.1.5:9765",
             "host from host, scheme from local_host_is_http",
-            "Claude cannot use this address: it is plain http.",
+            "MCP clients cannot use this address: it is plain http.",
             "/.well-known/oauth-protected-resource/mcp",
             "403",
             "https_required",

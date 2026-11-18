@@ -48,7 +48,7 @@ pub async fn revoke_connected_app(grant_id: String) -> Result<(), ServerFnError>
     }
 }
 
-/// The address Soulful derives for this request, what to change for Claude
+/// The address Soulful derives for this request, what to change for MCP clients
 /// to connect when the browser is at `browser_origin`, and the latest
 /// connection requests.
 #[post("/api/remote-access", _: AdminSession, headers: HeaderMap, uri: Uri)]
@@ -92,7 +92,7 @@ fn database_error(e: String) -> ServerFnError {
 fn closed_because(mcp_off: Option<&str>, gate_fails: bool) -> Vec<String> {
     let mut closed = Vec::new();
     if let Some(why) = mcp_off {
-        closed.push(format!("Claude (MCP) access is turned off: {why}."));
+        closed.push(format!("MCP access is turned off: {why}."));
     }
     if gate_fails {
         closed.push(format!("{GATE_CLOSED}."));
@@ -101,7 +101,7 @@ fn closed_because(mcp_off: Option<&str>, gate_fails: bool) -> Vec<String> {
 }
 
 /// The advice for a browser at `browser_origin`: what keeps the paths
-/// closed, then what keeps Claude from the address `explained` derives.
+/// closed, then what keeps MCP clients from the address `explained` derives.
 #[cfg(feature = "server")]
 fn remote_access_advice(
     browser_origin: &str,
@@ -116,7 +116,7 @@ fn remote_access_advice(
     advice
 }
 
-/// What keeps Claude from connecting at the address `explained` derives,
+/// What keeps MCP clients from connecting at the address `explained` derives,
 /// for a browser at `browser`, or, when the paths are `open`, that it can
 /// connect.
 #[cfg(feature = "server")]
@@ -169,12 +169,12 @@ pub(crate) fn address_advice(
         problem = true;
     }
     if !base.is_https() && !base.is_loopback() {
-        advice.push("Claude cannot use this address: it is plain http.".into());
+        advice.push("MCP clients cannot use this address: it is plain http.".into());
         problem = true;
     }
     if base.is_https() && !problem && open {
         advice.push(format!(
-            "This address works for Claude: add {} as a custom connector.",
+            "This address works for MCP clients: add {} as a remote MCP server in your AI assistant.",
             mcp_url(base)
         ));
     }
@@ -190,7 +190,7 @@ mod tests {
     use crate::connection::test_util::header_map;
 
     const WORKS: &str =
-        "This address works for Claude: add https://music.example.com/mcp as a custom connector.";
+        "This address works for MCP clients: add https://music.example.com/mcp as a remote MCP server in your AI assistant.";
 
     fn advice(pairs: &[(&str, &str)], authority: Option<&str>) -> Vec<String> {
         let browser = BaseUrl::parse("https://music.example.com").unwrap();
@@ -209,7 +209,7 @@ mod tests {
             "Your browser is on music.example.com, but the request reached Soulbeet naming soulful:9765. Have the proxy send X-Forwarded-Host (or Forwarded host=) with the public name.".to_string()]);
         assert_eq!(advice(&[("host", "music.example.com"), ("x-forwarded-proto", "http")], None), vec![
             "Your browser uses https, but Soulbeet sees http: have the proxy send X-Forwarded-Proto: https (or Forwarded proto=https).".to_string(),
-            "Claude cannot use this address: it is plain http.".to_string()]);
+            "MCP clients cannot use this address: it is plain http.".to_string()]);
         assert_eq!(advice(&[
                 ("host", "soulful:9765"),
                 ("x-forwarded-host", "old.example.com"),
@@ -285,9 +285,8 @@ mod tests {
         assert_eq!(
             remote_access_advice("https://music.example.com", &good, &closed),
             vec![
-                "Claude (MCP) access is turned off: MCP=off is set.".to_string(),
-                "Claude (MCP) access stays off until the security checks in Settings pass."
-                    .to_string(),
+                "MCP access is turned off: MCP=off is set.".to_string(),
+                "MCP access stays off until the security checks in Settings pass.".to_string(),
             ]
         );
         assert_eq!(

@@ -1,4 +1,4 @@
-//! The paths Claude (MCP) connects through, `/.well-known/...`,
+//! The paths MCP clients connect through, `/.well-known/...`,
 //! `/oauth/...` and `/mcp`, behind one guard that refuses them while MCP is
 //! switched off, the instance is unsafe to expose, or the request's address
 //! is not https.
@@ -185,7 +185,7 @@ fn admit(state: &ConnectionState, explained: &BaseExplanation) -> Result<BaseUrl
         return Err(refusal(
             StatusCode::NOT_FOUND,
             "mcp_disabled",
-            format!("Claude (MCP) access is turned off: {why}"),
+            format!("MCP access is turned off: {why}"),
         ));
     }
     // Which check fails is shown only to the admin, in Settings: an anonymous
@@ -216,7 +216,7 @@ fn admit(state: &ConnectionState, explained: &BaseExplanation) -> Result<BaseUrl
             StatusCode::FORBIDDEN,
             "https_required",
             format!(
-                "Soulbeet derived the address {base} for this request. Claude connects only \
+                "Soulbeet derived the address {base} for this request. MCP clients connect only \
                  over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: \
                  proto=https), or set PUBLIC_URL."
             ),
@@ -228,7 +228,7 @@ fn admit(state: &ConnectionState, explained: &BaseExplanation) -> Result<BaseUrl
 
 /// What the endpoints answer while a security check fails.
 pub(crate) const GATE_CLOSED: &str =
-    "Claude (MCP) access stays off until the security checks in Settings pass";
+    "MCP access stays off until the security checks in Settings pass";
 
 /// Keeps a page from being framed by another site: sets
 /// `Content-Security-Policy: frame-ancestors 'none'` on a response that has
@@ -281,13 +281,10 @@ mod tests {
     #[tokio::test]
     async fn the_endpoints_answer_404_while_mcp_is_off() {
         for (switch, message) in [
-            (
-                "off",
-                "Claude (MCP) access is turned off: MCP=off is set",
-            ),
+            ("off", "MCP access is turned off: MCP=off is set"),
             (
                 "disabled",
-                "Claude (MCP) access is turned off: MCP is set to 'disabled', which is neither on nor off",
+                "MCP access is turned off: MCP is set to 'disabled', which is neither on nor off",
             ),
         ] {
             let state = ConnectionState {
@@ -355,7 +352,7 @@ mod tests {
             body,
             json!({
                 "error": "mcp_unavailable",
-                "message": "Claude (MCP) access stays off until the security checks in Settings pass"
+                "message": "MCP access stays off until the security checks in Settings pass"
             })
         );
     }
@@ -373,7 +370,7 @@ mod tests {
             body,
             json!({
                 "error": "https_required",
-                "message": "Soulbeet derived the address http://192.168.1.5:9765 for this request. Claude connects only over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: proto=https), or set PUBLIC_URL.",
+                "message": "Soulbeet derived the address http://192.168.1.5:9765 for this request. MCP clients connect only over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: proto=https), or set PUBLIC_URL.",
                 "derived_base": "http://192.168.1.5:9765",
                 "host_from": "host",
                 "scheme_from": "local_host_is_http"

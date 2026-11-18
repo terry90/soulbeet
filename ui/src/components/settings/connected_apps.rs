@@ -115,7 +115,7 @@ fn AppList(
     rsx! {
         if apps.is_empty() {
             p { class: "text-sm font-mono text-gray-300",
-                "No app is connected. Add {origin}/mcp as a custom connector in Claude to connect one."
+                "No app is connected. Add {origin}/mcp as a remote MCP server in your AI assistant to connect one."
             }
         } else {
             ul { class: "space-y-2",
@@ -318,7 +318,7 @@ mod tests {
     fn no_apps_says_how_to_connect_one() {
         let html = render(vec![], "https://music.example.com");
         assert!(html.contains(
-            "No app is connected. Add https://music.example.com/mcp as a custom connector in Claude to connect one."
+            "No app is connected. Add https://music.example.com/mcp as a remote MCP server in your AI assistant to connect one."
         ));
     }
 }

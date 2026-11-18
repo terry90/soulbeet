@@ -251,7 +251,7 @@ async fn applied(acq: &Acquire, job: &str, change: Transition) {
     assert!(matches!(done, Transitioned::Applied { .. }), "{done:?}");
 }
 
-/// `n` MCP track jobs of alice ("Song Number 1" and on), each picked by Claude: waiting for a
+/// `n` MCP track jobs of alice ("Song Number 1" and on), each picked by the assistant: waiting for a
 /// source choice, then queued with one file of peer_a, none holding a download place.
 pub(crate) async fn queued_track_jobs(acq: &Acquire, n: usize) -> Vec<String> {
     let mut jobs = Vec::with_capacity(n);

@@ -1,4 +1,4 @@
-//! The OAuth 2.1 authorization server Claude connects through.
+//! The OAuth 2.1 authorization server MCP clients connect through.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -799,12 +799,12 @@ impl Candidate {
     }
 
     /// A file of it was scored below the floor, a match of another recording kept because the
-    /// search asked for those: never taken unless Claude names it (download_source).
+    /// search asked for those: never taken unless the assistant names it (download_source).
     pub fn below_floor(&self) -> bool {
         self.group.items.iter().any(|item| item.below_floor)
     }
 
-    /// Whether a job may take it without Claude naming it: an automatic pick, next_source and
+    /// Whether a job may take it without the assistant naming it: an automatic pick, next_source and
     /// failover take only a candidate neither flagged (D5) nor below the floor.
     pub fn automatic(&self) -> bool {
         !self.flagged() && !self.below_floor()
@@ -830,7 +830,7 @@ pub struct CandidateView {
 }
 
 impl CandidateView {
-    /// The groups of its candidates a job may take without Claude naming them (`automatic`):
+    /// The groups of its candidates a job may take without the assistant naming them (`automatic`):
     /// what its failover may use (D4, D5).
     pub fn automatic_groups(&self) -> Vec<DownloadableGroup> {
         (self.candidates.iter())

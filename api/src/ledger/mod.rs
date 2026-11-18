@@ -403,7 +403,7 @@ impl BatchOrigin {
     }
 }
 
-/// Whether an MCP job takes its best source itself or waits for Claude's choice.
+/// Whether an MCP job takes its best source itself or waits for the assistant's choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pick {
@@ -581,7 +581,7 @@ pub enum Transition {
         items: Vec<(u32, DownloadableItem)>,
         search_id: String,
     },
-    /// D15, the runner after it read search `search_id`: the job waits for Claude's choice.
+    /// D15, the runner after it read search `search_id`: the job waits for the assistant's choice.
     AwaitChoice { search_id: String },
     /// The runner, for a searching job whose search `from` ended and expired: the job searches
     /// again under `search_id`, so the expired search's candidate ids keep naming what they named.

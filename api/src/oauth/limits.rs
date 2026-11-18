@@ -89,7 +89,7 @@ pub(crate) struct Limits {
     pub(crate) cimd_fetch: WindowLimiter,
     /// Token requests that issue tokens, per user id: the user of the code
     /// or refresh token. Not per client id, since every user of an install
-    /// shares Claude's.
+    /// shares its client id.
     pub(crate) token_user: WindowLimiter,
     /// Refreshes, per grant id.
     pub(crate) token_grant: WindowLimiter,

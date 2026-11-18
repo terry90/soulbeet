@@ -7,7 +7,7 @@ test('the connection endpoints say they are closed, not why', async ({ request }
   const body = await r.json();
   expect(body).toEqual({
     error: 'mcp_unavailable',
-    message: 'Claude (MCP) access stays off until the security checks in Settings pass',
+    message: 'MCP access stays off until the security checks in Settings pass',
   });
   expect(r.headers()['cache-control']).toBe('no-store');
 });

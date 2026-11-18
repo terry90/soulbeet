@@ -119,7 +119,7 @@ pub struct AppConfig {
     navidrome_music_path: Option<PathBuf>,
     /// Who can create accounts (`REGISTRATION`)
     registration: RegistrationMode,
-    /// Why `MCP` switches Claude (MCP) access off; None when it is on
+    /// Why `MCP` switches MCP access off; None when it is on
     mcp_off: Option<String>,
     /// HTTP server port (default: 9765)
     pub port: u16,
@@ -248,7 +248,7 @@ impl AppConfig {
         self.registration
     }
 
-    /// Why `MCP` switches Claude (MCP) access off; None when it is on.
+    /// Why `MCP` switches MCP access off; None when it is on.
     pub fn mcp_off(&self) -> Option<&str> {
         self.mcp_off.as_deref()
     }

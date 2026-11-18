@@ -13,10 +13,10 @@ use crate::connections::LoggedRequest;
 /// needs (`NEEDED_REFUSALS`), other refused or failed ones, and answered
 /// ones. Kept apart, so a day of routine calls does not push the last
 /// refusals out, and scanners' 404s and expired tokens' 401s do not push
-/// out the refusal that says why Claude cannot connect.
+/// out the refusal that says why an MCP client cannot connect.
 pub(crate) const LOG_CAPACITY: usize = 50;
 
-/// The connection layer's refusals that say why Claude cannot connect at
+/// The connection layer's refusals that say why an MCP client cannot connect at
 /// all, which an admin reads in Settings to fix the instance.
 const NEEDED_REFUSALS: [&str; 5] = [
     "origin_not_allowed",
@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn scanners_and_expired_tokens_do_not_push_out_why_claude_cannot_connect() {
+    fn scanners_and_expired_tokens_do_not_push_out_why_an_mcp_client_cannot_connect() {
         let log = RequestLog::default();
         for (at, code) in NEEDED_REFUSALS.iter().enumerate() {
             log.record(entry(at as i64, Some(403), Some(code)));

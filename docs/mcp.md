@@ -1,16 +1,16 @@
-# Connecting Claude to Soulbeet (MCP)
+# Soulbeet's MCP server
 
-Soulbeet can answer Claude, on claude.ai and in the Claude apps, as an MCP server. You add your Soulbeet as a custom connector and ask Claude for music in plain words: "find these eight carols, get the ones I don't have and make a playlist of them". Claude then checks your library, searches Soulseek, downloads, imports with beets and fills the Navidrome playlist through Soulbeet's tools.
+Soulbeet is an MCP server, so any MCP client that supports remote servers with OAuth can use it: Claude, ChatGPT, Cursor or an agent of your own. You add your Soulbeet to your AI assistant as a remote MCP server and ask for music in plain words: "find these eight carols, get the ones I don't have and make a playlist of them". The assistant then checks your library, searches Soulseek, downloads, imports with beets and fills the Navidrome playlist through Soulbeet's tools. Soulbeet has no list of allowed clients; it was tested against claude.ai.
 
-This page is for the person who runs Soulbeet. It covers what your server needs, how to put it behind a reverse proxy, how each person connects, what Claude may and may not do, and what each error means.
+This page is for the person who runs Soulbeet. It covers what your server needs, how to put it behind a reverse proxy, how each person connects, what an MCP client may and may not do, and what each error means.
 
 ## What it is
 
-Soulbeet answers Claude at `https://{your address}/mcp`, for whatever address you serve it at. There is no fixed host name to configure.
+Soulbeet answers MCP clients at `https://{your address}/mcp`, for whatever address you serve it at. There is no fixed host name to configure.
 
-Each person connects their own Soulbeet account, and Claude then acts as that person only: their folders, downloads, playlists, ratings and settings.
+Each person connects their own Soulbeet account, and the client then acts as that person only: their folders, downloads, playlists, ratings and settings.
 
-Through Soulbeet, Claude can:
+Through Soulbeet, an MCP client can:
 
 - read Soulbeet's status: whether slskd, beets and Navidrome work, your folders and their free space;
 - read your Navidrome library: search it, find tracks by MusicBrainz id or artist and title, list albums, starred items and playlists;
@@ -23,20 +23,20 @@ Through Soulbeet, Claude can:
 - change some of your settings;
 - find duplicates and delete music, only once you switch deletion on for that app (see [Deleting music](#deleting-music)).
 
-Long work goes on in Soulbeet after the chat ends: a batch of downloads keeps running, imports finish, and a playlist asked for with the batch keeps filling. In a new chat Claude finds earlier work with `list_batches`.
+Long work goes on in Soulbeet after the chat ends: a batch of downloads keeps running, imports finish, and a playlist asked for with the batch keeps filling. In a new chat the assistant finds earlier work with `list_batches`.
 
 ## Requirements
 
-- **A public name.** Claude connects from Anthropic's servers, not from your browser. The name needs an `A` record, and every address it resolves to must be globally routable: not `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, loopback or link-local. A name with only an `AAAA` record does not work.
-- **https with a certificate Claude trusts.** Soulbeet refuses Claude's endpoints over plain http, except on a loopback address for local tests.
+- **A public name, for hosted clients.** Hosted assistants such as claude.ai connect from their vendor's servers, not from your browser, so the name must resolve to public addresses. For claude.ai the name needs an `A` record, and every address it resolves to must be globally routable: not `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, loopback or link-local. A name with only an `AAAA` record does not work. A client that runs on your own machine or on your LAN only needs to reach the https address of Soulbeet. Soulbeet does not check that its own name is public: it requires https, or a loopback address.
+- **https with a certificate the client trusts.** Soulbeet refuses the OAuth and `/mcp` endpoints over plain http, except on a loopback address for local tests.
 - **Soulbeet at the root of that name.** Soulbeet cannot run under a sub-path: `https://music.example.com` works, `https://example.com/music` does not.
-- **The Security Checks in Settings > Config pass.** Until they do, Claude's endpoints answer `mcp_unavailable`. The two checks are:
+- **The Security Checks in Settings > Config pass.** Until they do, the OAuth and `/mcp` endpoints answer `mcp_unavailable`. The two checks are:
   - `SECRET_KEY` is unset (Soulbeet then generates a key) or at least 32 bytes. A shorter one is not used at all: Soulbeet signs sessions with the key in `secret.key` instead. Settings shows: "SECRET_KEY is shorter than 32 bytes, so Soulbeet does not use it and signs sessions with the key stored in secret.key next to the database. Remove SECRET_KEY, or set it to a random value of at least 32 bytes, for example the output of `openssl rand -hex 32`. Setting a new SECRET_KEY ends every session and makes the stored Navidrome passwords unreadable: each user is asked to sign in again once."
   - The seeded `admin` account no longer has the password `admin`. Settings shows: "The seeded admin account still has the password 'admin'. Change it in Settings > Users."
 
-Two environment variables concern Claude:
+Two environment variables concern MCP access:
 
-- `MCP`: `on` or `off`, in any case, for the OAuth and `/mcp` endpoints Claude uses; any other value turns them off and logs a warning. Unset is `on`.
+- `MCP`: `on` or `off`, in any case, for the OAuth and `/mcp` endpoints MCP clients use; any other value turns them off and logs a warning. Unset is `on`.
 - `PUBLIC_URL`: optional. The public address, `https://host` or `https://host:port`, no path. When it is set, Soulbeet uses it as its address and does not read the address from request headers. If it is set and cannot be used, nobody can sign in until it is fixed or removed, and Settings > Config says why.
 
 One more matters for deletion and for knowing whether Navidrome sees your folders:
@@ -66,7 +66,7 @@ The proxy must:
 - **Set the forwarded headers itself, and never pass on the ones a client sent.** Soulbeet reads the first `Forwarded` element and the first `X-Forwarded-*` value, so a client that sends its own would choose the address Soulbeet issues tokens for. Each example below overwrites or removes them. Where a proxy cannot promise that, set `PUBLIC_URL`, and the headers are not read.
 - **Send the public host and the https scheme**, through `Host` or `X-Forwarded-Host`, and `X-Forwarded-Proto: https`.
 - **Not buffer `text/event-stream` answers.** Soulbeet sends them with `X-Accel-Buffering: no`.
-- **Let one answer take 60 seconds.** A tool call can wait up to 30 seconds on the server and then read for up to 20, so an answer comes within 50 seconds. That fits the 60 second read timeout most proxies have by default. Clients on protocol 2025-11-25 or older, which per Claude's documentation includes claude.ai, get the response headers at once and a keep-alive every 15 seconds while a tool waits. Clients on protocol 2026-07-28 get no byte until the tool answers.
+- **Let one answer take 60 seconds.** A tool call can wait up to 30 seconds on the server and then read for up to 20, so an answer comes within 50 seconds. That fits the 60 second read timeout most proxies have by default. Clients on protocol 2025-11-25 or older (claude.ai is one, per Claude's documentation) get the response headers at once and a keep-alive every 15 seconds while a tool waits. Clients on protocol 2026-07-28 get no byte until the tool answers.
 - **Pass WebSocket upgrades**, for the web app's live download updates.
 
 Each example serves `music.example.com` and sends requests to Soulbeet at `soulbeet:9765`.
@@ -156,32 +156,36 @@ Leave `httpHostHeader` unset, so the public name reaches Soulbeet as `Host`; the
 Two Cloudflare limits:
 
 - Cloudflare answers 524 when the origin sends nothing for 125 seconds. Soulbeet answers a tool call within about 50 seconds, so this limit is not reached.
-- WAF and bot rules must let Claude's addresses, `160.79.104.0/21`, through.
+- WAF and bot rules must let your MCP client's addresses through. For claude.ai these are Anthropic's, `160.79.104.0/21`.
 
 ## Check the address
 
 Admins find **Remote access** in Settings > Config. It shows:
 
-- the address Soulbeet derived for the page's own request ("Soulbeet sees this page's request at {address}"); open Settings at your public address, so the request passes through the same proxy as Claude's;
+- the address Soulbeet derived for the page's own request ("Soulbeet sees this page's request at {address}"); open Settings at your public address, so the request passes through the same proxy as the MCP clients' requests;
 - where the host and the scheme came from: `forwarded`, `x_forwarded_host`, `host`, `authority`, `public_url` or `missing` for the host, and `forwarded`, `x_forwarded_proto`, `local_host_is_http`, `named_host_is_https`, `public_url` or `unread` for the scheme;
 - advice lines, which compare that address with the one your browser is on:
-  - "Claude (MCP) access is turned off: {why}."
-  - "Claude (MCP) access stays off until the security checks in Settings pass."
+  - "MCP access is turned off: {why}."
+  - "MCP access stays off until the security checks in Settings pass."
   - "PUBLIC_URL pins the address to {address}; request headers are not read."
   - "Your browser is on {browser host}, but the request reached Soulbeet naming {host}. Have the proxy send X-Forwarded-Host (or Forwarded host=) with the public name."
   - "Your browser is on {browser host}, but the proxy names {host} in X-Forwarded-Host. Check the proxy's forwarded host." (or "in Forwarded")
   - "Your browser uses https, but Soulbeet sees http: have the proxy send X-Forwarded-Proto: https (or Forwarded proto=https)."
-  - "Claude cannot use this address: it is plain http."
+  - "MCP clients cannot use this address: it is plain http."
   - "Soulbeet cannot tell this request's address: {problem}"
-  - "This address works for Claude: add {address}/mcp as a custom connector."
-- **Latest connection requests**: requests to `/.well-known/`, `/oauth/` and `/mcp`, with the time, the address derived, where it came from, the `Host`, `X-Forwarded-Host`, `X-Forwarded-Proto` and `Forwarded` headers as received, and the status with its refusal code. Soulbeet keeps the latest 50 of each of three kinds: refusals that keep Claude out (`origin_not_allowed`, `https_required`, `mcp_unavailable`, `mcp_disabled`, `address_unreadable`), other refused or failed requests, and answered ones. The list is in memory and starts empty when Soulbeet starts.
+  - "This address works for MCP clients: add {address}/mcp as a remote MCP server in your AI assistant."
+- **Latest connection requests**: requests to `/.well-known/`, `/oauth/` and `/mcp`, with the time, the address derived, where it came from, the `Host`, `X-Forwarded-Host`, `X-Forwarded-Proto` and `Forwarded` headers as received, and the status with its refusal code. Soulbeet keeps the latest 50 of each of three kinds: refusals that keep MCP clients out (`origin_not_allowed`, `https_required`, `mcp_unavailable`, `mcp_disabled`, `address_unreadable`), other refused or failed requests, and answered ones. The list is in memory and starts empty when Soulbeet starts.
 
-## Connect from claude.ai and the phone app
+## Connect a client
+
+Any client that supports remote MCP servers over streamable HTTP with OAuth adds `{address}/mcp`. It can register itself with dynamic client registration, or identify itself with a client ID metadata document (an https URL that serves the client's name and redirect URIs; Soulbeet fetches it, so it must be on a public address). Redirect URIs must be https, or http on a loopback address. Soulbeet shows the consent page described below, and you click **Allow**. The steps below are the worked example for claude.ai.
+
+### claude.ai and the phone app
 
 1. On claude.ai, open **Customize > Connectors**, then **Add > Add custom connector**.
 2. Give it a name, for example "Soulbeet", and the address `https://music.example.com/mcp`.
 3. Keep the options marked **Detected**. Either OAuth client choice works: "Use Claude's published identity" and "Register automatically" are both supported.
-4. Click **Add**, then **Connect**. Claude opens Soulbeet in your browser.
+4. Click **Add**, then **Connect**. claude.ai opens Soulbeet in your browser.
 5. If you are not signed in, Soulbeet shows its sign-in page (`/login/return?return_to=...`). Sign in with your Soulbeet account, or with your Navidrome account when Soulbeet uses Navidrome sign-in.
 6. Soulbeet then asks:
 
@@ -197,11 +201,11 @@ Admins find **Remote access** in Settings > Config. It shows:
 
 On Team and Enterprise plans an Owner adds the connector in **Organization settings > Connectors**, and then each member connects with their own Soulbeet account. On the Free plan you can have one custom connector.
 
-In the phone app: connectors connected on the web work in the mobile app. Turn one on for a chat with **+ > Connectors**. Claude asks before it calls a tool (**Allow once** or **Always allow**), and you can set what it may call without asking on the connector's page.
+In the phone app: connectors connected on the web work in the mobile app. Turn one on for a chat with **+ > Connectors**. claude.ai asks before it calls a tool (**Allow once** or **Always allow**), and you can set what it may call without asking on the connector's page.
 
 ## Accounts
 
-Every person connects their own Soulbeet account, and an app connected by one person acts as that person. Claude sees their folders, downloads, playlists, ratings and settings, and reads Navidrome as their Navidrome account sees it. No tool manages users, folders or the slskd settings, so an admin's Claude cannot change those either.
+Every person connects their own Soulbeet account, and an app connected by one person acts as that person. The client sees their folders, downloads, playlists, ratings and settings, and reads Navidrome as their Navidrome account sees it. No tool manages users, folders or the slskd settings, so an admin's client cannot change those either.
 
 How accounts appear depends on `REGISTRATION` (see the README): with Navidrome sign-in (`navidrome`, the default when `NAVIDROME_URL` is set), a Navidrome user's Soulbeet account is created the first time they sign in, which can be the sign-in of the connection itself. With `admin`, an admin creates the accounts; with `open`, anyone can register.
 
@@ -223,13 +227,13 @@ A password change, an admin's reset of the password, or a Navidrome sign-in that
 
 Access tokens last 1 hour. Refresh tokens last 60 days from their issue, and each refresh gives a new one, so an app used at least once in 60 days stays connected. A refresh token used again more than a minute after it was replaced ends the connection.
 
-When nothing is connected the panel says "No app is connected. Add {your address}/mcp as a custom connector in Claude to connect one."
+When nothing is connected the panel says "No app is connected. Add {your address}/mcp as a remote MCP server in your AI assistant to connect one."
 
 ## Deleting music
 
 Deletion is off for every app until its owner turns on **Allow deleting music** in Settings > Users > Connected apps. With it on, an app can:
 
-- delete songs you confirmed: `preview_delete_tracks` checks up to 25 songs and says for each whether it may be deleted and, if not, why, with a confirmation token for exactly the songs it allows; Claude shows you the preview and asks; `delete_tracks` with that token deletes them after your yes. `find_duplicates` finds songs your library holds more than once, to preview;
+- delete songs you confirmed: `preview_delete_tracks` checks up to 25 songs and says for each whether it may be deleted and, if not, why, with a confirmation token for exactly the songs it allows; the assistant shows you the preview and asks; `delete_tracks` with that token deletes them after your yes. `find_duplicates` finds songs your library holds more than once, to preview;
 - replace a library copy while it downloads a better one: `ensure_in_library`'s `replace_existing` takes the token of a preview with reason `replaced`, and the previewed copies are deleted once the new copy is imported, within 24 hours;
 - run your rating sync (`sync_ratings`) with its auto-delete: when you turned auto-delete on, the songs you rated 1 star are deleted;
 - keep a discovery track (`promote_discovery_track`) that replaces an earlier copy of the song in your library;
@@ -272,7 +276,7 @@ The full list is under [Known limits](#known-limits).
 
 ## Tools
 
-What each tool does, in the order Claude sees them. Every tool answers one JSON document, and a failure has a stable code (see [Error codes](#error-codes)). Every time a tool answers or takes is RFC 3339 in UTC to the second, such as `2026-11-15T10:00:00Z`.
+What each tool does, in the order an MCP client sees them. Every tool answers one JSON document, and a failure has a stable code (see [Error codes](#error-codes)). Every time a tool answers or takes is RFC 3339 in UTC to the second, such as `2026-11-15T10:00:00Z`.
 
 ### Status, settings and folders
 
@@ -283,7 +287,7 @@ What each tool does, in the order Claude sees them. Every tool answers one JSON 
 ### Library
 
 - `get_library_stats`: counts of tracks, albums and artists, the user's ratings, and the 20 most common genres.
-- `find_in_library`: looks up to 100 tracks, by recording MBID, then by artist and title; matches are `mbid`, `exact` or `fuzzy`, and fuzzy ones are left for Claude to judge.
+- `find_in_library`: looks up to 100 tracks, by recording MBID, then by artist and title; matches are `mbid`, `exact` or `fuzzy`, and fuzzy ones are left for the assistant to judge.
 - `search_library`: free text search of the library for songs, albums or artists.
 - `get_library_album`: one album with its songs in order.
 - `list_starred`: the songs, albums or artists the user starred.
@@ -382,27 +386,29 @@ Soulbeet's limits:
 | Refreshes | 10 a minute per connection |
 | Client metadata fetches | 10 a minute per user |
 
-Claude's own limits: claude.ai was seen to drop a tool call after 90 seconds (November 2026), and a result about 150,000 characters.
+claude.ai's own limits: it was seen to drop a tool call after 90 seconds (November 2026), and a result about 150,000 characters.
 
 ## Troubleshooting
 
-### Claude says "Couldn't reach the MCP server"
+### claude.ai says "Couldn't reach the MCP server"
 
-Claude's servers could not reach your address. Check that the name has a public `A` record (see [Requirements](#requirements)), that your firewall and any WAF let `160.79.104.0/21` through, and that the address does not redirect to another host.
+This is claude.ai's message. Its servers could not reach your address. Other hosted clients fail the same way, with their own wording. Check that the name has a public `A` record (see [Requirements](#requirements)), that your firewall and any WAF let the client's addresses through (`160.79.104.0/21` for claude.ai), and that the address does not redirect to another host.
 
-### Claude says "Authorization with the MCP server failed"
+### claude.ai says "Authorization with the MCP server failed"
 
-The sign-in started but did not finish. Two causes are common: Soulbeet's token endpoint took more than 10 seconds to answer, or the address in Claude is not the address Soulbeet derives for Claude's requests. Open [Remote access](#check-the-address) and compare.
+This is also claude.ai's message.
+
+The sign-in started but did not finish. Two causes are common: Soulbeet's token endpoint took more than 10 seconds to answer, or the address in the client is not the address Soulbeet derives for its requests. Open [Remote access](#check-the-address) and compare.
 
 ### A connection answer with an `error` code
 
-Claude's endpoints answer a refusal as `{"error": code, "message": text}`.
+The OAuth and `/mcp` endpoints answer a refusal as `{"error": code, "message": text}`.
 
-- `mcp_disabled` (404): "Claude (MCP) access is turned off: MCP=off is set", or "Claude (MCP) access is turned off: MCP is set to '{value}', which is neither on nor off". Set `MCP=on` or remove it.
-- `mcp_unavailable` (503): "Claude (MCP) access stays off until the security checks in Settings pass". The answer does not say which check fails: an admin sees that in Settings > Config under Security Checks, with the texts quoted under [Requirements](#requirements). Fix what it lists.
+- `mcp_disabled` (404): "MCP access is turned off: MCP=off is set", or "MCP access is turned off: MCP is set to '{value}', which is neither on nor off". Set `MCP=on` or remove it.
+- `mcp_unavailable` (503): "MCP access stays off until the security checks in Settings pass". The answer does not say which check fails: an admin sees that in Settings > Config under Security Checks, with the texts quoted under [Requirements](#requirements). Fix what it lists.
 - `address_unreadable` (400): "Cannot tell this request's address: {problem}", where the problem is one of "The request names no host (Forwarded host=, X-Forwarded-Host or Host)", "'{value}' is not a valid host", "'{value}' is not http or https", "The address must not contain a user name or password", "The address must not have a path: Soulbeet cannot run under a sub-path", or "PUBLIC_URL is not usable: {problem}". Fix the proxy header or `PUBLIC_URL` it names.
-- `https_required` (403): "Soulbeet derived the address {address} for this request. Claude connects only over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: proto=https), or set PUBLIC_URL." The answer also gives `derived_base`, `host_from` and `scheme_from`.
-- `origin_not_allowed` (403): "Requests from {origin} are not accepted". A request to `/mcp` came with an `Origin` that is plain http and neither Soulbeet's own address nor loopback, or that is not an origin at all (`null`). Claude is not affected; this guards against DNS rebinding.
+- `https_required` (403): "Soulbeet derived the address {address} for this request. MCP clients connect only over https: have the proxy send X-Forwarded-Proto: https (or Forwarded: proto=https), or set PUBLIC_URL." The answer also gives `derived_base`, `host_from` and `scheme_from`.
+- `origin_not_allowed` (403): "Requests from {origin} are not accepted". A request to `/mcp` came with an `Origin` that is plain http and neither Soulbeet's own address nor loopback, or that is not an origin at all (`null`). MCP clients are not affected; this guards against DNS rebinding.
 - `settings_unreadable` (503): "Soulbeet's database is unavailable". Check the server's disk and log.
 
 When `PUBLIC_URL` is set but unusable, nobody can sign in, and Settings > Config says "PUBLIC_URL is not usable: {problem}. It must look like https://host or https://host:port. Nobody can sign in until it is fixed or removed."
@@ -411,7 +417,7 @@ When `PUBLIC_URL` is set but unusable, nobody can sign in, and Settings > Config
 
 The `WWW-Authenticate` header names `invalid_token` with one of these descriptions:
 
-- "No access token was sent": the first request of every connection; Claude then signs in. If Claude keeps getting it, the proxy drops the `Authorization` header.
+- "No access token was sent": the first request of every connection; the client then signs in. If it keeps getting it, the proxy drops the `Authorization` header.
 - "The access token is unknown, expired or revoked": the app was disconnected, the user's password changed, or the token expired and could not be refreshed. Connect again.
 - "The access token was issued for another address of this server": the app connected at one address (for example a LAN address) and now calls another. Connect again at the public address, or set `PUBLIC_URL`.
 
@@ -426,7 +432,7 @@ Soulbeet's sign-in and consent pages show these texts:
 - "Soulbeet did not understand the answer. Start the connection again from the app."
 - "Soulbeet's database is unavailable. Start the connection again from the app."
 - "This app sent {parameter} more than once. Start the connection again from the app."
-- "This app sent a request Soulbeet cannot accept ({error}: {description}). Start the connection again from the app." With `invalid_target` the description is "resource must be {address}/mcp": the address in Claude differs from the address Soulbeet derives. Make them the same (see [Check the address](#check-the-address)).
+- "This app sent a request Soulbeet cannot accept ({error}: {description}). Start the connection again from the app." With `invalid_target` the description is "resource must be {address}/mcp": the address in the client differs from the address Soulbeet derives. Make them the same (see [Check the address](#check-the-address)).
 - "Soulbeet could not use this app's client metadata at {url}: {problem}"
 - "Too many app sign-ins in a minute. Try again in {n} seconds."
 
@@ -456,16 +462,16 @@ A tool that fails answers its document with `ok: false` and an `error` with thes
 
 The ones you are most likely to see:
 
-- `rate_limited`: "Too many tool calls from this app: at most 120 a minute. Try again in {n} seconds." Claude waits and tries again.
+- `rate_limited`: "Too many tool calls from this app: at most 120 a minute. Try again in {n} seconds." The assistant waits and tries again.
 - `permission_not_granted`: deletion is off for the app ("Deleting music is turned off for this app"), or the change is one no app may make (see [Deleting music](#deleting-music)).
 - `delete_daily_limit`: "At most 100 tracks a day can be deleted through connected apps, and {used} were deleted in the last 24 hours. {n} more can be deleted from {time}."
-- `expired_handle` for a confirmation: "This confirmation token was already used" or "This confirmation token expired at {time}; preview the songs again". Claude makes a new preview.
+- `expired_handle` for a confirmation: "This confirmation token was already used" or "This confirmation token expired at {time}; preview the songs again". The assistant makes a new preview.
 
 ## Error codes
 
 | Code | Stage | What it means | What to do |
 |---|---|---|---|
-| `invalid_input` | `input` | An argument is missing, has the wrong type or range, or is one the tool does not take; `facts.expected` names what it takes. Also a request the state does not allow, such as running discovery while it is off. | Claude corrects the call. |
+| `invalid_input` | `input` | An argument is missing, has the wrong type or range, or is one the tool does not take; `facts.expected` names what it takes. Also a request the state does not allow, such as running discovery while it is off. | The assistant corrects the call. |
 | `unknown_handle` | `input` | An id that names nothing this user may use: a job, batch, search, candidate, folder, song, album, discovery track, confirmation token or connected app. Another user's id reads the same. | Get the id again from the tool that lists it. |
 | `expired_handle` | `input`, `import`, `delete` | The id was valid but is no longer usable: a search older than 24 hours, a confirmation token used or older than 10 minutes, a replacement consent past its 24 hours, a discovery track no longer pending. | Start again from the step that gave it: a new search or a new preview. |
 | `permission_not_granted` | `input`, `delete` | The app may not do this: deletion is off for it (user action `enable_deletion`), or no app may make the change: auto-delete on (`enable_auto_delete`), the discovery folder or promote threshold (`change_discovery_settings`), a 1-star song rating or a rating of a pending discovery track (`rate_in_navidrome`). | Do what the user action says: tick Allow deleting music in Settings > Users > Connected apps, change the setting in Settings > Library, or rate in Navidrome. |
@@ -511,7 +517,7 @@ The ones you are most likely to see:
 | `transfer_stuck_in_remote_queue` | `transfer` | The transfer waited 15 minutes in the source's queue. | Another source. |
 | `transfer_list_unreadable` | `transfer` | slskd's list of downloads could not be read. | Check slskd; update Soulbeet or slskd if their versions do not match. |
 | `file_not_found_after_download` | `file_lookup` | slskd finished, but Soulbeet cannot find the file where it looks. User action `fix_download_path` when the file is not on disk. | Mount slskd's download folder in Soulbeet at `DOWNLOAD_PATH`. |
-| `import_no_match` | `import` | beets found no close enough match. | Claude reads `get_import_choices` and decides with `resolve_import`, or you decide in the web page. |
+| `import_no_match` | `import` | beets found no close enough match. | The assistant reads `get_import_choices` and decides with `resolve_import`, or you decide in the web page. |
 | `import_already_in_library` | `import`, `index` | The library already holds this recording; the facts give its song ids. | Nothing. To replace it, preview with reason `replaced` and pass `replace_existing`. |
 | `import_nothing_to_import` | `import` | beets found nothing to import in the downloaded files. | Another source. |
 | `import_lookup_failed` | `import` | beets could not look the files up. | Try again later. |
@@ -617,14 +623,14 @@ The delete tools:
 26. `replace_existing` replaces only for track items whose previewed file is inside the folder the jobs import into. A previewed copy beets finds no duplicate of stays and is listed in `not_replaced`, as is every copy a job did not replace within its 24 hours.
 27. `preview_delete_tracks`, `delete_tracks` and `get_deletion_history` show the absolute paths of the files, which are in the user's own folders.
 
-Proxies and Claude:
+Proxies and MCP clients:
 
-28. A tool call waits at most 30 seconds for running work, since claude.ai was seen to drop a call after 90 seconds and many proxies end a silent answer after 60. Claude follows long work by calling again.
+28. A tool call waits at most 30 seconds for running work, since claude.ai was seen to drop a call after 90 seconds and many proxies end a silent answer after 60. The assistant follows long work by calling again.
 29. `get_tag_tracks` (tracks of a genre or tag from Last.fm or ListenBrainz) is not built.
 
 ## Security
 
-What exposing Soulbeet for Claude adds:
+What exposing Soulbeet to MCP clients adds:
 
 - The OAuth endpoints and `/mcp` answer only while the Security Checks pass, and only over https or on a loopback address. `MCP=off` turns them all off.
 - Access and refresh tokens are opaque, stored only as hashes, and bound to the address they were issued for.
@@ -636,7 +642,7 @@ What exposing Soulbeet for Claude adds:
 
 ## Upgrading
 
-The release that adds Claude (MCP) access changes these on the first start:
+The release that adds MCP access changes these on the first start:
 
 - `MCP` is on unless you set it off, but the endpoints stay closed until the Security Checks in Settings > Config pass.
 - A `SECRET_KEY` under 32 bytes is no longer used, nor the key built into earlier versions for installs without `SECRET_KEY`: Soulbeet signs sessions with the key it generates in `secret.key`. Everyone is signed out once; stored Navidrome passwords are stored again under the new key on that start.

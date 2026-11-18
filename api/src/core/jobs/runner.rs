@@ -194,13 +194,13 @@ pub(crate) const MCP_DOWNLOADS_PER_USER: u32 = 6;
 pub(crate) enum Picked {
     /// The candidate at this index downloads, the others stand by.
     Auto(usize),
-    /// Every candidate waits for Claude (pick review, or none at min_score a job may take
-    /// without Claude naming it).
+    /// Every candidate waits for the assistant (pick review, or none at min_score a job may take
+    /// without the assistant naming it).
     Choose,
 }
 
 /// D4, on `view`'s candidates, best first (never empty: drive fails a job whose view is empty
-/// first): the best one at or above `min_score` a job may take without Claude naming it,
+/// first): the best one at or above `min_score` a job may take without the assistant naming it,
 /// neither flagged nor below the floor (`Candidate::automatic`).
 pub(crate) fn pick(candidates: &[Candidate], options: &JobOptions) -> Picked {
     if options.pick == Pick::Review {
@@ -987,7 +987,7 @@ mod tests {
             ..auto(0.1)
         };
         assert_eq!(pick(&candidates, &review), Picked::Choose);
-        // A file scored below the floor matches another recording: only Claude takes it.
+        // A file scored below the floor matches another recording: only the assistant takes it.
         let mut weak = candidate("peer_d", 0.79, 0);
         weak.group.items[0].below_floor = true;
         let candidates = vec![weak, candidate("peer_c", 0.6, 0)];
