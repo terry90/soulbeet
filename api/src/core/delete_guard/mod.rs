@@ -2980,7 +2980,9 @@ mod tests {
         assert_eq!(rows().await, 0);
 
         // Another file at the path: the checked one is gone, so the removal is done and
-        // recorded, but beets' item at the path may be the new file's.
+        // recorded, but beets' item at the path may be the new file's. The checked file stays
+        // open so the filesystem cannot give its inode to the new one.
+        let _checked = std::fs::File::open(moved.join(path.file_name().unwrap())).unwrap();
         std::fs::remove_file(&album).unwrap();
         std::fs::remove_dir_all(&moved).unwrap();
         std::fs::create_dir(&album).unwrap();
