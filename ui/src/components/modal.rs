@@ -107,7 +107,7 @@ pub fn Modal(props: Props) -> Element {
             // Scrollable Body. Focus starts here, so the keys scroll it.
             div {
               id: "{id}-body",
-              class: "overflow-y-auto p-4 outline-none scrollbar-thin scrollbar-thumb-beet-accent/50 scrollbar-track-transparent",
+              class: "overflow-y-auto p-4 pb-10 fade-bottom outline-none scrollbar-thin scrollbar-thumb-beet-accent/50 scrollbar-track-transparent",
               tabindex: "-1",
               {props.children}
             }

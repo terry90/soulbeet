@@ -1468,6 +1468,9 @@
   .pb-3 {
     padding-bottom: calc(var(--spacing) * 3);
   }
+  .pb-10 {
+    padding-bottom: calc(var(--spacing) * 10);
+  }
   .pb-12 {
     padding-bottom: calc(var(--spacing) * 12);
   }
@@ -2187,6 +2190,9 @@
         box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow);
       }
     }
+  }
+  .fade-bottom {
+    mask-image: linear-gradient(to bottom, black calc(100% - 2.5rem), transparent);
   }
   .nav-link {
     font-family: var(--font-display);
