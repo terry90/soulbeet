@@ -15,8 +15,9 @@ fn extract_package_version(toml_content: &str) -> Option<String> {
     None
 }
 
+/// `on_whats_new` opens the release notes.
 #[component]
-pub fn Footer() -> Element {
+pub fn Footer(on_whats_new: EventHandler) -> Element {
     let cargo_toml = include_str!("../../Cargo.toml");
     let local_version = extract_package_version(cargo_toml);
 
@@ -85,8 +86,15 @@ pub fn Footer() -> Element {
 
     rsx! {
       footer { class: "py-4 text-center border-t border-white/5",
-        div { class: "flex justify-center gap-6 text-[10px] font-mono uppercase tracking-widest text-gray-500",
+        div { class: "flex flex-wrap justify-center gap-x-6 gap-y-2 text-[10px] font-mono uppercase tracking-widest text-gray-500",
           {version}
+          button {
+            class: "inline-flex items-center min-h-6 px-1 -mx-1 -my-1 uppercase tracking-widest hover:text-beet-accent transition-colors cursor-pointer",
+            onclick: move |_| on_whats_new.call(()),
+            span { aria_hidden: "true", "[ " }
+            "What's new"
+            span { aria_hidden: "true", " ]" }
+          }
           a {
             class: "hover:text-beet-accent transition-colors",
             href: "https://hub.docker.com/repository/docker/docccccc/soulbeet",

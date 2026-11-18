@@ -36,14 +36,40 @@ pub static DB: Lazy<SqlitePool> = Lazy::new(|| async move {
         .await
         .expect("Failed to connect to database");
 
-    MIGRATOR.run(&pool).await.expect("Failed to run migrations");
+    migrate(&pool, shared::changelog::running_version())
+        .await
+        .expect("Failed to run migrations");
 
     dioxus::Ok(pool)
 });
 
+/// Runs the migrations. On a new database the accounts they seed are new
+/// users, so they start at `running`, the version of this build: release
+/// notes are for the accounts of an install that ran an earlier version.
+#[cfg(feature = "server")]
+pub(crate) async fn migrate(
+    pool: &SqlitePool,
+    running: shared::changelog::Version,
+) -> Result<(), sqlx::Error> {
+    let new: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = '_sqlx_migrations')",
+    )
+    .fetch_one(pool)
+    .await?;
+    MIGRATOR.run(pool).await?;
+    if new {
+        sqlx::query("UPDATE users SET changelog_seen = ?")
+            .bind(running.to_string())
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 #[cfg(all(test, feature = "server"))]
 pub(crate) mod test_db {
-    use super::MIGRATOR;
+    use super::{migrate, MIGRATOR};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use sqlx::SqlitePool;
     use std::path::Path;
@@ -56,8 +82,9 @@ pub(crate) mod test_db {
     pub const DELETE_TOOLS: i64 = 20261120000000;
     pub const USER_CHANGE_NUMBERS: i64 = 20261123000000;
     pub const REPORT_REAL_PATH_STATUS: i64 = 20261124000000;
+    pub const CHANGELOG_SEEN: i64 = 20261125000000;
 
-    async fn empty() -> SqlitePool {
+    pub async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
             .max_connections(1)
             .idle_timeout(None)
@@ -69,7 +96,9 @@ pub(crate) mod test_db {
 
     pub async fn migrated() -> SqlitePool {
         let pool = empty().await;
-        MIGRATOR.run(&pool).await.expect("migrations");
+        migrate(&pool, shared::changelog::running_version())
+            .await
+            .expect("migrations");
         pool
     }
 
@@ -85,7 +114,9 @@ pub(crate) mod test_db {
             .connect_with(options)
             .await
             .expect("file database");
-        MIGRATOR.run(&pool).await.expect("migrations");
+        migrate(&pool, shared::changelog::running_version())
+            .await
+            .expect("migrations");
         pool
     }
 
@@ -98,6 +129,17 @@ pub(crate) mod test_db {
                 .expect("migration");
         }
         pool
+    }
+
+    /// Applies the migration `version` and every later one, as an upgrade to
+    /// this build does.
+    pub async fn apply_from(pool: &SqlitePool, version: i64) {
+        for m in MIGRATOR.iter().filter(|m| m.version >= version) {
+            sqlx::raw_sql(&m.sql)
+                .execute(pool)
+                .await
+                .expect("migration");
+        }
     }
 
     pub async fn apply(pool: &SqlitePool, version: i64) {
@@ -502,6 +544,42 @@ mod tests {
                 ("u2".to_string(), "offline".to_string())
             ]
         );
+    }
+
+    async fn changelog_seen_of(db: &SqlitePool, id: &str) -> String {
+        sqlx::query_scalar("SELECT changelog_seen FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn accounts_from_before_release_notes_have_seen_0_8_0() {
+        let db = test_db::migrated_before(test_db::CHANGELOG_SEEN).await;
+        insert_user(&db, "u1", "bob").await;
+        test_db::apply(&db, test_db::CHANGELOG_SEEN).await;
+        assert_eq!(changelog_seen_of(&db, SEEDED).await, "0.8.0");
+        assert_eq!(changelog_seen_of(&db, "u1").await, "0.8.0");
+    }
+
+    #[tokio::test]
+    async fn a_new_install_starts_its_seeded_admin_at_the_running_version() {
+        let db = test_db::empty().await;
+        let running = shared::changelog::Version::parse("9.4.1").unwrap();
+        super::migrate(&db, running).await.unwrap();
+        assert_eq!(changelog_seen_of(&db, SEEDED).await, "9.4.1");
+
+        // A later start migrates an existing database, which keeps what each account saw.
+        insert_user(&db, "u1", "bob").await;
+        sqlx::query("UPDATE users SET changelog_seen = '0.9.0' WHERE id = 'u1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let newer = shared::changelog::Version::parse("9.5.0").unwrap();
+        super::migrate(&db, newer).await.unwrap();
+        assert_eq!(changelog_seen_of(&db, SEEDED).await, "9.4.1");
+        assert_eq!(changelog_seen_of(&db, "u1").await, "0.9.0");
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ pub mod search;
 pub mod settings;
 pub mod simple;
 pub mod status;
+pub mod whats_new;
 
 pub use album::{Album, AlbumHeader};
 pub use confirm_modal::*;
@@ -27,3 +28,4 @@ pub use search::*;
 pub use settings::*;
 pub use simple::*;
 pub use status::*;
+pub use whats_new::*;

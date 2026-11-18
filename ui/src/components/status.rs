@@ -30,6 +30,37 @@ pub fn navidrome_hint(health: &SystemHealth, status: NavidromeStatus) -> Option<
     }
 }
 
+/// One line of status: a status dot, a label (hidden on small screens), a
+/// message and an action.
+#[component]
+pub fn StatusBanner(
+    dot_class: &'static str,
+    label: &'static str,
+    message: String,
+    children: Element,
+) -> Element {
+    rsx! {
+        div { class: "mx-4 sm:mx-6 lg:mx-8 mt-2 px-3 py-2 bg-beet-panel border border-white/10 rounded flex items-center gap-3 text-xs font-mono",
+            span { class: "w-1.5 h-1.5 rounded-full {dot_class} shrink-0" }
+            span { class: "text-gray-500 uppercase tracking-widest shrink-0 hidden sm:inline", "{label}" }
+            span { class: "text-gray-400 flex-1 min-w-0 line-clamp-2 sm:line-clamp-1 break-words", "{message}" }
+            {children}
+        }
+    }
+}
+
+/// How a StatusBanner action looks, for an action that is a link.
+pub const STATUS_ACTION_CLASS: &str =
+    "shrink-0 text-gray-300 hover:text-white underline decoration-dotted cursor-pointer";
+
+/// A StatusBanner action button.
+#[component]
+pub fn StatusAction(label: &'static str, onclick: EventHandler<MouseEvent>) -> Element {
+    rsx! {
+        button { class: STATUS_ACTION_CLASS, onclick: move |event| onclick.call(event), "{label}" }
+    }
+}
+
 #[component]
 pub fn SystemStatus(health: SystemHealth, navidrome_status: NavidromeStatus) -> Element {
     let nav_hint = navidrome_hint(&health, navidrome_status);
@@ -90,6 +121,32 @@ pub fn SystemStatus(health: SystemHealth, navidrome_status: NavidromeStatus) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_banner_wraps_its_message_on_phones_next_to_its_action() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                StatusBanner {
+                    dot_class: "bg-beet-accent",
+                    label: "WHAT'S NEW",
+                    message: "Could not load the release notes.".to_string(),
+                    StatusAction { label: "Try again", onclick: |_| {} }
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("line-clamp-2 sm:line-clamp-1 break-words\">Could not load"),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "<button class=\"{STATUS_ACTION_CLASS}\">Try again</button>"
+            )),
+            "{html}"
+        );
+    }
 
     #[test]
     fn importer_chip_texts() {

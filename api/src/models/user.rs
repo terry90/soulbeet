@@ -12,6 +12,8 @@ use argon2::{
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
+use shared::changelog::Version;
+#[cfg(feature = "server")]
 use sqlx::SqlitePool;
 #[cfg(feature = "server")]
 use std::fmt;
@@ -114,15 +116,17 @@ impl User {
         let password_hash = hash_password(password).map_err(UserChangeError::Db)?;
         let id = Uuid::new_v4().to_string();
 
+        // A new account has nothing to catch up on in "What's new".
         sqlx::query_as::<_, User>(
-            "INSERT INTO users (id, username, password_hash, navidrome_status, role) \
-             VALUES (?, ?, ?, ?, CASE WHEN EXISTS (SELECT 1 FROM users WHERE role = 'admin') \
-             THEN 'user' ELSE 'admin' END) RETURNING *",
+            "INSERT INTO users (id, username, password_hash, navidrome_status, changelog_seen, \
+             role) VALUES (?, ?, ?, ?, ?, CASE WHEN EXISTS (SELECT 1 FROM users WHERE \
+             role = 'admin') THEN 'user' ELSE 'admin' END) RETURNING *",
         )
         .bind(&id)
         .bind(username)
         .bind(password_hash)
         .bind(shared::system::NavidromeStatus::Unknown.as_str())
+        .bind(shared::changelog::running_version().to_string())
         .fetch_one(db)
         .await
         .map_err(change_error)
@@ -341,6 +345,53 @@ impl User {
             .map_err(|e| e.to_string())
     }
 
+    /// The version whose release notes this user last closed.
+    pub(crate) async fn changelog_seen_in(db: &SqlitePool, id: &str) -> Result<Version, String> {
+        let seen: String = sqlx::query_scalar("SELECT changelog_seen FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| UserChangeError::NotFound.to_string())?;
+        Version::parse(&seen)
+    }
+
+    /// Records that this user closed the release notes up to `version`. The
+    /// stored version never goes down: a tab left open on an older version
+    /// must not bring back notes closed on a newer one.
+    pub(crate) async fn mark_changelog_seen_in(
+        db: &SqlitePool,
+        id: &str,
+        version: Version,
+    ) -> Result<(), String> {
+        loop {
+            let stored: String =
+                sqlx::query_scalar("SELECT changelog_seen FROM users WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| UserChangeError::NotFound.to_string())?;
+            if Version::parse(&stored)? >= version {
+                return Ok(());
+            }
+            // Written only over the value compared, so a concurrent close is
+            // compared again instead of overwritten.
+            let done = sqlx::query(
+                "UPDATE users SET changelog_seen = ? WHERE id = ? AND changelog_seen = ?",
+            )
+            .bind(version.to_string())
+            .bind(id)
+            .bind(&stored)
+            .execute(db)
+            .await
+            .map_err(|e| e.to_string())?;
+            if done.rows_affected() == 1 {
+                return Ok(());
+            }
+        }
+    }
+
     /// Every user with a Navidrome password stored, whatever its last status.
     pub(crate) async fn linked_to_navidrome_in(db: &SqlitePool) -> Result<Vec<User>, String> {
         sqlx::query_as::<_, User>("SELECT * FROM users WHERE navidrome_token IS NOT NULL")
@@ -495,7 +546,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        test_db::apply(&db, test_db::USERNAME_CASE).await;
+        test_db::apply_from(&db, test_db::USERNAME_CASE).await;
         assert!(matches!(
             User::find_by_name_in(&db, "bob").await.unwrap(),
             NameMatch::Several
@@ -508,6 +559,55 @@ mod tests {
             User::create_in(&db, "BOB", "pw").await.unwrap_err(),
             UserChangeError::UsernameTaken
         );
+    }
+
+    #[tokio::test]
+    async fn a_new_account_has_seen_the_running_version() {
+        let db = test_db::migrated().await;
+        let user = User::create_in(&db, "a", "pw").await.unwrap();
+        assert_eq!(
+            User::changelog_seen_in(&db, &user.id).await.unwrap(),
+            shared::changelog::running_version()
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_the_release_notes_records_the_version() {
+        let db = test_db::migrated().await;
+        let user = User::create_in(&db, "a", "pw").await.unwrap();
+        let other = User::create_in(&db, "b", "pw").await.unwrap();
+        let later = Version::parse("12.3.4").unwrap();
+        User::mark_changelog_seen_in(&db, &user.id, later)
+            .await
+            .unwrap();
+        assert_eq!(User::changelog_seen_in(&db, &user.id).await.unwrap(), later);
+        // A tab still on an older version closing its notes lowers nothing.
+        User::mark_changelog_seen_in(&db, &user.id, Version::parse("12.3.3").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(User::changelog_seen_in(&db, &user.id).await.unwrap(), later);
+        assert_eq!(
+            User::changelog_seen_in(&db, &other.id).await.unwrap(),
+            shared::changelog::running_version()
+        );
+        assert_eq!(
+            User::mark_changelog_seen_in(&db, "nobody", later).await,
+            Err("User not found".to_string())
+        );
+        assert_eq!(
+            User::changelog_seen_in(&db, "nobody").await,
+            Err("User not found".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_inserted_without_a_seen_version_fails_to_read() {
+        let db = test_db::migrated().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u', 'u', 'x')")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(User::changelog_seen_in(&db, "u").await.is_err());
     }
 
     #[test]
