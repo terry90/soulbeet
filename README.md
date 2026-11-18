@@ -20,7 +20,7 @@ Screenshots: [here](./screenshots)
 - **Rate & Keep**: Listen in Navidrome. 3+ stars promotes a track to your permanent library, 1 star deletes it. Unrated tracks expire and get replaced with fresh picks.
 - **Multi-user**: Private or shared folders. Each user gets their own discovery profiles, scrobble credentials, and preferences.
 - **Multiple Metadata Providers**: MusicBrainz (albums) or Last.fm (single tracks), selectable per user.
-- **Claude**: connect Soulbeet to claude.ai or the Claude app and ask for a playlist; see [docs/mcp.md](docs/mcp.md)
+- **MCP Server**: Connect your AI assistant (Claude, ChatGPT, anything that speaks MCP) and ask for a playlist in plain words. It finds the tracks, downloads what is missing and builds the playlist in Navidrome. See [MCP Server](#mcp-server).
 
 ## How It Works
 
@@ -143,8 +143,8 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `BEETS_CONFIG` | Path to your beets config file. Replaces the shipped `/app/beets_config.yaml` (beets defaults still apply underneath) | `beets_config.yaml` |
 | `BEETS_PYTHON` | Python interpreter that runs beets imports and the config check. By default it is read from the `#!` line of `beet` (`/usr/bin/python3` in the image) | |
 | `PUBLIC_URL` | Optional. The public address (`https://host[:port]`, no path). When set, Soulbeet uses it instead of reading the address from request headers | |
-| `MCP` | `on` or `off`, in any case, for the OAuth and `/mcp` endpoints Claude uses; any other value turns them off and logs a warning | `on` (unset) |
-| `NAVIDROME_MUSIC_PATH` | Optional. Where Soulbeet sees the root of Navidrome's default library. Set it when Soulbeet mounts that library at another path than Navidrome does (e.g. Navidrome at `/music`, Soulbeet at `/media/music`): deletion checks, the rating sync and Claude's tools use it to find Navidrome's songs on disk. Without it, Soulbeet learns where each library is from the files it imports | |
+| `MCP` | `on` or `off`, in any case, for the OAuth and `/mcp` endpoints MCP clients use; any other value turns them off and logs a warning | `on` (unset) |
+| `NAVIDROME_MUSIC_PATH` | Optional. Where Soulbeet sees the root of Navidrome's default library. Set it when Soulbeet mounts that library at another path than Navidrome does (e.g. Navidrome at `/music`, Soulbeet at `/media/music`): deletion checks, the rating sync and the MCP tools use it to find Navidrome's songs on disk. Without it, Soulbeet learns where each library is from the files it imports | |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
@@ -172,7 +172,7 @@ The release that adds admin roles changes a few things on the first start:
 -   **Folder roots.** The upgrade approves the parent directory of each existing admin folder, so an admin folder at `/music/main` approves `/music`. It never approves `/`, so a top-level admin folder such as `/music` approves nothing: add `/music` as a root and tick **Shared** on that folder before other users add folders inside it.
 -   **Folder conflicts.** Existing folders that are outside every root, or that equal, contain or sit inside another user's folder, are listed under Folder Conflicts in Settings > Library. They keep working and can still be renamed in place, but a move to another path has to pass the folder rules. To solve one, tick **Shared** on one of the folders, or delete a folder entry there (its files stay on disk).
 
-The release that adds Claude (MCP) access has its own upgrade notes in [docs/mcp.md](docs/mcp.md#upgrading).
+The release that adds the MCP server has its own upgrade notes in [docs/mcp.md](docs/mcp.md#upgrading).
 
 ### Beets Configuration
 
@@ -294,16 +294,39 @@ Your Soulbeet folder paths must point to the same physical directories that Navi
 
 When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from disk during rating sync. Soulbeet finds each track's file from Navidrome's library path, so it needs the library root (learned from imports, or `NAVIDROME_MUSIC_PATH`). A track another listener rated above 1 star, starred or keeps in a playlist is kept, and so is any track Soulbeet cannot check; Settings > Library > Deletion Checks lists what was kept and why. [docs/mcp.md, "What every deletion checks"](docs/mcp.md#what-every-deletion-checks) lists every check.
 
-### Connecting Claude (MCP)
+### MCP Server
 
-Soulbeet can answer Claude on claude.ai and in the Claude apps. Each person connects their own account, and Claude acts as that person. You need:
+Soulbeet is also an MCP server, so any AI assistant that speaks MCP (Claude, ChatGPT, Cursor, your own agent...) can drive it. Ask for music in plain words and the assistant checks your library, searches Soulseek, downloads, imports and builds the Navidrome playlist.
 
-1. **A public https name** for Soulbeet, at the root of the name (no sub-path), with a certificate Claude trusts. Claude connects from Anthropic's servers, so the name must resolve to a public address.
-2. **Proxy headers**: the reverse proxy sends the public host and `X-Forwarded-Proto: https`, and never passes on forwarded headers a client sent. Or set `PUBLIC_URL`.
-3. **The Security Checks** in Settings > Config passing: `SECRET_KEY` unset or at least 32 bytes, and the `admin` password changed.
-4. **The connector**: in Claude, add `{your address}/mcp` (for example `https://music.example.com/mcp`) as a custom connector, then connect and allow it on Soulbeet's consent page.
+The endpoint is `{your Soulbeet address}/mcp`. It speaks streamable HTTP and signs clients in with OAuth, so there is no API key to copy around.
 
-Deletion is off for every connected app until its owner turns it on in Settings > Users > Connected apps. See [docs/mcp.md](docs/mcp.md) for proxy examples (Caddy, nginx, Traefik, Cloudflare tunnel), what Claude can do, the limits, and every error code.
+#### Set it up
+
+1. Serve Soulbeet over https, at the root of the name: `https://music.example.com` works, `https://example.com/music` does not. Hosted assistants (claude.ai, ChatGPT) connect from their own servers, so for those the address must be public.
+2. Have your reverse proxy send the public host and `X-Forwarded-Proto: https`, or set `PUBLIC_URL`.
+3. Open Settings > Config at that address. The Security Checks must pass (`SECRET_KEY` unset or at least 32 bytes, `admin` password changed), and **Remote access** tells you whether the address is usable.
+4. Add `https://music.example.com/mcp` as a remote MCP server in your client. On claude.ai, for example, that is **Customize > Connectors > Add custom connector**. The client sends you to Soulbeet: sign in and click **Allow**.
+
+Each person connects their own account, and the assistant acts as that person only.
+
+#### Use it
+
+Ask in a chat:
+
+- "Make a Christmas playlist with 30 classics and download the ones I don't have."
+- "Get In Rainbows by Radiohead into my library."
+- "How is that batch of downloads going?"
+- "Do I have duplicates in my library?"
+
+Downloads keep running after you close the chat, and a playlist asked for with them keeps filling. Ask about them later in a new chat.
+
+#### Deleting music
+
+A connected app cannot delete anything until you tick **Allow deleting music** for it in Settings > Users > Connected apps. With it on, the assistant shows what it would delete and waits for your yes before deleting tracks. It can then also run your rating sync, which deletes your 1-star songs when auto-delete is on. A track another listener rated above 1 star, starred or keeps in a playlist is kept, and the limit is 100 tracks per 24 hours.
+
+To turn the MCP server off, set `MCP=off`.
+
+[docs/mcp.md](docs/mcp.md) has the proxy examples (Caddy, nginx, Traefik, Cloudflare tunnel), every tool, the limits and the error codes. It walks through claude.ai, the client it was tested with.
 
 ## Development
 
