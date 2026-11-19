@@ -319,9 +319,10 @@ async fn run_automation() {
                 "Automation: generated {} candidates for user {}",
                 count, user.username
             ),
-            Err(e) => info!(
+            Err(f) => info!(
                 "Automation: recommendation generation failed for {}: {}",
-                user.username, e
+                user.username,
+                crate::core::logged(&f)
             ),
         }
     }

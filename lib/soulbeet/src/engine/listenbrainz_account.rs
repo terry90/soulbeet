@@ -16,6 +16,8 @@ use shared::recommendation::{
 };
 
 const NAME: &str = "listenbrainz_account";
+/// Half the other generators' share: it reads one user's neighbours and playlists only.
+const WEIGHT: f64 = 0.2;
 const SIMILAR_USERS: usize = 10;
 const RECORDINGS_PER_USER: usize = 50;
 /// ln(0) is undefined, so a recording without listens still weighs a little.
@@ -124,6 +126,10 @@ impl ListenBrainzAccountGenerator {
 impl CandidateGenerator for ListenBrainzAccountGenerator {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn weight(&self) -> f64 {
+        WEIGHT
     }
 
     async fn generate(

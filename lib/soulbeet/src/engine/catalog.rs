@@ -17,6 +17,7 @@ use shared::recommendation::{
 };
 
 const NAME: &str = "catalog";
+const WEIGHT: f64 = 0.4;
 const FAVOURITE_SEEDS: usize = 10;
 const HOP1_NEIGHBOURS: usize = 5;
 /// Only the closest neighbours of a seed are followed a second hop.
@@ -47,6 +48,10 @@ impl CatalogGenerator {
 impl CandidateGenerator for CatalogGenerator {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn weight(&self) -> f64 {
+        WEIGHT
     }
 
     async fn generate(

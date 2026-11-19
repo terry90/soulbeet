@@ -588,8 +588,12 @@ pub async fn generate_discovery_playlist_internal(
                     info!("No candidates for {}, running engine", profile_name);
                     match generate_recommendations_for_user(user_id, *profile).await {
                         Ok(count) => info!("Generated {} candidates for {}", count, profile_name),
-                        Err(e) => {
-                            warn!("{} engine failed: {}", profile_name, e);
+                        Err(f) => {
+                            warn!(
+                                "{} engine failed: {}",
+                                profile_name,
+                                crate::core::logged(&f)
+                            );
                             break;
                         }
                     }
@@ -1248,7 +1252,7 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
 pub async fn generate_recommendations() -> Result<u32, ServerFnError> {
     generate_recommendations_internal(&auth.0.user_id)
         .await
-        .map_err(server_error)
+        .map_err(failure_error)
 }
 
 /// How a discovery import counts. Config and runtime failures must not land
@@ -1291,123 +1295,39 @@ async fn discard_download(src: &std::path::Path, download_base: &std::path::Path
     }
 }
 
+/// Every discovery profile's candidates for the user, from one profile build.
 #[cfg(feature = "server")]
-pub async fn generate_recommendations_internal(user_id: &str) -> Result<u32, String> {
+pub async fn generate_recommendations_internal(user_id: &str) -> Result<u32, Failure> {
+    use crate::core::index::ServerNavidrome;
+    use crate::core::recommend::{generate_in, DiscoveryServices};
     use shared::recommendation::DiscoveryProfile;
 
-    let mut total = 0u32;
-
-    for profile in &DiscoveryProfile::ALL {
-        match generate_recommendations_for_user(user_id, *profile).await {
-            Ok(count) => total += count,
-            Err(e) => {
-                tracing::warn!("Profile {} failed: {}", profile, e);
-            }
-        }
-    }
-
-    Ok(total)
+    generate_in(
+        &crate::db::DB,
+        &ServerNavidrome,
+        &DiscoveryServices::live(),
+        &UserId::new(user_id),
+        &DiscoveryProfile::ALL,
+    )
+    .await
 }
 
 #[cfg(feature = "server")]
 pub async fn generate_recommendations_for_user(
     user_id: &str,
     discovery_profile: shared::recommendation::DiscoveryProfile,
-) -> Result<u32, String> {
-    use crate::models::discovery_candidate::DiscoveryCandidateRow;
-    use crate::models::engine_report::EngineReportRow;
-    use crate::models::user_profile::UserProfileRow;
-    use std::sync::Arc;
+) -> Result<u32, Failure> {
+    use crate::core::index::ServerNavidrome;
+    use crate::core::recommend::{generate_in, DiscoveryServices};
 
-    let settings = UserSettings::get(user_id).await?;
-
-    // Build providers based on user's configured credentials
-    let mut providers: Vec<Arc<dyn soulbeet::ScrobbleProvider>> = Vec::new();
-    let mut generators: Vec<Arc<dyn soulbeet::CandidateGenerator>> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-
-    let lfm_configured = matches!(
-        (&settings.lastfm_api_key, &settings.lastfm_username),
-        (Some(k), Some(u)) if !k.is_empty() && !u.is_empty()
-    );
-
-    if lfm_configured {
-        let lfm = Arc::new(soulbeet::LastFmProvider::with_user(
-            settings.lastfm_api_key.as_ref().unwrap().clone(),
-            settings.lastfm_username.as_ref().unwrap().clone(),
-        ));
-        providers.push(lfm.clone());
-        generators.push(Arc::new(
-            soulbeet::engine::lastfm_pipeline::LastFmPipeline::new(lfm),
-        ));
-    } else {
-        skipped.push(format!(
-            "Last.fm: {}",
-            if settings
-                .lastfm_api_key
-                .as_ref()
-                .is_none_or(|t| t.is_empty())
-            {
-                "no API key"
-            } else {
-                "no username"
-            }
-        ));
-    }
-
-    info!(
-        "Provider registration: {} active, {} skipped{}",
-        providers.len(),
-        skipped.len(),
-        if skipped.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", skipped.join(", "))
-        }
-    );
-
-    if providers.is_empty() {
-        return Err(format!(
-            "No scrobble providers configured ({}). Set up Last.fm in Settings > Library.",
-            skipped.join("; ")
-        ));
-    }
-
-    // Use first available provider for profile building
-    let profile_provider = &*providers[0];
-
-    let config = shared::recommendation::ProfileConfig::from_profile(discovery_profile);
-
-    let (profile, candidates, report) = soulbeet::engine::build_and_recommend(
-        &providers.iter().map(Clone::clone).collect::<Vec<_>>(),
-        &generators.iter().map(Clone::clone).collect::<Vec<_>>(),
-        profile_provider,
-        &config,
-        50,
+    generate_in(
+        &crate::db::DB,
+        &ServerNavidrome,
+        &DiscoveryServices::live(),
+        &UserId::new(user_id),
+        &[discovery_profile],
     )
     .await
-    .map_err(|e| e.to_string())?;
-
-    // Cache profile
-    UserProfileRow::upsert(user_id, &profile).await?;
-
-    // Store engine report in history
-    let report_json = serde_json::to_string(&report).map_err(|e| e.to_string())?;
-    EngineReportRow::insert(
-        user_id,
-        &discovery_profile.to_string(),
-        &report_json,
-        candidates.len() as u32,
-    )
-    .await?;
-    EngineReportRow::prune(user_id, 30).await?;
-
-    // Clear and store candidates for this specific profile
-    let profile_name = discovery_profile.to_string();
-    DiscoveryCandidateRow::clear_for_user_profile(user_id, &profile_name).await?;
-    DiscoveryCandidateRow::upsert_batch(user_id, &profile_name, &candidates).await?;
-
-    Ok(candidates.len() as u32)
 }
 
 #[get("/api/discovery/report", auth: AuthSession)]

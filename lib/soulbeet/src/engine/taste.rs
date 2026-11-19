@@ -165,7 +165,6 @@ async fn profile_of(
         seed_artists: top.into_iter().take(SEED_ARTISTS).collect(),
         favourite_artists,
         known,
-        ..Default::default()
     })
 }
 

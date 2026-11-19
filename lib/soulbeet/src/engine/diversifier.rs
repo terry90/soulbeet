@@ -33,20 +33,7 @@ pub fn diversify(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Popularity penalty: penalize candidates from popular artists,
-    // scaled by the configured penalty strength
-    let mut popularity_penalized = 0usize;
-    for candidate in &mut pool {
-        if let Some(listeners) = candidate.artist_listener_count {
-            // Use 1M listeners as a rough "very popular" threshold
-            let popularity = (listeners as f64 / 1_000_000.0).clamp(0.0, 1.0);
-            if popularity > 0.5 {
-                let penalty = (popularity - 0.5) * 2.0 * config.popularity_penalty_strength;
-                candidate.score *= (1.0 - penalty).max(0.1);
-                popularity_penalized += 1;
-            }
-        }
-    }
+    let popularity_penalized = penalise_popular(&mut pool, config.popularity_penalty_strength);
 
     // Re-sort after popularity penalty
     pool.sort_by(|a, b| {
@@ -83,12 +70,10 @@ pub fn diversify(
     let mut regular_pool: Vec<Candidate> = Vec::new();
 
     for c in pool {
-        let is_exploration = c.signals.iter().any(|s| {
-            s.contains("tag_explore")
-                || s.contains("genre_explore")
-                || s.contains("hop2")
-                || s.contains("momentum")
-        });
+        let is_exploration = c
+            .signals
+            .iter()
+            .any(|s| s.contains("tag_explore") || s.contains("hop2") || s.contains("momentum"));
         if is_exploration {
             exploration_pool.push(c);
         } else {
@@ -223,6 +208,24 @@ pub fn diversify(
     (selected, summary)
 }
 
+/// Penalises the most listened tenth of the candidates with a listener count,
+/// the most listened the most: rank r of the top n keeps
+/// `1 - strength * (1 - r / n)` of its score, never less than a tenth. Ranking
+/// instead of a fixed listener count works whatever scale the counts come in.
+/// Returns how many were penalised.
+fn penalise_popular(pool: &mut [Candidate], strength: f64) -> usize {
+    let mut counted: Vec<usize> = (0..pool.len())
+        .filter(|&i| pool[i].artist_listener_count.is_some())
+        .collect();
+    counted.sort_by_key(|&i| std::cmp::Reverse(pool[i].artist_listener_count));
+    let top_n = counted.len() / 10;
+    for (rank, &i) in counted.iter().take(top_n).enumerate() {
+        let kept = 1.0 - strength * (1.0 - rank as f64 / top_n as f64);
+        pool[i].score *= kept.max(0.1);
+    }
+    top_n
+}
+
 /// Build target genre proportions from the profile, adjusted by exploration budget.
 fn build_genre_targets(
     profile: &UserMusicProfile,
@@ -285,5 +288,49 @@ fn update_genre_counts(
 ) {
     if let Some(ref genre) = candidate.primary_genre {
         *counts.entry(genre.to_lowercase()).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::test_support::candidate;
+
+    fn counted(n: u64) -> Vec<Candidate> {
+        (1..=n)
+            .rev()
+            .map(|count| {
+                let mut c = candidate("catalog", &format!("artist {count}"), "t", 1.0);
+                c.artist_listener_count = Some(count);
+                c
+            })
+            .collect()
+    }
+
+    fn score_of(pool: &[Candidate], count: u64) -> f64 {
+        pool.iter()
+            .find(|c| c.artist_listener_count == Some(count))
+            .unwrap()
+            .score
+    }
+
+    #[test]
+    fn the_most_listened_tenth_is_penalised_by_rank() {
+        let mut pool = counted(20);
+        assert_eq!(penalise_popular(&mut pool, 0.6), 2);
+        assert!((score_of(&pool, 20) - 0.4).abs() < 1e-9);
+        assert!((score_of(&pool, 19) - 0.7).abs() < 1e-9);
+        assert!((1..=18).all(|n| score_of(&pool, n) == 1.0));
+
+        let mut few = counted(9);
+        assert_eq!(penalise_popular(&mut few, 0.6), 0);
+        assert!(few.iter().all(|c| c.score == 1.0));
+    }
+
+    #[test]
+    fn a_penalty_never_takes_a_score_below_a_tenth() {
+        let mut pool = counted(10);
+        penalise_popular(&mut pool, 1.0);
+        assert!((score_of(&pool, 10) - 0.1).abs() < 1e-9);
     }
 }

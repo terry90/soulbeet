@@ -15,6 +15,7 @@ use shared::recommendation::{
 };
 
 const NAME: &str = "deezer";
+const WEIGHT: f64 = 0.4;
 const FAVOURITE_SEEDS: usize = 10;
 
 pub struct DeezerGenerator {
@@ -83,6 +84,10 @@ impl DeezerGenerator {
 impl CandidateGenerator for DeezerGenerator {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn weight(&self) -> f64 {
+        WEIGHT
     }
 
     async fn generate(

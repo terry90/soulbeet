@@ -18,7 +18,8 @@ pub struct EngineReportRow {
 
 #[cfg(feature = "server")]
 impl EngineReportRow {
-    pub async fn insert(
+    pub(crate) async fn insert_in(
+        db: &sqlx::SqlitePool,
         user_id: &str,
         profile: &str,
         report_json: &str,
@@ -33,7 +34,7 @@ impl EngineReportRow {
         .bind(profile)
         .bind(report_json)
         .bind(candidate_count as i32)
-        .execute(&*DB)
+        .execute(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -51,14 +52,18 @@ impl EngineReportRow {
     }
 
     /// Keep only the last N reports per user, delete older ones
-    pub async fn prune(user_id: &str, keep: u32) -> Result<(), String> {
+    pub(crate) async fn prune_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        keep: u32,
+    ) -> Result<(), String> {
         sqlx::query(
             "DELETE FROM engine_reports WHERE user_id = ? AND id NOT IN (SELECT id FROM engine_reports WHERE user_id = ? ORDER BY created_at DESC LIMIT ?)",
         )
         .bind(user_id)
         .bind(user_id)
         .bind(keep)
-        .execute(&*DB)
+        .execute(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(())

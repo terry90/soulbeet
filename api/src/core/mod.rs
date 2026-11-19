@@ -17,6 +17,7 @@ pub mod library;
 pub mod metadata;
 pub mod playlists;
 pub mod ratings;
+pub(crate) mod recommend;
 pub mod reconcile;
 pub mod settings;
 pub mod sources;

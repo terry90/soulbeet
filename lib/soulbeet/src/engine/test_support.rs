@@ -1,17 +1,20 @@
-//! In-memory listening histories and music knowledge for engine tests.
+//! In-memory listening histories, music knowledge and generators for engine tests.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use shared::recommendation::{
-    fold_name, ArtistRef, KnownMusic, Listen, Neighbour, PlayedArtist, PlayedTrack, RecordingFacts,
-    TimePeriod, TrackRef, WeightedTag,
+    fold_name, ArtistRef, Candidate, CandidateSet, DiscoveryProfile, KnownMusic, Listen, Neighbour,
+    PlayedArtist, PlayedTrack, ProfileConfig, RecordingFacts, SourceErrors, TimePeriod, TrackRef,
+    UserMusicProfile, WeightedTag,
 };
 
+use super::track_candidate;
 use crate::history::HistoryError;
 use crate::knowledge::KnowledgeError;
 use crate::polite::RemoteError;
-use crate::{ListeningHistory, MusicKnowledge};
+use crate::{CandidateGenerator, GeneratorOutput, ListeningHistory, MusicKnowledge};
 
 #[derive(Default)]
 pub(crate) struct FakeHistory {
@@ -249,4 +252,65 @@ pub(crate) fn known_of(artist_names: &[&str]) -> KnownMusic {
         known.add_artist(&artist(name, None));
     }
     known
+}
+
+/// A generator that answers the same candidates and errors every run.
+pub(crate) struct FixedGenerator {
+    pub name: &'static str,
+    pub weight: f64,
+    pub candidates: Vec<Candidate>,
+    pub errors: SourceErrors,
+}
+
+#[async_trait]
+impl CandidateGenerator for FixedGenerator {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+
+    async fn generate(
+        &self,
+        _profile: &UserMusicProfile,
+        _config: &ProfileConfig,
+    ) -> GeneratorOutput {
+        let mut candidates = CandidateSet::new();
+        for candidate in &self.candidates {
+            candidates.insert(candidate.clone());
+        }
+        GeneratorOutput {
+            candidates,
+            signals: Vec::new(),
+            mbid_failures: 0,
+            errors: self.errors.clone(),
+        }
+    }
+}
+
+/// A candidate of `generator` for `title` by `artist`, under the signal `fixed`.
+pub(crate) fn candidate(generator: &str, artist: &str, title: &str, score: f64) -> Candidate {
+    track_candidate(track(artist, None, title, None), score, "fixed", generator)
+}
+
+pub(crate) fn fixed(
+    name: &'static str,
+    weight: f64,
+    tracks: &[(&str, &str, f64)],
+) -> Arc<dyn CandidateGenerator> {
+    Arc::new(FixedGenerator {
+        name,
+        weight,
+        candidates: tracks
+            .iter()
+            .map(|(a, t, score)| candidate(name, a, t, *score))
+            .collect(),
+        errors: SourceErrors::default(),
+    })
+}
+
+pub(crate) fn balanced() -> ProfileConfig {
+    ProfileConfig::from_profile(DiscoveryProfile::Balanced)
 }

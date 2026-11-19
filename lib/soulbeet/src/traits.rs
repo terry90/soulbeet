@@ -8,9 +8,9 @@ use shared::{
     failure::{Failure, UserAction},
     metadata::{AlbumWithTracks, Provider, SearchResult as MetadataSearchResult},
     recommendation::{
-        ArtistPopularity, CandidateSet, KnownMusic, Listen, Neighbour, PlayedArtist, PlayedTrack,
-        ProfileConfig, RankedArtist, RankedTrack, RecordingFacts, SignalReport, SimilarArtist,
-        SimilarTrack, SourceErrors, TimePeriod, TrackRef, UserMusicProfile, WeightedTag,
+        CandidateSet, KnownMusic, Listen, Neighbour, PlayedArtist, PlayedTrack, ProfileConfig,
+        RecordingFacts, SignalReport, SourceErrors, TimePeriod, TrackRef, UserMusicProfile,
+        WeightedTag,
     },
     system::ImporterHealth,
 };
@@ -462,38 +462,6 @@ pub trait MusicImporter: Send + Sync {
 }
 
 #[async_trait]
-pub trait ScrobbleProvider: Send + Sync {
-    fn id(&self) -> &str;
-    fn name(&self) -> &str;
-
-    // Listening history
-    async fn get_listens(&self, count: u32) -> Result<Vec<Listen>>;
-    async fn get_top_artists(&self, period: TimePeriod, count: u32) -> Result<Vec<RankedArtist>>;
-    async fn get_top_tracks(&self, period: TimePeriod, count: u32) -> Result<Vec<RankedTrack>>;
-
-    // Metadata
-    async fn get_artist_tags(&self, artist: &str) -> Result<Vec<WeightedTag>>;
-    async fn get_artist_popularity(&self, artist: &str) -> Result<ArtistPopularity>;
-    async fn get_global_popularity_median(&self) -> Result<u64>;
-
-    // Similarity
-    async fn get_similar_artists(&self, artist: &str, limit: u32) -> Result<Vec<SimilarArtist>>;
-    async fn get_similar_tracks(
-        &self,
-        artist: &str,
-        track: &str,
-        limit: u32,
-    ) -> Result<Vec<SimilarTrack>>;
-
-    // Tag/genre exploration
-    async fn get_tag_top_tracks(&self, tag: &str, limit: u32) -> Result<Vec<RankedTrack>>;
-    async fn get_related_tags(&self, tag: &str) -> Result<Vec<String>>;
-
-    // Artist tracks
-    async fn get_artist_top_tracks(&self, artist: &str, limit: u32) -> Result<Vec<RankedTrack>>;
-}
-
-#[async_trait]
 pub trait ListeningHistory: Send + Sync {
     fn name(&self) -> &'static str;
     async fn top_artists(
@@ -587,6 +555,9 @@ pub struct GeneratorOutput {
 #[async_trait]
 pub trait CandidateGenerator: Send + Sync {
     fn name(&self) -> &'static str;
+    /// This generator's share of the blend, before the shares of the generators
+    /// that found nothing are given to the others.
+    fn weight(&self) -> f64;
     async fn generate(&self, profile: &UserMusicProfile, config: &ProfileConfig)
         -> GeneratorOutput;
 }

@@ -11,52 +11,11 @@ pub struct Listen {
     pub timestamp: i64,
 }
 
-/// An artist ranked by play count
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RankedArtist {
-    pub name: String,
-    pub mbid: Option<String>,
-    pub play_count: u64,
-}
-
-/// A track ranked by play count
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RankedTrack {
-    pub artist: String,
-    pub track: String,
-    pub mbid: Option<String>,
-    pub play_count: u64,
-}
-
 /// A tag/genre with a normalized weight
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeightedTag {
     pub name: String,
     pub weight: f64,
-}
-
-/// An artist similar to another
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimilarArtist {
-    pub name: String,
-    pub mbid: Option<String>,
-    pub score: f64,
-}
-
-/// A track similar to another
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimilarTrack {
-    pub artist: String,
-    pub track: String,
-    pub mbid: Option<String>,
-    pub score: f64,
-}
-
-/// Artist popularity metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtistPopularity {
-    pub listener_count: u64,
-    pub play_count: u64,
 }
 
 /// Time period for statistics
@@ -165,23 +124,16 @@ impl ProfileConfig {
     }
 }
 
-/// User's music profile built from scrobble history.
+/// User's music profile built from the listening histories.
 /// Cached in the database, rebuilt periodically.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserMusicProfile {
     pub genre_distribution: Vec<WeightedTag>,
-    pub era_preference: Vec<(String, f64)>, // decade label -> weight
-    pub obscurity_score: f64,               // 0.0 = mainstream, 1.0 = deep cuts
-    pub repeat_ratio: f64,                  // 0.0 = all repeats, 1.0 = all unique tracks
-    pub freshness_half_life_days: f64,      // how fast user moves on from artists
+    pub obscurity_score: f64, // 0.0 = mainstream, 1.0 = deep cuts
+    pub repeat_ratio: f64,    // 0.0 = all repeats, 1.0 = all unique tracks
     pub momentum_artists: Vec<MomentumArtist>,
     pub tag_comfort_zone: Vec<String>,
     pub tag_exploration_zone: Vec<String>,
-    pub top_artists_hash: String, // hash to detect profile staleness
-    #[serde(default)]
-    pub known_artist_names: Vec<String>, // lowercased top artist names for filtering
-    #[serde(default)]
-    pub known_track_keys: Vec<String>, // "artist:track" lowercased keys for filtering
     #[serde(default)]
     pub seed_artists: Vec<PlayedArtist>,
     #[serde(default)]
@@ -469,7 +421,6 @@ impl CandidateSet {
 /// Structured report of an engine run, capturing every stage's output.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EngineReport {
-    pub profile_source: String,
     pub profile_summary: ProfileSummary,
     pub pipeline_reports: Vec<PipelineReport>,
     pub blend_summary: BlendSummary,
@@ -491,7 +442,6 @@ pub struct ProfileSummary {
     pub top_genres: Vec<String>,
     pub obscurity_score: f64,
     pub repeat_ratio: f64, // actually uniqueness ratio: 0.0 = all repeats, 1.0 = all unique
-    pub freshness_half_life_days: f64,
     pub momentum_artists: Vec<String>,
     pub comfort_tags: usize,
     pub exploration_tags: usize,
@@ -532,9 +482,7 @@ pub struct BlendSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FreshnessSummary {
-    pub known_artists_penalized: usize,
     pub total_candidates: usize,
-    pub penalty_factor: f64,
     pub new_release_boosted: usize,
 }
 
@@ -569,7 +517,6 @@ impl EngineReport {
             "=== Engine Report ({:.1}s) ===\n",
             self.duration_secs
         ));
-        out.push_str(&format!("Profile from: {}\n", self.profile_source));
         if !self.sources.is_empty() {
             out.push_str(&format!("Sources: {}\n", self.sources.join(", ")));
         }
@@ -594,8 +541,8 @@ impl EngineReport {
             p.top_genres.join(", ")
         ));
         out.push_str(&format!(
-            "  Obscurity: {:.2}, Repeat ratio: {:.2}, Half-life: {:.0}d\n",
-            p.obscurity_score, p.repeat_ratio, p.freshness_half_life_days
+            "  Obscurity: {:.2}, Repeat ratio: {:.2}\n",
+            p.obscurity_score, p.repeat_ratio
         ));
         if !p.momentum_artists.is_empty() {
             out.push_str(&format!("  Momentum: {}\n", p.momentum_artists.join(", ")));
@@ -651,8 +598,8 @@ impl EngineReport {
 
         let f = &self.freshness_summary;
         out.push_str(&format!(
-            "\n--- Freshness (penalty={:.2}, {} penalized, {} boosted) ---\n",
-            f.penalty_factor, f.known_artists_penalized, f.new_release_boosted
+            "\n--- Freshness ({} new releases boosted) ---\n",
+            f.new_release_boosted
         ));
 
         let d = &self.diversifier_summary;
