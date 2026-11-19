@@ -51,7 +51,7 @@ pub(crate) const RUN_DISCOVERY: ToolSpec = ToolSpec {
     title: "Run discovery now",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Starts a discovery run for this user: recommendations from Last.fm or ListenBrainz, Soulseek searches, downloads into the discovery folder, imports, and the profile playlists. Returns at once with the run's progress; get_discovery shows how it goes. A run takes minutes. Failure codes: {common}, folder_required (no discovery folder), already_running (a run for this user is going, or a call with this request_key still runs).")
+        format!("Starts a discovery run for this user: recommendations from the user's Navidrome plays and stars, ListenBrainz when a username is saved, data about music from ListenBrainz and MusicBrainz, and Deezer when the user turned it on; then Soulseek searches, downloads into the discovery folder, imports, and the profile playlists. Returns at once with the run's progress; get_discovery shows how it goes. A run takes minutes. Failure codes: {common}, folder_required (no discovery folder), no_listening_data (nothing played or starred in Navidrome yet; user action listen_in_navidrome), navidrome_not_linked and navidrome_unreachable (the Navidrome library could not be read), already_running (a run for this user is going, or a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"#,

@@ -476,6 +476,7 @@ The ones you are most likely to see:
 | `expired_handle` | `input`, `import`, `delete` | The id was valid but is no longer usable: a search older than 24 hours, a confirmation token used or older than 10 minutes, a replacement consent past its 24 hours, a discovery track no longer pending. | Start again from the step that gave it: a new search or a new preview. |
 | `permission_not_granted` | `input`, `delete` | The app may not do this: deletion is off for it (user action `enable_deletion`), or no app may make the change: auto-delete on (`enable_auto_delete`), the discovery folder or promote threshold (`change_discovery_settings`), a 1-star song rating or a rating of a pending discovery track (`rate_in_navidrome`). | Do what the user action says: tick Allow deleting music in Settings > Users > Connected apps, change the setting in Settings > Library, or rate in Navidrome. |
 | `folder_required` | `input` | There is no folder to download into: no `folder_id` and no default folder, no library folder at all, or no discovery folder. User action `add_folder` when one is missing. | Add a folder or choose a default in Settings > Library, or a discovery folder in Settings > Library > Discovery. |
+| `no_listening_data` | `input` | Discovery found nothing played or starred in Navidrome, and no ListenBrainz history. User action `listen_in_navidrome`. | Play or star music in Navidrome, then run discovery again. |
 | `rate_limited` | `input`, `source_search` | Too many tool calls from this app, 3 source searches already waiting for this user, or 200 unfinished app jobs for this user. | Wait; `retry_after_seconds` says how long where it is known. |
 | `metadata_unavailable` | `metadata` | MusicBrainz or Last.fm did not answer or answered with an error. | Try again later. |
 | `metadata_not_found` | `metadata` | The provider has no such recording, release or artist. | Search again with other words or another id. |
@@ -577,6 +578,7 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 | `rate_in_navidrome` | "Rate the song 1 star yourself in Navidrome", or "Rate the song yourself in Navidrome" | "Navidrome" |
 | `enable_auto_delete` | "Turn on auto-delete yourself" | "Soulbeet Settings > Library" |
 | `change_discovery_settings` | "Change the discovery promote threshold yourself", or "Change the discovery folder yourself" | "Soulbeet Settings > Library" (the threshold), or "Soulbeet Settings > Library > Discovery" (the folder) |
+| `listen_in_navidrome` | "Play or star music in Navidrome" | "Navidrome" |
 
 ## Failure causes
 

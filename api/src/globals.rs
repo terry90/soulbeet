@@ -254,7 +254,61 @@ pub fn start_channel_cleanup_task() {
             }
         });
         info!("Started automation task (interval: 6h)");
+
+        tokio::spawn(async {
+            let delay = first_recommendation_delay(&mut rand::rng());
+            info!(
+                "Recommendations start in {}s, then every 6h",
+                delay.as_secs()
+            );
+            tokio::time::sleep(delay).await;
+            let mut interval = tokio::time::interval(RECOMMENDATION_INTERVAL);
+            loop {
+                interval.tick().await;
+                run_recommendations().await;
+            }
+        });
     });
+}
+
+#[cfg(feature = "server")]
+const RECOMMENDATION_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// 30 s for the server to be ready, then a random point in the first cycle, so installs
+/// started together do not call ListenBrainz and Deezer in step.
+#[cfg(feature = "server")]
+fn first_recommendation_delay(rng: &mut impl rand::Rng) -> Duration {
+    Duration::from_secs(30 + rng.random_range(0..RECOMMENDATION_INTERVAL.as_secs()))
+}
+
+/// One recommendation cycle: drops expired music facts, then builds each connected user's
+/// profile once and stores every discovery profile's candidates from it.
+#[cfg(feature = "server")]
+async fn run_recommendations() {
+    match crate::models::knowledge_cache::prune_expired_in(&crate::db::DB).await {
+        Ok(n) => info!("Recommendations: pruned {n} expired cached facts"),
+        Err(e) => warn!("Recommendations: could not prune expired cached facts: {e}"),
+    }
+    let connected_users = match crate::models::user::User::get_connected_users().await {
+        Ok(users) => users,
+        Err(e) => {
+            info!("Recommendations: failed to get connected users: {}", e);
+            return;
+        }
+    };
+    for user in &connected_users {
+        match crate::server_fns::discovery::generate_recommendations_internal(&user.id).await {
+            Ok(count) => info!(
+                "Recommendations: generated {} candidates for user {}",
+                count, user.username
+            ),
+            Err(f) => info!(
+                "Recommendations: generation failed for {}: {}",
+                user.username,
+                crate::core::logged(&f)
+            ),
+        }
+    }
 }
 
 #[cfg(feature = "server")]
@@ -312,22 +366,7 @@ async fn run_automation() {
         }
     }
 
-    // 3. Regenerate recommendations for each user
-    for user in &connected_users {
-        match crate::server_fns::discovery::generate_recommendations_internal(&user.id).await {
-            Ok(count) => info!(
-                "Automation: generated {} candidates for user {}",
-                count, user.username
-            ),
-            Err(f) => info!(
-                "Automation: recommendation generation failed for {}: {}",
-                user.username,
-                crate::core::logged(&f)
-            ),
-        }
-    }
-
-    // 4. Expire old discovery tracks per-profile and refill gaps
+    // 3. Expire old discovery tracks per-profile and refill gaps
     for user in &connected_users {
         let user_id = &user.id;
         let settings = match crate::models::user_settings::UserSettings::get(user_id).await {
@@ -418,6 +457,20 @@ async fn run_automation() {
                 "Automation: refill failed for {}: {}",
                 user.username, e.message
             ),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_recommendation_cycle_starts_within_six_hours_of_boot() {
+        let mut rng = rand::rng();
+        for _ in 0..1000 {
+            let d = first_recommendation_delay(&mut rng);
+            assert!(d >= Duration::from_secs(30) && d < Duration::from_secs(30 + 21_600));
         }
     }
 }

@@ -4,8 +4,11 @@
 
 use std::sync::Arc;
 
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use shared::recommendation::{DiscoveryProfile, ProfileConfig};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
+use shared::navidrome::LastRun;
+use shared::recommendation::{
+    Candidate, DiscoveryProfile, EngineReport, ProfileConfig, NO_LISTENING_DATA,
+};
 use soulbeet::deezer::DeezerClient;
 use soulbeet::engine::catalog::CatalogGenerator;
 use soulbeet::engine::deezer_radio::DeezerGenerator;
@@ -88,7 +91,8 @@ impl DiscoveryServices {
 
 /// Builds the user's profile once, then stores each of `profiles`' candidates and report.
 /// Returns how many candidates were stored in all. Fails when the Navidrome library cannot
-/// be read: without it, the user's own music could be recommended back to them.
+/// be read, since without it the user's own music could be recommended back to them, and
+/// when the profile has nothing to start from, after storing the reports that say so.
 pub(crate) async fn generate_in(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,
@@ -168,17 +172,7 @@ pub(crate) async fn generate_in(
         )
         .await;
         let name = profile.name();
-        let report_json = serde_json::to_string(&report).map_err(|e| stored(e.to_string()))?;
-        EngineReportRow::insert_in(db, &user_id, name, &report_json, candidates.len() as u32)
-            .await
-            .map_err(stored)?;
-        EngineReportRow::prune_in(db, &user_id, REPORTS_KEPT)
-            .await
-            .map_err(stored)?;
-        DiscoveryCandidateRow::clear_for_user_profile_in(db, &user_id, name)
-            .await
-            .map_err(stored)?;
-        DiscoveryCandidateRow::upsert_batch_in(db, &user_id, name, &candidates)
+        store_run_in(db, &user_id, name, &candidates, &report)
             .await
             .map_err(stored)?;
         info!("{name}: {} candidates for {user_id}", candidates.len());
@@ -187,7 +181,57 @@ pub(crate) async fn generate_in(
     UserProfileRow::upsert_in(db, &user_id, &build.profile)
         .await
         .map_err(stored)?;
+    if !build.profile.has_seeds() {
+        return Err(no_listening_data());
+    }
     Ok(total)
+}
+
+/// The profile has no seeds: nothing played or starred in Navidrome and no ListenBrainz history.
+pub(crate) fn no_listening_data() -> Failure {
+    Failure::new(
+        FailureCode::NoListeningData,
+        Stage::Input,
+        RetryAdvice::NeedsUser,
+        NO_LISTENING_DATA,
+    )
+    .with_user_action(UserAction::new(
+        UserActionCode::ListenInNavidrome,
+        "Play or star music in Navidrome",
+        "Navidrome",
+    ))
+}
+
+/// Stores a run's report, keeping the user's last `REPORTS_KEPT`, and its candidates. A run
+/// with a failed source only adds to the profile's candidates, so an outage does not empty
+/// the pool an earlier run filled; a run where every source answered replaces them.
+pub(crate) async fn store_run_in(
+    db: &SqlitePool,
+    user_id: &str,
+    profile: &str,
+    candidates: &[Candidate],
+    report: &EngineReport,
+) -> Result<(), String> {
+    let report_json = serde_json::to_string(report).map_err(|e| e.to_string())?;
+    EngineReportRow::insert_in(db, user_id, profile, &report_json, candidates.len() as u32).await?;
+    EngineReportRow::prune_in(db, user_id, REPORTS_KEPT).await?;
+    if report.source_errors.is_empty() {
+        DiscoveryCandidateRow::clear_for_user_profile_in(db, user_id, profile).await?;
+    }
+    DiscoveryCandidateRow::upsert_batch_in(db, user_id, profile, candidates).await
+}
+
+/// The latest run as the Discovery page shows it. None when there is no run, or its report
+/// does not parse.
+pub(crate) fn last_run_of(row: Option<EngineReportRow>) -> Option<LastRun> {
+    let row = row?;
+    let report: EngineReport = serde_json::from_str(&row.report_json).ok()?;
+    Some(LastRun {
+        created_at: row.created_at,
+        state: report.state,
+        sources: report.sources,
+        source_errors: report.source_errors,
+    })
 }
 
 /// The Navidrome library could not be read in full.
@@ -220,7 +264,137 @@ fn client_failure(e: RemoteError) -> Failure {
 mod tests {
     use super::*;
     use crate::db::test_db;
-    use shared::recommendation::UserMusicProfile;
+    use shared::recommendation::{EngineState, SourceError, UserMusicProfile};
+
+    fn cand(artist: &str, track: &str) -> Candidate {
+        Candidate {
+            artist: artist.into(),
+            track: track.into(),
+            album: None,
+            mbid: None,
+            score: 1.0,
+            signals: vec!["artist_hop1".into()],
+            source: "catalog".into(),
+            artist_listener_count: None,
+            primary_genre: None,
+            release_year: None,
+            artist_mbid: None,
+        }
+    }
+
+    /// Track names, sorted: candidates of equal score come back in no set order.
+    fn tracks(candidates: Vec<Candidate>) -> Vec<String> {
+        let mut names: Vec<String> = candidates.into_iter().map(|c| c.track).collect();
+        names.sort();
+        names
+    }
+
+    fn report_row(report_json: &str) -> EngineReportRow {
+        EngineReportRow {
+            id: "r".into(),
+            user_id: "alice".into(),
+            profile: "Balanced".into(),
+            report_json: report_json.into(),
+            candidate_count: 0,
+            created_at: "2026-11-19 08:00:00".into(),
+        }
+    }
+
+    #[test]
+    fn no_listening_data_is_a_failure_the_user_can_act_on() {
+        let f = no_listening_data();
+        assert_eq!(
+            (f.code.as_str(), f.message.as_str()),
+            (
+                "no_listening_data",
+                "No listening data yet. Play or star music in Navidrome."
+            )
+        );
+        assert_eq!(
+            f.user_action.unwrap().code,
+            UserActionCode::ListenInNavidrome
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_with_a_failed_source_keeps_the_previous_candidates() {
+        let db = test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        store_run_in(
+            &db,
+            "alice",
+            "Balanced",
+            &[cand("A", "a1")],
+            &EngineReport::default(),
+        )
+        .await
+        .unwrap();
+        let failed = EngineReport {
+            source_errors: vec![SourceError {
+                source: "ListenBrainz Labs".into(),
+                message: "down".into(),
+                failures: 1,
+            }],
+            ..Default::default()
+        };
+        store_run_in(&db, "alice", "Balanced", &[cand("B", "b1")], &failed)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracks(
+                DiscoveryCandidateRow::get_unused_in(&db, "alice", "Balanced", 10)
+                    .await
+                    .unwrap()
+            ),
+            ["a1", "b1"]
+        );
+        store_run_in(
+            &db,
+            "alice",
+            "Balanced",
+            &[cand("C", "c1")],
+            &EngineReport::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tracks(
+                DiscoveryCandidateRow::get_unused_in(&db, "alice", "Balanced", 10)
+                    .await
+                    .unwrap()
+            ),
+            ["c1"]
+        );
+    }
+
+    /// The literal of shared's `REPORT_0_9_0`: a report as 0.9.0 stored it.
+    const REPORT_0_9_0: &str = r#"{"profile_source":"ListenBrainz+Last.fm","profile_summary":{"genre_count":2,"top_genres":["rock","pop"],"obscurity_score":0.4,"repeat_ratio":0.7,"freshness_half_life_days":90.0,"momentum_artists":["Khruangbin"],"comfort_tags":1,"exploration_tags":1},"pipeline_reports":[{"name":"lastfm_pipeline","signals":[{"name":"lfm_track_graph","candidates_produced":3,"top_candidates":[{"artist":"Muse","track":"Hysteria","score":0.9,"genre":"rock","listeners":3000000}]}],"total_candidates":3,"mbid_failures":0}],"blend_summary":{"sources":1,"total_after_blend":3,"cross_source_matches":0,"top_blended":[]},"freshness_summary":{"known_artists_penalized":1,"total_candidates":3,"penalty_factor":0.67,"new_release_boosted":0},"diversifier_summary":{"popularity_penalized":0,"artist_cap_skipped":0,"genre_quota_skipped":0,"exploration_backfilled":0,"effective_exploration_budget":0.2,"unique_artists":3,"unique_genres":1,"top_selected":[]},"final_count":3,"duration_secs":12.5}"#;
+
+    #[test]
+    fn the_last_run_reads_reports_of_both_shapes() {
+        assert_eq!(
+            last_run_of(Some(report_row(REPORT_0_9_0))),
+            Some(LastRun {
+                created_at: "2026-11-19 08:00:00".into(),
+                state: EngineState::Recommended,
+                sources: vec![],
+                source_errors: vec![],
+            })
+        );
+        let empty = EngineReport {
+            state: EngineState::NoListeningData,
+            sources: vec!["Navidrome".into()],
+            ..Default::default()
+        };
+        let row = report_row(&serde_json::to_string(&empty).unwrap());
+        let run = last_run_of(Some(row)).unwrap();
+        assert_eq!(
+            (run.state, run.sources),
+            (EngineState::NoListeningData, vec!["Navidrome".to_string()])
+        );
+        assert_eq!(last_run_of(Some(report_row("not json"))), None);
+        assert_eq!(last_run_of(None), None);
+    }
 
     #[test]
     fn listenbrainz_needs_only_a_username_and_deezer_only_the_switch() {

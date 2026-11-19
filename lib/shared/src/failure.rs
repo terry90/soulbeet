@@ -296,6 +296,8 @@ pub enum UserActionCode {
     /// The discovery folder or promote threshold, which only the user changes, in Soulful's own
     /// Settings.
     ChangeDiscoverySettings,
+    /// Discovery has nothing to recommend from until the user plays or stars music in Navidrome.
+    ListenInNavidrome,
 }
 
 /// Defines `FailureCode` from one list of variants and wire names: `as_str`
@@ -330,6 +332,8 @@ failure_codes! {
     ExpiredHandle => "expired_handle",
     PermissionNotGranted => "permission_not_granted",
     FolderRequired => "folder_required",
+    /// Nothing played or starred in Navidrome and no ListenBrainz history to recommend from.
+    NoListeningData => "no_listening_data",
     RateLimited => "rate_limited",
     MetadataUnavailable => "metadata_unavailable",
     MetadataNotFound => "metadata_not_found",
@@ -440,15 +444,17 @@ mod tests {
     /// `backend_response_unreadable`, `search_query_rejected`,
     /// `search_already_running`, `search_lost`, `import_disk_full`,
     /// `delete_failed`, `partial` (design 10.1), `wrong_job_state`,
-    /// `sources_exhausted`, `result_rejected` and `search_stopped`, and
+    /// `sources_exhausted`, `result_rejected`, `search_stopped` and
+    /// `no_listening_data`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 84] = [
+    const NAMES: [&str; 85] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
         "permission_not_granted",
         "folder_required",
+        "no_listening_data",
         "rate_limited",
         "metadata_unavailable",
         "metadata_not_found",

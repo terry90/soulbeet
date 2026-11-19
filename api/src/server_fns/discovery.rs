@@ -106,6 +106,9 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
     let lifetime_days = settings.parse_lifetime_days();
     let playlist_names =
         serde_json::from_str(&settings.discovery_playlist_name).unwrap_or_default();
+    let latest = crate::models::engine_report::EngineReportRow::get_history(&auth.0.user_id, 1)
+        .await
+        .map_err(server_error)?;
     Ok(DiscoveryConfig {
         enabled: settings.discovery_enabled,
         folder_id: settings.discovery_folder_id,
@@ -115,6 +118,7 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
         profiles: settings.discovery_profiles,
         playlist_names,
         last_generated_at: settings.discovery_last_generated_at,
+        last_run: crate::core::recommend::last_run_of(latest.into_iter().next()),
     })
 }
 
@@ -586,17 +590,8 @@ pub async fn generate_discovery_playlist_internal(
                     )
                     .await;
                     info!("No candidates for {}, running engine", profile_name);
-                    match generate_recommendations_for_user(user_id, *profile).await {
-                        Ok(count) => info!("Generated {} candidates for {}", count, profile_name),
-                        Err(f) => {
-                            warn!(
-                                "{} engine failed: {}",
-                                profile_name,
-                                crate::core::logged(&f)
-                            );
-                            break;
-                        }
-                    }
+                    let count = generate_recommendations_for_user(user_id, *profile).await?;
+                    info!("Generated {} candidates for {}", count, profile_name);
                     candidates =
                         DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count)
                             .await
