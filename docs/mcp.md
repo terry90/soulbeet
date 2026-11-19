@@ -336,7 +336,7 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 ### Discovery
 
 - `get_discovery`: the user's discovery: folder, profiles, the current run and the pending tracks.
-- `run_discovery`: starts a discovery run. Recommendations come from the user's Navidrome plays and stars, from ListenBrainz when a username is saved, from ListenBrainz and MusicBrainz data about similar artists, and from Deezer when the user turned it on. With nothing played or starred in Navidrome (and no ListenBrainz history) it fails with `no_listening_data`.
+- `run_discovery`: starts a discovery run. Recommendations come from the user's Navidrome plays and stars, from ListenBrainz when a username is saved, from data about music from ListenBrainz and MusicBrainz, and from Deezer when the user turned it on. With nothing played or starred in Navidrome (and no ListenBrainz history) it fails with `no_listening_data`.
 - `promote_discovery_track`: moves a pending discovery track into the library; it replaces an earlier copy only with the deletion switch on.
 - `remove_discovery_track`: deletes a pending discovery track from the discovery folder.
 - `sync_ratings`: runs the user's rating sync now, as Soulbeet does every 6 hours.

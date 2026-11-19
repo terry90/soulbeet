@@ -30,7 +30,7 @@ You search and click download, or you ask your assistant. Behind the scenes:
 
 1. **Soulbeet** finds the best source on Soulseek, downloads it through **slskd**, tags and organizes it with **beets**, and puts it in your library.
 2. **Navidrome** picks up the new files and makes them streamable.
-3. For discovery: your **Navidrome** plays and stars (and your **ListenBrainz** history, when you saved a username) feed the recommendation engine. It asks ListenBrainz and MusicBrainz about similar artists, finds new tracks, downloads them, and pushes playlists to Navidrome.
+3. For discovery: your **Navidrome** plays and stars (and your **ListenBrainz** history, when you saved a username) feed the recommendation engine. It asks ListenBrainz for similar artists and MusicBrainz for artist ids and genres, finds new tracks, downloads them, and pushes playlists to Navidrome.
 
 ## MCP Server
 
