@@ -184,7 +184,7 @@ pub struct CandidateSet {
 /// Normalize a string for cross-source matching.
 /// Lowercases, strips non-alphanumeric characters (keeps whitespace),
 /// then collapses whitespace. Handles cases like "don't" vs "dont",
-/// "AC/DC" vs "ACDC", and whitespace differences between Last.fm
+/// "AC/DC" vs "ACDC", and whitespace differences between ListenBrainz
 /// and MusicBrainz names.
 pub fn normalize_for_matching(s: &str) -> String {
     s.to_lowercase()
