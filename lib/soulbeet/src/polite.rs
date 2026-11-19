@@ -101,6 +101,14 @@ fn gate_for(key: &str) -> Gate {
         .clone()
 }
 
+/// A whole-seconds header value, if present and numeric.
+fn header_secs(headers: &HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 pub struct PoliteClient {
     http: Client,
     base: String,
@@ -186,14 +194,8 @@ impl PoliteClient {
 
     /// An exhausted limit holds every request to the host until it resets.
     async fn hold_gate(&self, headers: &HeaderMap) {
-        let number = |name: &str| {
-            headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok())
-        };
-        if number("X-RateLimit-Remaining") == Some(0) {
-            if let Some(secs) = number("X-RateLimit-Reset-In") {
+        if header_secs(headers, "X-RateLimit-Remaining") == Some(0) {
+            if let Some(secs) = header_secs(headers, "X-RateLimit-Reset-In") {
                 let mut next = self.gate.lock().await;
                 *next = (*next).max(Instant::now() + Duration::from_secs(secs));
             }
@@ -253,11 +255,7 @@ impl PoliteClient {
             };
             let quota = status.is_success() && self.is_quota.is_some_and(|f| f(&bytes));
             if status == StatusCode::TOO_MANY_REQUESTS || quota {
-                if let Some(secs) = headers
-                    .get("X-RateLimit-Reset-In")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                {
+                if let Some(secs) = header_secs(&headers, "X-RateLimit-Reset-In") {
                     wait = Duration::from_secs(secs);
                 }
                 last = RemoteError::RateLimited { service };
