@@ -263,7 +263,6 @@ pub enum Service {
     Beets,
     Navidrome,
     Musicbrainz,
-    Lastfm,
     Filesystem,
     /// Soulful's own settings database.
     Database,
@@ -284,8 +283,6 @@ pub enum UserActionCode {
     FreeDiskSpace,
     RelinkNavidrome,
     ConfigureNavidrome,
-    /// A metadata provider refused Soulful's key for it.
-    ConfigureProvider,
     EnableDeletion,
     EnableIndexing,
     AddFolder,
@@ -338,7 +335,6 @@ failure_codes! {
     MetadataUnavailable => "metadata_unavailable",
     MetadataNotFound => "metadata_not_found",
     MetadataRateLimited => "metadata_rate_limited",
-    ProviderNotConfigured => "provider_not_configured",
     NavidromeUnreachable => "navidrome_unreachable",
     NavidromeAuthFailed => "navidrome_auth_failed",
     NavidromeNotLinked => "navidrome_not_linked",
@@ -448,7 +444,7 @@ mod tests {
     /// `no_listening_data`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 85] = [
+    const NAMES: [&str; 84] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -459,7 +455,6 @@ mod tests {
         "metadata_unavailable",
         "metadata_not_found",
         "metadata_rate_limited",
-        "provider_not_configured",
         "navidrome_unreachable",
         "navidrome_auth_failed",
         "navidrome_not_linked",

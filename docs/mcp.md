@@ -478,10 +478,9 @@ The ones you are most likely to see:
 | `folder_required` | `input` | There is no folder to download into: no `folder_id` and no default folder, no library folder at all, or no discovery folder. User action `add_folder` when one is missing. | Add a folder or choose a default in Settings > Library, or a discovery folder in Settings > Library > Discovery. |
 | `no_listening_data` | `input` | Discovery found nothing played or starred in Navidrome, and no ListenBrainz history. User action `listen_in_navidrome`. | Play or star music in Navidrome, then run discovery again. |
 | `rate_limited` | `input`, `source_search` | Too many tool calls from this app, 3 source searches already waiting for this user, or 200 unfinished app jobs for this user. | Wait; `retry_after_seconds` says how long where it is known. |
-| `metadata_unavailable` | `metadata` | MusicBrainz or Last.fm did not answer or answered with an error. | Try again later. |
-| `metadata_not_found` | `metadata` | The provider has no such recording, release or artist. | Search again with other words or another id. |
-| `metadata_rate_limited` | `metadata` | MusicBrainz or Last.fm refused for too many requests. | Try again later. |
-| `provider_not_configured` | `metadata` | Last.fm refused the API key or none is saved; a `lastfm:` id needs one. User action `configure_provider`. | Save a valid Last.fm API key in Settings > Library, or use MusicBrainz. |
+| `metadata_unavailable` | `metadata` | MusicBrainz did not answer or answered with an error. | Try again later. |
+| `metadata_not_found` | `metadata` | MusicBrainz has no such recording, release or artist, or a download names an album from a Last.fm search, which Soulbeet no longer uses. | Search again with other words or another id. |
+| `metadata_rate_limited` | `metadata` | MusicBrainz refused for too many requests. | Try again later. |
 | `navidrome_unreachable` | `library_check`, `index`, `playlist`, `delete` | Navidrome did not answer, answered an HTTP error (often a proxy or a wrong `NAVIDROME_URL`), or answered something that is not its API. From `find_duplicates`: Navidrome's pages held fewer songs than it counts. | Check that Navidrome runs and `NAVIDROME_URL` is right; try again. |
 | `navidrome_auth_failed` | `library_check`, `index`, `playlist`, `delete` | Navidrome refused the stored Navidrome password. User action `relink_navidrome`. | Sign in to Soulbeet again with your current Navidrome password. |
 | `navidrome_not_linked` | `library_check`, `index`, `playlist`, `delete` | The account is not linked to Navidrome or its stored password cannot be read (user action `relink_navidrome`), or `NAVIDROME_URL` is not set (user action `configure_navidrome`). | Sign in to Soulbeet with your Navidrome account, or set `NAVIDROME_URL`. |
@@ -490,7 +489,7 @@ The ones you are most likely to see:
 | `backend_not_configured` | `source_search`, `enqueue`, `transfer` | The slskd URL or API key is missing, does not parse, or slskd refused the key. User action `configure_backend`. | An admin sets the slskd URL and API key in Settings > Config. |
 | `backend_unreachable` | `source_search`, `enqueue`, `transfer` | slskd did not answer, is not connected to the Soulseek network, or is not logged in (then user action `configure_backend`: check slskd's Soulseek user name and password). | Check slskd; try again later. |
 | `settings_unreadable` | any | Soulbeet could not read its own database. | Check the server's disk and log; try again later. |
-| `backend_response_unreadable` | `source_search`, `enqueue`, `transfer`, `metadata` | slskd, or a metadata provider, answered something Soulbeet cannot read. For slskd, user action `update_soulful_or_backend`. | Update Soulbeet or slskd so that their versions match. |
+| `backend_response_unreadable` | `source_search`, `enqueue`, `transfer`, `metadata` | slskd, or MusicBrainz, answered something Soulbeet cannot read. For slskd, user action `update_soulful_or_backend`. | Update Soulbeet or slskd so that their versions match. |
 | `search_rate_limited` | `source_search` | slskd refused the search for too many requests. | Try again later. |
 | `search_no_results` | `source_search` | Nothing on the Soulseek network matched. | Search with other words. |
 | `search_all_filtered` | `source_search` | Results came back, but each one scored too low or was cut by the filters; the facts count each. | Loosen the filters (for example `lossless_only`) or change the query. |
@@ -571,7 +570,6 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 | `free_disk_space` | "Free disk space: {message}" | "The disk that holds the path in the message" |
 | `relink_navidrome` | "Sign in to Soulbeet again with your current Navidrome password", "Sign in to Soulbeet once as a Navidrome admin, so Soulbeet can list Navidrome's users", or "Have every Navidrome user sign in to Soulbeet once, so Soulbeet can read their ratings" | "Soulbeet sign-in" |
 | `configure_navidrome` | "Set NAVIDROME_URL to the address of your Navidrome server", "Make Navidrome's music folder readable by Soulbeet at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulbeet sees Navidrome's default library", or "Give every Navidrome account linked to Soulbeet access to this track's library, so Soulbeet can read their ratings of it" | "Soulbeet's environment", or "Navidrome's user settings" |
-| `configure_provider` | "Set a valid Last.fm API key" | "Settings > Library" |
 | `enable_deletion` | "Allow deleting music for this app" | "Settings > Users > Connected apps" |
 | `enable_indexing` | "Make this Navidrome account an admin, enable Navidrome's file watcher, or set a scan schedule" | "Navidrome" |
 | `add_folder` | "Add a library folder", or "Choose a discovery folder" | "Settings > Library", or "Settings > Library > Discovery" |
@@ -582,7 +580,7 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 
 ## Failure causes
 
-A failure's `cause.service` names whose answer `cause.raw` holds: `slskd`, `beets`, `navidrome`, `musicbrainz`, `lastfm`, `filesystem`, `database` (Soulbeet's own settings database), or `soulful` (Soulbeet's own words about what it found wrong, or lines it could not read from a service). `cause.status` is the service's status code when it gave one.
+A failure's `cause.service` names whose answer `cause.raw` holds: `slskd`, `beets`, `navidrome`, `musicbrainz`, `filesystem`, `database` (Soulbeet's own settings database), or `soulful` (Soulbeet's own words about what it found wrong, or lines it could not read from a service). `cause.status` is the service's status code when it gave one.
 
 ## Known limits
 
@@ -653,3 +651,11 @@ The release that adds MCP access changes these on the first start:
 - A browser tab left open across the upgrade cannot read a Deletion History row of reason `cleanup` until it reloads.
 - The checks' messages no longer name file paths, in Settings > Library ("Kept by auto-delete") and in import notes.
 - Turning on **Allow deleting music** for an app asks first, with the text quoted under [Connected apps](#connected-apps).
+
+The release that removes Last.fm changes the tools:
+
+- `search_music` no longer takes `provider`, and a call that passes it is refused with `invalid_input`. Its answer no longer has `provider_requested` or `provider_used`, nor has `get_release`'s.
+- `get_release` takes a MusicBrainz release id only; a `lastfm:` id is refused with `invalid_input`.
+- `get_settings` no longer has `default_metadata_provider` or `lastfm`.
+- The failure code `provider_not_configured`, the user action `configure_provider` and the cause service `lastfm` are gone.
+- A job whose album came from a Last.fm search and has no track list yet fails with `metadata_not_found`: search for the album again.
