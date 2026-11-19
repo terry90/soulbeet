@@ -47,36 +47,40 @@ test('a Navidrome-only user who plays music gets candidates', async ({ browser }
   await createNavidromeUser(user);
 
   const context = await browser.newContext();
-  const page = await context.newPage();
-  await loginViaUi(page, user);
-  await seededFolder(
-    context,
-    'disc',
-    glassAtlas.tracks.map((t) => ({
-      recordingMbid: t.mbid,
-      format: 'flac' as const,
-      relativePath: `${glassAtlas.artist}/${glassAtlas.title}/${t.title}.flac`,
-    })),
-  );
+  try {
+    const page = await context.newPage();
+    await loginViaUi(page, user);
+    await seededFolder(
+      context,
+      'disc',
+      glassAtlas.tracks.map((t) => ({
+        recordingMbid: t.mbid,
+        format: 'flac' as const,
+        relativePath: `${glassAtlas.artist}/${glassAtlas.title}/${t.title}.flac`,
+      })),
+    );
 
-  const played = [await songId(user, 'Northern Line'), await songId(user, 'Paper Lanterns')];
-  for (const id of played) {
-    await subsonicAs(user, 'scrobble', { id, submission: 'true' });
+    const played = [await songId(user, 'Northern Line'), await songId(user, 'Paper Lanterns')];
+    for (const id of played) {
+      await subsonicAs(user, 'scrobble', { id, submission: 'true' });
+    }
+    for (const id of played) {
+      await waitForPlay(user, id);
+    }
+
+    const generated = await page.request.post('/api/discovery/generate-recommendations');
+    expect(generated.status(), await generated.text()).toBe(200);
+    expect(Number(await generated.json())).toBeGreaterThan(0);
+
+    const reports = await page.request.get('/api/discovery/reports');
+    expect(reports.status()).toBe(200);
+    const newest = ((await reports.json()) as { text: string; created_at: string }[]).sort((a, b) =>
+      b.created_at.localeCompare(a.created_at),
+    )[0];
+    expect(newest, 'a report was stored').toBeDefined();
+    expect(newest?.text).toContain('Sources: Navidrome, catalog');
+    expect(newest?.text).toContain(lowtideChoir.name);
+  } finally {
+    await context.close();
   }
-  for (const id of played) {
-    await waitForPlay(user, id);
-  }
-
-  const generated = await page.request.post('/api/discovery/generate-recommendations');
-  expect(generated.status(), await generated.text()).toBe(200);
-  expect(Number(await generated.json())).toBeGreaterThan(0);
-
-  const reports = await page.request.get('/api/discovery/reports');
-  expect(reports.status()).toBe(200);
-  const newest = ((await reports.json()) as { text: string; created_at: string }[]).sort((a, b) =>
-    b.created_at.localeCompare(a.created_at),
-  )[0];
-  expect(newest, 'a report was stored').toBeDefined();
-  expect(newest?.text).toContain('Sources: Navidrome, catalog');
-  expect(newest?.text).toContain(lowtideChoir.name);
 });
