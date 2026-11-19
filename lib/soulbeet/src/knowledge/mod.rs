@@ -56,7 +56,7 @@ impl KnowledgeError {
 
 /// Serve `key` from the cache, or run `fetch` and store its answer for `ttl`.
 /// A failed fetch is returned and never stored.
-pub async fn cached<T, F>(
+pub(crate) async fn cached<T, F>(
     cache: &dyn KnowledgeCache,
     key: &str,
     ttl: Duration,

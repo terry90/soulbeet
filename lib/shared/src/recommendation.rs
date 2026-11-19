@@ -327,7 +327,7 @@ pub struct SourceError {
     pub failures: u32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SourceErrors(Vec<SourceError>);
 
 impl SourceErrors {
