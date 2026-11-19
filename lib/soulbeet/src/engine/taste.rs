@@ -424,13 +424,15 @@ fn merge(base: &mut UserMusicProfile, other: UserMusicProfile) {
         MERGED_MOMENTUM_ARTISTS,
         |m| (&m.name, m.mbid.as_deref()),
     );
-    union(
+    // Seeds and favourites take turns, so each history holds about half of the
+    // first places the generators read.
+    interleave(
         &mut base.seed_artists,
         other.seed_artists,
         SEED_ARTISTS,
         |p| (&p.artist.name, p.artist.mbid.as_deref()),
     );
-    union(
+    interleave(
         &mut base.favourite_artists,
         other.favourite_artists,
         FAVOURITE_ARTISTS,
@@ -450,20 +452,45 @@ fn union<T>(
         if into.len() >= cap {
             break;
         }
-        let present = {
-            let (name, mbid) = artist(&item);
-            let name = fold_name(name);
-            into.iter().any(|x| {
-                let (n, m) = artist(x);
-                fold_name(n) == name
-                    || matches!((m, mbid), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b))
-            })
-        };
-        if !present {
+        if !names(into, &item, &artist) {
             into.push(item);
         }
     }
     into.truncate(cap);
+}
+
+/// Takes from `into` and `from` in turn, skipping artists already taken by
+/// folded name or MBID, up to `cap`: a full first list cannot crowd out the
+/// second one's first artists.
+fn interleave<T>(
+    into: &mut Vec<T>,
+    from: Vec<T>,
+    cap: usize,
+    artist: impl Fn(&T) -> (&str, Option<&str>),
+) {
+    let mut base = std::mem::take(into).into_iter();
+    let mut from = from.into_iter();
+    while into.len() < cap {
+        let (a, b) = (base.next(), from.next());
+        if a.is_none() && b.is_none() {
+            break;
+        }
+        for item in a.into_iter().chain(b) {
+            if into.len() < cap && !names(into, &item, &artist) {
+                into.push(item);
+            }
+        }
+    }
+}
+
+/// Whether `list` holds the artist of `item`, by folded name or MBID.
+fn names<T>(list: &[T], item: &T, artist: &impl Fn(&T) -> (&str, Option<&str>)) -> bool {
+    let (name, mbid) = artist(item);
+    let name = fold_name(name);
+    list.iter().any(|x| {
+        let (n, m) = artist(x);
+        fold_name(n) == name || matches!((m, mbid), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b))
+    })
 }
 
 #[cfg(test)]
@@ -473,7 +500,7 @@ mod tests {
     use super::*;
     use crate::engine::test_support::*;
     use crate::ListeningHistory;
-    use shared::recommendation::{Listen, PlayedTrack};
+    use shared::recommendation::{Listen, PlayedTrack, TrackRef};
 
     const SH: &str = "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
     const VN: &str = "2e3f4a5b-6c7d-4e8f-9a0b-1c2d3e4f5a6b";
@@ -524,14 +551,27 @@ mod tests {
 
     #[tokio::test]
     async fn listenbrainz_is_the_base_and_navidrome_adds_its_seeds_and_library() {
+        // More of each than the caps hold, so Navidrome only gets in by taking turns.
+        let tops = |prefix: &str| -> Vec<PlayedArtist> {
+            (0..SEED_ARTISTS + 2)
+                .map(|i| played(&format!("{prefix}{i}"), None, 100 - i as u64))
+                .collect()
+        };
+        let loved = |prefix: &str| -> Vec<TrackRef> {
+            (0..FAVOURITE_ARTISTS + 2)
+                .map(|i| track(&format!("{prefix}{i}"), None, "t", None))
+                .collect()
+        };
         let listenbrainz = FakeHistory {
             name: "ListenBrainz",
-            top_artists: vec![played("A", None, 5)],
+            top_artists: tops("LB"),
+            favourites: loved("LB loved "),
             ..Default::default()
         };
         let navidrome = FakeHistory {
             name: "Navidrome",
-            top_artists: vec![played("B", None, 3)],
+            top_artists: tops("ND"),
+            favourites: loved("ND starred "),
             known: known_of(&["C"]),
             ..Default::default()
         };
@@ -539,10 +579,53 @@ mod tests {
             [Arc::new(listenbrainz), Arc::new(navidrome)];
         let b = build_profile(&histories, &FakeKnowledge::default()).await;
         assert_eq!(b.sources, ["ListenBrainz", "Navidrome"]);
-        assert_eq!(names(&b.profile.seed_artists), ["A", "B"]);
-        for name in ["A", "B", "C"] {
+        assert_eq!(
+            names(&b.profile.seed_artists),
+            ["LB0", "ND0", "LB1", "ND1", "LB2", "ND2", "LB3", "ND3", "LB4", "ND4"]
+        );
+        let first_favourites: Vec<&str> = b
+            .profile
+            .favourite_artists
+            .iter()
+            .take(10)
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            first_favourites,
+            [
+                "LB loved 0",
+                "ND starred 0",
+                "LB loved 1",
+                "ND starred 1",
+                "LB loved 2",
+                "ND starred 2",
+                "LB loved 3",
+                "ND starred 3",
+                "LB loved 4",
+                "ND starred 4"
+            ]
+        );
+        assert_eq!(b.profile.favourite_artists.len(), FAVOURITE_ARTISTS);
+        for name in ["LB11", "ND11", "C"] {
             assert!(b.profile.known.knows_artist(&artist(name, None)), "{name}");
         }
+    }
+
+    #[test]
+    fn interleaving_skips_an_artist_the_other_list_already_holds() {
+        let mut base = vec![artist("A", None), artist("B", Some(SH))];
+        interleave(
+            &mut base,
+            vec![
+                artist("a", None),
+                artist("Other B", Some(SH)),
+                artist("C", None),
+            ],
+            3,
+            |a| (&a.name, a.mbid.as_deref()),
+        );
+        let got: Vec<&str> = base.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(got, ["A", "B", "C"]);
     }
 
     #[tokio::test]
