@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use shared::recommendation::TimePeriod;
 
 use crate::polite::{Pace, PoliteClient, RemoteError};
@@ -31,7 +32,7 @@ impl ListenBrainzClient {
     ) -> Result<Vec<LbArtist>, RemoteError> {
         let path = format!(
             "/1/stats/user/{}/artists?range={}&count={count}",
-            encode(user),
+            path_segment(user),
             range(period)
         );
         let page: Option<Payload<ArtistsPayload<LbArtist>>> = self.http.get(&path).await?;
@@ -46,7 +47,7 @@ impl ListenBrainzClient {
     ) -> Result<Vec<LbRecording>, RemoteError> {
         let path = format!(
             "/1/stats/user/{}/recordings?range={}&count={count}",
-            encode(user),
+            path_segment(user),
             range(period)
         );
         let page: Option<Payload<RecordingsPayload>> = self.http.get(&path).await?;
@@ -59,7 +60,11 @@ impl ListenBrainzClient {
         user: &str,
         count: usize,
     ) -> Result<Vec<LbListen>, RemoteError> {
-        let path = format!("/1/user/{}/listens?count={}", encode(user), count.min(1000));
+        let path = format!(
+            "/1/user/{}/listens?count={}",
+            path_segment(user),
+            count.min(1000)
+        );
         let page: Option<Payload<ListensPayload>> = self.http.get(&path).await?;
         Ok(page.map(|p| p.payload.listens).unwrap_or_default())
     }
@@ -67,7 +72,7 @@ impl ListenBrainzClient {
     pub async fn user_loved(&self, user: &str) -> Result<Vec<LbFeedback>, RemoteError> {
         let path = format!(
             "/1/feedback/user/{}/get-feedback?score=1&metadata=true&count=1000",
-            encode(user)
+            path_segment(user)
         );
         let page: Option<FeedbackPage> = self.http.get(&path).await?;
         Ok(page.map(|p| p.feedback).unwrap_or_default())
@@ -164,9 +169,17 @@ fn range(period: TimePeriod) -> &'static str {
     }
 }
 
-/// Form encoding for user names and tags in a path or query.
+/// Form encoding for tags in a query string.
 pub(super) fn encode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'~');
+
+/// User names sit in a path, which ListenBrainz only percent-decodes, so a
+/// space must be %20 and never '+'.
+fn path_segment(s: &str) -> String {
+    utf8_percent_encode(s, PATH_SEGMENT).to_string()
 }
 
 #[cfg(test)]
@@ -504,7 +517,7 @@ mod tests {
         assert!(lb.user_listens("a b&c", 5000).await.unwrap().is_empty());
         assert_eq!(
             seen.lock().unwrap()[0].target,
-            "/1/user/a+b%26c/listens?count=1000"
+            "/1/user/a%20b%26c/listens?count=1000"
         );
     }
 }
