@@ -296,7 +296,7 @@ async fn run_recommendations() {
     let due = match due_in(&DB).await {
         Ok(due) => due,
         Err(e) => {
-            info!("Recommendations: failed to get the users with discovery on: {e}");
+            warn!("Recommendations: failed to get the users with discovery on: {e}");
             return;
         }
     };
@@ -308,7 +308,7 @@ async fn run_recommendations() {
                 "Recommendations: generated {} candidates for user {}",
                 count, user.username
             ),
-            Err(f) => info!(
+            Err(f) => warn!(
                 "Recommendations: generation failed for {}: {}",
                 user.username,
                 crate::core::logged(&f)

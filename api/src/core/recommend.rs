@@ -7,7 +7,8 @@ use std::sync::Arc;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::navidrome::LastRun;
 use shared::recommendation::{
-    Candidate, DiscoveryProfile, EngineReport, EngineState, ProfileConfig, NO_LISTENING_DATA,
+    Candidate, DiscoveryProfile, EngineReport, EngineState, ProfileConfig, SourceErrors,
+    NO_LISTENING_DATA,
 };
 use soulbeet::deezer::DeezerClient;
 use soulbeet::engine::catalog::CatalogGenerator;
@@ -25,7 +26,7 @@ use soulbeet::polite::{Pace, RemoteError};
 use soulbeet::traits::MusicBrainzLookup;
 use soulbeet::{CandidateGenerator, KnowledgeCache, ListeningHistory};
 use sqlx::SqlitePool;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::UserId;
 use crate::core::database_failure;
@@ -106,8 +107,9 @@ pub(crate) async fn due_in(db: &SqlitePool) -> Result<Vec<(User, Vec<DiscoveryPr
 
 /// Builds the user's profile once, then stores each of `profiles`' candidates and report.
 /// Returns how many candidates were stored in all. Fails when the Navidrome library cannot
-/// be read, since without it the user's own music could be recommended back to them, and
-/// when the profile has nothing to start from, after storing the reports that say so.
+/// be read, since without it the user's own music could be recommended back to them, when a
+/// remote client cannot be set up, and when the profile has nothing to start from, each
+/// after storing the reports that say so.
 pub(crate) async fn generate_in(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,
@@ -119,13 +121,66 @@ pub(crate) async fn generate_in(
     let settings = UserSettings::get_in(db, &user_id)
         .await
         .map_err(|e| database_failure(Stage::Input, e))?;
-    let plan = plan_for(&settings);
+    let RunSources {
+        histories,
+        generators,
+        knowledge,
+    } = match sources_of(navidrome, services, user, plan_for(&settings)).await {
+        Ok(sources) => sources,
+        Err((source, failure)) => {
+            store_failure_in(db, &user_id, profiles, source, &failure).await;
+            return Err(failure);
+        }
+    };
 
+    let build = build_profile(&histories, knowledge.as_ref()).await;
+    let stored = |e: String| database_failure(Stage::Input, e);
+    let mut total = 0u32;
+    for profile in profiles {
+        let config = ProfileConfig::from_profile(*profile);
+        let (candidates, report) = recommend(
+            &build,
+            &generators,
+            knowledge.as_ref(),
+            &config,
+            CANDIDATES_PER_PROFILE,
+        )
+        .await;
+        let name = profile.name();
+        store_run_in(db, &user_id, name, &candidates, &report)
+            .await
+            .map_err(stored)?;
+        info!("{name}: {} candidates for {user_id}", candidates.len());
+        total += candidates.len() as u32;
+    }
+    if !build.profile.has_seeds() {
+        return Err(no_listening_data());
+    }
+    Ok(total)
+}
+
+/// What a run reads: the user's histories, the generators their settings turn on, and the
+/// knowledge about music.
+struct RunSources {
+    histories: Vec<Arc<dyn ListeningHistory>>,
+    generators: Vec<Arc<dyn CandidateGenerator>>,
+    knowledge: Arc<MetaBrainzKnowledge>,
+}
+
+/// Reads the Navidrome library and sets up the remote clients `plan` turns on. Fails with
+/// the name of the source that could not be read or set up.
+async fn sources_of(
+    navidrome: &dyn NavidromeOf,
+    services: &DiscoveryServices,
+    user: &UserId,
+    plan: SourcePlan,
+) -> Result<RunSources, (&'static str, Failure)> {
     let navi = navidrome.navidrome_of(user).await.map_err(|e| {
-        e.failure(
+        let failure = e.failure(
             Stage::Input,
             format!("Discovery needs your Navidrome library: {e}"),
-        )
+        );
+        ("Navidrome", failure)
     })?;
     let library = soulbeet::history::navidrome::read(&navi)
         .await
@@ -172,31 +227,37 @@ pub(crate) async fn generate_in(
         .map_err(client_failure)?;
         generators.push(Arc::new(DeezerGenerator::new(Arc::new(deezer))));
     }
+    Ok(RunSources {
+        histories,
+        generators,
+        knowledge,
+    })
+}
 
-    let build = build_profile(&histories, knowledge.as_ref()).await;
-    let stored = |e: String| database_failure(Stage::Input, e);
-    let mut total = 0u32;
+/// Stores for each of `profiles` the report of a run that ended before recommending, because
+/// `source` failed, so the Discovery page shows it. Their pools stay, as an outage's do. A
+/// report that cannot be stored is logged: the run's own failure is what the caller needs.
+async fn store_failure_in(
+    db: &SqlitePool,
+    user_id: &str,
+    profiles: &[DiscoveryProfile],
+    source: &str,
+    failure: &Failure,
+) {
+    let mut errors = SourceErrors::default();
+    errors.record(source, &failure.message);
+    let report = EngineReport {
+        source_errors: errors.into_vec(),
+        ..Default::default()
+    };
     for profile in profiles {
-        let config = ProfileConfig::from_profile(*profile);
-        let (candidates, report) = recommend(
-            &build,
-            &generators,
-            knowledge.as_ref(),
-            &config,
-            CANDIDATES_PER_PROFILE,
-        )
-        .await;
-        let name = profile.name();
-        store_run_in(db, &user_id, name, &candidates, &report)
-            .await
-            .map_err(stored)?;
-        info!("{name}: {} candidates for {user_id}", candidates.len());
-        total += candidates.len() as u32;
+        if let Err(e) = store_run_in(db, user_id, profile.name(), &[], &report).await {
+            warn!(
+                "Could not store the failed run of {} for {user_id}: {e}",
+                profile.name()
+            );
+        }
     }
-    if !build.profile.has_seeds() {
-        return Err(no_listening_data());
-    }
-    Ok(total)
 }
 
 /// The profile has no seeds: nothing played or starred in Navidrome and no ListenBrainz history.
@@ -281,9 +342,9 @@ pub(crate) fn last_run_of(rows: Vec<EngineReportRow>) -> Option<LastRun> {
     Some(last)
 }
 
-/// The Navidrome library could not be read in full.
-fn library_failure(e: HistoryError) -> Failure {
-    match &e {
+/// The Navidrome library could not be read in full, with the source that failed.
+fn library_failure(e: HistoryError) -> (&'static str, Failure) {
+    let failure = match &e {
         HistoryError::Navidrome(n) => n.failure(
             Stage::Input,
             format!("Discovery needs your Navidrome library: {e}"),
@@ -294,17 +355,20 @@ fn library_failure(e: HistoryError) -> Failure {
             RetryAdvice::SameSourceLater,
             format!("{e}. Try again later."),
         ),
-    }
+    };
+    (e.service(), failure)
 }
 
 /// A remote client that cannot be set up: its host is not a URL, or no HTTP client builds.
-fn client_failure(e: RemoteError) -> Failure {
-    Failure::new(
+/// With the service it is for.
+fn client_failure(e: RemoteError) -> (&'static str, Failure) {
+    let failure = Failure::new(
         FailureCode::MetadataUnavailable,
         Stage::Input,
         RetryAdvice::NotRetryable,
         e.to_string(),
-    )
+    );
+    (e.service(), failure)
 }
 
 #[cfg(test)]
@@ -312,6 +376,7 @@ mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::models::user_settings::UpdateUserSettings;
+    use crate::test_navidrome::{NavidromeFor, NavidromeStub, BAD_GATEWAY};
     use shared::recommendation::SourceError;
     use shared::system::NavidromeStatus;
 
@@ -533,6 +598,101 @@ mod tests {
             discovery_folder_id: folder.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    /// MusicBrainz for runs that must not reach it.
+    struct NoMusicBrainz;
+
+    #[async_trait::async_trait]
+    impl MusicBrainzLookup for NoMusicBrainz {
+        async fn search_artists(
+            &self,
+            name: &str,
+            _: u8,
+        ) -> Result<Vec<soulbeet::musicbrainz::ArtistMatch>, soulbeet::MetadataError> {
+            panic!("this run asks MusicBrainz nothing, yet searched {name}")
+        }
+
+        async fn genre_names(&self) -> Result<Vec<String>, soulbeet::MetadataError> {
+            panic!("this run asks MusicBrainz nothing, yet read its genres")
+        }
+    }
+
+    /// A host nothing listens on, for services a run must not reach.
+    const UNREACHED: &str = "http://127.0.0.1:9";
+
+    /// The services of a run whose ListenBrainz is at `listenbrainz`, asked without pauses
+    /// or retries.
+    fn services_at(db: &SqlitePool, listenbrainz: &str) -> DiscoveryServices {
+        let pace = Pace {
+            min_interval: std::time::Duration::ZERO,
+            backoff: std::time::Duration::ZERO,
+            retries: 0,
+            timeout: std::time::Duration::from_secs(5),
+        };
+        DiscoveryServices {
+            hosts: KnowledgeHosts {
+                listenbrainz: listenbrainz.into(),
+                labs: UNREACHED.into(),
+                deezer: UNREACHED.into(),
+            },
+            cache: Arc::new(SqliteKnowledgeCache::new(db.clone())),
+            musicbrainz: Arc::new(NoMusicBrainz),
+            metabrainz_pace: pace,
+            deezer_pace: pace,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_that_cannot_read_navidrome_says_so_for_each_profile_and_keeps_the_pool() {
+        let db = test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        store_run_in(
+            &db,
+            "alice",
+            "Balanced",
+            &[cand("A", "a1")],
+            &EngineReport::default(),
+        )
+        .await
+        .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer_when("/api/song", "_start=0", 502, BAD_GATEWAY);
+
+        let f = generate_in(
+            &db,
+            &NavidromeFor(Ok(navi.client())),
+            &services_at(&db, UNREACHED),
+            &UserId::new("alice"),
+            &[DiscoveryProfile::Balanced, DiscoveryProfile::Adventurous],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(f.code, FailureCode::NavidromeUnreachable);
+        let rows = EngineReportRow::latest_per_profile_in(&db, "alice")
+            .await
+            .unwrap();
+        let mut stored: Vec<&str> = rows.iter().map(|r| r.profile.as_str()).collect();
+        stored.sort();
+        assert_eq!(stored, ["Adventurous", "Balanced"]);
+        let run = last_run_of(rows).unwrap();
+        assert!(run.sources.is_empty());
+        assert_eq!(
+            run.source_errors,
+            [SourceError {
+                source: "Navidrome".into(),
+                message: f.message.clone(),
+                failures: 1,
+            }]
+        );
+        assert_eq!(
+            tracks(
+                DiscoveryCandidateRow::get_unused_in(&db, "alice", "Balanced", 10)
+                    .await
+                    .unwrap()
+            ),
+            ["a1"]
+        );
     }
 
     #[tokio::test]

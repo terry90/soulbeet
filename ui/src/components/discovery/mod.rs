@@ -212,7 +212,10 @@ fn LastRunLine(run: LastRun) -> Element {
     }
     let used = run.sources.join(", ");
     rsx! {
-        p { class: "text-gray-400 text-xs font-mono mt-1", "Last run used: {used}" }
+        // A run that failed before recommending used no source.
+        if !run.sources.is_empty() {
+            p { class: "text-gray-400 text-xs font-mono mt-1", "Last run used: {used}" }
+        }
         for e in &run.source_errors {
             p { class: "text-red-400 text-xs font-mono", "{e.source} failed: {e.message}" }
         }
@@ -598,10 +601,22 @@ mod tests {
         assert!(html.contains("Deezer failed: Deezer kept refusing for too many requests"));
         let empty = LastRun {
             state: EngineState::NoListeningData,
-            ..run
+            ..run.clone()
         };
         assert!(
             render_run(empty).contains("No listening data yet. Play or star music in Navidrome.")
         );
+        let unread = LastRun {
+            sources: vec![],
+            source_errors: vec![SourceError {
+                source: "Navidrome".into(),
+                message: "Discovery needs your Navidrome library".into(),
+                failures: 1,
+            }],
+            ..run
+        };
+        let html = render_run(unread);
+        assert!(!html.contains("Last run used"));
+        assert!(html.contains("Navidrome failed: Discovery needs your Navidrome library"));
     }
 }
