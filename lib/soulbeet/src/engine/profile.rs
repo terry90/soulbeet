@@ -335,6 +335,7 @@ async fn build_momentum_artists(
             momentum_list.push(MomentumArtist {
                 name: artist.name.clone(),
                 momentum_score: momentum,
+                mbid: None,
             });
         }
     }

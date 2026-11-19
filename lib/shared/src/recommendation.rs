@@ -182,6 +182,19 @@ pub struct UserMusicProfile {
     pub known_artist_names: Vec<String>, // lowercased top artist names for filtering
     #[serde(default)]
     pub known_track_keys: Vec<String>, // "artist:track" lowercased keys for filtering
+    #[serde(default)]
+    pub seed_artists: Vec<PlayedArtist>,
+    #[serde(default)]
+    pub favourite_artists: Vec<ArtistRef>,
+    #[serde(default)]
+    pub known: KnownMusic,
+}
+
+impl UserMusicProfile {
+    /// Generators start from seed and favourite artists; without either there is nothing to follow.
+    pub fn has_seeds(&self) -> bool {
+        !self.seed_artists.is_empty() || !self.favourite_artists.is_empty()
+    }
 }
 
 /// An artist with momentum (gaining in recent listening vs all-time)
@@ -189,6 +202,8 @@ pub struct UserMusicProfile {
 pub struct MomentumArtist {
     pub name: String,
     pub momentum_score: f64, // how much they've climbed in recent rank
+    #[serde(default)]
+    pub mbid: Option<String>,
 }
 
 /// A recommendation candidate with score and provenance

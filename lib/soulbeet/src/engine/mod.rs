@@ -3,6 +3,9 @@ pub mod diversifier;
 pub mod freshness;
 pub mod lastfm_pipeline;
 pub mod profile;
+pub mod taste;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
