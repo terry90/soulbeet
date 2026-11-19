@@ -7,7 +7,7 @@ use std::sync::Arc;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::navidrome::LastRun;
 use shared::recommendation::{
-    Candidate, DiscoveryProfile, EngineReport, ProfileConfig, NO_LISTENING_DATA,
+    Candidate, DiscoveryProfile, EngineReport, EngineState, ProfileConfig, NO_LISTENING_DATA,
 };
 use soulbeet::deezer::DeezerClient;
 use soulbeet::engine::catalog::CatalogGenerator;
@@ -245,17 +245,40 @@ pub(crate) async fn store_run_in(
     tx.commit().await.map_err(|e| e.to_string())
 }
 
-/// The latest run as the Discovery page shows it. None when there is no run, or its report
-/// does not parse.
-pub(crate) fn last_run_of(row: Option<EngineReportRow>) -> Option<LastRun> {
-    let row = row?;
-    let report: EngineReport = serde_json::from_str(&row.report_json).ok()?;
-    Some(LastRun {
-        created_at: row.created_at,
-        state: report.state,
-        sources: report.sources,
-        source_errors: report.source_errors,
-    })
+/// The latest run as the Discovery page shows it, from each profile's newest report: when the
+/// newest was stored, every source they used and their distinct failures. No listening data
+/// only when no profile had any. None when there is no report, or none parses.
+pub(crate) fn last_run_of(rows: Vec<EngineReportRow>) -> Option<LastRun> {
+    let mut runs = (rows.into_iter()).filter_map(|row| {
+        let report: EngineReport = serde_json::from_str(&row.report_json).ok()?;
+        Some((row.created_at, report))
+    });
+    let (created_at, first) = runs.next()?;
+    let mut last = LastRun {
+        created_at,
+        state: first.state,
+        sources: first.sources,
+        source_errors: first.source_errors,
+    };
+    for (created_at, report) in runs {
+        last.created_at = last.created_at.max(created_at);
+        if report.state != EngineState::NoListeningData {
+            last.state = report.state;
+        }
+        for source in report.sources {
+            if !last.sources.contains(&source) {
+                last.sources.push(source);
+            }
+        }
+        for error in report.source_errors {
+            let seen = (last.source_errors.iter())
+                .any(|e| e.source == error.source && e.message == error.message);
+            if !seen {
+                last.source_errors.push(error);
+            }
+        }
+    }
+    Some(last)
 }
 
 /// The Navidrome library could not be read in full.
@@ -289,7 +312,7 @@ mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::models::user_settings::UpdateUserSettings;
-    use shared::recommendation::{EngineState, SourceError};
+    use shared::recommendation::SourceError;
     use shared::system::NavidromeStatus;
 
     fn cand(artist: &str, track: &str) -> Candidate {
@@ -385,7 +408,7 @@ mod tests {
     #[test]
     fn the_last_run_reads_reports_of_both_shapes() {
         assert_eq!(
-            last_run_of(Some(report_row(REPORT_0_9_0))),
+            last_run_of(vec![report_row(REPORT_0_9_0)]),
             Some(LastRun {
                 created_at: "2026-11-19 08:00:00".into(),
                 state: EngineState::Recommended,
@@ -399,13 +422,78 @@ mod tests {
             ..Default::default()
         };
         let row = report_row(&serde_json::to_string(&empty).unwrap());
-        let run = last_run_of(Some(row)).unwrap();
+        let run = last_run_of(vec![row]).unwrap();
         assert_eq!(
             (run.state, run.sources),
             (EngineState::NoListeningData, vec!["Navidrome".to_string()])
         );
-        assert_eq!(last_run_of(Some(report_row("not json"))), None);
-        assert_eq!(last_run_of(None), None);
+        assert_eq!(last_run_of(vec![report_row("not json")]), None);
+        assert_eq!(last_run_of(vec![]), None);
+    }
+
+    /// A report that used `sources` and saw `errors`, each (source, message), fail once.
+    fn report_of(sources: &[&str], errors: &[(&str, &str)]) -> EngineReport {
+        EngineReport {
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            source_errors: (errors.iter())
+                .map(|(source, message)| SourceError {
+                    source: source.to_string(),
+                    message: message.to_string(),
+                    failures: 1,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_last_run_joins_the_newest_report_of_each_profile() {
+        let db = test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        // Stored within one second, as a cycle's profiles often are.
+        for (profile, report) in [
+            ("Balanced", report_of(&["Navidrome"], &[("Deezer", "old")])),
+            ("Balanced", report_of(&["Navidrome", "catalog"], &[])),
+            (
+                "Adventurous",
+                report_of(&["Navidrome", "deezer"], &[("ListenBrainz Labs", "down")]),
+            ),
+            (
+                "Conservative",
+                report_of(&["Navidrome"], &[("ListenBrainz Labs", "down")]),
+            ),
+        ] {
+            store_run_in(&db, "alice", profile, &[], &report)
+                .await
+                .unwrap();
+        }
+        let rows = EngineReportRow::latest_per_profile_in(&db, "alice")
+            .await
+            .unwrap();
+        let run = last_run_of(rows).unwrap();
+        let mut sources = run.sources.clone();
+        sources.sort();
+        assert_eq!(sources, ["Navidrome", "catalog", "deezer"]);
+        assert_eq!(
+            run.source_errors,
+            report_of(&[], &[("ListenBrainz Labs", "down")]).source_errors
+        );
+    }
+
+    #[test]
+    fn the_last_run_has_no_listening_data_only_when_no_profile_had_any() {
+        let empty = EngineReport {
+            state: EngineState::NoListeningData,
+            ..Default::default()
+        };
+        let empty = report_row(&serde_json::to_string(&empty).unwrap());
+        let state = |rows: Vec<EngineReportRow>| last_run_of(rows).unwrap().state;
+        assert_eq!(
+            state(vec![empty.clone(), empty.clone()]),
+            EngineState::NoListeningData
+        );
+        let recommended = report_row(&serde_json::to_string(&EngineReport::default()).unwrap());
+        assert_eq!(state(vec![empty, recommended]), EngineState::Recommended);
     }
 
     #[test]

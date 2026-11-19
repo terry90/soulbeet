@@ -106,9 +106,12 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
     let lifetime_days = settings.parse_lifetime_days();
     let playlist_names =
         serde_json::from_str(&settings.discovery_playlist_name).unwrap_or_default();
-    let latest = crate::models::engine_report::EngineReportRow::get_history(&auth.0.user_id, 1)
-        .await
-        .map_err(server_error)?;
+    let latest = crate::models::engine_report::EngineReportRow::latest_per_profile_in(
+        &crate::db::DB,
+        &auth.0.user_id,
+    )
+    .await
+    .map_err(server_error)?;
     Ok(DiscoveryConfig {
         enabled: settings.discovery_enabled,
         folder_id: settings.discovery_folder_id,
@@ -118,7 +121,7 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
         profiles: settings.discovery_profiles,
         playlist_names,
         last_generated_at: settings.discovery_last_generated_at,
-        last_run: crate::core::recommend::last_run_of(latest.into_iter().next()),
+        last_run: crate::core::recommend::last_run_of(latest),
     })
 }
 

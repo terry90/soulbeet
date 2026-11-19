@@ -40,13 +40,32 @@ impl EngineReportRow {
         Ok(())
     }
 
+    /// The newest first. created_at has whole seconds, so rowid orders reports stored in one.
     pub async fn get_history(user_id: &str, limit: u32) -> Result<Vec<Self>, String> {
         sqlx::query_as::<_, Self>(
-            "SELECT * FROM engine_reports WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM engine_reports WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
         )
         .bind(user_id)
         .bind(limit)
         .fetch_all(&*DB)
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// Each profile's newest report, the newest first: what describes its candidate pool now.
+    pub(crate) async fn latest_per_profile_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+    ) -> Result<Vec<Self>, String> {
+        sqlx::query_as::<_, Self>(
+            "SELECT id, user_id, profile, report_json, candidate_count, created_at FROM (
+               SELECT *, rowid AS seq, ROW_NUMBER() OVER (
+                 PARTITION BY profile ORDER BY created_at DESC, rowid DESC
+               ) AS n FROM engine_reports WHERE user_id = ?
+             ) WHERE n = 1 ORDER BY created_at DESC, seq DESC",
+        )
+        .bind(user_id)
+        .fetch_all(db)
         .await
         .map_err(|e| e.to_string())
     }
@@ -58,7 +77,7 @@ impl EngineReportRow {
         keep: u32,
     ) -> Result<(), String> {
         sqlx::query(
-            "DELETE FROM engine_reports WHERE user_id = ? AND id NOT IN (SELECT id FROM engine_reports WHERE user_id = ? ORDER BY created_at DESC LIMIT ?)",
+            "DELETE FROM engine_reports WHERE user_id = ? AND id NOT IN (SELECT id FROM engine_reports WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?)",
         )
         .bind(user_id)
         .bind(user_id)
