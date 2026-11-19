@@ -59,17 +59,23 @@ impl DeezerClient {
     }
 
     async fn list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, KnowledgeError> {
-        let envelope: Envelope<T> = self.http.get(path).await?.unwrap_or(Envelope {
-            data: None,
-            error: None,
-        });
+        let Some(envelope) = self.http.get::<Envelope<T>>(path).await? else {
+            return Ok(Vec::new());
+        };
         match envelope.error {
             Some(e) if e.code == NO_DATA => Ok(Vec::new()),
             Some(e) => Err(KnowledgeError::Deezer {
                 code: e.code,
                 message: e.message,
             }),
-            None => Ok(envelope.data.unwrap_or_default()),
+            // An answer with neither data nor error must not be cached as "nothing there".
+            None => envelope.data.ok_or_else(|| {
+                RemoteError::Unreadable {
+                    service: "Deezer",
+                    detail: "no data and no error".into(),
+                }
+                .into()
+            }),
         }
     }
 }
@@ -136,6 +142,18 @@ mod tests {
     async fn a_radio_without_data_is_empty() {
         let (base, _) = serve(vec![ok(include_str!("fixtures/radio_no_data.json"))]);
         assert_eq!(client(&base).artist_radio(1).await.unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_data_or_error_is_not_cached() {
+        let (base, seen) = serve(vec![ok("{}"), ok(NUNO)]);
+        let dz = client(&base);
+        assert!(matches!(
+            dz.artist_radio(4193009).await,
+            Err(KnowledgeError::Remote(RemoteError::Unreadable { .. }))
+        ));
+        assert_eq!(dz.artist_radio(4193009).await.unwrap().len(), 5);
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
