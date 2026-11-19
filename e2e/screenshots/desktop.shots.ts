@@ -4,8 +4,10 @@
 import { expect, test } from '@playwright/test';
 import { openDownloadsPanel, openSettings } from '../helpers/app.js';
 import { save, searchAsUser } from './save.js';
+import { holdTransfers } from './transfers.js';
 
 test('search, album, downloads, dashboard and settings', async ({ page }) => {
+  const showTransfers = await holdTransfers(page);
   await searchAsUser(page);
   await save(page, 'search');
 
@@ -17,7 +19,10 @@ test('search, album, downloads, dashboard and settings', async ({ page }) => {
   await page.getByRole('heading', { name: 'Search Results' }).evaluate((heading) => heading.scrollIntoView({ block: 'start' }));
   await save(page, 'album');
 
+  const [title, artist] = await album.getByRole('paragraph').allTextContents();
+  showTransfers(artist, title, await album.locator('span.flex-grow').allTextContents());
   await openDownloadsPanel(page);
+  await expect(page.getByText('LIB', { exact: true }).first()).toBeVisible();
   await save(page, 'downloads');
   await page.getByRole('button', { name: 'Close downloads' }).click();
 

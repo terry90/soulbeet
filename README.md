@@ -350,7 +350,7 @@ When enabled (Settings > Library > Auto-delete), 1-star tracks are deleted from 
 
 ### Refreshing the screenshots
 
-The pictures in [screenshots](./screenshots) are taken on a running Soulbeet, so they show a real library. Nothing is downloaded or changed there.
+The pictures in [screenshots](./screenshots) are taken on a running Soulbeet, so they show a real library. Nothing is downloaded or changed there: the downloads panel is staged, it shows the album you searched for part way through without fetching it.
 
 ```bash
 cd e2e && npm ci && npx playwright install chromium
