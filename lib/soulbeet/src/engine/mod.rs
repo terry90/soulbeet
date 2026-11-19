@@ -1,5 +1,6 @@
 pub mod blender;
 pub mod catalog;
+pub mod deezer_radio;
 pub mod diversifier;
 pub mod freshness;
 pub mod lastfm_pipeline;
