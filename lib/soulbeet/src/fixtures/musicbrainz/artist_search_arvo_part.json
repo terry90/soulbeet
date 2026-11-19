@@ -1,0 +1,162 @@
+{
+ "created": "2026-11-19T16:22:19.995Z",
+ "count": 1,
+ "offset": 0,
+ "artists": [
+  {
+   "id": "ae0b2424-d4c5-4c54-82ac-fe3be5453270",
+   "type": "Person",
+   "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+   "score": 100,
+   "gender-id": "36d3d30a-839d-3eda-8cb3-29be4384e4a9",
+   "name": "Arvo Pärt",
+   "sort-name": "Pärt, Arvo",
+   "gender": "male",
+   "country": "EE",
+   "area": {
+    "id": "e1c1215f-dcc0-35b4-b840-d2ca2151593b",
+    "type": "Country",
+    "type-id": "06dd0ae4-8c74-30bb-b43d-95dcedf961de",
+    "name": "Estonia",
+    "sort-name": "Estonia",
+    "life-span": {
+     "ended": null
+    }
+   },
+   "begin-area": {
+    "id": "060e538d-a434-4ed0-8201-453e693f279e",
+    "type": "City",
+    "type-id": "6fd8f29a-3d0a-32fc-980d-ea697b69da78",
+    "name": "Paide",
+    "sort-name": "Paide",
+    "life-span": {
+     "ended": null
+    }
+   },
+   "disambiguation": "Estonian composer",
+   "ipis": [
+    "00084495149",
+    "00086019765"
+   ],
+   "isnis": [
+    "0000000110050480"
+   ],
+   "life-span": {
+    "begin": "1935-09-11",
+    "ended": null
+   },
+   "aliases": [
+    {
+     "sort-name": "Avro Part",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "Avro Part",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Arvo Part",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "Arvo Part",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Pärt, Arvo",
+     "type-id": "d4dcd0c0-b341-3612-a332-c0ce797b25cf",
+     "name": "Arvo Pärt",
+     "locale": "et",
+     "type": "Legal name",
+     "primary": true,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "A. Pärt",
+     "name": "A. Pärt",
+     "locale": null,
+     "type": null,
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Pärt",
+     "name": "Pärt",
+     "locale": null,
+     "type": null,
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    }
+   ],
+   "tags": [
+    {
+     "count": 5,
+     "name": "classical"
+    },
+    {
+     "count": 0,
+     "name": "orchestral"
+    },
+    {
+     "count": 5,
+     "name": "composer"
+    },
+    {
+     "count": 1,
+     "name": "contemporary classical"
+    },
+    {
+     "count": 0,
+     "name": "choral"
+    },
+    {
+     "count": 2,
+     "name": "contemporary"
+    },
+    {
+     "count": 0,
+     "name": "symphony"
+    },
+    {
+     "count": 2,
+     "name": "estonian"
+    },
+    {
+     "count": 1,
+     "name": "minimalism"
+    },
+    {
+     "count": 4,
+     "name": "modern classical"
+    },
+    {
+     "count": 1,
+     "name": "religious"
+    },
+    {
+     "count": 1,
+     "name": "estonian composer"
+    },
+    {
+     "count": -1,
+     "name": "cleaned up"
+    },
+    {
+     "count": 1,
+     "name": "christian artist"
+    },
+    {
+     "count": 1,
+     "name": "christian liturgical music"
+    }
+   ]
+  }
+ ]
+}

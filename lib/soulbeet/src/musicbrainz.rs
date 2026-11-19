@@ -12,6 +12,7 @@ use musicbrainz_rs::{
 use serde::Serialize;
 use shared::failure::{cut_chars, Service, RAW_MAX_CHARS};
 use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, Track};
+use shared::recommendation::fold_name;
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -421,6 +422,10 @@ pub struct ArtistMatch {
     pub country: Option<String>,
     pub begin: Option<String>,
     pub end: Option<String>,
+    /// Other names MusicBrainz knows the artist by, such as a romanised one.
+    /// Kept out of the tool answers, which show the artist as before.
+    #[serde(skip)]
+    pub aliases: Vec<String>,
 }
 
 /// The recording a recording's releases were looked up for.
@@ -483,6 +488,76 @@ pub async fn search_artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, 
     Ok(found.entities.into_iter().map(artist_match).collect())
 }
 
+/// The MBID of the one artist whose name or alias equals `name` once folded;
+/// None for no such artist or for several distinct ones, so a near name like
+/// "Fishmans+" never stands in for "Fishmans".
+pub fn exact_artist(name: &str, found: &[ArtistMatch]) -> Option<String> {
+    let wanted = fold_name(name);
+    let mut hits = found
+        .iter()
+        .filter(|m| {
+            fold_name(&m.name) == wanted || m.aliases.iter().any(|a| fold_name(a) == wanted)
+        })
+        .map(|m| m.mbid.as_str());
+    let first = hits.next()?;
+    hits.all(|mbid| mbid == first).then(|| first.to_string())
+}
+
+/// The MusicBrainz web service root: `MUSICBRAINZ_HOST` is reached over
+/// http, as musicbrainz_rs reaches it.
+fn web_base(host: Option<String>) -> String {
+    match host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+        Some(host) => format!("http://{host}"),
+        None => "https://musicbrainz.org".to_string(),
+    }
+}
+
+fn genre_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Every genre name MusicBrainz knows, one request.
+pub async fn genre_names() -> Result<Vec<String>, MetadataError> {
+    let service = Service::Musicbrainz;
+    let url = format!(
+        "{}/ws/2/genre/all?fmt=txt",
+        web_base(std::env::var("MUSICBRAINZ_HOST").ok())
+    );
+    crate::http::mb_rate_limit().await;
+    let unavailable = |raw: String| MetadataError::Unavailable {
+        service,
+        status: None,
+        raw: cut_chars(raw, RAW_MAX_CHARS),
+    };
+    let client = reqwest::Client::builder()
+        .user_agent(crate::polite::USER_AGENT)
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| unavailable(e.without_url().to_string()))?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| unavailable(e.without_url().to_string()))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| unavailable(e.without_url().to_string()))?;
+    if !status.is_success() {
+        return Err(MetadataError::Rejected {
+            service,
+            status: Some(status.as_u16()),
+            raw: cut_chars(body, RAW_MAX_CHARS),
+        });
+    }
+    Ok(genre_list(&body))
+}
+
 /// The recording `mbid` and the page of releases it is on that starts at
 /// `offset`. MusicBrainz answers at most 100 releases per page
 /// (musicbrainz.org/doc/MusicBrainz_API "Browse").
@@ -527,6 +602,12 @@ fn artist_match(a: Artist) -> ArtistMatch {
         country: given(a.country),
         begin: given(life_span.begin.map(|d| d.0)),
         end: given(life_span.end.map(|d| d.0)),
+        aliases: a
+            .aliases
+            .unwrap_or_default()
+            .into_iter()
+            .map(|alias| alias.name)
+            .collect(),
     }
 }
 
@@ -632,6 +713,21 @@ impl Default for MusicBrainzProvider {
 }
 
 #[async_trait::async_trait]
+impl crate::traits::MusicBrainzLookup for MusicBrainzProvider {
+    async fn search_artists(
+        &self,
+        name: &str,
+        limit: u8,
+    ) -> Result<Vec<ArtistMatch>, MetadataError> {
+        search_artists(name, limit).await
+    }
+
+    async fn genre_names(&self) -> Result<Vec<String>, MetadataError> {
+        genre_names().await
+    }
+}
+
+#[async_trait::async_trait]
 impl crate::MetadataProvider for MusicBrainzProvider {
     fn id(&self) -> Provider {
         Provider::MusicBrainz
@@ -669,6 +765,67 @@ impl crate::MetadataProvider for MusicBrainzProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn found(mbid: &str, name: &str, aliases: &[&str]) -> ArtistMatch {
+        ArtistMatch {
+            mbid: mbid.into(),
+            name: name.into(),
+            sort_name: name.into(),
+            disambiguation: None,
+            artist_type: None,
+            country: None,
+            begin: None,
+            end: None,
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_artist_resolves_only_on_one_exact_name_or_alias() {
+        let fishmans = [
+            found("dc436953-1dc3-437d-9656-da401a0e9134", "Fishmans+", &[]),
+            found(
+                "d0f25f16-7782-42e8-8047-c16a1cb2b450",
+                "フィッシュマンズ",
+                &["Fishmans"],
+            ),
+        ];
+        assert_eq!(
+            exact_artist("Fishmans", &fishmans).as_deref(),
+            Some("d0f25f16-7782-42e8-8047-c16a1cb2b450")
+        );
+        let sleep = [
+            found("aaaaaaaa-0000-4000-8000-000000000001", "Sleep", &[]),
+            found("aaaaaaaa-0000-4000-8000-000000000002", "Sleep", &[]),
+        ];
+        assert_eq!(exact_artist("Sleep", &sleep), None);
+        assert_eq!(exact_artist("Fishman", &fishmans), None);
+    }
+
+    #[test]
+    fn aliases_come_from_the_search_answer() {
+        let body: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/musicbrainz/artist_search_arvo_part.json"
+        ))
+        .unwrap();
+        let a: Artist = serde_json::from_value(body["artists"][0].clone()).unwrap();
+        let m = artist_match(a);
+        assert!(m.aliases.contains(&"Arvo Part".to_string()));
+        assert_eq!(
+            exact_artist("arvo part", &[m]).as_deref(),
+            Some("ae0b2424-d4c5-4c54-82ac-fe3be5453270")
+        );
+    }
+
+    #[test]
+    fn the_genre_list_is_one_genre_per_line_from_the_mirror_when_set() {
+        assert_eq!(
+            genre_list(include_str!("fixtures/musicbrainz/genres.txt")).len(),
+            10
+        );
+        assert_eq!(web_base(None), "https://musicbrainz.org");
+        assert_eq!(web_base(Some("stubs:5050".into())), "http://stubs:5050");
+    }
 
     #[tokio::test]
     async fn musicbrainz_errors_keep_their_kind() {
@@ -867,7 +1024,8 @@ mod tests {
                 artist_type: Some("Person".into()),
                 country: Some("US".into()),
                 begin: Some("1903-05-03".into()),
-                end: Some("1977-10-14".into())
+                end: Some("1977-10-14".into()),
+                aliases: vec![]
             }
         );
     }

@@ -662,6 +662,7 @@ mod tests {
             country: Some("US".into()),
             begin: Some("1903-05-03".into()),
             end: Some("1977-10-14".into()),
+            aliases: vec![],
         };
         assert_eq!(
             Value::Object(artist_fields("Bing Crosby", &[crosby])),
@@ -830,6 +831,7 @@ mod tests {
             country: None,
             begin: None,
             end: None,
+            aliases: vec![],
         };
         let a = &artist_fields("Bing Crosby", &[artist])["artists"][0];
         assert_eq!(
@@ -917,6 +919,7 @@ mod tests {
             country: Some(long),
             begin: None,
             end: None,
+            aliases: vec![],
         };
         let a = &artist_fields("Bing Crosby", &[artist])["artists"][0];
         assert_eq!(

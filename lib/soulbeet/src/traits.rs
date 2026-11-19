@@ -22,6 +22,7 @@ use std::time::Duration;
 use crate::error::Result;
 use crate::history::HistoryError;
 use crate::knowledge::{CacheError, KnowledgeError};
+use crate::musicbrainz::ArtistMatch;
 use crate::MetadataError;
 
 #[async_trait]
@@ -561,6 +562,16 @@ pub trait KnowledgeCache: Send + Sync {
         value: &str,
         ttl: Duration,
     ) -> std::result::Result<(), CacheError>;
+}
+
+#[async_trait]
+pub trait MusicBrainzLookup: Send + Sync {
+    async fn search_artists(
+        &self,
+        name: &str,
+        limit: u8,
+    ) -> std::result::Result<Vec<ArtistMatch>, MetadataError>;
+    async fn genre_names(&self) -> std::result::Result<Vec<String>, MetadataError>;
 }
 
 #[async_trait]
