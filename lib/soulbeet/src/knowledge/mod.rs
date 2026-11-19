@@ -8,6 +8,8 @@ use crate::polite::RemoteError;
 use crate::traits::KnowledgeCache;
 use crate::MetadataError;
 
+pub mod metabrainz;
+
 pub const DAY: Duration = Duration::from_secs(86_400);
 pub const TTL_SIMILAR_ARTISTS: Duration = Duration::from_secs(30 * 86_400);
 pub const TTL_TOP_TRACKS: Duration = Duration::from_secs(14 * 86_400);
@@ -54,6 +56,40 @@ impl KnowledgeError {
     }
 }
 
+/// Where the knowledge clients connect. An override takes `host[:port]` and
+/// is reached over http, as `MUSICBRAINZ_HOST` is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnowledgeHosts {
+    pub listenbrainz: String,
+    pub labs: String,
+    pub deezer: String,
+}
+
+impl KnowledgeHosts {
+    pub fn from_env() -> Self {
+        Self::hosts_from(|var| std::env::var(var).ok())
+    }
+
+    fn hosts_from(read: impl Fn(&str) -> Option<String>) -> Self {
+        let host = |var: &str, default: &str| match read(var)
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
+            Some(host) => format!("http://{host}"),
+            None => default.to_string(),
+        };
+        Self {
+            listenbrainz: host("LISTENBRAINZ_HOST", "https://api.listenbrainz.org"),
+            labs: host(
+                "LISTENBRAINZ_LABS_HOST",
+                "https://labs.api.listenbrainz.org",
+            ),
+            deezer: host("DEEZER_HOST", "https://api.deezer.com"),
+        }
+    }
+}
+
 /// Serve `key` from the cache, or run `fetch` and store its answer for `ttl`.
 /// A failed fetch is returned and never stored.
 pub(crate) async fn cached<T, F>(
@@ -66,15 +102,37 @@ where
     T: Serialize + DeserializeOwned,
     F: Future<Output = Result<T, KnowledgeError>>,
 {
-    if let Some(stored) = cache.get(key).await? {
-        return serde_json::from_str(&stored)
-            .map_err(|e| CacheError(format!("unreadable cache entry {key}: {e}")).into());
+    if let Some(stored) = read(cache, key).await? {
+        return Ok(stored);
     }
     let value = fetch.await?;
-    let json = serde_json::to_string(&value)
-        .map_err(|e| CacheError(format!("cannot store {key}: {e}")))?;
-    cache.put(key, &json, ttl).await?;
+    store(cache, key, &value, ttl).await?;
     Ok(value)
+}
+
+/// The value stored under `key`; a value that does not parse is a cache error.
+pub(crate) async fn read<T: DeserializeOwned>(
+    cache: &dyn KnowledgeCache,
+    key: &str,
+) -> Result<Option<T>, KnowledgeError> {
+    match cache.get(key).await? {
+        Some(stored) => serde_json::from_str(&stored)
+            .map(Some)
+            .map_err(|e| CacheError(format!("unreadable cache entry {key}: {e}")).into()),
+        None => Ok(None),
+    }
+}
+
+pub(crate) async fn store<T: Serialize>(
+    cache: &dyn KnowledgeCache,
+    key: &str,
+    value: &T,
+    ttl: Duration,
+) -> Result<(), KnowledgeError> {
+    let json =
+        serde_json::to_string(value).map_err(|e| CacheError(format!("cannot store {key}: {e}")))?;
+    cache.put(key, &json, ttl).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -170,5 +228,22 @@ mod tests {
             KnowledgeError::Cache(CacheError("locked".into())).service(),
             "Soulbeet cache"
         );
+    }
+
+    #[test]
+    fn hosts_are_https_by_default_and_http_when_overridden() {
+        let h = KnowledgeHosts::hosts_from(|k| {
+            (k == "LISTENBRAINZ_HOST").then(|| "stubs:5060".to_string())
+        });
+        assert_eq!(
+            (h.listenbrainz.as_str(), h.labs.as_str(), h.deezer.as_str()),
+            (
+                "http://stubs:5060",
+                "https://labs.api.listenbrainz.org",
+                "https://api.deezer.com"
+            )
+        );
+        let empty = KnowledgeHosts::hosts_from(|_| Some(String::new()));
+        assert_eq!(empty.listenbrainz, "https://api.listenbrainz.org");
     }
 }
