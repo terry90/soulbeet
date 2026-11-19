@@ -281,23 +281,29 @@ fn first_recommendation_delay(rng: &mut impl rand::Rng) -> Duration {
     Duration::from_secs(30 + rng.random_range(0..RECOMMENDATION_INTERVAL.as_secs()))
 }
 
-/// One recommendation cycle: drops expired music facts, then builds each connected user's
-/// profile once and stores every discovery profile's candidates from it.
+/// One recommendation cycle: drops expired music facts, then, for each user with discovery
+/// on, builds their profile once and stores their selected profiles' candidates from it.
 #[cfg(feature = "server")]
 async fn run_recommendations() {
-    match crate::models::knowledge_cache::prune_expired_in(&crate::db::DB).await {
+    use crate::core::index::ServerNavidrome;
+    use crate::core::recommend::{due_in, generate_in, DiscoveryServices};
+    use crate::db::DB;
+
+    match crate::models::knowledge_cache::prune_expired_in(&DB).await {
         Ok(n) => info!("Recommendations: pruned {n} expired cached facts"),
         Err(e) => warn!("Recommendations: could not prune expired cached facts: {e}"),
     }
-    let connected_users = match crate::models::user::User::get_connected_users().await {
-        Ok(users) => users,
+    let due = match due_in(&DB).await {
+        Ok(due) => due,
         Err(e) => {
-            info!("Recommendations: failed to get connected users: {}", e);
+            info!("Recommendations: failed to get the users with discovery on: {e}");
             return;
         }
     };
-    for user in &connected_users {
-        match crate::server_fns::discovery::generate_recommendations_internal(&user.id).await {
+    let services = DiscoveryServices::live();
+    for (user, profiles) in &due {
+        let id = UserId::new(&user.id);
+        match generate_in(&DB, &ServerNavidrome, &services, &id, profiles).await {
             Ok(count) => info!(
                 "Recommendations: generated {} candidates for user {}",
                 count, user.username

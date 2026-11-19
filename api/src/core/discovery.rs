@@ -218,9 +218,8 @@ pub(crate) async fn start_in(
     }
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
     let track_counts = settings.parse_track_counts();
-    // Settings clears the choice by storing an empty id.
-    let folder_id = (settings.discovery_folder_id.as_ref())
-        .filter(|id| !id.is_empty())
+    let folder_id = settings
+        .discovery_folder()
         .ok_or_else(discovery_folder_required)?;
     let mut profiles = Vec::new();
     for profile in &selected_profiles {
@@ -272,12 +271,12 @@ pub(crate) async fn overview_in(
     ctx: &UserCtx,
 ) -> Result<Overview, Failure> {
     let settings = crate::core::settings::get_in(db, ctx).await?;
-    let folder = match settings.discovery_folder_id.as_deref() {
-        Some(id) if !id.is_empty() => Folder::get_by_id_in(db, id)
+    let folder = match settings.discovery_folder() {
+        Some(id) => Folder::get_by_id_in(db, id)
             .await
             .map_err(|e| database_failure(Stage::Input, e))?
             .filter(|f| f.user_id == ctx.user_id),
-        _ => None,
+        None => None,
     };
     let mut pending = match &folder {
         Some(folder) => DiscoveryTrackRow::get_pending_by_folder_in(db, &folder.id)

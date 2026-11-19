@@ -29,11 +29,13 @@ use tracing::info;
 
 use crate::auth::UserId;
 use crate::core::database_failure;
+use crate::core::discovery::parse_profiles;
 use crate::core::index::NavidromeOf;
 use crate::db::DB;
 use crate::models::discovery_candidate::DiscoveryCandidateRow;
 use crate::models::engine_report::EngineReportRow;
 use crate::models::knowledge_cache::SqliteKnowledgeCache;
+use crate::models::user::User;
 use crate::models::user_profile::UserProfileRow;
 use crate::models::user_settings::UserSettings;
 
@@ -87,6 +89,20 @@ impl DiscoveryServices {
             deezer_pace: Pace::DEEZER,
         }
     }
+}
+
+/// The users the background cycle refreshes, each with the discovery profiles they selected:
+/// connected to Navidrome, discovery on and a discovery folder chosen. No one else's library
+/// is read or sent to MetaBrainz or Deezer.
+pub(crate) async fn due_in(db: &SqlitePool) -> Result<Vec<(User, Vec<DiscoveryProfile>)>, String> {
+    let mut due = Vec::new();
+    for user in User::get_connected_users_in(db).await? {
+        let settings = UserSettings::get_in(db, &user.id).await?;
+        if settings.discovery_enabled && settings.discovery_folder().is_some() {
+            due.push((user, parse_profiles(&settings.discovery_profiles)));
+        }
+    }
+    Ok(due)
 }
 
 /// Builds the user's profile once, then stores each of `profiles`' candidates and report.
@@ -264,7 +280,9 @@ fn client_failure(e: RemoteError) -> Failure {
 mod tests {
     use super::*;
     use crate::db::test_db;
+    use crate::models::user_settings::UpdateUserSettings;
     use shared::recommendation::{EngineState, SourceError, UserMusicProfile};
+    use shared::system::NavidromeStatus;
 
     fn cand(artist: &str, track: &str) -> Candidate {
         Candidate {
@@ -413,6 +431,67 @@ mod tests {
         );
         s.deezer_recommendations = true;
         assert!(plan_for(&s).deezer);
+    }
+
+    /// Makes `user` with a folder, Navidrome `status` and `discovery` settings.
+    async fn user_with(db: &SqlitePool, user: &str, status: &str, discovery: UpdateUserSettings) {
+        crate::core::folder_of(db, user).await;
+        sqlx::query("UPDATE users SET navidrome_status = ? WHERE id = ?")
+            .bind(status)
+            .bind(user)
+            .execute(db)
+            .await
+            .unwrap();
+        UserSettings::upsert_in(db, user, discovery).await.unwrap();
+    }
+
+    fn discovery(enabled: bool, folder: Option<&str>) -> UpdateUserSettings {
+        UpdateUserSettings {
+            discovery_enabled: Some(enabled),
+            discovery_folder_id: folder.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cycle_covers_only_connected_users_with_discovery_on_and_a_folder() {
+        let db = test_db::migrated().await;
+        let connected = NavidromeStatus::Connected.as_str();
+        user_with(
+            &db,
+            "alice",
+            connected,
+            UpdateUserSettings {
+                discovery_profiles: Some("Balanced,Adventurous".into()),
+                ..discovery(true, Some("alice-folder"))
+            },
+        )
+        .await;
+        user_with(&db, "off", connected, discovery(false, Some("off-folder"))).await;
+        user_with(&db, "nofolder", connected, discovery(true, None)).await;
+        user_with(&db, "cleared", connected, discovery(true, Some(""))).await;
+        let offline = NavidromeStatus::Offline.as_str();
+        user_with(
+            &db,
+            "offline",
+            offline,
+            discovery(true, Some("offline-folder")),
+        )
+        .await;
+
+        let due: Vec<(String, Vec<DiscoveryProfile>)> = due_in(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(user, profiles)| (user.id, profiles))
+            .collect();
+        assert_eq!(
+            due,
+            [(
+                "alice".to_string(),
+                vec![DiscoveryProfile::Balanced, DiscoveryProfile::Adventurous]
+            )]
+        );
     }
 
     #[tokio::test]

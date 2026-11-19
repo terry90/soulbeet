@@ -75,6 +75,13 @@ impl UserSettings {
         Ok(settings.unwrap_or_else(|| Self::defaults(user_id)))
     }
 
+    /// The chosen discovery folder's id. Settings clears the choice by storing an empty id.
+    pub(crate) fn discovery_folder(&self) -> Option<&str> {
+        self.discovery_folder_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+    }
+
     /// What a user without a row has.
     pub(crate) fn defaults(user_id: &str) -> UserSettings {
         UserSettings {
