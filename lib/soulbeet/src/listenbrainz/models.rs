@@ -102,6 +102,10 @@ pub struct SimilarUser {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaylistSummary {
     pub mbid: String,
+    /// The Troi patch that made it, such as `weekly-exploration`.
+    pub source_patch: Option<String>,
+    /// RFC 3339, as ListenBrainz sends it.
+    pub date: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +130,45 @@ pub(crate) struct PlaylistEnvelope<T> {
 #[derive(Debug, Deserialize)]
 pub(crate) struct PlaylistHeader {
     pub identifier: String,
+    pub date: String,
+    #[serde(default)]
+    extension: Option<PlaylistHeaderExtension>,
+}
+
+impl PlaylistHeader {
+    pub fn source_patch(&self) -> Option<&str> {
+        self.extension
+            .as_ref()?
+            .metadata
+            .as_ref()?
+            .additional_metadata
+            .as_ref()?
+            .algorithm_metadata
+            .as_ref()?
+            .source_patch
+            .as_deref()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaylistHeaderExtension {
+    #[serde(rename = "https://musicbrainz.org/doc/jspf#playlist")]
+    metadata: Option<PlaylistMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaylistMetadata {
+    additional_metadata: Option<AdditionalMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdditionalMetadata {
+    algorithm_metadata: Option<AlgorithmMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlgorithmMetadata {
+    source_patch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

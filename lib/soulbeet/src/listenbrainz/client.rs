@@ -97,6 +97,8 @@ impl ListenBrainzClient {
             .into_iter()
             .map(|p| PlaylistSummary {
                 mbid: last_segment(&p.playlist.identifier).to_string(),
+                source_patch: p.playlist.source_patch().map(str::to_string),
+                date: p.playlist.date,
             })
             .collect())
     }
@@ -585,10 +587,70 @@ mod tests {
         );
         assert_eq!(
             playlists,
+            [
+                summary(
+                    "48f2eb97-33e7-496c-8da1-25ead7280a81",
+                    "daily-jams",
+                    "2026-11-18T23:03:34.548019+00:00"
+                ),
+                summary(
+                    "55f2a01f-3974-46ca-8461-a8a84886eba4",
+                    "weekly-exploration",
+                    "2026-08-23T22:13:00.700111+00:00"
+                ),
+                summary(
+                    "54cc305b-f68e-4ab8-a2b9-3188727a3b5b",
+                    "weekly-jams",
+                    "2026-08-23T22:07:21.126678+00:00"
+                ),
+                summary(
+                    "865982ba-7d21-48f5-81ce-893a3f341faa",
+                    "weekly-exploration",
+                    "2026-07-28T12:24:12.184152+00:00"
+                ),
+                summary(
+                    "3c8f40f3-0e59-4275-8b86-8f3d3588b4d8",
+                    "top-discoveries-of-2025",
+                    "2026-02-22T10:42:29.813561+00:00"
+                ),
+                summary(
+                    "b0a1c836-9635-4080-a676-a48a9b74b853",
+                    "top-missed-recordings-of-2025",
+                    "2026-02-22T10:26:09.147289+00:00"
+                ),
+                summary(
+                    "e3f1ab53-3ac4-4e9f-a74d-42bddbd4a2f1",
+                    "top-missed-recordings-of-2024",
+                    "2026-02-22T08:34:02.254698+00:00"
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_without_extension_metadata_has_no_source_patch() {
+        let body = r#"{"playlists":[{"playlist":{
+            "identifier":"https://listenbrainz.org/playlist/48f2eb97-33e7-496c-8da1-25ead7280a81",
+            "date":"2026-11-18T23:03:34.548019+00:00","title":"Untagged"}}]}"#;
+        let (base, _) = serve(vec![ok(body)]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let playlists = lb.recommendation_playlists("rob").await.unwrap();
+        assert_eq!(
+            playlists,
             [PlaylistSummary {
-                mbid: "48f2eb97-33e7-496c-8da1-25ead7280a81".into()
+                mbid: "48f2eb97-33e7-496c-8da1-25ead7280a81".into(),
+                source_patch: None,
+                date: "2026-11-18T23:03:34.548019+00:00".into(),
             }]
         );
+    }
+
+    fn summary(mbid: &str, source_patch: &str, date: &str) -> PlaylistSummary {
+        PlaylistSummary {
+            mbid: mbid.into(),
+            source_patch: Some(source_patch.into()),
+            date: date.into(),
+        }
     }
 
     #[tokio::test]

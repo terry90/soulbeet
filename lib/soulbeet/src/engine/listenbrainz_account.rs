@@ -8,6 +8,7 @@ use tracing::info;
 
 use super::{merge_signals, track_candidate};
 use crate::listenbrainz::client::ListenBrainzClient;
+use crate::listenbrainz::models::PlaylistSummary;
 use crate::polite::RemoteError;
 use crate::traits::{CandidateGenerator, GeneratorOutput};
 use shared::recommendation::{
@@ -84,7 +85,8 @@ impl ListenBrainzAccountGenerator {
         set
     }
 
-    /// The tracks of every playlist Troi made for the user, by position.
+    /// The tracks of the newest Weekly Exploration and Top Missed Recordings
+    /// playlists Troi made for the user, by position.
     async fn troi(&self, known: &KnownMusic, errors: &mut SourceErrors) -> CandidateSet {
         let mut set = CandidateSet::new();
         let playlists = match self.client.recommendation_playlists(&self.user).await {
@@ -94,7 +96,7 @@ impl ListenBrainzAccountGenerator {
                 return set;
             }
         };
-        for summary in playlists {
+        for summary in unheard_playlists(&playlists) {
             let tracks = match self.client.playlist(&summary.mbid).await {
                 Ok(tracks) => tracks,
                 Err(e) => {
@@ -155,6 +157,25 @@ impl CandidateGenerator for ListenBrainzAccountGenerator {
     }
 }
 
+/// The other playlists are built from music the user already played, and
+/// each read costs a paced request. Playlists of one day tie on the date, so
+/// the patch name, which ends in the year, breaks the tie toward the later year.
+fn unheard_playlists(listing: &[PlaylistSummary]) -> Vec<&PlaylistSummary> {
+    let newest = |wanted: fn(&str) -> bool| {
+        listing
+            .iter()
+            .filter(|p| p.source_patch.as_deref().is_some_and(wanted))
+            .max_by(|a, b| (&a.date, &a.source_patch).cmp(&(&b.date, &b.source_patch)))
+    };
+    [
+        newest(|patch| patch == "weekly-exploration"),
+        newest(|patch| patch.starts_with("top-missed-recordings-of-")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 fn is_new(known: &KnownMusic, track: &TrackRef) -> bool {
     !known.knows_artist(&track.artist) && !known.knows_track(track)
 }
@@ -177,6 +198,8 @@ mod tests {
     const PLAYLISTS: &str =
         include_str!("../listenbrainz/fixtures/recommendation_playlists_rob.json");
     const PLAYLIST: &str = include_str!("../listenbrainz/fixtures/playlist.json");
+
+    const NO_TRACKS: &str = r#"{"playlist":{"track":[]}}"#;
 
     fn ok(body: &str) -> Reply {
         Reply {
@@ -218,6 +241,7 @@ mod tests {
                 ok(TOP_RECORDINGS),
                 ok(PLAYLISTS),
                 ok(PLAYLIST),
+                ok(NO_TRACKS),
             ],
             &profile,
         )
@@ -256,14 +280,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn troi_reads_each_playlists_tracks() {
+    async fn troi_reads_only_the_newest_exploration_and_missed_playlists() {
         let mut profile = UserMusicProfile::default();
         profile
             .known
             .recording_mbids
             .insert("418bce6c-1195-4cf2-b5c0-4cf163acbd46".into());
         let (out, targets) = run(
-            vec![ok(r#"{"payload":[]}"#), ok(PLAYLISTS), ok(PLAYLIST)],
+            vec![
+                ok(r#"{"payload":[]}"#),
+                ok(PLAYLISTS),
+                ok(PLAYLIST),
+                ok(NO_TRACKS),
+            ],
             &profile,
         )
         .await;
@@ -272,7 +301,8 @@ mod tests {
             [
                 "/1/user/rob/similar-users",
                 "/1/user/rob/playlists/recommendations",
-                "/1/playlist/48f2eb97-33e7-496c-8da1-25ead7280a81",
+                "/1/playlist/55f2a01f-3974-46ca-8461-a8a84886eba4",
+                "/1/playlist/b0a1c836-9635-4080-a676-a48a9b74b853",
             ]
         );
         let mut got: Vec<_> = out
@@ -294,5 +324,30 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_listing_with_only_jams_reads_no_playlist() {
+        let listing = r#"{"playlist_count":2,"playlists":[
+            {"playlist":{"identifier":"https://listenbrainz.org/playlist/48f2eb97-33e7-496c-8da1-25ead7280a81",
+             "date":"2026-11-18T23:03:34+00:00","extension":{"https://musicbrainz.org/doc/jspf#playlist":
+             {"additional_metadata":{"algorithm_metadata":{"source_patch":"daily-jams"}}}}}},
+            {"playlist":{"identifier":"https://listenbrainz.org/playlist/54cc305b-f68e-4ab8-a2b9-3188727a3b5b",
+             "date":"2026-08-23T22:07:21+00:00","extension":{"https://musicbrainz.org/doc/jspf#playlist":
+             {"additional_metadata":{"algorithm_metadata":{"source_patch":"weekly-jams"}}}}}}]}"#;
+        let (out, targets) = run(
+            vec![ok(r#"{"payload":[]}"#), ok(listing)],
+            &UserMusicProfile::default(),
+        )
+        .await;
+        assert_eq!(
+            targets,
+            [
+                "/1/user/rob/similar-users",
+                "/1/user/rob/playlists/recommendations",
+            ]
+        );
+        assert!(out.candidates.into_vec().is_empty());
+        assert!(out.errors.is_empty());
     }
 }
