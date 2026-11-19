@@ -30,6 +30,7 @@ pub fn FolderManager() -> Element {
     let mut lb_username = use_signal(String::new);
     let mut lb_token = use_signal(String::new);
     let mut deezer_recommendations = use_signal(|| false);
+    let mut library_error = use_signal(String::new);
 
     // Discovery settings state
     let mut discovery_enabled = use_signal(|| false);
@@ -277,6 +278,7 @@ pub fn FolderManager() -> Element {
 
         // Library Settings
         Panel { title: "Library Settings",
+            Messages { error: library_error() }
             match &*settings_resource.read() {
                 None => rsx! { Loading {} },
                 Some(Err(e)) => rsx! {
@@ -593,7 +595,14 @@ pub fn FolderManager() -> Element {
                                     deezer_recommendations: Some(new_val),
                                     ..Default::default()
                                 };
-                                let _ = api::update_user_settings(update).await;
+                                // Roll back so the switch never shows off while the server still sends names to Deezer
+                                match api::update_user_settings(update).await {
+                                    Ok(_) => library_error.set(String::new()),
+                                    Err(e) => {
+                                        deezer_recommendations.set(!new_val);
+                                        library_error.set(friendly_error(&e));
+                                    }
+                                }
                             },
                         }
                     }
