@@ -489,6 +489,7 @@ mod tests {
 
     use super::*;
     use crate::knowledge::MemoryCache;
+    use crate::listenbrainz::models::ArtistTagEntry;
     use crate::musicbrainz::ArtistMatch;
     use crate::polite::Pace;
     use crate::test_http::{serve, Reply};
@@ -750,6 +751,28 @@ mod tests {
         let again = k.artist_tags(&ids[..1]).await.unwrap();
         assert_eq!(again[TINARIWEN].len(), named.len());
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    // Built by hand: no real artist_metadata answer has a count at zero or below.
+    #[test]
+    fn only_tags_with_positive_votes_are_weighted() {
+        let tags = |counts: &[(&str, i64)]| {
+            Some(ArtistTags {
+                artist: counts
+                    .iter()
+                    .map(|&(tag, count)| ArtistTagEntry {
+                        tag: tag.into(),
+                        count,
+                    })
+                    .collect(),
+            })
+        };
+        let kept: Vec<(String, f64)> = scaled_tags(tags(&[("rock", 3), ("pop", 0), ("noise", -1)]))
+            .into_iter()
+            .map(|t| (t.name, t.weight))
+            .collect();
+        assert_eq!(kept, [("rock".to_string(), 1.0)]);
+        assert!(scaled_tags(tags(&[("pop", 0), ("noise", -1)])).is_empty());
     }
 
     #[tokio::test]
