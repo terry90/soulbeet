@@ -141,7 +141,6 @@ impl ListeningHistory for ListenBrainzHistory {
             known.add_artist(&played.artist);
         }
         for played in self.tracks(TimePeriod::AllTime, 200).await? {
-            known.add_artist(&played.track.artist);
             known.add_track(&played.track);
         }
         Ok(known)
