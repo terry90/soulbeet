@@ -22,7 +22,6 @@ Screenshots: [here](./screenshots)
 - **Three Discovery Profiles**: Conservative (close to what you know), Balanced, or Adventurous (unfamiliar territory). Run one or all three, each with its own playlist.
 - **Rate & Keep**: Listen in Navidrome. 3+ stars promotes a track to your permanent library, 1 star deletes it. Unrated tracks expire and get replaced with fresh picks.
 - **Multi-user**: Private or shared folders. Each user gets their own discovery profiles, ListenBrainz username, and preferences.
-- **Multiple Metadata Providers**: MusicBrainz (albums) or Last.fm (single tracks), selectable per user.
 
 ## How It Works
 
@@ -190,7 +189,7 @@ For discovery (optional): enable discovery on a folder in Settings > Library, pi
 
 **Note**: Users who are not admins can only add library folders inside a root an admin approved in Settings > Library, never at the root itself.
 
-**Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. The ListenBrainz username and optional token, the Deezer switch and the Last.fm API key (used by the Last.fm metadata provider only) are configured per-user in Settings > Library.
+**Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. The ListenBrainz username, the optional token and the Deezer switch are configured per-user in Settings > Library.
 
 ### Upgrading to roles and folder roots
 
