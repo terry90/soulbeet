@@ -17,6 +17,8 @@ pub(crate) struct Seen {
     pub method: String,
     pub target: String,
     pub content_type: Option<String>,
+    pub user_agent: Option<String>,
+    pub authorization: Option<String>,
     pub body: String,
 }
 
@@ -69,6 +71,8 @@ fn read_request(reader: &mut impl BufRead) -> Seen {
     let target = parts.next().unwrap_or_default().to_string();
 
     let mut content_type = None;
+    let mut user_agent = None;
+    let mut authorization = None;
     let mut content_length = 0;
     loop {
         let mut header = String::new();
@@ -85,6 +89,10 @@ fn read_request(reader: &mut impl BufRead) -> Seen {
             content_length = value.parse().unwrap();
         } else if name.eq_ignore_ascii_case("content-type") {
             content_type = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("user-agent") {
+            user_agent = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.to_string());
         }
     }
 
@@ -94,6 +102,8 @@ fn read_request(reader: &mut impl BufRead) -> Seen {
         method,
         target,
         content_type,
+        user_agent,
+        authorization,
         body: String::from_utf8(body).unwrap(),
     }
 }

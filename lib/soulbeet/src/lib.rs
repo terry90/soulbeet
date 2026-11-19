@@ -8,6 +8,7 @@ pub mod listenbrainz;
 pub mod metadata_error;
 pub mod musicbrainz;
 pub mod navidrome;
+pub mod polite;
 pub mod services;
 pub mod slskd;
 #[cfg(test)]
