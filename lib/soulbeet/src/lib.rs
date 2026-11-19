@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod beets;
+pub mod deezer;
 pub mod engine;
 pub mod error;
 pub mod history;

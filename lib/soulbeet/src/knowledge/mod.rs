@@ -37,6 +37,8 @@ pub enum KnowledgeError {
     TokenRefused,
     #[error("ListenBrainz now asks for a token for this; save one in Settings > Library")]
     TokenRequired,
+    #[error("Deezer refused the request ({code}): {message}")]
+    Deezer { code: u32, message: String },
     #[error(transparent)]
     MusicBrainz(MetadataError),
     #[error(transparent)]
@@ -50,6 +52,7 @@ impl KnowledgeError {
             Self::Remote(e) => e.service(),
             Self::AlgorithmRetired { .. } => "ListenBrainz Labs",
             Self::TokenRefused | Self::TokenRequired => "ListenBrainz",
+            Self::Deezer { .. } => "Deezer",
             Self::MusicBrainz(_) => "MusicBrainz",
             Self::Cache(_) => "Soulbeet cache",
         }
