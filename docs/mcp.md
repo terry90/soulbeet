@@ -626,7 +626,7 @@ The delete tools:
 Proxies and MCP clients:
 
 28. A tool call waits at most 30 seconds for running work, since claude.ai was seen to drop a call after 90 seconds and many proxies end a silent answer after 60. The assistant follows long work by calling again.
-29. `get_tag_tracks` (tracks of a genre or tag from Last.fm or ListenBrainz) is not built.
+29. `get_tag_tracks` (tracks of a genre or tag from ListenBrainz) is not built.
 
 ## Security
 
