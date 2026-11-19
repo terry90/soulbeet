@@ -1,3 +1,4 @@
+pub mod listenbrainz;
 pub mod navidrome;
 
 use thiserror::Error;
