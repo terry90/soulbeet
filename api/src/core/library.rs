@@ -92,7 +92,7 @@ impl From<&NativeSong> for SongFacts {
             recording_mbid: given(song.mbz_recording_id.as_deref()),
             rating: song.rating,
             starred: song.starred,
-            starred_at: when(song.starred_at.as_deref()),
+            starred_at: song.starred_at.map(time::at),
             play_count: song.play_count,
         }
     }

@@ -611,6 +611,7 @@ mod tests {
             bit_rate: 0,
             starred: false,
             starred_at: None,
+            rated_at: None,
             play_count: 0,
             play_date: None,
             mbz_artist_id: None,

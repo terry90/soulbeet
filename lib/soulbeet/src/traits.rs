@@ -469,6 +469,8 @@ pub trait ListeningHistory: Send + Sync {
         count: usize,
     ) -> std::result::Result<Vec<PlayedTrack>, HistoryError>;
     async fn listens(&self, count: usize) -> std::result::Result<Vec<Listen>, HistoryError>;
+    /// Most recently favoured first, so a generator taking the first few gets the user's
+    /// current favourites.
     async fn favourites(&self) -> std::result::Result<Vec<TrackRef>, HistoryError>;
     /// Every artist and track the user already has, which no generator may recommend.
     async fn known(&self) -> std::result::Result<KnownMusic, HistoryError>;

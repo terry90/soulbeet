@@ -41,6 +41,15 @@ fn disliked(song: &NativeSong) -> bool {
     matches!(song.rating, 1 | 2)
 }
 
+/// The later of the star and the 4 or 5 rating. `starred_at` also moves on an unstar and
+/// `rated_at` on any rating, so each counts only while it still makes a favourite. None
+/// sorts below every date: a rating from before Navidrome 0.59.0 has no date.
+fn favoured_at(song: &NativeSong) -> Option<DateTime<Utc>> {
+    let starred = song.starred_at.filter(|_| song.starred);
+    let rated = song.rated_at.filter(|_| song.rating >= 4);
+    starred.max(rated)
+}
+
 fn track_ref(song: &NativeSong) -> TrackRef {
     TrackRef {
         artist: ArtistRef {
@@ -162,13 +171,22 @@ impl ListeningHistory for NavidromeHistory {
             .collect())
     }
 
+    /// Navidrome lists songs oldest import first; favourites go by when the user favoured them.
     async fn favourites(&self) -> Result<Vec<TrackRef>, HistoryError> {
-        Ok(self
+        let mut songs: Vec<&NativeSong> = self
             .songs
             .iter()
             .filter(|s| !disliked(s) && (s.starred || s.rating >= 4))
-            .map(track_ref)
-            .collect())
+            .collect();
+        songs.sort_by(|a, b| {
+            favoured_at(b)
+                .cmp(&favoured_at(a))
+                .then_with(|| b.rating.cmp(&a.rating))
+                .then_with(|| b.play_count.cmp(&a.play_count))
+                .then_with(|| b.play_date.cmp(&a.play_date))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(songs.into_iter().map(track_ref).collect())
     }
 
     async fn known(&self) -> Result<KnownMusic, HistoryError> {
@@ -204,6 +222,19 @@ mod tests {
         rating: u8,
         starred: bool,
     ) -> NativeSong {
+        serde_json::from_value(song_json(id, artist, title, plays, played, rating, starred))
+            .unwrap()
+    }
+
+    fn song_json(
+        id: &str,
+        artist: &str,
+        title: &str,
+        plays: u64,
+        played: Option<&str>,
+        rating: u8,
+        starred: bool,
+    ) -> serde_json::Value {
         let mut json = serde_json::json!({
             "id": id, "path": format!("{artist}/{title}.flac"), "title": title,
             "size": 1000, "libraryId": 1, "libraryPath": "/music", "missing": false,
@@ -212,6 +243,25 @@ mod tests {
         });
         if let Some(date) = played {
             json["playDate"] = date.into();
+        }
+        json
+    }
+
+    /// A song with this user's star and rating dates, as Navidrome 0.59.0 on sends them.
+    fn favoured(
+        id: &str,
+        title: &str,
+        starred: bool,
+        starred_at: Option<&str>,
+        rating: u8,
+        rated_at: Option<&str>,
+    ) -> NativeSong {
+        let mut json = song_json(id, title, title, 0, None, rating, starred);
+        if let Some(at) = starred_at {
+            json["starredAt"] = at.into();
+        }
+        if let Some(at) = rated_at {
+            json["ratedAt"] = at.into();
         }
         serde_json::from_value(json).unwrap()
     }
@@ -320,7 +370,58 @@ mod tests {
         );
         let favourites = h.favourites().await.unwrap();
         let got: Vec<&str> = favourites.iter().map(|t| t.title.as_str()).collect();
-        assert_eq!(got, ["starred", "five"]);
+        // Neither has a date, so the higher rating goes first.
+        assert_eq!(got, ["five", "starred"]);
+    }
+
+    #[tokio::test]
+    async fn favourites_put_the_latest_star_or_rating_first() {
+        // Navidrome lists songs oldest import first.
+        let h = NavidromeHistory::from_songs(
+            vec![
+                favoured("1", "rated before 0.59", false, None, 5, None),
+                favoured(
+                    "2",
+                    "unstarred lately",
+                    false,
+                    Some("2026-11-18T10:00:00Z"),
+                    4,
+                    None,
+                ),
+                favoured("3", "old star", true, Some("2025-03-01T10:00:00Z"), 0, None),
+                favoured("4", "new star", true, Some("2026-11-15T10:00:00Z"), 0, None),
+                favoured(
+                    "5",
+                    "rated 5 today",
+                    false,
+                    None,
+                    5,
+                    Some("2026-11-19T09:00:00Z"),
+                ),
+                favoured(
+                    "6",
+                    "rated 3 today",
+                    true,
+                    Some("2025-06-01T10:00:00Z"),
+                    3,
+                    Some("2026-11-19T11:00:00Z"),
+                ),
+            ],
+            now(),
+        );
+        let favourites = h.favourites().await.unwrap();
+        let got: Vec<&str> = favourites.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            got,
+            [
+                "rated 5 today",
+                "new star",
+                "rated 3 today",
+                "old star",
+                "rated before 0.59",
+                "unstarred lately"
+            ]
+        );
     }
 
     #[tokio::test]

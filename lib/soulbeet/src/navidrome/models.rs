@@ -421,8 +421,13 @@ pub struct NativeSong {
     /// Whether this user starred the song.
     #[serde(default)]
     pub starred: bool,
+    /// When this user last starred or unstarred the song (`SetStar`, sql_annotations.go).
     #[serde(default)]
-    pub starred_at: Option<String>,
+    pub starred_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When this user last rated the song (`SetRating`, sql_annotations.go). Absent before
+    /// Navidrome 0.59.0 and for ratings made before it.
+    #[serde(default)]
+    pub rated_at: Option<chrono::DateTime<chrono::Utc>>,
     /// This user's plays.
     #[serde(default)]
     pub play_count: u64,
