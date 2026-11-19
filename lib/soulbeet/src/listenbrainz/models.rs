@@ -134,10 +134,11 @@ pub(crate) struct JspfPlaylist {
 }
 
 /// A JSPF track: `identifier` lists recording URLs, the extension artist URLs.
+/// ListenBrainz leaves out the names of a recording it has no metadata for.
 #[derive(Debug, Deserialize)]
 pub(crate) struct JspfTrack {
-    pub title: String,
-    pub creator: String,
+    pub title: Option<String>,
+    pub creator: Option<String>,
     pub identifier: Vec<String>,
     pub extension: JspfTrackExtension,
 }
@@ -150,6 +151,7 @@ pub(crate) struct JspfTrackExtension {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MusicBrainzTrackExtension {
+    #[serde(default)]
     pub artist_identifiers: Vec<String>,
 }
 

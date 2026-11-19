@@ -101,6 +101,8 @@ impl ListenBrainzClient {
             .collect())
     }
 
+    /// A track missing its title or artist name is left out, since a
+    /// candidate needs both.
     pub async fn playlist(&self, playlist_mbid: &str) -> Result<Vec<PlaylistTrack>, RemoteError> {
         let path = format!("/1/playlist/{playlist_mbid}");
         let page: Option<PlaylistEnvelope<JspfPlaylist>> = self.http.get(&path).await?;
@@ -108,12 +110,14 @@ impl ListenBrainzClient {
             .map(|p| p.playlist.track)
             .unwrap_or_default()
             .into_iter()
-            .map(|t| PlaylistTrack {
-                recording_mbid: t.identifier.first().map(|u| last_segment(u).to_string()),
-                artist_mbid: (t.extension.musicbrainz.artist_identifiers.first())
-                    .map(|u| last_segment(u).to_string()),
-                title: t.title,
-                creator: t.creator,
+            .filter_map(|t| {
+                Some(PlaylistTrack {
+                    recording_mbid: t.identifier.first().map(|u| last_segment(u).to_string()),
+                    artist_mbid: (t.extension.musicbrainz.artist_identifiers.first())
+                        .map(|u| last_segment(u).to_string()),
+                    title: t.title?,
+                    creator: t.creator?,
+                })
             })
             .collect())
     }
@@ -608,6 +612,46 @@ mod tests {
                 recording_mbid: Some("22c7fa7f-2404-4103-8267-6a98b4b1f8ee".into()),
                 artist_mbid: Some("8229a8f1-b315-4fae-af57-b3eb71efdaf4".into()),
             }
+        );
+    }
+
+    /// ListenBrainz writes `creator`, `title` and `artist_identifiers` only
+    /// when it has them, so one bare recording must not cost the playlist.
+    #[tokio::test]
+    async fn a_track_without_names_is_left_out_and_one_without_artists_kept() {
+        let body = r#"{"playlist":{"track":[
+            {"identifier":["https://musicbrainz.org/recording/22c7fa7f-2404-4103-8267-6a98b4b1f8ee"],
+             "extension":{"https://musicbrainz.org/doc/jspf#track":{"added_by":"troi-bot"}}},
+            {"identifier":["https://musicbrainz.org/recording/418bce6c-1195-4cf2-b5c0-4cf163acbd46"],
+             "creator":"Bicep","title":"Lido",
+             "extension":{"https://musicbrainz.org/doc/jspf#track":{"added_by":"troi-bot"}}},
+            {"identifier":["https://musicbrainz.org/recording/f1ff69d8-0ee1-4978-a194-2725659ea543"],
+             "creator":"Rival Consoles","title":"Memory Arc",
+             "extension":{"https://musicbrainz.org/doc/jspf#track":{"added_by":"troi-bot",
+               "artist_identifiers":["https://musicbrainz.org/artist/803f2853-7e3e-4dff-96a7-9f77b5f56de5"]}}}
+        ]}}"#;
+        let (base, _) = serve(vec![ok(body)]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let tracks = lb
+            .playlist("48f2eb97-33e7-496c-8da1-25ead7280a81")
+            .await
+            .unwrap();
+        assert_eq!(
+            tracks,
+            [
+                PlaylistTrack {
+                    title: "Lido".into(),
+                    creator: "Bicep".into(),
+                    recording_mbid: Some("418bce6c-1195-4cf2-b5c0-4cf163acbd46".into()),
+                    artist_mbid: None,
+                },
+                PlaylistTrack {
+                    title: "Memory Arc".into(),
+                    creator: "Rival Consoles".into(),
+                    recording_mbid: Some("f1ff69d8-0ee1-4978-a194-2725659ea543".into()),
+                    artist_mbid: Some("803f2853-7e3e-4dff-96a7-9f77b5f56de5".into()),
+                },
+            ]
         );
     }
 
