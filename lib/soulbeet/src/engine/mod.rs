@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod diversifier;
 pub mod freshness;
 pub mod lastfm_pipeline;
+pub mod listenbrainz_account;
 pub mod profile;
 pub mod taste;
 #[cfg(test)]
@@ -17,7 +18,7 @@ use crate::error::Result;
 use crate::traits::{CandidateGenerator, ScrobbleProvider};
 use shared::recommendation::{
     Candidate, CandidateSet, CandidateSnapshot, EngineReport, PipelineReport, ProfileConfig,
-    ProfileSummary, SignalReport, TimePeriod, UserMusicProfile,
+    ProfileSummary, SignalReport, TimePeriod, TrackRef, UserMusicProfile,
 };
 
 const ARTIST_CACHE_LIMIT: usize = 100;
@@ -56,6 +57,44 @@ pub(crate) fn signal_report(name: &str, set: &CandidateSet) -> SignalReport {
             .take(3)
             .map(|c| CandidateSnapshot::from_candidate(c))
             .collect(),
+    }
+}
+
+/// Caps each signal, reports it and merges it into one set, signals in order.
+pub(crate) fn merge_signals(
+    signals: Vec<(&str, CandidateSet)>,
+) -> (CandidateSet, Vec<SignalReport>) {
+    let mut candidates = CandidateSet::new();
+    let mut reports = Vec::new();
+    for (name, mut set) in signals {
+        cap_signal(&mut set);
+        reports.push(signal_report(name, &set));
+        for candidate in set.into_vec() {
+            candidates.insert(candidate);
+        }
+    }
+    (candidates, reports)
+}
+
+/// A candidate for a track one signal of a generator found.
+pub(crate) fn track_candidate(
+    track: TrackRef,
+    score: f64,
+    signal: &str,
+    source: &str,
+) -> Candidate {
+    Candidate {
+        artist: track.artist.name,
+        track: track.title,
+        album: None,
+        mbid: track.mbid,
+        score,
+        signals: vec![signal.to_string()],
+        source: source.to_string(),
+        artist_listener_count: None,
+        primary_genre: None,
+        release_year: None,
+        artist_mbid: track.artist.mbid,
     }
 }
 

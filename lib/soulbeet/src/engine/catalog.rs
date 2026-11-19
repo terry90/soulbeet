@@ -8,13 +8,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::info;
 
-use super::{cap_signal, signal_report};
+use super::{merge_signals, track_candidate};
 use crate::knowledge::KnowledgeError;
 use crate::traits::{CandidateGenerator, GeneratorOutput};
 use crate::MusicKnowledge;
 use shared::recommendation::{
-    ArtistRef, Candidate, CandidateSet, KnownMusic, Neighbour, ProfileConfig, SourceErrors,
-    TrackRef, UserMusicProfile,
+    ArtistRef, CandidateSet, KnownMusic, Neighbour, ProfileConfig, SourceErrors, UserMusicProfile,
 };
 
 const NAME: &str = "catalog";
@@ -64,20 +63,12 @@ impl CandidateGenerator for CatalogGenerator {
         let momentum = run.momentum(profile, config).await;
         let tag_explore = run.tag_explore(profile).await;
 
-        let mut candidates = CandidateSet::new();
-        let mut signals = Vec::new();
-        for (name, mut set) in [
+        let (candidates, signals) = merge_signals(vec![
             ("artist_hop1", hop1),
             ("artist_hop2", hop2),
             ("momentum", momentum),
             ("tag_explore", tag_explore),
-        ] {
-            cap_signal(&mut set);
-            signals.push(signal_report(name, &set));
-            for candidate in set.into_vec() {
-                candidates.insert(candidate);
-            }
-        }
+        ]);
         info!("Catalog generator: {} candidates", candidates.len());
         GeneratorOutput {
             candidates,
@@ -176,7 +167,7 @@ impl Run<'_> {
                 if self.known.knows_artist(&track.artist) || self.known.knows_track(&track) {
                     continue;
                 }
-                set.insert(candidate(track, score, "tag_explore"));
+                set.insert(track_candidate(track, score, "tag_explore", NAME));
             }
         }
         set
@@ -216,7 +207,7 @@ impl Run<'_> {
             Ok(tracks) => {
                 for track in tracks {
                     if !self.known.knows_track(&track) {
-                        set.insert(candidate(track, score, signal));
+                        set.insert(track_candidate(track, score, signal, NAME));
                     }
                 }
             }
@@ -249,22 +240,6 @@ fn seeds(profile: &UserMusicProfile) -> Vec<ArtistRef> {
 
 fn same_mbid(a: &ArtistRef, b: &ArtistRef) -> bool {
     matches!((&a.mbid, &b.mbid), (Some(x), Some(y)) if x.eq_ignore_ascii_case(y))
-}
-
-fn candidate(track: TrackRef, score: f64, signal: &str) -> Candidate {
-    Candidate {
-        artist: track.artist.name,
-        track: track.title,
-        album: None,
-        mbid: track.mbid,
-        score,
-        signals: vec![signal.to_string()],
-        source: NAME.to_string(),
-        artist_listener_count: None,
-        primary_genre: None,
-        release_year: None,
-        artist_mbid: track.artist.mbid,
-    }
 }
 
 #[cfg(test)]

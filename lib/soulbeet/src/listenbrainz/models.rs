@@ -91,6 +91,68 @@ pub struct MbidMapping {
     pub recording_mbid: Option<String>,
 }
 
+// --- Similar users and recommendation playlists ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimilarUser {
+    pub user_name: String,
+    pub similarity: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistSummary {
+    pub mbid: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistTrack {
+    pub title: String,
+    pub creator: String,
+    pub recording_mbid: Option<String>,
+    pub artist_mbid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlaylistListing {
+    pub playlists: Vec<PlaylistEnvelope<PlaylistHeader>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlaylistEnvelope<T> {
+    pub playlist: T,
+}
+
+/// `identifier` is the playlist's URL, its MBID the last segment.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlaylistHeader {
+    pub identifier: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct JspfPlaylist {
+    pub track: Vec<JspfTrack>,
+}
+
+/// A JSPF track: `identifier` lists recording URLs, the extension artist URLs.
+#[derive(Debug, Deserialize)]
+pub(crate) struct JspfTrack {
+    pub title: String,
+    pub creator: String,
+    pub identifier: Vec<String>,
+    pub extension: JspfTrackExtension,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct JspfTrackExtension {
+    #[serde(rename = "https://musicbrainz.org/doc/jspf#track")]
+    pub musicbrainz: MusicBrainzTrackExtension,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MusicBrainzTrackExtension {
+    pub artist_identifiers: Vec<String>,
+}
+
 // --- LB Radio ---
 
 /// Recordings keyed by the artist MBID they belong to.

@@ -78,6 +78,46 @@ impl ListenBrainzClient {
         Ok(page.map(|p| p.feedback).unwrap_or_default())
     }
 
+    pub async fn similar_users(&self, user: &str) -> Result<Vec<SimilarUser>, RemoteError> {
+        let path = format!("/1/user/{}/similar-users", path_segment(user));
+        let page: Option<Payload<Vec<SimilarUser>>> = self.http.get(&path).await?;
+        Ok(page.map(|p| p.payload).unwrap_or_default())
+    }
+
+    /// The listing carries no tracks; `playlist` reads them.
+    pub async fn recommendation_playlists(
+        &self,
+        user: &str,
+    ) -> Result<Vec<PlaylistSummary>, RemoteError> {
+        let path = format!("/1/user/{}/playlists/recommendations", path_segment(user));
+        let listing: Option<PlaylistListing> = self.http.get(&path).await?;
+        Ok(listing
+            .map(|l| l.playlists)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| PlaylistSummary {
+                mbid: last_segment(&p.playlist.identifier).to_string(),
+            })
+            .collect())
+    }
+
+    pub async fn playlist(&self, playlist_mbid: &str) -> Result<Vec<PlaylistTrack>, RemoteError> {
+        let path = format!("/1/playlist/{playlist_mbid}");
+        let page: Option<PlaylistEnvelope<JspfPlaylist>> = self.http.get(&path).await?;
+        Ok(page
+            .map(|p| p.playlist.track)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| PlaylistTrack {
+                recording_mbid: t.identifier.first().map(|u| last_segment(u).to_string()),
+                artist_mbid: (t.extension.musicbrainz.artist_identifiers.first())
+                    .map(|u| last_segment(u).to_string()),
+                title: t.title,
+                creator: t.creator,
+            })
+            .collect())
+    }
+
     /// Every recording of the artist alone, at any popularity.
     pub async fn artist_radio(
         &self,
@@ -167,6 +207,11 @@ fn range(period: TimePeriod) -> &'static str {
         TimePeriod::Year => "this_year",
         TimePeriod::AllTime => "all_time",
     }
+}
+
+/// The MBID at the end of a MusicBrainz or ListenBrainz URL.
+fn last_segment(url: &str) -> &str {
+    url.rsplit_once('/').map_or(url, |(_, id)| id)
 }
 
 /// Form encoding for tags in a query string.
@@ -507,6 +552,62 @@ mod tests {
                 "/1/stats/user/rob/recordings?range=all_time&count=2",
                 "/1/user/rob/listens?count=2",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn similar_users_read_their_payload() {
+        let (base, seen) = serve(vec![ok(include_str!("fixtures/similar_users_rob.json"))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let users = lb.similar_users("rob").await.unwrap();
+        assert_eq!(seen.lock().unwrap()[0].target, "/1/user/rob/similar-users");
+        assert_eq!(users.len(), 2);
+        assert_eq!(
+            (users[0].user_name.as_str(), users[0].similarity),
+            ("Violet&Red", 0.5391550135659047)
+        );
+    }
+
+    #[tokio::test]
+    async fn recommendation_playlists_are_named_by_their_mbid() {
+        let (base, seen) = serve(vec![ok(include_str!(
+            "fixtures/recommendation_playlists_rob.json"
+        ))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let playlists = lb.recommendation_playlists("rob").await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/1/user/rob/playlists/recommendations"
+        );
+        assert_eq!(
+            playlists,
+            [PlaylistSummary {
+                mbid: "48f2eb97-33e7-496c-8da1-25ead7280a81".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_reads_its_tracks_and_their_mbids() {
+        let (base, seen) = serve(vec![ok(include_str!("fixtures/playlist.json"))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let tracks = lb
+            .playlist("48f2eb97-33e7-496c-8da1-25ead7280a81")
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/1/playlist/48f2eb97-33e7-496c-8da1-25ead7280a81"
+        );
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(
+            tracks[0],
+            PlaylistTrack {
+                title: "Fauna".into(),
+                creator: "Carbon Based Lifeforms".into(),
+                recording_mbid: Some("22c7fa7f-2404-4103-8267-6a98b4b1f8ee".into()),
+                artist_mbid: Some("8229a8f1-b315-4fae-af57-b3eb71efdaf4".into()),
+            }
         );
     }
 
