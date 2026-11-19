@@ -43,7 +43,7 @@ impl From<DiscoveryCandidateRow> for Candidate {
 #[cfg(feature = "server")]
 impl DiscoveryCandidateRow {
     pub(crate) async fn upsert_batch_in(
-        db: &sqlx::SqlitePool,
+        conn: &mut sqlx::SqliteConnection,
         user_id: &str,
         profile: &str,
         candidates: &[Candidate],
@@ -67,7 +67,7 @@ impl DiscoveryCandidateRow {
             .bind(&signals)
             .bind(&c.source)
             .bind(profile)
-            .execute(db)
+            .execute(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
         }
@@ -129,14 +129,14 @@ impl DiscoveryCandidateRow {
     }
 
     pub(crate) async fn clear_for_user_profile_in(
-        db: &sqlx::SqlitePool,
+        conn: &mut sqlx::SqliteConnection,
         user_id: &str,
         profile: &str,
     ) -> Result<(), String> {
         sqlx::query("DELETE FROM discovery_candidates WHERE user_id = ? AND profile = ?")
             .bind(user_id)
             .bind(profile)
-            .execute(db)
+            .execute(conn)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())

@@ -215,8 +215,9 @@ pub(crate) fn no_listening_data() -> Failure {
 }
 
 /// Stores a run's report, keeping the user's last `REPORTS_KEPT`, and its candidates. A run
-/// with a failed source only adds to the profile's candidates, so an outage does not empty
-/// the pool an earlier run filled; a run where every source answered replaces them.
+/// that found candidates replaces the profile's pool. One that found none keeps the pool when
+/// a source failed, so an outage does not empty it, and clears it when every source answered.
+/// One transaction, so a concurrent run of the profile never leaves it empty or mixed.
 pub(crate) async fn store_run_in(
     db: &SqlitePool,
     user_id: &str,
@@ -225,12 +226,23 @@ pub(crate) async fn store_run_in(
     report: &EngineReport,
 ) -> Result<(), String> {
     let report_json = serde_json::to_string(report).map_err(|e| e.to_string())?;
-    EngineReportRow::insert_in(db, user_id, profile, &report_json, candidates.len() as u32).await?;
-    EngineReportRow::prune_in(db, user_id, REPORTS_KEPT).await?;
-    if report.source_errors.is_empty() {
-        DiscoveryCandidateRow::clear_for_user_profile_in(db, user_id, profile).await?;
+    // The first statement writes, so the transaction waits for other writers instead of
+    // failing as one that read first would.
+    let mut tx = db.begin().await.map_err(|e| e.to_string())?;
+    EngineReportRow::insert_in(
+        &mut tx,
+        user_id,
+        profile,
+        &report_json,
+        candidates.len() as u32,
+    )
+    .await?;
+    EngineReportRow::prune_in(&mut tx, user_id, REPORTS_KEPT).await?;
+    if !candidates.is_empty() || report.source_errors.is_empty() {
+        DiscoveryCandidateRow::clear_for_user_profile_in(&mut tx, user_id, profile).await?;
     }
-    DiscoveryCandidateRow::upsert_batch_in(db, user_id, profile, candidates).await
+    DiscoveryCandidateRow::upsert_batch_in(&mut tx, user_id, profile, candidates).await?;
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
 /// The latest run as the Discovery page shows it. None when there is no run, or its report
@@ -331,18 +343,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_run_with_a_failed_source_keeps_the_previous_candidates() {
+    async fn a_run_replaces_the_pool_unless_a_failed_source_left_it_with_nothing() {
         let db = test_db::migrated().await;
         crate::core::folder_of(&db, "alice").await;
-        store_run_in(
-            &db,
-            "alice",
-            "Balanced",
-            &[cand("A", "a1")],
-            &EngineReport::default(),
-        )
-        .await
-        .unwrap();
+        let pool = || async {
+            tracks(
+                DiscoveryCandidateRow::get_unused_in(&db, "alice", "Balanced", 10)
+                    .await
+                    .unwrap(),
+            )
+        };
+        let answered = EngineReport::default();
         let failed = EngineReport {
             source_errors: vec![SourceError {
                 source: "ListenBrainz Labs".into(),
@@ -351,34 +362,21 @@ mod tests {
             }],
             ..Default::default()
         };
+        store_run_in(&db, "alice", "Balanced", &[cand("A", "a1")], &answered)
+            .await
+            .unwrap();
+        store_run_in(&db, "alice", "Balanced", &[], &failed)
+            .await
+            .unwrap();
+        assert_eq!(pool().await, ["a1"], "an outage does not empty the pool");
         store_run_in(&db, "alice", "Balanced", &[cand("B", "b1")], &failed)
             .await
             .unwrap();
-        assert_eq!(
-            tracks(
-                DiscoveryCandidateRow::get_unused_in(&db, "alice", "Balanced", 10)
-                    .await
-                    .unwrap()
-            ),
-            ["a1", "b1"]
-        );
-        store_run_in(
-            &db,
-            "alice",
-            "Balanced",
-            &[cand("C", "c1")],
-            &EngineReport::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            tracks(
-                DiscoveryCandidateRow::get_unused_in(&db, "alice", "Balanced", 10)
-                    .await
-                    .unwrap()
-            ),
-            ["c1"]
-        );
+        assert_eq!(pool().await, ["b1"], "a run with candidates replaces it");
+        store_run_in(&db, "alice", "Balanced", &[], &answered)
+            .await
+            .unwrap();
+        assert!(pool().await.is_empty(), "nothing found with no failure");
     }
 
     /// The literal of shared's `REPORT_0_9_0`: a report as 0.9.0 stored it.
