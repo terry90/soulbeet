@@ -1,0 +1,23 @@
+{
+  "payload": {
+    "artists": [
+      {
+        "artist_mbid": "a74b1b7f-71a5-4011-9441-d0b5e4122711",
+        "artist_name": "Radiohead",
+        "listen_count": 3654336
+      },
+      {
+        "artist_mbid": "f59c5520-5f46-4d2c-b2c4-822eabf53419",
+        "artist_name": "Linkin Park",
+        "listen_count": 3115206
+      },
+      {
+        "artist_mbid": null,
+        "artist_name": "The Beatles",
+        "listen_count": 758747
+      }
+    ],
+    "count": 1000,
+    "range": "all_time"
+  }
+}

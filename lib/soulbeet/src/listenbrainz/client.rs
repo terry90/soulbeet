@@ -1,270 +1,159 @@
-use reqwest::Client;
-use serde_json::json;
-use tracing::debug;
+use std::collections::HashMap;
 
-use crate::error::{Result, SoulseekError};
-use crate::http::resilient_send;
 use shared::recommendation::TimePeriod;
+
+use crate::polite::{Pace, PoliteClient, RemoteError};
 
 use super::models::*;
 
-const LB_API_BASE: &str = "https://api.listenbrainz.org";
-
+/// The ListenBrainz API. Most reads need no token; the token is sent on
+/// every request when the user saved one.
 pub struct ListenBrainzClient {
-    client: Client,
-    username: String,
-    token: Option<String>,
+    http: PoliteClient,
 }
 
 impl ListenBrainzClient {
-    pub fn new(username: impl Into<String>, token: Option<String>) -> Self {
-        Self {
-            client: crate::http::build_client("soulful/0.1 (https://github.com/soulful)"),
-            username: username.into(),
-            token,
-        }
+    pub fn new(base_url: &str, token: Option<String>, pace: Pace) -> Result<Self, RemoteError> {
+        let http = PoliteClient::new(base_url, "ListenBrainz", pace)?.with_token(token);
+        Ok(Self { http })
     }
 
-    fn auth_header(&self) -> Option<(String, String)> {
-        self.token
-            .as_ref()
-            .map(|t| ("Authorization".to_string(), format!("Token {}", t)))
+    pub fn has_token(&self) -> bool {
+        self.http.has_token()
     }
 
-    /// GET with retries and rate limiting. Returns None for 204 No Content.
-    async fn get(&self, path: &str) -> Result<Option<reqwest::Response>> {
-        let url = format!("{}{}", LB_API_BASE, path);
-        debug!("ListenBrainz GET {}", url);
-
-        crate::http::lb_rate_limit().await;
-        let auth = self.auth_header();
-        let resp = resilient_send(
-            || {
-                let mut req = self.client.get(&url);
-                if let Some((ref key, ref val)) = auth {
-                    req = req.header(key.as_str(), val.as_str());
-                }
-                req
-            },
-            &format!("LB GET {}", path),
-        )
-        .await?;
-
-        if resp.status().as_u16() == 204 {
-            return Ok(None);
-        }
-
-        Ok(Some(resp))
-    }
-
-    async fn post_json(&self, path: &str, body: serde_json::Value) -> Result<reqwest::Response> {
-        let url = format!("{}{}", LB_API_BASE, path);
-        debug!("ListenBrainz POST {}", url);
-
-        crate::http::lb_rate_limit().await;
-        let auth = self.auth_header();
-        let body_clone = body.clone();
-        resilient_send(
-            || {
-                let mut req = self.client.post(&url).json(&body_clone);
-                if let Some((ref key, ref val)) = auth {
-                    req = req.header(key.as_str(), val.as_str());
-                }
-                req
-            },
-            &format!("LB POST {}", path),
-        )
-        .await
-        .map_err(Into::into)
-    }
-
-    async fn get_json<T: serde::de::DeserializeOwned + Default>(
+    /// 204 means ListenBrainz has not computed the user's statistics yet.
+    pub async fn user_top_artists(
         &self,
-        path: &str,
-        context: &str,
-    ) -> Result<T> {
-        match self.get(path).await? {
-            Some(resp) => resp.json().await.map_err(|e| SoulseekError::Api {
-                status: 500,
-                message: format!("Failed to parse {} response: {}", context, e),
-            }),
-            None => Ok(T::default()),
-        }
-    }
-
-    // --- Listens ---
-
-    fn encoded_username(&self) -> String {
-        urlencoding(&self.username)
-    }
-
-    pub async fn get_listens(&self, count: u32) -> Result<ListensResponse> {
-        let path = format!(
-            "/1/user/{}/listens?count={}",
-            self.encoded_username(),
-            count
-        );
-        self.get_json(&path, "listens").await
-    }
-
-    /// Fetch top recordings for an arbitrary user (not just self.username).
-    /// Used by the recommendation engine for collaborative filtering.
-    pub async fn get_user_top_recordings(
-        &self,
-        username: &str,
+        user: &str,
         period: TimePeriod,
-        count: u32,
-    ) -> Result<TopRecordingsResponse> {
-        let range = time_period_to_range(period);
+        count: usize,
+    ) -> Result<Vec<LbArtist>, RemoteError> {
         let path = format!(
-            "/1/stats/user/{}/recordings?range={}&count={}",
-            urlencoding(username),
-            range,
-            count
+            "/1/stats/user/{}/artists?range={}&count={count}",
+            encode(user),
+            range(period)
         );
-        self.get_json(&path, "top recordings").await
+        let page: Option<Payload<ArtistsPayload<LbArtist>>> = self.http.get(&path).await?;
+        Ok(page.map(|p| p.payload.artists).unwrap_or_default())
     }
 
-    // --- Stats ---
-
-    pub async fn get_top_artists(
+    pub async fn user_top_recordings(
         &self,
+        user: &str,
         period: TimePeriod,
-        count: u32,
-    ) -> Result<TopArtistsResponse> {
-        let range = time_period_to_range(period);
+        count: usize,
+    ) -> Result<Vec<LbRecording>, RemoteError> {
         let path = format!(
-            "/1/stats/user/{}/artists?range={}&count={}",
-            self.encoded_username(),
-            range,
-            count
+            "/1/stats/user/{}/recordings?range={}&count={count}",
+            encode(user),
+            range(period)
         );
-        self.get_json(&path, "top artists").await
+        let page: Option<Payload<RecordingsPayload>> = self.http.get(&path).await?;
+        Ok(page.map(|p| p.payload.recordings).unwrap_or_default())
     }
 
-    pub async fn get_top_recordings(
+    /// ListenBrainz serves at most 1000 listens per request.
+    pub async fn user_listens(
         &self,
-        period: TimePeriod,
-        count: u32,
-    ) -> Result<TopRecordingsResponse> {
-        let range = time_period_to_range(period);
+        user: &str,
+        count: usize,
+    ) -> Result<Vec<LbListen>, RemoteError> {
+        let path = format!("/1/user/{}/listens?count={}", encode(user), count.min(1000));
+        let page: Option<Payload<ListensPayload>> = self.http.get(&path).await?;
+        Ok(page.map(|p| p.payload.listens).unwrap_or_default())
+    }
+
+    pub async fn user_loved(&self, user: &str) -> Result<Vec<LbFeedback>, RemoteError> {
         let path = format!(
-            "/1/stats/user/{}/recordings?range={}&count={}",
-            self.encoded_username(),
-            range,
-            count
+            "/1/feedback/user/{}/get-feedback?score=1&metadata=true&count=1000",
+            encode(user)
         );
-        self.get_json(&path, "top recordings").await
+        let page: Option<FeedbackPage> = self.http.get(&path).await?;
+        Ok(page.map(|p| p.feedback).unwrap_or_default())
     }
 
-    // --- Similar Users ---
-
-    pub async fn get_similar_users(&self) -> Result<Vec<SimilarUser>> {
-        let path = format!("/1/user/{}/similar-users", self.encoded_username());
-        let raw: SimilarUsersRaw = self.get_json(&path, "similar users").await?;
-        Ok(raw.into_users())
-    }
-
-    // --- Recommendation Playlists ---
-
-    pub async fn get_recommendation_playlists(&self) -> Result<RecommendationPlaylistsResponse> {
-        let path = format!(
-            "/1/user/{}/playlists/recommendations",
-            self.encoded_username()
-        );
-        self.get_json(&path, "recommendation playlists").await
-    }
-
-    // --- LB Radio: Artist ---
-
-    pub async fn get_artist_radio(
+    /// Every recording of the artist alone, at any popularity.
+    pub async fn artist_radio(
         &self,
-        mbid: &str,
-        mode: &str,
-        max_similar_artists: u32,
-        max_recordings_per_artist: u32,
-    ) -> Result<ArtistRadioResponse> {
+        artist_mbid: &str,
+    ) -> Result<ArtistRadioResponse, RemoteError> {
         let path = format!(
-            "/1/lb-radio/artist/{}?mode={}&max_similar_artists={}&max_recordings_per_artist={}&pop_begin=0&pop_end=100",
-            mbid, mode, max_similar_artists, max_recordings_per_artist
+            "/1/lb-radio/artist/{artist_mbid}?mode=easy&max_similar_artists=0\
+             &max_recordings_per_artist=1000&pop_begin=0&pop_end=100"
         );
-        self.get_json(&path, "artist radio").await
+        Ok(self.http.get(&path).await?.unwrap_or_default())
     }
 
-    // --- LB Radio: Tags ---
-
-    pub async fn get_tag_radio(
+    pub async fn tag_radio(
         &self,
         tag: &str,
-        pop_begin: u32,
-        pop_end: u32,
-        count: u32,
-    ) -> Result<TagRadioResponse> {
+        count: usize,
+    ) -> Result<Vec<TagRadioRecording>, RemoteError> {
         let path = format!(
-            "/1/lb-radio/tags?tag={}&pop_begin={}&pop_end={}&count={}",
-            urlencoding(tag),
-            pop_begin,
-            pop_end,
-            count
+            "/1/lb-radio/tags?tag={}&pop_begin=0&pop_end=100&count={count}",
+            encode(tag)
         );
-        self.get_json(&path, "tag radio").await
+        Ok(self.http.get(&path).await?.unwrap_or_default())
     }
 
-    // --- Popularity: Artist ---
-
-    pub async fn get_artist_popularity(
+    pub async fn artist_popularity(
         &self,
-        artist_mbids: &[&str],
-    ) -> Result<ArtistPopularityResponse> {
-        let body = json!({
-            "artist_mbids": artist_mbids,
-        });
-        let resp = self.post_json("/1/popularity/artist", body).await?;
-        resp.json().await.map_err(|e| SoulseekError::Api {
-            status: 500,
-            message: format!("Failed to parse artist popularity response: {}", e),
-        })
+        artist_mbids: &[String],
+    ) -> Result<Vec<ArtistPopularityEntry>, RemoteError> {
+        let body = ArtistMbids { artist_mbids };
+        Ok(self
+            .http
+            .post("/1/popularity/artist", &body)
+            .await?
+            .unwrap_or_default())
     }
 
-    // --- Sitewide Stats ---
-
-    pub async fn get_sitewide_artists(&self, count: u32) -> Result<SitewideArtistsResponse> {
-        let path = format!("/1/stats/sitewide/artists?count={}", count);
-        self.get_json(&path, "sitewide artists").await
+    pub async fn sitewide_artists(&self, count: usize) -> Result<Vec<SitewideArtist>, RemoteError> {
+        let path = format!("/1/stats/sitewide/artists?range=all_time&count={count}");
+        let page: Option<Payload<ArtistsPayload<SitewideArtist>>> = self.http.get(&path).await?;
+        Ok(page.map(|p| p.payload.artists).unwrap_or_default())
     }
 
-    // --- Popularity: Top Recordings for Artist ---
-
-    pub async fn get_top_recordings_for_artist(
+    /// Answers 401 without a token.
+    pub async fn top_recordings_for_artist(
         &self,
-        mbid: &str,
-    ) -> Result<TopRecordingsForArtistResponse> {
-        let path = format!("/1/popularity/top-recordings-for-artist/{}", mbid);
-        self.get_json(&path, "top recordings for artist").await
+        artist_mbid: &str,
+    ) -> Result<Vec<TopRecordingForArtist>, RemoteError> {
+        let path = format!("/1/popularity/top-recordings-for-artist/{artist_mbid}");
+        Ok(self.http.get(&path).await?.unwrap_or_default())
     }
 
-    // --- Metadata: Artist ---
-
-    pub async fn get_artist_metadata(
+    /// One request for every artist, the MBIDs comma separated.
+    pub async fn artist_metadata(
         &self,
-        artist_mbids: &[&str],
-    ) -> Result<ArtistMetadataResponse> {
-        let mbids_param = artist_mbids.join(",");
+        artist_mbids: &[String],
+    ) -> Result<Vec<ArtistMetadataEntry>, RemoteError> {
         let path = format!(
             "/1/metadata/artist/?artist_mbids={}&inc=tag",
-            urlencoding(&mbids_param)
+            artist_mbids.join(",")
         );
-        self.get_json(&path, "artist metadata").await
+        Ok(self.http.get(&path).await?.unwrap_or_default())
     }
 
-    // --- MusicBrainz artist lookup (cached + rate-limited) ---
-
-    pub async fn lookup_artist_mbid(&self, artist: &str) -> Result<Option<String>> {
-        crate::http::cached_mbid_lookup(&self.client, artist).await
+    /// Keyed by recording MBID; recordings ListenBrainz does not know are absent.
+    pub async fn recording_metadata(
+        &self,
+        recording_mbids: &[String],
+    ) -> Result<HashMap<String, RecordingMetadata>, RemoteError> {
+        let body = RecordingMetadataQuery {
+            recording_mbids,
+            inc: "artist",
+        };
+        Ok(self
+            .http
+            .post("/1/metadata/recording/", &body)
+            .await?
+            .unwrap_or_default())
     }
 }
 
-fn time_period_to_range(period: TimePeriod) -> &'static str {
+fn range(period: TimePeriod) -> &'static str {
     match period {
         TimePeriod::Week => "this_week",
         TimePeriod::Month => "this_month",
@@ -275,7 +164,347 @@ fn time_period_to_range(period: TimePeriod) -> &'static str {
     }
 }
 
-/// Simple percent-encoding for URL path/query segments.
-fn urlencoding(s: &str) -> String {
+/// Form encoding for user names and tags in a path or query.
+pub(super) fn encode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_http::{serve, Reply};
+
+    fn ok(body: &str) -> Reply {
+        Reply {
+            status: 200,
+            body: body.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_top_artists_read_the_stats_endpoint() {
+        let (base, seen) = serve(vec![ok(include_str!("fixtures/user_top_artists_rob.json"))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let artists = lb
+            .user_top_artists("rob", TimePeriod::Month, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/1/stats/user/rob/artists?range=this_month&count=3"
+        );
+        assert_eq!(
+            (artists[0].artist_name.as_str(), artists[0].listen_count),
+            ("Wax Tailor", 4298)
+        );
+        assert_eq!(
+            artists[0].artist_mbid.as_deref(),
+            Some("c24b47a1-2f52-44f3-a3c6-374dca844731")
+        );
+        assert_eq!(seen.lock().unwrap()[0].authorization, None);
+    }
+
+    #[tokio::test]
+    async fn stats_not_computed_yet_read_as_none() {
+        let (base, _) = serve(vec![Reply {
+            status: 204,
+            body: String::new(),
+        }]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let artists = lb
+            .user_top_artists("rob", TimePeriod::AllTime, 3)
+            .await
+            .unwrap();
+        assert!(artists.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loved_tracks_come_with_their_metadata() {
+        let (base, seen) = serve(vec![ok(include_str!("fixtures/loved_rob.json"))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let loved = lb.user_loved("rob").await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/1/feedback/user/rob/get-feedback?score=1&metadata=true&count=1000"
+        );
+        assert_eq!(loved.len(), 2);
+        assert_eq!(
+            loved[0].recording_mbid.as_deref(),
+            Some("40313583-d07e-4ed3-a2db-1a6d3f63906e")
+        );
+        let track = loved[0].track_metadata.as_ref().unwrap();
+        assert_eq!(track.artist_name, "Kaskade & Punctual feat. Poppy Baskcomb");
+        let mapping = track.mbid_mapping.as_ref().unwrap();
+        assert_eq!(
+            mapping.artist_mbids[0],
+            "29ed4a49-fb99-4a5c-8713-609cabe6f34a"
+        );
+        assert_eq!(
+            mapping.recording_mbid.as_deref(),
+            Some("40313583-d07e-4ed3-a2db-1a6d3f63906e")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_artist_radio_asks_for_the_artist_alone() {
+        let (base, seen) = serve(vec![ok(include_str!(
+            "fixtures/artist_radio_wonder_who.json"
+        ))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let radio = lb
+            .artist_radio("75874408-e5a8-4bdd-94cf-3dfc8ce1acdc")
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/1/lb-radio/artist/75874408-e5a8-4bdd-94cf-3dfc8ce1acdc?mode=easy&max_similar_artists=0&max_recordings_per_artist=1000&pop_begin=0&pop_end=100"
+        );
+        let recordings = &radio["75874408-e5a8-4bdd-94cf-3dfc8ce1acdc"];
+        assert_eq!(recordings.len(), 5);
+        let popular = recordings
+            .iter()
+            .find(|r| r.total_listen_count == 904)
+            .unwrap();
+        assert_eq!(
+            popular.recording_mbid,
+            "45f17c9f-41d0-42b7-82d4-f2be545aadbb"
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_metadata_is_posted_and_keyed_by_recording() {
+        let (base, seen) = serve(vec![ok(include_str!(
+            "fixtures/recording_metadata_wonder_who.json"
+        ))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let ids = vec!["45f17c9f-41d0-42b7-82d4-f2be545aadbb".to_string()];
+        let map = lb.recording_metadata(&ids).await.unwrap();
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            (sent.method.as_str(), sent.target.as_str()),
+            ("POST", "/1/metadata/recording/")
+        );
+        assert_eq!(
+            sent.body,
+            r#"{"recording_mbids":["45f17c9f-41d0-42b7-82d4-f2be545aadbb"],"inc":"artist"}"#
+        );
+        let flowers = &map["45f17c9f-41d0-42b7-82d4-f2be545aadbb"];
+        assert_eq!(flowers.recording.name, "Watch the Flowers Grow");
+        assert_eq!(
+            flowers.recording.first_release_date.as_deref(),
+            Some("2012-03-27")
+        );
+        assert_eq!(flowers.artist.name, "The Wonder Who");
+        assert_eq!(
+            flowers.artist.artists[0].artist_mbid,
+            "75874408-e5a8-4bdd-94cf-3dfc8ce1acdc"
+        );
+        let lonesome = &map["7f3593da-7abc-4ae1-943e-cda2e4a00771"];
+        assert_eq!(lonesome.recording.first_release_date, None);
+    }
+
+    #[tokio::test]
+    async fn artist_metadata_names_every_artist_in_one_request() {
+        let (base, seen) = serve(vec![ok(include_str!("fixtures/artist_metadata.json"))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let ids = vec![
+            "5c98fc12-be83-4246-ae5b-2184192913b9".to_string(),
+            "ed3f4831-e3e0-4dc0-9381-f5649e9df221".to_string(),
+        ];
+        let entries = lb.artist_metadata(&ids).await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/1/metadata/artist/?artist_mbids=5c98fc12-be83-4246-ae5b-2184192913b9,ed3f4831-e3e0-4dc0-9381-f5649e9df221&inc=tag"
+        );
+        let tinariwen = entries
+            .iter()
+            .find(|e| e.artist_mbid == "5c98fc12-be83-4246-ae5b-2184192913b9")
+            .unwrap();
+        let tags = &tinariwen.tag.as_ref().unwrap().artist;
+        assert!(tags
+            .iter()
+            .any(|t| (t.tag.as_str(), t.count) == ("desert blues", 7)));
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sitewide_artists_keep_an_artist_without_an_mbid() {
+        let (base, seen) = serve(vec![ok(include_str!("fixtures/sitewide_artists.json"))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let artists = lb.sitewide_artists(200).await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/1/stats/sitewide/artists?range=all_time&count=200"
+        );
+        assert_eq!(artists.len(), 3);
+        assert_eq!(
+            artists[0].artist_mbid.as_deref(),
+            Some("a74b1b7f-71a5-4011-9441-d0b5e4122711")
+        );
+        assert_eq!(
+            (
+                artists[2].artist_name.as_str(),
+                artists[2].artist_mbid.as_deref()
+            ),
+            ("The Beatles", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn popularity_is_posted_by_artist() {
+        let (base, seen) = serve(vec![ok(include_str!("fixtures/artist_popularity.json"))]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        let ids: Vec<String> = [
+            "5c98fc12-be83-4246-ae5b-2184192913b9",
+            "d0f25f16-7782-42e8-8047-c16a1cb2b450",
+            "ed3f4831-e3e0-4dc0-9381-f5649e9df221",
+            "616699bf-d176-4368-a30a-1c4a6dd526db",
+            "5b1b9c77-dfee-42ce-a4ae-abee4d40d407",
+            "ae0b2424-d4c5-4c54-82ac-fe3be5453270",
+        ]
+        .map(String::from)
+        .into();
+        let entries = lb.artist_popularity(&ids).await.unwrap();
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            (sent.method.as_str(), sent.target.as_str()),
+            ("POST", "/1/popularity/artist")
+        );
+        assert_eq!(
+            sent.body,
+            format!(r#"{{"artist_mbids":["{}"]}}"#, ids.join(r#"",""#))
+        );
+        let fishmans = entries
+            .iter()
+            .find(|e| e.artist_mbid == "d0f25f16-7782-42e8-8047-c16a1cb2b450")
+            .unwrap();
+        assert_eq!(fishmans.total_user_count, Some(4836));
+        assert_eq!(entries.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn top_recordings_need_the_token() {
+        let (base, seen) = serve(vec![
+            ok(include_str!("fixtures/top_recordings_radiohead.json")),
+            Reply {
+                status: 401,
+                body: include_str!("fixtures/token_required.json").into(),
+            },
+        ]);
+        let with_token =
+            ListenBrainzClient::new(&base, Some("t".into()), Pace::immediate()).unwrap();
+        assert!(with_token.has_token());
+        let top = with_token
+            .top_recordings_for_artist("a74b1b7f-71a5-4011-9441-d0b5e4122711")
+            .await
+            .unwrap();
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            sent.target,
+            "/1/popularity/top-recordings-for-artist/a74b1b7f-71a5-4011-9441-d0b5e4122711"
+        );
+        assert_eq!(sent.authorization.as_deref(), Some("Token t"));
+        assert_eq!(top.len(), 3);
+        assert_eq!(
+            (top[0].recording_name.as_str(), top[0].total_listen_count),
+            ("Karma Police", 3890683)
+        );
+        assert_eq!(top[0].artist_name, "Radiohead");
+        assert_eq!(
+            top[0].artist_mbids,
+            vec!["a74b1b7f-71a5-4011-9441-d0b5e4122711".to_string()]
+        );
+
+        let without = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        assert!(!without.has_token());
+        let refused = without
+            .top_recordings_for_artist("a74b1b7f-71a5-4011-9441-d0b5e4122711")
+            .await;
+        assert!(matches!(
+            refused,
+            Err(RemoteError::Status {
+                service: "ListenBrainz",
+                status: 401,
+                ..
+            })
+        ));
+        assert_eq!(seen.lock().unwrap()[1].authorization, None);
+    }
+
+    #[tokio::test]
+    async fn tag_radio_and_user_reads_parse_their_captures() {
+        let (base, seen) = serve(vec![
+            ok(include_str!("fixtures/tag_radio_desert_blues.json")),
+            ok(include_str!("fixtures/user_top_recordings_rob.json")),
+            ok(include_str!("fixtures/listens_rob.json")),
+        ]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+
+        let radio = lb.tag_radio("desert blues", 20).await.unwrap();
+        assert_eq!(radio.len(), 4);
+        assert_eq!(
+            (radio[0].recording_mbid.as_str(), radio[0].percent),
+            ("0671db54-477b-4a41-81bd-b8cc4f9927e7", 100.0)
+        );
+
+        let top = lb
+            .user_top_recordings("rob", TimePeriod::AllTime, 2)
+            .await
+            .unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(
+            (
+                top[0].artist_name.as_str(),
+                top[0].track_name.as_str(),
+                top[0].listen_count
+            ),
+            ("TM Juke", "Just for a Day (Sunday)", 243)
+        );
+        assert_eq!(
+            top[0].recording_mbid.as_deref(),
+            Some("586a6fc2-804e-4e60-a115-217d8ae9e90d")
+        );
+        assert_eq!(
+            top[0].artist_mbids,
+            vec!["3fa17b15-b8d1-46c4-a0e3-6e0f2a064a1d".to_string()]
+        );
+
+        let listens = lb.user_listens("rob", 2).await.unwrap();
+        assert_eq!(listens.len(), 2);
+        assert_eq!(listens[0].listened_at, 1771414109);
+        assert_eq!(
+            (
+                listens[0].track_metadata.artist_name.as_str(),
+                listens[0].track_metadata.track_name.as_str(),
+                listens[0].track_metadata.release_name.as_deref()
+            ),
+            ("Röyksopp", "Some Resolve", Some("Profound Mysteries II"))
+        );
+
+        let targets: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.target.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "/1/lb-radio/tags?tag=desert+blues&pop_begin=0&pop_end=100&count=20",
+                "/1/stats/user/rob/recordings?range=all_time&count=2",
+                "/1/user/rob/listens?count=2",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn listens_are_asked_at_most_a_thousand_at_a_time_and_names_are_encoded() {
+        let (base, seen) = serve(vec![ok(r#"{"payload":{"listens":[]}}"#)]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+        assert!(lb.user_listens("a b&c", 5000).await.unwrap().is_empty());
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            "/1/user/a+b%26c/listens?count=1000"
+        );
+    }
 }

@@ -19,7 +19,6 @@ pub mod traits;
 
 pub use beets::{duplicate_note, DuplicateNote};
 pub use lastfm::LastFmProvider;
-pub use listenbrainz::ListenBrainzProvider;
 pub use metadata_error::MetadataError;
 pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
 pub use services::{Services, ServicesBuilder};

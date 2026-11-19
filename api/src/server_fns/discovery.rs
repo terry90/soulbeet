@@ -1326,38 +1326,10 @@ pub async fn generate_recommendations_for_user(
     let mut generators: Vec<Arc<dyn soulbeet::CandidateGenerator>> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
-    let lb_configured = matches!(
-        (&settings.listenbrainz_token, &settings.listenbrainz_username),
-        (Some(t), Some(u)) if !t.is_empty() && !u.is_empty()
-    );
     let lfm_configured = matches!(
         (&settings.lastfm_api_key, &settings.lastfm_username),
         (Some(k), Some(u)) if !k.is_empty() && !u.is_empty()
     );
-
-    if lb_configured {
-        let lb = Arc::new(soulbeet::ListenBrainzProvider::new(
-            settings.listenbrainz_username.as_ref().unwrap().clone(),
-            settings.listenbrainz_token.clone(),
-        ));
-        providers.push(lb.clone());
-        generators.push(Arc::new(
-            soulbeet::engine::listenbrainz_pipeline::ListenBrainzPipeline::new(lb),
-        ));
-    } else {
-        skipped.push(format!(
-            "ListenBrainz: {}",
-            if settings
-                .listenbrainz_token
-                .as_ref()
-                .is_none_or(|t| t.is_empty())
-            {
-                "no token"
-            } else {
-                "no username"
-            }
-        ));
-    }
 
     if lfm_configured {
         let lfm = Arc::new(soulbeet::LastFmProvider::with_user(
@@ -1395,10 +1367,10 @@ pub async fn generate_recommendations_for_user(
     );
 
     if providers.is_empty() {
-        return Err(
-            format!("No scrobble providers configured ({}). Set up Last.fm or ListenBrainz in Settings > Library.",
-                skipped.join("; "))
-        );
+        return Err(format!(
+            "No scrobble providers configured ({}). Set up Last.fm in Settings > Library.",
+            skipped.join("; ")
+        ));
     }
 
     // Use first available provider for profile building

@@ -1,0 +1,27 @@
+{
+  "payload": {
+    "recordings": [
+      {
+        "track_name": "Just for a Day (Sunday)",
+        "artist_name": "TM Juke",
+        "recording_mbid": "586a6fc2-804e-4e60-a115-217d8ae9e90d",
+        "artist_mbids": [
+          "3fa17b15-b8d1-46c4-a0e3-6e0f2a064a1d"
+        ],
+        "listen_count": 243,
+        "release_name": "Maps From the Wilderness"
+      },
+      {
+        "track_name": "Finally Moving",
+        "artist_name": "Pretty Lights",
+        "recording_mbid": "3b3aaac8-64e5-4574-8290-3002d199fb9c",
+        "artist_mbids": [
+          "3a07764c-7cc5-42e9-8205-3de7532f4771"
+        ],
+        "listen_count": 227,
+        "release_name": "Taking Up Your Precious Time"
+      }
+    ],
+    "range": "all_time"
+  }
+}

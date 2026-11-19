@@ -1,0 +1,22 @@
+{
+  "payload": {
+    "artists": [
+      {
+        "artist_mbid": "c24b47a1-2f52-44f3-a3c6-374dca844731",
+        "artist_name": "Wax Tailor",
+        "listen_count": 4298
+      },
+      {
+        "artist_mbid": "1c70a3fc-fa3c-4be1-8b55-c3192db8a884",
+        "artist_name": "Röyksopp",
+        "listen_count": 4249
+      },
+      {
+        "artist_mbid": "a8b39181-6939-451e-9641-2db231b73706",
+        "artist_name": "Abakus",
+        "listen_count": 3809
+      }
+    ],
+    "user_id": "rob"
+  }
+}

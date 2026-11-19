@@ -1,0 +1,20 @@
+[
+  {
+    "artist_mbid": "534dda3c-b73f-408b-8889-bd68eae84df6",
+    "name": "Ben Howard",
+    "score": 1284,
+    "reference_mbid": "b9e82c61-c1ec-4b42-9233-ca3567d2f2da"
+  },
+  {
+    "artist_mbid": "cd8c5019-5d75-4d5c-bc28-e1e26a7dd5c8",
+    "name": "José González",
+    "score": 1140,
+    "reference_mbid": "b9e82c61-c1ec-4b42-9233-ca3567d2f2da"
+  },
+  {
+    "artist_mbid": "626d3be1-08a5-4b46-835f-67601919db26",
+    "name": null,
+    "score": 319,
+    "reference_mbid": "b9e82c61-c1ec-4b42-9233-ca3567d2f2da"
+  }
+]

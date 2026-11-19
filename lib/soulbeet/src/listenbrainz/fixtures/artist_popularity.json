@@ -1,0 +1,32 @@
+[
+  {
+    "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9",
+    "total_listen_count": 779844,
+    "total_user_count": 33831
+  },
+  {
+    "artist_mbid": "d0f25f16-7782-42e8-8047-c16a1cb2b450",
+    "total_listen_count": 172537,
+    "total_user_count": 4836
+  },
+  {
+    "artist_mbid": "ed3f4831-e3e0-4dc0-9381-f5649e9df221",
+    "total_listen_count": 160996,
+    "total_user_count": 3681
+  },
+  {
+    "artist_mbid": "616699bf-d176-4368-a30a-1c4a6dd526db",
+    "total_listen_count": 13532,
+    "total_user_count": 1140
+  },
+  {
+    "artist_mbid": "5b1b9c77-dfee-42ce-a4ae-abee4d40d407",
+    "total_listen_count": 19379,
+    "total_user_count": 2594
+  },
+  {
+    "artist_mbid": "ae0b2424-d4c5-4c54-82ac-fe3be5453270",
+    "total_listen_count": 1870,
+    "total_user_count": 173
+  }
+]

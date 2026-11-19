@@ -2,7 +2,6 @@ pub mod blender;
 pub mod diversifier;
 pub mod freshness;
 pub mod lastfm_pipeline;
-pub mod listenbrainz_pipeline;
 pub mod profile;
 
 use std::collections::{HashMap, HashSet};
@@ -83,7 +82,6 @@ impl ArtistCache {
 }
 
 pub use lastfm_pipeline::LastFmPipeline;
-pub use listenbrainz_pipeline::ListenBrainzPipeline;
 pub use profile::build_profile;
 
 /// Run the full recommendation pipeline with a pre-built profile.

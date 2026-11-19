@@ -1,0 +1,26 @@
+[
+  {
+    "artist_mbid": "dc436953-1dc3-437d-9656-da401a0e9134",
+    "name": "Fishmans+",
+    "score": 861,
+    "reference_mbid": "d0f25f16-7782-42e8-8047-c16a1cb2b450"
+  },
+  {
+    "artist_mbid": "f9133036-ab3d-4e97-bd11-7a2c98ad148a",
+    "name": "Death Grips",
+    "score": 181,
+    "reference_mbid": "d0f25f16-7782-42e8-8047-c16a1cb2b450"
+  },
+  {
+    "artist_mbid": "52fbc948-398c-45f6-833b-dd75164b896a",
+    "name": "Sweet Trip",
+    "score": 168,
+    "reference_mbid": "d0f25f16-7782-42e8-8047-c16a1cb2b450"
+  },
+  {
+    "artist_mbid": "d5cc67b8-1cc4-453b-96e8-44487acdebea",
+    "name": "Beach House",
+    "score": 139,
+    "reference_mbid": "d0f25f16-7782-42e8-8047-c16a1cb2b450"
+  }
+]
