@@ -10,6 +10,8 @@ pub mod folder;
 #[cfg(feature = "server")]
 pub mod folder_root;
 #[cfg(feature = "server")]
+pub mod knowledge_cache;
+#[cfg(feature = "server")]
 pub mod navidrome_library;
 #[cfg(feature = "server")]
 pub mod navidrome_read_failure;

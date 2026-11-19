@@ -24,6 +24,7 @@ pub struct UserSettings {
     pub discovery_navidrome_playlist_id: Option<String>,
     pub discovery_last_generated_at: Option<String>,
     pub default_download_folder_id: Option<String>,
+    pub deezer_recommendations: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -60,6 +61,8 @@ pub struct UpdateUserSettings {
     pub discovery_playlist_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_download_folder_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deezer_recommendations: Option<bool>,
 }
 
 #[cfg(feature = "server")]
@@ -103,6 +106,7 @@ impl UserSettings {
             discovery_navidrome_playlist_id: None,
             discovery_last_generated_at: None,
             default_download_folder_id: None,
+            deezer_recommendations: false,
         }
     }
 
@@ -157,7 +161,8 @@ impl UserSettings {
             discovery_lifetime_days,
             discovery_profiles,
             discovery_playlist_name,
-            default_download_folder_id
+            default_download_folder_id,
+            deezer_recommendations
         );
         if given.is_empty() {
             insert.push(" ON CONFLICT(user_id) DO NOTHING");
@@ -351,5 +356,28 @@ mod tests {
             s.discovery_track_count,
             UserSettings::defaults("alice").discovery_track_count
         );
+    }
+
+    #[tokio::test]
+    async fn deezer_is_off_until_the_user_turns_it_on() {
+        let db = test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        assert!(
+            !UserSettings::get_in(&db, "alice")
+                .await
+                .unwrap()
+                .deezer_recommendations
+        );
+        let s = UserSettings::upsert_in(
+            &db,
+            "alice",
+            UpdateUserSettings {
+                deezer_recommendations: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(s.deezer_recommendations);
     }
 }
