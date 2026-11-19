@@ -515,6 +515,9 @@ pub async fn generate_discovery_playlist_internal(
     let mut all_profile_stats: Vec<ProfileGenerationStats> = Vec::new();
     // Set when the importer broke during the run and stopped it.
     let mut importer_issue: Option<Failure> = None;
+    // Set when the engine failed. Every profile is built from the same library read, so it
+    // is not run again for later profiles, which still use the candidates they hold.
+    let mut engine_issue: Option<Failure> = None;
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
@@ -580,7 +583,7 @@ pub async fn generate_discovery_playlist_internal(
                     .map_err(|e| run_database_failure(Stage::Input, e))?;
 
             if candidates.is_empty() {
-                if _attempt == 0 {
+                if _attempt == 0 && engine_issue.is_none() {
                     update_progress(
                         user_id,
                         &profile_name,
@@ -590,8 +593,20 @@ pub async fn generate_discovery_playlist_internal(
                     )
                     .await;
                     info!("No candidates for {}, running engine", profile_name);
-                    let count = generate_recommendations_for_user(user_id, *profile).await?;
-                    info!("Generated {} candidates for {}", count, profile_name);
+                    match generate_recommendations_for_user(user_id, *profile).await {
+                        Ok(count) => {
+                            info!("Generated {} candidates for {}", count, profile_name)
+                        }
+                        Err(f) => {
+                            warn!(
+                                "{} engine failed: {}",
+                                profile_name,
+                                crate::core::logged(&f)
+                            );
+                            engine_issue = Some(f);
+                            break;
+                        }
+                    }
                     candidates =
                         DiscoveryCandidateRow::get_unused(user_id, &profile_name, fetch_count)
                             .await
@@ -1086,13 +1101,32 @@ pub async fn generate_discovery_playlist_internal(
         }
     }
 
+    run_outcome(
+        GenerationResult {
+            total_imported: total_downloads,
+            profiles: all_profile_stats,
+        },
+        importer_issue,
+        engine_issue,
+    )
+}
+
+/// What a run returns once its imports are scanned. A broken importer fails it even after
+/// imports, since the user must fix it. A failed engine fails it only when nothing was
+/// imported, so a run that imported tracks still reports them.
+#[cfg(feature = "server")]
+fn run_outcome(
+    result: shared::navidrome::GenerationResult,
+    importer_issue: Option<Failure>,
+    engine_issue: Option<Failure>,
+) -> Result<shared::navidrome::GenerationResult, Failure> {
     if let Some(issue) = importer_issue {
         return Err(issue);
     }
-    Ok(GenerationResult {
-        total_imported: total_downloads,
-        profiles: all_profile_stats,
-    })
+    match engine_issue {
+        Some(issue) if result.total_imported == 0 => Err(issue),
+        _ => Ok(result),
+    }
 }
 
 /// Starts a Navidrome scan of `imported` new tracks and waits up to two
@@ -1397,8 +1431,8 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::{
-        discovery_folder_not_found, run_database_failure, scan_imports, settle_poll, QueuedTrack,
-        FAILED_STATE_CONFIRM,
+        discovery_folder_not_found, run_database_failure, run_outcome, scan_imports, settle_poll,
+        QueuedTrack, FAILED_STATE_CONFIRM,
     };
     use crate::core::discovery::{
         discovery_disabled, discovery_folder_required, generation_running,
@@ -1462,6 +1496,44 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn an_engine_failure_fails_the_run_only_when_nothing_was_imported() {
+        use crate::core::recommend::no_listening_data;
+        use shared::navidrome::{GenerationResult, ProfileGenerationStats};
+
+        let imported = GenerationResult {
+            total_imported: 10,
+            profiles: vec![ProfileGenerationStats {
+                profile: "Conservative".into(),
+                imports_succeeded: 10,
+                ..Default::default()
+            }],
+        };
+        let importer = Failure::new(
+            FailureCode::ImporterBroken,
+            Stage::Import,
+            RetryAdvice::NeedsUser,
+            "beets cannot start",
+        );
+        assert_eq!(
+            run_outcome(imported.clone(), None, Some(no_listening_data())),
+            Ok(imported.clone())
+        );
+        assert_eq!(
+            run_outcome(GenerationResult::default(), None, Some(no_listening_data())),
+            Err(no_listening_data())
+        );
+        assert_eq!(
+            run_outcome(
+                imported.clone(),
+                Some(importer.clone()),
+                Some(no_listening_data())
+            ),
+            Err(importer)
+        );
+        assert_eq!(run_outcome(imported.clone(), None, None), Ok(imported));
     }
 
     #[test]
