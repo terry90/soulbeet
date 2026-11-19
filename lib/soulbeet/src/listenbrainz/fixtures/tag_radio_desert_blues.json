@@ -2,25 +2,21 @@
   {
     "percent": 100,
     "recording_mbid": "0671db54-477b-4a41-81bd-b8cc4f9927e7",
-    "source": "release-group",
-    "tag_count": 16
+    "source": "release-group"
   },
   {
     "percent": 21,
     "recording_mbid": "b0d3e48f-4e05-4bfe-929b-4bb580c38840",
-    "source": "release-group",
-    "tag_count": 6
+    "source": "release-group"
   },
   {
     "percent": 100,
     "recording_mbid": "1ba3336e-4c02-4211-8d72-271ff345ef9e",
-    "source": "release-group",
-    "tag_count": 6
+    "source": "release-group"
   },
   {
     "percent": 100,
     "recording_mbid": "abe617b3-dae0-43d6-93af-a566fee0749f",
-    "source": "release-group",
-    "tag_count": 6
+    "source": "release-group"
   }
 ]
