@@ -942,6 +942,20 @@ impl NavidromeClient {
         Ok(Some(users.into_iter().map(|u| u.user_name).collect()))
     }
 
+    /// Every artist row this user can see, in one request (`GET /api/artist`,
+    /// server/nativeapi/artists.go:17-29 in 0.64.2, `artistRepository.ReadAll`). A non-admin
+    /// sees the artists of their libraries (persistence/artist_repository.go:191-205). No
+    /// `_end` is sent, so the list is not cut short, as for `user_names`; one answer also
+    /// cannot shift between pages.
+    pub async fn list_artists(&self) -> Result<Vec<NativeArtist>> {
+        let url = self.base_url.join("api/artist")?;
+        let resp = self.native_request(self.client.get(url)).await?;
+        if !resp.status().is_success() {
+            return Err(native_failure("List artists", resp).await);
+        }
+        resp.json().await.map_err(parse)
+    }
+
     /// The native song list for `query`; a non-success status is an Http error of `action`.
     async fn native_songs(
         &self,
@@ -1247,6 +1261,42 @@ mod tests {
             seen.lock().unwrap()[1].target,
             "/api/song?_start=100&_end=200&_sort=created_at&_order=DESC&missing=false"
         );
+    }
+
+    #[tokio::test]
+    async fn artists_are_listed_whole_with_their_mbids() {
+        // model/artist.go in 0.64.2: mbzArtistId is omitempty.
+        let artists = r#"[{"id":"2kD9pWq4ZxC1vBnM6yTjLs","name":"Marrow Choir","orderArtistName":"marrow choir",
+        "mbzArtistId":"4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a","stats":{"albumartist":{"songCount":12,"albumCount":1,"size":341200231},
+        "artist":{"songCount":12,"albumCount":1,"size":341200231}},"size":341200231,"albumCount":1,"songCount":12,
+        "missing":false,"createdAt":"2026-11-01T18:20:07.551902337+01:00","updatedAt":"2026-11-01T18:20:07.551902337+01:00"},
+        {"id":"7fH3jKl9QwE2rT5yU8iOpA","name":"Vela Norte","orderArtistName":"vela norte","missing":false}]"#;
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: r#"{"token":"jwt"}"#.into(),
+            },
+            Reply {
+                status: 200,
+                body: artists.into(),
+            },
+        ]);
+        let listed = client(&url).list_artists().await.unwrap();
+        let got: Vec<(&str, Option<&str>)> = listed
+            .iter()
+            .map(|a| (a.id.as_str(), a.mbz_artist_id.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "2kD9pWq4ZxC1vBnM6yTjLs",
+                    Some("4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a")
+                ),
+                ("7fH3jKl9QwE2rT5yU8iOpA", None)
+            ]
+        );
+        assert_eq!(seen.lock().unwrap()[1].target, "/api/artist");
     }
 
     #[tokio::test]

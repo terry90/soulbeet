@@ -737,6 +737,7 @@ mod tests {
         let navi = NavidromeStub::start();
         navi.answer("/api/song", &["[]"]);
         navi.header("/api/song", "X-Total-Count", "0");
+        navi.answer("/api/artist", &["[]"]);
         generate_in(
             db,
             &NavidromeFor(Ok(navi.client())),

@@ -11,13 +11,15 @@ use shared::recommendation::{
 };
 
 use super::HistoryError;
-use crate::navidrome::models::NativeSong;
+use crate::navidrome::models::{NativeArtist, NativeSong, Participant};
 use crate::navidrome::NavidromeClient;
 use crate::traits::ListeningHistory;
 
 /// The library's songs with this user's annotations, read once.
 pub struct NavidromeHistory {
     songs: Vec<NativeSong>,
+    /// The MusicBrainz id of each artist row that has one, by Navidrome artist id.
+    artist_mbids: HashMap<String, String>,
     now: DateTime<Utc>,
 }
 
@@ -25,7 +27,8 @@ pub struct NavidromeHistory {
 /// Navidrome joins this user's `play_count`, `play_date`, `rating` and `starred` onto each song
 /// (`withAnnotation`, persistence/sql_annotations.go:62-90 in 0.64.2; :17-41 at fa46aefa).
 /// `Incomplete` when the pages held fewer songs than Navidrome counts, since a part of the
-/// history would be missing.
+/// history would be missing. The artist rows follow, as they hold the artist MBIDs from
+/// Navidrome 0.55.0 on.
 pub async fn read(client: &NavidromeClient) -> Result<NavidromeHistory, HistoryError> {
     let page = client.all_songs().await?;
     if (page.songs.len() as u64) < page.total {
@@ -34,7 +37,12 @@ pub async fn read(client: &NavidromeClient) -> Result<NavidromeHistory, HistoryE
             total: page.total,
         });
     }
-    Ok(NavidromeHistory::from_songs(page.songs, Utc::now()))
+    let artists = client.list_artists().await?;
+    Ok(NavidromeHistory::from_songs(
+        page.songs,
+        artists,
+        Utc::now(),
+    ))
 }
 
 fn disliked(song: &NativeSong) -> bool {
@@ -50,20 +58,45 @@ fn favoured_at(song: &NativeSong) -> Option<DateTime<Utc>> {
     starred.max(rated)
 }
 
-fn track_ref(song: &NativeSong) -> TrackRef {
-    TrackRef {
-        artist: ArtistRef {
-            name: song.artist.clone(),
-            mbid: song.mbz_artist_id.clone(),
-        },
-        title: song.title.clone(),
-        mbid: song.mbz_recording_id.clone(),
-    }
-}
-
 impl NavidromeHistory {
-    pub fn from_songs(songs: Vec<NativeSong>, now: DateTime<Utc>) -> Self {
-        Self { songs, now }
+    pub fn from_songs(
+        songs: Vec<NativeSong>,
+        artists: Vec<NativeArtist>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let artist_mbids = artists
+            .into_iter()
+            .filter_map(|a| Some((a.id, a.mbz_artist_id?)))
+            .collect();
+        Self {
+            songs,
+            artist_mbids,
+            now,
+        }
+    }
+
+    fn mbid_of(&self, participant: &Participant) -> Option<String> {
+        self.artist_mbids.get(&participant.id).cloned()
+    }
+
+    /// The song's display artist with the MBID of its main artist: the song's own where the
+    /// scanner before Navidrome 0.55.0 filled it, else the first `artist` participant's row.
+    fn artist_of(&self, song: &NativeSong) -> ArtistRef {
+        ArtistRef {
+            name: song.artist.clone(),
+            mbid: song.mbz_artist_id.clone().or_else(|| {
+                let main = song.participants.artist.first()?;
+                self.mbid_of(main)
+            }),
+        }
+    }
+
+    fn track_ref(&self, song: &NativeSong) -> TrackRef {
+        TrackRef {
+            artist: self.artist_of(song),
+            title: song.title.clone(),
+            mbid: song.mbz_recording_id.clone(),
+        }
     }
 
     /// Played songs the user did not rate 1 or 2. A period keeps those whose last play falls
@@ -105,18 +138,13 @@ impl ListeningHistory for NavidromeHistory {
         let mut by_key: HashMap<String, usize> = HashMap::new();
         let mut artists: Vec<PlayedArtist> = Vec::new();
         for song in self.seed_songs(period) {
-            let key = match &song.mbz_artist_id {
+            let artist = self.artist_of(song);
+            let key = match &artist.mbid {
                 Some(mbid) => mbid.to_lowercase(),
-                None => normalize_for_matching(&song.artist),
+                None => normalize_for_matching(&artist.name),
             };
             let at = *by_key.entry(key).or_insert_with(|| {
-                artists.push(PlayedArtist {
-                    artist: ArtistRef {
-                        name: song.artist.clone(),
-                        mbid: song.mbz_artist_id.clone(),
-                    },
-                    plays: 0,
-                });
+                artists.push(PlayedArtist { artist, plays: 0 });
                 artists.len() - 1
             });
             artists[at].plays += song.play_count;
@@ -146,7 +174,7 @@ impl ListeningHistory for NavidromeHistory {
             .into_iter()
             .take(count)
             .map(|s| PlayedTrack {
-                track: track_ref(s),
+                track: self.track_ref(s),
                 plays: s.play_count,
             })
             .collect())
@@ -186,17 +214,25 @@ impl ListeningHistory for NavidromeHistory {
                 .then_with(|| b.play_date.cmp(&a.play_date))
                 .then_with(|| a.id.cmp(&b.id))
         });
-        Ok(songs.into_iter().map(track_ref).collect())
+        Ok(songs.into_iter().map(|s| self.track_ref(s)).collect())
     }
 
     async fn known(&self) -> Result<KnownMusic, HistoryError> {
         let mut known = KnownMusic::default();
         for song in &self.songs {
-            known.add_track(&track_ref(song));
+            known.add_track(&self.track_ref(song));
             known.add_artist(&ArtistRef {
                 name: song.album_artist.clone(),
                 mbid: song.mbz_album_artist_id.clone(),
             });
+            // Every credited artist, so a recommendation under any of their names or MBIDs is known.
+            let credited = song.participants.artist.iter();
+            for participant in credited.chain(&song.participants.albumartist) {
+                known.add_artist(&ArtistRef {
+                    name: participant.name.clone(),
+                    mbid: self.mbid_of(participant),
+                });
+            }
         }
         Ok(known)
     }
@@ -211,6 +247,69 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         "2026-11-19T12:00:00Z".parse().unwrap()
+    }
+
+    fn history(songs: Vec<NativeSong>) -> NavidromeHistory {
+        NavidromeHistory::from_songs(songs, Vec::new(), now())
+    }
+
+    const SH: &str = "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
+    const VN: &str = "2e3f4a5b-6c7d-4e8f-9a0b-1c2d3e4f5a6b";
+    const MC: &str = "3f4a5b6c-7d8e-4f9a-0b1c-2d3e4f5a6b7c";
+
+    /// The artist rows of Static Harbor, Vela Norte and Marrow Choir, with their MBIDs.
+    fn artist_rows() -> Vec<NativeArtist> {
+        serde_json::from_value(serde_json::json!([
+            {"id": "ar-sh", "name": "Static Harbor", "mbzArtistId": SH, "missing": false},
+            {"id": "ar-vn", "name": "Vela Norte", "mbzArtistId": VN, "missing": false},
+            {"id": "ar-mc", "name": "Marrow Choir", "mbzArtistId": MC, "missing": false},
+            {"id": "ar-none", "name": "Untagged", "missing": false},
+        ]))
+        .unwrap()
+    }
+
+    /// A played song as Navidrome 0.55.0 on sends it: no artist MBIDs, the artists by id.
+    fn credited_json(
+        id: &str,
+        title: &str,
+        artists: &[(&str, &str)],
+        album_artist: (&str, &str),
+    ) -> serde_json::Value {
+        let display = artists
+            .iter()
+            .map(|a| a.1)
+            .collect::<Vec<_>>()
+            .join(" feat. ");
+        let mut json = song_json(
+            id,
+            &display,
+            title,
+            3,
+            Some("2026-11-18T20:00:00Z"),
+            0,
+            false,
+        );
+        let list = |credits: &[(&str, &str)]| -> serde_json::Value {
+            credits
+                .iter()
+                .map(|(id, name)| serde_json::json!({"id": id, "name": name, "missing": false}))
+                .collect()
+        };
+        json["albumArtist"] = album_artist.1.into();
+        json["participants"] = serde_json::json!({
+            "artist": list(artists),
+            "albumartist": list(&[album_artist]),
+        });
+        json
+    }
+
+    fn credited(
+        id: &str,
+        title: &str,
+        artists: &[(&str, &str)],
+        album_artist: (&str, &str),
+    ) -> NativeSong {
+        serde_json::from_value(credited_json(id, title, artists, album_artist)).unwrap()
     }
 
     fn song(
@@ -305,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn top_tracks_rank_played_songs_and_never_seed_a_disliked_one() {
-        let h = NavidromeHistory::from_songs(library(), now());
+        let h = history(library());
         let all = h.top_tracks(TimePeriod::AllTime, 10).await.unwrap();
         assert_eq!(titles(&all), ["Northern Line", "Maritime"]);
         let month = h.top_tracks(TimePeriod::Month, 10).await.unwrap();
@@ -347,7 +446,7 @@ mod tests {
         ];
         songs[0].mbz_artist_id = Some("a1".into());
         songs[1].mbz_artist_id = Some("a1".into());
-        let h = NavidromeHistory::from_songs(songs, now());
+        let h = history(songs);
         let artists = h.top_artists(TimePeriod::AllTime, 10).await.unwrap();
         let got: Vec<(&str, u64)> = artists
             .iter()
@@ -359,15 +458,12 @@ mod tests {
 
     #[tokio::test]
     async fn favourites_are_starred_or_well_rated_songs() {
-        let h = NavidromeHistory::from_songs(
-            vec![
-                song("1", "A", "starred", 0, None, 0, true),
-                song("2", "A", "five", 0, None, 5, false),
-                song("3", "A", "starred but disliked", 0, None, 2, true),
-                song("4", "A", "middling", 0, None, 3, false),
-            ],
-            now(),
-        );
+        let h = history(vec![
+            song("1", "A", "starred", 0, None, 0, true),
+            song("2", "A", "five", 0, None, 5, false),
+            song("3", "A", "starred but disliked", 0, None, 2, true),
+            song("4", "A", "middling", 0, None, 3, false),
+        ]);
         let favourites = h.favourites().await.unwrap();
         let got: Vec<&str> = favourites.iter().map(|t| t.title.as_str()).collect();
         // Neither has a date, so the higher rating goes first.
@@ -377,38 +473,35 @@ mod tests {
     #[tokio::test]
     async fn favourites_put_the_latest_star_or_rating_first() {
         // Navidrome lists songs oldest import first.
-        let h = NavidromeHistory::from_songs(
-            vec![
-                favoured("1", "rated before 0.59", false, None, 5, None),
-                favoured(
-                    "2",
-                    "unstarred lately",
-                    false,
-                    Some("2026-11-18T10:00:00Z"),
-                    4,
-                    None,
-                ),
-                favoured("3", "old star", true, Some("2025-03-01T10:00:00Z"), 0, None),
-                favoured("4", "new star", true, Some("2026-11-15T10:00:00Z"), 0, None),
-                favoured(
-                    "5",
-                    "rated 5 today",
-                    false,
-                    None,
-                    5,
-                    Some("2026-11-19T09:00:00Z"),
-                ),
-                favoured(
-                    "6",
-                    "rated 3 today",
-                    true,
-                    Some("2025-06-01T10:00:00Z"),
-                    3,
-                    Some("2026-11-19T11:00:00Z"),
-                ),
-            ],
-            now(),
-        );
+        let h = history(vec![
+            favoured("1", "rated before 0.59", false, None, 5, None),
+            favoured(
+                "2",
+                "unstarred lately",
+                false,
+                Some("2026-11-18T10:00:00Z"),
+                4,
+                None,
+            ),
+            favoured("3", "old star", true, Some("2025-03-01T10:00:00Z"), 0, None),
+            favoured("4", "new star", true, Some("2026-11-15T10:00:00Z"), 0, None),
+            favoured(
+                "5",
+                "rated 5 today",
+                false,
+                None,
+                5,
+                Some("2026-11-19T09:00:00Z"),
+            ),
+            favoured(
+                "6",
+                "rated 3 today",
+                true,
+                Some("2025-06-01T10:00:00Z"),
+                3,
+                Some("2026-11-19T11:00:00Z"),
+            ),
+        ]);
         let favourites = h.favourites().await.unwrap();
         let got: Vec<&str> = favourites.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(
@@ -429,10 +522,7 @@ mod tests {
         let mut songs = library();
         songs[2].album_artist = "Marrow Choir".into();
         songs[2].mbz_album_artist_id = Some("B2".into());
-        let known = NavidromeHistory::from_songs(songs, now())
-            .known()
-            .await
-            .unwrap();
+        let known = history(songs).known().await.unwrap();
         let undertow = TrackRef {
             artist: ArtistRef {
                 name: "Static Harbor".into(),
@@ -453,8 +543,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn from_0_55_on_artist_mbids_come_from_the_artist_rows() {
+        let sh = ("ar-sh", "Static Harbor");
+        let vn = ("ar-vn", "Vela Norte");
+        let songs = vec![
+            credited("1", "Northern Line", &[sh, vn], ("ar-mc", "Marrow Choir")),
+            credited("2", "Undertow", &[sh], sh),
+            credited("3", "Foglight", &[("ar-none", "Untagged")], vn),
+        ];
+        let h = NavidromeHistory::from_songs(songs, artist_rows(), now());
+
+        let artists = h.top_artists(TimePeriod::AllTime, 10).await.unwrap();
+        let got: Vec<(&str, Option<&str>, u64)> = artists
+            .iter()
+            .map(|a| (a.artist.name.as_str(), a.artist.mbid.as_deref(), a.plays))
+            .collect();
+        // Both Static Harbor songs count under its MBID, whatever the display artist.
+        assert_eq!(
+            got,
+            [
+                ("Static Harbor feat. Vela Norte", Some(SH), 6),
+                ("Untagged", None, 3)
+            ]
+        );
+        let tracks = h.top_tracks(TimePeriod::AllTime, 10).await.unwrap();
+        assert!(
+            tracks
+                .iter()
+                .all(|t| t.track.artist.mbid.as_deref()
+                    == (t.track.title != "Foglight").then_some(SH))
+        );
+
+        let known = h.known().await.unwrap();
+        for mbid in [SH, VN, MC] {
+            assert!(
+                known.knows_artist(&ArtistRef {
+                    name: "another spelling".into(),
+                    mbid: Some(mbid.to_uppercase())
+                }),
+                "{mbid}"
+            );
+        }
+        assert!(known.knows_artist(&ArtistRef {
+            name: "Vela Norte".into(),
+            mbid: None
+        }));
+    }
+
+    #[tokio::test]
+    async fn the_songs_own_artist_mbid_goes_first() {
+        // A song scanned before Navidrome 0.55.0 carries its own MBID.
+        let mut song = credited(
+            "1",
+            "Northern Line",
+            &[("ar-vn", "Vela Norte")],
+            ("ar-vn", "Vela Norte"),
+        );
+        song.mbz_artist_id = Some("a1".into());
+        let h = NavidromeHistory::from_songs(vec![song], artist_rows(), now());
+        let artists = h.top_artists(TimePeriod::AllTime, 10).await.unwrap();
+        assert_eq!(artists[0].artist.mbid.as_deref(), Some("a1"));
+    }
+
+    #[tokio::test]
     async fn listens_are_one_per_played_song_newest_first() {
-        let h = NavidromeHistory::from_songs(library(), now());
+        let h = history(library());
         let listens = h.listens(10).await.unwrap();
         let got: Vec<&str> = listens.iter().map(|l| l.track.as_str()).collect();
         assert_eq!(got, ["Northern Line", "Maritime"]);
@@ -504,5 +657,50 @@ mod tests {
             matches!(err, HistoryError::Incomplete { read: 1, total: 2 }),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_read_takes_the_artist_mbids_from_the_artist_list() {
+        let login = r#"{"id":"8uY3tR6eW9qA2sD5fG8hJ1","name":"Alice","username":"alice","isAdmin":false,"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.c2ln"}"#;
+        let sh = ("ar-sh", "Static Harbor");
+        let page =
+            serde_json::to_string(&[credited_json("1", "Northern Line", &[sh], sh)]).unwrap();
+        let artists = serde_json::to_string(&serde_json::json!([
+            {"id": "ar-sh", "name": "Static Harbor", "mbzArtistId": SH, "missing": false}
+        ]))
+        .unwrap();
+        let (url, seen) = serve_with_headers(vec![
+            (
+                Reply {
+                    status: 200,
+                    body: login.into(),
+                },
+                vec![],
+            ),
+            (
+                Reply {
+                    status: 200,
+                    body: page,
+                },
+                vec![("X-Total-Count", "1".into())],
+            ),
+            (
+                Reply {
+                    status: 200,
+                    body: artists,
+                },
+                vec![],
+            ),
+        ]);
+        let client = NavidromeClientBuilder::new()
+            .base_url(&url)
+            .username("alice")
+            .password("secret-password")
+            .build()
+            .unwrap();
+        let h = read(&client).await.unwrap();
+        let top = h.top_artists(TimePeriod::AllTime, 10).await.unwrap();
+        assert_eq!(top[0].artist.mbid.as_deref(), Some(SH));
+        assert_eq!(seen.lock().unwrap()[2].target, "/api/artist");
     }
 }

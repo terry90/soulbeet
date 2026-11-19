@@ -546,6 +546,7 @@ impl Library {
                 play_date: None,
                 mbz_artist_id: None,
                 mbz_album_artist_id: None,
+                participants: Default::default(),
             },
             "al1",
         );
