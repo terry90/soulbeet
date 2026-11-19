@@ -124,9 +124,8 @@ impl ProfileConfig {
     }
 }
 
-/// User's music profile built from the listening histories.
-/// Cached in the database, rebuilt periodically.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// User's music profile built from the listening histories, rebuilt every run.
+#[derive(Debug, Clone, Default)]
 pub struct UserMusicProfile {
     pub genre_distribution: Vec<WeightedTag>,
     pub obscurity_score: f64, // 0.0 = mainstream, 1.0 = deep cuts
@@ -134,11 +133,8 @@ pub struct UserMusicProfile {
     pub momentum_artists: Vec<MomentumArtist>,
     pub tag_comfort_zone: Vec<String>,
     pub tag_exploration_zone: Vec<String>,
-    #[serde(default)]
     pub seed_artists: Vec<PlayedArtist>,
-    #[serde(default)]
     pub favourite_artists: Vec<ArtistRef>,
-    #[serde(default)]
     pub known: KnownMusic,
 }
 

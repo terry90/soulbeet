@@ -36,7 +36,6 @@ use crate::models::discovery_candidate::DiscoveryCandidateRow;
 use crate::models::engine_report::EngineReportRow;
 use crate::models::knowledge_cache::SqliteKnowledgeCache;
 use crate::models::user::User;
-use crate::models::user_profile::UserProfileRow;
 use crate::models::user_settings::UserSettings;
 
 /// Candidates kept per discovery profile and run.
@@ -194,9 +193,6 @@ pub(crate) async fn generate_in(
         info!("{name}: {} candidates for {user_id}", candidates.len());
         total += candidates.len() as u32;
     }
-    UserProfileRow::upsert_in(db, &user_id, &build.profile)
-        .await
-        .map_err(stored)?;
     if !build.profile.has_seeds() {
         return Err(no_listening_data());
     }
@@ -281,7 +277,7 @@ mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::models::user_settings::UpdateUserSettings;
-    use shared::recommendation::{EngineState, SourceError, UserMusicProfile};
+    use shared::recommendation::{EngineState, SourceError};
     use shared::system::NavidromeStatus;
 
     fn cand(artist: &str, track: &str) -> Candidate {
@@ -491,21 +487,6 @@ mod tests {
                 "alice".to_string(),
                 vec![DiscoveryProfile::Balanced, DiscoveryProfile::Adventurous]
             )]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_profile_stored_before_the_hash_column_went_still_saves() {
-        let db = test_db::migrated().await;
-        UserProfileRow::upsert_in(&db, "alice", &UserMusicProfile::default())
-            .await
-            .unwrap();
-        UserProfileRow::upsert_in(&db, "alice", &UserMusicProfile::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            UserProfileRow::get_report_in(&db, "alice").await.unwrap(),
-            None
         );
     }
 }
