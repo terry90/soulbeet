@@ -205,15 +205,12 @@ pub fn DiscoveryOverview() -> Element {
 
 #[component]
 fn LastRunLine(run: LastRun) -> Element {
-    if run.state == EngineState::NoListeningData {
-        return rsx! {
-            p { class: "text-beet-accent text-xs font-mono mt-1", "{NO_LISTENING_DATA}" }
-        };
-    }
     let used = run.sources.join(", ");
     rsx! {
-        // A run that failed before recommending used no source.
-        if !run.sources.is_empty() {
+        if run.state == EngineState::NoListeningData {
+            p { class: "text-beet-accent text-xs font-mono mt-1", "{NO_LISTENING_DATA}" }
+        } else if !run.sources.is_empty() {
+            // A run that failed before recommending used no source.
             p { class: "text-gray-400 text-xs font-mono mt-1", "Last run used: {used}" }
         }
         for e in &run.source_errors {
@@ -601,11 +598,12 @@ mod tests {
         assert!(html.contains("Deezer failed: Deezer kept refusing for too many requests"));
         let empty = LastRun {
             state: EngineState::NoListeningData,
+            sources: vec![],
             ..run.clone()
         };
-        assert!(
-            render_run(empty).contains("No listening data yet. Play or star music in Navidrome.")
-        );
+        let html = render_run(empty);
+        assert!(html.contains("No listening data yet. Play or star music in Navidrome."));
+        assert!(html.contains("Deezer failed: Deezer kept refusing for too many requests"));
         let unread = LastRun {
             sources: vec![],
             source_errors: vec![SourceError {

@@ -328,6 +328,7 @@ impl SourceErrors {
 pub enum EngineState {
     #[default]
     Recommended,
+    /// No history had plays or stars, and every history answered.
     NoListeningData,
 }
 

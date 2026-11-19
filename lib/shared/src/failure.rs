@@ -329,7 +329,8 @@ failure_codes! {
     ExpiredHandle => "expired_handle",
     PermissionNotGranted => "permission_not_granted",
     FolderRequired => "folder_required",
-    /// Nothing played or starred in Navidrome and no ListenBrainz history to recommend from.
+    /// Nothing played or starred in Navidrome and no ListenBrainz history to recommend from,
+    /// every history having answered.
     NoListeningData => "no_listening_data",
     RateLimited => "rate_limited",
     MetadataUnavailable => "metadata_unavailable",

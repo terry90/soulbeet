@@ -7,8 +7,8 @@ use std::sync::Arc;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::navidrome::LastRun;
 use shared::recommendation::{
-    Candidate, DiscoveryProfile, EngineReport, EngineState, ProfileConfig, SourceErrors,
-    NO_LISTENING_DATA,
+    Candidate, DiscoveryProfile, EngineReport, EngineState, ProfileConfig, SourceError,
+    SourceErrors, NO_LISTENING_DATA,
 };
 use soulbeet::deezer::DeezerClient;
 use soulbeet::engine::catalog::CatalogGenerator;
@@ -154,7 +154,7 @@ pub(crate) async fn generate_in(
         total += candidates.len() as u32;
     }
     if !build.profile.has_seeds() {
-        return Err(no_listening_data());
+        return Err(no_seeds(build.errors.into_vec()));
     }
     Ok(total)
 }
@@ -258,6 +258,27 @@ async fn store_failure_in(
             );
         }
     }
+}
+
+/// The profile has no seeds. A history that `failed` may hold the user's listening, so the
+/// run is retried later and the failure names it; with every history answered, there is no
+/// listening data.
+fn no_seeds(failed: Vec<SourceError>) -> Failure {
+    if failed.is_empty() {
+        return no_listening_data();
+    }
+    let failed: Vec<String> = (failed.iter())
+        .map(|e| format!("{} failed: {}", e.source, e.message))
+        .collect();
+    Failure::new(
+        FailureCode::MetadataUnavailable,
+        Stage::Input,
+        RetryAdvice::SameSourceLater,
+        format!(
+            "{}. Discovery has no listening data to start from until it answers. Try again later.",
+            failed.join("; ")
+        ),
+    )
 }
 
 /// The profile has no seeds: nothing played or starred in Navidrome and no ListenBrainz history.
@@ -377,7 +398,6 @@ mod tests {
     use crate::db::test_db;
     use crate::models::user_settings::UpdateUserSettings;
     use crate::test_navidrome::{NavidromeFor, NavidromeStub, BAD_GATEWAY};
-    use shared::recommendation::SourceError;
     use shared::system::NavidromeStatus;
 
     fn cand(artist: &str, track: &str) -> Candidate {
@@ -692,6 +712,87 @@ mod tests {
                     .unwrap()
             ),
             ["a1"]
+        );
+    }
+
+    /// ListenBrainz's bot challenge page, captured.
+    const CHALLENGE: &str =
+        include_str!("../../../lib/soulbeet/src/listenbrainz/fixtures/challenge.html");
+
+    /// The failure of alice's Balanced run with an empty Navidrome library, her ListenBrainz
+    /// account being `listenbrainz_user` at `listenbrainz`.
+    async fn empty_library_run(
+        db: &SqlitePool,
+        listenbrainz: &str,
+        listenbrainz_user: Option<&str>,
+    ) -> Failure {
+        crate::core::folder_of(db, "alice").await;
+        let settings = UpdateUserSettings {
+            listenbrainz_username: listenbrainz_user.map(str::to_string),
+            ..Default::default()
+        };
+        UserSettings::upsert_in(db, "alice", settings)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer("/api/song", &["[]"]);
+        navi.header("/api/song", "X-Total-Count", "0");
+        generate_in(
+            db,
+            &NavidromeFor(Ok(navi.client())),
+            &services_at(db, listenbrainz),
+            &UserId::new("alice"),
+            &[DiscoveryProfile::Balanced],
+        )
+        .await
+        .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn no_listening_data_is_said_only_when_every_history_answered() {
+        let db = test_db::migrated().await;
+        let f = empty_library_run(&db, UNREACHED, None).await;
+        assert_eq!(f, no_listening_data());
+        let rows = EngineReportRow::latest_per_profile_in(&db, "alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            last_run_of(rows).map(|run| run.state),
+            Some(EngineState::NoListeningData)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_seeds_while_a_history_failed_is_retried_later_and_names_it() {
+        let db = test_db::migrated().await;
+        // The stand-in answers any path, so it serves as ListenBrainz too.
+        let listenbrainz = NavidromeStub::start();
+        listenbrainz.answer("/1/stats/user/rob/artists", &[CHALLENGE]);
+        let f = empty_library_run(&db, &listenbrainz.url, Some("rob")).await;
+        assert_eq!(
+            (f.code, f.retry, f.user_action),
+            (
+                FailureCode::MetadataUnavailable,
+                RetryAdvice::SameSourceLater,
+                None
+            )
+        );
+        assert!(
+            f.message
+                .contains("ListenBrainz failed: ListenBrainz answered with a browser check"),
+            "{}",
+            f.message
+        );
+        let rows = EngineReportRow::latest_per_profile_in(&db, "alice")
+            .await
+            .unwrap();
+        let run = last_run_of(rows).unwrap();
+        assert_eq!(run.state, EngineState::Recommended);
+        assert_eq!(
+            (run.source_errors.iter())
+                .map(|e| e.source.as_str())
+                .collect::<Vec<_>>(),
+            ["ListenBrainz"]
         );
     }
 

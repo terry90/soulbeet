@@ -111,7 +111,8 @@ pub(crate) fn track_candidate(
 /// 4. New releases are boosted.
 /// 5. The diversifier picks the final list.
 ///
-/// A profile without seeds runs no generator: the report says there is no listening data.
+/// A profile without seeds runs no generator. The report says there is no listening data only
+/// when every history answered, since one that failed may hold it.
 pub async fn recommend(
     build: &ProfileBuild,
     generators: &[Arc<dyn CandidateGenerator>],
@@ -130,7 +131,9 @@ pub async fn recommend(
 
     if !profile.has_seeds() {
         info!("No listening data to recommend from");
-        report.state = EngineState::NoListeningData;
+        if errors.is_empty() {
+            report.state = EngineState::NoListeningData;
+        }
         report.source_errors = errors.into_vec();
         report.duration_secs = start.elapsed().as_secs_f64();
         return (Vec::new(), report);
@@ -329,6 +332,32 @@ mod tests {
         assert_eq!(
             (report.state, report.sources.clone()),
             (EngineState::NoListeningData, vec!["Navidrome".to_string()])
+        );
+        assert!(report.pipeline_reports.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_profile_with_a_failed_history_reports_the_failure_not_missing_data() {
+        let mut errors = SourceErrors::default();
+        errors.record("ListenBrainz", "ListenBrainz answered with a browser check");
+        let (got, report) = recommend(
+            &ProfileBuild {
+                errors,
+                ..Default::default()
+            },
+            &[fixed("catalog", 0.4, &[("B", "b1", 1.0)])],
+            &FakeKnowledge::default(),
+            &balanced(),
+            50,
+        )
+        .await;
+        assert!(got.is_empty());
+        assert_eq!(report.state, EngineState::Recommended);
+        assert_eq!(
+            (report.source_errors.iter())
+                .map(|e| e.source.as_str())
+                .collect::<Vec<_>>(),
+            ["ListenBrainz"]
         );
         assert!(report.pipeline_reports.is_empty());
     }
