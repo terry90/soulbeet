@@ -1139,9 +1139,14 @@ mod tests {
     async fn colliding(names: &[&str]) -> sqlx::SqlitePool {
         let db = test_db::migrated_before(test_db::USERNAME_CASE).await;
         for name in names {
-            User::create_in(&db, name, "pw").await.unwrap();
+            sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')")
+                .bind(format!("id-{name}"))
+                .bind(name)
+                .execute(&db)
+                .await
+                .unwrap();
         }
-        test_db::apply(&db, test_db::USERNAME_CASE).await;
+        test_db::apply_from(&db, test_db::USERNAME_CASE).await;
         db
     }
 

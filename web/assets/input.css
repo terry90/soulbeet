@@ -40,6 +40,12 @@
                transition-all duration-200 hover:bg-beet-leaf hover:text-beet-dark hover:shadow-[0_0_15px_rgba(0,255,157,0.6)] cursor-pointer;
     }
 
+    /* For a scrolling box: fades its bottom edge so cut-off content reads as more to scroll.
+       Give the box bottom padding of the fade's height so its last line clears it. */
+    .fade-bottom {
+        mask-image: linear-gradient(to bottom, black calc(100% - 2.5rem), transparent);
+    }
+
     .nav-link {
         @apply font-display text-sm text-gray-400 hover:text-white hover:scale-105 transition-transform duration-200;
     }

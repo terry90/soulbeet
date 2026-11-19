@@ -57,6 +57,9 @@ done
 # Cargo.lock records the workspace crates' versions too; refresh only those
 cargo update --workspace
 
+# the app shows CHANGELOG.md in "What's new"; date it in UTC like the release
+"$(dirname "$0")/stamp_changelog.sh" "$NEW_VERSION" "$(date -u +%Y-%m-%d)" CHANGELOG.md
+
 # for GitHub Actions
 if [ -n "$GITHUB_OUTPUT" ]; then
     echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT

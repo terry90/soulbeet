@@ -13,7 +13,7 @@ use websocket::use_resilient_websocket;
 
 use ui::{
     AutoDownloadSignal, Downloads, HealthProvider, Layout, Navbar, SearchPrefill, SearchReset,
-    SettingsProvider,
+    SettingsProvider, StatusAction, StatusBanner,
 };
 use views::{
     leave_login, DashboardPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage, SettingsPage,
@@ -317,14 +317,13 @@ fn WebNavbar() -> Element {
                     dot_class: "bg-beet-accent",
                     label: "UPDATE",
                     message: "Soulbeet was updated. Reload this page.".to_string(),
-                    button {
-                        class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted cursor-pointer",
+                    StatusAction {
+                        label: "Reload",
                         onclick: |_| {
                             if let Some(window) = web_sys::window() {
                                 let _ = window.location().reload();
                             }
                         },
-                        "Reload"
                     }
                 }
             }
@@ -332,11 +331,7 @@ fn WebNavbar() -> Element {
             NavidromeBanner {}
             if let Some(message) = logout_error() {
                 StatusBanner { dot_class: "bg-beet-accent", label: "SIGN-OUT", message,
-                    button {
-                        class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted cursor-pointer",
-                        onclick: logout,
-                        "Try again"
-                    }
+                    StatusAction { label: "Try again", onclick: logout }
                 }
             }
 
@@ -365,30 +360,11 @@ fn ImporterBanner() -> Element {
             label: "BEETS",
             message: issue.title.clone(),
             Link {
-                class: "shrink-0 text-gray-300 hover:text-white underline decoration-dotted",
+                class: ui::STATUS_ACTION_CLASS,
                 to: Route::SettingsPage {},
                 onclick: move |_| requested_tab.set(Some(SettingsTab::Config)),
                 "Fix in Config"
             }
-        }
-    }
-}
-
-/// One line under the navbar: a status dot, a label (hidden on small
-/// screens), a message and an action.
-#[component]
-fn StatusBanner(
-    dot_class: &'static str,
-    label: &'static str,
-    message: String,
-    children: Element,
-) -> Element {
-    rsx! {
-        div { class: "mx-4 sm:mx-6 lg:mx-8 mt-2 px-3 py-2 bg-beet-panel border border-white/10 rounded flex items-center gap-3 text-xs font-mono",
-            span { class: "w-1.5 h-1.5 rounded-full {dot_class} shrink-0" }
-            span { class: "text-gray-500 uppercase tracking-widest shrink-0 hidden sm:inline", "{label}" }
-            span { class: "text-gray-400 flex-1 min-w-0 truncate", "{message}" }
-            {children}
         }
     }
 }

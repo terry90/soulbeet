@@ -109,7 +109,7 @@ fn source_build_id() -> String {
 }
 
 /// The Rust sources and manifests under `dir`, outside build output and
-/// hidden folders.
+/// hidden folders, and CHANGELOG.md, which the build embeds.
 fn collect_sources(dir: &Path, files: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -125,7 +125,10 @@ fn collect_sources(dir: &Path, files: &mut Vec<PathBuf>) {
                 collect_sources(&entry.path(), files);
             }
         } else if kind.is_file()
-            && (name.ends_with(".rs") || name == "Cargo.toml" || name == "Cargo.lock")
+            && (name.ends_with(".rs")
+                || name == "Cargo.toml"
+                || name == "Cargo.lock"
+                || name == "CHANGELOG.md")
         {
             files.push(entry.path());
         }

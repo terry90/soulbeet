@@ -67,6 +67,8 @@ export function libraryItems(folderName: string): LibraryItem[] {
     readOnly: true,
   });
   try {
+    // beets may be writing its library: wait for its lock instead of failing.
+    db.exec('PRAGMA busy_timeout = 5000');
     const rows = db.prepare('SELECT title, mb_trackid FROM items').all() as {
       title: string;
       mb_trackid: string;
