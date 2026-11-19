@@ -158,14 +158,15 @@ impl CandidateGenerator for ListenBrainzAccountGenerator {
 }
 
 /// The other playlists are built from music the user already played, and
-/// each read costs a paced request. Playlists of one day tie on the date, so
-/// the patch name, which ends in the year, breaks the tie toward the later year.
+/// each read costs a paced request. Several years are generated on one day, so
+/// the calendar day is compared first, then the patch name (which ends in the
+/// year), then the full timestamp.
 fn unheard_playlists(listing: &[PlaylistSummary]) -> Vec<&PlaylistSummary> {
     let newest = |wanted: fn(&str) -> bool| {
         listing
             .iter()
             .filter(|p| p.source_patch.as_deref().is_some_and(wanted))
-            .max_by(|a, b| (&a.date, &a.source_patch).cmp(&(&b.date, &b.source_patch)))
+            .max_by_key(|p| (p.date.get(..10), p.source_patch.as_deref(), p.date.as_str()))
     };
     [
         newest(|patch| patch == "weekly-exploration"),
@@ -323,6 +324,39 @@ mod tests {
                     vec!["lb_troi".to_string()]
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_later_year_wins_when_an_earlier_year_is_generated_later_the_same_day() {
+        let entry = |id: &str, date: &str, patch: &str| {
+            format!(
+                r#"{{"playlist":{{"identifier":"https://listenbrainz.org/playlist/{id}",
+                "date":"{date}","extension":{{"https://musicbrainz.org/doc/jspf#playlist":
+                {{"additional_metadata":{{"algorithm_metadata":{{"source_patch":"{patch}"}}}}}}}}}}}}"#
+            )
+        };
+        let listing = format!(
+            r#"{{"playlist_count":2,"playlists":[{},{}]}}"#,
+            entry(
+                "b0a1c836-9635-4080-a676-a48a9b74b853",
+                "2026-02-22T10:00:00+00:00",
+                "top-missed-recordings-of-2025"
+            ),
+            entry(
+                "55f2a01f-3974-46ca-8461-a8a84886eba4",
+                "2026-02-22T11:00:00+00:00",
+                "top-missed-recordings-of-2024"
+            ),
+        );
+        let (_, targets) = run(
+            vec![ok(r#"{"payload":[]}"#), ok(&listing), ok(NO_TRACKS)],
+            &UserMusicProfile::default(),
+        )
+        .await;
+        assert_eq!(
+            targets[2],
+            "/1/playlist/b0a1c836-9635-4080-a676-a48a9b74b853"
         );
     }
 
