@@ -426,6 +426,15 @@ pub struct NativeSong {
     /// This user's plays.
     #[serde(default)]
     pub play_count: u64,
+    /// When this user last played the song (`omitempty`, model/annotation.go:6-12).
+    #[serde(default)]
+    pub play_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// MusicBrainz id of the song's artist (model/mediafile.go:79).
+    #[serde(default)]
+    pub mbz_artist_id: Option<String>,
+    /// MusicBrainz id of the song's album artist (model/mediafile.go:80).
+    #[serde(default)]
+    pub mbz_album_artist_id: Option<String>,
 }
 
 #[cfg(test)]

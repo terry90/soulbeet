@@ -842,6 +842,32 @@ impl NavidromeClient {
         Ok(SongPage { songs, total })
     }
 
+    /// Every present song, read `SONG_PAGE` at a time through `list_songs` until a short page.
+    /// A song seen again on a later page (the order shifted while reading) is kept once, in
+    /// first-seen order; `total` is the count the last page reported, so a caller checks that
+    /// it read as many.
+    pub async fn all_songs(&self) -> Result<SongPage> {
+        let mut songs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut start = 0;
+        loop {
+            let page = self.list_songs(start, start + SONG_PAGE).await?;
+            let short = page.songs.len() < SONG_PAGE as usize;
+            for song in page.songs {
+                if seen.insert(song.id.clone()) {
+                    songs.push(song);
+                }
+            }
+            if short {
+                return Ok(SongPage {
+                    songs,
+                    total: page.total,
+                });
+            }
+            start += SONG_PAGE;
+        }
+    }
+
     /// Present songs (missing=false), the one Navidrome added last first, rows `start` to `end`
     /// (exclusive). The `created_at` sort is `media_file.created_at`
     /// (persistence/mediafile_repository.go:100 in 0.64.2), set when a file is first stored
@@ -987,6 +1013,9 @@ pub enum StarTarget<'a> {
     Song(&'a str),
     Album(&'a str),
 }
+
+/// Songs `all_songs` reads in one request.
+pub const SONG_PAGE: u32 = 1000;
 
 /// A page of list_songs: its songs, and how many present songs Navidrome counted.
 #[derive(Debug)]
@@ -2383,6 +2412,37 @@ mod tests {
         assert!(
             matches!(&err, NavidromeError::Http { action: "List songs", status: 502, body: None, raw: Some(r) } if r == BAD_GATEWAY),
             "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_songs_reads_pages_until_a_short_one() {
+        let inner = &NATIVE_SONG[1..NATIVE_SONG.len() - 1];
+        let page = |ids: Vec<String>| {
+            let songs: Vec<String> = ids
+                .iter()
+                .map(|id| inner.replace("3sG8kPq0WmZ1xYbN4vTcDe", id))
+                .collect();
+            format!("[{}]", songs.join(","))
+        };
+        let first = page((0..1000).map(|i| format!("s{i}")).collect());
+        let second = page(vec!["s999".into(), "s1000".into()]);
+        let (url, seen) = serve_with_headers(vec![
+            (reply(LOGIN), vec![]),
+            (reply(first), vec![("X-Total-Count", "1001".into())]),
+            (reply(second), vec![("X-Total-Count", "1001".into())]),
+        ]);
+        let all = client(&url).all_songs().await.unwrap();
+        assert_eq!((all.songs.len(), all.total), (1001, 1001));
+        assert_eq!(all.songs[1000].id, "s1000");
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[1].target,
+            "/api/song?_start=0&_end=1000&_sort=recently_added&_order=ASC&missing=false"
+        );
+        assert_eq!(
+            seen[2].target,
+            "/api/song?_start=1000&_end=2000&_sort=recently_added&_order=ASC&missing=false"
         );
     }
 

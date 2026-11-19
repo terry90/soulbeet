@@ -1,3 +1,5 @@
+pub mod navidrome;
+
 use thiserror::Error;
 
 use crate::navidrome::NavidromeError;

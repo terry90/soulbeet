@@ -656,9 +656,6 @@ pub(crate) fn listing(folder: &Path, roots: &[PathBuf]) -> Listing {
     }
 }
 
-/// Songs `duplicates` reads from Navidrome in one request.
-pub(crate) const DUPLICATE_PAGE: u32 = 1000;
-
 /// Navidrome's pages held `read` different songs of the `total` it counts. The message names no
 /// cause: Soulful sees only the two numbers (list_songs says how the order can shift).
 fn songs_missed(read: usize, total: u64) -> Failure {
@@ -683,8 +680,8 @@ pub struct SongGroup {
     pub songs: Vec<SongFacts>,
 }
 
-/// D11: every present song of the caller through `list_songs`, DUPLICATE_PAGE at a time until a
-/// short page, grouped by (match_key(artist), match_key(title)); the groups of two or more,
+/// D11: every present song of the caller through `all_songs` (SONG_PAGE at a time until a
+/// short page), grouped by (match_key(artist), match_key(title)); the groups of two or more,
 /// ordered by that key. A song id seen again on a later page is skipped (a song added mid-search
 /// shifts the offsets). A page that fails fails the search, and so do pages that hold fewer songs
 /// than Navidrome counted at the last one (an order that shifts while the pages are read can make
@@ -693,29 +690,15 @@ pub struct SongGroup {
 pub async fn duplicates(navi: &NavidromeClient) -> Result<Vec<SongGroup>, Failure> {
     let failure = |e: NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
     let mut by_key: BTreeMap<(String, String), Vec<SongFacts>> = BTreeMap::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut start = 0;
-    let total = loop {
-        let page = navi
-            .list_songs(start, start + DUPLICATE_PAGE)
-            .await
-            .map_err(failure)?;
-        for song in &page.songs {
-            if !seen.insert(song.id.clone()) {
-                continue;
-            }
-            by_key
-                .entry((match_key(&song.artist), match_key(&song.title)))
-                .or_default()
-                .push(SongFacts::from(song));
-        }
-        if page.songs.len() < DUPLICATE_PAGE as usize {
-            break page.total;
-        }
-        start += DUPLICATE_PAGE;
-    };
-    if (seen.len() as u64) < total {
-        return Err(songs_missed(seen.len(), total));
+    let page = navi.all_songs().await.map_err(failure)?;
+    for song in &page.songs {
+        by_key
+            .entry((match_key(&song.artist), match_key(&song.title)))
+            .or_default()
+            .push(SongFacts::from(song));
+    }
+    if (page.songs.len() as u64) < page.total {
+        return Err(songs_missed(page.songs.len(), page.total));
     }
     Ok(by_key
         .into_values()
