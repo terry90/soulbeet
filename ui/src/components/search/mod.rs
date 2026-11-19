@@ -22,7 +22,7 @@ use shared::download::{
     AutoDownloadEvent, DownloadQuery, DownloadableGroup, DownloadableItem,
     SearchState as DownloadSearchState,
 };
-use shared::metadata::{Album, AlbumWithTracks, SearchResult, SearchResults, Track};
+use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
 use std::collections::{HashMap, HashSet};
 
 use track::TrackResult;
@@ -58,7 +58,7 @@ fn album_query(album: &Album) -> DownloadQuery {
 pub fn Search() -> Element {
     let auth = use_auth();
     let mut settings = use_settings();
-    let mut search_results = use_signal::<Option<SearchResults>>(|| None);
+    let mut search_results = use_signal::<Option<Vec<SearchResult>>>(|| None);
     let mut search = use_signal(String::new);
     let mut artist = use_signal::<Option<String>>(|| None);
     let mut search_type = use_signal(|| settings.last_search_type());
@@ -767,14 +767,14 @@ pub fn Search() -> Element {
           }
         } else {
           match &*search_results.read() {
-              Some(ref data) if !data.results.is_empty() => {
+              Some(ref data) if !data.is_empty() => {
                 rsx! {
                   div { class: "w-full bg-beet-panel/50 border border-white/5 p-6 backdrop-blur-sm mt-8 rounded-lg",
                     h5 { class: "text-xl font-display font-bold mb-4 border-b border-white/10 pb-2 text-white",
                       "Search Results"
                     }
                     ul { class: "list-none p-0 space-y-4",
-                      for item in data.results.iter() {
+                      for item in data.iter() {
                         match item {
                             SearchResult::Track(ref track) => {
                                 let track_clone = track.clone();

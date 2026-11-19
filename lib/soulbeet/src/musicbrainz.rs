@@ -11,7 +11,7 @@ use musicbrainz_rs::{
 };
 use serde::Serialize;
 use shared::failure::{cut_chars, Service, RAW_MAX_CHARS};
-use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, Track};
+use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
 use shared::recommendation::fold_name;
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
@@ -725,14 +725,6 @@ impl crate::traits::MusicBrainzLookup for MusicBrainzProvider {
 
 #[async_trait::async_trait]
 impl crate::MetadataProvider for MusicBrainzProvider {
-    fn id(&self) -> Provider {
-        Provider::MusicBrainz
-    }
-
-    fn name(&self) -> &'static str {
-        "MusicBrainz"
-    }
-
     async fn search_albums(
         &self,
         artist: Option<&str>,

@@ -6,7 +6,7 @@ use shared::{
         SkipKind, SourcePresence,
     },
     failure::{Failure, UserAction},
-    metadata::{AlbumWithTracks, Provider, SearchResult as MetadataSearchResult},
+    metadata::{AlbumWithTracks, SearchResult as MetadataSearchResult},
     recommendation::{
         CandidateSet, KnownMusic, Listen, Neighbour, PlayedArtist, PlayedTrack, ProfileConfig,
         RecordingFacts, SignalReport, SourceErrors, TimePeriod, TrackRef, UserMusicProfile,
@@ -27,9 +27,6 @@ use crate::MetadataError;
 
 #[async_trait]
 pub trait MetadataProvider: Send + Sync {
-    fn id(&self) -> Provider;
-    fn name(&self) -> &'static str;
-
     async fn search_albums(
         &self,
         artist: Option<&str>,
@@ -426,9 +423,6 @@ pub enum ForgetOutcome {
 
 #[async_trait]
 pub trait MusicImporter: Send + Sync {
-    fn id(&self) -> &'static str;
-    fn name(&self) -> &'static str;
-
     async fn import(
         &self,
         sources: &[&Path],

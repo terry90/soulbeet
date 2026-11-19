@@ -1,42 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Metadata provider identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Provider {
-    #[default]
-    MusicBrainz,
-    LastFm,
-}
-
-impl std::fmt::Display for Provider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Provider::MusicBrainz => write!(f, "musicbrainz"),
-            Provider::LastFm => write!(f, "lastfm"),
-        }
-    }
-}
-
-impl std::str::FromStr for Provider {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "musicbrainz" => Ok(Provider::MusicBrainz),
-            "lastfm" => Ok(Provider::LastFm),
-            _ => Err(format!("Unknown provider: {}", s)),
-        }
-    }
-}
-
-/// Wrapper for search results that includes provider information.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SearchResults {
-    pub provider: Provider,
-    pub results: Vec<SearchResult>,
-}
-
 /// Represents a search result which can be either a track or an album.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]

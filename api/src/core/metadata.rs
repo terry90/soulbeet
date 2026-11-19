@@ -2,7 +2,7 @@
 
 use shared::download::DownloadQuery;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use shared::metadata::{Album, AlbumWithTracks, SearchResults};
+use shared::metadata::{Album, AlbumWithTracks, SearchResult};
 use soulbeet::musicbrainz::{self, ArtistMatch, MusicBrainzProvider, RecordingReleases};
 use soulbeet::{MetadataError, MetadataProvider};
 
@@ -22,27 +22,23 @@ pub async fn search(
     artist: Option<&str>,
     query: &str,
     limit: usize,
-) -> Result<SearchResults, Failure> {
+) -> Result<Vec<SearchResult>, Failure> {
     search_in(&MusicBrainzProvider::new(), kind, artist, query, limit).await
 }
 
-/// The search on `provider`, the results named by its id.
+/// The search on `provider`.
 async fn search_in(
     provider: &dyn MetadataProvider,
     kind: SearchKind,
     artist: Option<&str>,
     query: &str,
     limit: usize,
-) -> Result<SearchResults, Failure> {
-    let results = match kind {
+) -> Result<Vec<SearchResult>, Failure> {
+    match kind {
         SearchKind::Albums => provider.search_albums(artist, query, limit).await,
         SearchKind::Tracks => provider.search_tracks(artist, query, limit).await,
     }
-    .map_err(|e| provider_failure(&e))?;
-    Ok(SearchResults {
-        provider: provider.id(),
-        results,
-    })
+    .map_err(|e| provider_failure(&e))
 }
 
 /// The MusicBrainz release `id` with its tracks.
@@ -139,8 +135,7 @@ fn tracklist_failure(album_title: &str, e: &MetadataError) -> Failure {
 mod tests {
     use super::*;
     use shared::failure::Service;
-    use shared::metadata::SearchResult as MetadataSearchResult;
-    use shared::metadata::{Provider, Track};
+    use shared::metadata::Track;
 
     /// Fails every call the way step 3's with_retry does when MusicBrainz gives no answer.
     struct Unanswered;
@@ -155,18 +150,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MetadataProvider for Unanswered {
-        fn id(&self) -> Provider {
-            Provider::MusicBrainz
-        }
-        fn name(&self) -> &'static str {
-            "MusicBrainz"
-        }
         async fn search_albums(
             &self,
             _: Option<&str>,
             _: &str,
             _: usize,
-        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+        ) -> Result<Vec<SearchResult>, MetadataError> {
             Err(unanswered())
         }
         async fn search_tracks(
@@ -174,7 +163,7 @@ mod tests {
             _: Option<&str>,
             _: &str,
             _: usize,
-        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+        ) -> Result<Vec<SearchResult>, MetadataError> {
             Err(unanswered())
         }
         async fn get_album(&self, _: &str) -> Result<AlbumWithTracks, MetadataError> {
@@ -182,23 +171,17 @@ mod tests {
         }
     }
 
-    /// Finds nothing, as the provider it names.
-    struct Empty(Provider);
+    /// Finds nothing.
+    struct Empty;
 
     #[async_trait::async_trait]
     impl MetadataProvider for Empty {
-        fn id(&self) -> Provider {
-            self.0
-        }
-        fn name(&self) -> &'static str {
-            "Empty"
-        }
         async fn search_albums(
             &self,
             _: Option<&str>,
             _: &str,
             _: usize,
-        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+        ) -> Result<Vec<SearchResult>, MetadataError> {
             Ok(Vec::new())
         }
         async fn search_tracks(
@@ -206,7 +189,7 @@ mod tests {
             _: Option<&str>,
             _: &str,
             _: usize,
-        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+        ) -> Result<Vec<SearchResult>, MetadataError> {
             Ok(Vec::new())
         }
         async fn get_album(&self, _: &str) -> Result<AlbumWithTracks, MetadataError> {
@@ -219,18 +202,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MetadataProvider for AskedFor {
-        fn id(&self) -> Provider {
-            Provider::MusicBrainz
-        }
-        fn name(&self) -> &'static str {
-            "MusicBrainz"
-        }
         async fn search_albums(
             &self,
             _: Option<&str>,
             _: &str,
             limit: usize,
-        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+        ) -> Result<Vec<SearchResult>, MetadataError> {
             *self.0.lock().unwrap() = Some(limit);
             Ok(vec![])
         }
@@ -239,7 +216,7 @@ mod tests {
             _: Option<&str>,
             _: &str,
             limit: usize,
-        ) -> Result<Vec<MetadataSearchResult>, MetadataError> {
+        ) -> Result<Vec<SearchResult>, MetadataError> {
             *self.0.lock().unwrap() = Some(limit);
             Ok(vec![])
         }
@@ -258,19 +235,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_results_name_the_provider_that_answered() {
-        for provider in [Provider::LastFm, Provider::MusicBrainz] {
-            let found = search_in(
-                &Empty(provider),
-                SearchKind::Albums,
-                None,
-                "Winter Songs",
-                SEARCH_LIMIT,
-            )
-            .await
-            .unwrap();
-            assert_eq!(found.provider, provider);
-        }
+    async fn a_search_answers_what_the_provider_found() {
+        let found = search_in(
+            &Empty,
+            SearchKind::Albums,
+            None,
+            "Winter Songs",
+            SEARCH_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert!(found.is_empty());
     }
 
     #[tokio::test]

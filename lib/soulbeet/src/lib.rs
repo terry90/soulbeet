@@ -11,7 +11,6 @@ pub mod metadata_error;
 pub mod musicbrainz;
 pub mod navidrome;
 pub mod polite;
-pub mod services;
 pub mod slskd;
 #[cfg(test)]
 pub(crate) mod test_http;
@@ -20,7 +19,6 @@ pub mod traits;
 pub use beets::{duplicate_note, DuplicateNote};
 pub use metadata_error::MetadataError;
 pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
-pub use services::{Services, ServicesBuilder};
 pub use traits::{
     CandidateGenerator, DownloadBackend, DriverChoice, DuplicateRun, FailKind, ForgetOutcome,
     GeneratorOutput, ImportMode, ImportOutcome, ImportResult, ImportedItem, KnowledgeCache,

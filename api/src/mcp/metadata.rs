@@ -3,7 +3,7 @@
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, json_chars, TEXT_MAX_CHARS};
-use shared::metadata::{Album, AlbumWithTracks, SearchResult, SearchResults, Track};
+use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
 use soulbeet::musicbrainz::{ArtistMatch, RecordingReleases};
 
 use super::args::Args;
@@ -74,9 +74,12 @@ fn search_fields(kind: &str, query: &str, entries: Vec<Value>) -> Map<String, Va
 }
 
 /// D6: `{"kind", "query", kind's key: [..]}` for a recording or release search.
-pub(crate) fn music_fields(kind: &str, query: &str, results: &SearchResults) -> Map<String, Value> {
+pub(crate) fn music_fields(
+    kind: &str,
+    query: &str,
+    results: &[SearchResult],
+) -> Map<String, Value> {
     let entries = results
-        .results
         .iter()
         .map(|result| match result {
             SearchResult::Track(track) => recording_entry(track),
@@ -285,7 +288,7 @@ pub(crate) async fn get_recording_releases(
 mod tests {
     use serde_json::{json, Map, Value};
     use shared::failure::{FailureCode, RetryAdvice, Service, Stage};
-    use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
+    use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
     use soulbeet::musicbrainz::{RecordingInfo, RecordingRelease, ReleaseGroupInfo};
     use soulbeet::MetadataError;
 
@@ -312,10 +315,7 @@ mod tests {
 
     #[test]
     fn a_recording_search_lists_what_musicbrainz_found() {
-        let results = SearchResults {
-            provider: Provider::MusicBrainz,
-            results: vec![SearchResult::Track(silent_night())],
-        };
+        let results = [SearchResult::Track(silent_night())];
         assert_eq!(
             Value::Object(music_fields("recording", "Silent Night", &results)),
             json!({
@@ -339,14 +339,7 @@ mod tests {
             cover_url: None,
             release_types: Some(vec!["Album".into(), "Compilation".into()]),
         };
-        let doc = music_fields(
-            "release",
-            "Merry Christmas",
-            &SearchResults {
-                provider: Provider::MusicBrainz,
-                results: vec![SearchResult::Album(album)],
-            },
-        );
+        let doc = music_fields("release", "Merry Christmas", &[SearchResult::Album(album)]);
         assert_eq!(
             doc["releases"][0]["release_types"],
             json!(["Album", "Compilation"])
@@ -632,14 +625,7 @@ mod tests {
                 })
             })
             .collect();
-        let mut doc = music_fields(
-            "recording",
-            "Silent Night",
-            &SearchResults {
-                provider: Provider::MusicBrainz,
-                results: tracks,
-            },
-        );
+        let mut doc = music_fields("recording", "Silent Night", &tracks);
         let kept = doc["recordings"].as_array().unwrap().len();
         assert!(kept > 0 && kept < 25, "{kept}");
         assert_eq!(doc["left_out"], json!(25 - kept));
@@ -671,13 +657,10 @@ mod tests {
         let found = music_fields(
             "recording",
             "Silent Night",
-            &SearchResults {
-                provider: Provider::MusicBrainz,
-                results: vec![
-                    SearchResult::Track(track.clone()),
-                    SearchResult::Track(short.clone()),
-                ],
-            },
+            &[
+                SearchResult::Track(track.clone()),
+                SearchResult::Track(short.clone()),
+            ],
         );
         let (long, kept) = (&found["recordings"][0], &found["recordings"][1]);
         assert_eq!(
@@ -708,10 +691,7 @@ mod tests {
         let release = &music_fields(
             "release",
             "Winter Songs",
-            &SearchResults {
-                provider: Provider::MusicBrainz,
-                results: vec![SearchResult::Album(album.clone())],
-            },
+            &[SearchResult::Album(album.clone())],
         )["releases"][0];
         assert_eq!(
             (&release["id"], &release["ids_too_long"]),
@@ -784,10 +764,7 @@ mod tests {
         let found = music_fields(
             "recording",
             "Silent Night",
-            &SearchResults {
-                provider: Provider::MusicBrainz,
-                results: vec![SearchResult::Track(track.clone())],
-            },
+            &[SearchResult::Track(track.clone())],
         );
         let r = &found["recordings"][0];
         assert_eq!(

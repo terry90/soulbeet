@@ -697,7 +697,7 @@ mod test_effects {
     use crate::ledger::JobEvent;
     use crate::server_fns::download::test_support::StubBackend;
     use shared::download::EnqueueStatus;
-    use shared::metadata::{AlbumWithTracks, Provider, SearchResult, Track};
+    use shared::metadata::{AlbumWithTracks, SearchResult, Track};
     use soulbeet::{MetadataError, MetadataProvider};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -879,12 +879,6 @@ mod test_effects {
 
     #[async_trait]
     impl MetadataProvider for Tracklist {
-        fn id(&self) -> Provider {
-            Provider::MusicBrainz
-        }
-        fn name(&self) -> &'static str {
-            "MusicBrainz"
-        }
         async fn search_albums(
             &self,
             _: Option<&str>,

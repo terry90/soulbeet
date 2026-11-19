@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use shared::{
     download::{DownloadQuery, SearchResult as DownloadSearchResult},
-    metadata::{AlbumWithTracks, SearchResults},
+    metadata::{AlbumWithTracks, SearchResult},
 };
 
 #[cfg(feature = "server")]
@@ -29,7 +29,7 @@ pub struct PollQuery {
 }
 
 #[post("/api/metadata/search/album", _: AuthSession)]
-pub async fn search_album(input: SearchQuery) -> Result<SearchResults, ServerFnError> {
+pub async fn search_album(input: SearchQuery) -> Result<Vec<SearchResult>, ServerFnError> {
     metadata::search(
         SearchKind::Albums,
         input.artist.as_deref(),
@@ -41,7 +41,7 @@ pub async fn search_album(input: SearchQuery) -> Result<SearchResults, ServerFnE
 }
 
 #[post("/api/metadata/search/track", _: AuthSession)]
-pub async fn search_track(input: SearchQuery) -> Result<SearchResults, ServerFnError> {
+pub async fn search_track(input: SearchQuery) -> Result<Vec<SearchResult>, ServerFnError> {
     metadata::search(
         SearchKind::Tracks,
         input.artist.as_deref(),
