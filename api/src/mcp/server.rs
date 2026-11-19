@@ -58,7 +58,8 @@ pub(crate) fn common_codes(calls_a_minute: u32) -> String {
 pub(crate) const NAVIDROME_CODES: &str = "navidrome_not_linked, navidrome_auth_failed, navidrome_unreachable, navidrome_circuit_open, navidrome_refused";
 
 /// The failure codes of every tool that asks MusicBrainz.
-pub(crate) const METADATA_CODES: &str = "metadata_unavailable, metadata_not_found, metadata_rate_limited, backend_response_unreadable";
+pub(crate) const METADATA_CODES: &str =
+    "metadata_unavailable, metadata_not_found, metadata_rate_limited, backend_response_unreadable";
 
 /// Every tool, in the fixed order `tools/list` answers (MCP 2026-07-28
 /// `server/tools.mdx`, "deterministic order").
@@ -394,7 +395,10 @@ mod tests {
 
     #[test]
     fn every_code_a_description_lists_is_a_failure_code() {
-        for code in METADATA_CODES.split(", ").chain(NAVIDROME_CODES.split(", ")) {
+        for code in METADATA_CODES
+            .split(", ")
+            .chain(NAVIDROME_CODES.split(", "))
+        {
             assert!(
                 serde_json::from_value::<shared::failure::FailureCode>(json!(code)).is_ok(),
                 "{code}"

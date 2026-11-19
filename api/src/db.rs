@@ -657,7 +657,11 @@ mod tests {
                 .fetch_all(&db)
                 .await
                 .unwrap();
-        for gone in ["default_metadata_provider", "lastfm_api_key", "lastfm_username"] {
+        for gone in [
+            "default_metadata_provider",
+            "lastfm_api_key",
+            "lastfm_username",
+        ] {
             assert!(!columns.iter().any(|c| c == gone), "{gone}");
         }
         let s = crate::models::user_settings::UserSettings::get_in(&db, "u1")

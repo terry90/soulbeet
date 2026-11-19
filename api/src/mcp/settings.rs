@@ -402,7 +402,9 @@ mod tests {
                     "playlist_ids": {}, "promote_threshold": 3, "last_generated_at": null}
             })
         );
-        assert!(!doc.to_string().contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"));
+        assert!(!doc
+            .to_string()
+            .contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"));
         assert!(doc.get("lastfm").is_none() && doc.get("default_metadata_provider").is_none());
         s.default_download_folder_id = Some("gone".into());
         assert_eq!(settings_fields(&s, &folders)["default_folder_found"], false);
