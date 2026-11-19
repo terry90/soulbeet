@@ -10,7 +10,7 @@ use shared::{
     recommendation::{
         ArtistPopularity, CandidateSet, KnownMusic, Listen, Neighbour, PlayedArtist, PlayedTrack,
         ProfileConfig, RankedArtist, RankedTrack, RecordingFacts, SignalReport, SimilarArtist,
-        SimilarTrack, TimePeriod, TrackRef, UserMusicProfile, WeightedTag,
+        SimilarTrack, SourceErrors, TimePeriod, TrackRef, UserMusicProfile, WeightedTag,
     },
     system::ImporterHealth,
 };
@@ -574,12 +574,19 @@ pub trait MusicBrainzLookup: Send + Sync {
     async fn genre_names(&self) -> std::result::Result<Vec<String>, MetadataError>;
 }
 
+/// What one generator found in a run. A failing source is recorded in `errors`
+/// and the generator goes on with the others.
+#[derive(Debug)]
+pub struct GeneratorOutput {
+    pub candidates: CandidateSet,
+    pub signals: Vec<SignalReport>,
+    pub mbid_failures: usize,
+    pub errors: SourceErrors,
+}
+
 #[async_trait]
 pub trait CandidateGenerator: Send + Sync {
-    fn name(&self) -> &str;
-    async fn generate_candidates(
-        &self,
-        profile: &UserMusicProfile,
-        config: &ProfileConfig,
-    ) -> Result<(CandidateSet, Vec<SignalReport>, usize)>;
+    fn name(&self) -> &'static str;
+    async fn generate(&self, profile: &UserMusicProfile, config: &ProfileConfig)
+        -> GeneratorOutput;
 }

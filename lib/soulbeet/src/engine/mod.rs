@@ -1,4 +1,5 @@
 pub mod blender;
+pub mod catalog;
 pub mod diversifier;
 pub mod freshness;
 pub mod lastfm_pipeline;
@@ -15,11 +16,48 @@ use tracing::{info, warn};
 use crate::error::Result;
 use crate::traits::{CandidateGenerator, ScrobbleProvider};
 use shared::recommendation::{
-    Candidate, CandidateSet, EngineReport, PipelineReport, ProfileConfig, ProfileSummary,
-    TimePeriod, UserMusicProfile,
+    Candidate, CandidateSet, CandidateSnapshot, EngineReport, PipelineReport, ProfileConfig,
+    ProfileSummary, SignalReport, TimePeriod, UserMusicProfile,
 };
 
 const ARTIST_CACHE_LIMIT: usize = 100;
+/// Keeps one signal from crowding out the others in the blend.
+pub const MAX_CANDIDATES_PER_SIGNAL: usize = 500;
+
+/// Keeps the best-scored `MAX_CANDIDATES_PER_SIGNAL` candidates of a signal.
+pub(crate) fn cap_signal(set: &mut CandidateSet) {
+    if set.len() > MAX_CANDIDATES_PER_SIGNAL {
+        let mut entries: Vec<_> = set.candidates.drain().collect();
+        entries.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        entries.truncate(MAX_CANDIDATES_PER_SIGNAL);
+        for (k, v) in entries {
+            set.candidates.insert(k, v);
+        }
+    }
+}
+
+/// A signal's count and its three best candidates, for the run report.
+pub(crate) fn signal_report(name: &str, set: &CandidateSet) -> SignalReport {
+    let mut sorted: Vec<&Candidate> = set.candidates.values().collect();
+    sorted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    SignalReport {
+        name: name.to_string(),
+        candidates_produced: set.len(),
+        top_candidates: sorted
+            .iter()
+            .take(3)
+            .map(|c| CandidateSnapshot::from_candidate(c))
+            .collect(),
+    }
+}
 
 /// Per-pipeline-run cache for artist popularity and genre metadata.
 /// Avoids redundant API calls when the same artist appears across signals.
@@ -140,12 +178,12 @@ pub async fn recommend(
         // Per-pipeline timeout: 2 minutes max
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(3600),
-            generator.generate_candidates(profile, config),
+            generator.generate(profile, config),
         )
         .await;
 
-        let result = match result {
-            Ok(r) => r,
+        let output = match result {
+            Ok(output) => output,
             Err(_) => {
                 warn!("Generator '{}' timed out after 1h", generator.name());
                 report.pipeline_reports.push(PipelineReport {
@@ -158,31 +196,27 @@ pub async fn recommend(
             }
         };
 
-        match result {
-            Ok((set, signal_reports, mbid_failures)) => {
-                info!(
-                    "Generator '{}' produced {} candidates",
-                    generator.name(),
-                    set.len()
-                );
-                report.pipeline_reports.push(PipelineReport {
-                    name: generator.name().to_string(),
-                    signals: signal_reports,
-                    total_candidates: set.len(),
-                    mbid_failures,
-                });
-                source_sets.push((generator.name(), set));
-            }
-            Err(e) => {
-                warn!("Generator '{}' failed: {}", generator.name(), e);
-                report.pipeline_reports.push(PipelineReport {
-                    name: format!("{} (ERROR: {})", generator.name(), e),
-                    signals: vec![],
-                    total_candidates: 0,
-                    mbid_failures: 0,
-                });
-            }
+        info!(
+            "Generator '{}' produced {} candidates",
+            generator.name(),
+            output.candidates.len()
+        );
+        for e in output.errors.into_vec() {
+            warn!(
+                "Generator '{}': {} failed {} times: {}",
+                generator.name(),
+                e.source,
+                e.failures,
+                e.message
+            );
         }
+        report.pipeline_reports.push(PipelineReport {
+            name: generator.name().to_string(),
+            signals: output.signals,
+            total_candidates: output.candidates.len(),
+            mbid_failures: output.mbid_failures,
+        });
+        source_sets.push((generator.name(), output.candidates));
     }
 
     if source_sets.is_empty() {

@@ -4,16 +4,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use super::ArtistCache;
-use crate::error::Result;
+use super::{cap_signal, signal_report, ArtistCache};
 use crate::lastfm::LastFmProvider;
-use crate::traits::{CandidateGenerator, ScrobbleProvider};
+use crate::traits::{CandidateGenerator, GeneratorOutput, ScrobbleProvider};
 use shared::recommendation::{
-    Candidate, CandidateSet, CandidateSnapshot, ProfileConfig, SignalReport, TimePeriod,
-    UserMusicProfile,
+    Candidate, CandidateSet, ProfileConfig, SourceErrors, TimePeriod, UserMusicProfile,
 };
 
-const MAX_CANDIDATES_PER_SIGNAL: usize = 500;
 const WEIGHT_HOP1: f64 = 0.7;
 const WEIGHT_TAG_EXPLORE: f64 = 0.5;
 
@@ -32,22 +29,6 @@ impl LastFmPipeline {
 
     fn known_artists(profile: &UserMusicProfile) -> HashSet<String> {
         profile.known_artist_names.iter().cloned().collect()
-    }
-
-    /// Truncate a candidate set to the per-signal cap.
-    fn cap(set: &mut CandidateSet) {
-        if set.len() > MAX_CANDIDATES_PER_SIGNAL {
-            let mut entries: Vec<_> = set.candidates.drain().collect();
-            entries.sort_by(|a, b| {
-                b.1.score
-                    .partial_cmp(&a.1.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            entries.truncate(MAX_CANDIDATES_PER_SIGNAL);
-            for (k, v) in entries {
-                set.candidates.insert(k, v);
-            }
-        }
     }
 
     // --- Signal 1: Track Similarity Graph ---
@@ -126,7 +107,7 @@ impl LastFmPipeline {
             }
         }
 
-        Self::cap(&mut candidates);
+        cap_signal(&mut candidates);
         info!("Track graph produced {} candidates", candidates.len());
         candidates
     }
@@ -256,7 +237,7 @@ impl LastFmPipeline {
             }
         }
 
-        Self::cap(&mut candidates);
+        cap_signal(&mut candidates);
         info!("Artist chains produced {} candidates", candidates.len());
         candidates
     }
@@ -330,7 +311,7 @@ impl LastFmPipeline {
             }
         }
 
-        Self::cap(&mut candidates);
+        cap_signal(&mut candidates);
         info!("Tag explore produced {} candidates", candidates.len());
         candidates
     }
@@ -404,7 +385,7 @@ impl LastFmPipeline {
             }
         }
 
-        Self::cap(&mut candidates);
+        cap_signal(&mut candidates);
         info!("Momentum signal produced {} candidates", candidates.len());
         candidates
     }
@@ -412,15 +393,15 @@ impl LastFmPipeline {
 
 #[async_trait]
 impl CandidateGenerator for LastFmPipeline {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "lastfm_pipeline"
     }
 
-    async fn generate_candidates(
+    async fn generate(
         &self,
         profile: &UserMusicProfile,
         config: &ProfileConfig,
-    ) -> Result<(CandidateSet, Vec<SignalReport>, usize)> {
+    ) -> GeneratorOutput {
         info!("Running Last.fm candidate generation pipeline");
         let mut combined = CandidateSet::new();
         let mut cache = ArtistCache::new();
@@ -430,25 +411,25 @@ impl CandidateGenerator for LastFmPipeline {
         // if one fails the others still contribute.
         // The cache accumulates across signals within this pipeline run.
         let track_graph = self.signal_track_graph(profile, config, &mut cache).await;
-        signal_reports.push(build_signal_report("lfm_track_graph", &track_graph));
+        signal_reports.push(signal_report("lfm_track_graph", &track_graph));
         for (_, c) in track_graph.candidates {
             combined.insert(c);
         }
 
         let chains = self.signal_artist_chains(profile, config, &mut cache).await;
-        signal_reports.push(build_signal_report("lfm_artist_chains", &chains));
+        signal_reports.push(signal_report("lfm_artist_chains", &chains));
         for (_, c) in chains.candidates {
             combined.insert(c);
         }
 
         let tag_explore = self.signal_tag_explore(profile, config, &mut cache).await;
-        signal_reports.push(build_signal_report("lfm_tag_explore", &tag_explore));
+        signal_reports.push(signal_report("lfm_tag_explore", &tag_explore));
         for (_, c) in tag_explore.candidates {
             combined.insert(c);
         }
 
         let momentum = self.signal_momentum(profile, config, &mut cache).await;
-        signal_reports.push(build_signal_report("lfm_momentum", &momentum));
+        signal_reports.push(signal_report("lfm_momentum", &momentum));
         for (_, c) in momentum.candidates {
             combined.insert(c);
         }
@@ -458,24 +439,12 @@ impl CandidateGenerator for LastFmPipeline {
             combined.len(),
             cache.popularity.len() + cache.genre.len(),
         );
-        Ok((combined, signal_reports, 0))
-    }
-}
-
-fn build_signal_report(name: &str, set: &CandidateSet) -> SignalReport {
-    let mut sorted: Vec<&Candidate> = set.candidates.values().collect();
-    sorted.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    SignalReport {
-        name: name.to_string(),
-        candidates_produced: set.len(),
-        top_candidates: sorted
-            .iter()
-            .take(3)
-            .map(|c| CandidateSnapshot::from_candidate(c))
-            .collect(),
+        // Each signal logs its own failures and the pipeline reports none.
+        GeneratorOutput {
+            candidates: combined,
+            signals: signal_reports,
+            mbid_failures: 0,
+            errors: SourceErrors::default(),
+        }
     }
 }
