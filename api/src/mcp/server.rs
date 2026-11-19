@@ -82,7 +82,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Soulbeet settings",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Shows the user's Soulbeet settings: default download folder and whether it still exists, auto-delete on a 1 star rating, the default metadata provider, the Last.fm and ListenBrainz user names and whether a key or token is saved (never the key or token), and the discovery settings. Takes no arguments. Failure codes: {common}.")
+            format!("Shows the user's Soulbeet settings: default download folder and whether it still exists, auto-delete on a 1 star rating, the ListenBrainz user name and whether a token is saved (never the token), and the discovery settings. Takes no arguments. Failure codes: {common}.")
         },
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         read_only: true,
@@ -827,7 +827,7 @@ mod tests {
             "u1",
             UpdateUserSettings {
                 default_download_folder_id: Some("f1".into()),
-                lastfm_api_key: Some("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e".into()),
+                listenbrainz_token: Some("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d".into()),
                 ..Default::default()
             },
         )
@@ -840,13 +840,13 @@ mod tests {
             (
                 doc["ok"].as_bool(),
                 doc["default_folder_found"].as_bool(),
-                doc["lastfm"]["api_key_saved"].as_bool()
+                doc["listenbrainz"]["token_saved"].as_bool()
             ),
             (Some(true), Some(true), Some(true))
         );
         assert!(!settings
             .to_string()
-            .contains("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e"));
+            .contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"));
         let first =
             document(&call_tool(app.clone(), &token, "list_folders", json!({"limit": 1})).await);
         let f = &first["folders"][0];

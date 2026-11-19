@@ -25,8 +25,6 @@ pub fn FolderManager() -> Element {
     // Library settings state
     let mut auto_delete_enabled = use_signal(|| false);
     let mut discovery_promote_threshold = use_signal(|| "3".to_string());
-    let mut lastfm_api_key = use_signal(String::new);
-    let mut lastfm_username = use_signal(String::new);
     let mut lb_username = use_signal(String::new);
     let mut lb_token = use_signal(String::new);
     let mut deezer_recommendations = use_signal(|| false);
@@ -53,8 +51,6 @@ pub fn FolderManager() -> Element {
         if let Some(Ok(user_settings)) = &*settings_resource.read() {
             auto_delete_enabled.set(user_settings.auto_delete_enabled);
             discovery_promote_threshold.set(user_settings.discovery_promote_threshold.to_string());
-            lastfm_api_key.set(user_settings.lastfm_api_key.clone().unwrap_or_default());
-            lastfm_username.set(user_settings.lastfm_username.clone().unwrap_or_default());
             lb_username.set(
                 user_settings
                     .listenbrainz_username
@@ -478,55 +474,6 @@ pub fn FolderManager() -> Element {
                                                 }
                                             }
                                         }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Last.fm
-                    div { class: "p-3 bg-beet-dark rounded border border-white/10",
-                        p { class: "text-sm text-white font-medium mb-2", "Last.fm" }
-                        div { class: "space-y-3",
-                            div {
-                                label { class: LABEL_CLASS, "Username" }
-                                input {
-                                    class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
-                                    value: "{lastfm_username}",
-                                    oninput: move |e| lastfm_username.set(e.value()),
-                                    onchange: move |_| async move {
-                                        let update = api::UpdateUserSettings {
-                                            lastfm_username: Some(lastfm_username()),
-                                            ..Default::default()
-                                        };
-                                        let _ = api::update_user_settings(update).await;
-                                    },
-                                    placeholder: "Your Last.fm username",
-                                }
-                            }
-                            div {
-                                label { class: LABEL_CLASS, "API Key" }
-                                input {
-                                    class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
-                                    value: "{lastfm_api_key}",
-                                    oninput: move |e| lastfm_api_key.set(e.value()),
-                                    onchange: move |_| async move {
-                                        let update = api::UpdateUserSettings {
-                                            lastfm_api_key: Some(lastfm_api_key()),
-                                            ..Default::default()
-                                        };
-                                        let _ = api::update_user_settings(update).await;
-                                    },
-                                    placeholder: "Enter Last.fm API key",
-                                    "type": "password",
-                                }
-                                p { class: "text-xs text-gray-500 font-mono mt-1",
-                                    "Get one at "
-                                    a {
-                                        href: "https://www.last.fm/api/account/create",
-                                        target: "_blank",
-                                        class: "text-beet-accent hover:underline",
-                                        "last.fm/api"
                                     }
                                 }
                             }

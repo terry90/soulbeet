@@ -281,7 +281,7 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 ### Status, settings and folders
 
 - `get_status`: what Soulbeet can do for this user now: whether slskd and beets work, the Navidrome link and scan status, the folders with free space and `in_navidrome` (`listed` when a Navidrome library Soulbeet has located on this machine holds the folder, so imports into it show up in Navidrome; `unknown` otherwise), the batches still running, whether this app may delete music, and Soulbeet's address.
-- `get_settings`: the user's settings: default folder, auto-delete, metadata provider, Last.fm and ListenBrainz names (never keys), discovery settings.
+- `get_settings`: the user's settings: default folder, auto-delete, ListenBrainz name (never the token), discovery settings.
 - `list_folders`: the user's library folders with ids, paths, free space, whether shared, `in_navidrome`, and which is the default.
 
 ### Library

@@ -6,11 +6,8 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
 pub struct UserSettings {
     pub user_id: String,
-    pub default_metadata_provider: Option<String>,
     pub last_search_type: Option<String>,
     pub auto_delete_enabled: bool,
-    pub lastfm_api_key: Option<String>,
-    pub lastfm_username: Option<String>,
     pub discovery_promote_threshold: u8,
     pub navidrome_banner_dismissed: bool,
     pub listenbrainz_username: Option<String>,
@@ -30,15 +27,9 @@ pub struct UserSettings {
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub struct UpdateUserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_metadata_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_search_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_delete_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lastfm_api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lastfm_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_promote_threshold: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,11 +79,8 @@ impl UserSettings {
     pub(crate) fn defaults(user_id: &str) -> UserSettings {
         UserSettings {
             user_id: user_id.to_string(),
-            default_metadata_provider: Some("musicbrainz".to_string()),
             last_search_type: Some("album".to_string()),
             auto_delete_enabled: false,
-            lastfm_api_key: None,
-            lastfm_username: None,
             discovery_promote_threshold: 3,
             navidrome_banner_dismissed: false,
             listenbrainz_username: None,
@@ -146,11 +134,8 @@ impl UserSettings {
             };
         }
         columns!(
-            default_metadata_provider,
             last_search_type,
             auto_delete_enabled,
-            lastfm_api_key,
-            lastfm_username,
             discovery_promote_threshold,
             navidrome_banner_dismissed,
             listenbrainz_username,
