@@ -121,6 +121,7 @@ impl LastFmPipeline {
                     artist_listener_count,
                     primary_genre,
                     release_year: None,
+                    artist_mbid: None,
                 });
             }
         }
@@ -191,6 +192,7 @@ impl LastFmPipeline {
                             artist_listener_count,
                             primary_genre: primary_genre.clone(),
                             release_year: None,
+                            artist_mbid: None,
                         });
                     }
                 }
@@ -247,6 +249,7 @@ impl LastFmPipeline {
                             artist_listener_count,
                             primary_genre: primary_genre.clone(),
                             release_year: None,
+                            artist_mbid: None,
                         });
                     }
                 }
@@ -322,6 +325,7 @@ impl LastFmPipeline {
                     artist_listener_count,
                     primary_genre,
                     release_year: None,
+                    artist_mbid: None,
                 });
             }
         }
@@ -394,6 +398,7 @@ impl LastFmPipeline {
                         artist_listener_count,
                         primary_genre: primary_genre.clone(),
                         release_year: None,
+                        artist_mbid: None,
                     });
                 }
             }

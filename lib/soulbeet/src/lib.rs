@@ -2,7 +2,9 @@ pub mod audio;
 pub mod beets;
 pub mod engine;
 pub mod error;
+pub mod history;
 pub mod http;
+pub mod knowledge;
 pub mod lastfm;
 pub mod listenbrainz;
 pub mod metadata_error;
@@ -23,6 +25,7 @@ pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
 pub use services::{Services, ServicesBuilder};
 pub use traits::{
     CandidateGenerator, DownloadBackend, DriverChoice, DuplicateRun, FailKind, ForgetOutcome,
-    ImportMode, ImportOutcome, ImportResult, ImportedItem, MetadataProvider, MusicImporter,
-    Relocation, ScrobbleProvider, SkipReason, SourceFile, TaskCount, TimeoutKind, WantedRemoval,
+    ImportMode, ImportOutcome, ImportResult, ImportedItem, KnowledgeCache, ListeningHistory,
+    MetadataProvider, MusicImporter, MusicKnowledge, Relocation, ScrobbleProvider, SkipReason,
+    SourceFile, TaskCount, TimeoutKind, WantedRemoval,
 };

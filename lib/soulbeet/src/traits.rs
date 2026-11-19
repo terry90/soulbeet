@@ -8,16 +8,20 @@ use shared::{
     failure::{Failure, UserAction},
     metadata::{AlbumWithTracks, Provider, SearchResult as MetadataSearchResult},
     recommendation::{
-        ArtistPopularity, CandidateSet, Listen, ProfileConfig, RankedArtist, RankedTrack,
-        SignalReport, SimilarArtist, SimilarTrack, TimePeriod, UserMusicProfile, WeightedTag,
+        ArtistPopularity, CandidateSet, KnownMusic, Listen, Neighbour, PlayedArtist, PlayedTrack,
+        ProfileConfig, RankedArtist, RankedTrack, RecordingFacts, SignalReport, SimilarArtist,
+        SimilarTrack, TimePeriod, TrackRef, UserMusicProfile, WeightedTag,
     },
     system::ImporterHealth,
 };
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::Result;
+use crate::history::HistoryError;
+use crate::knowledge::{CacheError, KnowledgeError};
 use crate::MetadataError;
 
 #[async_trait]
@@ -486,6 +490,77 @@ pub trait ScrobbleProvider: Send + Sync {
 
     // Artist tracks
     async fn get_artist_top_tracks(&self, artist: &str, limit: u32) -> Result<Vec<RankedTrack>>;
+}
+
+#[async_trait]
+pub trait ListeningHistory: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn top_artists(
+        &self,
+        period: TimePeriod,
+        count: usize,
+    ) -> std::result::Result<Vec<PlayedArtist>, HistoryError>;
+    async fn top_tracks(
+        &self,
+        period: TimePeriod,
+        count: usize,
+    ) -> std::result::Result<Vec<PlayedTrack>, HistoryError>;
+    async fn listens(&self, count: usize) -> std::result::Result<Vec<Listen>, HistoryError>;
+    async fn favourites(&self) -> std::result::Result<Vec<TrackRef>, HistoryError>;
+    /// Every artist and track the user already has, which no generator may recommend.
+    async fn known(&self) -> std::result::Result<KnownMusic, HistoryError>;
+}
+
+#[async_trait]
+pub trait MusicKnowledge: Send + Sync {
+    fn name(&self) -> &'static str;
+    /// Ok(None): searched, no single exact match. Err: the lookup failed.
+    async fn resolve_artist(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<String>, KnowledgeError>;
+    async fn similar_artists(
+        &self,
+        seed_name: &str,
+        seed_mbid: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<Neighbour>, KnowledgeError>;
+    async fn artist_top_tracks(
+        &self,
+        artist_mbid: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<TrackRef>, KnowledgeError>;
+    async fn artist_tags(
+        &self,
+        artist_mbids: &[String],
+    ) -> std::result::Result<HashMap<String, Vec<WeightedTag>>, KnowledgeError>;
+    async fn artist_popularity(
+        &self,
+        artist_mbids: &[String],
+    ) -> std::result::Result<HashMap<String, u64>, KnowledgeError>;
+    async fn popularity_reference(&self) -> std::result::Result<u64, KnowledgeError>;
+    async fn related_tags(&self, tag: &str) -> std::result::Result<Vec<String>, KnowledgeError>;
+    async fn tag_tracks(
+        &self,
+        tag: &str,
+        count: usize,
+    ) -> std::result::Result<Vec<TrackRef>, KnowledgeError>;
+    async fn recordings(
+        &self,
+        recording_mbids: &[String],
+    ) -> std::result::Result<HashMap<String, RecordingFacts>, KnowledgeError>;
+}
+
+#[async_trait]
+pub trait KnowledgeCache: Send + Sync {
+    /// None when absent or expired.
+    async fn get(&self, key: &str) -> std::result::Result<Option<String>, CacheError>;
+    async fn put(
+        &self,
+        key: &str,
+        value: &str,
+        ttl: Duration,
+    ) -> std::result::Result<(), CacheError>;
 }
 
 #[async_trait]

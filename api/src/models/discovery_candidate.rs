@@ -35,6 +35,7 @@ impl From<DiscoveryCandidateRow> for Candidate {
             artist_listener_count: None,
             primary_genre: None,
             release_year: None,
+            artist_mbid: None,
         }
     }
 }
