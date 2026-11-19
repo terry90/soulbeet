@@ -533,11 +533,7 @@ pub async fn genre_names() -> Result<Vec<String>, MetadataError> {
         status: None,
         raw: cut_chars(raw, RAW_MAX_CHARS),
     };
-    let client = reqwest::Client::builder()
-        .user_agent(crate::polite::USER_AGENT)
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| unavailable(e.without_url().to_string()))?;
+    let client = crate::http::build_client(crate::polite::USER_AGENT);
     let response = client
         .get(&url)
         .send()
