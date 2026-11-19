@@ -11,6 +11,7 @@ import {
   sitewide,
   tagSimilarity,
 } from '../../fixtures/discovery.js';
+import { glassAtlas } from '../../fixtures/dataset.js';
 import { createStubServer, sendJson, sendText } from './router.js';
 
 /** The only Labs algorithm the app asks for; Labs retires the others. */
@@ -79,14 +80,16 @@ export function createListenBrainzServer(): Server {
           sendJson(
             res,
             200,
-            asked.map((mbid) => {
-              const tags = artistsByMbid.get(mbid)?.tags ?? artistTags[mbid] ?? [];
-              return {
-                artist_mbid: mbid,
-                name: artistsByMbid.get(mbid)?.name ?? '',
-                tag: { artist: tags.map((t) => ({ ...t, artist_mbid: mbid })) },
-              };
-            }),
+            asked
+              .filter((mbid) => artistsByMbid.has(mbid) || mbid in artistTags)
+              .map((mbid) => {
+                const tags = artistsByMbid.get(mbid)?.tags ?? artistTags[mbid] ?? [];
+                return {
+                  artist_mbid: mbid,
+                  name: artistsByMbid.get(mbid)?.name ?? glassAtlas.artist,
+                  tag: { artist: tags.map((t) => ({ ...t, artist_mbid: mbid })) },
+                };
+              }),
           );
         },
       },
