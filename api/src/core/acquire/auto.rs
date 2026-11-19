@@ -340,19 +340,20 @@ pub(crate) async fn run_search(
     }
 }
 
-/// Reports `failure` as the pipeline's and ends its job Failed.
+/// Reports `failure` as the pipeline's and ends its job Failed with it, so get_jobs shows it
+/// when no tab knows the batch, as after a restart.
 pub(crate) async fn fail_job(ledger: &Ledger, ctx: &UserCtx, run: &AutoRun, failure: Failure) {
+    ledger.record(JobEvent::Ended {
+        job: run.job.clone(),
+        state: JobState::Failed,
+        failure: Some(failure.clone()),
+    });
     let _ = get_or_create_user_channel(&ctx.id())
         .await
         .send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
             batch_id: run.batch_id.clone(),
             failure,
         }));
-    ledger.record(JobEvent::Ended {
-        job: run.job.clone(),
-        state: JobState::Failed,
-        failure: None,
-    });
 }
 
 #[cfg(test)]
@@ -570,18 +571,35 @@ mod tests {
 
     #[tokio::test]
     async fn a_resumed_auto_download_of_a_lastfm_album_fails_with_a_message_to_search_again() {
-        let (ledger, mut recorded) = Ledger::recording();
+        let db = crate::db::test_db::migrated().await;
+        let folder_id = crate::core::folder_of(&db, "auto-lastfm").await;
+        let folder = Folder::get_by_id_in(&db, &folder_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ledger = Ledger::start(db.clone());
         let ctx = test_ctx("auto-lastfm");
+        ledger
+            .create(
+                NewJob {
+                    id: "j1".into(),
+                    user: ctx.id(),
+                    folder_id,
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Searching,
+                    search_id: None,
+                    picked: vec![],
+                    kind: JobKind::Album,
+                    options: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
         let mut rx = crate::globals::get_or_create_user_channel(&ctx.id())
             .await
             .subscribe();
-        let folder = Folder {
-            id: "f1".into(),
-            user_id: ctx.user_id.clone(),
-            name: "Music".into(),
-            path: "/music".into(),
-            shared: false,
-        };
         // A search of this backend would fail: starting one is refused.
         let stub = StubBackend::new(vec![]);
         stub.fail_search_start(SoulseekError::InvalidResponse("refused".into()));
@@ -604,7 +622,7 @@ mod tests {
         };
 
         run_search(
-            ledger,
+            ledger.clone(),
             ctx,
             folder,
             DownloadQuery::new(vec![]).album(album),
@@ -612,15 +630,16 @@ mod tests {
             run,
         )
         .await;
+        ledger.settled().await;
 
-        assert_eq!(
-            recorded.events(),
-            vec![JobEvent::Ended {
-                job: "j1".into(),
-                state: JobState::Failed,
-                failure: None
-            }]
-        );
+        // No tab knows a resumed job's batch, so get_jobs is where the message is read.
+        let (state, stored): (String, String) =
+            sqlx::query_as("SELECT state, failure FROM jobs WHERE id = 'j1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let stored: Failure = serde_json::from_str(&stored).unwrap();
+        assert_eq!(state, JobState::Failed.as_str());
         let failed = std::iter::from_fn(|| rx.try_recv().ok())
             .find_map(|e| match e {
                 DownloadEvent::AutoDownload(AutoDownloadEvent::Failed { failure, .. }) => {
@@ -636,5 +655,6 @@ mod tests {
                 "'Winter Songs' came from a Last.fm search, which Soulbeet no longer uses: search for it again"
             )
         );
+        assert_eq!(stored, failed);
     }
 }
