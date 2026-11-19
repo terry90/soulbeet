@@ -6,7 +6,6 @@ pub mod error;
 pub mod history;
 pub mod http;
 pub mod knowledge;
-pub mod lastfm;
 pub mod listenbrainz;
 pub mod metadata_error;
 pub mod musicbrainz;
@@ -19,7 +18,6 @@ pub(crate) mod test_http;
 pub mod traits;
 
 pub use beets::{duplicate_note, DuplicateNote};
-pub use lastfm::LastFmProvider;
 pub use metadata_error::MetadataError;
 pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
 pub use services::{Services, ServicesBuilder};

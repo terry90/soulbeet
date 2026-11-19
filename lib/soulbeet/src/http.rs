@@ -158,7 +158,7 @@ pub async fn resilient_send(
 
         match build_request().send().await {
             Err(e) => {
-                // Without the URL: a Last.fm request's query holds its API key.
+                // Without the URL: the error text reaches users and logs, and a request's query can hold a user name or token.
                 let e = e.without_url();
                 warn!("{}: attempt {} network error: {}", context, attempt + 1, e);
                 // Timeouts indicate the server is hanging, not a transient blip.
@@ -223,18 +223,11 @@ impl RateLimiter {
 
 // MusicBrainz: 1 req/sec (documented hard limit, 503 if exceeded)
 static MB_LIMITER: LazyLock<RateLimiter> = LazyLock::new(RateLimiter::new);
-// Last.fm: 1 req/sec (undocumented, matching MB for safety)
-static LFM_LIMITER: LazyLock<RateLimiter> = LazyLock::new(RateLimiter::new);
 
 const MB_INTERVAL: Duration = Duration::from_millis(1100);
-const LFM_INTERVAL: Duration = Duration::from_millis(1000);
 
 pub async fn mb_rate_limit() {
     MB_LIMITER.wait(MB_INTERVAL).await;
-}
-
-pub async fn lastfm_rate_limit() {
-    LFM_LIMITER.wait(LFM_INTERVAL).await;
 }
 
 #[cfg(test)]
@@ -244,13 +237,12 @@ mod tests {
     #[tokio::test]
     async fn a_request_that_got_no_answer_does_not_name_its_url() {
         // Port 1 on loopback refuses the connection at once.
-        let url =
-            "http://127.0.0.1:1/2.0/?method=track.search&api_key=3f2b9c1e8d7a6b5c&format=json";
+        let url = "http://127.0.0.1:1/1/user/bob/listens?token=3f2b9c1e8d7a6b5c";
         let client = build_client("Soulbeet test");
-        let e = resilient_send(|| client.get(url), "Last.fm API")
+        let e = resilient_send(|| client.get(url), "ListenBrainz API")
             .await
             .unwrap_err();
-        assert_eq!((e.status, e.context.as_str()), (None, "Last.fm API"));
+        assert_eq!((e.status, e.context.as_str()), (None, "ListenBrainz API"));
         assert!(!e.body.contains("3f2b9c1e8d7a6b5c"), "{}", e.body);
         // reqwest's text for a refused connection, without " for url (...)".
         assert_eq!(e.body, "error sending request");
@@ -259,19 +251,22 @@ mod tests {
     #[test]
     fn send_errors_read_as_before() {
         let refused = SoulseekError::from(SendError {
-            context: "Last.fm API".into(),
+            context: "ListenBrainz API".into(),
             status: Some(400),
             body: "b".into(),
         });
-        assert_eq!(refused.to_string(), "API error: 400 - Last.fm API (400): b");
+        assert_eq!(
+            refused.to_string(),
+            "API error: 400 - ListenBrainz API (400): b"
+        );
         let unsent = SoulseekError::from(SendError {
-            context: "Last.fm API".into(),
+            context: "ListenBrainz API".into(),
             status: None,
             body: "error sending request".into(),
         });
         assert_eq!(
             unsent.to_string(),
-            "API error: 0 - Last.fm API: error sending request"
+            "API error: 0 - ListenBrainz API: error sending request"
         );
     }
 }

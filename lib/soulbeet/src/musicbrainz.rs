@@ -852,7 +852,6 @@ mod tests {
             MetadataError::RateLimited { .. } => "rate_limited",
             MetadataError::Unreadable { .. } => "unreadable",
             MetadataError::Unavailable { .. } => "unavailable",
-            MetadataError::NotConfigured { .. } => "not_configured",
         })
         .collect();
         assert_eq!(
