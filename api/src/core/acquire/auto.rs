@@ -3,7 +3,7 @@
 
 use crate::auth::UserCtx;
 use crate::config::CONFIG;
-use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
+use crate::core::metadata::hydrate_album_tracks;
 use crate::core::sources::{self, Searched};
 use crate::core::{backend_unavailable, database_failure};
 use crate::globals::get_or_create_user_channel;
@@ -100,7 +100,6 @@ pub async fn auto_download(
     if let Some(failure) = crate::importer_health::blocking_failure().await {
         return Err(failure);
     }
-    let key = lastfm_key(ctx).await?;
 
     // Search every configured backend (per D-06).
     let backends = match sources::usable_backends().await {
@@ -160,7 +159,6 @@ pub async fn auto_download(
             ctx,
             folder,
             query,
-            key,
             backends,
             run,
         ));
@@ -180,7 +178,6 @@ pub(crate) async fn run_search(
     ctx: UserCtx,
     folder: Folder,
     mut query: DownloadQuery,
-    lastfm_key: Option<String>,
     backends: (Searched, Vec<Searched>),
     mut run: AutoRun,
 ) {
@@ -211,7 +208,7 @@ pub(crate) async fn run_search(
                 query: query_desc.clone(),
                 backend_count: 1 + rest.len(),
             });
-            if let Err(failure) = hydrate_album_tracks(&mut query, lastfm_key.as_deref()).await {
+            if let Err(failure) = hydrate_album_tracks(&mut query).await {
                 info!(
                     "Auto-download: no tracklist for '{}': {}",
                     query_desc, failure.message
@@ -490,7 +487,6 @@ mod tests {
             ctx,
             folder,
             DownloadQuery::new(vec![]),
-            None,
             (("a".into(), a), vec![]),
             run,
         )
@@ -544,7 +540,6 @@ mod tests {
             ctx,
             folder,
             DownloadQuery::new(vec![]),
-            None,
             (("a".into(), a), vec![]),
             run,
         )
@@ -613,7 +608,6 @@ mod tests {
             ctx,
             folder,
             DownloadQuery::new(vec![]).album(album),
-            None,
             (("a".into(), a), vec![]),
             run,
         )

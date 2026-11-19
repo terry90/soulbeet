@@ -208,9 +208,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Search music",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Searches MusicBrainz (default) or Last.fm for recordings, releases (albums and EPs) or artists, to check that a recording exists and get its ids. Returns MBIDs where the provider has them, titles, artists, dates, release types and durations, and provider_used, which is musicbrainz when Last.fm was asked for and no Last.fm key is saved. Artist search reads MusicBrainz only. Up to 25 results (limit, default 10); left_out counts results left out to keep the answer under 60,000 characters. MBIDs never change; a lastfm: id names a Last.fm entry by its artist and name. An id over 500 characters is null, and ids_too_long names its field. MusicBrainz allows one request a second, so a search takes one to a few seconds. Failure codes: {common}, {METADATA_CODES}.")
+            format!("Searches MusicBrainz for recordings, releases (albums and EPs) or artists, to check that a recording exists and get its ids. Returns MBIDs, titles, artists, dates, release types and durations. Up to 25 results (limit, default 10); left_out counts results left out to keep the answer under 60,000 characters. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. MusicBrainz allows one request a second, so a search takes one to a few seconds. Failure codes: {common}, {METADATA_CODES}.")
         },
-        input_schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["recording","release","artist"]},"query":{"type":"string"},"artist":{"type":"string","description":"A credit to narrow a recording or release search"},"provider":{"type":"string","enum":["musicbrainz","lastfm"]},"limit":{"type":"integer","minimum":1,"maximum":25}},"required":["kind","query"],"additionalProperties":false}"#,
+        input_schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["recording","release","artist"]},"query":{"type":"string"},"artist":{"type":"string","description":"A credit to narrow a recording or release search"},"limit":{"type":"integer","minimum":1,"maximum":25}},"required":["kind","query"],"additionalProperties":false}"#,
         read_only: true,
         destructive: false,
         idempotent: true,
@@ -222,7 +222,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Release",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id or the lastfm: id search_music gave a release. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. Pages of 25 tracks by default (limit up to 100). Failure codes: {common}, {METADATA_CODES}.")
+            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. Pages of 25 tracks by default (limit up to 100). Failure codes: {common}, {METADATA_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"release_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["release_id"],"additionalProperties":false}"#,
         read_only: true,

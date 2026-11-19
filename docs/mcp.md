@@ -14,7 +14,7 @@ Through Soulbeet, an MCP client can:
 
 - read Soulbeet's status: whether slskd, beets and Navidrome work, your folders and their free space;
 - read your Navidrome library: search it, find tracks by MusicBrainz id or artist and title, list albums, starred items and playlists;
-- look up recordings and releases on MusicBrainz or Last.fm;
+- look up recordings and releases on MusicBrainz;
 - search Soulseek for sources and download a chosen one;
 - get a list of tracks or albums into your library in one batch, and follow it;
 - decide imports that beets skipped;
@@ -296,8 +296,8 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 ### Music metadata
 
-- `search_music`: searches MusicBrainz (or Last.fm) for recordings, releases or artists, to check that a recording exists and get its ids.
-- `get_release`: a release with its tracks.
+- `search_music`: searches MusicBrainz for recordings, releases or artists, to check that a recording exists and get its ids.
+- `get_release`: a release with its tracks, by MusicBrainz release id.
 - `get_recording_releases`: a recording and the releases it appears on, to tell a studio album from a compilation or a live record.
 
 ### Downloads

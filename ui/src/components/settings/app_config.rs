@@ -4,12 +4,10 @@ use shared::system::NavidromeStatus;
 use super::connection_status_row::{beets_row, ConnectionStatusRow, ImporterDetails};
 use super::panel::{LoadError, Loading, Messages, Panel, LABEL_CLASS};
 use crate::friendly_error;
-use crate::settings_context::use_settings;
 use crate::{use_auth, use_system_health, TextInput};
 
 #[component]
 pub fn AppConfigManager() -> Element {
-    let mut settings = use_settings();
     let auth = use_auth();
     let mut config_resource =
         use_resource(move || async move { auth.call(api::get_app_config()).await });
@@ -47,10 +45,7 @@ pub fn AppConfigManager() -> Element {
         };
 
         match auth.call(api::update_app_config(config)).await {
-            Ok(_) => {
-                let _ = settings.refresh_providers().await;
-                success_msg.set("Configuration saved".to_string());
-            }
+            Ok(_) => success_msg.set("Configuration saved".to_string()),
             Err(e) => error.set(friendly_error(&e)),
         }
         saving.set(false);

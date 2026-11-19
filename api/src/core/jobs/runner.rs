@@ -24,7 +24,6 @@ use crate::services::download_backend;
 use async_trait::async_trait;
 use shared::download::{DownloadQuery, DownloadableGroup, DownloadableItem, QueuedDownload};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::musicbrainz::MusicBrainzProvider;
 use soulbeet::{DownloadBackend, ImportMode};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -172,7 +171,7 @@ impl Effects for LiveEffects {
     }
 
     async fn hydrate(&self, query: &mut DownloadQuery) -> Result<(), Failure> {
-        metadata::hydrate_in(&MusicBrainzProvider::new(), query).await
+        metadata::hydrate_album_tracks(query).await
     }
 
     async fn enqueue(

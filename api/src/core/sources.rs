@@ -84,9 +84,8 @@ pub(crate) async fn owned_search(
 /// Starts a search on the named backend, or the default one, for `query`
 /// with its album's tracklist, and records it in the ledger as `ctx`'s.
 pub async fn start(ctx: &UserCtx, query: DownloadQuery) -> Result<String, Failure> {
-    let key = metadata::lastfm_key(ctx).await?;
     let mut query = query;
-    metadata::hydrate_album_tracks(&mut query, key.as_deref()).await?;
+    metadata::hydrate_album_tracks(&mut query).await?;
 
     // Stored by the id the backend is looked up by, so a poll finds it again.
     let backend_id = query
