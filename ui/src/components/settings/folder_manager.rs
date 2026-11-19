@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 use super::panel::{
     ListRow, LoadError, Loading, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS,
 };
+use super::toggle::Toggle;
 use crate::auth::use_auth;
 use crate::{friendly_error, FieldLook, TextInput};
 
@@ -28,6 +29,7 @@ pub fn FolderManager() -> Element {
     let mut lastfm_username = use_signal(String::new);
     let mut lb_username = use_signal(String::new);
     let mut lb_token = use_signal(String::new);
+    let mut deezer_recommendations = use_signal(|| false);
 
     // Discovery settings state
     let mut discovery_enabled = use_signal(|| false);
@@ -59,6 +61,7 @@ pub fn FolderManager() -> Element {
                     .unwrap_or_default(),
             );
             lb_token.set(user_settings.listenbrainz_token.clone().unwrap_or_default());
+            deezer_recommendations.set(user_settings.deezer_recommendations);
             discovery_enabled.set(user_settings.discovery_enabled);
             discovery_folder_id.set(
                 user_settings
@@ -296,11 +299,9 @@ pub fn FolderManager() -> Element {
                                         "Periodically generate a playlist of new tracks to try"
                                     }
                                 }
-                                button {
-                                    class: format!(
-                                        "relative w-11 h-6 rounded-full cursor-pointer transition-colors {}",
-                                        if discovery_enabled() { "bg-beet-leaf" } else { "bg-gray-600" }
-                                    ),
+                                Toggle {
+                                    on: discovery_enabled(),
+                                    on_class: "bg-beet-leaf",
                                     onclick: move |_| async move {
                                         let new_val = !discovery_enabled();
                                         discovery_enabled.set(new_val);
@@ -310,12 +311,6 @@ pub fn FolderManager() -> Element {
                                         };
                                         let _ = api::update_user_settings(update).await;
                                     },
-                                    span {
-                                        class: format!(
-                                            "absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform {}",
-                                            if discovery_enabled() { "translate-x-5" } else { "" }
-                                        ),
-                                    }
                                 }
                             }
 
@@ -554,11 +549,14 @@ pub fn FolderManager() -> Element {
                                 placeholder: "Enter ListenBrainz username",
                                 "type": "text",
                             }
+                            p { class: "text-xs text-gray-500 font-mono mt-2",
+                                "Your ListenBrainz history joins your Navidrome plays for recommendations."
+                            }
                         }
                         div { class: "mt-3",
-                            p { class: "text-sm text-white font-medium mb-1", "ListenBrainz Token" }
+                            p { class: "text-sm text-white font-medium mb-1", "ListenBrainz Token (optional)" }
                             p { class: "text-xs text-gray-500 font-mono mb-2",
-                                "Configure scrobbling in your Navidrome personal settings."
+                                "Not needed. With it, artist top tracks come from ListenBrainz's own ranking and ListenBrainz allows more requests."
                             }
                             input {
                                 class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
@@ -575,8 +573,28 @@ pub fn FolderManager() -> Element {
                                 "type": "password",
                             }
                         }
-                        p { class: "text-xs text-gray-500 font-mono mt-3",
-                            "Set up scrobbling in your Navidrome personal settings to feed the recommendation engine."
+                    }
+
+                    // Deezer recommendations
+                    div { class: "flex items-center justify-between p-3 bg-beet-dark rounded border border-white/10",
+                        div {
+                            p { class: "text-sm text-white font-medium", "Also use Deezer for recommendations" }
+                            p { class: "text-xs text-gray-500 font-mono mt-0.5",
+                                "Sends the names of artists you play to Deezer. Deezer has not approved this use."
+                            }
+                        }
+                        Toggle {
+                            on: deezer_recommendations(),
+                            on_class: "bg-beet-leaf",
+                            onclick: move |_| async move {
+                                let new_val = !deezer_recommendations();
+                                deezer_recommendations.set(new_val);
+                                let update = api::UpdateUserSettings {
+                                    deezer_recommendations: Some(new_val),
+                                    ..Default::default()
+                                };
+                                let _ = api::update_user_settings(update).await;
+                            },
                         }
                     }
 
@@ -588,11 +606,9 @@ pub fn FolderManager() -> Element {
                                 "Automatically delete files rated 1 star in Navidrome during sync"
                             }
                         }
-                        button {
-                            class: format!(
-                                "relative w-11 h-6 rounded-full cursor-pointer transition-colors {}",
-                                if auto_delete_enabled() { "bg-red-500" } else { "bg-gray-600" }
-                            ),
+                        Toggle {
+                            on: auto_delete_enabled(),
+                            on_class: "bg-red-500",
                             onclick: move |_| async move {
                                 let new_val = !auto_delete_enabled();
                                 auto_delete_enabled.set(new_val);
@@ -602,12 +618,6 @@ pub fn FolderManager() -> Element {
                                 };
                                 let _ = api::update_user_settings(update).await;
                             },
-                            span {
-                                class: format!(
-                                    "absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform {}",
-                                    if auto_delete_enabled() { "translate-x-5" } else { "" }
-                                ),
-                            }
                         }
                     }
 
