@@ -572,4 +572,75 @@ mod tests {
         });
         assert_eq!(offered, Some(stored));
     }
+
+    #[tokio::test]
+    async fn a_resumed_auto_download_of_a_lastfm_album_fails_with_a_message_to_search_again() {
+        let (ledger, mut recorded) = Ledger::recording();
+        let ctx = test_ctx("auto-lastfm");
+        let mut rx = crate::globals::get_or_create_user_channel(&ctx.id())
+            .await
+            .subscribe();
+        let folder = Folder {
+            id: "f1".into(),
+            user_id: ctx.user_id.clone(),
+            name: "Music".into(),
+            path: "/music".into(),
+            shared: false,
+        };
+        // A search of this backend would fail: starting one is refused.
+        let stub = StubBackend::new(vec![]);
+        stub.fail_search_start(SoulseekError::InvalidResponse("refused".into()));
+        let a: Arc<dyn DownloadBackend> = stub;
+        let run = AutoRun {
+            batch_id: "b1".into(),
+            job: "j1".into(),
+            search_id: "s1".into(),
+            import_mode: ImportMode::Singleton,
+            found: None,
+        };
+        let album = shared::metadata::Album {
+            id: "lastfm:album:marrow choir:winter songs".into(),
+            title: "Winter Songs".into(),
+            artist: "Marrow Choir".into(),
+            release_date: None,
+            mbid: None,
+            cover_url: None,
+            release_types: None,
+        };
+
+        run_search(
+            ledger,
+            ctx,
+            folder,
+            DownloadQuery::new(vec![]).album(album),
+            None,
+            (("a".into(), a), vec![]),
+            run,
+        )
+        .await;
+
+        assert_eq!(
+            recorded.events(),
+            vec![JobEvent::Ended {
+                job: "j1".into(),
+                state: JobState::Failed,
+                failure: None
+            }]
+        );
+        let failed = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|e| match e {
+                DownloadEvent::AutoDownload(AutoDownloadEvent::Failed { failure, .. }) => {
+                    Some(failure)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (failed.code, failed.message.as_str()),
+            (
+                FailureCode::MetadataNotFound,
+                "'Winter Songs' came from a Last.fm search, which Soulbeet no longer uses: search for it again"
+            )
+        );
+    }
 }

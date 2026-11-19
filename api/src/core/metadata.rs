@@ -186,6 +186,9 @@ pub(crate) async fn hydrate_in(
     let Some(album) = album_to_hydrate(query) else {
         return Ok(());
     };
+    if let Some(failure) = lastfm_album_failure(album) {
+        return Err(failure);
+    }
     let album_with_tracks = provider
         .get_album(&album.id)
         .await
@@ -197,6 +200,22 @@ pub(crate) async fn hydrate_in(
 /// The album of an album query whose track list is still empty.
 fn album_to_hydrate(query: &DownloadQuery) -> Option<&Album> {
     query.album.as_ref().filter(|_| query.tracks.is_empty())
+}
+
+/// A job kept from before Soulbeet dropped Last.fm can hold an album id a Last.fm search gave.
+/// No provider can look it up, so the user searches for the album again.
+fn lastfm_album_failure(album: &Album) -> Option<Failure> {
+    album.id.starts_with("lastfm:").then(|| {
+        Failure::new(
+            FailureCode::MetadataNotFound,
+            Stage::Metadata,
+            RetryAdvice::OtherQuery,
+            format!(
+                "'{}' came from a Last.fm search, which Soulbeet no longer uses: search for it again",
+                album.title
+            ),
+        )
+    })
 }
 
 /// The tracklist of the album could not be looked up.
@@ -212,6 +231,7 @@ mod tests {
     use super::*;
     use shared::failure::Service;
     use shared::metadata::SearchResult as MetadataSearchResult;
+    use shared::metadata::Track;
     use soulbeet::lastfm::LastFmId;
 
     /// Fails every call the way step 3's with_retry does when MusicBrainz gives no answer.
@@ -411,6 +431,53 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!((f.code, f.stage, f.retry, f.message.as_str()), expected);
+    }
+
+    #[tokio::test]
+    async fn an_album_from_a_lastfm_search_fails_without_asking_the_provider() {
+        // Both id forms a 0.9.0 job can hold (LastFmId::album and the form from before ids named their kind).
+        for id in [
+            "lastfm:album:marrow choir:winter songs",
+            "lastfm:marrow choir:winter songs",
+        ] {
+            let album = Album {
+                id: id.into(),
+                title: "Winter Songs".into(),
+                artist: "Marrow Choir".into(),
+                release_date: None,
+                mbid: None,
+                cover_url: None,
+                release_types: None,
+            };
+            let mut query = DownloadQuery::new(vec![]).album(album.clone());
+            // Unanswered fails with metadata_unavailable: any other code shows it was not asked.
+            let f = hydrate_in(&Unanswered, &mut query).await.unwrap_err();
+            assert_eq!(
+                (f.code, f.stage, f.retry, f.message.as_str(), f.cause, f.user_action),
+                (
+                    FailureCode::MetadataNotFound,
+                    Stage::Metadata,
+                    RetryAdvice::OtherQuery,
+                    "'Winter Songs' came from a Last.fm search, which Soulbeet no longer uses: search for it again",
+                    None,
+                    None
+                )
+            );
+            // With its tracklist already kept, the job needs no lookup and goes on.
+            let track = Track {
+                id: "t1".into(),
+                title: "O Holy Night".into(),
+                artist: "Marrow Choir".into(),
+                album_id: None,
+                album_title: None,
+                release_date: None,
+                duration: None,
+                mbid: None,
+                release_mbid: None,
+            };
+            let mut kept = DownloadQuery::new(vec![track]).album(album);
+            hydrate_in(&Unanswered, &mut kept).await.unwrap();
+        }
     }
 
     #[tokio::test]
