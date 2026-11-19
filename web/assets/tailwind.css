@@ -836,9 +836,6 @@
   .gap-6 {
     gap: calc(var(--spacing) * 6);
   }
-  .gap-8 {
-    gap: calc(var(--spacing) * 8);
-  }
   :where(.space-y-0 > :not(:last-child)) {
     --tw-space-y-reverse: 0;
     margin-block-start: 0;
@@ -2079,6 +2076,9 @@
     }
     .sm\:inline {
       display: inline;
+    }
+    .sm\:gap-8 {
+      gap: calc(var(--spacing) * 8);
     }
     .sm\:p-8 {
       padding: calc(var(--spacing) * 8);
