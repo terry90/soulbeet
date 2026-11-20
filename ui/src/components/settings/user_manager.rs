@@ -30,6 +30,13 @@ fn sign_in_tags(user: &UserSummary) -> Vec<String> {
     tags
 }
 
+/// What a new password from the admin `admin_id` does besides, for the
+/// account `user`.
+fn reset_note(user: &UserSummary, admin_id: Option<&str>) -> Option<&'static str> {
+    (user.sso_name.is_some() && admin_id != Some(user.id.as_str()))
+        .then_some("Setting a password also removes this account's single sign-on link.")
+}
+
 /// The signed-in user's own username, password and other ways to sign in,
 /// for every role. `sso_result` is how a single sign-on link that just came
 /// back from the provider ended.
@@ -232,6 +239,8 @@ pub fn UserManager() -> Element {
                 success_msg.set("Password updated".to_string());
                 editing_user_id.set(None);
                 edit_user_password.set("".to_string());
+                // It may have removed a single sign-on link.
+                fetch_users().await;
             }
             Err(e) => error.set(friendly_error(&e)),
         }
@@ -285,6 +294,7 @@ pub fn UserManager() -> Element {
                         let id_delete = user.id.clone();
                         let id_unlink = user.id.clone();
                         let tags = sign_in_tags(&user);
+                        let reset_note = reset_note(&user, auth.user_id().as_deref());
                         let (role_label, other_role, role_action) = if user.role.is_admin() {
                             ("admin", Role::User, "Make user")
                         } else {
@@ -301,6 +311,9 @@ pub fn UserManager() -> Element {
                                   oninput: move |v| edit_user_password.set(v),
                                   placeholder: "New password",
                                   password: true,
+                                }
+                                if let Some(note) = reset_note {
+                                  p { class: "text-xs text-gray-500 font-mono", "{note}" }
                                 }
                                 div { class: "flex gap-2 mt-1",
                                   button {
@@ -375,6 +388,16 @@ mod tests {
             has_password,
             sso_name: sso_name.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn a_password_for_another_linked_account_says_it_removes_the_link() {
+        let linked = summary(true, Some("ann@id"));
+        assert!(reset_note(&linked, Some("admin"))
+            .is_some_and(|note| note.contains("removes this account's single sign-on link")));
+        // The admin's own password keeps their link.
+        assert_eq!(reset_note(&linked, Some("u")), None);
+        assert_eq!(reset_note(&summary(true, None), Some("admin")), None);
     }
 
     #[test]

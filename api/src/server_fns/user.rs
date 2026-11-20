@@ -93,23 +93,46 @@ pub async fn set_user_role(user_id: String, role: Role) -> Result<(), ServerFnEr
         .map_err(user_change_error)
 }
 
-#[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
-pub async fn update_user_password(user_id: String, password: String) -> Result<(), ServerFnError> {
+/// Sets the password of `user_id` for `actor`. Their own keeps its single
+/// sign-on link. An admin's new password for another account removes it:
+/// the admin gives the account to whoever gets the password, and the
+/// identity linked to it may be the reason (a name someone else chose at
+/// the provider). Either ends the account's sessions.
+#[cfg(feature = "server")]
+pub(crate) async fn set_password_in(
+    db: &sqlx::SqlitePool,
+    actor: &UserCtx,
+    user_id: &str,
+    password: &str,
+) -> Result<(), ServerFnError> {
+    use models::user::User;
+
     if password.is_empty() {
         return Err(refusal_error("Password cannot be empty"));
     }
-    if !may_set_password(&auth.0, &user_id) {
+    if !may_set_password(actor, user_id) {
         return Err(forbidden_error(ADMIN_ONLY));
     }
+    if actor.user_id == user_id {
+        User::update_password_in(db, user_id, password)
+            .await
+            .map(|_| ())
+    } else {
+        User::reset_password_in(db, user_id, password).await
+    }
+    .map_err(server_error)
+}
+
+#[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
+pub async fn update_user_password(user_id: String, password: String) -> Result<(), ServerFnError> {
     // The bump ends every session of this user; the caller's own is renewed.
     let own_session = if user_id == auth.0.user_id {
         Some(SessionCookie::for_request(&headers, &uri)?)
     } else {
         None
     };
-    models::user::User::update_password(&user_id, &password)
-        .await
-        .map_err(server_error)?;
+    set_password_in(&crate::db::DB, &auth.0, &user_id, &password).await?;
+    crate::security::note_password_set(&user_id, &password);
     if let Some(session) = own_session {
         start_session(&cookies, &session, &user_id).await?;
     }

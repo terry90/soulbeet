@@ -160,7 +160,7 @@ pub async fn register(username: String, password: String) -> Result<(), ServerFn
 /// Categorized result of a Navidrome ping attempt.
 #[cfg(feature = "server")]
 #[derive(Debug, Clone, Copy)]
-enum NavidromeAuthResult {
+pub(crate) enum NavidromeAuthResult {
     /// Credentials accepted by Navidrome.
     Success,
     /// Navidrome refused the credentials (Subsonic error code 40).
@@ -414,8 +414,9 @@ pub(crate) async fn apply_navidrome_login(
         LoginPlan::RefuseUnlinked => {
             return Ok(LoginOutcome::Refused(format!(
                 "A Soulbeet account named '{username}' exists but is not linked to Navidrome. \
-                 Sign in to it with its Soulbeet password or single sign-on, then use Connect \
-                 Navidrome in Settings > Users. An admin can set its Soulbeet password for you."
+                 If it is yours, sign in to it with its Soulbeet password or single sign-on, \
+                 then use Connect Navidrome in Settings > Users. If it is not, or you cannot \
+                 sign in to it, ask an admin."
             )));
         }
         LoginPlan::RefuseNoAccount => {
@@ -545,7 +546,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
 /// Navidrome about the name it is given. Attempts are held back like
 /// sign-ins: a wrong password counts as a failed sign-in of that name.
 #[cfg(feature = "server")]
-async fn connect_navidrome_in<F>(
+pub(crate) async fn connect_navidrome_in<F>(
     db: &sqlx::SqlitePool,
     limiter: &LoginLimiter,
     user: &auth::UserCtx,

@@ -220,12 +220,6 @@ impl User {
             .map_err(|e| e.to_string())
     }
 
-    pub async fn update_password(id: &str, password: &str) -> Result<(), String> {
-        Self::update_password_in(&DB, id, password).await?;
-        security::note_password_set(id, password);
-        Ok(())
-    }
-
     pub(crate) async fn update_password_in(
         db: &SqlitePool,
         id: &str,
@@ -242,6 +236,30 @@ impl User {
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| UserChangeError::NotFound.to_string())
+    }
+
+    /// An admin's new password for another account: it also removes the
+    /// account's OpenID Connect identity, so whoever held that identity is
+    /// out, and ends the account's sessions.
+    pub(crate) async fn reset_password_in(
+        db: &SqlitePool,
+        id: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        let password_hash = hash_password(password)?;
+        let done = sqlx::query(
+            "UPDATE users SET password_hash = ?, oidc_issuer = NULL, oidc_subject = NULL, \
+             oidc_username = NULL, credentials_version = credentials_version + 1 WHERE id = ?",
+        )
+        .bind(password_hash)
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        if done.rows_affected() == 0 {
+            return Err(UserChangeError::NotFound.to_string());
+        }
+        Ok(())
     }
 
     pub async fn update_username(id: &str, new_username: &str) -> Result<(), UserChangeError> {

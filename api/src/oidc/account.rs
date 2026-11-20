@@ -791,6 +791,95 @@ mod tests {
         assert_eq!(reread(&db, &admin).await.oidc_subject, None);
     }
 
+    fn ctx_of(user: &User) -> crate::auth::UserCtx {
+        crate::auth::UserCtx {
+            user_id: user.id.clone(),
+            username: user.username.clone(),
+            role: user.role,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_admin_password_reset_takes_an_account_back_from_its_identity() {
+        use crate::login_limiter::LoginLimiter;
+        use crate::server_fns::auth::{connect_navidrome_in, NavidromeAuthResult};
+        use crate::server_fns::user::set_password_in;
+
+        // Mallory chose the name "bob" at the provider and her first sign-in
+        // made the account before Navidrome's Bob used Soulbeet.
+        let db = test_db::migrated().await;
+        let taken = sign_in(&db, "sub-mallory", "bob").await.unwrap();
+        let her_session = session_of(&taken);
+        let NameMatch::One(admin) = User::find_by_name_in(&db, "admin").await.unwrap() else {
+            panic!("the seeded admin");
+        };
+
+        // The admin gives the account a password for Bob.
+        set_password_in(&db, &ctx_of(&admin), &taken.id, "for-bob")
+            .await
+            .unwrap();
+        let bobs = reread(&db, &taken).await;
+        assert_eq!(
+            (&bobs.oidc_issuer, &bobs.oidc_subject, &bobs.oidc_username),
+            (&None, &None, &None)
+        );
+        assert!(bobs.password_matches("for-bob"));
+        // Her session ended, and her identity no longer opens the account.
+        let key = session_key();
+        assert!(load_session(Some(&her_session), &db, &key).await.is_err());
+        assert_eq!(
+            sign_in(&db, "sub-mallory", "bob").await.unwrap_err(),
+            SsoError::AccountExists
+        );
+
+        // Bob signs in with that password and connects his Navidrome account:
+        // none of it reaches Mallory.
+        connect_navidrome_in(
+            &db,
+            &LoginLimiter::new(),
+            &ctx_of(&bobs),
+            "enc",
+            std::time::Instant::now,
+            |_| async { NavidromeAuthResult::Success },
+        )
+        .await
+        .unwrap();
+        let connected = reread(&db, &bobs).await;
+        assert_eq!(connected.navidrome_token.as_deref(), Some("enc"));
+        assert_eq!(connected.oidc_subject, None);
+        assert_eq!(
+            sign_in(&db, "sub-mallory", "bob").await.unwrap_err(),
+            SsoError::AccountExists
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_ones_own_password_keeps_the_link() {
+        use crate::server_fns::user::set_password_in;
+
+        let db = test_db::migrated().await;
+        let ann = sign_in(&db, "sub-ann", "ann").await.unwrap();
+        set_password_in(&db, &ctx_of(&ann), &ann.id, "pw")
+            .await
+            .unwrap();
+        // An admin's own password too.
+        let NameMatch::One(admin) = User::find_by_name_in(&db, "admin").await.unwrap() else {
+            panic!("the seeded admin");
+        };
+        User::link_oidc_identity_in(&db, &admin.id, ISSUER, "sub-admin", "admin")
+            .await
+            .unwrap();
+        set_password_in(&db, &ctx_of(&admin), &admin.id, "new-admin-pw")
+            .await
+            .unwrap();
+        for user in [&ann, &admin] {
+            let after = reread(&db, user).await;
+            assert!(after.oidc_subject.is_some(), "{}", after.username);
+            assert!(after.has_password());
+        }
+        assert_eq!(sign_in(&db, "sub-ann", "ann").await.unwrap().id, ann.id);
+    }
+
     #[tokio::test]
     async fn an_identity_stays_on_one_account_and_an_account_keeps_its_identity() {
         let db = test_db::migrated().await;
