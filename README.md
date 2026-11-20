@@ -142,7 +142,7 @@ For discovery (optional): enable discovery on a folder in Settings > Library, pi
 
 ## Guides
 
-- [Configuration](docs/configuration.md): every environment variable with its default, how sign-in works with Navidrome, and which settings live in the web UI.
+- [Configuration](docs/configuration.md): the environment variables and their defaults (the `OIDC_*` ones are in Single sign-on), how sign-in works with Navidrome, and which settings live in the web UI.
 - [Single sign-on](docs/sso.md): signing in through an OpenID Connect provider (Pocket ID, Authelia, Authentik, Keycloak), how accounts are matched, and when to turn off linking by name.
 - [Upgrading](docs/upgrading.md): what changes on the first start after the release that adds admin roles and folder roots.
 - [Beets](docs/beets.md): the beets config file, import flags, skipped imports, image tiers, per-folder libraries and album mode.
