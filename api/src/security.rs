@@ -42,7 +42,8 @@ const WEAK_SECRET_KEY: &str = "SECRET_KEY is shorter than 32 bytes, so Soulbeet 
      it and signs sessions with the key stored in secret.key next to the database. Remove \
      SECRET_KEY, or set it to a random value of at least 32 bytes, for example the output of \
      `openssl rand -hex 32`. Setting a new SECRET_KEY ends every session and makes the stored \
-     Navidrome passwords unreadable: each user is asked to sign in again once.";
+     Navidrome passwords unreadable: each user enters theirs again once, by signing in with it \
+     or under Connect Navidrome in Settings > Users.";
 
 /// The reasons the instance is not safe to expose. Empty means open. Never hashes.
 #[cfg(feature = "server")]
