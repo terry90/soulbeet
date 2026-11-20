@@ -847,9 +847,9 @@ async fn find_or_create_account(
         }
         Account::NotRegistered => {
             tracing::info!(
-                "OIDC sign-in refused: no account '{}', and OIDC_AUTO_REGISTER is off \
-                 (it is by default with REGISTRATION=admin)",
-                identity.username
+                "OIDC sign-in refused: no account {}, and OIDC_AUTO_REGISTER is off \
+                 (it is by default unless REGISTRATION=open)",
+                loggable(&identity.username)
             );
             Err(SsoError::NotRegistered)
         }

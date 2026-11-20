@@ -189,7 +189,7 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `OIDC_PROVIDER_NAME` | Name on the login button ("Sign in with ...") | `SSO` |
 | `OIDC_SCOPES` | Scopes to request (`openid` is always added) | `openid profile email` |
 | `OIDC_USERNAME_CLAIM` | ID token claim used as the Soulbeet username | `preferred_username` |
-| `OIDC_AUTO_REGISTER` | Create an account on first sign-in when none has that username | `false` with `REGISTRATION=admin`, else `true` |
+| `OIDC_AUTO_REGISTER` | Create an account on first sign-in when none has that username | `true` with `REGISTRATION=open`, else `false` |
 | `OIDC_LINK_BY_USERNAME` | On a first sign-in, link the existing account of that username instead of refusing it. Read the warning below before turning it on | `false` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
@@ -222,7 +222,7 @@ How accounts are matched:
 
 -   An account is tied to the provider's user (its issuer and `sub`), so renaming the user at the provider does not change accounts. A first sign-in never takes an existing account: if an account named by `OIDC_USERNAME_CLAIM` already exists (ignoring letter case, like every sign-in), the sign-in is refused. The owner of that account signs in with its password and links single sign-on in Settings.
 -   `OIDC_LINK_BY_USERNAME=true` makes a first sign-in link the existing account of that name instead, which signs that account out of its other sessions. Turn it on only if you alone decide the usernames at the provider. Anyone who can choose that name at the provider, or who holds the account of that name in Soulbeet, ends up with the account.
--   With no account of that name, one is created as a plain user, unless `REGISTRATION=admin` (or `OIDC_AUTO_REGISTER=false`). Restrict who may sign in at the provider (Pocket ID: allowed user groups on the client).
+-   With no account of that name, one is created as a plain user when `REGISTRATION=open`, or when `OIDC_AUTO_REGISTER=true` in any mode. Otherwise the sign-in is refused: an admin creates the account in Settings > Users, and its owner signs in with that password and links single sign-on. Restrict who may sign in at the provider (Pocket ID: allowed user groups on the client).
 -   With `OIDC_USERNAME_CLAIM=email`, a sign-in is accepted only when the provider says the address is verified (`email_verified` is `true`). A missing or any other value is refused.
 -   **Navidrome**: an account created through single sign-on has no password and no Navidrome password yet, and a banner says so. A Navidrome login with the same username does not join it, because the provider and Navidrome may give that name to different people.
 -   Signing in from an MCP client's authorization page goes back to it afterwards, as a password sign-in does.

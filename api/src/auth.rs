@@ -142,7 +142,8 @@ impl SsoError {
             SsoError::Failed => "Single sign-on failed. The server log has the details.",
             SsoError::Denied => "Single sign-on was cancelled or refused by the provider.",
             SsoError::NotRegistered => {
-                "No Soulbeet account for this user. Ask an admin to create it."
+                "No Soulbeet account for this user. Ask an admin to create one, then sign in \
+                 with its password and link single sign-on in Settings."
             }
             SsoError::AccountExists => {
                 "A Soulbeet account with this username already exists. Sign in with its \

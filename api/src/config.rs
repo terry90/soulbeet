@@ -120,7 +120,7 @@ pub struct OidcConfig {
     /// Shown on the login button
     pub provider_name: String,
     /// Create an account on first sign-in for a username that has none;
-    /// unset, it does unless `REGISTRATION=admin`
+    /// unset, only with `REGISTRATION=open`
     pub auto_register: bool,
     /// On a first sign-in, link the one account whose name matches the
     /// username claim and has no identity yet. Off unless the admin, who
@@ -203,10 +203,11 @@ impl OidcConfig {
             scopes.insert(0, "openid".to_string());
         }
 
-        // The provider decides who may sign in; an admin-only instance
-        // creates no accounts unless told to.
+        // Unset, single sign-on opens no more than REGISTRATION does: in
+        // navidrome mode only Navidrome users get accounts, in admin mode
+        // only the ones an admin creates.
         let auto_register = match get("OIDC_AUTO_REGISTER") {
-            None => registration != RegistrationMode::Admin,
+            None => registration == RegistrationMode::Open,
             Some(v) => parse_bool(&v)
                 .ok_or_else(|| format!("OIDC_AUTO_REGISTER has an invalid value '{v}'"))?,
         };
@@ -558,7 +559,7 @@ mod oidc_tests {
         assert_eq!(config.scopes, "openid profile email");
         assert_eq!(config.username_claim, "preferred_username");
         assert_eq!(config.provider_name, "SSO");
-        assert!(config.auto_register);
+        assert!(!config.auto_register);
         assert!(!config.link_by_username);
     }
 
@@ -627,12 +628,24 @@ mod oidc_tests {
         let auto = |vars: &[(&str, &str)], mode| {
             parse_with(vars, None, mode).unwrap().unwrap().auto_register
         };
-        assert!(auto(&REQUIRED, RegistrationMode::Navidrome));
+        // Only open registration lets anyone the provider accepts in. In
+        // navidrome mode only Navidrome users get accounts.
         assert!(auto(&REQUIRED, RegistrationMode::Open));
+        assert!(!auto(&REQUIRED, RegistrationMode::Navidrome));
         assert!(!auto(&REQUIRED, RegistrationMode::Admin));
-        let mut vars = REQUIRED.to_vec();
-        vars.push(("OIDC_AUTO_REGISTER", "yes"));
-        assert!(auto(&vars, RegistrationMode::Admin));
+        // An explicit setting wins in every mode.
+        let mut on = REQUIRED.to_vec();
+        on.push(("OIDC_AUTO_REGISTER", "yes"));
+        let mut off = REQUIRED.to_vec();
+        off.push(("OIDC_AUTO_REGISTER", "false"));
+        for mode in [
+            RegistrationMode::Open,
+            RegistrationMode::Navidrome,
+            RegistrationMode::Admin,
+        ] {
+            assert!(auto(&on, mode));
+            assert!(!auto(&off, mode));
+        }
     }
 
     #[test]
