@@ -183,16 +183,16 @@ fn choose_account(by_identity: Option<User>, same_name: NameMatch, config: &Oidc
     }
 }
 
+fn db_error(e: String) -> SsoError {
+    tracing::error!("OIDC sign-in failed: {e}");
+    SsoError::Failed
+}
+
 async fn find_or_create_account(
     db: &SqlitePool,
     identity: &Identity,
     config: &OidcConfig,
 ) -> Result<User, SsoError> {
-    let db_error = |e: String| {
-        tracing::error!("OIDC sign-in failed: {e}");
-        SsoError::Failed
-    };
-
     let by_identity = User::find_by_oidc_identity_in(db, &identity.issuer, &identity.subject)
         .await
         .map_err(db_error)?;
@@ -202,18 +202,18 @@ async fn find_or_create_account(
             .await
             .map_err(db_error)?,
     };
+    enter_account(db, identity, choose_account(by_identity, same_name, config)).await
+}
 
-    match choose_account(by_identity, same_name, config) {
-        Account::Linked(mut user) => {
-            // Shown in Settings: the name the provider gives it now.
-            if user.oidc_username.as_deref() != Some(identity.username.as_str()) {
-                User::note_oidc_username_in(db, &user.id, &identity.username)
-                    .await
-                    .map_err(db_error)?;
-                user.oidc_username = Some(identity.username.clone());
-            }
-            Ok(user)
-        }
+/// Signs `identity` in to `account`, as chosen from what the database held
+/// a moment ago.
+async fn enter_account(
+    db: &SqlitePool,
+    identity: &Identity,
+    account: Account,
+) -> Result<User, SsoError> {
+    match account {
+        Account::Linked(user) => with_current_name(db, identity, user).await,
         Account::Unlinked(user) => {
             match User::link_oidc_identity_in(
                 db,
@@ -226,9 +226,9 @@ async fn find_or_create_account(
             .map_err(db_error)?
             {
                 OidcLink::Linked => {}
-                // Linked by a concurrent sign-in in the meantime.
+                // Linked by a concurrent sign-in meanwhile.
                 OidcLink::AccountLinked | OidcLink::IdentityTaken => {
-                    return Err(SsoError::Conflict)
+                    return linked_meanwhile(db, identity, || conflict(identity)).await
                 }
             }
             tracing::info!(
@@ -254,9 +254,12 @@ async fn find_or_create_account(
                     );
                     Ok(user)
                 }
-                // Created by a concurrent sign-in or registration meanwhile.
-                Err(UserChangeError::UsernameTaken) => Err(SsoError::Conflict),
-                Err(e) => Err(db_error(e.to_string())),
+                // Created by a concurrent sign-in or registration meanwhile:
+                // the name, or the identity, is taken now.
+                Err(UserChangeError::UsernameTaken) => {
+                    linked_meanwhile(db, identity, || conflict(identity)).await
+                }
+                Err(e) => linked_meanwhile(db, identity, || db_error(e.to_string())).await,
             }
         }
         Account::Exists => {
@@ -267,14 +270,7 @@ async fn find_or_create_account(
             );
             Err(SsoError::AccountExists)
         }
-        Account::Conflict => {
-            tracing::warn!(
-                "OIDC sign-in refused: the account {} is linked to another OIDC identity, \
-                 or several accounts have that name in other letter case",
-                loggable(&identity.username)
-            );
-            Err(SsoError::Conflict)
-        }
+        Account::Conflict => Err(conflict(identity)),
         Account::NotRegistered => {
             tracing::info!(
                 "OIDC sign-in refused: no account {}, and OIDC_AUTO_REGISTER is off \
@@ -284,6 +280,47 @@ async fn find_or_create_account(
             Err(SsoError::NotRegistered)
         }
     }
+}
+
+/// `user`, linked to `identity`, showing the name the provider gives it now.
+async fn with_current_name(
+    db: &SqlitePool,
+    identity: &Identity,
+    mut user: User,
+) -> Result<User, SsoError> {
+    if user.oidc_username.as_deref() != Some(identity.username.as_str()) {
+        User::note_oidc_username_in(db, &user.id, &identity.username)
+            .await
+            .map_err(db_error)?;
+        user.oidc_username = Some(identity.username.clone());
+    }
+    Ok(user)
+}
+
+/// After a link or an account creation failed, maybe because it lost a
+/// race: the account another sign-in of `identity` linked or created
+/// meanwhile, else the error `otherwise` gives.
+async fn linked_meanwhile(
+    db: &SqlitePool,
+    identity: &Identity,
+    otherwise: impl FnOnce() -> SsoError,
+) -> Result<User, SsoError> {
+    match User::find_by_oidc_identity_in(db, &identity.issuer, &identity.subject)
+        .await
+        .map_err(db_error)?
+    {
+        Some(user) => with_current_name(db, identity, user).await,
+        None => Err(otherwise()),
+    }
+}
+
+fn conflict(identity: &Identity) -> SsoError {
+    tracing::warn!(
+        "OIDC sign-in refused: the account {} is linked to another OIDC identity, \
+         or several accounts have that name in other letter case",
+        loggable(&identity.username)
+    );
+    SsoError::Conflict
 }
 
 #[cfg(test)]
@@ -480,6 +517,82 @@ mod tests {
         assert_eq!(sign_in(&db, "sub-a", "alice").await.unwrap().id, local.id);
     }
 
+    /// Two first sign-ins of `ann`'s identity at once: each chose what to do
+    /// before the other wrote. `planned` is what the slower one chose.
+    async fn first_sign_ins_at_once(
+        db: &SqlitePool,
+        config: &OidcConfig,
+        planned: Account,
+        ann: &Identity,
+    ) -> Result<User, SsoError> {
+        // The faster one finishes first.
+        let first = find_or_create_account(db, ann, config).await.unwrap();
+        let second = enter_account(db, ann, planned).await;
+        if let Ok(user) = &second {
+            assert_eq!(user.id, first.id);
+        }
+        second
+    }
+
+    #[tokio::test]
+    async fn two_first_sign_ins_of_one_identity_end_in_its_one_account() {
+        let db = test_db::migrated().await;
+        let ann = identity("sub-ann", "ann");
+
+        // Both create the account: the second one signs in to it.
+        let user = first_sign_ins_at_once(&db, &test_config(), Account::New, &ann)
+            .await
+            .unwrap();
+        assert_eq!(user.oidc_subject.as_deref(), Some("sub-ann"));
+        assert_eq!(user_count(&db).await, 2);
+
+        // Both link the account of that name (OIDC_LINK_BY_USERNAME).
+        let db = test_db::migrated().await;
+        let bob = User::create_in(&db, "bob", "pw").await.unwrap();
+        let bobs = identity("sub-bob", "bob");
+        let by_name = OidcConfig {
+            link_by_username: true,
+            ..test_config()
+        };
+        let user = first_sign_ins_at_once(&db, &by_name, Account::Unlinked(bob.clone()), &bobs)
+            .await
+            .unwrap();
+        assert_eq!(user.id, bob.id);
+        assert_eq!(user.credentials_version, bob.credentials_version + 1);
+    }
+
+    #[tokio::test]
+    async fn a_first_sign_in_that_loses_to_another_identity_is_a_conflict() {
+        let db = test_db::migrated().await;
+        let ann = identity("sub-ann", "ann");
+        // Another identity of that name was created meanwhile.
+        sign_in(&db, "sub-other", "ann").await.unwrap();
+        assert_eq!(
+            enter_account(&db, &ann, Account::New).await.unwrap_err(),
+            SsoError::Conflict
+        );
+
+        // Another identity linked the account of that name meanwhile.
+        let db = test_db::migrated().await;
+        let bob = User::create_in(&db, "bob", "pw").await.unwrap();
+        User::link_oidc_identity_in(&db, &bob.id, ISSUER, "sub-other", "bob")
+            .await
+            .unwrap();
+        assert_eq!(
+            enter_account(&db, &identity("sub-bob", "bob"), Account::Unlinked(bob))
+                .await
+                .unwrap_err(),
+            SsoError::Conflict
+        );
+    }
+
+    async fn user_count(db: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn refuses_unknown_names_without_auto_register() {
         let db = test_db::migrated().await;
@@ -559,7 +672,9 @@ mod tests {
 
         // A session that still stands links.
         let check = check_of(&session_of(&after));
-        let linked = link_for_session_in(&db, &check, &ann.id, &id).await.unwrap();
+        let linked = link_for_session_in(&db, &check, &ann.id, &id)
+            .await
+            .unwrap();
         assert_eq!(linked.oidc_subject.as_deref(), Some("sub-ann"));
     }
 

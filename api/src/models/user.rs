@@ -727,7 +727,10 @@ mod tests {
             .await
             .unwrap();
         let sso = User::find_by_id_in(&db, &sso.id).await.unwrap().unwrap();
-        assert_eq!(UserSummary::from(&sso).sso_name.as_deref(), Some("sso-renamed"));
+        assert_eq!(
+            UserSummary::from(&sso).sso_name.as_deref(),
+            Some("sso-renamed")
+        );
         assert_eq!(sso.username, "sso");
         User::note_oidc_username_in(&db, &local.id, "nobody")
             .await
@@ -753,7 +756,11 @@ mod tests {
         assert!(User::unlink_oidc_identity_in(&db, &a.id).await.unwrap());
         let after = User::find_by_id_in(&db, &a.id).await.unwrap().unwrap();
         assert_eq!(
-            (&after.oidc_issuer, &after.oidc_subject, &after.oidc_username),
+            (
+                &after.oidc_issuer,
+                &after.oidc_subject,
+                &after.oidc_username
+            ),
             (&None, &None, &None)
         );
         assert_eq!(after.credentials_version, 2);
