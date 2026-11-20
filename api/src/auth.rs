@@ -113,6 +113,15 @@ pub enum SsoError {
 }
 
 impl SsoError {
+    const ALL: [SsoError; 6] = [
+        SsoError::Failed,
+        SsoError::Denied,
+        SsoError::NotRegistered,
+        SsoError::AccountExists,
+        SsoError::Conflict,
+        SsoError::Disabled,
+    ];
+
     pub fn code(self) -> &'static str {
         match self {
             SsoError::Failed => "failed",
@@ -124,17 +133,12 @@ impl SsoError {
         }
     }
 
-    pub fn from_code(code: &str) -> Option<Self> {
-        [
-            SsoError::Failed,
-            SsoError::Denied,
-            SsoError::NotRegistered,
-            SsoError::AccountExists,
-            SsoError::Conflict,
-            SsoError::Disabled,
-        ]
-        .into_iter()
-        .find(|e| e.code() == code)
+    /// The error a code names; an unknown code is a failure.
+    pub fn from_code(code: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|e| e.code() == code)
+            .unwrap_or(SsoError::Failed)
     }
 
     pub fn message(self) -> &'static str {
@@ -241,6 +245,20 @@ pub struct SignInMethods {
     pub sso_unlink_allowed: bool,
     /// `NAVIDROME_URL` is set, so the account can connect Navidrome
     pub navidrome: bool,
+}
+
+#[cfg(test)]
+mod sso_error_tests {
+    use super::*;
+
+    #[test]
+    fn codes_name_one_error_and_unknown_ones_fail() {
+        for error in SsoError::ALL {
+            assert_eq!(SsoError::from_code(error.code()), error);
+        }
+        // A typed or stale /login/error address still says something failed.
+        assert_eq!(SsoError::from_code("nonsense"), SsoError::Failed);
+    }
 }
 
 #[cfg(test)]

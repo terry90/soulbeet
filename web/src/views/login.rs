@@ -80,7 +80,7 @@ pub fn LoginReturnPage(return_to: ReturnTo) -> Element {
 /// `/login/error/<code>`: where the server sends a failed single sign-on.
 #[component]
 pub fn LoginErrorPage(code: String) -> Element {
-    let sso_error = SsoError::from_code(&code).map(|e| e.message().to_string());
+    let sso_error = Some(SsoError::from_code(&code).message().to_string());
     rsx! {
         LoginView { sso_error, return_to: None }
     }
