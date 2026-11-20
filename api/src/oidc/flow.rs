@@ -145,10 +145,12 @@ pub(super) fn authorization_url(provider: &Provider, config: &OidcConfig, flow: 
         .append_pair("nonce", &flow.nonce)
         .append_pair("code_challenge", &pkce_challenge(&flow.verifier))
         .append_pair("code_challenge_method", "S256");
-    // A link binds whoever the provider says signed in, for good. The user
-    // signs in at the provider again and so sees who that is, rather than a
-    // session someone else left open there being linked unseen (OpenID
-    // Connect Core 1.0, section 3.1.2.1).
+    // A link binds whoever the provider says signed in, for good. The
+    // provider is asked to make the user sign in again, so a session someone
+    // else left open there is not linked unseen (OpenID Connect Core 1.0,
+    // section 3.1.2.1). Not every provider does; Settings shows the name
+    // linked so the user can check it. No max_age or auth_time check: small
+    // providers leave auth_time out.
     if matches!(flow.purpose, Purpose::Link { .. }) {
         url.query_pairs_mut().append_pair("prompt", "login");
     }
