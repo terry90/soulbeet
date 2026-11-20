@@ -7,9 +7,9 @@
 Sign in to Soulbeet through Pocket ID, Authelia, Authentik, Keycloak or another OpenID Connect provider, next to your password.
 
 - **A button on the login page**: Once an admin sets it up, the login page has a button to sign in through your provider.
-- **Your account stays yours**: A first sign-in never takes an existing account, so sign in with your password once and link single sign-on in Settings > Users.
+- **Your account stays yours**: By default, a first sign-in does not take an existing account. Sign in with your password once and link single sign-on in Settings > Users.
 - **Navidrome**: An account made through single sign-on gets Navidrome with Connect Navidrome in Settings > Users.
-- **For admins**: Single sign-on creates accounts by default only with `REGISTRATION=open`; see Single Sign-On in the README.
+- **For admins**: Single sign-on creates accounts by default only with `REGISTRATION=open`. `OIDC_LINK_BY_USERNAME=true` lets a first sign-in take the existing account of that name, so read the warning in Single Sign-On in the README before turning it on.
 
 [How to set it up](https://github.com/terry90/soulbeet#single-sign-on-openid-connect)
 
