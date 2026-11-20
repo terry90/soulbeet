@@ -354,7 +354,10 @@ pub(crate) async fn stored_password_in(
             user.id
         );
         if let Err(e) = mark_password_unreadable(db, &user.id, encrypted).await {
-            tracing::warn!("Could not mark user {} to enter their Navidrome password again: {e}", user.id);
+            tracing::warn!(
+                "Could not mark user {} to enter their Navidrome password again: {e}",
+                user.id
+            );
         }
     }
     Err(NavidromeLookupError::PasswordUnreadable)
