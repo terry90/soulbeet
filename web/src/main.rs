@@ -16,7 +16,8 @@ use ui::{
     SettingsProvider, StatusAction, StatusBanner,
 };
 use views::{
-    leave_login, DashboardPage, LoginErrorPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage,
+    leave_login, DashboardPage, LoginErrorPage, LoginErrorReturnPage, LoginPage, LoginReturnPage,
+    ReturnTo, SearchPage,
     SettingsPage, SettingsTab, SettingsTabRequest, SsoLinkNotice, SsoLinkResultPage,
 };
 
@@ -35,6 +36,8 @@ pub enum Route {
         LoginReturnPage { return_to: ReturnTo },
         #[route("/login/error/:code")]
         LoginErrorPage { code: String },
+        #[route("/login/error/:code/return?:..return_to")]
+        LoginErrorReturnPage { code: String, return_to: ReturnTo },
 
         #[layout(WebNavbar)]
             #[route("/")]
@@ -131,14 +134,20 @@ fn AuthGuard() -> Element {
     use_effect(move || match (auth.is_logged_in(), &current) {
         (
             false,
-            Route::LoginPage {} | Route::LoginReturnPage { .. } | Route::LoginErrorPage { .. },
+            Route::LoginPage {}
+            | Route::LoginReturnPage { .. }
+            | Route::LoginErrorPage { .. }
+            | Route::LoginErrorReturnPage { .. },
         ) => {}
         (false, _) => {
             nav.replace(Route::LoginPage {});
         }
         (true, Route::LoginPage {} | Route::LoginErrorPage { .. }) => leave_login(nav, None),
         // Back to the request that asked for sign-in
-        (true, Route::LoginReturnPage { return_to }) => leave_login(nav, return_to.accepted()),
+        (
+            true,
+            Route::LoginReturnPage { return_to } | Route::LoginErrorReturnPage { return_to, .. },
+        ) => leave_login(nav, return_to.accepted()),
         (true, _) => {}
     });
 
@@ -512,6 +521,32 @@ mod tests {
                 code: "identity_taken".into()
             }
         );
+    }
+
+    #[test]
+    fn a_failed_single_sign_on_keeps_the_request_it_was_for() {
+        use api::auth::SsoError;
+        let sent = SsoError::Denied.location(Some(BACK));
+        let route: Route = sent.parse().unwrap();
+        match &route {
+            Route::LoginErrorReturnPage { code, return_to } => {
+                assert_eq!(code, "denied");
+                assert_eq!(return_to.accepted(), Some(BACK));
+            }
+            other => panic!("not the error page with a request: {other:?}"),
+        }
+        assert_eq!(route.to_string(), sent);
+
+        // Without one, the error page keeps its bare address.
+        let sent = SsoError::Denied.location(None);
+        let route: Route = sent.parse().unwrap();
+        assert_eq!(
+            route,
+            Route::LoginErrorPage {
+                code: "denied".into()
+            }
+        );
+        assert_eq!(route.to_string(), sent);
     }
 
     #[test]

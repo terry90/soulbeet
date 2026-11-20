@@ -86,6 +86,19 @@ pub fn LoginErrorPage(code: String) -> Element {
     }
 }
 
+/// `/login/error/<code>/return?return_to=...`: a failed single sign-on that
+/// was on the way to an app's request. Signing in from here, with the
+/// password or the button, still goes back to it; `AuthGuard` reads it from
+/// the route.
+#[component]
+pub fn LoginErrorReturnPage(code: String, return_to: ReturnTo) -> Element {
+    let sso_error = Some(SsoError::from_code(&code).message().to_string());
+    let return_to = return_to.accepted().map(str::to_owned);
+    rsx! {
+        LoginView { sso_error, return_to }
+    }
+}
+
 #[component]
 fn LoginView(sso_error: Option<String>, return_to: Option<String>) -> Element {
     let mut auth = use_auth();

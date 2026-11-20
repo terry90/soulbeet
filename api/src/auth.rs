@@ -133,6 +133,19 @@ impl SsoError {
         }
     }
 
+    /// The login page that shows this error, on the way to `return_to`, an
+    /// app's authorize request, when the sign-in was for one.
+    pub fn location(self, return_to: Option<&str>) -> String {
+        match return_to {
+            None => format!("/login/error/{}", self.code()),
+            Some(back) => format!(
+                "/login/error/{}/return?{}",
+                self.code(),
+                shared::oauth::return_to_query(back)
+            ),
+        }
+    }
+
     /// The error a code names; an unknown code is a failure.
     pub fn from_code(code: &str) -> Self {
         Self::ALL
@@ -258,6 +271,19 @@ mod sso_error_tests {
         }
         // A typed or stale /login/error address still says something failed.
         assert_eq!(SsoError::from_code("nonsense"), SsoError::Failed);
+    }
+
+    #[test]
+    fn an_error_keeps_the_app_request_the_sign_in_was_for() {
+        assert_eq!(SsoError::Denied.location(None), "/login/error/denied");
+        let back = "/oauth/authorize?client_id=c&state=a%26b";
+        assert_eq!(
+            SsoError::Denied.location(Some(back)),
+            format!(
+                "/login/error/denied/return?{}",
+                shared::oauth::return_to_query(back)
+            )
+        );
     }
 }
 

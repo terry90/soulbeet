@@ -224,7 +224,7 @@ How accounts are matched:
 -   With `OIDC_USERNAME_CLAIM=email`, a sign-in is accepted only when the provider says the address is verified (`email_verified` is `true`). A missing or any other value is refused.
 -   **Linking and unlinking**: signed in, a user links single sign-on in Settings > Users, which sends them to the provider and back. The provider asks them to sign in there again, so the identity linked is the one they just signed in with and not a provider session someone else left open in that browser. An identity is linked to one account only, and an account to one identity. A user can unlink their own account there while it keeps another way in (a password of its own, or a stored Navidrome password). An admin sees in Settings > Users which accounts use single sign-on and which have no password, and can unlink any of them. Linking or unlinking signs the account out everywhere else.
 -   **Navidrome**: an account created through single sign-on has no password and no Navidrome password yet, and a banner says so. A Navidrome login with the same username does not join it, because the provider and Navidrome may give that name to different people. Instead, the user enters their Navidrome password under **Connect Navidrome** in Settings > Users. Soulbeet checks it with Navidrome for the account's own username and stores it. Any account can do this, also to store a Navidrome password that changed.
--   Signing in from an MCP client's authorization page goes back to it afterwards, as a password sign-in does.
+-   Signing in from an MCP client's authorization page goes back to it afterwards, as a password sign-in does, also after a failed single sign-on: the error page keeps the request.
 
 ### Upgrading to roles and folder roots
 

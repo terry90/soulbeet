@@ -410,9 +410,10 @@ fn flow_cookie(state: &str, value: String, session: &SessionCookie) -> Cookie<'s
     cookie
 }
 
-/// Back to the login page, which shows what went wrong.
-fn to_login(error: SsoError) -> Response {
-    Redirect::to(&format!("/login/error/{}", error.code())).into_response()
+/// Back to the login page, which shows what went wrong, still on the way to
+/// `return_to` when the sign-in was.
+fn to_login(error: SsoError, return_to: Option<&str>) -> Response {
+    Redirect::to(&error.location(return_to)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -448,15 +449,15 @@ async fn start_sign_in(
     uri: &Uri,
     params: LoginParams,
 ) -> Response {
-    let Some(config) = CONFIG.oidc() else {
-        return to_login(SsoError::Disabled);
-    };
     // Only a request Soulbeet itself may send the browser back to.
     let return_to = params
         .return_to
         .as_deref()
         .and_then(shared::oauth::accepted_return_to)
         .map(str::to_owned);
+    let Some(config) = CONFIG.oidc() else {
+        return to_login(SsoError::Disabled, return_to.as_deref());
+    };
     let started = Start::for_request(
         config.redirect_pin.as_ref(),
         CONFIG.public_url(),
@@ -468,14 +469,19 @@ async fn start_sign_in(
         Ok(start) if start.elsewhere => {
             return Redirect::to(&start.login_url(return_to.as_deref())).into_response();
         }
-        Ok(start) => begin(cookies, config, Purpose::SignIn { return_to }, &start).await,
+        Ok(start) => {
+            let purpose = Purpose::SignIn {
+                return_to: return_to.clone(),
+            };
+            begin(cookies, config, purpose, &start).await
+        }
         Err(e) => Err(e),
     };
     match begun {
         Ok(url) => Redirect::to(url.as_str()).into_response(),
         Err(e) => {
             tracing::error!("OIDC sign-in failed: {e}");
-            to_login(SsoError::Failed)
+            to_login(SsoError::Failed, return_to.as_deref())
         }
     }
 }
@@ -562,17 +568,19 @@ struct CallbackParams {
 
 /// `GET /api/auth/oidc/callback`: the provider sends the browser back here.
 async fn callback(cookies: Cookies, Query(params): Query<CallbackParams>) -> Response {
+    // Without a flow, there is no app request to keep.
     let Some(config) = CONFIG.oidc() else {
-        return to_login(SsoError::Disabled);
+        return to_login(SsoError::Disabled, None);
     };
     let flow = match take_flow(&cookies, &params) {
         Ok(flow) => flow,
-        Err(error) => return to_login(error),
+        Err(error) => return to_login(error, None),
     };
     let identity = verified_identity(config, &flow, params).await;
     let session = flow.session;
 
-    let (user, to) = match flow.purpose {
+    // `return_to`: the app request a failed sign-in still goes back to.
+    let (user, to, return_to) = match flow.purpose {
         Purpose::SignIn { return_to } => {
             let user = match identity {
                 Ok(identity) => sign_in_account(&identity, config).await,
@@ -581,9 +589,10 @@ async fn callback(cookies: Cookies, Query(params): Query<CallbackParams>) -> Res
             match user {
                 Ok(user) => {
                     tracing::info!("User '{}' signed in through OIDC", user.username);
-                    (user, return_to.unwrap_or_else(|| "/".to_string()))
+                    let to = return_to.clone().unwrap_or_else(|| "/".to_string());
+                    (user, to, return_to)
                 }
-                Err(error) => return to_login(error),
+                Err(error) => return to_login(error, return_to.as_deref()),
             }
         }
         Purpose::Link { user_id } => {
@@ -597,7 +606,7 @@ async fn callback(cookies: Cookies, Query(params): Query<CallbackParams>) -> Res
                 Err(_) => Err(SsoLinkResult::Failed),
             };
             match linked {
-                Ok(user) => (user, SsoLinkResult::Linked.location()),
+                Ok(user) => (user, SsoLinkResult::Linked.location(), None),
                 Err(result) => return Redirect::to(&result.location()).into_response(),
             }
         }
@@ -607,7 +616,7 @@ async fn callback(cookies: Cookies, Query(params): Query<CallbackParams>) -> Res
         Ok(()) => Redirect::to(&to).into_response(),
         Err(e) => {
             tracing::error!("OIDC sign-in failed: cannot start a session: {e}");
-            to_login(SsoError::Failed)
+            to_login(SsoError::Failed, return_to.as_deref())
         }
     }
 }
