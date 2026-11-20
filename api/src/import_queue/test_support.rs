@@ -276,14 +276,6 @@ impl Drop for ActiveGuard<'_> {
 
 #[async_trait]
 impl MusicImporter for StubImporter {
-    fn id(&self) -> &'static str {
-        "stub"
-    }
-
-    fn name(&self) -> &'static str {
-        "Stub"
-    }
-
     async fn import(
         &self,
         sources: &[&Path],

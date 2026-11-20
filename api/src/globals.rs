@@ -247,14 +247,81 @@ pub fn start_channel_cleanup_task() {
             }
             // Wait 30s for server to be fully ready
             tokio::time::sleep(Duration::from_secs(30)).await;
-            let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600)); // 6 hours
-            loop {
-                interval.tick().await;
-                run_automation().await;
-            }
+            repeat_spaced(Duration::from_secs(6 * 3600), run_automation).await;
         });
-        info!("Started automation task (interval: 6h)");
+        info!("Started automation task (6h after each run ends)");
+
+        tokio::spawn(async {
+            let delay = first_recommendation_delay(&mut rand::rng());
+            info!(
+                "Recommendations start in {}s, then 6h after each cycle ends",
+                delay.as_secs()
+            );
+            tokio::time::sleep(delay).await;
+            repeat_spaced(RECOMMENDATION_INTERVAL, run_recommendations).await;
+        });
     });
+}
+
+/// Runs `cycle` forever and waits `period` after each one ends. A tokio interval, even
+/// with MissedTickBehavior::Delay, starts the next cycle at once after one that ran past
+/// the period, and these cycles call remote services that may be the reason it ran long.
+#[cfg(feature = "server")]
+async fn repeat_spaced<F, Fut>(period: Duration, mut cycle: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        cycle().await;
+        tokio::time::sleep(period).await;
+    }
+}
+
+#[cfg(feature = "server")]
+const RECOMMENDATION_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// 30 s for the server to be ready, then a random point in the first cycle, so installs
+/// started together do not call ListenBrainz and Deezer in step.
+#[cfg(feature = "server")]
+fn first_recommendation_delay(rng: &mut impl rand::Rng) -> Duration {
+    Duration::from_secs(30 + rng.random_range(0..RECOMMENDATION_INTERVAL.as_secs()))
+}
+
+/// One recommendation cycle: drops expired music facts, then, for each user with discovery
+/// on, builds their profile once and stores their selected profiles' candidates from it.
+#[cfg(feature = "server")]
+async fn run_recommendations() {
+    use crate::core::index::ServerNavidrome;
+    use crate::core::recommend::{due_in, generate_in, DiscoveryServices};
+    use crate::db::DB;
+
+    match crate::models::knowledge_cache::prune_expired_in(&DB).await {
+        Ok(n) => info!("Recommendations: pruned {n} expired cached facts"),
+        Err(e) => warn!("Recommendations: could not prune expired cached facts: {e}"),
+    }
+    let due = match due_in(&DB).await {
+        Ok(due) => due,
+        Err(e) => {
+            warn!("Recommendations: failed to get the users with discovery on: {e}");
+            return;
+        }
+    };
+    let services = DiscoveryServices::live();
+    for (user, profiles) in &due {
+        let id = UserId::new(&user.id);
+        match generate_in(&DB, &ServerNavidrome, &services, &id, profiles).await {
+            Ok(count) => info!(
+                "Recommendations: generated {} candidates for user {}",
+                count, user.username
+            ),
+            Err(f) => warn!(
+                "Recommendations: generation failed for {}: {}",
+                user.username,
+                crate::core::logged(&f)
+            ),
+        }
+    }
 }
 
 #[cfg(feature = "server")]
@@ -312,21 +379,7 @@ async fn run_automation() {
         }
     }
 
-    // 3. Regenerate recommendations for each user
-    for user in &connected_users {
-        match crate::server_fns::discovery::generate_recommendations_internal(&user.id).await {
-            Ok(count) => info!(
-                "Automation: generated {} candidates for user {}",
-                count, user.username
-            ),
-            Err(e) => info!(
-                "Automation: recommendation generation failed for {}: {}",
-                user.username, e
-            ),
-        }
-    }
-
-    // 4. Expire old discovery tracks per-profile and refill gaps
+    // 3. Expire old discovery tracks per-profile and refill gaps
     for user in &connected_users {
         let user_id = &user.id;
         let settings = match crate::models::user_settings::UserSettings::get(user_id).await {
@@ -418,5 +471,48 @@ async fn run_automation() {
                 user.username, e.message
             ),
         }
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_recommendation_cycle_starts_within_six_hours_of_boot() {
+        let mut rng = rand::rng();
+        for _ in 0..1000 {
+            let d = first_recommendation_delay(&mut rng);
+            assert!(d >= Duration::from_secs(30) && d < Duration::from_secs(30 + 21_600));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cycle_that_runs_past_the_period_is_followed_by_a_full_period() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::Instant;
+
+        let hour = Duration::from_secs(3600);
+        let boot = Instant::now();
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let seen = starts.clone();
+        let task = tokio::spawn(repeat_spaced(6 * hour, move || {
+            let seen = seen.clone();
+            async move {
+                let first = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(boot.elapsed());
+                    seen.len() == 1
+                };
+                tokio::time::sleep(if first { 7 * hour } else { hour }).await;
+            }
+        }));
+
+        tokio::time::sleep(21 * hour).await;
+        task.abort();
+        assert_eq!(
+            *starts.lock().unwrap(),
+            vec![Duration::ZERO, 13 * hour, 20 * hour]
+        );
     }
 }

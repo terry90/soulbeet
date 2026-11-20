@@ -534,9 +534,13 @@ impl User {
     }
 
     pub async fn get_connected_users() -> Result<Vec<User>, String> {
+        Self::get_connected_users_in(&DB).await
+    }
+
+    pub(crate) async fn get_connected_users_in(db: &SqlitePool) -> Result<Vec<User>, String> {
         sqlx::query_as::<_, User>("SELECT * FROM users WHERE navidrome_status = ?")
             .bind(shared::system::NavidromeStatus::Connected.as_str())
-            .fetch_all(&*DB)
+            .fetch_all(db)
             .await
             .map_err(|e| e.to_string())
     }

@@ -1,0 +1,53 @@
+{
+  "0671db54-477b-4a41-81bd-b8cc4f9927e7": {
+    "artist": {
+      "name": "Tinariwen",
+      "artists": [
+        {
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9",
+          "name": "Tinariwen"
+        }
+      ]
+    },
+    "recording": {
+      "name": "Sastanàqqàm",
+      "first_release_date": "2017-02-10",
+      "length": 204600
+    }
+  },
+  "b0d3e48f-4e05-4bfe-929b-4bb580c38840": {
+    "artist": {
+      "name": "Tinariwen",
+      "artists": [
+        {
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9",
+          "name": "Tinariwen"
+        }
+      ]
+    },
+    "recording": {
+      "name": "Izarharh Ténéré",
+      "length": 302746
+    }
+  },
+  "1ba3336e-4c02-4211-8d72-271ff345ef9e": {
+    "artist": {
+      "name": "Vieux Farka Touré et Khruangbin",
+      "artists": [
+        {
+          "artist_mbid": "7682d624-9e0b-45b2-b7d0-d1b18b3ebd05",
+          "name": "Vieux Farka Touré"
+        },
+        {
+          "artist_mbid": "aea4c9b9-9f8d-49dc-b2ca-57d6f26e8634",
+          "name": "Khruangbin"
+        }
+      ]
+    },
+    "recording": {
+      "name": "Diarabi",
+      "first_release_date": "2022-09-23",
+      "length": 301000
+    }
+  }
+}

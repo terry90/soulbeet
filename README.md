@@ -8,7 +8,7 @@
 [![GitHub License](https://img.shields.io/github/license/terry90/soulbeet)](https://github.com/terry90/soulbeet)
 [![GitHub Repo stars](https://img.shields.io/github/stars/terry90/soulbeet)](https://github.com/terry90/soulbeet)
 
-Soulbeet is a self-hosted music downloader, library manager, and discovery engine. Search for music, download it, and let the app handle everything else: finding the best source, tagging, organizing, and keeping your library clean. Connect your scrobble history and Soulbeet will find new music for you automatically. Or skip the UI and ask your AI assistant: Soulbeet is an [MCP server](#mcp-server).
+Soulbeet is a self-hosted music downloader, library manager, and discovery engine. Search for music, download it, and let the app handle everything else: finding the best source, tagging, organizing, and keeping your library clean. Play music in Navidrome and Soulbeet will find new music for you automatically. Or skip the UI and ask your AI assistant: Soulbeet is an [MCP server](#mcp-server).
 
 > "Make a Christmas playlist with 30 classics and download the ones I don't have."
 
@@ -18,11 +18,10 @@ Screenshots: [here](./screenshots)
 
 - **Ask your AI assistant**: Soulbeet is an MCP server. Connect Claude, ChatGPT or any other MCP client and ask for an album or a whole playlist in plain words. It finds the tracks, downloads what is missing and builds the playlist in Navidrome. See [MCP Server](#mcp-server).
 - **Search & Download**: Find albums and tracks, hit download. Soulbeet picks the best available source from Soulseek, downloads it, tags it with beets, and puts it in your library. No manual file management.
-- **Music Discovery**: Soulbeet analyzes your Last.fm and ListenBrainz history, finds new music through track similarity, artist exploration, collaborative filtering, and genre discovery, downloads the best candidates, and pushes playlists to your Navidrome server. Fully automatic.
+- **Music Discovery**: Soulbeet reads what you play and star in Navidrome, adds your ListenBrainz history if you give it your username, finds new music through similar artists, collaborative filtering and genre exploration (and Deezer artist radios if you turn them on), downloads the best candidates, and pushes playlists to your Navidrome server. Fully automatic, and Navidrome is the only account it needs.
 - **Three Discovery Profiles**: Conservative (close to what you know), Balanced, or Adventurous (unfamiliar territory). Run one or all three, each with its own playlist.
 - **Rate & Keep**: Listen in Navidrome. 3+ stars promotes a track to your permanent library, 1 star deletes it. Unrated tracks expire and get replaced with fresh picks.
-- **Multi-user**: Private or shared folders. Each user gets their own discovery profiles, scrobble credentials, and preferences.
-- **Multiple Metadata Providers**: MusicBrainz (albums) or Last.fm (single tracks), selectable per user.
+- **Multi-user**: Private or shared folders. Each user gets their own discovery profiles, ListenBrainz username, and preferences.
 
 ## How It Works
 
@@ -30,7 +29,7 @@ You search and click download, or you ask your assistant. Behind the scenes:
 
 1. **Soulbeet** finds the best source on Soulseek, downloads it through **slskd**, tags and organizes it with **beets**, and puts it in your library.
 2. **Navidrome** picks up the new files and makes them streamable.
-3. For discovery: **Last.fm / ListenBrainz** feed your listening history into the recommendation engine, which finds new tracks, downloads them, and pushes playlists to Navidrome.
+3. For discovery: your **Navidrome** plays and stars (and your **ListenBrainz** history, when you saved a username) feed the recommendation engine. It asks ListenBrainz for similar artists and MusicBrainz for artist ids and genres, finds new tracks, downloads them, and pushes playlists to Navidrome.
 
 ## MCP Server
 
@@ -163,7 +162,7 @@ A fresh install has one account, `admin` with the password `admin`. It is the on
 6.  Users who are not admins can only add folders inside a folder root an admin approved. Add one under **Approved Folder Roots** in Settings > Library, for example `/music`, so a user can add `/music/alice`. The root itself cannot be the folder of a user who is not an admin. If one of your own folders is that root (an admin folder at `/music`), tick **Shared** next to it, or every folder inside it is refused as being inside another user's folder.
 7.  That's it. Search for something and download it.
 
-For discovery (optional): add your Last.fm API key and/or ListenBrainz token in Settings > Library, enable discovery on a folder, pick your profiles, and hit Generate.
+For discovery (optional): enable discovery on a folder in Settings > Library, pick your profiles, and hit Generate. Play or star some music in Navidrome first, since that is what discovery starts from. You can also add your ListenBrainz username there.
 
 ## Configuration
 
@@ -199,7 +198,7 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 
 **Note**: Users who are not admins can only add library folders inside a root an admin approved in Settings > Library, never at the root itself.
 
-**Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. Scrobble credentials (Last.fm API key, ListenBrainz token) are configured per-user in Settings > Library.
+**Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. The ListenBrainz username, the optional token and the Deezer switch are configured per-user in Settings > Library.
 
 ### Single Sign-On (OpenID Connect)
 
@@ -342,7 +341,7 @@ match:
 
 ### Discovery Setup
 
-Discovery generates personalized playlists from your scrobble history and pushes them to Navidrome. Here's how to set it up.
+Discovery generates personalized playlists from what you play and star in Navidrome and pushes them to Navidrome. Here's how to set it up.
 
 #### Navidrome Configuration
 
@@ -351,17 +350,20 @@ Your Soulbeet folder paths must point to the same physical directories that Navi
 #### Soulbeet Configuration
 
 1. Go to **Settings > Library** in the Soulbeet web UI
-2. Add your **Last.fm API key** and/or **ListenBrainz username + token**
-3. **Enable Discovery** on a folder and pick your profiles (Conservative, Balanced, Adventurous)
-4. Optionally customize playlist names for each profile
-5. Hit **Generate** to run the first batch
+2. Optionally add your **ListenBrainz username**. Soulbeet then reads your ListenBrainz history too. The token is optional: with one, ListenBrainz allows more requests and ranks an artist's top tracks itself
+3. Optionally turn on **Also use Deezer for recommendations**. This sends the names of artists you play to Deezer, which has not approved this use, so it is off until you turn it on
+4. **Enable Discovery** on a folder and pick your profiles (Conservative, Balanced, Adventurous)
+5. Optionally customize playlist names for each profile
+6. Hit **Generate** to run the first batch
+
+Discovery starts from the songs you played, starred or rated 4 or 5 stars in Navidrome. Songs you rated 1 or 2 stars never count. With nothing played or starred yet, a run stops and the Discovery page says "No listening data yet. Play or star music in Navidrome." The page also lists the sources that fed the last run and any that failed.
 
 #### How It Works
 
 - Discovery creates a `Discovery/` directory inside your chosen folder, with subdirectories per profile (e.g., `Discovery/Balanced/`, `Discovery/Adventurous/`).
 - Tracks are downloaded from Soulseek, imported via beets into the profile subdirectory, and tagged properly.
 - A smart playlist is created in Navidrome (via the native API) for each profile, filtered by the folder path. The playlist auto-updates as Navidrome scans new files.
-- Every 6 hours, an automation task syncs ratings, creates playlists if missing, and regenerates expired discovery batches.
+- Every 6 hours, an automation task syncs ratings, creates playlists if missing, and regenerates expired discovery batches. Recommendations for the profiles you selected are refreshed on their own 6-hour cycle, only for users with discovery on and a discovery folder chosen. The cycle starts at a random point in the first 6 hours after Soulbeet starts.
 
 #### Auto-Delete
 

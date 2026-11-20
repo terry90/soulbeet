@@ -106,6 +106,12 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
     let lifetime_days = settings.parse_lifetime_days();
     let playlist_names =
         serde_json::from_str(&settings.discovery_playlist_name).unwrap_or_default();
+    let latest = crate::models::engine_report::EngineReportRow::latest_per_profile_in(
+        &crate::db::DB,
+        &auth.0.user_id,
+    )
+    .await
+    .map_err(server_error)?;
     Ok(DiscoveryConfig {
         enabled: settings.discovery_enabled,
         folder_id: settings.discovery_folder_id,
@@ -115,6 +121,7 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
         profiles: settings.discovery_profiles,
         playlist_names,
         last_generated_at: settings.discovery_last_generated_at,
+        last_run: crate::core::recommend::last_run_of(latest),
     })
 }
 
@@ -511,6 +518,9 @@ pub async fn generate_discovery_playlist_internal(
     let mut all_profile_stats: Vec<ProfileGenerationStats> = Vec::new();
     // Set when the importer broke during the run and stopped it.
     let mut importer_issue: Option<Failure> = None;
+    // Set when the engine failed. Every profile is built from the same library read, so it
+    // is not run again for later profiles, which still use the candidates they hold.
+    let mut engine_issue: Option<Failure> = None;
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
@@ -576,7 +586,7 @@ pub async fn generate_discovery_playlist_internal(
                     .map_err(|e| run_database_failure(Stage::Input, e))?;
 
             if candidates.is_empty() {
-                if _attempt == 0 {
+                if _attempt == 0 && engine_issue.is_none() {
                     update_progress(
                         user_id,
                         &profile_name,
@@ -587,9 +597,16 @@ pub async fn generate_discovery_playlist_internal(
                     .await;
                     info!("No candidates for {}, running engine", profile_name);
                     match generate_recommendations_for_user(user_id, *profile).await {
-                        Ok(count) => info!("Generated {} candidates for {}", count, profile_name),
-                        Err(e) => {
-                            warn!("{} engine failed: {}", profile_name, e);
+                        Ok(count) => {
+                            info!("Generated {} candidates for {}", count, profile_name)
+                        }
+                        Err(f) => {
+                            warn!(
+                                "{} engine failed: {}",
+                                profile_name,
+                                crate::core::logged(&f)
+                            );
+                            engine_issue = Some(f);
                             break;
                         }
                     }
@@ -1087,13 +1104,32 @@ pub async fn generate_discovery_playlist_internal(
         }
     }
 
+    run_outcome(
+        GenerationResult {
+            total_imported: total_downloads,
+            profiles: all_profile_stats,
+        },
+        importer_issue,
+        engine_issue,
+    )
+}
+
+/// What a run returns once its imports are scanned. A broken importer fails it even after
+/// imports, since the user must fix it. A failed engine fails it only when nothing was
+/// imported, so a run that imported tracks still reports them.
+#[cfg(feature = "server")]
+fn run_outcome(
+    result: shared::navidrome::GenerationResult,
+    importer_issue: Option<Failure>,
+    engine_issue: Option<Failure>,
+) -> Result<shared::navidrome::GenerationResult, Failure> {
     if let Some(issue) = importer_issue {
         return Err(issue);
     }
-    Ok(GenerationResult {
-        total_imported: total_downloads,
-        profiles: all_profile_stats,
-    })
+    match engine_issue {
+        Some(issue) if result.total_imported == 0 => Err(issue),
+        _ => Ok(result),
+    }
 }
 
 /// Starts a Navidrome scan of `imported` new tracks and waits up to two
@@ -1248,7 +1284,7 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
 pub async fn generate_recommendations() -> Result<u32, ServerFnError> {
     generate_recommendations_internal(&auth.0.user_id)
         .await
-        .map_err(server_error)
+        .map_err(failure_error)
 }
 
 /// How a discovery import counts. Config and runtime failures must not land
@@ -1291,151 +1327,39 @@ async fn discard_download(src: &std::path::Path, download_base: &std::path::Path
     }
 }
 
+/// Every discovery profile's candidates for the user, from one profile build.
 #[cfg(feature = "server")]
-pub async fn generate_recommendations_internal(user_id: &str) -> Result<u32, String> {
+pub async fn generate_recommendations_internal(user_id: &str) -> Result<u32, Failure> {
+    use crate::core::index::ServerNavidrome;
+    use crate::core::recommend::{generate_in, DiscoveryServices};
     use shared::recommendation::DiscoveryProfile;
 
-    let mut total = 0u32;
-
-    for profile in &DiscoveryProfile::ALL {
-        match generate_recommendations_for_user(user_id, *profile).await {
-            Ok(count) => total += count,
-            Err(e) => {
-                tracing::warn!("Profile {} failed: {}", profile, e);
-            }
-        }
-    }
-
-    Ok(total)
+    generate_in(
+        &crate::db::DB,
+        &ServerNavidrome,
+        &DiscoveryServices::live(),
+        &UserId::new(user_id),
+        &DiscoveryProfile::ALL,
+    )
+    .await
 }
 
 #[cfg(feature = "server")]
 pub async fn generate_recommendations_for_user(
     user_id: &str,
     discovery_profile: shared::recommendation::DiscoveryProfile,
-) -> Result<u32, String> {
-    use crate::models::discovery_candidate::DiscoveryCandidateRow;
-    use crate::models::engine_report::EngineReportRow;
-    use crate::models::user_profile::UserProfileRow;
-    use std::sync::Arc;
+) -> Result<u32, Failure> {
+    use crate::core::index::ServerNavidrome;
+    use crate::core::recommend::{generate_in, DiscoveryServices};
 
-    let settings = UserSettings::get(user_id).await?;
-
-    // Build providers based on user's configured credentials
-    let mut providers: Vec<Arc<dyn soulbeet::ScrobbleProvider>> = Vec::new();
-    let mut generators: Vec<Arc<dyn soulbeet::CandidateGenerator>> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-
-    let lb_configured = matches!(
-        (&settings.listenbrainz_token, &settings.listenbrainz_username),
-        (Some(t), Some(u)) if !t.is_empty() && !u.is_empty()
-    );
-    let lfm_configured = matches!(
-        (&settings.lastfm_api_key, &settings.lastfm_username),
-        (Some(k), Some(u)) if !k.is_empty() && !u.is_empty()
-    );
-
-    if lb_configured {
-        let lb = Arc::new(soulbeet::ListenBrainzProvider::new(
-            settings.listenbrainz_username.as_ref().unwrap().clone(),
-            settings.listenbrainz_token.clone(),
-        ));
-        providers.push(lb.clone());
-        generators.push(Arc::new(
-            soulbeet::engine::listenbrainz_pipeline::ListenBrainzPipeline::new(lb),
-        ));
-    } else {
-        skipped.push(format!(
-            "ListenBrainz: {}",
-            if settings
-                .listenbrainz_token
-                .as_ref()
-                .is_none_or(|t| t.is_empty())
-            {
-                "no token"
-            } else {
-                "no username"
-            }
-        ));
-    }
-
-    if lfm_configured {
-        let lfm = Arc::new(soulbeet::LastFmProvider::with_user(
-            settings.lastfm_api_key.as_ref().unwrap().clone(),
-            settings.lastfm_username.as_ref().unwrap().clone(),
-        ));
-        providers.push(lfm.clone());
-        generators.push(Arc::new(
-            soulbeet::engine::lastfm_pipeline::LastFmPipeline::new(lfm),
-        ));
-    } else {
-        skipped.push(format!(
-            "Last.fm: {}",
-            if settings
-                .lastfm_api_key
-                .as_ref()
-                .is_none_or(|t| t.is_empty())
-            {
-                "no API key"
-            } else {
-                "no username"
-            }
-        ));
-    }
-
-    info!(
-        "Provider registration: {} active, {} skipped{}",
-        providers.len(),
-        skipped.len(),
-        if skipped.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", skipped.join(", "))
-        }
-    );
-
-    if providers.is_empty() {
-        return Err(
-            format!("No scrobble providers configured ({}). Set up Last.fm or ListenBrainz in Settings > Library.",
-                skipped.join("; "))
-        );
-    }
-
-    // Use first available provider for profile building
-    let profile_provider = &*providers[0];
-
-    let config = shared::recommendation::ProfileConfig::from_profile(discovery_profile);
-
-    let (profile, candidates, report) = soulbeet::engine::build_and_recommend(
-        &providers.iter().map(Clone::clone).collect::<Vec<_>>(),
-        &generators.iter().map(Clone::clone).collect::<Vec<_>>(),
-        profile_provider,
-        &config,
-        50,
+    generate_in(
+        &crate::db::DB,
+        &ServerNavidrome,
+        &DiscoveryServices::live(),
+        &UserId::new(user_id),
+        &[discovery_profile],
     )
     .await
-    .map_err(|e| e.to_string())?;
-
-    // Cache profile
-    UserProfileRow::upsert(user_id, &profile).await?;
-
-    // Store engine report in history
-    let report_json = serde_json::to_string(&report).map_err(|e| e.to_string())?;
-    EngineReportRow::insert(
-        user_id,
-        &discovery_profile.to_string(),
-        &report_json,
-        candidates.len() as u32,
-    )
-    .await?;
-    EngineReportRow::prune(user_id, 30).await?;
-
-    // Clear and store candidates for this specific profile
-    let profile_name = discovery_profile.to_string();
-    DiscoveryCandidateRow::clear_for_user_profile(user_id, &profile_name).await?;
-    DiscoveryCandidateRow::upsert_batch(user_id, &profile_name, &candidates).await?;
-
-    Ok(candidates.len() as u32)
 }
 
 #[get("/api/discovery/report", auth: AuthSession)]
@@ -1510,8 +1434,8 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::{
-        discovery_folder_not_found, run_database_failure, scan_imports, settle_poll, QueuedTrack,
-        FAILED_STATE_CONFIRM,
+        discovery_folder_not_found, run_database_failure, run_outcome, scan_imports, settle_poll,
+        QueuedTrack, FAILED_STATE_CONFIRM,
     };
     use crate::core::discovery::{
         discovery_disabled, discovery_folder_required, generation_running,
@@ -1575,6 +1499,44 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn an_engine_failure_fails_the_run_only_when_nothing_was_imported() {
+        use crate::core::recommend::no_listening_data;
+        use shared::navidrome::{GenerationResult, ProfileGenerationStats};
+
+        let imported = GenerationResult {
+            total_imported: 10,
+            profiles: vec![ProfileGenerationStats {
+                profile: "Conservative".into(),
+                imports_succeeded: 10,
+                ..Default::default()
+            }],
+        };
+        let importer = Failure::new(
+            FailureCode::ImporterBroken,
+            Stage::Import,
+            RetryAdvice::NeedsUser,
+            "beets cannot start",
+        );
+        assert_eq!(
+            run_outcome(imported.clone(), None, Some(no_listening_data())),
+            Ok(imported.clone())
+        );
+        assert_eq!(
+            run_outcome(GenerationResult::default(), None, Some(no_listening_data())),
+            Err(no_listening_data())
+        );
+        assert_eq!(
+            run_outcome(
+                imported.clone(),
+                Some(importer.clone()),
+                Some(no_listening_data())
+            ),
+            Err(importer)
+        );
+        assert_eq!(run_outcome(imported.clone(), None, None), Ok(imported));
     }
 
     #[test]

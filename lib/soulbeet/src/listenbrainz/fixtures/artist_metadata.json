@@ -1,0 +1,73 @@
+[
+  {
+    "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9",
+    "name": "Tinariwen",
+    "tag": {
+      "artist": [
+        {
+          "tag": "malian",
+          "count": 2,
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9"
+        },
+        {
+          "tag": "african",
+          "count": 4,
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9"
+        },
+        {
+          "tag": "traditional pop",
+          "count": 2,
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9"
+        },
+        {
+          "tag": "touareg",
+          "count": 4,
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9"
+        },
+        {
+          "tag": "folk",
+          "count": 2,
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9"
+        },
+        {
+          "tag": "desert blues",
+          "count": 7,
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9"
+        },
+        {
+          "tag": "tishoumaren",
+          "count": 3,
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9"
+        },
+        {
+          "tag": "tuareg",
+          "count": 2,
+          "artist_mbid": "5c98fc12-be83-4246-ae5b-2184192913b9"
+        }
+      ]
+    }
+  },
+  {
+    "artist_mbid": "ed3f4831-e3e0-4dc0-9381-f5649e9df221",
+    "name": "Arijit Singh",
+    "tag": {
+      "artist": [
+        {
+          "tag": "bollywood",
+          "count": 4,
+          "artist_mbid": "ed3f4831-e3e0-4dc0-9381-f5649e9df221"
+        },
+        {
+          "tag": "indian pop",
+          "count": 3,
+          "artist_mbid": "ed3f4831-e3e0-4dc0-9381-f5649e9df221"
+        },
+        {
+          "tag": "filmi",
+          "count": 3,
+          "artist_mbid": "ed3f4831-e3e0-4dc0-9381-f5649e9df221"
+        }
+      ]
+    }
+  }
+]

@@ -421,11 +421,62 @@ pub struct NativeSong {
     /// Whether this user starred the song.
     #[serde(default)]
     pub starred: bool,
+    /// When this user last starred or unstarred the song (`SetStar`, sql_annotations.go).
     #[serde(default)]
-    pub starred_at: Option<String>,
+    pub starred_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When this user last rated the song (`SetRating`, sql_annotations.go). Absent before
+    /// Navidrome 0.59.0 and for ratings made before it.
+    #[serde(default)]
+    pub rated_at: Option<chrono::DateTime<chrono::Utc>>,
     /// This user's plays.
     #[serde(default)]
     pub play_count: u64,
+    /// When this user last played the song (`omitempty`, model/annotation.go:6-12).
+    #[serde(default)]
+    pub play_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// MusicBrainz id of the song's artist. Only the scanner before Navidrome 0.55.0 fills it:
+    /// the later one never sets it (model/metadata/map_mediafile.go:53-58 in 0.64.2) and the
+    /// field is `omitempty`, so it is absent. From then on the MBIDs are on the artist rows
+    /// (`NativeArtist`), which `participants` names by id.
+    #[serde(default)]
+    pub mbz_artist_id: Option<String>,
+    /// MusicBrainz id of the song's album artist, filled only before Navidrome 0.55.0 as
+    /// `mbz_artist_id` is.
+    #[serde(default)]
+    pub mbz_album_artist_id: Option<String>,
+    /// The song's artists by role, from Navidrome 0.55.0 on (model/mediafile.go:99 in 0.64.2).
+    #[serde(default)]
+    pub participants: Participants,
+}
+
+/// The artists and album artists of a song, the main one first (model/participants.go). The
+/// list keeps only each artist's id and name (persistence/sql_participations.go:12-16,
+/// unmarshalParticipants), never its MBID. Other roles are not read.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Participants {
+    #[serde(default)]
+    pub artist: Vec<Participant>,
+    #[serde(default)]
+    pub albumartist: Vec<Participant>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Participant {
+    /// The artist row's id (`NativeArtist::id`).
+    pub id: String,
+    pub name: String,
+}
+
+/// An artist row from Navidrome's native API (GET /api/artist, model/artist.go). The scanner
+/// writes `mbz_artist_id` from the artist's MusicBrainz tag and never clears it with an empty
+/// one (scanner/phase_1_folders.go:393, persistence/artist_repository.go:116-118 in 0.64.2).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeArtist {
+    pub id: String,
+    /// `omitempty`: absent for an artist without one.
+    #[serde(default)]
+    pub mbz_artist_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -457,6 +508,41 @@ mod tests {
             r#"{"scanning":true,"count":12,"folderCount":3,"lastScan":"2026-11-15T10:02:00Z","scanType":"quick","elapsedTime":9000000000}"#,
         );
         assert_eq!(running.last_start(), None);
+    }
+
+    #[test]
+    fn a_song_from_0_55_on_names_its_artists_by_id_without_mbids() {
+        // As persistence/sql_participations.go stores them: id, name and any sub-role.
+        let song: NativeSong = serde_json::from_str(
+            r#"{"id":"3sG8kPq0WmZ1xYbN4vTcDe","path":"a.flac","title":"Northern Line","size":1,
+            "libraryId":1,"libraryPath":"/music","missing":false,"updatedAt":"2026-11-01T18:20:03Z",
+            "artistId":"2kD9pWq4ZxC1vBnM6yTjLs","artist":"Static Harbor feat. Vela Norte",
+            "albumArtistId":"2kD9pWq4ZxC1vBnM6yTjLs","album":"Winter Songs","albumArtist":"Static Harbor",
+            "mbzRecordingID":"0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c",
+            "participants":{"albumartist":[{"id":"2kD9pWq4ZxC1vBnM6yTjLs","name":"Static Harbor","missing":false}],
+            "artist":[{"id":"2kD9pWq4ZxC1vBnM6yTjLs","name":"Static Harbor","missing":false},
+            {"id":"7fH3jKl9QwE2rT5yU8iOpA","name":"Vela Norte","missing":false}],
+            "producer":[{"id":"9aB8cD7eF6gH5iJ4kL3mN2","name":"Marrow Choir","subRole":"mix","missing":false}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(song.mbz_artist_id, None);
+        assert_eq!(song.mbz_album_artist_id, None);
+        let ids = |list: &[Participant]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|p| (p.id.clone(), p.name.clone()))
+                .collect()
+        };
+        assert_eq!(
+            ids(&song.participants.artist),
+            [
+                ("2kD9pWq4ZxC1vBnM6yTjLs".into(), "Static Harbor".into()),
+                ("7fH3jKl9QwE2rT5yU8iOpA".into(), "Vela Norte".into())
+            ]
+        );
+        assert_eq!(
+            ids(&song.participants.albumartist),
+            [("2kD9pWq4ZxC1vBnM6yTjLs".into(), "Static Harbor".into())]
+        );
     }
 
     #[test]

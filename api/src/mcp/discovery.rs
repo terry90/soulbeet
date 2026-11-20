@@ -5,7 +5,7 @@ use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, Failure, FailureCode, TEXT_MAX_CHARS};
 use shared::navidrome::{
-    DiscoveryProgress, DiscoveryTrack, GenerationStatus, ProfilePhase, DAILY_APP_DELETIONS,
+    DiscoveryProgress, DiscoveryTrack, GenerationStatus, LastRun, ProfilePhase, DAILY_APP_DELETIONS,
 };
 use shared::recommendation::DiscoveryProfile;
 
@@ -36,7 +36,7 @@ pub(crate) const GET_DISCOVERY: ToolSpec = ToolSpec {
     title: "Discovery status",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Shows this user's discovery: whether it is on, its folder, each profile's track count, lifetime and Navidrome playlist, the promote threshold, the current run or one that ended in the last 5 minutes, and the pending tracks (at most 150, soonest to expire first) with when each expires; the automation removes an expired track at its next round. Track ids stay valid; only pending tracks can be kept or removed. Takes no arguments. Failure codes: {common}.")
+        format!("Shows this user's discovery: whether it is on, its folder, each profile's track count, lifetime and Navidrome playlist, the promote threshold, the current run or one that ended in the last 5 minutes, the last recommendation run, and the pending tracks (at most 150, soonest to expire first) with when each expires; the automation removes an expired track at its next round. A run that ended in error has its failure in run.failure. last_run is the newest recommendation run, also the automatic one every 6 hours: its state (no_listening_data means nothing played or starred in Navidrome yet and every listening history answered: tell the user to play or star music in Navidrome), the sources it used and those that failed. Track ids stay valid; only pending tracks can be kept or removed. Takes no arguments. Failure codes: {common}.")
     },
     input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
     read_only: true,
@@ -51,7 +51,7 @@ pub(crate) const RUN_DISCOVERY: ToolSpec = ToolSpec {
     title: "Run discovery now",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Starts a discovery run for this user: recommendations from Last.fm or ListenBrainz, Soulseek searches, downloads into the discovery folder, imports, and the profile playlists. Returns at once with the run's progress; get_discovery shows how it goes. A run takes minutes. Failure codes: {common}, folder_required (no discovery folder), already_running (a run for this user is going, or a call with this request_key still runs).")
+        format!("Starts a discovery run for this user: recommendations from the user's Navidrome plays and stars, ListenBrainz when a username is saved, data about music from ListenBrainz and MusicBrainz, and Deezer when the user turned it on; then Soulseek searches, downloads into the discovery folder, imports, and the profile playlists. Returns at once with the run's progress. Failure codes: {common} (invalid_input also when discovery is off for this user), folder_required (no discovery folder), already_running (a run for this user is going, or a call with this request_key still runs). A run takes minutes: call get_discovery until run.status is complete or error. A run that cannot build recommendations ends with run.status error, and get_discovery shows why in run.failure until 5 minutes after it ends: no_listening_data (nothing played or starred in Navidrome yet and every listening history answered; user action listen_in_navidrome), metadata_unavailable (no listening data to start from while a listening history such as ListenBrainz failed, the message names it; retry later), navidrome_not_linked or navidrome_unreachable (the Navidrome library could not be read).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"#,
@@ -166,6 +166,7 @@ fn overview_fields(o: &Overview) -> Map<String, Value> {
         "last_generated_at": s.discovery_last_generated_at.as_deref().map(time::text),
         "profiles": profiles,
         "run": o.run.as_ref().map(run_fields),
+        "last_run": o.last_run.as_ref().map(last_run_fields),
         "pending": pending,
         "pending_total": o.pending.len(),
     }) else {
@@ -180,6 +181,25 @@ fn overview_fields(o: &Overview) -> Map<String, Value> {
         sent.saturating_sub(RESULT_MAX_CHARS),
     );
     fields
+}
+
+/// The last recommendation run as get_discovery shows it.
+fn last_run_fields(r: &LastRun) -> Value {
+    let errors: Vec<Value> = (r.source_errors.iter())
+        .map(|e| {
+            json!({
+                "source": e.source,
+                "message": cut_json(e.message.clone(), TEXT_MAX_CHARS),
+                "failures": e.failures,
+            })
+        })
+        .collect();
+    json!({
+        "created_at": time::text(&r.created_at),
+        "state": r.state,
+        "sources": r.sources,
+        "source_errors": errors,
+    })
 }
 
 /// A run as get_discovery and run_discovery show it.
@@ -383,6 +403,8 @@ mod tests {
 
     use axum::Router;
     use serde_json::json;
+    use shared::failure::TEXT_MAX_CHARS;
+    use shared::recommendation::{EngineReport, EngineState, SourceError};
     use soulbeet::{ImportOutcome, ImportResult, SkipReason};
 
     use crate::connection::test_util::{access_token, call_tool, document, grant_of, RESOURCE};
@@ -391,6 +413,7 @@ mod tests {
     use crate::core::delete_guard::Origin;
     use crate::core::discovery::test_support::TestDiscovery;
     use crate::core::discovery::Replace;
+    use crate::core::recommend::store_run_in;
     use crate::import_queue::import_failure;
     use crate::import_queue::test_support::no_match;
     use crate::mcp::paging::RESULT_MAX_CHARS;
@@ -447,6 +470,75 @@ mod tests {
             (doc["folder"]["folder_id"].as_str(), doc["run"].is_null()),
             (Some("alice-music"), true)
         );
+    }
+
+    #[tokio::test]
+    async fn get_discovery_shows_the_callers_last_recommendation_run() {
+        let lib = Library::new().await;
+        let (app, token) = discovery_app(&lib, Arc::new(TestDiscovery::default())).await;
+        let doc = document(&call_tool(app.clone(), &token, "get_discovery", json!({})).await);
+        assert!(doc["last_run"].is_null(), "{doc}");
+
+        let empty = EngineReport {
+            state: EngineState::NoListeningData,
+            sources: vec!["Navidrome".into()],
+            ..Default::default()
+        };
+        store_run_in(&lib.db, "alice", "Balanced", &[], &empty)
+            .await
+            .unwrap();
+        let bobs = EngineReport {
+            sources: vec!["Navidrome".into()],
+            source_errors: vec![SourceError {
+                source: "ListenBrainz Labs".into(),
+                message: "bob's outage".into(),
+                failures: 1,
+            }],
+            ..Default::default()
+        };
+        store_run_in(&lib.db, "bob", "Balanced", &[], &bobs)
+            .await
+            .unwrap();
+        let doc = document(&call_tool(app.clone(), &token, "get_discovery", json!({})).await);
+        let run = &doc["last_run"];
+        assert_eq!(
+            (&run["state"], &run["sources"], &run["source_errors"]),
+            (
+                &json!("no_listening_data"),
+                &json!(["Navidrome"]),
+                &json!([])
+            )
+        );
+        assert!(run["created_at"].is_string(), "{run}");
+
+        let failed = EngineReport {
+            sources: vec!["Navidrome".into()],
+            source_errors: vec![SourceError {
+                source: "Deezer".into(),
+                message: "x".repeat(2 * TEXT_MAX_CHARS),
+                failures: 3,
+            }],
+            ..Default::default()
+        };
+        store_run_in(&lib.db, "alice", "Adventurous", &[], &failed)
+            .await
+            .unwrap();
+        let doc = document(&call_tool(app, &token, "get_discovery", json!({})).await);
+        let run = &doc["last_run"];
+        let error = &run["source_errors"][0];
+        assert_eq!(
+            (
+                &run["state"],
+                run["source_errors"].as_array().map(Vec::len),
+                &error["source"],
+                &error["failures"]
+            ),
+            (&json!("recommended"), Some(1), &json!("Deezer"), &json!(3))
+        );
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("characters left out"));
     }
 
     #[tokio::test]

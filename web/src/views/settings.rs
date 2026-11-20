@@ -2,14 +2,12 @@ use api::auth::SsoLinkResult;
 use dioxus::prelude::*;
 use ui::settings::{
     AccountPanel, AppConfigManager, ConnectedAppsPanel, ConnectionStatusPanel, DeletionChecksPanel,
-    FolderAdminPanel, FolderManager, PreferencesManager, RemoteAccessPanel, SecurityStatusPanel,
-    UserManager,
+    FolderAdminPanel, FolderManager, RemoteAccessPanel, SecurityStatusPanel, UserManager,
 };
 
 #[derive(PartialEq, Clone, Copy, Default)]
 pub(crate) enum SettingsTab {
     #[default]
-    Search,
     Library,
     Users,
     Config,
@@ -70,12 +68,6 @@ pub fn SettingsPage() -> Element {
             // Tab navigation - pill style matching navbar
             nav { class: "flex items-center justify-center gap-1 bg-beet-panel/50 p-1.5 rounded-full border border-white/5 backdrop-blur-sm w-fit mx-auto",
                 TabButton {
-                    label: "Search",
-                    icon_path: "M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z",
-                    active: active_tab() == SettingsTab::Search,
-                    onclick: move |_| active_tab.set(SettingsTab::Search),
-                }
-                TabButton {
                     label: "Library",
                     icon_path: "M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z",
                     active: active_tab() == SettingsTab::Library,
@@ -98,7 +90,6 @@ pub fn SettingsPage() -> Element {
             // Tab content
             div { class: "pt-8",
                 match active_tab() {
-                    SettingsTab::Search => rsx! { PreferencesManager {} },
                     SettingsTab::Library => rsx! {
                         div { class: "space-y-8",
                             FolderManager {}
@@ -162,5 +153,15 @@ fn TabButton(
             }
             span { "{label}" }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_open_on_library() {
+        assert!(SettingsTab::default() == SettingsTab::Library);
     }
 }

@@ -2,17 +2,17 @@
 
 ## Unreleased
 
-### Sign in with your login provider
+### Discovery without Last.fm, and single sign-on
 
-Sign in to Soulbeet through Pocket ID, Authelia, Authentik, Keycloak or another OpenID Connect provider, next to your password.
+Discovery and search no longer use Last.fm, and you can sign in through an OpenID Connect provider such as Pocket ID, Authelia, Authentik or Keycloak.
 
-- **A button on the login page**: Once an admin sets it up, the login page has a button to sign in through your provider.
+- **Discovery needs no key**: Recommendations now come from what you play and star in Navidrome, matched against ListenBrainz and MusicBrainz data; no account or API key is needed, a ListenBrainz username adds your listens there, and a switch in Settings > Library adds tracks from Deezer artist radios, off by default because it sends your artist names to Deezer.
+- **Import your Last.fm history now**: Last.fm keys stop working on December 1 unless their owner pays for Pro, so bring your scrobbles into ListenBrainz before then with its importer at https://listenbrainz.org/settings/import/, which needs only your Last.fm username.
+- **Last.fm is gone**: Search uses MusicBrainz only and the Last.fm settings are removed; a download left from before the upgrade whose album came from a Last.fm search fails, and the log and `get_jobs` say to search for it again; for AI assistants `search_music` no longer takes `provider`, see Upgrading in docs/mcp.md.
+- **Sign in with your login provider**: Once an admin sets it up, the login page has a button to sign in through your provider, and an account made that way connects to Navidrome when you enter your Navidrome password in Connect Navidrome in Settings > Users.
 - **Your account stays yours**: By default a first sign-in leaves an existing account alone, so sign in with your password and link single sign-on in Settings > Users, which asks for your current password, as changing your password now does, and shows the name you linked.
-- **Navidrome**: An account made through single sign-on connects to your Navidrome account when you enter your Navidrome password in Connect Navidrome in Settings > Users.
-- **For admins**: Single sign-on creates accounts by default only with `REGISTRATION=open`, and setting the password of another account removes its single sign-on link.
-- **Linking by name**: Read the warning in the README before you set `OIDC_LINK_BY_USERNAME=true`, which lets a first sign-in take the existing account of that name.
 
-[How to set it up](https://github.com/terry90/soulbeet#single-sign-on-openid-connect)
+[How to set up single sign-on](https://github.com/terry90/soulbeet#single-sign-on-openid-connect)
 
 ## 0.9.0 - 2026-11-19
 

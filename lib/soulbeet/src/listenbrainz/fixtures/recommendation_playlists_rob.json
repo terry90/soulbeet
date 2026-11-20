@@ -1,0 +1,124 @@
+{
+  "playlist_count": 41,
+  "playlists": [
+    {
+      "playlist": {
+        "identifier": "https://listenbrainz.org/playlist/48f2eb97-33e7-496c-8da1-25ead7280a81",
+        "title": "Daily Jams for rob, 2026-11-19 Thu",
+        "date": "2026-11-18T23:03:34.548019+00:00",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#playlist": {
+            "additional_metadata": {
+              "algorithm_metadata": {
+                "source_patch": "daily-jams"
+              }
+            },
+            "created_for": "rob"
+          }
+        }
+      }
+    },
+    {
+      "playlist": {
+        "identifier": "https://listenbrainz.org/playlist/55f2a01f-3974-46ca-8461-a8a84886eba4",
+        "title": "Weekly Exploration for rob, week of 2026-08-24 Mon",
+        "date": "2026-08-23T22:13:00.700111+00:00",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#playlist": {
+            "additional_metadata": {
+              "algorithm_metadata": {
+                "source_patch": "weekly-exploration"
+              }
+            },
+            "created_for": "rob"
+          }
+        }
+      }
+    },
+    {
+      "playlist": {
+        "identifier": "https://listenbrainz.org/playlist/54cc305b-f68e-4ab8-a2b9-3188727a3b5b",
+        "title": "Weekly Jams for rob, week of 2026-08-24 Mon",
+        "date": "2026-08-23T22:07:21.126678+00:00",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#playlist": {
+            "additional_metadata": {
+              "algorithm_metadata": {
+                "source_patch": "weekly-jams"
+              }
+            },
+            "created_for": "rob"
+          }
+        }
+      }
+    },
+    {
+      "playlist": {
+        "identifier": "https://listenbrainz.org/playlist/865982ba-7d21-48f5-81ce-893a3f341faa",
+        "title": "Weekly Exploration for rob, week of 2026-07-28 Tue",
+        "date": "2026-07-28T12:24:12.184152+00:00",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#playlist": {
+            "additional_metadata": {
+              "algorithm_metadata": {
+                "source_patch": "weekly-exploration"
+              }
+            },
+            "created_for": "rob"
+          }
+        }
+      }
+    },
+    {
+      "playlist": {
+        "identifier": "https://listenbrainz.org/playlist/3c8f40f3-0e59-4275-8b86-8f3d3588b4d8",
+        "title": "Top Discoveries of 2025 for rob",
+        "date": "2026-02-22T10:42:29.813561+00:00",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#playlist": {
+            "additional_metadata": {
+              "algorithm_metadata": {
+                "source_patch": "top-discoveries-of-2025"
+              }
+            },
+            "created_for": "rob"
+          }
+        }
+      }
+    },
+    {
+      "playlist": {
+        "identifier": "https://listenbrainz.org/playlist/b0a1c836-9635-4080-a676-a48a9b74b853",
+        "title": "Top Missed Recordings of 2025 for rob",
+        "date": "2026-02-22T10:26:09.147289+00:00",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#playlist": {
+            "additional_metadata": {
+              "algorithm_metadata": {
+                "source_patch": "top-missed-recordings-of-2025"
+              }
+            },
+            "created_for": "rob"
+          }
+        }
+      }
+    },
+    {
+      "playlist": {
+        "identifier": "https://listenbrainz.org/playlist/e3f1ab53-3ac4-4e9f-a74d-42bddbd4a2f1",
+        "title": "Top Missed Recordings of 2024 for rob",
+        "date": "2026-02-22T08:34:02.254698+00:00",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#playlist": {
+            "additional_metadata": {
+              "algorithm_metadata": {
+                "source_patch": "top-missed-recordings-of-2024"
+              }
+            },
+            "created_for": "rob"
+          }
+        }
+      }
+    }
+  ]
+}

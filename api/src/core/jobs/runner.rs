@@ -24,7 +24,6 @@ use crate::services::download_backend;
 use async_trait::async_trait;
 use shared::download::{DownloadQuery, DownloadableGroup, DownloadableItem, QueuedDownload};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::musicbrainz::MusicBrainzProvider;
 use soulbeet::{DownloadBackend, ImportMode};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -172,7 +171,7 @@ impl Effects for LiveEffects {
     }
 
     async fn hydrate(&self, query: &mut DownloadQuery) -> Result<(), Failure> {
-        metadata::hydrate_in(&MusicBrainzProvider::new(), query).await
+        metadata::hydrate_album_tracks(query).await
     }
 
     async fn enqueue(
@@ -698,7 +697,7 @@ mod test_effects {
     use crate::ledger::JobEvent;
     use crate::server_fns::download::test_support::StubBackend;
     use shared::download::EnqueueStatus;
-    use shared::metadata::{AlbumWithTracks, Provider, SearchResult, Track};
+    use shared::metadata::{AlbumWithTracks, SearchResult, Track};
     use soulbeet::{MetadataError, MetadataProvider};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -880,12 +879,6 @@ mod test_effects {
 
     #[async_trait]
     impl MetadataProvider for Tracklist {
-        fn id(&self) -> Provider {
-            Provider::MusicBrainz
-        }
-        fn name(&self) -> &'static str {
-            "MusicBrainz"
-        }
         async fn search_albums(
             &self,
             _: Option<&str>,

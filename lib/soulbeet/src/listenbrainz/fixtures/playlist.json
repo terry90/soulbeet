@@ -1,0 +1,55 @@
+{
+  "playlist": {
+    "identifier": "https://listenbrainz.org/playlist/48f2eb97-33e7-496c-8da1-25ead7280a81",
+    "track": [
+      {
+        "album": "Seeker",
+        "creator": "Carbon Based Lifeforms",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#track": {
+            "added_by": "troi-bot",
+            "artist_identifiers": [
+              "https://musicbrainz.org/artist/8229a8f1-b315-4fae-af57-b3eb71efdaf4"
+            ]
+          }
+        },
+        "identifier": [
+          "https://musicbrainz.org/recording/22c7fa7f-2404-4103-8267-6a98b4b1f8ee"
+        ],
+        "title": "Fauna"
+      },
+      {
+        "album": "Isles",
+        "creator": "Bicep",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#track": {
+            "added_by": "troi-bot",
+            "artist_identifiers": [
+              "https://musicbrainz.org/artist/10e8f0df-90f9-4957-aedd-c4e0d187e3a8"
+            ]
+          }
+        },
+        "identifier": [
+          "https://musicbrainz.org/recording/418bce6c-1195-4cf2-b5c0-4cf163acbd46"
+        ],
+        "title": "Lido"
+      },
+      {
+        "album": "Persona",
+        "creator": "Rival Consoles",
+        "extension": {
+          "https://musicbrainz.org/doc/jspf#track": {
+            "added_by": "troi-bot",
+            "artist_identifiers": [
+              "https://musicbrainz.org/artist/803f2853-7e3e-4dff-96a7-9f77b5f56de5"
+            ]
+          }
+        },
+        "identifier": [
+          "https://musicbrainz.org/recording/f1ff69d8-0ee1-4978-a194-2725659ea543"
+        ],
+        "title": "Memory Arc"
+      }
+    ]
+  }
+}

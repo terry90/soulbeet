@@ -11,10 +11,9 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use soulbeet::{
     beets::{BeetsImporter, BeetsSettings},
     error::SoulseekError,
-    musicbrainz::MusicBrainzProvider,
     navidrome::NavidromeClientBuilder,
     slskd::{DownloadConfig, SoulseekClientBuilder},
-    DownloadBackend, LastFmProvider, MetadataProvider, MusicImporter, NavidromeClient,
+    DownloadBackend, MusicImporter, NavidromeClient,
 };
 #[cfg(feature = "server")]
 use tokio::sync::RwLock;
@@ -24,7 +23,6 @@ use crate::models::app_config::{keys, AppConfig};
 
 pub mod providers {
     pub const MUSICBRAINZ: &str = "musicbrainz";
-    pub const LASTFM: &str = "lastfm";
 }
 
 pub mod downloaders {
@@ -49,10 +47,7 @@ static NAVIDROME_CLIENTS: LazyLock<RwLock<HashMap<String, Arc<NavidromeClient>>>
 
 #[cfg(feature = "server")]
 pub fn available_metadata_providers() -> Vec<(&'static str, &'static str)> {
-    vec![
-        (providers::MUSICBRAINZ, "MusicBrainz"),
-        (providers::LASTFM, "Last.fm"),
-    ]
+    vec![(providers::MUSICBRAINZ, "MusicBrainz")]
 }
 
 #[cfg(feature = "server")]
@@ -140,24 +135,6 @@ async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, Bac
             Ok(Arc::new(client))
         }
         _ => Err(BackendLookupError::Unknown(id.to_string())),
-    }
-}
-
-/// The key, when one is saved.
-#[cfg(feature = "server")]
-pub(crate) fn usable_lastfm_key(key: Option<&str>) -> Option<&str> {
-    key.filter(|k| !k.is_empty())
-}
-
-/// Last.fm when it is asked for and a key is saved, else MusicBrainz.
-#[cfg(feature = "server")]
-pub fn metadata_provider(
-    id: Option<&str>,
-    lastfm_api_key: Option<&str>,
-) -> Arc<dyn MetadataProvider> {
-    match (id, usable_lastfm_key(lastfm_api_key)) {
-        (Some(providers::LASTFM), Some(key)) => Arc::new(LastFmProvider::new(key)),
-        _ => Arc::new(MusicBrainzProvider::new()),
     }
 }
 
@@ -761,27 +738,6 @@ mod tests {
                 (FailureCode::InvalidInput, stage, RetryAdvice::NotRetryable)
             );
         }
-    }
-
-    #[test]
-    fn a_lastfm_lookup_without_a_key_is_answered_by_musicbrainz() {
-        use shared::metadata::Provider;
-        assert_eq!(
-            metadata_provider(
-                Some(providers::LASTFM),
-                Some("0123456789abcdef0123456789abcdef")
-            )
-            .id(),
-            Provider::LastFm
-        );
-        for key in [None, Some("")] {
-            assert_eq!(
-                metadata_provider(Some(providers::LASTFM), key).id(),
-                Provider::MusicBrainz
-            );
-        }
-        assert_eq!(metadata_provider(None, None).id(), Provider::MusicBrainz);
-        assert_eq!(usable_lastfm_key(Some("")), None);
     }
 
     #[tokio::test]

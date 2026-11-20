@@ -22,7 +22,7 @@ use shared::download::{
     AutoDownloadEvent, DownloadQuery, DownloadableGroup, DownloadableItem,
     SearchState as DownloadSearchState,
 };
-use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
+use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
 use std::collections::{HashMap, HashSet};
 
 use track::TrackResult;
@@ -49,18 +49,16 @@ pub struct SourceChoices {
     pub groups: Vec<DownloadableGroup>,
 }
 
-/// A download query for `album`, which a search by `provider` gave.
-fn album_query(album: &Album, provider: Provider) -> DownloadQuery {
-    DownloadQuery::new(vec![])
-        .album(album.clone())
-        .metadata_provider(provider)
+/// A download query for `album`.
+fn album_query(album: &Album) -> DownloadQuery {
+    DownloadQuery::new(vec![]).album(album.clone())
 }
 
 #[component]
 pub fn Search() -> Element {
     let auth = use_auth();
     let mut settings = use_settings();
-    let mut search_results = use_signal::<Option<SearchResults>>(|| None);
+    let mut search_results = use_signal::<Option<Vec<SearchResult>>>(|| None);
     let mut search = use_signal(String::new);
     let mut artist = use_signal::<Option<String>>(|| None);
     let mut search_type = use_signal(|| settings.last_search_type());
@@ -546,12 +544,9 @@ pub fn Search() -> Element {
         download_error.set(String::new());
         download_options.set(None);
 
-        let provider = Some(settings.default_provider());
-
         let query_data = api::SearchQuery {
             artist: artist(),
             query: search(),
-            provider,
         };
 
         let result = match search_type() {
@@ -576,7 +571,7 @@ pub fn Search() -> Element {
         }
     });
 
-    let mut toggle_expand = move |album_id: String, provider: Provider| {
+    let mut toggle_expand = move |album_id: String| {
         let is_expanded = expanded_albums.read().contains(&album_id);
         if is_expanded {
             expanded_albums.write().remove(&album_id);
@@ -587,10 +582,7 @@ pub fn Search() -> Element {
                 let aid = album_id.clone();
                 spawn(async move {
                     match auth
-                        .call(api::find_album(api::AlbumQuery {
-                            id: aid.clone(),
-                            provider: Some(provider),
-                        }))
+                        .call(api::find_album(api::AlbumQuery { id: aid.clone() }))
                         .await
                     {
                         Ok(album_data) => {
@@ -775,15 +767,14 @@ pub fn Search() -> Element {
           }
         } else {
           match &*search_results.read() {
-              Some(ref data) if !data.results.is_empty() => {
-                let provider = data.provider;
+              Some(ref data) if !data.is_empty() => {
                 rsx! {
                   div { class: "w-full bg-beet-panel/50 border border-white/5 p-6 backdrop-blur-sm mt-8 rounded-lg",
                     h5 { class: "text-xl font-display font-bold mb-4 border-b border-white/10 pb-2 text-white",
                       "Search Results"
                     }
                     ul { class: "list-none p-0 space-y-4",
-                      for item in data.results.iter() {
+                      for item in data.iter() {
                         match item {
                             SearchResult::Track(ref track) => {
                                 let track_clone = track.clone();
@@ -806,7 +797,7 @@ pub fn Search() -> Element {
                                           let album_id_for_expand = track_clone_2.album_id.clone();
                                           move || {
                                               if let Some(ref aid) = album_id_for_expand {
-                                                  toggle_expand(aid.clone(), provider);
+                                                  toggle_expand(aid.clone());
                                               }
                                           }
                                       },
@@ -855,13 +846,13 @@ pub fn Search() -> Element {
                                       on_toggle: {
                                           let id = album_clone.id.clone();
                                           move || {
-                                              toggle_expand(id.clone(), provider);
+                                              toggle_expand(id.clone());
                                           }
                                       },
                                       on_search_sources: {
                                           let album_for_search = album.clone();
                                           move || {
-                                              let query = album_query(&album_for_search, provider);
+                                              let query = album_query(&album_for_search);
                                               spawn(download(query));
                                           }
                                       },
@@ -871,11 +862,11 @@ pub fn Search() -> Element {
                                       selected_folder_id: current_folder_id.clone(),
                                       active_menu,
                                       on_download: move |_| {
-                                          let query = album_query(&album_for_dl, provider);
+                                          let query = album_query(&album_for_dl);
                                           handle_auto_download(album_for_dl.id.clone(), query);
                                       },
                                       on_override_download: move |folder: Folder| {
-                                          let query = album_query(&album_for_override, provider);
+                                          let query = album_query(&album_for_override);
                                           handle_override_download(album_for_override.id.clone(), query, folder);
                                       },
                                       tracks: tracks_for_panel,
@@ -929,9 +920,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_album_query_carries_the_album_and_its_provider() {
+    fn an_album_query_carries_the_album() {
         let album = Album {
-            id: "lastfm:album:marrow choir:winter songs".to_string(),
+            id: "8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f".to_string(),
             title: "Winter Songs".to_string(),
             artist: "Marrow Choir".to_string(),
             release_date: None,
@@ -939,9 +930,8 @@ mod tests {
             cover_url: None,
             release_types: None,
         };
-        let query = album_query(&album, Provider::LastFm);
+        let query = album_query(&album);
         assert!(query.tracks.is_empty());
         assert_eq!(query.album, Some(album));
-        assert_eq!(query.metadata_provider, Some(Provider::LastFm));
     }
 }

@@ -12,7 +12,6 @@ use crate::core::acquire::{
     Acquisition, AutoRun, NewBatch, RequestBatch,
 };
 use crate::core::jobs::runner::{spawn_drive, ACQUIRE};
-use crate::core::metadata::lastfm_key;
 use crate::core::sources::{server_restarted_search, view, RECENT_FAILURES_SECS};
 use crate::core::{backend_unavailable, database_failure, sources};
 use crate::globals::{get_or_create_user_channel, send_user_event};
@@ -348,17 +347,13 @@ impl Resume for Live {
     }
 
     async fn search(&self, ctx: UserCtx, folder: Folder, query: DownloadQuery, run: AutoRun) {
-        let ready = async {
-            Ok::<_, Failure>((lastfm_key(&ctx).await?, sources::usable_backends().await?))
-        };
-        match ready.await {
-            Ok((key, backends)) => {
+        match sources::usable_backends().await {
+            Ok(backends) => {
                 tokio::spawn(run_search(
                     LEDGER.clone(),
                     ctx,
                     folder,
                     query,
-                    key,
                     backends,
                     run,
                 ));

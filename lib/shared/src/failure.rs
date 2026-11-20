@@ -263,7 +263,6 @@ pub enum Service {
     Beets,
     Navidrome,
     Musicbrainz,
-    Lastfm,
     Filesystem,
     /// Soulful's own settings database.
     Database,
@@ -284,8 +283,6 @@ pub enum UserActionCode {
     FreeDiskSpace,
     RelinkNavidrome,
     ConfigureNavidrome,
-    /// A metadata provider refused Soulful's key for it.
-    ConfigureProvider,
     EnableDeletion,
     EnableIndexing,
     AddFolder,
@@ -296,6 +293,8 @@ pub enum UserActionCode {
     /// The discovery folder or promote threshold, which only the user changes, in Soulful's own
     /// Settings.
     ChangeDiscoverySettings,
+    /// Discovery has nothing to recommend from until the user plays or stars music in Navidrome.
+    ListenInNavidrome,
 }
 
 /// Defines `FailureCode` from one list of variants and wire names: `as_str`
@@ -330,11 +329,13 @@ failure_codes! {
     ExpiredHandle => "expired_handle",
     PermissionNotGranted => "permission_not_granted",
     FolderRequired => "folder_required",
+    /// Nothing played or starred in Navidrome and no ListenBrainz history to recommend from,
+    /// every history having answered.
+    NoListeningData => "no_listening_data",
     RateLimited => "rate_limited",
     MetadataUnavailable => "metadata_unavailable",
     MetadataNotFound => "metadata_not_found",
     MetadataRateLimited => "metadata_rate_limited",
-    ProviderNotConfigured => "provider_not_configured",
     NavidromeUnreachable => "navidrome_unreachable",
     NavidromeAuthFailed => "navidrome_auth_failed",
     NavidromeNotLinked => "navidrome_not_linked",
@@ -440,7 +441,8 @@ mod tests {
     /// `backend_response_unreadable`, `search_query_rejected`,
     /// `search_already_running`, `search_lost`, `import_disk_full`,
     /// `delete_failed`, `partial` (design 10.1), `wrong_job_state`,
-    /// `sources_exhausted`, `result_rejected` and `search_stopped`, and
+    /// `sources_exhausted`, `result_rejected`, `search_stopped` and
+    /// `no_listening_data`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
     const NAMES: [&str; 84] = [
@@ -449,11 +451,11 @@ mod tests {
         "expired_handle",
         "permission_not_granted",
         "folder_required",
+        "no_listening_data",
         "rate_limited",
         "metadata_unavailable",
         "metadata_not_found",
         "metadata_rate_limited",
-        "provider_not_configured",
         "navidrome_unreachable",
         "navidrome_auth_failed",
         "navidrome_not_linked",

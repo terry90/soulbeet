@@ -1080,7 +1080,12 @@ mod tests {
             bit_rate: 0,
             starred: false,
             starred_at: None,
+            rated_at: None,
             play_count: 0,
+            play_date: None,
+            mbz_artist_id: None,
+            mbz_album_artist_id: None,
+            participants: Default::default(),
         };
         let item = Path::new("Zzqx Artist/Qzz Album/01 Song Number 1.mp3");
         assert!(is_imported_file(
@@ -1798,7 +1803,12 @@ mod tests {
             bit_rate: 0,
             starred: false,
             starred_at: None,
+            rated_at: None,
             play_count: 0,
+            play_date: None,
+            mbz_artist_id: None,
+            mbz_album_artist_id: None,
+            participants: Default::default(),
         };
         let item = Path::new("Zzqx Artist/Qzz Album/01 Song Number 1.mp3");
         assert!(!is_imported_file(&song(""), item, 4));

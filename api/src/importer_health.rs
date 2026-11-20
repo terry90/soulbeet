@@ -108,12 +108,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MusicImporter for Stub {
-        fn id(&self) -> &'static str {
-            "stub"
-        }
-        fn name(&self) -> &'static str {
-            "Stub"
-        }
         async fn import(
             &self,
             _: &[&Path],

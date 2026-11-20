@@ -1,4 +1,4 @@
-// Settings flows: folder management, user management, search preferences.
+// Settings flows: folder management and user management.
 // The Config tab (slskd connection) is covered by the setup project.
 
 import { randomUUID } from 'node:crypto';
@@ -54,22 +54,6 @@ test('a non-admin sees only their own account', async ({ page }) => {
 
   await expect(page.getByText('Your Account')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Create User' })).toHaveCount(0);
-});
-
-test('persists the default metadata provider', async ({ page }) => {
-  await page.getByRole('button', { name: 'Search', exact: true }).click();
-
-  const select = page.locator('select').first();
-  await select.selectOption({ label: 'MusicBrainz' });
-  await page.getByRole('button', { name: 'Save Preferences' }).click();
-
-  await expect(page.getByText('Settings saved successfully')).toBeVisible();
-
-  // Leave and come back (client-side), then check the choice stuck.
-  await page.getByRole('link', { name: 'Dashboard' }).click();
-  await openSettings(page);
-  await page.getByRole('button', { name: 'Search', exact: true }).click();
-  await expect(page.locator('select').first()).toHaveValue('musicbrainz');
 });
 
 test('a new password takes the current one', async ({ context, page }) => {

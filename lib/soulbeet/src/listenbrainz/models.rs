@@ -1,254 +1,305 @@
-use serde::Deserialize;
+use std::collections::HashMap;
 
-// --- Listens ---
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Default)]
-pub struct ListensResponse {
-    pub payload: ListensPayload,
+// Envelopes the client unwraps before handing results out.
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct Payload<T> {
+    pub payload: T,
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct ListensPayload {
-    #[serde(default)]
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArtistsPayload<T> {
+    pub artists: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RecordingsPayload {
+    pub recordings: Vec<LbRecording>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListensPayload {
     pub listens: Vec<LbListen>,
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct FeedbackPage {
+    pub feedback: Vec<LbFeedback>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ArtistMbids<'a> {
+    pub artist_mbids: &'a [String],
+}
+
+/// Field order is the order ListenBrainz documents the body in.
+#[derive(Debug, Serialize)]
+pub(crate) struct RecordingMetadataQuery<'a> {
+    pub recording_mbids: &'a [String],
+    pub inc: &'static str,
+}
+
+/// `/1/validate-token`'s answer; `code`, `message` and `user_name` are not read.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TokenValidation {
+    pub valid: bool,
+}
+
+// --- User statistics, listens and feedback ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LbArtist {
+    pub artist_name: String,
+    pub artist_mbid: Option<String>,
+    pub listen_count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LbRecording {
+    pub track_name: String,
+    pub artist_name: String,
+    pub recording_mbid: Option<String>,
+    pub artist_mbids: Vec<String>,
+    pub listen_count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LbListen {
     pub listened_at: i64,
     pub track_metadata: TrackMetadata,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TrackMetadata {
     pub artist_name: String,
     pub track_name: String,
-    #[serde(default)]
     pub release_name: Option<String>,
-    #[serde(default)]
-    pub additional_info: Option<TrackAdditionalInfo>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct TrackAdditionalInfo {
-    #[serde(default)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct LbFeedback {
     pub recording_mbid: Option<String>,
-    #[serde(default)]
-    pub artist_mbids: Option<Vec<String>>,
+    pub track_metadata: Option<FeedbackTrack>,
 }
 
-// --- Stats: Top Artists ---
-
-#[derive(Debug, Deserialize, Default)]
-pub struct TopArtistsResponse {
-    pub payload: TopArtistsPayload,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct TopArtistsPayload {
-    #[serde(default)]
-    pub artists: Vec<LbArtist>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LbArtist {
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeedbackTrack {
     pub artist_name: String,
-    #[serde(default)]
-    pub artist_mbid: Option<String>,
-    pub listen_count: u64,
-}
-
-// --- Stats: Top Recordings ---
-
-#[derive(Debug, Deserialize, Default)]
-pub struct TopRecordingsResponse {
-    pub payload: TopRecordingsPayload,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct TopRecordingsPayload {
-    #[serde(default)]
-    pub recordings: Vec<LbRecording>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LbRecording {
     pub track_name: String,
-    pub artist_name: String,
-    #[serde(default)]
+    pub mbid_mapping: Option<MbidMapping>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MbidMapping {
+    pub artist_mbids: Vec<String>,
     pub recording_mbid: Option<String>,
-    pub listen_count: u64,
 }
 
-// --- Similar Users ---
+// --- Similar users and recommendation playlists ---
 
-/// The LB API returns `{"payload": [{"user_name": "...", "similarity": 0.19}, ...]}`
-#[derive(Debug, Deserialize, Default)]
-pub struct SimilarUsersResponse {
-    #[serde(default)]
-    pub payload: Vec<SimilarUser>,
-}
-
-/// Alternative: some LB versions return a bare array. Try both shapes.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum SimilarUsersRaw {
-    Wrapped(SimilarUsersResponse),
-    Bare(Vec<SimilarUser>),
-}
-
-impl Default for SimilarUsersRaw {
-    fn default() -> Self {
-        Self::Wrapped(SimilarUsersResponse::default())
-    }
-}
-
-impl SimilarUsersRaw {
-    pub fn into_users(self) -> Vec<SimilarUser> {
-        match self {
-            Self::Wrapped(w) => w.payload,
-            Self::Bare(v) => v,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SimilarUser {
     pub user_name: String,
     pub similarity: f64,
 }
 
-// --- Recommendation Playlists (JSPF) ---
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistSummary {
+    pub mbid: String,
+    /// The Troi patch that made it, such as `weekly-exploration`.
+    pub source_patch: Option<String>,
+    /// RFC 3339, as ListenBrainz sends it.
+    pub date: String,
+}
 
-#[derive(Debug, Deserialize, Default)]
-pub struct RecommendationPlaylistsResponse {
-    pub playlists: Vec<JspfPlaylistWrapper>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistTrack {
+    pub title: String,
+    pub creator: String,
+    pub recording_mbid: Option<String>,
+    pub artist_mbid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct JspfPlaylistWrapper {
-    pub playlist: JspfPlaylist,
+pub(crate) struct PlaylistListing {
+    pub playlists: Vec<PlaylistEnvelope<PlaylistHeader>>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct JspfPlaylist {
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlaylistEnvelope<T> {
+    pub playlist: T,
+}
+
+/// `identifier` is the playlist's URL, its MBID the last segment.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlaylistHeader {
+    pub identifier: String,
+    pub date: String,
     #[serde(default)]
-    pub title: String,
-    #[serde(default)]
+    extension: Option<PlaylistHeaderExtension>,
+}
+
+impl PlaylistHeader {
+    pub fn source_patch(&self) -> Option<&str> {
+        self.extension
+            .as_ref()?
+            .metadata
+            .as_ref()?
+            .additional_metadata
+            .as_ref()?
+            .algorithm_metadata
+            .as_ref()?
+            .source_patch
+            .as_deref()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaylistHeaderExtension {
+    #[serde(rename = "https://musicbrainz.org/doc/jspf#playlist")]
+    metadata: Option<PlaylistMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaylistMetadata {
+    additional_metadata: Option<AdditionalMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdditionalMetadata {
+    algorithm_metadata: Option<AlgorithmMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlgorithmMetadata {
+    source_patch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct JspfPlaylist {
     pub track: Vec<JspfTrack>,
 }
 
+/// A JSPF track: `identifier` lists recording URLs, the extension artist URLs.
+/// ListenBrainz leaves out the names of a recording it has no metadata for.
 #[derive(Debug, Deserialize)]
-pub struct JspfTrack {
-    pub title: String,
-    pub creator: String,
-    #[serde(default)]
-    pub identifier: Option<String>,
+pub(crate) struct JspfTrack {
+    pub title: Option<String>,
+    pub creator: Option<String>,
+    pub identifier: Vec<String>,
+    pub extension: JspfTrackExtension,
 }
 
-// --- LB Radio: Artist ---
-// Response is a JSON object: { "artist_mbid": [ { recording_mbid, similar_artist_mbid, similar_artist_name, total_listen_count }, ... ] }
-pub type ArtistRadioResponse = std::collections::HashMap<String, Vec<ArtistRadioRecording>>;
+#[derive(Debug, Deserialize)]
+pub(crate) struct JspfTrackExtension {
+    #[serde(rename = "https://musicbrainz.org/doc/jspf#track")]
+    pub musicbrainz: MusicBrainzTrackExtension,
+}
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct MusicBrainzTrackExtension {
+    #[serde(default)]
+    pub artist_identifiers: Vec<String>,
+}
+
+// --- LB Radio ---
+
+/// Recordings keyed by the artist MBID they belong to.
+pub type ArtistRadioResponse = HashMap<String, Vec<ArtistRadioRecording>>;
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ArtistRadioRecording {
-    #[serde(default)]
-    pub recording_mbid: Option<String>,
-    #[serde(default)]
-    pub similar_artist_mbid: Option<String>,
-    #[serde(default)]
-    pub similar_artist_name: Option<String>,
-    #[serde(default)]
+    pub recording_mbid: String,
     pub total_listen_count: u64,
 }
 
-// --- LB Radio: Tags ---
-// Response is a flat JSON array: [ { recording_mbid, percent, source, tag_count }, ... ]
-pub type TagRadioResponse = Vec<TagRadioRecording>;
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TagRadioRecording {
-    #[serde(default)]
-    pub recording_mbid: Option<String>,
-    #[serde(default)]
+    pub recording_mbid: String,
     pub percent: f64,
 }
 
-// --- Popularity: Artist ---
+// --- Popularity and sitewide statistics ---
 
-#[derive(Debug, Deserialize, Default)]
-pub struct ArtistPopularityResponse(pub Vec<ArtistPopularityEntry>);
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ArtistPopularityEntry {
+    pub artist_mbid: String,
+    pub total_user_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SitewideArtist {
     #[serde(default)]
     pub artist_mbid: Option<String>,
-    #[serde(default)]
-    pub total_listen_count: u64,
-    #[serde(default)]
-    pub total_user_count: u64,
-}
-
-// --- Sitewide Artists ---
-
-#[derive(Debug, Deserialize, Default)]
-pub struct SitewideArtistsResponse {
-    pub payload: SitewideArtistsPayload,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct SitewideArtistsPayload {
-    #[serde(default)]
-    pub artists: Vec<SitewideArtist>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SitewideArtist {
     pub artist_name: String,
-    pub listen_count: u64,
 }
 
-// --- Popularity: Top Recordings for Artist ---
-
-#[derive(Debug, Deserialize, Default)]
-pub struct TopRecordingsForArtistResponse(pub Vec<TopRecordingForArtist>);
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TopRecordingForArtist {
     pub artist_name: String,
-    #[serde(default)]
-    pub recording_name: Option<String>,
-    #[serde(default)]
-    pub recording_mbid: Option<String>,
-    #[serde(default)]
+    pub artist_mbids: Vec<String>,
+    pub recording_mbid: String,
+    pub recording_name: String,
     pub total_listen_count: u64,
-    #[serde(default)]
-    pub total_user_count: u64,
 }
 
-// --- Metadata: Artist ---
+// --- Metadata ---
 
-#[derive(Debug, Deserialize, Default)]
-pub struct ArtistMetadataResponse(pub Vec<ArtistMetadataEntry>);
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ArtistMetadataEntry {
-    #[serde(default)]
-    pub artist_mbid: Option<String>,
-    #[serde(default)]
+    pub artist_mbid: String,
     pub tag: Option<ArtistTags>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ArtistTags {
-    #[serde(default)]
     pub artist: Vec<ArtistTagEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ArtistTagEntry {
     pub tag: String,
     pub count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingMetadata {
+    pub artist: RecordingArtist,
+    pub recording: RecordingFields,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingArtist {
+    pub name: String,
+    pub artists: Vec<CreditArtist>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreditArtist {
+    pub artist_mbid: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingFields {
+    pub name: String,
     #[serde(default)]
-    pub genre_mbid: Option<String>,
+    pub first_release_date: Option<String>,
+}
+
+// --- ListenBrainz Labs ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LabsNeighbour {
+    pub artist_mbid: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub score: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimilarTag {
+    pub similar_tag: String,
+    pub count: u64,
 }

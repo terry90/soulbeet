@@ -1,42 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Metadata provider identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Provider {
-    #[default]
-    MusicBrainz,
-    LastFm,
-}
-
-impl std::fmt::Display for Provider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Provider::MusicBrainz => write!(f, "musicbrainz"),
-            Provider::LastFm => write!(f, "lastfm"),
-        }
-    }
-}
-
-impl std::str::FromStr for Provider {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "musicbrainz" => Ok(Provider::MusicBrainz),
-            "lastfm" => Ok(Provider::LastFm),
-            _ => Err(format!("Unknown provider: {}", s)),
-        }
-    }
-}
-
-/// Wrapper for search results that includes provider information.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SearchResults {
-    pub provider: Provider,
-    pub results: Vec<SearchResult>,
-}
-
 /// Represents a search result which can be either a track or an album.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -71,10 +34,10 @@ pub struct Track {
 }
 
 impl Track {
-    /// `duration` in seconds. Both providers write `{minutes}:{SS}`, with any
+    /// `duration` in seconds. MusicBrainz is written `{minutes}:{SS}`, with any
     /// number of minute digits and two second digits; anything else is `None`.
-    /// A zero length is `None` too: Last.fm album tracklists give 0 for a
-    /// length they do not know.
+    /// A zero length is `None` too: no recording lasts zero seconds, so it
+    /// means unknown.
     pub fn duration_secs(&self) -> Option<u32> {
         let (minutes, seconds) = self.duration.as_deref()?.split_once(':')?;
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
@@ -108,9 +71,9 @@ pub struct Album {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
     /// The release group's primary type, then its secondary types, as
-    /// MusicBrainz names them; None when the provider gives no release types
-    /// (Last.fm), when MusicBrainz gives a type musicbrainz_rs does not
-    /// know, or when the release group has no type set (D15).
+    /// MusicBrainz names them; None when the provider gives no release types,
+    /// when MusicBrainz gives a type musicbrainz_rs does not know, or when
+    /// the release group has no type set (D15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_types: Option<Vec<String>>,
 }

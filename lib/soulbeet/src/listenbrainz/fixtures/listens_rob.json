@@ -1,0 +1,31 @@
+{
+  "payload": {
+    "listens": [
+      {
+        "listened_at": 1771414109,
+        "track_metadata": {
+          "artist_name": "Röyksopp",
+          "track_name": "Some Resolve",
+          "release_name": "Profound Mysteries II",
+          "additional_info": {
+            "recording_mbid": "30d08f4c-d825-4ae1-b79c-44242cddd7c0"
+          }
+        },
+        "user_name": "rob"
+      },
+      {
+        "listened_at": 1771413706,
+        "track_metadata": {
+          "artist_name": "Röyksopp feat. Susanne Sundfør",
+          "track_name": "Tell Him",
+          "release_name": "Profound Mysteries II",
+          "additional_info": {
+            "recording_mbid": "46f0b53f-6731-457c-93e7-57cff0e5b0c2"
+          }
+        },
+        "user_name": "rob"
+      }
+    ],
+    "latest_listen_ts": 1771414109
+  }
+}

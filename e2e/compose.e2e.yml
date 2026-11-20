@@ -20,6 +20,9 @@ services:
       - DOWNLOAD_PATH=/downloads
       - BEETS_CONFIG=/app/beets-e2e.yaml
       - MUSICBRAINZ_HOST=stubs:5050
+      - LISTENBRAINZ_HOST=stubs:5060
+      - LISTENBRAINZ_LABS_HOST=stubs:5061
+      - DEEZER_HOST=stubs:5062
       - NAVIDROME_URL=http://navidrome:4533
       - OIDC_ISSUER_URL=http://stubs:5070
       - OIDC_CLIENT_ID=soulbeet-e2e
@@ -47,6 +50,9 @@ services:
       - DOWNLOAD_PATH=/downloads
       - BEETS_CONFIG=/config/config.yaml
       - MUSICBRAINZ_HOST=stubs:5050
+      - LISTENBRAINZ_HOST=stubs:5060
+      - LISTENBRAINZ_LABS_HOST=stubs:5061
+      - DEEZER_HOST=stubs:5062
     volumes:
       - ./.runtime/downloads:/downloads
       - ./.runtime/music-user90:/music

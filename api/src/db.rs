@@ -83,6 +83,7 @@ pub(crate) mod test_db {
     pub const USER_CHANGE_NUMBERS: i64 = 20261123000000;
     pub const REPORT_REAL_PATH_STATUS: i64 = 20261124000000;
     pub const CHANGELOG_SEEN: i64 = 20261125000000;
+    pub const REMOVE_LASTFM: i64 = 20261130000000;
 
     pub async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
@@ -607,6 +608,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seq, 41);
+    }
+
+    #[tokio::test]
+    async fn rows_from_0_9_0_load_once_last_fm_is_removed() {
+        let db = test_db::migrated_before(test_db::REMOVE_LASTFM).await;
+        insert_user(&db, "u1", "bob").await;
+        insert_folder(&db, "u1", "/music/bob").await;
+        sqlx::query(
+            "INSERT INTO user_settings (user_id, default_metadata_provider, lastfm_api_key, \
+             lastfm_username, listenbrainz_username, discovery_track_count, \
+             discovery_lifetime_days) VALUES ('u1', 'lastfm', '3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e', \
+             'bob_fm', 'bob_lb', ?, ?)",
+        )
+        // The per-profile JSON 0.9.0 keeps in these two columns.
+        .bind(r#"{"Conservative":10,"Balanced":10,"Adventurous":10}"#)
+        .bind(r#"{"Conservative":7,"Balanced":7,"Adventurous":7}"#)
+        .execute(&db)
+        .await
+        .unwrap();
+        // An album a Last.fm search gave, kept by a job and its search as 0.9.0 wrote them.
+        let wanted = r#"{"album":{"id":"lastfm:album:marrow choir:winter songs","title":"Winter Songs","artist":"Marrow Choir","release_date":null},"tracks":[],"backend":null,"metadata_provider":"lastfm"}"#;
+        sqlx::query(
+            "INSERT INTO batches (id, user_id, origin, created_at) VALUES ('b1', 'u1', 'ui', 7)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO searches (id, user_id, expires_at, query) VALUES ('s1', 'u1', 9999999999, ?)",
+        )
+        .bind(wanted)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, user_id, folder_id, created_at, updated_at, wanted, \
+             import_mode, state, batch_id, kind, search_id) \
+             VALUES ('j1', 'u1', '/music/bob', 7, 7, ?, 'album', 'searching', 'b1', 'album', 's1')",
+        )
+        .bind(wanted)
+        .execute(&db)
+        .await
+        .unwrap();
+        test_db::apply(&db, test_db::REMOVE_LASTFM).await;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('user_settings')")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        for gone in [
+            "default_metadata_provider",
+            "lastfm_api_key",
+            "lastfm_username",
+        ] {
+            assert!(!columns.iter().any(|c| c == gone), "{gone}");
+        }
+        let s = crate::models::user_settings::UserSettings::get_in(&db, "u1")
+            .await
+            .unwrap();
+        assert_eq!(s.listenbrainz_username.as_deref(), Some("bob_lb"));
+        let user = crate::auth::UserId::new("u1");
+        let job = crate::ledger::store::job_record(&db, "j1", &user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.wanted.album.unwrap().id,
+            "lastfm:album:marrow choir:winter songs"
+        );
+        let search = crate::ledger::store::search_of(&db, "s1", &user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(search.query.tracks.is_empty());
     }
 
     #[tokio::test]

@@ -53,8 +53,6 @@ pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<Strin
         "default_folder_id": default_folder_id,
         "default_folder_found": default_folder_found,
         "auto_delete_enabled": s.auto_delete_enabled,
-        "default_metadata_provider": s.default_metadata_provider,
-        "lastfm": {"username": s.lastfm_username, "api_key_saved": saved(&s.lastfm_api_key)},
         "listenbrainz": {"username": s.listenbrainz_username, "token_saved": saved(&s.listenbrainz_token)},
         "discovery": {
             "enabled": s.discovery_enabled,
@@ -66,6 +64,7 @@ pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<Strin
             "playlist_ids": playlist_ids,
             "promote_threshold": s.discovery_promote_threshold,
             "last_generated_at": s.discovery_last_generated_at.as_deref().map(time::text),
+            "deezer_recommendations": s.deezer_recommendations,
         },
     }) else {
         unreachable!("an object literal is an object");
@@ -381,10 +380,10 @@ mod tests {
     async fn settings_name_what_is_saved_but_never_the_key() {
         let db = test_db::migrated().await;
         let mut s = UserSettings::get_in(&db, "u1").await.unwrap();
-        s.lastfm_api_key = Some("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e".into());
-        s.lastfm_username = Some("alice_fm".into());
-        s.listenbrainz_token = Some(String::new());
+        s.listenbrainz_username = Some("alice_lb".into());
+        s.listenbrainz_token = Some("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d".into());
         s.default_download_folder_id = Some("f1".into());
+        s.deezer_recommendations = true;
         let folders = vec![Folder {
             id: "f1".into(),
             user_id: "u1".into(),
@@ -397,17 +396,19 @@ mod tests {
             doc,
             json!({
                 "default_folder_id": "f1", "default_folder_found": true, "auto_delete_enabled": false,
-                "default_metadata_provider": "musicbrainz",
-                "lastfm": {"username": "alice_fm", "api_key_saved": true},
-                "listenbrainz": {"username": null, "token_saved": false},
+                "listenbrainz": {"username": "alice_lb", "token_saved": true},
                 "discovery": {"enabled": false, "folder_id": null, "profiles": ["Conservative", "Balanced", "Adventurous"],
                     "track_count": {"Conservative": 10, "Balanced": 10, "Adventurous": 10},
                     "lifetime_days": {"Conservative": 7, "Balanced": 7, "Adventurous": 7},
                     "playlist_names": {"Conservative": "Comfort Zone", "Balanced": "Fresh Picks", "Adventurous": "Deep Cuts"},
-                    "playlist_ids": {}, "promote_threshold": 3, "last_generated_at": null}
+                    "playlist_ids": {}, "promote_threshold": 3, "last_generated_at": null,
+                    "deezer_recommendations": true}
             })
         );
-        assert!(!doc.to_string().contains("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e"));
+        assert!(!doc
+            .to_string()
+            .contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"));
+        assert!(doc.get("lastfm").is_none() && doc.get("default_metadata_provider").is_none());
         s.default_download_folder_id = Some("gone".into());
         assert_eq!(settings_fields(&s, &folders)["default_folder_found"], false);
         s.default_download_folder_id = Some(String::new());
@@ -668,7 +669,6 @@ mod tests {
             &db,
             "u1",
             UpdateUserSettings {
-                lastfm_api_key: Some("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e".into()),
                 listenbrainz_token: Some("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d".into()),
                 ..Default::default()
             },
