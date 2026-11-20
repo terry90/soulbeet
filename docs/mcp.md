@@ -186,7 +186,7 @@ Any client that supports remote MCP servers over streamable HTTP with OAuth adds
 2. Give it a name, for example "Soulbeet", and the address `https://music.example.com/mcp`.
 3. Keep the options marked **Detected**. Either OAuth client choice works: "Use Claude's published identity" and "Register automatically" are both supported.
 4. Click **Add**, then **Connect**. claude.ai opens Soulbeet in your browser.
-5. If you are not signed in, Soulbeet shows its sign-in page (`/login/return?return_to=...`). Sign in with your Soulbeet account, or with your Navidrome account when Soulbeet uses Navidrome sign-in.
+5. If you are not signed in, Soulbeet shows its sign-in page (`/login/return?return_to=...`). Sign in with your Soulbeet account, with your Navidrome account when Soulbeet uses Navidrome sign-in, or with the **Sign in with ...** button when an admin set up single sign-on. If a single sign-on fails, the page that says why keeps the request, so signing in from there still leads to the next step.
 6. Soulbeet then asks:
 
    > **Connect claude.ai to Soulbeet**
@@ -223,7 +223,7 @@ A user whose account is not linked to Navidrome can still use the tools that do 
 - **Disconnect** asks "Disconnect {app host}? It will have to be connected again from the app." and ends the app's access.
 - Admins see every user's apps, with the owner's name, and can disconnect any of them. Only the owner can change an app's deletion switch.
 
-A password change, an admin's reset of the password, or a Navidrome sign-in that links an account which had no Navidrome link disconnects every app of that user. Every new connection starts with deletion off.
+A password change, an admin's reset of the password, a Navidrome sign-in that links an account which had no Navidrome link, or linking or unlinking single sign-on disconnects every app of that user. Every new connection starts with deletion off.
 
 Access tokens last 1 hour. Refresh tokens last 60 days from their issue, and each refresh gives a new one, so an app used at least once in 60 days stays connected. A refresh token used again more than a minute after it was replaced ends the connection.
 
