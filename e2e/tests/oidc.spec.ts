@@ -8,7 +8,9 @@ import { createNavidromeUser } from '../helpers/navidrome.js';
 // Single sign-on against the OIDC stub (stubs/src/oidc-server.ts), which
 // checks the client secret, the registered redirect URI and PKCE before it
 // issues a token. The app on 9765 runs with REGISTRATION=open, so a first
-// sign-in under a new name creates an account.
+// sign-in under a new name creates an account, and leaves
+// OIDC_LINK_BY_USERNAME at its default, so a first sign-in under the name of
+// an account that has no single sign-on link joins that account.
 
 interface ProviderUser {
   username: string;
@@ -105,22 +107,24 @@ test('creates an account on first sign-in and keeps it when the username changes
   expect(await currentUser(page)).toEqual(first);
 });
 
-test('refuses a first sign-in under the name of an existing account', async ({ page }) => {
-  const user = uniqueUser('sso-taken');
+test('a first sign-in under the name of an existing account joins it', async ({ page }) => {
+  const user = uniqueUser('sso-join');
   await registerUser(page.context().request, user);
   await loginViaApi(page.context(), user);
   const local = await currentUser(page);
   await page.context().clearCookies();
 
-  // Whatever the letter case, the name proves nothing: the owner links it from Settings.
-  for (const username of [user.username, user.username.toUpperCase()]) {
-    await signInWithSso(page, { username, subject: randomUUID() });
-    await expect(page).toHaveURL(/\/login\/error\/account_exists$/);
-    await expect(page.getByText('link single sign-on in Settings')).toBeVisible();
-    expect((await page.request.get('/api/auth/me')).status()).toBe(401);
-  }
+  // The same name in any letter case is the same account.
+  const nameAtProvider = user.username.toUpperCase();
+  await signInWithSso(page, { username: nameAtProvider, subject: randomUUID() });
+  await expect(page).toHaveURL(/\/$/);
+  expect((await currentUser(page)).user_id).toBe(local.user_id);
+  expect(await flowCookies(page.context())).toEqual([]);
+  await openAccountSettings(page);
+  await expect(page.getByText(`Linked to ${nameAtProvider} at Stub ID.`)).toBeVisible();
 
-  // The account is untouched and its password still opens it.
+  // The account keeps its password.
+  await page.context().clearCookies();
   await loginViaApi(page.context(), user);
   expect((await currentUser(page)).user_id).toBe(local.user_id);
 });
