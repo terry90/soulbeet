@@ -35,7 +35,7 @@ You search and click download, or you ask your assistant. Behind the scenes:
 
 Soulbeet is an MCP server, so any AI assistant that speaks MCP (Claude, ChatGPT, Cursor, your own agent...) can drive it. You ask for music in plain words, for example "Get In Rainbows by Radiohead into my library", "How is that batch of downloads going?" or "Do I have duplicates in my library?". The assistant checks your library, searches Soulseek, downloads, imports and builds the Navidrome playlist, and you never open the web UI. Downloads keep running after you close the chat.
 
-Serve Soulbeet over https at the root of a name (public, for hosted assistants such as claude.ai), then add `https://music.example.com/mcp` as a remote MCP server in your client and click **Allow** when Soulbeet asks. Each person connects their own account, and the assistant acts as that person only. It cannot delete music until you allow it in Settings > Users > Connected apps.
+Serve Soulbeet over https at the root of a name (public, for hosted assistants such as claude.ai), then add `https://music.example.com/mcp` as a remote MCP server in your client and click **Allow** when Soulbeet asks. Clients sign in with OAuth, so there is no API key to copy around. Each person connects their own account, and the assistant acts as that person only. It cannot delete music until you allow it in Settings > Users > Connected apps.
 
 [docs/mcp.md](docs/mcp.md) has the setup steps, the proxy examples (Caddy, nginx, Traefik, Cloudflare tunnel), every tool, the limits and the error codes.
 

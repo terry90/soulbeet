@@ -1,6 +1,6 @@
 # Upgrading
 
-This page lists what changes on the first start after an upgrade that needs action from you.
+This page lists what changes on the first start after an upgrade, and what to do where something needs doing.
 
 ## Upgrading to roles and folder roots
 
