@@ -284,9 +284,10 @@ impl Identity {
 mod tests {
     use super::*;
     use crate::connection::test_util::{serve_on_loopback, streamed};
-    use crate::oidc::flow::{new_flow, Purpose, Start};
-    use crate::oidc::testing::{identity_at, json_of_size, test_config, test_provider, ISSUER};
-    use axum::http::{header::HOST, HeaderMap, StatusCode, Uri};
+    use crate::oidc::testing::{
+        identity_at, json_of_size, sign_id_token, test_config, test_flow, test_provider, ISSUER,
+    };
+    use axum::http::{HeaderMap, StatusCode};
     use axum::{routing::post, Router};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use serde_json::json;
@@ -307,13 +308,6 @@ mod tests {
             .unwrap_err();
         assert!(refused.contains("bad\\nINFO"), "{refused}");
         assert!(!refused.contains('\n'), "{refused}");
-    }
-
-    fn test_flow() -> Flow {
-        let mut headers = HeaderMap::new();
-        headers.insert(HOST, "soulbeet.example.com".parse().unwrap());
-        let start = Start::for_request(None, None, &headers, &Uri::from_static("/")).unwrap();
-        new_flow(Purpose::SignIn { return_to: None }, &start)
     }
 
     /// What a token request carried: its Authorization header and its form.
@@ -546,18 +540,6 @@ mod tests {
         assert!(refusal(Some(json!(1))).contains("not a boolean"));
     }
 
-    /// A throwaway Ed25519 key, only for these tests.
-    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
------END PRIVATE KEY-----";
-
-    fn sign(kid: &str, claims: Value) -> String {
-        let mut header = jsonwebtoken::Header::new(Algorithm::EdDSA);
-        header.kid = Some(kid.to_string());
-        let key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_KEY_PEM.as_bytes()).unwrap();
-        jsonwebtoken::encode(&header, &claims, &key).unwrap()
-    }
-
     fn valid_claims() -> Value {
         let now = chrono::Utc::now().timestamp();
         json!({
@@ -572,7 +554,7 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
 
     #[test]
     fn verifies_a_valid_id_token() {
-        let claims = verify(&sign("k1", valid_claims())).unwrap();
+        let claims = verify(&sign_id_token("k1", valid_claims())).unwrap();
         assert_eq!(claims.sub, "abc");
         assert_eq!(claims.other["preferred_username"], "alice");
     }
@@ -582,7 +564,7 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         let with = |key: &str, value: Value| {
             let mut claims = valid_claims();
             claims[key] = value;
-            sign("k1", claims)
+            sign_id_token("k1", claims)
         };
         let invalid = |token: String| matches!(verify(&token), Err(TokenError::Invalid(_)));
 
@@ -599,16 +581,16 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
 
         let mut claims = valid_claims();
         claims.as_object_mut().unwrap().remove("nonce");
-        assert!(invalid(sign("k1", claims)));
+        assert!(invalid(sign_id_token("k1", claims)));
 
         // Signed by a key the cache does not have: the caller refreshes.
         assert!(matches!(
-            verify(&sign("rotated", valid_claims())),
+            verify(&sign_id_token("rotated", valid_claims())),
             Err(TokenError::UnknownKey)
         ));
 
         // A tampered payload breaks the signature.
-        let token = sign("k1", valid_claims());
+        let token = sign_id_token("k1", valid_claims());
         let mut parts: Vec<&str> = token.split('.').collect();
         let forged = URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&with_username(valid_claims(), "admin")).unwrap());

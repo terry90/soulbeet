@@ -14,7 +14,7 @@ use super::flow::{
     authorization_url, flow_cookie, new_flow, seal_flow, take_flow, Flow, Purpose, Start,
 };
 use super::loggable;
-use super::provider::provider;
+use super::provider::{ProviderCache, PROVIDER};
 use super::token::{exchange_code, verify_id_token, Identity, TokenError};
 use crate::auth::{SsoError, SsoLinkResult};
 use crate::base_url::BaseUrl;
@@ -143,7 +143,8 @@ async fn begin(
     purpose: Purpose,
     start: &Start,
 ) -> Result<url::Url, String> {
-    let provider = provider(config, false)
+    let provider = PROVIDER
+        .provider(config, false)
         .await
         .map_err(|e| format!("cannot reach the provider: {e}"))?;
 
@@ -175,7 +176,7 @@ pub(super) async fn callback(cookies: Cookies, Query(params): Query<CallbackPara
         Ok(flow) => flow,
         Err(error) => return to_login(error, None),
     };
-    let identity = verified_identity(config, &flow, params).await;
+    let identity = verified_identity(&PROVIDER, config, &flow, params).await;
     let session = flow.session;
 
     // `return_to`: the app request a failed sign-in still goes back to.
@@ -220,8 +221,10 @@ pub(super) async fn callback(cookies: Cookies, Query(params): Query<CallbackPara
     }
 }
 
-/// Who the provider says signed in, for the flow `flow`.
+/// Who the provider says signed in, for the flow `flow`, with the provider
+/// as `providers` holds it.
 async fn verified_identity(
+    providers: &ProviderCache,
     config: &OidcConfig,
     flow: &Flow,
     params: CallbackParams,
@@ -244,14 +247,14 @@ async fn verified_identity(
         SsoError::Failed
     };
 
-    let provider = provider(config, false).await.map_err(failed)?;
+    let provider = providers.provider(config, false).await.map_err(failed)?;
     let id_token = exchange_code(&provider, config, &code, flow)
         .await
         .map_err(failed)?;
     let claims = match verify_id_token(&provider, config, &id_token, &flow.nonce) {
         Err(TokenError::UnknownKey) => {
             // The provider may have rotated its keys since they were cached.
-            let provider = self::provider(config, true).await.map_err(failed)?;
+            let provider = providers.provider(config, true).await.map_err(failed)?;
             verify_id_token(&provider, config, &id_token, &flow.nonce)
         }
         result => result,
@@ -262,4 +265,95 @@ async fn verified_identity(
         tracing::warn!("OIDC sign-in refused: {e}");
         SsoError::Failed
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oidc::testing::{sign_id_token, test_flow, StubProvider};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// The provider's answer to a sign-in: a code.
+    fn with_code() -> CallbackParams {
+        CallbackParams {
+            code: Some("the-code".to_string()),
+            state: None,
+            error: None,
+            error_description: None,
+        }
+    }
+
+    /// The provider `stub` as a sign-in cached it a minute ago, when it
+    /// published the key `kid`.
+    fn cached_a_minute_ago(stub: &StubProvider, kid: &str) -> ProviderCache {
+        let fetched_at = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        ProviderCache::holding(Some(Arc::new(stub.copy(&[kid], fetched_at))), None)
+    }
+
+    /// A sign-in as `username` whose ID token the provider signs with `kid`.
+    async fn sign_in(
+        stub: &StubProvider,
+        providers: &ProviderCache,
+        kid: &str,
+        username: &str,
+    ) -> Result<Identity, SsoError> {
+        let flow = test_flow();
+        stub.answer_id_token(sign_id_token(kid, stub.claims(&flow, username)));
+        verified_identity(providers, &stub.config(), &flow, with_code()).await
+    }
+
+    #[tokio::test]
+    async fn a_rotated_key_is_fetched_once_and_the_sign_in_goes_through() {
+        let stub = StubProvider::start(&["new"]).await;
+        let providers = cached_a_minute_ago(&stub, "old");
+
+        // Signed with a key the cached copy does not have: the provider's
+        // keys are fetched again, and the token verifies with them.
+        let identity = sign_in(&stub, &providers, "new", "alice").await.unwrap();
+        assert_eq!(identity.username, "alice");
+        assert_eq!(identity.issuer, stub.issuer);
+        assert_eq!(stub.fetches(), 1);
+
+        // The new key is cached now.
+        let identity = sign_in(&stub, &providers, "new", "bob").await.unwrap();
+        assert_eq!(identity.username, "bob");
+        assert_eq!(stub.fetches(), 1);
+
+        // A key the provider does not publish: refused, without asking a
+        // provider that was asked moments ago again.
+        assert_eq!(
+            sign_in(&stub, &providers, "forged", "mallory").await,
+            Err(SsoError::Failed)
+        );
+        assert_eq!(stub.fetches(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_provider_down_at_a_key_rotation_is_asked_again_only_after_the_backoff() {
+        let stub = StubProvider::start(&["new"]).await;
+        let providers = cached_a_minute_ago(&stub, "old");
+        stub.set_down(true);
+
+        // The new keys cannot be fetched: the sign-in fails, and the ones
+        // right after it do not ask the provider again.
+        for _ in 0..3 {
+            assert_eq!(
+                sign_in(&stub, &providers, "new", "alice").await,
+                Err(SsoError::Failed)
+            );
+        }
+        assert_eq!(stub.fetches(), 1);
+        // Meanwhile a token signed with a cached key still signs in.
+        let identity = sign_in(&stub, &providers, "old", "bob").await.unwrap();
+        assert_eq!(identity.username, "bob");
+        assert_eq!(stub.fetches(), 1);
+
+        // After the backoff, the next sign-in asks again and gets the keys.
+        stub.set_down(false);
+        providers.end_backoff();
+        let identity = sign_in(&stub, &providers, "new", "alice").await.unwrap();
+        assert_eq!(identity.username, "alice");
+        assert_eq!(stub.fetches(), 2);
+    }
 }

@@ -35,7 +35,8 @@ pub(super) static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build the OIDC HTTP client")
 });
 
-static PROVIDER: LazyLock<ProviderCache> = LazyLock::new(Default::default);
+/// The provider of the configured single sign-on.
+pub(super) static PROVIDER: LazyLock<ProviderCache> = LazyLock::new(Default::default);
 
 /// The parts of the discovery document this flow uses.
 #[derive(Deserialize)]
@@ -112,7 +113,7 @@ impl Cached {
 /// The cached provider. What it holds is locked only to read or replace it,
 /// never across a fetch, and one fetch runs at a time.
 #[derive(Default)]
-struct ProviderCache {
+pub(super) struct ProviderCache {
     cached: std::sync::Mutex<Cached>,
     fetching: Mutex<()>,
 }
@@ -178,9 +179,37 @@ impl ProviderCache {
     }
 }
 
-/// The provider of `config`, cached (see [`ProviderCache::get`]).
-pub(super) async fn provider(config: &OidcConfig, refresh: bool) -> Result<Arc<Provider>, String> {
-    PROVIDER.get(refresh, || fetch_provider(config)).await
+impl ProviderCache {
+    /// The provider of `config`, fetched from it as [`ProviderCache::get`]
+    /// says.
+    pub(super) async fn provider(
+        &self,
+        config: &OidcConfig,
+        refresh: bool,
+    ) -> Result<Arc<Provider>, String> {
+        self.get(refresh, || fetch_provider(config)).await
+    }
+}
+
+#[cfg(test)]
+impl ProviderCache {
+    /// A cache holding `provider`, and the failure at `failed_at`.
+    pub(super) fn holding(provider: Option<Arc<Provider>>, failed_at: Option<Instant>) -> Self {
+        let cache = ProviderCache::default();
+        *cache.cached() = Cached {
+            provider,
+            failed_at,
+        };
+        cache
+    }
+
+    /// As if the backoff after the last failure were over.
+    pub(super) fn end_backoff(&self) {
+        let mut cached = self.cached();
+        cached.failed_at = cached
+            .failed_at
+            .and_then(|at| at.checked_sub(FAILURE_BACKOFF));
+    }
 }
 
 /// The endpoints a discovery document names.
@@ -468,17 +497,6 @@ mod tests {
         assert!(retry.answer(false).is_none());
     }
 
-    /// A cache holding `provider` as fetched now and then, and the failure
-    /// at `failed_at`.
-    fn holding(provider: Option<Arc<Provider>>, failed_at: Option<Instant>) -> ProviderCache {
-        let cache = ProviderCache::default();
-        *cache.cached() = Cached {
-            provider,
-            failed_at,
-        };
-        cache
-    }
-
     /// A fetch answering `result` at once, counted in `fetches`.
     fn counted(
         fetches: &AtomicUsize,
@@ -500,7 +518,7 @@ mod tests {
     #[tokio::test]
     async fn a_slow_fetch_runs_alone_and_holds_up_no_sign_in_that_has_a_copy() {
         let stale = cached(PROVIDER_TTL * 2);
-        let cache = holding(Some(stale.clone()), None);
+        let cache = ProviderCache::holding(Some(stale.clone()), None);
         let (answer, answered) = tokio::sync::oneshot::channel::<()>();
 
         // The sign-in that found the copy stale fetches, and the provider is
@@ -536,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn sign_ins_without_a_copy_wait_for_the_one_fetch() {
-        let cache = holding(None, None);
+        let cache = ProviderCache::holding(None, None);
         let (answer, answered) = tokio::sync::oneshot::channel::<()>();
         let first = cache.get(false, || async {
             answered.await.unwrap();
@@ -561,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_fetch_keeps_the_stale_copy_and_backs_off() {
         let stale = cached(PROVIDER_TTL * 2);
-        let cache = holding(Some(stale.clone()), None);
+        let cache = ProviderCache::holding(Some(stale.clone()), None);
         let fetches = AtomicUsize::new(0);
 
         let kept = cache
