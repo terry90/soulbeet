@@ -228,13 +228,14 @@ How accounts are matched:
 
 **Warning**: by default, whoever holds a name at the provider gets the Soulbeet account of that name, admin accounts included. Unlinking an account taken this way, or an admin setting its password (which removes the link), only helps once `OIDC_LINK_BY_USERNAME` is `false` or the name at the provider is changed: the next sign-in under that name links it again.
 
-The default is fine for a family, friends or local instance where the admin runs the provider too, creates the accounts there, and people cannot pick or change their own username at the provider. Then the same name means the same person, and existing Soulbeet users just click **Sign in with ...**.
+The default is fine for a family, friends or local instance where the admin runs the provider too, creates the accounts there, and people cannot pick or change their own username at the provider. With `REGISTRATION=navidrome`, the admin also creates the Navidrome accounts, so the names match there too. Then the same name means the same person, and existing Soulbeet users just click **Sign in with ...**.
 
 Set `OIDC_LINK_BY_USERNAME=false` if any of these is true:
 
 -   People can sign up at the provider by themselves, or change their username there (or the claim `OIDC_USERNAME_CLAIM` names).
 -   The provider is shared with people who should not all get into Soulbeet, such as a company or public provider.
 -   Soulbeet runs with `REGISTRATION=open`, or strangers can create accounts in it some other way. Someone can register a name with a password first; the real person's first single sign-on then joins that account, and the stranger keeps the password.
+-   Soulbeet runs with `REGISTRATION=navidrome`, and a Navidrome user may have the same name as a different person at the provider. A Navidrome user who signed in to Soulbeet once has an account, and the first single sign-on under that name joins it, with that user's Navidrome library, ratings and playlists.
 -   Someone at the provider holds the name of a Soulbeet admin (the seeded one is `admin`) without being that admin. They would sign in as that admin.
 
 With it off, a first sign-in under the name of an existing account is refused. The owner signs in with their password and links single sign-on in Settings > Users.
