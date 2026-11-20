@@ -1,6 +1,6 @@
 //! One paced HTTP client for ListenBrainz, ListenBrainz Labs and Deezer. It
-//! spaces requests per host, waits out rate limits and never hands a bot
-//! challenge page to a caller as data.
+//! spaces requests per host, waits out rate limits, retries a bot challenge
+//! page like an outage and never hands one to a caller as data.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -280,16 +280,20 @@ impl PoliteClient {
                     body: String::from_utf8_lossy(&bytes).into_owned(),
                 });
             }
-            return match serde_json::from_slice(&bytes) {
-                Ok(value) => Ok(Some(value)),
+            match serde_json::from_slice(&bytes) {
+                Ok(value) => return Ok(Some(value)),
+                // The bot challenge shows up around an outage and passes with it.
                 Err(_) if bytes.trim_ascii_start().first() == Some(&b'<') => {
-                    Err(RemoteError::Challenged { service })
+                    last = RemoteError::Challenged { service };
+                    self.pause(attempt, wait).await;
                 }
-                Err(e) => Err(RemoteError::Unreadable {
-                    service,
-                    detail: e.to_string(),
-                }),
-            };
+                Err(e) => {
+                    return Err(RemoteError::Unreadable {
+                        service,
+                        detail: e.to_string(),
+                    })
+                }
+            }
         }
         Err(last)
     }
@@ -411,11 +415,22 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 4);
     }
 
+    const CHALLENGE: &str = include_str!("listenbrainz/fixtures/challenge.html");
+
     #[tokio::test]
-    async fn a_browser_check_is_not_data() {
-        let (base, seen) = serve(vec![ok(include_str!(
-            "listenbrainz/fixtures/challenge.html"
-        ))]);
+    async fn a_browser_check_is_retried_like_an_outage() {
+        let (base, seen) = serve(vec![ok(CHALLENGE), ok("[4]")]);
+        let c = PoliteClient::new(&base, "ListenBrainz", Pace::immediate()).unwrap();
+        assert_eq!(
+            c.get::<Vec<u8>>("/1/lb-radio/tags").await.unwrap(),
+            Some(vec![4])
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_browser_check_that_outlasts_the_retries_is_not_data() {
+        let (base, seen) = serve((0..4).map(|_| ok(CHALLENGE)).collect());
         let c = PoliteClient::new(&base, "ListenBrainz", Pace::immediate()).unwrap();
         assert_eq!(
             c.get::<Vec<u8>>("/1/lb-radio/tags").await,
@@ -423,7 +438,7 @@ mod tests {
                 service: "ListenBrainz"
             })
         );
-        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(seen.lock().unwrap().len(), 4);
     }
 
     #[tokio::test]
