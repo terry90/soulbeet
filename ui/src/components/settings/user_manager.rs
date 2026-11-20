@@ -9,7 +9,7 @@ use dioxus::prelude::*;
 use super::panel::{
     ListRow, LoadError, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS,
 };
-use super::sign_in_methods::SingleSignOnSection;
+use super::sign_in_methods::{NavidromeSection, SingleSignOnSection};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
 use crate::{FieldLook, TextInput};
@@ -113,6 +113,9 @@ pub fn AccountPanel(sso_result: Option<SsoLinkResult>) -> Element {
               methods: methods.clone(),
               result: sso_result,
               on_change: move |_| sign_in_methods.restart(),
+            }
+            if methods.navidrome {
+              NavidromeSection {}
             }
           },
           Some(Err(e)) => rsx! {

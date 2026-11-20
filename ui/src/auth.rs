@@ -15,6 +15,14 @@ impl Auth {
         self.state.set(Some(response));
     }
 
+    /// Follows a change of the account's Navidrome connection made while
+    /// signed in.
+    pub fn set_navidrome_status(&mut self, status: shared::system::NavidromeStatus) {
+        if let Some(state) = self.state.write().as_mut() {
+            state.navidrome_status = status;
+        }
+    }
+
     /// Signs out on the server, then here. When the server could not end
     /// the session, its token still works, so the user stays signed in here
     /// too and the error is returned for display.
@@ -92,6 +100,27 @@ pub fn use_auth() -> Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connecting_navidrome_updates_the_status_of_a_signed_in_user_only() {
+        let dom = VirtualDom::new(|| rsx! {});
+        dom.in_scope(ScopeId::ROOT, || {
+            use shared::system::NavidromeStatus;
+            let mut auth = Auth::new(Signal::new(Some(AuthResponse {
+                username: "ann".to_string(),
+                user_id: "u1".to_string(),
+                navidrome_status: NavidromeStatus::NotLinked,
+                role: Default::default(),
+                rename_allowed: false,
+            })));
+            auth.set_navidrome_status(NavidromeStatus::Connected);
+            assert_eq!(auth.navidrome_status(), NavidromeStatus::Connected);
+
+            let mut signed_out = Auth::new(Signal::new(None));
+            signed_out.set_navidrome_status(NavidromeStatus::Connected);
+            assert!(!signed_out.is_logged_in());
+        });
+    }
 
     #[test]
     fn a_failed_sign_out_keeps_the_user_signed_in() {

@@ -1,12 +1,15 @@
-//! How the signed-in user signs in besides their password: single sign-on.
+//! How the signed-in user signs in besides their password: single sign-on,
+//! and the Navidrome login Soulbeet uses for them.
 
 use api::auth::{SignInMethods, SsoLinkResult};
-use api::{start_sso_link, unlink_sso};
+use api::{connect_navidrome, start_sso_link, unlink_sso};
 use dioxus::prelude::*;
+use shared::system::NavidromeStatus;
 
 use super::panel::{Messages, LABEL_CLASS};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
+use crate::TextInput;
 
 const NOTE_CLASS: &str = "text-xs text-gray-500 font-mono";
 
@@ -101,6 +104,61 @@ pub(super) fn SingleSignOnSection(
     }
 }
 
+/// Connects the account to Navidrome with its Navidrome password, for
+/// discovery and rating sync. Also how an account made through single
+/// sign-on gets Navidrome, and how any account stores a changed password.
+#[component]
+pub(super) fn NavidromeSection() -> Element {
+    let mut auth = use_auth();
+    let mut password = use_signal(String::new);
+    let mut error = use_signal(String::new);
+    let mut success = use_signal(String::new);
+    let mut connecting = use_signal(|| false);
+
+    let connect = move |_| async move {
+        error.set(String::new());
+        success.set(String::new());
+        connecting.set(true);
+        match auth.call(connect_navidrome(password())).await {
+            Ok(()) => {
+                auth.set_navidrome_status(NavidromeStatus::Connected);
+                password.set(String::new());
+                success.set("Navidrome connected".to_string());
+            }
+            Err(e) => error.set(friendly_error(&e)),
+        }
+        connecting.set(false);
+    };
+
+    let note = match auth.navidrome_status() {
+        NavidromeStatus::Connected => {
+            "Connected. Enter your Navidrome password again here after you change it."
+        }
+        _ => "Enter your Navidrome password to use discovery and rating sync.",
+    };
+
+    rsx! {
+      div { class: "mt-6",
+        label { class: LABEL_CLASS, "Navidrome" }
+        Messages { error: error(), success: success() }
+        p { class: "{NOTE_CLASS} mb-2", "{note}" }
+        TextInput {
+          value: password(),
+          oninput: move |v| password.set(v),
+          placeholder: "Navidrome password",
+          aria_label: "Navidrome password",
+          password: true,
+        }
+        button {
+          class: "retro-btn mt-2 rounded",
+          disabled: connecting(),
+          onclick: connect,
+          "Connect Navidrome"
+        }
+      }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +220,44 @@ mod tests {
             None,
         );
         assert!(html.contains(">Unlink<"), "{html}");
+    }
+
+    fn render_navidrome(status: NavidromeStatus) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |status: NavidromeStatus| {
+                let signed_in = use_signal(|| {
+                    Some(api::auth::AuthResponse {
+                        username: "ann".into(),
+                        user_id: "u1".into(),
+                        navidrome_status: status,
+                        role: Default::default(),
+                        rename_allowed: false,
+                    })
+                });
+                use_context_provider(|| crate::auth::Auth::new(signed_in));
+                rsx! {
+                    NavidromeSection {}
+                }
+            },
+            status,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn an_account_without_navidrome_is_asked_for_its_navidrome_password() {
+        let html = render_navidrome(NavidromeStatus::NotLinked);
+        assert!(
+            html.contains("Enter your Navidrome password to use discovery"),
+            "{html}"
+        );
+        assert!(html.contains("aria-label=\"Navidrome password\""), "{html}");
+        assert!(html.contains(">Connect Navidrome<"), "{html}");
+
+        let html = render_navidrome(NavidromeStatus::Connected);
+        assert!(html.contains("Connected."), "{html}");
+        assert!(html.contains(">Connect Navidrome<"), "{html}");
     }
 
     #[test]
