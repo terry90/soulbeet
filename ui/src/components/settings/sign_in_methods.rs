@@ -107,8 +107,10 @@ pub(super) fn SingleSignOnSection(
 /// Connects the account to Navidrome with its Navidrome password, for
 /// discovery and rating sync. Also how an account made through single
 /// sign-on gets Navidrome, and how any account stores a changed password.
+/// `on_change` runs once a password is stored: the account may now unlink
+/// single sign-on.
 #[component]
-pub(super) fn NavidromeSection() -> Element {
+pub(super) fn NavidromeSection(on_change: EventHandler<()>) -> Element {
     let mut auth = use_auth();
     let mut password = use_signal(String::new);
     let mut error = use_signal(String::new);
@@ -124,6 +126,7 @@ pub(super) fn NavidromeSection() -> Element {
                 auth.set_navidrome_status(NavidromeStatus::Connected);
                 password.set(String::new());
                 success.set("Navidrome connected".to_string());
+                on_change.call(());
             }
             Err(e) => error.set(friendly_error(&e)),
         }
@@ -236,7 +239,7 @@ mod tests {
                 });
                 use_context_provider(|| crate::auth::Auth::new(signed_in));
                 rsx! {
-                    NavidromeSection {}
+                    NavidromeSection { on_change: |_| {} }
                 }
             },
             status,

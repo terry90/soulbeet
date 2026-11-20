@@ -75,6 +75,8 @@ pub fn AccountPanel(sso_result: Option<SsoLinkResult>) -> Element {
             Ok(_) => {
                 success_msg.set("Password updated".to_string());
                 new_password.set("".to_string());
+                // A password of its own may let the account unlink single sign-on.
+                sign_in_methods.restart();
             }
             Err(e) => error.set(friendly_error(&e)),
         }
@@ -115,7 +117,7 @@ pub fn AccountPanel(sso_result: Option<SsoLinkResult>) -> Element {
               on_change: move |_| sign_in_methods.restart(),
             }
             if methods.navidrome {
-              NavidromeSection {}
+              NavidromeSection { on_change: move |_| sign_in_methods.restart() }
             }
           },
           Some(Err(e)) => rsx! {
