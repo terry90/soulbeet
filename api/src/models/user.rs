@@ -33,7 +33,11 @@ pub struct User {
     pub role: Role,
     #[serde(skip)]
     pub credentials_version: i64,
-    /// The OpenID Connect subject this account signs in as, once linked
+    /// The OpenID Connect issuer of the identity this account signs in as,
+    /// once linked; set together with `oidc_subject`
+    #[serde(skip)]
+    pub oidc_issuer: Option<String>,
+    /// The subject (`sub`) that issuer gave the identity
     #[serde(skip)]
     pub oidc_subject: Option<String>,
 }
@@ -345,31 +349,37 @@ impl User {
         Ok(())
     }
 
-    /// The account linked to an OpenID Connect subject.
-    pub(crate) async fn find_by_oidc_subject_in(
+    /// The account linked to an OpenID Connect identity: a subject is unique
+    /// only within its issuer, so both are matched.
+    pub(crate) async fn find_by_oidc_identity_in(
         db: &SqlitePool,
+        issuer: &str,
         subject: &str,
     ) -> Result<Option<User>, String> {
-        sqlx::query_as::<_, User>("SELECT * FROM users WHERE oidc_subject = ?")
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE oidc_issuer = ? AND oidc_subject = ?")
+            .bind(issuer)
             .bind(subject)
             .fetch_optional(db)
             .await
             .map_err(|e| e.to_string())
     }
 
-    /// Links an account that has no OpenID Connect subject yet to `subject`.
-    /// False when the account is gone or already linked. Like a first link
-    /// to Navidrome, it ends the account's other sessions: someone else can
-    /// now sign in to it.
-    pub(crate) async fn link_oidc_subject_in(
+    /// Links an account that has no OpenID Connect identity yet to the
+    /// subject `subject` of `issuer`. False when the account is gone or
+    /// already linked. Like a first link to Navidrome, it ends the account's
+    /// other sessions: someone else can now sign in to it.
+    pub(crate) async fn link_oidc_identity_in(
         db: &SqlitePool,
         id: &str,
+        issuer: &str,
         subject: &str,
     ) -> Result<bool, String> {
         let done = sqlx::query(
-            "UPDATE users SET oidc_subject = ?, credentials_version = credentials_version + 1 \
+            "UPDATE users SET oidc_issuer = ?, oidc_subject = ?, \
+             credentials_version = credentials_version + 1 \
              WHERE id = ? AND oidc_subject IS NULL",
         )
+        .bind(issuer)
         .bind(subject)
         .bind(id)
         .execute(db)
@@ -384,18 +394,20 @@ impl User {
     pub(crate) async fn create_oidc_in(
         db: &SqlitePool,
         username: &str,
+        issuer: &str,
         subject: &str,
     ) -> Result<User, UserChangeError> {
         sqlx::query_as::<_, User>(
             "INSERT INTO users (id, username, password_hash, navidrome_status, changelog_seen, \
-             role, oidc_subject) VALUES (?, ?, ?, ?, ?, CASE WHEN EXISTS (SELECT 1 FROM users \
-             WHERE role = 'admin') THEN 'user' ELSE 'admin' END, ?) RETURNING *",
+             role, oidc_issuer, oidc_subject) VALUES (?, ?, ?, ?, ?, CASE WHEN EXISTS (SELECT 1 \
+             FROM users WHERE role = 'admin') THEN 'user' ELSE 'admin' END, ?, ?) RETURNING *",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(username)
         .bind(NO_PASSWORD)
         .bind(shared::system::NavidromeStatus::Unknown.as_str())
         .bind(shared::changelog::running_version().to_string())
+        .bind(issuer)
         .bind(subject)
         .fetch_one(db)
         .await
@@ -541,6 +553,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version_of(&db, &user.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_oidc_identity_belongs_to_one_account() {
+        let db = test_db::migrated().await;
+        let a = User::create_in(&db, "a", "pw").await.unwrap();
+        let b = User::create_in(&db, "b", "pw").await.unwrap();
+        assert!(User::link_oidc_identity_in(&db, &a.id, "https://id", "1")
+            .await
+            .unwrap());
+        // An account keeps the identity it has.
+        assert!(!User::link_oidc_identity_in(&db, &a.id, "https://id", "2")
+            .await
+            .unwrap());
+        let a = User::find_by_id_in(&db, &a.id).await.unwrap().unwrap();
+        assert_eq!(a.oidc_subject.as_deref(), Some("1"));
+        assert_eq!(a.credentials_version, 1);
+        // The pair is unique; the same subject at another issuer is not.
+        assert!(User::link_oidc_identity_in(&db, &b.id, "https://id", "1")
+            .await
+            .is_err());
+        assert!(
+            User::link_oidc_identity_in(&db, &b.id, "https://other", "1")
+                .await
+                .unwrap()
+        );
+        // Never one half of an identity.
+        assert!(
+            sqlx::query("UPDATE users SET oidc_subject = NULL WHERE id = ?")
+                .bind(&a.id)
+                .execute(&db)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -691,6 +737,7 @@ mod tests {
             navidrome_status: "unknown".into(),
             role: Role::User,
             credentials_version: 3,
+            oidc_issuer: None,
             oidc_subject: None,
         };
         let json = serde_json::to_value(user).unwrap();

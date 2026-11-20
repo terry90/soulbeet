@@ -1048,7 +1048,9 @@ mod tests {
     #[tokio::test]
     async fn a_navidrome_sign_in_connects_an_account_made_by_single_sign_on() {
         let db = test_db::migrated().await;
-        User::create_oidc_in(&db, "bob", "sub-bob").await.unwrap();
+        User::create_oidc_in(&db, "bob", "https://id.example.com", "sub-bob")
+            .await
+            .unwrap();
         let bob = signed_in(
             apply_navidrome_login(&db, "Bob", "navidrome-pw", "enc", RegistrationMode::Admin)
                 .await

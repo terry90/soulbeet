@@ -12,9 +12,9 @@
 //! serving meanwhile, so an unreachable provider does not stall every login.
 //!
 //! A successful sign-in starts the same session as a password login. An
-//! account is found by its OIDC subject; on its first sign-in, by the username
-//! claim (ignoring ASCII case, as every sign-in does), which links an existing
-//! account of that name to the identity.
+//! account is found by its OIDC identity (issuer and subject); on its first
+//! sign-in, by the username claim (ignoring ASCII case, as every sign-in
+//! does), which links an existing account of that name to the identity.
 //!
 //! A sign-in started from the login page of an app's authorize request
 //! (`/login/return`) goes back to that request afterwards.
@@ -559,6 +559,8 @@ async fn exchange_code(
 /// ID token claims. `iss`, `aud` and `exp` are also checked by `jsonwebtoken`.
 #[derive(Deserialize)]
 struct IdClaims {
+    /// Checked against the discovery document's issuer
+    iss: String,
     sub: String,
     /// A string or an array; its value is checked by `jsonwebtoken`
     aud: Value,
@@ -673,9 +675,11 @@ fn verify_id_token(
     Ok(claims)
 }
 
-/// Who signed in: the provider's stable subject and the Soulbeet username.
+/// Who signed in: the provider's stable identifier (issuer and subject,
+/// OpenID Connect Core 1.0, section 5.7) and the Soulbeet username.
 #[derive(Debug, PartialEq)]
 struct Identity {
+    issuer: String,
     subject: String,
     username: String,
 }
@@ -709,6 +713,7 @@ impl Identity {
         }
 
         Ok(Self {
+            issuer: claims.iss.clone(),
             subject: claims.sub.clone(),
             username: username.to_string(),
         })
@@ -718,13 +723,13 @@ impl Identity {
 /// Which account an identity signs in to.
 #[derive(Debug)]
 enum Account {
-    /// Already linked to this subject
+    /// Already linked to this identity
     Linked(User),
-    /// Has the username (ignoring case) and no subject yet: link it
+    /// Has the username (ignoring case) and no identity yet: link it
     Unlinked(User),
     /// Nobody has the username: create the account
     New,
-    /// The username belongs to an account linked to another subject, or
+    /// The username belongs to an account linked to another identity, or
     /// to several accounts that differ only in case
     Conflict,
     /// Nobody has the username and accounts are not created
@@ -732,8 +737,8 @@ enum Account {
 }
 
 /// `same_name`: the accounts whose username matches the identity's.
-fn choose_account(by_subject: Option<User>, same_name: NameMatch, auto_register: bool) -> Account {
-    if let Some(user) = by_subject {
+fn choose_account(by_identity: Option<User>, same_name: NameMatch, auto_register: bool) -> Account {
+    if let Some(user) = by_identity {
         return Account::Linked(user);
     }
     match same_name {
@@ -754,20 +759,20 @@ async fn find_or_create_account(
         SsoError::Failed
     };
 
-    let by_subject = User::find_by_oidc_subject_in(db, &identity.subject)
+    let by_identity = User::find_by_oidc_identity_in(db, &identity.issuer, &identity.subject)
         .await
         .map_err(db_error)?;
-    let same_name = match by_subject {
+    let same_name = match by_identity {
         Some(_) => NameMatch::None,
         None => User::find_by_name_in(db, &identity.username)
             .await
             .map_err(db_error)?,
     };
 
-    match choose_account(by_subject, same_name, auto_register) {
+    match choose_account(by_identity, same_name, auto_register) {
         Account::Linked(user) => Ok(user),
         Account::Unlinked(user) => {
-            if !User::link_oidc_subject_in(db, &user.id, &identity.subject)
+            if !User::link_oidc_identity_in(db, &user.id, &identity.issuer, &identity.subject)
                 .await
                 .map_err(db_error)?
             {
@@ -784,16 +789,19 @@ async fn find_or_create_account(
                 .map_err(db_error)?
                 .ok_or(SsoError::Failed)
         }
-        Account::New => match User::create_oidc_in(db, &identity.username, &identity.subject).await
-        {
-            Ok(user) => {
-                tracing::info!("Created the account '{}' on OIDC sign-in", user.username);
-                Ok(user)
+        Account::New => {
+            match User::create_oidc_in(db, &identity.username, &identity.issuer, &identity.subject)
+                .await
+            {
+                Ok(user) => {
+                    tracing::info!("Created the account '{}' on OIDC sign-in", user.username);
+                    Ok(user)
+                }
+                // Created by a concurrent sign-in or registration meanwhile.
+                Err(UserChangeError::UsernameTaken) => Err(SsoError::Conflict),
+                Err(e) => Err(db_error(e.to_string())),
             }
-            // Created by a concurrent sign-in or registration meanwhile.
-            Err(UserChangeError::UsernameTaken) => Err(SsoError::Conflict),
-            Err(e) => Err(db_error(e.to_string())),
-        },
+        }
         Account::Conflict => {
             tracing::warn!(
                 "OIDC sign-in refused: the account '{}' is linked to another OIDC identity, \
@@ -887,10 +895,13 @@ mod tests {
 
     #[test]
     fn identity_from_username_claim() {
-        let c = claims(json!({ "sub": "abc", "aud": "soulbeet", "preferred_username": " alice " }));
+        let c = claims(json!({
+            "iss": ISSUER, "sub": "abc", "aud": "soulbeet", "preferred_username": " alice "
+        }));
         assert_eq!(
             Identity::from_claims(&c, "preferred_username").unwrap(),
             Identity {
+                issuer: ISSUER.into(),
                 subject: "abc".into(),
                 username: "alice".into()
             }
@@ -902,12 +913,14 @@ mod tests {
     #[test]
     fn identity_refuses_unverified_email() {
         let c = claims(json!({
-            "sub": "abc", "aud": ["soulbeet"], "email": "a@example.com", "email_verified": false
+            "iss": ISSUER, "sub": "abc", "aud": ["soulbeet"], "email": "a@example.com",
+            "email_verified": false
         }));
         assert!(Identity::from_claims(&c, "email").is_err());
 
         let c = claims(json!({
-            "sub": "abc", "aud": ["soulbeet"], "email": "a@example.com", "email_verified": true
+            "iss": ISSUER, "sub": "abc", "aud": ["soulbeet"], "email": "a@example.com",
+            "email_verified": true
         }));
         assert_eq!(
             Identity::from_claims(&c, "email").unwrap().username,
@@ -1038,7 +1051,12 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
     }
 
     fn identity(subject: &str, username: &str) -> Identity {
+        identity_at(ISSUER, subject, username)
+    }
+
+    fn identity_at(issuer: &str, subject: &str, username: &str) -> Identity {
         Identity {
+            issuer: issuer.to_string(),
             subject: subject.to_string(),
             username: username.to_string(),
         }
@@ -1057,6 +1075,29 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         let again = sign_in(&db, "sub-a", "alice-renamed").await.unwrap();
         assert_eq!(again.id, created.id);
         assert_eq!(again.username, "alice");
+    }
+
+    #[tokio::test]
+    async fn the_same_subject_at_another_issuer_is_another_identity() {
+        // Providers such as Gitea number their users, so after a switch of
+        // provider the new one's user "1" must not get the old one's account.
+        let db = test_db::migrated().await;
+        let alice = sign_in(&db, "1", "alice").await.unwrap();
+        assert_eq!(alice.oidc_issuer.as_deref(), Some(ISSUER));
+
+        let other = "https://other.example.com";
+        let stranger = find_or_create_account(&db, &identity_at(other, "1", "mallory"), true)
+            .await
+            .unwrap();
+        assert_ne!(stranger.id, alice.id);
+        // Under alice's name, it is not let in either.
+        assert_eq!(
+            find_or_create_account(&db, &identity_at(other, "2", "alice"), true)
+                .await
+                .unwrap_err(),
+            SsoError::Conflict
+        );
+        assert_eq!(sign_in(&db, "1", "alice").await.unwrap().id, alice.id);
     }
 
     #[tokio::test]
