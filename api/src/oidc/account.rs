@@ -54,7 +54,9 @@ fn session_changed() -> SsoLinkResult {
 /// The link of `link_from_session` once the session is read, in one BEGIN
 /// IMMEDIATE transaction that checks the session `check` again first: a
 /// password change or a sign-out that commits after the session was read
-/// still stops the link.
+/// still stops the link. The account for this browser's new session comes
+/// from the link itself, so a change that commits after it still ends that
+/// session.
 async fn link_for_session_in(
     db: &SqlitePool,
     check: &SessionCheck,
@@ -92,7 +94,7 @@ async fn link_for_session_in(
             SsoLinkResult::IdentityTaken
         });
     }
-    match User::link_oidc_identity_in(
+    let user = match User::link_oidc_identity_in(
         &mut *tx,
         user_id,
         &identity.issuer,
@@ -102,16 +104,11 @@ async fn link_for_session_in(
     .await
     .map_err(failed)?
     {
-        OidcLink::Linked => {}
+        OidcLink::Linked(user) => *user,
         OidcLink::AccountLinked => return Err(SsoLinkResult::AlreadyLinked),
         OidcLink::IdentityTaken => return Err(SsoLinkResult::IdentityTaken),
-    }
+    };
     tx.commit().await.map_err(|e| failed(e.to_string()))?;
-
-    let user = User::find_by_id_in(db, user_id)
-        .await
-        .map_err(failed)?
-        .ok_or(SsoLinkResult::SessionChanged)?;
     tracing::info!(
         "Linked the account {} to the OIDC identity {} from its session",
         loggable(&user.username),
@@ -215,7 +212,7 @@ async fn enter_account(
     match account {
         Account::Linked(user) => with_current_name(db, identity, user).await,
         Account::Unlinked(user) => {
-            match User::link_oidc_identity_in(
+            let linked = match User::link_oidc_identity_in(
                 db,
                 &user.id,
                 &identity.issuer,
@@ -225,23 +222,19 @@ async fn enter_account(
             .await
             .map_err(db_error)?
             {
-                OidcLink::Linked => {}
+                OidcLink::Linked(linked) => *linked,
                 // Linked by a concurrent sign-in meanwhile.
                 OidcLink::AccountLinked | OidcLink::IdentityTaken => {
                     return linked_meanwhile(db, identity, || conflict(identity)).await
                 }
-            }
+            };
             tracing::info!(
                 "Linked the account {} to the OIDC identity {} by its name \
                  (OIDC_LINK_BY_USERNAME)",
-                loggable(&user.username),
+                loggable(&linked.username),
                 identity.for_log()
             );
-            // Read back: the link changed the credentials version.
-            User::find_by_id_in(db, &user.id)
-                .await
-                .map_err(db_error)?
-                .ok_or(SsoError::Failed)
+            Ok(linked)
         }
         Account::New => {
             match User::create_oidc_in(db, &identity.username, &identity.issuer, &identity.subject)

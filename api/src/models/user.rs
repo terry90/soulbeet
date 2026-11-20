@@ -118,9 +118,10 @@ pub enum NameMatch {
 
 /// What linking an account to an OpenID Connect identity did.
 #[cfg(feature = "server")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum OidcLink {
-    Linked,
+    /// The account as the link left it
+    Linked(Box<User>),
     /// The account already has an identity, or is gone: nothing changed
     AccountLinked,
     /// Another account has this identity: nothing changed
@@ -426,7 +427,9 @@ impl User {
     /// Links an account that has no OpenID Connect identity yet to the
     /// subject `subject` of `issuer`, which the provider calls `username`.
     /// Like a first link to Navidrome, it ends the account's other sessions:
-    /// someone else can now sign in to it.
+    /// someone else can now sign in to it. The account comes back from the
+    /// same statement, so a session made from it has the link's credentials
+    /// version, not that of a later change.
     pub(crate) async fn link_oidc_identity_in<'e>(
         db: impl SqliteExecutor<'e>,
         id: &str,
@@ -434,20 +437,20 @@ impl User {
         subject: &str,
         username: &str,
     ) -> Result<OidcLink, String> {
-        let done = sqlx::query(
+        let done = sqlx::query_as::<_, User>(
             "UPDATE users SET oidc_issuer = ?, oidc_subject = ?, oidc_username = ?, \
              credentials_version = credentials_version + 1 \
-             WHERE id = ? AND oidc_subject IS NULL",
+             WHERE id = ? AND oidc_subject IS NULL RETURNING *",
         )
         .bind(issuer)
         .bind(subject)
         .bind(username)
         .bind(id)
-        .execute(db)
+        .fetch_optional(db)
         .await;
         match done {
-            Ok(done) if done.rows_affected() == 1 => Ok(OidcLink::Linked),
-            Ok(_) => Ok(OidcLink::AccountLinked),
+            Ok(Some(user)) => Ok(OidcLink::Linked(Box::new(user))),
+            Ok(None) => Ok(OidcLink::AccountLinked),
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(OidcLink::IdentityTaken),
             Err(e) => Err(e.to_string()),
         }
@@ -678,36 +681,41 @@ mod tests {
                     .unwrap()
             }
         };
-        assert_eq!(
-            link(a.id.clone(), "https://id", "1").await,
-            OidcLink::Linked
-        );
+        // The link gives the account as it left it, for the session that
+        // follows.
+        let OidcLink::Linked(linked) = link(a.id.clone(), "https://id", "1").await else {
+            panic!("linked");
+        };
+        assert_eq!(linked.id, a.id);
+        assert_eq!(linked.oidc_subject.as_deref(), Some("1"));
+        assert_eq!(linked.oidc_username.as_deref(), Some("name"));
+        assert_eq!(linked.credentials_version, 1);
         // An account keeps the identity it has.
-        assert_eq!(
+        assert!(matches!(
             link(a.id.clone(), "https://id", "2").await,
             OidcLink::AccountLinked
-        );
+        ));
         let a = User::find_by_id_in(&db, &a.id).await.unwrap().unwrap();
         assert_eq!(a.oidc_subject.as_deref(), Some("1"));
         assert_eq!(a.credentials_version, 1);
         // The pair is unique; the same subject at another issuer is not.
-        assert_eq!(
+        assert!(matches!(
             link(b.id.clone(), "https://id", "1").await,
             OidcLink::IdentityTaken
-        );
+        ));
         assert_eq!(
             version_of(&db, &b.id).await,
             0,
             "a refused link changes nothing"
         );
-        assert_eq!(
+        assert!(matches!(
             link(b.id.clone(), "https://other", "1").await,
-            OidcLink::Linked
-        );
-        assert_eq!(
+            OidcLink::Linked(_)
+        ));
+        assert!(matches!(
             link("nobody".into(), "https://id", "3").await,
             OidcLink::AccountLinked
-        );
+        ));
         // Nor does a new account get an identity another one has.
         assert!(matches!(
             User::create_oidc_in(&db, "c", "https://id", "1").await,
@@ -805,12 +813,12 @@ mod tests {
         assert_eq!(version_of(&db, &a.id).await, 2);
         // The identity is free again, for this account or another.
         let b = User::create_in(&db, "b", "pw").await.unwrap();
-        assert_eq!(
+        assert!(matches!(
             User::link_oidc_identity_in(&db, &b.id, "https://id", "1", "b-at-id")
                 .await
                 .unwrap(),
-            OidcLink::Linked
-        );
+            OidcLink::Linked(_)
+        ));
     }
 
     #[tokio::test]
