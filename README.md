@@ -153,7 +153,7 @@ For discovery (optional): enable discovery on a folder in Settings > Library, pi
 
 ## Development
 
-Install Rust and `dioxus_cli`, run `./css.sh` and `dx serve --platform web`. [docs/development.md](docs/development.md) has the test commands and how to refresh the screenshots.
+To run Soulbeet from source, run the tests or refresh the screenshots, see [docs/development.md](docs/development.md).
 
 ## Roadmap
 
