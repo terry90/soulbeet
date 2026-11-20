@@ -80,6 +80,8 @@ test('a Navidrome-only user who plays music gets candidates', async ({ browser }
     expect(newest, 'a report was stored').toBeDefined();
     expect(newest?.text).toContain('Sources: Navidrome, ListenBrainz similar artists');
     expect(newest?.text).toContain(lowtideChoir.name);
+    // A stub that drifts from what a client asks shows up as a failed source.
+    expect(newest?.text, 'no source failed').not.toMatch(/ failed (once|\d+ times): /);
   } finally {
     await context.close();
   }
