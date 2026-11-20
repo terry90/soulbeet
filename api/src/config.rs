@@ -86,19 +86,25 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// Returns the default for missing or invalid values (see [`parse_bool`]).
 #[cfg(feature = "server")]
 fn parse_bool_env(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .map(|v| {
-            parse_bool(&v).unwrap_or_else(|| {
-                tracing::warn!(
-                    "Invalid boolean value '{}' for {}, using default: {}",
-                    v,
-                    key,
-                    default
-                );
-                default
-            })
-        })
-        .unwrap_or(default)
+    parse_bool_setting(key, std::env::var(key).ok().as_deref(), default)
+}
+
+/// `value`, the setting `key`, as a boolean (see [`parse_bool`]): the
+/// default when unset, and when invalid, with a warning.
+#[cfg(feature = "server")]
+fn parse_bool_setting(key: &str, value: Option<&str>, default: bool) -> bool {
+    let Some(value) = value else {
+        return default;
+    };
+    parse_bool(value).unwrap_or_else(|| {
+        tracing::warn!(
+            "Invalid boolean value '{}' for {}, using default: {}",
+            value,
+            key,
+            default
+        );
+        default
+    })
 }
 
 /// Sign-in through an OpenID Connect provider, set by the `OIDC_*` variables.
@@ -203,20 +209,19 @@ impl OidcConfig {
             scopes.insert(0, "openid".to_string());
         }
 
-        // Unset, single sign-on opens no more than REGISTRATION does: in
-        // navidrome mode only Navidrome users get accounts, in admin mode
-        // only the ones an admin creates.
-        let auto_register = match get("OIDC_AUTO_REGISTER") {
-            None => registration == RegistrationMode::Open,
-            Some(v) => parse_bool(&v)
-                .ok_or_else(|| format!("OIDC_AUTO_REGISTER has an invalid value '{v}'"))?,
-        };
-
-        let link_by_username = match get("OIDC_LINK_BY_USERNAME") {
-            None => false,
-            Some(v) => parse_bool(&v)
-                .ok_or_else(|| format!("OIDC_LINK_BY_USERNAME has an invalid value '{v}'"))?,
-        };
+        // Unset or invalid, single sign-on opens no more than REGISTRATION
+        // does: in navidrome mode only Navidrome users get accounts, in admin
+        // mode only the ones an admin creates.
+        let auto_register = parse_bool_setting(
+            "OIDC_AUTO_REGISTER",
+            get("OIDC_AUTO_REGISTER").as_deref(),
+            registration == RegistrationMode::Open,
+        );
+        let link_by_username = parse_bool_setting(
+            "OIDC_LINK_BY_USERNAME",
+            get("OIDC_LINK_BY_USERNAME").as_deref(),
+            false,
+        );
 
         Ok(Some(Self {
             issuer_url,
@@ -668,16 +673,22 @@ mod oidc_tests {
     }
 
     #[test]
-    fn invalid_auto_register_is_an_error() {
+    fn an_invalid_switch_keeps_its_default_and_single_sign_on_stays_on() {
+        // As BEETS_ALBUM_MODE: a typo is warned about and the default used.
+        // Unset auto-register opens no more than REGISTRATION already does.
         let mut vars = REQUIRED.to_vec();
-        vars.push(("OIDC_AUTO_REGISTER", "maybe"));
-        assert!(parse(&vars).unwrap_err().contains("OIDC_AUTO_REGISTER"));
-    }
-
-    #[test]
-    fn invalid_link_by_username_is_an_error() {
-        let mut vars = REQUIRED.to_vec();
-        vars.push(("OIDC_LINK_BY_USERNAME", "maybe"));
-        assert!(parse(&vars).unwrap_err().contains("OIDC_LINK_BY_USERNAME"));
+        vars.extend([
+            ("OIDC_AUTO_REGISTER", "ture"),
+            ("OIDC_LINK_BY_USERNAME", "maybe"),
+        ]);
+        for (mode, auto_register) in [
+            (RegistrationMode::Open, true),
+            (RegistrationMode::Navidrome, false),
+            (RegistrationMode::Admin, false),
+        ] {
+            let config = parse_with(&vars, None, mode).unwrap().unwrap();
+            assert_eq!(config.auto_register, auto_register, "{mode:?}");
+            assert!(!config.link_by_username, "{mode:?}");
+        }
     }
 }
