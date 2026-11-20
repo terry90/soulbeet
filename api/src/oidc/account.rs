@@ -396,13 +396,18 @@ mod tests {
     async fn links_an_existing_account_once_ignoring_case_when_allowed() {
         let db = test_db::migrated().await;
         let local = User::create_in(&db, "alice", "pw").await.unwrap();
+        let old_session = session_of(&local);
         let linked = sign_in_linking_by_name(&db, "sub-a", "Alice")
             .await
             .unwrap();
         assert_eq!(linked.id, local.id);
         assert_eq!(linked.oidc_subject.as_deref(), Some("sub-a"));
-        // Linking ends the sessions the account had.
+        // Linking ends the sessions the account had, so whoever held the
+        // name before is signed out.
         assert_eq!(linked.credentials_version, local.credentials_version + 1);
+        assert!(load_session(Some(&old_session), &db, &session_key())
+            .await
+            .is_err());
         assert!(linked.password_matches("pw"));
 
         // Another identity with that name does not get in.
