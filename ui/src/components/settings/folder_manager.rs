@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use super::panel::{
     ListRow, LoadError, Loading, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS,
 };
-use super::toggle::Toggle;
+use super::toggle::{save_switch, Toggle};
 use crate::auth::use_auth;
 use crate::{friendly_error, FieldLook, TextInput};
 
@@ -28,7 +28,7 @@ pub fn FolderManager() -> Element {
     let mut lb_username = use_signal(String::new);
     let mut lb_token = use_signal(String::new);
     let mut deezer_recommendations = use_signal(|| false);
-    let mut library_error = use_signal(String::new);
+    let library_error = use_signal(String::new);
 
     // Discovery settings state
     let mut discovery_enabled = use_signal(|| false);
@@ -300,15 +300,12 @@ pub fn FolderManager() -> Element {
                                 Toggle {
                                     on: discovery_enabled(),
                                     on_class: "bg-beet-leaf",
-                                    onclick: move |_| async move {
-                                        let new_val = !discovery_enabled();
-                                        discovery_enabled.set(new_val);
-                                        let update = api::UpdateUserSettings {
-                                            discovery_enabled: Some(new_val),
+                                    onclick: move |_| save_switch(discovery_enabled, library_error, |on| {
+                                        api::update_user_settings(api::UpdateUserSettings {
+                                            discovery_enabled: Some(on),
                                             ..Default::default()
-                                        };
-                                        let _ = api::update_user_settings(update).await;
-                                    },
+                                        })
+                                    }),
                                 }
                             }
 
@@ -535,22 +532,12 @@ pub fn FolderManager() -> Element {
                         Toggle {
                             on: deezer_recommendations(),
                             on_class: "bg-beet-leaf",
-                            onclick: move |_| async move {
-                                let new_val = !deezer_recommendations();
-                                deezer_recommendations.set(new_val);
-                                let update = api::UpdateUserSettings {
-                                    deezer_recommendations: Some(new_val),
+                            onclick: move |_| save_switch(deezer_recommendations, library_error, |on| {
+                                api::update_user_settings(api::UpdateUserSettings {
+                                    deezer_recommendations: Some(on),
                                     ..Default::default()
-                                };
-                                // Roll back so the switch never shows off while the server still sends names to Deezer
-                                match api::update_user_settings(update).await {
-                                    Ok(_) => library_error.set(String::new()),
-                                    Err(e) => {
-                                        deezer_recommendations.set(!new_val);
-                                        library_error.set(friendly_error(&e));
-                                    }
-                                }
-                            },
+                                })
+                            }),
                         }
                     }
 
@@ -565,15 +552,12 @@ pub fn FolderManager() -> Element {
                         Toggle {
                             on: auto_delete_enabled(),
                             on_class: "bg-red-500",
-                            onclick: move |_| async move {
-                                let new_val = !auto_delete_enabled();
-                                auto_delete_enabled.set(new_val);
-                                let update = api::UpdateUserSettings {
-                                    auto_delete_enabled: Some(new_val),
+                            onclick: move |_| save_switch(auto_delete_enabled, library_error, |on| {
+                                api::update_user_settings(api::UpdateUserSettings {
+                                    auto_delete_enabled: Some(on),
                                     ..Default::default()
-                                };
-                                let _ = api::update_user_settings(update).await;
-                            },
+                                })
+                            }),
                         }
                     }
 

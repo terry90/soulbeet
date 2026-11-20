@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use dioxus::prelude::*;
 
 /// A sliding switch; `on_class` is the track colour while it is on.
@@ -20,9 +22,30 @@ pub fn Toggle(on: bool, on_class: &'static str, onclick: EventHandler<MouseEvent
     }
 }
 
+/// Flips a switch and saves it. A failed save puts the switch back and shows
+/// why, so the switch never shows a state the server does not act on.
+pub(super) async fn save_switch<T, F>(
+    mut on: Signal<bool>,
+    mut error: Signal<String>,
+    save: impl FnOnce(bool) -> F,
+) where
+    F: Future<Output = Result<T, ServerFnError>>,
+{
+    let new_val = !on();
+    on.set(new_val);
+    match save(new_val).await {
+        Ok(_) => error.set(String::new()),
+        Err(e) => {
+            on.set(!new_val);
+            error.set(crate::friendly_error(&e));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::simple::ToggleDriver;
 
     fn render(app: fn() -> Element) -> String {
         let mut dom = VirtualDom::new(app);
@@ -36,5 +59,55 @@ mod tests {
         assert!(on.contains("bg-red-500") && on.contains("translate-x-5"));
         let off = render(|| rsx! { Toggle { on: false, on_class: "bg-red-500", onclick: |_| {} } });
         assert!(off.contains("bg-gray-600") && !off.contains("translate-x-5"));
+    }
+
+    /// A switch that starts on, saved by a save that fails when `fails` says so.
+    fn saved_switch(fails: bool) -> ToggleDriver {
+        ToggleDriver::new(VirtualDom::new_with_props(
+            |fails: bool| {
+                let on = use_signal(|| true);
+                let error = use_signal(|| "an old error".to_string());
+                rsx! {
+                    Toggle {
+                        on: on(),
+                        on_class: "bg-red-500",
+                        onclick: move |_| save_switch(on, error, move |_| async move {
+                            if fails {
+                                Err(ServerFnError::ServerError {
+                                    message: "Session expired".into(),
+                                    code: 401,
+                                    details: None,
+                                })
+                            } else {
+                                Ok(())
+                            }
+                        }),
+                    }
+                    p { "{error}" }
+                }
+            },
+            fails,
+        ))
+    }
+
+    #[test]
+    fn a_failed_save_puts_the_switch_back_and_shows_why() {
+        let mut switch = saved_switch(true);
+        switch.click();
+        let html = switch.html();
+        assert!(html.contains("bg-red-500"), "{html}");
+        assert!(
+            html.contains("Session expired. Please log in again."),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_saved_switch_keeps_its_new_state_and_clears_the_error() {
+        let mut switch = saved_switch(false);
+        switch.click();
+        let html = switch.html();
+        assert!(html.contains("bg-gray-600"), "{html}");
+        assert!(!html.contains("an old error"), "{html}");
     }
 }
