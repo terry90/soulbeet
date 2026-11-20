@@ -153,7 +153,7 @@ pub async fn register(username: String, password: String) -> Result<(), ServerFn
 
 /// Categorized result of a Navidrome ping attempt.
 #[cfg(feature = "server")]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum NavidromeAuthResult {
     /// Credentials accepted by Navidrome.
     Success,
@@ -526,6 +526,88 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
     }
 }
 
+/// Connects the signed-in account to Navidrome: stores the Navidrome
+/// password once Navidrome accepts it for the account's own username, as a
+/// Navidrome login does, without signing anyone out. `navidrome` asks
+/// Navidrome about the name it is given. Attempts are held back like
+/// sign-ins: a wrong password counts as a failed sign-in of that name.
+#[cfg(feature = "server")]
+async fn connect_navidrome_in<F>(
+    db: &sqlx::SqlitePool,
+    limiter: &LoginLimiter,
+    user: &auth::UserCtx,
+    encrypted_password: &str,
+    clock: impl Fn() -> std::time::Instant,
+    navidrome: impl FnOnce(String) -> F,
+) -> Result<(), ServerFnError>
+where
+    F: std::future::Future<Output = NavidromeAuthResult>,
+{
+    use shared::system::NavidromeStatus;
+
+    let attempt = limiter
+        .begin(&user.username, clock())
+        .map_err(rate_limited_error)?;
+    match navidrome(user.username.clone()).await {
+        NavidromeAuthResult::Success => {
+            attempt.succeeded();
+            models::user::User::update_navidrome_token_in(
+                db,
+                &user.user_id,
+                Some(encrypted_password),
+                NavidromeStatus::Connected.as_str(),
+            )
+            .await
+            .map_err(server_error)
+        }
+        NavidromeAuthResult::AuthFailed => {
+            attempt.failed(clock());
+            Err(refusal_error(format!(
+                "Navidrome refused this password for '{}'.",
+                user.username
+            )))
+        }
+        NavidromeAuthResult::Unreachable => Err(refusal_error(
+            "Navidrome did not answer, so nothing changed. Try again later.",
+        )),
+        NavidromeAuthResult::NotConfigured => {
+            Err(refusal_error("This server does not use Navidrome."))
+        }
+    }
+}
+
+/// Connects the signed-in account to Navidrome with its Navidrome password.
+#[post("/api/auth/navidrome/connect", auth: AuthSession)]
+pub async fn connect_navidrome(password: String) -> Result<(), ServerFnError> {
+    use crate::crypto;
+    use crate::db::DB;
+    use crate::services::evict_navidrome_client;
+    use std::time::Instant;
+
+    if password.is_empty() {
+        return Err(refusal_error("Enter your Navidrome password."));
+    }
+    let encrypted =
+        crypto::encrypt(crate::secret_key::current(), &password).map_err(server_error)?;
+    let password = &password;
+    connect_navidrome_in(
+        &DB,
+        &LOGIN_LIMITER,
+        &auth.0,
+        &encrypted,
+        Instant::now,
+        |username| async move { try_navidrome_auth(&username, password).await },
+    )
+    .await?;
+    tracing::info!("User '{}' connected Navidrome", auth.0.username);
+
+    // The banner may come back if the credentials break again.
+    let _ = models::user_settings::UserSettings::reset_navidrome_banner(&auth.0.user_id).await;
+    // A cached client still holds the old password.
+    evict_navidrome_client(&auth.0.user_id).await;
+    Ok(())
+}
+
 #[post("/api/auth/refresh", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn refresh_token() -> Result<(), ServerFnError> {
     let session = SessionCookie::for_request(&headers, &uri)?;
@@ -715,7 +797,7 @@ mod tests {
     use crate::db::test_db;
     use crate::login_limiter::{LoginBlock, FREE_FAILURES};
     use crate::models::user::User;
-    use crate::server_fns::RATE_LIMITED_CODE;
+    use crate::server_fns::{RATE_LIMITED_CODE, REFUSAL_CODE};
     use std::time::Instant;
 
     fn code(e: &ServerFnError) -> u16 {
@@ -1046,6 +1128,131 @@ mod tests {
         assert!(!after.has_password());
         assert!(!after.password_matches("navidrome-pw"));
         assert_eq!(after.oidc_subject.as_deref(), Some("sub-mallory"));
+    }
+
+    fn ctx_of(user: &User) -> crate::auth::UserCtx {
+        crate::auth::UserCtx {
+            user_id: user.id.clone(),
+            username: user.username.clone(),
+            role: user.role,
+        }
+    }
+
+    /// Connects Navidrome for `user`, Navidrome answering `result`; returns
+    /// the name Navidrome was asked about.
+    async fn connect(
+        db: &sqlx::SqlitePool,
+        limiter: &LoginLimiter,
+        user: &User,
+        now: Instant,
+        result: NavidromeAuthResult,
+    ) -> (Result<(), ServerFnError>, Option<String>) {
+        let asked = std::cell::RefCell::new(None);
+        let outcome = connect_navidrome_in(
+            db,
+            limiter,
+            &ctx_of(user),
+            "enc",
+            || now,
+            |name| {
+                *asked.borrow_mut() = Some(name);
+                async { result }
+            },
+        )
+        .await;
+        (outcome, asked.into_inner())
+    }
+
+    #[tokio::test]
+    async fn an_account_made_by_single_sign_on_connects_its_own_navidrome_name() {
+        let db = test_db::migrated().await;
+        let sso = User::create_oidc_in(&db, "bob", "https://id.example.com", "sub-bob")
+            .await
+            .unwrap();
+        let limiter = LoginLimiter::new();
+        let (outcome, asked) = connect(
+            &db,
+            &limiter,
+            &sso,
+            Instant::now(),
+            NavidromeAuthResult::Success,
+        )
+        .await;
+        outcome.unwrap();
+        // Navidrome is asked about the account's own name, nobody else's.
+        assert_eq!(asked.as_deref(), Some("bob"));
+        let after = row(&db, "bob").await.unwrap();
+        assert_eq!(after.navidrome_token.as_deref(), Some("enc"));
+        assert_eq!(after.navidrome_status, "connected");
+        // Nobody is signed out, and nothing else about the account changes.
+        assert_eq!(after.credentials_version, sso.credentials_version);
+        assert!(!after.has_password());
+        assert_eq!(after.oidc_subject.as_deref(), Some("sub-bob"));
+    }
+
+    #[tokio::test]
+    async fn an_account_with_its_own_password_connects_navidrome_too() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "soulbeet-pw").await.unwrap();
+        let (outcome, _) = connect(
+            &db,
+            &LoginLimiter::new(),
+            &ann,
+            Instant::now(),
+            NavidromeAuthResult::Success,
+        )
+        .await;
+        outcome.unwrap();
+        let after = row(&db, "ann").await.unwrap();
+        assert_eq!(after.navidrome_token.as_deref(), Some("enc"));
+        assert_eq!(after.credentials_version, ann.credentials_version);
+        assert!(after.password_matches("soulbeet-pw"));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_navidrome_password_connects_nothing_and_counts_as_a_failed_sign_in() {
+        // Mallory made "bob" through single sign-on: guessing Navidrome Bob's
+        // password from her session is held back like the login form.
+        let db = test_db::migrated().await;
+        let sso = User::create_oidc_in(&db, "bob", "https://id.example.com", "sub-mallory")
+            .await
+            .unwrap();
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..=FREE_FAILURES {
+            let (outcome, _) =
+                connect(&db, &limiter, &sso, now, NavidromeAuthResult::AuthFailed).await;
+            // Not a 401: the session stays.
+            assert_eq!(code(&outcome.unwrap_err()), REFUSAL_CODE);
+        }
+        let (outcome, asked) =
+            connect(&db, &limiter, &sso, now, NavidromeAuthResult::Success).await;
+        assert_eq!(code(&outcome.unwrap_err()), RATE_LIMITED_CODE);
+        assert_eq!(asked, None);
+        // The login form shares the count.
+        assert!(limiter.begin("BOB", now).is_err());
+        let after = row(&db, "bob").await.unwrap();
+        assert_eq!(after.navidrome_token, None);
+        assert_eq!(after.navidrome_status, sso.navidrome_status);
+    }
+
+    #[tokio::test]
+    async fn no_verdict_from_navidrome_connects_nothing_and_counts_nothing() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for result in [
+            NavidromeAuthResult::Unreachable,
+            NavidromeAuthResult::NotConfigured,
+        ] {
+            for _ in 0..=FREE_FAILURES {
+                let (outcome, _) = connect(&db, &limiter, &ann, now, result).await;
+                assert_eq!(code(&outcome.unwrap_err()), REFUSAL_CODE);
+            }
+        }
+        assert!(limiter.begin("ann", now).is_ok());
+        assert_eq!(row(&db, "ann").await.unwrap().navidrome_token, None);
     }
 
     #[tokio::test]
