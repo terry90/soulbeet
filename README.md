@@ -223,7 +223,7 @@ How accounts are matched:
 -   An account is tied to the provider's user (its issuer and `sub`), so renaming the user at the provider does not change accounts. A first sign-in never takes an existing account: if an account named by `OIDC_USERNAME_CLAIM` already exists (ignoring letter case, like every sign-in), the sign-in is refused. The owner of that account signs in with its password and links single sign-on in Settings.
 -   `OIDC_LINK_BY_USERNAME=true` makes a first sign-in link the existing account of that name instead, which signs that account out of its other sessions. Turn it on only if you alone decide the usernames at the provider. Anyone who can choose that name at the provider, or who holds the account of that name in Soulbeet, ends up with the account.
 -   With no account of that name, one is created as a plain user, unless `REGISTRATION=admin` (or `OIDC_AUTO_REGISTER=false`). Restrict who may sign in at the provider (Pocket ID: allowed user groups on the client).
--   With `OIDC_USERNAME_CLAIM=email`, an address the provider marks as unverified is refused.
+-   With `OIDC_USERNAME_CLAIM=email`, a sign-in is accepted only when the provider says the address is verified (`email_verified` is `true`). A missing or any other value is refused.
 -   **Navidrome**: an account created through single sign-on has no password and no Navidrome password yet, and a banner says so. Log in once with your Navidrome username and password to connect it; both ways of signing in then reach the same account. Use the same username in Navidrome and at the provider.
 -   Signing in from an MCP client's authorization page goes back to it afterwards, as a password sign-in does.
 

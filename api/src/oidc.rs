@@ -708,11 +708,28 @@ impl Identity {
             ));
         }
 
-        // An unverified address must not take over the account of that name.
-        if username_claim == "email"
-            && claims.other.get("email_verified").and_then(Value::as_bool) == Some(false)
-        {
-            return Err(format!("the email '{username}' is not verified"));
+        // An address is a name only once the provider asserts it is verified:
+        // the boolean true (OpenID Connect Core 1.0, section 5.1). Anything
+        // else asserts nothing.
+        if username_claim == "email" {
+            let email = loggable(username);
+            match claims.other.get("email_verified") {
+                Some(Value::Bool(true)) => {}
+                Some(Value::Bool(false)) => {
+                    return Err(format!("the email {email} is not verified"));
+                }
+                None => {
+                    return Err(format!(
+                        "the ID token has no email_verified claim for the email {email}"
+                    ));
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "email_verified is not a boolean ({}) for the email {email}",
+                        loggable(&other.to_string())
+                    ));
+                }
+            }
         }
 
         Ok(Self {
@@ -930,20 +947,28 @@ mod tests {
 
     #[test]
     fn identity_refuses_unverified_email() {
-        let c = claims(json!({
-            "iss": ISSUER, "sub": "abc", "aud": ["soulbeet"], "email": "a@example.com",
-            "email_verified": false
-        }));
-        assert!(Identity::from_claims(&c, "email").is_err());
+        let with_verified = |verified: Option<Value>| {
+            let mut c = json!({
+                "iss": ISSUER, "sub": "abc", "aud": ["soulbeet"], "email": "a@example.com"
+            });
+            if let Some(verified) = verified {
+                c["email_verified"] = verified;
+            }
+            Identity::from_claims(&claims(c), "email")
+        };
 
-        let c = claims(json!({
-            "iss": ISSUER, "sub": "abc", "aud": ["soulbeet"], "email": "a@example.com",
-            "email_verified": true
-        }));
         assert_eq!(
-            Identity::from_claims(&c, "email").unwrap().username,
+            with_verified(Some(json!(true))).unwrap().username,
             "a@example.com"
         );
+        // Only the boolean true asserts a verified address (OpenID Connect
+        // Core 1.0, section 5.1); each refusal says why.
+        let refusal = |verified| with_verified(verified).unwrap_err();
+        assert!(refusal(Some(json!(false))).contains("not verified"));
+        assert!(refusal(None).contains("no email_verified"));
+        assert!(refusal(Some(json!("true"))).contains("not a boolean"));
+        assert!(refusal(Some(json!("false"))).contains("not a boolean"));
+        assert!(refusal(Some(json!(1))).contains("not a boolean"));
     }
 
     /// A throwaway Ed25519 key, only for these tests.
