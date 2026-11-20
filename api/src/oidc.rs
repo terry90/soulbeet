@@ -288,39 +288,39 @@ struct Start {
 }
 
 impl Start {
-    /// For the request `headers` and `uri`. The callback is at `pin`
-    /// (OIDC_REDIRECT_URL) when set, else at the request's address
-    /// (`public_url`, PUBLIC_URL, when set), on plain http when the browser
-    /// is: then the session cookie is not Secure either. The provider checks
-    /// the address against the ones registered there.
+    /// For the request `headers` and `uri`. The sign-in's address is `pin`
+    /// (OIDC_REDIRECT_URL) when set, else `public_url` (PUBLIC_URL) when
+    /// set, else the request's own, on plain http when the browser is. The
+    /// callback is at that address, and its cookies follow the rule of a
+    /// password login's session cookie there. The provider checks the
+    /// address against the ones registered there.
     fn for_request(
         pin: Option<&BaseUrl>,
         public_url: Option<&Result<BaseUrl, BaseUrlError>>,
         headers: &HeaderMap,
         uri: &Uri,
     ) -> Result<Start, String> {
+        // The pin is this sign-in's address, as PUBLIC_URL is a password
+        // login's: the move to it is a GET, which carries no Origin to tell
+        // plain http, so the pin's own scheme must decide.
+        let pin = pin.map(|pin| Ok(pin.clone()));
+        let address = pin.as_ref().or(public_url);
         let session =
-            SessionCookie::for_request_with(headers, uri, public_url).map_err(|e| e.to_string())?;
-        let callback = match pin {
-            Some(pin) => pin.clone(),
-            None => {
-                let base = request_base_with(headers, uri, public_url)
-                    .map_err(|e| format!("cannot tell this request's address: {e}"))?;
-                match public_url {
-                    None if !session.secure() => base.on_http(),
-                    _ => base,
-                }
-            }
+            SessionCookie::for_request_with(headers, uri, address).map_err(|e| e.to_string())?;
+        let base = request_base_with(headers, uri, address)
+            .map_err(|e| format!("cannot tell this request's address: {e}"))?;
+        let callback = match address {
+            None if !session.secure() => base.on_http(),
+            _ => base,
         };
-        // Only a pin can differ from the request's own address. The page's
-        // Origin says where the browser is; a request without one (a link, or
-        // the move to the pinned address) starts where it is.
-        let pinned = pin.is_some() || public_url.is_some();
+        // Only a pinned address can differ from the request's own. The
+        // page's Origin says where the browser is; a request without one (a
+        // link, or the move to the pinned address) starts where it is.
         let page = headers
             .get(axum::http::header::ORIGIN)
             .and_then(|origin| origin.to_str().ok())
             .and_then(|origin| BaseUrl::parse(origin).ok());
-        let elsewhere = pinned && page.is_some_and(|page| !page.same_host(&callback));
+        let elsewhere = address.is_some() && page.is_some_and(|page| !page.same_host(&callback));
         Ok(Start {
             callback,
             session,
@@ -1931,6 +1931,42 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
     }
 
     #[test]
+    fn a_sign_in_moved_to_a_plain_http_pin_keeps_its_cookies() {
+        // OIDC_REDIRECT_URL at http://nas:9765, no PUBLIC_URL, no proxy. The
+        // button is clicked on the LAN address, and the sign-in moves to the
+        // pin.
+        let pin = Some("http://nas:9765");
+        let lan = [
+            ("host", "192.168.1.10:9765"),
+            ("origin", "http://192.168.1.10:9765"),
+        ];
+        assert!(start_with(&lan, pin, None).unwrap().elsewhere);
+        // The move is a GET without an Origin, and the name alone derives
+        // https: the pin's own scheme decides, as PUBLIC_URL's does.
+        let start = start_with(&[("host", "nas:9765")], pin, None).unwrap();
+        assert!(!start.elsewhere);
+        assert_eq!(
+            start.redirect_uri(),
+            "http://nas:9765/api/auth/oidc/callback"
+        );
+        assert!(!start.session.secure());
+        let flow = new_flow(Purpose::SignIn { return_to: None }, &start);
+        assert_eq!(
+            flow_cookie("s", "v".into(), &flow.session).secure(),
+            Some(false)
+        );
+        assert!(!flow.session.secure());
+        // An https pin gives Secure cookies, also reached by a plain IP.
+        let start = start_with(
+            &[("host", "192.168.1.10:9765")],
+            Some("https://music.example.com"),
+            None,
+        )
+        .unwrap();
+        assert!(start.session.secure());
+    }
+
+    #[test]
     fn a_pinned_address_is_the_callback() {
         let lan = [("host", "192.168.1.5:9765")];
         let callback = |pin, public_url| start_with(&lan, pin, public_url).unwrap().redirect_uri();
@@ -1950,6 +1986,11 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         // login, and so does a request whose address cannot be told.
         assert!(start_with(&lan, None, Some("music.example.com")).is_err());
         assert!(start_with(&[], None, None).is_err());
+        // With OIDC_REDIRECT_URL, PUBLIC_URL plays no part.
+        assert_eq!(
+            callback(Some("https://sso.example.com"), Some("music.example.com")),
+            "https://sso.example.com/api/auth/oidc/callback"
+        );
     }
 
     #[test]
