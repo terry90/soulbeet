@@ -1,0 +1,181 @@
+//! How the signed-in user signs in besides their password: single sign-on.
+
+use api::auth::{SignInMethods, SsoLinkResult};
+use api::{start_sso_link, unlink_sso};
+use dioxus::prelude::*;
+
+use super::panel::{Messages, LABEL_CLASS};
+use crate::auth::use_auth;
+use crate::components::friendly_error;
+
+const NOTE_CLASS: &str = "text-xs text-gray-500 font-mono";
+
+/// What the link that came back from the provider says, as the panel's
+/// first error or success text.
+fn link_messages(result: Option<SsoLinkResult>) -> (String, String) {
+    match result {
+        None => (String::new(), String::new()),
+        Some(SsoLinkResult::Linked) => (String::new(), SsoLinkResult::Linked.message().into()),
+        Some(failed) => (failed.message().into(), String::new()),
+    }
+}
+
+/// Links the account to the single sign-on provider, or removes the link.
+/// Shows nothing while single sign-on is off and the account has no link.
+/// `result` is how a link that just came back from the provider ended.
+#[component]
+pub(super) fn SingleSignOnSection(
+    methods: SignInMethods,
+    result: Option<SsoLinkResult>,
+    on_change: EventHandler<()>,
+) -> Element {
+    let auth = use_auth();
+    let mut error = use_signal(|| link_messages(result).0);
+    let mut success = use_signal(|| link_messages(result).1);
+    let mut leaving = use_signal(|| false);
+
+    let link = move |_| async move {
+        error.set(String::new());
+        success.set(String::new());
+        leaving.set(true);
+        match auth.call(start_sso_link()).await {
+            // A full page load: the provider's sign-in page, then back.
+            Ok(url) => {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.location().set_href(&url);
+                }
+            }
+            Err(e) => {
+                error.set(friendly_error(&e));
+                leaving.set(false);
+            }
+        }
+    };
+
+    let unlink = move |_| async move {
+        error.set(String::new());
+        success.set(String::new());
+        let Some(user_id) = auth.user_id() else {
+            return;
+        };
+        match auth.call(unlink_sso(user_id)).await {
+            Ok(()) => {
+                success.set("Single sign-on unlinked".to_string());
+                on_change.call(());
+            }
+            Err(e) => error.set(friendly_error(&e)),
+        }
+    };
+
+    if !methods.sso_linked && methods.sso_provider.is_none() {
+        return rsx! {};
+    }
+    let provider = methods
+        .sso_provider
+        .clone()
+        .unwrap_or_else(|| "single sign-on".to_string());
+
+    rsx! {
+      div { class: "mt-6",
+        label { class: LABEL_CLASS, "Single sign-on" }
+        Messages { error: error(), success: success() }
+        if methods.sso_linked {
+          p { class: NOTE_CLASS, "This account signs in with {provider}." }
+          if methods.sso_unlink_allowed {
+            button { class: "retro-btn mt-2 rounded", onclick: unlink, "Unlink" }
+          } else {
+            p { class: "{NOTE_CLASS} mt-2",
+              "To unlink it, first set a password or connect Navidrome, so you can still sign in."
+            }
+          }
+        } else {
+          p { class: NOTE_CLASS, "Link this account to {provider} to sign in with it." }
+          button {
+            class: "retro-btn mt-2 rounded",
+            disabled: leaving(),
+            onclick: link,
+            "Link single sign-on"
+          }
+        }
+      }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(methods: SignInMethods, result: Option<SsoLinkResult>) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |(methods, result): (SignInMethods, Option<SsoLinkResult>)| {
+                let signed_out = use_signal(|| None);
+                use_context_provider(|| crate::auth::Auth::new(signed_out));
+                rsx! {
+                    SingleSignOnSection { methods, result, on_change: |_| {} }
+                }
+            },
+            (methods, result),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn offered() -> SignInMethods {
+        SignInMethods {
+            sso_provider: Some("Pocket ID".into()),
+            ..SignInMethods::default()
+        }
+    }
+
+    #[test]
+    fn an_unlinked_account_is_offered_the_link() {
+        let html = render(offered(), None);
+        assert!(html.contains("Link this account to Pocket ID"), "{html}");
+        assert!(html.contains("Link single sign-on"), "{html}");
+        assert!(!html.contains("Unlink"), "{html}");
+    }
+
+    #[test]
+    fn nothing_shows_while_single_sign_on_is_off_and_unused() {
+        assert_eq!(render(SignInMethods::default(), None), "");
+    }
+
+    #[test]
+    fn a_linked_account_unlinks_only_when_it_keeps_a_way_in() {
+        let linked = SignInMethods {
+            sso_linked: true,
+            ..offered()
+        };
+        let html = render(linked.clone(), None);
+        assert!(html.contains("signs in with Pocket ID"), "{html}");
+        assert!(
+            html.contains("first set a password or connect Navidrome"),
+            "{html}"
+        );
+        assert!(!html.contains(">Unlink<"), "{html}");
+
+        let html = render(
+            SignInMethods {
+                sso_unlink_allowed: true,
+                ..linked
+            },
+            None,
+        );
+        assert!(html.contains(">Unlink<"), "{html}");
+    }
+
+    #[test]
+    fn the_outcome_of_a_link_is_shown() {
+        let html = render(offered(), Some(SsoLinkResult::IdentityTaken));
+        assert!(
+            html.contains(SsoLinkResult::IdentityTaken.message()),
+            "{html}"
+        );
+        let linked = SignInMethods {
+            sso_linked: true,
+            ..offered()
+        };
+        let html = render(linked, Some(SsoLinkResult::Linked));
+        assert!(html.contains(SsoLinkResult::Linked.message()), "{html}");
+    }
+}

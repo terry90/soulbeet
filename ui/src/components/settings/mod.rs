@@ -8,6 +8,7 @@ mod panel;
 mod preferences;
 mod remote_access;
 mod security_status;
+mod sign_in_methods;
 mod user_manager;
 
 pub use app_config::{AppConfigManager, ConnectionStatusPanel};

@@ -1,12 +1,15 @@
-use api::auth::Role;
+use api::auth::{Role, SsoLinkResult};
 use api::models::user::UserSummary;
 use api::{
-    create_user, delete_user, get_users, set_user_role, unlink_sso, update_user_password,
-    update_username,
+    create_user, delete_user, get_sign_in_methods, get_users, set_user_role, unlink_sso,
+    update_user_password, update_username,
 };
 use dioxus::prelude::*;
 
-use super::panel::{ListRow, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS};
+use super::panel::{
+    ListRow, LoadError, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS,
+};
+use super::sign_in_methods::SingleSignOnSection;
 use crate::auth::use_auth;
 use crate::components::friendly_error;
 use crate::{FieldLook, TextInput};
@@ -26,14 +29,18 @@ fn sign_in_tags(user: &UserSummary) -> Vec<&'static str> {
     tags
 }
 
-/// The signed-in user's own username and password, for every role.
+/// The signed-in user's own username, password and other ways to sign in,
+/// for every role. `sso_result` is how a single sign-on link that just came
+/// back from the provider ended.
 #[component]
-pub fn AccountPanel() -> Element {
+pub fn AccountPanel(sso_result: Option<SsoLinkResult>) -> Element {
+    let auth = use_auth();
+    let mut sign_in_methods =
+        use_resource(move || async move { auth.call(get_sign_in_methods()).await });
     let mut new_username = use_signal(|| "".to_string());
     let mut new_password = use_signal(|| "".to_string());
     let mut error = use_signal(|| "".to_string());
     let mut success_msg = use_signal(|| "".to_string());
-    let auth = use_auth();
 
     let handle_rename = move |_| async move {
         error.set("".to_string());
@@ -98,6 +105,25 @@ pub fn AccountPanel() -> Element {
             password: true,
           }
           button { class: "retro-btn mt-2 rounded", onclick: handle_password, "Change Password" }
+        }
+
+        match &*sign_in_methods.read() {
+          Some(Ok(methods)) => rsx! {
+            SingleSignOnSection {
+              methods: methods.clone(),
+              result: sso_result,
+              on_change: move |_| sign_in_methods.restart(),
+            }
+          },
+          Some(Err(e)) => rsx! {
+            div { class: "mt-6",
+              LoadError {
+                message: friendly_error(e),
+                on_retry: move |_| sign_in_methods.restart(),
+              }
+            }
+          },
+          None => rsx! {},
         }
       }
     }

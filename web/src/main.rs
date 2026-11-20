@@ -17,7 +17,7 @@ use ui::{
 };
 use views::{
     leave_login, DashboardPage, LoginErrorPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage,
-    SettingsPage, SettingsTab, SettingsTabRequest,
+    SettingsPage, SettingsTab, SettingsTabRequest, SsoLinkNotice, SsoLinkResultPage,
 };
 
 mod auth;
@@ -43,6 +43,8 @@ pub enum Route {
             DashboardPage {},
             #[route("/settings")]
             SettingsPage {},
+            #[route("/settings/sso/:code")]
+            SsoLinkResultPage { code: String },
 }
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -158,6 +160,8 @@ fn WebNavbar() -> Element {
     use_context_provider(|| SearchPrefill(search_prefill));
     let settings_tab_request = use_signal(|| None::<SettingsTab>);
     use_context_provider(|| SettingsTabRequest(settings_tab_request));
+    let sso_link_notice = use_signal(|| None::<api::auth::SsoLinkResult>);
+    use_context_provider(|| SsoLinkNotice(sso_link_notice));
 
     #[allow(unused_mut)]
     let mut auto_download_signal = use_signal(|| None::<shared::download::AutoDownloadEvent>);
@@ -487,6 +491,18 @@ mod tests {
         let route: Route = sent.parse().unwrap();
         assert_eq!(return_to_of(&route), None);
         assert_eq!(route.to_string(), sent);
+    }
+
+    #[test]
+    fn a_single_sign_on_link_comes_back_to_its_result_page() {
+        use api::auth::SsoLinkResult;
+        let route: Route = SsoLinkResult::IdentityTaken.location().parse().unwrap();
+        assert_eq!(
+            route,
+            Route::SsoLinkResultPage {
+                code: "identity_taken".into()
+            }
+        );
     }
 
     #[test]
