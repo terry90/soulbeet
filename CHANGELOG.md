@@ -4,7 +4,7 @@
 
 ### Discovery without Last.fm
 
-Soulbeet no longer uses Last.fm for anything.
+Discovery and search no longer use Last.fm.
 
 - **Discovery needs no key**: Recommendations now come from what you play and star in Navidrome, matched against ListenBrainz and MusicBrainz data; no account or API key is needed, and a ListenBrainz username adds your listens there.
 - **Optional Deezer source**: A switch in Settings > Library adds tracks from Deezer artist radios; it is off by default because it sends your artist names to Deezer.
