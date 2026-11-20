@@ -10,14 +10,15 @@ use serde::Deserialize;
 use tower_cookies::Cookies;
 
 use super::account::{link_from_session, sign_in_account};
-use super::flow::{authorization_url, flow_cookie, new_flow, take_flow, Flow, Purpose, Start};
+use super::flow::{
+    authorization_url, flow_cookie, new_flow, seal_flow, take_flow, Flow, Purpose, Start,
+};
 use super::loggable;
 use super::provider::provider;
 use super::token::{exchange_code, verify_id_token, Identity, TokenError};
 use crate::auth::{SsoError, SsoLinkResult};
 use crate::base_url::BaseUrl;
 use crate::config::{OidcConfig, CONFIG};
-use crate::crypto;
 use crate::db::DB;
 use crate::server_fns::auth::{issue_session_cookie, AUTH_COOKIE_NAME};
 
@@ -147,11 +148,7 @@ async fn begin(
         .map_err(|e| format!("cannot reach the provider: {e}"))?;
 
     let flow = new_flow(purpose, start);
-    let sealed = serde_json::to_string(&flow)
-        .map_err(|e| e.to_string())
-        .and_then(|json| crypto::encrypt(crate::secret_key::current(), &json))
-        .map_err(|e| format!("cannot seal the login state: {e}"))?;
-
+    let sealed = seal_flow(&flow, crate::secret_key::current())?;
     cookies.add(flow_cookie(&flow.state, sealed, &flow.session));
     Ok(authorization_url(&provider, config, &flow))
 }
@@ -170,7 +167,11 @@ pub(super) async fn callback(cookies: Cookies, Query(params): Query<CallbackPara
     let Some(config) = CONFIG.oidc() else {
         return to_login(SsoError::Disabled, None);
     };
-    let flow = match take_flow(&cookies, params.state.as_deref()) {
+    let flow = match take_flow(
+        &cookies,
+        params.state.as_deref(),
+        crate::secret_key::current(),
+    ) {
         Ok(flow) => flow,
         Err(error) => return to_login(error, None),
     };

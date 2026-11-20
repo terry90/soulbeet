@@ -15,6 +15,7 @@ use crate::auth::{SsoError, OIDC_CALLBACK_PATH, OIDC_LOGIN_PATH};
 use crate::base_url::{request_base_with, BaseUrl, BaseUrlError};
 use crate::config::OidcConfig;
 use crate::crypto;
+use crate::secret_key::SecretKey;
 use crate::server_fns::auth::SessionCookie;
 
 /// Prefix of the cookie that holds the state, nonce and PKCE verifier between
@@ -183,9 +184,22 @@ pub(super) fn new_flow(purpose: Purpose, start: &Start) -> Flow {
     }
 }
 
-/// The flow this browser started that the callback answers. It is single
-/// use: its cookie is dropped whatever happens next.
-pub(super) fn take_flow(cookies: &Cookies, state: Option<&str>) -> Result<Flow, SsoError> {
+/// `flow` encrypted with `key`, for its cookie: the browser can neither read
+/// nor change it.
+pub(super) fn seal_flow(flow: &Flow, key: &SecretKey) -> Result<String, String> {
+    serde_json::to_string(flow)
+        .map_err(|e| e.to_string())
+        .and_then(|json| crypto::encrypt(key, &json))
+        .map_err(|e| format!("cannot seal the login state: {e}"))
+}
+
+/// The flow this browser started that the callback answers, sealed with
+/// `key`. It is single use: its cookie is dropped whatever happens next.
+pub(super) fn take_flow(
+    cookies: &Cookies,
+    state: Option<&str>,
+    key: &SecretKey,
+) -> Result<Flow, SsoError> {
     // The state names its cookie; a callback without one matches no login.
     let sealed = state.and_then(|state| {
         let name = flow_cookie_name(state);
@@ -199,7 +213,7 @@ pub(super) fn take_flow(cookies: &Cookies, state: Option<&str>) -> Result<Flow, 
     });
 
     let flow = sealed
-        .and_then(|sealed| crypto::decrypt(crate::secret_key::current(), &sealed).ok())
+        .and_then(|sealed| crypto::decrypt(key, &sealed).ok())
         .and_then(|json| serde_json::from_str::<Flow>(&json).ok())
         .filter(|flow| flow.expires_at > chrono::Utc::now().timestamp())
         .ok_or_else(|| {
@@ -501,5 +515,152 @@ mod tests {
         );
         // A sign-in keeps the provider's session: that is the point of it.
         assert_eq!(prompt_of(Purpose::SignIn { return_to: None }), None);
+    }
+
+    /// The key the server seals flows with in these tests.
+    fn server_key() -> SecretKey {
+        SecretKey::new("k".repeat(32))
+    }
+
+    /// A new sign-in's flow and its cookie's name and sealed value.
+    fn sealed_flow(key: &SecretKey) -> (Flow, (String, String)) {
+        let flow = flow_for(Purpose::SignIn { return_to: None });
+        let cookie = (
+            flow_cookie_name(&flow.state),
+            seal_flow(&flow, key).unwrap(),
+        );
+        (flow, cookie)
+    }
+
+    /// A callback for `state` from a browser holding `cookies` (names and
+    /// values): the flow it takes, and the Set-Cookie headers it answers.
+    async fn callback(
+        state: Option<&str>,
+        cookies: &[(String, String)],
+    ) -> (Result<Flow, SsoError>, Vec<String>) {
+        use axum::{body::Body, extract::Query, routing::get, Router};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+        use tower_cookies::CookieManagerLayer;
+
+        let taken = Arc::new(Mutex::new(None));
+        let slot = taken.clone();
+        let app = Router::new()
+            .route(
+                OIDC_CALLBACK_PATH,
+                get(
+                    move |cookies: Cookies, Query(query): Query<HashMap<String, String>>| {
+                        let state = query.get("state").cloned();
+                        let flow = take_flow(&cookies, state.as_deref(), &server_key());
+                        *slot.lock().unwrap() = Some(flow);
+                        async {}
+                    },
+                ),
+            )
+            .layer(CookieManagerLayer::new());
+
+        let uri = match state {
+            Some(state) => format!("{OIDC_CALLBACK_PATH}?code=c&state={state}"),
+            None => format!("{OIDC_CALLBACK_PATH}?code=c"),
+        };
+        let mut request = axum::http::Request::get(uri);
+        if !cookies.is_empty() {
+            let header = cookies
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            request = request.header(axum::http::header::COOKIE, header);
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let set_cookies = response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        let flow = taken.lock().unwrap().take().unwrap();
+        (flow, set_cookies)
+    }
+
+    /// Whether `set_cookies` tells the browser to drop the cookie `name`.
+    fn drops(set_cookies: &[String], name: &str) -> bool {
+        set_cookies.iter().any(|header| {
+            header.starts_with(&format!("{name}=;"))
+                && header.contains(&format!("Path={FLOW_COOKIE_PATH}"))
+                && header.contains("Max-Age=0")
+        })
+    }
+
+    #[tokio::test]
+    async fn the_callback_takes_the_flow_once() {
+        let (flow, cookie) = sealed_flow(&server_key());
+        let (taken, set_cookies) = callback(Some(&flow.state), &[cookie.clone()]).await;
+        let Ok(taken) = taken else {
+            panic!("the flow this browser started is refused");
+        };
+        assert_eq!(taken.state, flow.state);
+        assert_eq!(taken.nonce, flow.nonce);
+        assert_eq!(taken.verifier, flow.verifier);
+        assert_eq!(taken.redirect_uri, flow.redirect_uri);
+        // The browser drops the cookie: a second callback with the same
+        // state, replayed or reloaded, matches no login.
+        assert!(drops(&set_cookies, &cookie.0), "{set_cookies:?}");
+        let (again, _) = callback(Some(&flow.state), &[]).await;
+        assert!(matches!(again, Err(SsoError::Failed)));
+    }
+
+    #[tokio::test]
+    async fn a_flow_cookie_the_server_did_not_seal_now_is_refused_and_dropped() {
+        let (flow, (name, _)) = sealed_flow(&server_key());
+
+        // Sealed with another key (SECRET_KEY changed, or forged).
+        let (_, (_, other_key)) = sealed_flow(&SecretKey::new("x".repeat(32)));
+        // Started more than ten minutes ago.
+        let mut expired = flow_for(Purpose::SignIn { return_to: None });
+        expired.state = flow.state.clone();
+        expired.expires_at = chrono::Utc::now().timestamp() - 1;
+        let expired = seal_flow(&expired, &server_key()).unwrap();
+        // Under this state's name, the flow of another sign-in.
+        let (_, (_, another_sign_in)) = sealed_flow(&server_key());
+
+        for (case, value) in [
+            ("another key", other_key),
+            ("expired", expired),
+            ("another state", another_sign_in),
+            ("not sealed", "garbage".to_string()),
+        ] {
+            let (taken, set_cookies) = callback(Some(&flow.state), &[(name.clone(), value)]).await;
+            assert!(matches!(taken, Err(SsoError::Failed)), "{case}");
+            assert!(drops(&set_cookies, &name), "{case}: {set_cookies:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_callback_matches_only_the_flow_its_state_names() {
+        let (first, first_cookie) = sealed_flow(&server_key());
+        let (second, second_cookie) = sealed_flow(&server_key());
+        let both = [first_cookie.clone(), second_cookie.clone()];
+
+        // Without a state, or with one this browser has no flow for (a
+        // callback someone else started), nothing matches and nothing is
+        // dropped.
+        for state in [None, Some("unknown")] {
+            let (taken, set_cookies) = callback(state, &both).await;
+            assert!(matches!(taken, Err(SsoError::Failed)), "{state:?}");
+            assert!(set_cookies.is_empty(), "{state:?}: {set_cookies:?}");
+        }
+
+        // A sign-in in another tab keeps its flow while this one ends.
+        let (taken, set_cookies) = callback(Some(&second.state), &both).await;
+        assert!(taken.is_ok_and(|flow| flow.state == second.state));
+        assert!(drops(&set_cookies, &second_cookie.0));
+        assert!(!set_cookies.iter().any(|c| c.starts_with(&first_cookie.0)));
+        let (taken, _) = callback(Some(&first.state), &[first_cookie]).await;
+        assert!(taken.is_ok_and(|flow| flow.state == first.state));
     }
 }
