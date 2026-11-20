@@ -861,6 +861,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_account_without_a_password_is_closed_to_the_password_form() {
+        // Made through single sign-on: it has no password, and no password,
+        // the empty one included, opens it, whatever Navidrome answers.
+        let db = test_db::migrated().await;
+        let sso = User::create_oidc_in(&db, "bob", "https://id.example.com", "sub-bob")
+            .await
+            .unwrap();
+        let now = Instant::now();
+        for password in ["", " ", "sub-bob", "bob"] {
+            assert!(!sso.password_matches(password), "{password:?}");
+            for result in [
+                NavidromeAuthResult::NotConfigured,
+                NavidromeAuthResult::Unreachable,
+                NavidromeAuthResult::AuthFailed,
+            ] {
+                let refused = sign_in(&db, &LoginLimiter::new(), "bob", password, now, result)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(code(&refused), 401, "{password:?}, {result:?}");
+            }
+        }
+
+        // A password an admin sets opens it.
+        User::update_password_in(&db, &sso.id, "set-by-admin")
+            .await
+            .unwrap();
+        let signed_in = sign_in(
+            &db,
+            &LoginLimiter::new(),
+            "bob",
+            "set-by-admin",
+            now,
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(signed_in, Credentials::Local { user, .. } if user.id == sso.id));
+    }
+
+    #[tokio::test]
     async fn an_unknown_user_records_a_failure() {
         let db = test_db::migrated().await;
         let limiter = LoginLimiter::new();
