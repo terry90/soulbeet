@@ -248,6 +248,7 @@ pub fn start_channel_cleanup_task() {
             // Wait 30s for server to be fully ready
             tokio::time::sleep(Duration::from_secs(30)).await;
             let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600)); // 6 hours
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
                 run_automation().await;
@@ -263,6 +264,8 @@ pub fn start_channel_cleanup_task() {
             );
             tokio::time::sleep(delay).await;
             let mut interval = tokio::time::interval(RECOMMENDATION_INTERVAL);
+            // A cycle that ran past the interval is followed by a full one, not at once.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
                 run_recommendations().await;

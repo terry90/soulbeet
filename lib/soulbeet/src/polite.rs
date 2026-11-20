@@ -109,6 +109,19 @@ fn header_secs(headers: &HeaderMap, name: &str) -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
+/// Calls in a row that end unavailable, rate limited or challenged after their retries before
+/// the client stops asking.
+const FAILED_CALLS_BEFORE_GIVING_UP: u32 = 2;
+
+/// The calls in a row that failed after their retries, and the last one's error.
+#[derive(Default)]
+struct Streak {
+    calls: u32,
+    last: Option<RemoteError>,
+}
+
+/// A client lives for one recommendation run, so a service that went down is given up on for
+/// the rest of that run only.
 pub struct PoliteClient {
     http: Client,
     base: String,
@@ -117,6 +130,7 @@ pub struct PoliteClient {
     gate: Gate,
     token: Option<String>,
     is_quota: Option<fn(&[u8]) -> bool>,
+    failed: std::sync::Mutex<Streak>,
 }
 
 impl PoliteClient {
@@ -149,6 +163,7 @@ impl PoliteClient {
             gate: gate_for(&key),
             token: None,
             is_quota: None,
+            failed: Default::default(),
         })
     }
 
@@ -206,7 +221,39 @@ impl PoliteClient {
         self.pace.backoff * 2u32.pow(attempt)
     }
 
+    /// Once the service has failed `FAILED_CALLS_BEFORE_GIVING_UP` calls in a row, answers with
+    /// the last failure and sends nothing; any other outcome starts the count again.
     async fn send<B: Serialize + ?Sized, T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<Option<T>, RemoteError> {
+        let given_up = {
+            let failed = self.failed.lock().unwrap();
+            (failed.calls >= FAILED_CALLS_BEFORE_GIVING_UP).then(|| failed.last.clone())
+        };
+        if let Some(Some(e)) = given_up {
+            return Err(e);
+        }
+        let result = self.exchange(method, path, body).await;
+        let mut failed = self.failed.lock().unwrap();
+        match &result {
+            Err(
+                e @ (RemoteError::Unavailable { .. }
+                | RemoteError::RateLimited { .. }
+                | RemoteError::Challenged { .. }),
+            ) => {
+                failed.calls += 1;
+                failed.last = Some(e.clone());
+            }
+            _ => *failed = Streak::default(),
+        }
+        result
+    }
+
+    /// One call, with its retries.
+    async fn exchange<B: Serialize + ?Sized, T: DeserializeOwned>(
         &self,
         method: Method,
         path: &str,
@@ -439,6 +486,59 @@ mod tests {
             })
         );
         assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    fn bad_gateway() -> Reply {
+        Reply {
+            status: 502,
+            body: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn after_two_calls_in_a_row_fail_the_client_stops_asking() {
+        let (base, seen) = serve((0..8).map(|_| bad_gateway()).collect());
+        let c = PoliteClient::new(&base, "ListenBrainz", Pace::immediate()).unwrap();
+        let down = Err(RemoteError::Unavailable {
+            service: "ListenBrainz",
+            detail: "HTTP 502".into(),
+        });
+        assert_eq!(c.get::<Vec<u8>>("/a").await, down);
+        assert_eq!(c.get::<Vec<u8>>("/b").await, down);
+        assert_eq!(seen.lock().unwrap().len(), 8);
+        assert_eq!(c.get::<Vec<u8>>("/c").await, down);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            8,
+            "the third call sends nothing"
+        );
+
+        // The next run builds its own client, which asks again.
+        let (base, seen) = serve(vec![ok("[5]")]);
+        let fresh = PoliteClient::new(&base, "ListenBrainz", Pace::immediate()).unwrap();
+        assert_eq!(fresh.get::<Vec<u8>>("/c").await.unwrap(), Some(vec![5]));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_between_failures_starts_the_count_again() {
+        let mut replies: Vec<Reply> = (0..4).map(|_| bad_gateway()).collect();
+        replies.push(Reply {
+            status: 404,
+            body: "unknown".into(),
+        });
+        replies.extend((0..4).map(|_| bad_gateway()));
+        replies.push(ok("[6]"));
+        let (base, seen) = serve(replies);
+        let c = PoliteClient::new(&base, "ListenBrainz", Pace::immediate()).unwrap();
+        assert!(c.get::<Vec<u8>>("/a").await.is_err());
+        assert!(matches!(
+            c.get::<Vec<u8>>("/b").await,
+            Err(RemoteError::Status { status: 404, .. })
+        ));
+        assert!(c.get::<Vec<u8>>("/c").await.is_err());
+        assert_eq!(c.get::<Vec<u8>>("/d").await.unwrap(), Some(vec![6]));
+        assert_eq!(seen.lock().unwrap().len(), 10);
     }
 
     #[tokio::test]
