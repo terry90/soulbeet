@@ -199,7 +199,8 @@ async fn find_or_create_account(
             .await
             .map_err(db_error)?,
     };
-    enter_account(db, identity, choose_account(by_identity, same_name, config)).await
+    let account = choose_account(by_identity, same_name, config);
+    enter_account(db, identity, config, account).await
 }
 
 /// Signs `identity` in to `account`, as chosen from what the database held
@@ -207,6 +208,7 @@ async fn find_or_create_account(
 async fn enter_account(
     db: &SqlitePool,
     identity: &Identity,
+    config: &OidcConfig,
     account: Account,
 ) -> Result<User, SsoError> {
     match account {
@@ -247,11 +249,8 @@ async fn enter_account(
                     );
                     Ok(user)
                 }
-                // Created by a concurrent sign-in or registration meanwhile:
-                // the name, or the identity, is taken now.
-                Err(UserChangeError::UsernameTaken) => {
-                    linked_meanwhile(db, identity, || conflict(identity)).await
-                }
+                // Created by a concurrent sign-in or registration meanwhile.
+                Err(UserChangeError::UsernameTaken) => name_taken(db, identity, config).await,
                 Err(e) => linked_meanwhile(db, identity, || db_error(e.to_string())).await,
             }
         }
@@ -310,6 +309,33 @@ async fn linked_meanwhile(
     {
         Some(user) => with_current_name(db, identity, user).await,
         None => Err(otherwise()),
+    }
+}
+
+/// After the account creation for `identity` found its name taken: the
+/// account this identity has now if another sign-in of it made one, else
+/// what the account of that name allows, as on any first sign-in.
+async fn name_taken(
+    db: &SqlitePool,
+    identity: &Identity,
+    config: &OidcConfig,
+) -> Result<User, SsoError> {
+    if let Some(user) = User::find_by_oidc_identity_in(db, &identity.issuer, &identity.subject)
+        .await
+        .map_err(db_error)?
+    {
+        return with_current_name(db, identity, user).await;
+    }
+    let same_name = User::find_by_name_in(db, &identity.username)
+        .await
+        .map_err(db_error)?;
+    match choose_account(None, same_name, config) {
+        // Not created twice: the name was freed again meanwhile.
+        Account::New | Account::NotRegistered => Err(db_error(format!(
+            "the account {} was created and removed again during the sign-in",
+            loggable(&identity.username)
+        ))),
+        account => Box::pin(enter_account(db, identity, config, account)).await,
     }
 }
 
@@ -526,7 +552,7 @@ mod tests {
     ) -> Result<User, SsoError> {
         // The faster one finishes first.
         let first = find_or_create_account(db, ann, config).await.unwrap();
-        let second = enter_account(db, ann, planned).await;
+        let second = enter_account(db, ann, config, planned).await;
         if let Ok(user) = &second {
             assert_eq!(user.id, first.id);
         }
@@ -567,7 +593,9 @@ mod tests {
         // Another identity of that name was created meanwhile.
         sign_in(&db, "sub-other", "ann").await.unwrap();
         assert_eq!(
-            enter_account(&db, &ann, Account::New).await.unwrap_err(),
+            enter_account(&db, &ann, &test_config(), Account::New)
+                .await
+                .unwrap_err(),
             SsoError::Conflict
         );
 
@@ -578,11 +606,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            enter_account(&db, &identity("sub-bob", "bob"), Account::Unlinked(bob))
-                .await
-                .unwrap_err(),
+            enter_account(
+                &db,
+                &identity("sub-bob", "bob"),
+                &test_config(),
+                Account::Unlinked(bob)
+            )
+            .await
+            .unwrap_err(),
             SsoError::Conflict
         );
+    }
+
+    #[tokio::test]
+    async fn a_first_sign_in_that_loses_the_name_to_an_unlinked_account_treats_it_as_existing() {
+        // An admin or a registration created "ann" with a password while
+        // Ann's first sign-in was creating the account.
+        let db = test_db::migrated().await;
+        let ann = identity("sub-ann", "ann");
+        let planted = User::create_in(&db, "Ann", "pw").await.unwrap();
+        assert_eq!(
+            enter_account(&db, &ann, &test_config(), Account::New)
+                .await
+                .unwrap_err(),
+            SsoError::AccountExists
+        );
+        let after = reread(&db, &planted).await;
+        assert_eq!(after.oidc_subject, None);
+        assert_eq!(after.credentials_version, planted.credentials_version);
+
+        // An admin who chose OIDC_LINK_BY_USERNAME gets the link, as on any
+        // first sign-in.
+        let by_name = OidcConfig {
+            link_by_username: true,
+            ..test_config()
+        };
+        let linked = enter_account(&db, &ann, &by_name, Account::New)
+            .await
+            .unwrap();
+        assert_eq!(linked.id, planted.id);
+        assert_eq!(linked.oidc_subject.as_deref(), Some("sub-ann"));
+        assert_eq!(user_count(&db).await, 2);
     }
 
     async fn user_count(db: &SqlitePool) -> i64 {
