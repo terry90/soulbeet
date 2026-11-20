@@ -21,6 +21,12 @@ const oidcPort = Number(process.env.OIDC_PORT ?? 5070);
 // The app and the browser reach the stub on different hosts in compose.
 const oidcIssuer = process.env.OIDC_ISSUER ?? `http://127.0.0.1:${oidcPort}`;
 const oidcBrowserUrl = process.env.OIDC_BROWSER_URL ?? oidcIssuer;
+// Where the provider may send the browser back to: the callback at each
+// address the suite reaches the app at. Set OIDC_REDIRECT_URIS (comma
+// separated) when E2E_BASE_URL names another one.
+const oidcRedirectUris = (
+  process.env.OIDC_REDIRECT_URIS ?? 'http://127.0.0.1:9765/api/auth/oidc/callback'
+).split(',');
 
 const state = new SlskdState(audioDir, downloadsDir, undefined, enqueueLatencyMs);
 setInterval(() => state.tick(), 200).unref();
@@ -46,6 +52,7 @@ const oidc = createOidcServer({
   browserUrl: oidcBrowserUrl,
   clientId: 'soulbeet-e2e',
   clientSecret: 'e2e-oidc-secret',
+  redirectUris: oidcRedirectUris,
 });
 oidc.listen(oidcPort, '0.0.0.0', () => {
   console.log(`[oidc] listening on :${oidcPort} (issuer ${oidcIssuer})`);

@@ -1,14 +1,16 @@
 // OpenID Connect provider double for the single sign-on specs. It does what
 // soulbeet relies on and checks what soulbeet must send: discovery, an
-// authorization page, the code exchange (client secret, redirect URI and
-// PKCE S256) and RS256 ID tokens with the nonce, verifiable through /jwks.
+// authorization page that only sends the browser to a registered redirect
+// URI, the code exchange (client secret, redirect URI and PKCE S256) and
+// RS256 ID tokens with the nonce, verifiable through /jwks.
 //
 // The browser and the app reach the stub on different hosts in compose
 // (127.0.0.1 vs stubs), so the discovery document gives the browser-facing
 // URL for the authorization endpoint and the app-facing one for the rest.
 //
 // The authorization page is a form: the spec types who signs in (username and
-// subject) and approves or denies, so parallel specs never share state.
+// subject, and optionally the azp, email and email_verified claims) and
+// approves or denies, so parallel specs never share state.
 
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import type { Server } from 'node:http';
@@ -21,6 +23,8 @@ export interface OidcStubOptions {
   browserUrl: string;
   clientId: string;
   clientSecret: string;
+  /** The redirect URIs registered for the client, compared exactly. */
+  redirectUris: string[];
 }
 
 interface PendingCode {
@@ -29,12 +33,29 @@ interface PendingCode {
   nonce: string;
   subject: string;
   username: string;
+  /** Claims typed on the form, sent only when given. */
+  extra: Record<string, unknown>;
 }
 
 const base64url = (data: Buffer | string): string => Buffer.from(data).toString('base64url');
 
 const escapeHtml = (value: string): string =>
   value.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+/**
+ * The optional claims typed on the authorization form: azp and email as
+ * text, email_verified as JSON, so a spec can send true, false or "true".
+ */
+function typedClaims(form: URLSearchParams): Record<string, unknown> {
+  const claims: Record<string, unknown> = {};
+  for (const name of ['azp', 'email']) {
+    const value = form.get(name);
+    if (value) claims[name] = value;
+  }
+  const verified = form.get('email_verified');
+  if (verified) claims.email_verified = JSON.parse(verified);
+  return claims;
+}
 
 export function createOidcServer(options: OidcStubOptions): Server {
   const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -78,18 +99,21 @@ export function createOidcServer(options: OidcStubOptions): Server {
         pattern: '/authorize',
         handler: ({ res, url }) => {
           const params = url.searchParams;
+          const redirectUri = params.get('redirect_uri') ?? '';
           const problem =
             params.get('response_type') !== 'code'
               ? 'response_type must be code'
               : params.get('client_id') !== options.clientId
                 ? 'unknown client_id'
-                : !params.get('redirect_uri') || !params.get('state') || !params.get('nonce')
+                : !redirectUri || !params.get('state') || !params.get('nonce')
                   ? 'redirect_uri, state and nonce are required'
-                  : params.get('code_challenge_method') !== 'S256' || !params.get('code_challenge')
-                    ? 'PKCE S256 is required'
-                    : !params.get('scope')?.split(' ').includes('openid')
-                      ? 'the openid scope is required'
-                      : null;
+                  : !options.redirectUris.includes(redirectUri)
+                    ? `redirect_uri ${redirectUri} is not registered`
+                    : params.get('code_challenge_method') !== 'S256' || !params.get('code_challenge')
+                      ? 'PKCE S256 is required'
+                      : !params.get('scope')?.split(' ').includes('openid')
+                        ? 'the openid scope is required'
+                        : null;
           if (problem) {
             sendText(res, 400, problem);
             return;
@@ -104,6 +128,9 @@ export function createOidcServer(options: OidcStubOptions): Server {
 <form method="post" action="/authorize">${hidden}
 <label>Username <input name="username"></label>
 <label>Subject <input name="subject"></label>
+<label>Authorized party <input name="azp"></label>
+<label>Email <input name="email"></label>
+<label>Email verified (JSON) <input name="email_verified"></label>
 <button name="decision" value="approve">Approve</button>
 <button name="decision" value="deny">Deny</button>
 </form>`,
@@ -128,6 +155,7 @@ export function createOidcServer(options: OidcStubOptions): Server {
               nonce: form.get('nonce') ?? '',
               subject: form.get('subject') ?? '',
               username: form.get('username') ?? '',
+              extra: typedClaims(form),
             });
             redirect.searchParams.set('code', code);
           }
@@ -176,6 +204,7 @@ export function createOidcServer(options: OidcStubOptions): Server {
               nonce: pending.nonce,
               iat: now,
               exp: now + 300,
+              ...pending.extra,
             }),
           });
         },
