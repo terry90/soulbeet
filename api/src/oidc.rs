@@ -300,6 +300,13 @@ fn authorization_url(provider: &Provider, config: &OidcConfig, flow: &Flow) -> u
         .append_pair("nonce", &flow.nonce)
         .append_pair("code_challenge", &pkce_challenge(&flow.verifier))
         .append_pair("code_challenge_method", "S256");
+    // A link binds whoever the provider says signed in, for good. The user
+    // signs in at the provider again and so sees who that is, rather than a
+    // session someone else left open there being linked unseen (OpenID
+    // Connect Core 1.0, section 3.1.2.1).
+    if matches!(flow.purpose, Purpose::Link { .. }) {
+        url.query_pairs_mut().append_pair("prompt", "login");
+    }
     url
 }
 
@@ -1645,6 +1652,39 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
             failed_at: ago(FAILURE_BACKOFF * 2),
         };
         assert!(retry.answer(false).is_none());
+    }
+
+    fn flow_for(purpose: Purpose) -> Flow {
+        Flow {
+            state: "s".into(),
+            nonce: "n".into(),
+            verifier: "v".into(),
+            expires_at: 0,
+            purpose,
+        }
+    }
+
+    fn prompt_of(purpose: Purpose) -> Option<String> {
+        authorization_url(&test_provider(), &test_config(), &flow_for(purpose))
+            .query_pairs()
+            .find(|(name, _)| name == "prompt")
+            .map(|(_, value)| value.into_owned())
+    }
+
+    #[test]
+    fn a_link_asks_the_provider_to_sign_in_again() {
+        // A link binds whoever the provider says signed in. Without a new
+        // sign-in, a session someone else left open at the provider would be
+        // linked without anyone seeing it (OpenID Connect Core 1.0, 3.1.2.1).
+        assert_eq!(
+            prompt_of(Purpose::Link {
+                user_id: "u".into()
+            })
+            .as_deref(),
+            Some("login")
+        );
+        // A sign-in keeps the provider's session: that is the point of it.
+        assert_eq!(prompt_of(Purpose::SignIn { return_to: None }), None);
     }
 
     #[test]
