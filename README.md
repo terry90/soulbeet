@@ -226,6 +226,8 @@ How accounts are matched:
 -   **Navidrome**: an account created through single sign-on has no password and no Navidrome password yet, and a banner says so. A Navidrome login with the same username does not join it, because the provider and Navidrome may give that name to different people. Instead, the user enters their Navidrome password under **Connect Navidrome** in Settings > Users. Soulbeet checks it with Navidrome for the account's own username and stores it. Any account can do this, also to store a Navidrome password that changed.
 -   Signing in from an MCP client's authorization page goes back to it afterwards, as a password sign-in does, also after a failed single sign-on: the error page keeps the request.
 
+Signing out of Soulbeet does not sign you out of the provider. On a shared computer, sign out at the provider too, or the next person to click **Sign in with ...** gets your account.
+
 ### Upgrading to roles and folder roots
 
 The release that adds admin roles changes a few things on the first start:
