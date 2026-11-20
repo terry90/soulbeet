@@ -604,7 +604,10 @@ pub async fn connect_navidrome(password: String) -> Result<(), ServerFnError> {
         |username| async move { try_navidrome_auth(&username, password).await },
     )
     .await?;
-    tracing::info!("User '{}' connected Navidrome", auth.0.username);
+    tracing::info!(
+        "User {} connected Navidrome",
+        crate::oidc::loggable(&auth.0.username)
+    );
 
     // The banner may come back if the credentials break again.
     let _ = models::user_settings::UserSettings::reset_navidrome_banner(&auth.0.user_id).await;
