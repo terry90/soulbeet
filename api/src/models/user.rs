@@ -453,19 +453,27 @@ impl User {
         }
     }
 
-    /// Records `username`, the provider's name for the identity the account
-    /// `id` is linked to now, for Settings to show.
+    /// Records `username`, the provider's name for the identity `issuer` and
+    /// `subject` that just signed in to the account `id`, for Settings to
+    /// show. Changes nothing unless the account is linked to that identity.
     pub(crate) async fn note_oidc_username_in(
         db: &SqlitePool,
         id: &str,
+        issuer: &str,
+        subject: &str,
         username: &str,
     ) -> Result<(), String> {
-        sqlx::query("UPDATE users SET oidc_username = ? WHERE id = ? AND oidc_subject IS NOT NULL")
-            .bind(username)
-            .bind(id)
-            .execute(db)
-            .await
-            .map_err(|e| e.to_string())?;
+        sqlx::query(
+            "UPDATE users SET oidc_username = ? \
+             WHERE id = ? AND oidc_issuer = ? AND oidc_subject = ?",
+        )
+        .bind(username)
+        .bind(id)
+        .bind(issuer)
+        .bind(subject)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -741,7 +749,7 @@ mod tests {
         assert_eq!(summary.sso_name.as_deref(), Some("sso"));
 
         // The name follows the provider's, and a link always has one.
-        User::note_oidc_username_in(&db, &sso.id, "sso-renamed")
+        User::note_oidc_username_in(&db, &sso.id, "https://id", "1", "sso-renamed")
             .await
             .unwrap();
         let sso = User::find_by_id_in(&db, &sso.id).await.unwrap().unwrap();
@@ -750,7 +758,16 @@ mod tests {
             Some("sso-renamed")
         );
         assert_eq!(sso.username, "sso");
-        User::note_oidc_username_in(&db, &local.id, "nobody")
+        // Only the identity linked to the account renames its link: a
+        // sign-in of another one, at the same or another issuer, does not.
+        for (issuer, subject) in [("https://id", "2"), ("https://other", "1")] {
+            User::note_oidc_username_in(&db, &sso.id, issuer, subject, "someone-else")
+                .await
+                .unwrap();
+            let after = User::find_by_id_in(&db, &sso.id).await.unwrap().unwrap();
+            assert_eq!(after.oidc_username.as_deref(), Some("sso-renamed"));
+        }
+        User::note_oidc_username_in(&db, &local.id, "https://id", "1", "nobody")
             .await
             .unwrap();
         let local = User::find_by_id_in(&db, &local.id).await.unwrap().unwrap();

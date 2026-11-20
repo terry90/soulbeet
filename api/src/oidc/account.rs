@@ -289,9 +289,15 @@ async fn with_current_name(
     mut user: User,
 ) -> Result<User, SsoError> {
     if user.oidc_username.as_deref() != Some(identity.username.as_str()) {
-        User::note_oidc_username_in(db, &user.id, &identity.username)
-            .await
-            .map_err(db_error)?;
+        User::note_oidc_username_in(
+            db,
+            &user.id,
+            &identity.issuer,
+            &identity.subject,
+            &identity.username,
+        )
+        .await
+        .map_err(db_error)?;
         user.oidc_username = Some(identity.username.clone());
     }
     Ok(user)
