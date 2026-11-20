@@ -66,7 +66,7 @@ pub(super) fn test_config() -> OidcConfig {
         username_claim: "preferred_username".to_string(),
         provider_name: "Test".to_string(),
         auto_register: true,
-        link_by_username: false,
+        link_by_username: true,
     }
 }
 

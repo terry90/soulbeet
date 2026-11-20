@@ -130,9 +130,9 @@ pub struct OidcConfig {
     /// unset, only with `REGISTRATION=open`
     pub auto_register: bool,
     /// On a first sign-in, link the one account whose name matches the
-    /// username claim and has no identity yet. Off unless the admin, who
-    /// decides the names at the provider, turns it on: anyone who can take
-    /// that name there gets the account.
+    /// username claim and has no identity yet. On unless the admin turns it
+    /// off: right when the admin decides the names at the provider, wrong
+    /// when anyone else can take a name there, who then gets the account.
     pub link_by_username: bool,
 }
 
@@ -224,7 +224,7 @@ impl OidcConfig {
         let link_by_username = parse_bool_setting(
             "OIDC_LINK_BY_USERNAME",
             get("OIDC_LINK_BY_USERNAME").as_deref(),
-            false,
+            true,
         );
 
         Ok(Some(Self {
@@ -574,7 +574,7 @@ mod oidc_tests {
         assert_eq!(config.username_claim, "preferred_username");
         assert_eq!(config.provider_name, "SSO");
         assert!(!config.auto_register);
-        assert!(!config.link_by_username);
+        assert!(config.link_by_username);
     }
 
     #[test]
@@ -661,6 +661,24 @@ mod oidc_tests {
     }
 
     #[test]
+    fn link_by_username_is_on_unless_turned_off() {
+        let link =
+            |vars: &[(&str, &str)], mode| parse_with(vars, mode).unwrap().unwrap().link_by_username;
+        for mode in [
+            RegistrationMode::Open,
+            RegistrationMode::Navidrome,
+            RegistrationMode::Admin,
+        ] {
+            assert!(link(&REQUIRED, mode), "{mode:?}");
+            for off in ["false", "FALSE", "0", "no"] {
+                let mut vars = REQUIRED.to_vec();
+                vars.push(("OIDC_LINK_BY_USERNAME", off));
+                assert!(!link(&vars, mode), "{off} {mode:?}");
+            }
+        }
+    }
+
+    #[test]
     fn overrides() {
         let mut vars = REQUIRED.to_vec();
         vars.extend([
@@ -668,14 +686,14 @@ mod oidc_tests {
             ("OIDC_USERNAME_CLAIM", "email"),
             ("OIDC_PROVIDER_NAME", "Pocket ID"),
             ("OIDC_AUTO_REGISTER", "false"),
-            ("OIDC_LINK_BY_USERNAME", "true"),
+            ("OIDC_LINK_BY_USERNAME", "false"),
         ]);
         let config = parse(&vars).unwrap().unwrap();
         assert_eq!(config.client_secret.as_deref(), Some("s3cret"));
         assert_eq!(config.username_claim, "email");
         assert_eq!(config.provider_name, "Pocket ID");
         assert!(!config.auto_register);
-        assert!(config.link_by_username);
+        assert!(!config.link_by_username);
         assert!(!format!("{config:?}").contains("s3cret"));
     }
 
@@ -695,7 +713,7 @@ mod oidc_tests {
         ] {
             let config = parse_with(&vars, mode).unwrap().unwrap();
             assert_eq!(config.auto_register, auto_register, "{mode:?}");
-            assert!(!config.link_by_username, "{mode:?}");
+            assert!(config.link_by_username, "{mode:?}");
         }
     }
 }
