@@ -599,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn the_callback_takes_the_flow_once() {
         let (flow, cookie) = sealed_flow(&server_key());
-        let (taken, set_cookies) = callback(Some(&flow.state), &[cookie.clone()]).await;
+        let (taken, set_cookies) = callback(Some(&flow.state), std::slice::from_ref(&cookie)).await;
         let Ok(taken) = taken else {
             panic!("the flow this browser started is refused");
         };
