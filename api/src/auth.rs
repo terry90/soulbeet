@@ -159,9 +159,8 @@ impl SsoError {
             SsoError::Failed => "Single sign-on failed. The server log has the details.",
             SsoError::Denied => "Single sign-on was cancelled or refused by the provider.",
             SsoError::NotRegistered => {
-                "No Soulbeet account for this user yet. Sign in with your password first: your \
-                 Navidrome password if this server uses Navidrome, otherwise the one an admin \
-                 gave you. Then link single sign-on in Settings > Users."
+                "No Soulbeet account is linked to this single sign-on identity. Sign in with \
+                 your password first, then link single sign-on in Settings > Users."
             }
             SsoError::AccountExists => {
                 "A Soulbeet account with this username already exists. Sign in with its \
@@ -293,6 +292,18 @@ mod sso_error_tests {
         }
         // A typed or stale /login/error address still says something failed.
         assert_eq!(SsoError::from_code("nonsense"), SsoError::Failed);
+    }
+
+    #[test]
+    fn a_user_without_a_linked_account_is_sent_to_link_it() {
+        for error in [SsoError::NotRegistered, SsoError::AccountExists] {
+            let message = error.message();
+            assert!(message.contains("Sign in with"), "{message}");
+            assert!(
+                message.ends_with("then link single sign-on in Settings > Users."),
+                "{message}"
+            );
+        }
     }
 
     #[test]
