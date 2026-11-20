@@ -8,7 +8,7 @@ pub mod taste;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,8 +17,9 @@ use tracing::{info, warn};
 use crate::traits::CandidateGenerator;
 use crate::MusicKnowledge;
 use shared::recommendation::{
-    Candidate, CandidateSet, CandidateSnapshot, EngineReport, EngineState, PipelineReport,
-    ProfileConfig, ProfileSummary, SignalReport, SourceErrors, TrackRef, UserMusicProfile,
+    fold_name, Candidate, CandidateSet, CandidateSnapshot, EngineReport, EngineState,
+    PipelineReport, ProfileConfig, ProfileSummary, SignalReport, SourceErrors, TrackRef,
+    UserMusicProfile,
 };
 
 pub use taste::{build_profile, ProfileBuild};
@@ -222,7 +223,8 @@ fn profile_summary(profile: &UserMusicProfile) -> ProfileSummary {
 
 /// Fills the release year, artist MBID, listener count and genre of the
 /// `count` best candidates from the knowledge. A failed read is recorded and
-/// leaves the candidates as they are.
+/// leaves the candidates as they are. The release year needs a recording MBID,
+/// so a candidate whose source names the artist only (Deezer) gets none.
 async fn enrich(
     candidates: &mut CandidateSet,
     knowledge: &dyn MusicKnowledge,
@@ -261,6 +263,13 @@ async fn enrich(
         }
     }
 
+    // A source that names the artist only, like Deezer, needs the MBID looked up
+    // to get a listener count and a genre.
+    let mut resolver = Resolver::new(knowledge);
+    for c in best.iter_mut() {
+        resolver.fill(&mut c.artist_mbid, &c.artist, errors).await;
+    }
+
     let artists = distinct(best.iter().filter_map(|c| c.artist_mbid.clone()));
     if artists.is_empty() {
         return;
@@ -289,6 +298,57 @@ async fn enrich(
             }
         }
         Err(e) => errors.record(e.service(), &e),
+    }
+}
+
+/// Asks the knowledge once per name and run for the artist MBIDs histories
+/// and generators leave out.
+pub(crate) struct Resolver<'a> {
+    knowledge: &'a dyn MusicKnowledge,
+    answers: HashMap<String, Option<String>>,
+    failed: HashSet<String>,
+    pub(crate) failures: usize,
+}
+
+impl<'a> Resolver<'a> {
+    pub(crate) fn new(knowledge: &'a dyn MusicKnowledge) -> Self {
+        Self {
+            knowledge,
+            answers: HashMap::new(),
+            failed: HashSet::new(),
+            failures: 0,
+        }
+    }
+
+    pub(crate) async fn fill(
+        &mut self,
+        mbid: &mut Option<String>,
+        name: &str,
+        errors: &mut SourceErrors,
+    ) {
+        if mbid.is_some() {
+            return;
+        }
+        let key = fold_name(name);
+        if self.failed.contains(&key) {
+            return;
+        }
+        if let Some(answer) = self.answers.get(&key) {
+            mbid.clone_from(answer);
+            return;
+        }
+        match self.knowledge.resolve_artist(name).await {
+            Ok(answer) => {
+                mbid.clone_from(&answer);
+                self.answers.insert(key, answer);
+            }
+            // A failed lookup is not "no such artist"; it is only skipped for this run.
+            Err(e) => {
+                self.failures += 1;
+                errors.record(e.service(), &e);
+                self.failed.insert(key);
+            }
+        }
     }
 }
 
@@ -427,6 +487,51 @@ mod tests {
             (Some(2026), Some("b"), Some(900), Some("shoegaze"))
         );
         assert!(report.source_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_candidate_without_mbids_is_resolved_by_name_and_penalised_like_the_others() {
+        let quiet = ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9"];
+        let mut candidates: Vec<Candidate> = quiet
+            .iter()
+            .map(|m| {
+                let mut c = candidate("deezer", m, "t", 1.0);
+                c.artist_mbid = Some(m.to_string());
+                c
+            })
+            .collect();
+        // Deezer names the artist only.
+        candidates.push(candidate("deezer", "Famous", "Hit", 1.0));
+        let deezer: Arc<dyn CandidateGenerator> = Arc::new(FixedGenerator {
+            name: "deezer",
+            weight: 0.4,
+            candidates,
+            errors: SourceErrors::default(),
+        });
+        let knowledge = FakeKnowledge {
+            mbids: [("famous", "f")].into(),
+            users: quiet
+                .iter()
+                .zip(1..)
+                .map(|(m, n)| (*m, n))
+                .chain([("f", 1_000_000)])
+                .collect(),
+            tags: [("f", vec![tag("pop", 1.0)])].into(),
+            ..Default::default()
+        };
+        let (got, report) = recommend(&seeded(), &[deezer], &knowledge, &balanced(), 50).await;
+        let famous = got.iter().find(|c| c.artist == "Famous").unwrap();
+        let quiet_score = got.iter().find(|c| c.artist == "q1").unwrap().score;
+        assert_eq!(
+            (
+                famous.artist_mbid.as_deref(),
+                famous.artist_listener_count,
+                famous.primary_genre.as_deref()
+            ),
+            (Some("f"), Some(1_000_000), Some("pop"))
+        );
+        assert_eq!(report.diversifier_summary.popularity_penalized, 1);
+        assert!(famous.score < quiet_score);
     }
 
     #[tokio::test]

@@ -1,11 +1,12 @@
 //! The listening profile: what the user plays and stars, read from every
 //! listening history and described with the music knowledge.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::info;
 
+use super::Resolver;
 use crate::history::HistoryError;
 use crate::{ListeningHistory, MusicKnowledge};
 use shared::recommendation::{
@@ -174,51 +175,6 @@ fn required<T>(answer: Result<T, HistoryError>, errors: &mut SourceErrors) -> Op
 
 fn or_empty<T: Default>(answer: Result<T, HistoryError>, errors: &mut SourceErrors) -> T {
     required(answer, errors).unwrap_or_default()
-}
-
-/// Asks the knowledge once per name and run for the MBIDs histories leave out.
-struct Resolver<'a> {
-    knowledge: &'a dyn MusicKnowledge,
-    answers: HashMap<String, Option<String>>,
-    failed: HashSet<String>,
-    failures: usize,
-}
-
-impl<'a> Resolver<'a> {
-    fn new(knowledge: &'a dyn MusicKnowledge) -> Self {
-        Self {
-            knowledge,
-            answers: HashMap::new(),
-            failed: HashSet::new(),
-            failures: 0,
-        }
-    }
-
-    async fn fill(&mut self, mbid: &mut Option<String>, name: &str, errors: &mut SourceErrors) {
-        if mbid.is_some() {
-            return;
-        }
-        let key = fold_name(name);
-        if self.failed.contains(&key) {
-            return;
-        }
-        if let Some(answer) = self.answers.get(&key) {
-            mbid.clone_from(answer);
-            return;
-        }
-        match self.knowledge.resolve_artist(name).await {
-            Ok(answer) => {
-                mbid.clone_from(&answer);
-                self.answers.insert(key, answer);
-            }
-            // A failed lookup is not "no such artist"; it is only skipped for this run.
-            Err(e) => {
-                self.failures += 1;
-                errors.record(e.service(), &e);
-                self.failed.insert(key);
-            }
-        }
-    }
 }
 
 /// Artists played in the last 30 days, most played first.
