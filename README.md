@@ -228,7 +228,7 @@ How accounts are matched:
 
 **Warning**: by default, whoever holds a name at the provider gets the Soulbeet account of that name, admin accounts included. Unlinking an account taken this way, or an admin setting its password (which removes the link), only helps once `OIDC_LINK_BY_USERNAME` is `false` or the name at the provider is changed: the next sign-in under that name links it again.
 
-The default is fine for a family, friends or local instance where the admin runs the provider too, creates the accounts there, and people cannot pick or change their own username at the provider. With `REGISTRATION=navidrome`, the admin also creates the Navidrome accounts, so the names match there too. Then the same name means the same person, and existing Soulbeet users just click **Sign in with ...**.
+The default is fine for a family, friends or local instance where the admin runs the provider too, creates the accounts there, and people cannot pick or change their own username at the provider. Some providers let users edit their own username unless the admin turns that off (Pocket ID does by default), so check that setting before you keep the default. With `REGISTRATION=navidrome`, the admin also creates the Navidrome accounts, so the names match there too. Then the same name means the same person, and existing Soulbeet users just click **Sign in with ...**.
 
 Set `OIDC_LINK_BY_USERNAME=false` if any of these is true:
 
