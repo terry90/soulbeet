@@ -311,7 +311,7 @@ mod tests {
 
     /// What the advice to get a password from an admin says it costs.
     const LINK_AGAIN: &str =
-        "That also removes the single sign-on link, so link it again from Settings after.";
+        "If single sign-on is linked, that removes the link, so link it again from Settings after.";
 
     #[test]
     fn an_account_without_a_password_is_told_to_ask_an_admin() {

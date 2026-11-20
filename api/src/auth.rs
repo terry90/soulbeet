@@ -263,8 +263,8 @@ pub enum PasswordProof {
 /// Why an account without a password can neither link single sign-on nor
 /// set a password itself, and what the password an admin sets costs it.
 pub const NO_PASSWORD: &str = "This account has no password. Ask an admin to set one in \
-     Settings > Users. That also removes the single sign-on link, so link it again from \
-     Settings after.";
+     Settings > Users. If single sign-on is linked, that removes the link, so link it again \
+     from Settings after.";
 
 /// What the owner of an account linked to single sign-on can do before
 /// unlinking it, when it has no password (see `PasswordProof::NoPassword`):
