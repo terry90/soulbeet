@@ -10,6 +10,8 @@
 //!
 //! A failed fetch is not retried for 30 seconds, and a stale copy keeps
 //! serving meanwhile, so an unreachable provider does not stall every login.
+//! One fetch runs at a time, and a login that has a copy does not wait for
+//! it.
 //!
 //! A successful sign-in starts the same session as a password login. An
 //! account is found by its OIDC identity (issuer and subject). A first

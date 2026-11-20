@@ -1,6 +1,7 @@
 //! The provider's discovery document and signing keys, cached for an hour
 //! and fetched again at once on a key rotation.
 
+use std::future::Future;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,7 @@ pub(super) static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build the OIDC HTTP client")
 });
 
-static PROVIDER: LazyLock<Mutex<ProviderCache>> = LazyLock::new(Default::default);
+static PROVIDER: LazyLock<ProviderCache> = LazyLock::new(Default::default);
 
 /// The parts of the discovery document this flow uses.
 #[derive(Deserialize)]
@@ -75,13 +76,14 @@ pub(super) struct Provider {
     pub(super) fetched_at: Instant,
 }
 
+/// The provider as last fetched, and when a fetch last failed.
 #[derive(Default)]
-struct ProviderCache {
+struct Cached {
     provider: Option<Arc<Provider>>,
     failed_at: Option<Instant>,
 }
 
-impl ProviderCache {
+impl Cached {
     /// What the cache can answer without asking the provider: a usable copy,
     /// or, within the backoff after a failure, the stale copy or an error.
     /// `None` means fetch.
@@ -106,32 +108,78 @@ impl ProviderCache {
     }
 }
 
-/// The cached provider, fetched when missing, stale or `refresh` is set. A
-/// failed fetch keeps the stale copy, if any, and is not retried until
-/// [`FAILURE_BACKOFF`] has passed.
-pub(super) async fn provider(config: &OidcConfig, refresh: bool) -> Result<Arc<Provider>, String> {
-    let mut cache = PROVIDER.lock().await;
-    if let Some(answer) = cache.answer(refresh) {
-        return answer;
+/// The cached provider. What it holds is locked only to read or replace it,
+/// never across a fetch, and one fetch runs at a time.
+#[derive(Default)]
+struct ProviderCache {
+    cached: std::sync::Mutex<Cached>,
+    fetching: Mutex<()>,
+}
+
+impl ProviderCache {
+    fn cached(&self) -> std::sync::MutexGuard<'_, Cached> {
+        self.cached.lock().unwrap_or_else(|e| e.into_inner())
     }
-    match fetch_provider(config).await {
-        Ok(provider) => {
-            let provider = Arc::new(provider);
-            cache.provider = Some(provider.clone());
-            cache.failed_at = None;
-            Ok(provider)
+
+    /// The provider, from `fetch` when the copy is missing, stale or
+    /// `refresh` is set. While another fetch runs, a sign-in that has a copy
+    /// uses it, and one that has none or needs new keys waits for that
+    /// fetch. A failed fetch keeps the stale copy, if any, and is not retried
+    /// until [`FAILURE_BACKOFF`] has passed.
+    async fn get<F>(
+        &self,
+        refresh: bool,
+        fetch: impl FnOnce() -> F,
+    ) -> Result<Arc<Provider>, String>
+    where
+        F: Future<Output = Result<Provider, String>>,
+    {
+        if let Some(answer) = self.cached().answer(refresh) {
+            return answer;
         }
-        Err(e) => {
-            cache.failed_at = Some(Instant::now());
-            match &cache.provider {
-                Some(stale) => {
-                    tracing::warn!("OIDC: cannot refresh the provider, using the cached copy: {e}");
-                    Ok(stale.clone())
+        let _fetching = match self.fetching.try_lock() {
+            Ok(fetching) => fetching,
+            Err(_) => {
+                let stale = self.cached().provider.clone();
+                match stale {
+                    Some(stale) if !refresh => return Ok(stale),
+                    _ => self.fetching.lock().await,
                 }
-                None => Err(e),
+            }
+        };
+        // A fetch that ended meanwhile may have answered.
+        if let Some(answer) = self.cached().answer(refresh) {
+            return answer;
+        }
+
+        let fetched = fetch().await;
+        let mut cached = self.cached();
+        match fetched {
+            Ok(provider) => {
+                let provider = Arc::new(provider);
+                cached.provider = Some(provider.clone());
+                cached.failed_at = None;
+                Ok(provider)
+            }
+            Err(e) => {
+                cached.failed_at = Some(Instant::now());
+                match &cached.provider {
+                    Some(stale) => {
+                        tracing::warn!(
+                            "OIDC: cannot refresh the provider, using the cached copy: {e}"
+                        );
+                        Ok(stale.clone())
+                    }
+                    None => Err(e),
+                }
             }
         }
     }
+}
+
+/// The provider of `config`, cached (see [`ProviderCache::get`]).
+pub(super) async fn provider(config: &OidcConfig, refresh: bool) -> Result<Arc<Provider>, String> {
+    PROVIDER.get(refresh, || fetch_provider(config)).await
 }
 
 /// The endpoints a discovery document names.
@@ -275,6 +323,8 @@ mod tests {
     use crate::oidc::testing::{json_of_size, streamed, test_provider, TEST_KEY_X};
     use axum::{routing::get, Router};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
 
     #[tokio::test]
     async fn a_body_past_the_limit_is_refused() {
@@ -401,41 +451,156 @@ mod tests {
 
     #[test]
     fn provider_cache_answers() {
-        let fresh = ProviderCache {
+        let fresh = Cached {
             provider: Some(cached(Duration::from_secs(60))),
             failed_at: None,
         };
         assert!(matches!(fresh.answer(false), Some(Ok(_))));
         // A forced refresh fetches unless the copy is only seconds old.
         assert!(fresh.answer(true).is_none());
-        let just_fetched = ProviderCache {
+        let just_fetched = Cached {
             provider: Some(cached(Duration::ZERO)),
             failed_at: None,
         };
         assert!(matches!(just_fetched.answer(true), Some(Ok(_))));
 
-        let stale = ProviderCache {
+        let stale = Cached {
             provider: Some(cached(PROVIDER_TTL * 2)),
             failed_at: None,
         };
         assert!(stale.answer(false).is_none());
 
         // Right after a failure: the stale copy, or an error, without fetching.
-        let failed = ProviderCache {
+        let failed = Cached {
             provider: Some(cached(PROVIDER_TTL * 2)),
             failed_at: ago(Duration::from_secs(1)),
         };
         assert!(matches!(failed.answer(false), Some(Ok(_))));
-        let failed_empty = ProviderCache {
+        let failed_empty = Cached {
             provider: None,
             failed_at: ago(Duration::from_secs(1)),
         };
         assert!(matches!(failed_empty.answer(false), Some(Err(_))));
         // After the backoff, fetch again.
-        let retry = ProviderCache {
+        let retry = Cached {
             provider: None,
             failed_at: ago(FAILURE_BACKOFF * 2),
         };
         assert!(retry.answer(false).is_none());
+    }
+
+    /// A cache holding `provider` as fetched now and then, and the failure
+    /// at `failed_at`.
+    fn holding(provider: Option<Arc<Provider>>, failed_at: Option<Instant>) -> ProviderCache {
+        let cache = ProviderCache::default();
+        *cache.cached() = Cached {
+            provider,
+            failed_at,
+        };
+        cache
+    }
+
+    /// A fetch answering `result` at once, counted in `fetches`.
+    fn counted(
+        fetches: &AtomicUsize,
+        result: Result<Provider, String>,
+    ) -> impl FnOnce() -> std::future::Ready<Result<Provider, String>> + '_ {
+        move || {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(result)
+        }
+    }
+
+    fn renewed() -> Provider {
+        Provider {
+            issuer: "https://renewed.example.com".to_string(),
+            ..test_provider()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_fetch_runs_alone_and_holds_up_no_sign_in_that_has_a_copy() {
+        let stale = cached(PROVIDER_TTL * 2);
+        let cache = holding(Some(stale.clone()), None);
+        let (answer, answered) = tokio::sync::oneshot::channel::<()>();
+
+        // The sign-in that found the copy stale fetches, and the provider is
+        // slow to answer.
+        let slow = cache.get(false, || async {
+            answered.await.unwrap();
+            Ok(renewed())
+        });
+        tokio::pin!(slow);
+        assert!(futures::poll!(&mut slow).is_pending());
+
+        // Meanwhile another sign-in uses the stale copy at once, without a
+        // second fetch.
+        let fetches = AtomicUsize::new(0);
+        let other = cache.get(false, counted(&fetches, Ok(renewed())));
+        tokio::pin!(other);
+        let Poll::Ready(other) = futures::poll!(&mut other) else {
+            panic!("a sign-in with a copy waited for the fetch");
+        };
+        assert!(Arc::ptr_eq(&other.unwrap(), &stale));
+
+        // One that needs new keys waits for that fetch instead of starting
+        // another.
+        let forced = cache.get(true, counted(&fetches, Ok(renewed())));
+        tokio::pin!(forced);
+        assert!(futures::poll!(&mut forced).is_pending());
+
+        answer.send(()).unwrap();
+        assert_eq!(slow.await.unwrap().issuer, "https://renewed.example.com");
+        assert_eq!(forced.await.unwrap().issuer, "https://renewed.example.com");
+        assert_eq!(fetches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sign_ins_without_a_copy_wait_for_the_one_fetch() {
+        let cache = holding(None, None);
+        let (answer, answered) = tokio::sync::oneshot::channel::<()>();
+        let first = cache.get(false, || async {
+            answered.await.unwrap();
+            Err("unreachable".to_string())
+        });
+        tokio::pin!(first);
+        assert!(futures::poll!(&mut first).is_pending());
+
+        let fetches = AtomicUsize::new(0);
+        let second = cache.get(false, counted(&fetches, Ok(renewed())));
+        tokio::pin!(second);
+        assert!(futures::poll!(&mut second).is_pending());
+
+        // The fetch failed: both hear it, and the second does not ask again
+        // within the backoff.
+        answer.send(()).unwrap();
+        assert!(first.await.is_err());
+        assert!(second.await.is_err());
+        assert_eq!(fetches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_keeps_the_stale_copy_and_backs_off() {
+        let stale = cached(PROVIDER_TTL * 2);
+        let cache = holding(Some(stale.clone()), None);
+        let fetches = AtomicUsize::new(0);
+
+        let kept = cache
+            .get(false, counted(&fetches, Err("down".into())))
+            .await;
+        assert!(Arc::ptr_eq(&kept.unwrap(), &stale));
+        // Within the backoff, not even new keys are asked for.
+        for refresh in [false, true] {
+            let kept = cache.get(refresh, counted(&fetches, Ok(renewed()))).await;
+            assert!(Arc::ptr_eq(&kept.unwrap(), &stale));
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        // After it, the next sign-in fetches again.
+        cache.cached().failed_at = ago(FAILURE_BACKOFF * 2);
+        let renewed = cache.get(false, counted(&fetches, Ok(renewed()))).await;
+        assert_eq!(renewed.unwrap().issuer, "https://renewed.example.com");
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert!(cache.cached().failed_at.is_none());
     }
 }
