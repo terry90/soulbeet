@@ -316,6 +316,123 @@ mod tests {
         new_flow(Purpose::SignIn { return_to: None }, &start)
     }
 
+    /// What a token request carried: its Authorization header and its form.
+    type TokenRequest = (Option<String>, Vec<(String, String)>);
+
+    #[tokio::test]
+    async fn each_client_sends_its_credentials_the_way_the_provider_takes_them() {
+        use axum::Form;
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<TokenRequest>>> = Arc::default();
+        let record = seen.clone();
+        let app = Router::new().route(
+            "/token",
+            post(
+                move |headers: HeaderMap, Form(form): Form<Vec<(String, String)>>| {
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .map(|value| value.to_str().unwrap().to_string());
+                    record.lock().unwrap().push((authorization, form));
+                    async { axum::Json(json!({ "id_token": "the-id-token" })) }
+                },
+            ),
+        );
+        let (addr, _server) = serve_on_loopback(app).await;
+        let flow = test_flow();
+        // RFC 6749 allows any printable character in both; a colon in the
+        // id would split the Basic pair in the wrong place unless encoded.
+        let (client_id, secret) = ("soulbeet:e2e", "p@ss w:rd/+&%");
+        let exchange = |client_auth, client_secret: Option<&str>| {
+            let provider = Provider {
+                token_endpoint: url::Url::parse(&format!("http://{addr}/token")).unwrap(),
+                client_auth,
+                ..test_provider()
+            };
+            let config = OidcConfig {
+                client_id: client_id.to_string(),
+                client_secret: client_secret.map(str::to_string),
+                ..test_config()
+            };
+            let flow = &flow;
+            async move { exchange_code(&provider, &config, "the-code", flow).await }
+        };
+        let field = |form: &[(String, String)], name: &str| {
+            form.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, value)| value.clone())
+        };
+
+        for (client_auth, client_secret) in [
+            (ClientAuth::Basic, Some(secret)),
+            (ClientAuth::Post, Some(secret)),
+            (ClientAuth::Basic, None),
+            (ClientAuth::Post, None),
+        ] {
+            assert_eq!(
+                exchange(client_auth, client_secret).await.unwrap(),
+                "the-id-token"
+            );
+            let (authorization, form) = seen.lock().unwrap().pop().unwrap();
+            let case = format!("{client_auth:?}, secret {client_secret:?}");
+            // The code, sent back with the callback and verifier this flow
+            // gave the provider.
+            assert_eq!(
+                field(&form, "grant_type").as_deref(),
+                Some("authorization_code")
+            );
+            assert_eq!(field(&form, "code").as_deref(), Some("the-code"));
+            assert_eq!(
+                field(&form, "redirect_uri"),
+                Some(flow.redirect_uri.clone())
+            );
+            assert_eq!(field(&form, "code_verifier"), Some(flow.verifier.clone()));
+
+            match (client_auth, client_secret) {
+                // client_secret_basic: each half form-encoded, then Basic
+                // (RFC 6749, section 2.3.1). The form holds neither.
+                (ClientAuth::Basic, Some(_)) => {
+                    let pair = "soulbeet%3Ae2e:p%40ss+w%3Ard%2F%2B%26%25";
+                    assert_eq!(
+                        authorization,
+                        Some(format!(
+                            "Basic {}",
+                            base64::engine::general_purpose::STANDARD.encode(pair)
+                        )),
+                        "{case}"
+                    );
+                    // As the provider reads it back.
+                    let (id, password) = pair.split_once(':').unwrap();
+                    let decode = |s: &str| {
+                        url::form_urlencoded::parse(format!("x={s}").as_bytes())
+                            .next()
+                            .unwrap()
+                            .1
+                            .into_owned()
+                    };
+                    assert_eq!(
+                        (decode(id), decode(password)),
+                        (client_id.into(), secret.into())
+                    );
+                    assert_eq!(field(&form, "client_id"), None, "{case}");
+                    assert_eq!(field(&form, "client_secret"), None, "{case}");
+                }
+                // client_secret_post: both in the form.
+                (ClientAuth::Post, Some(_)) => {
+                    assert_eq!(authorization, None, "{case}");
+                    assert_eq!(field(&form, "client_id").as_deref(), Some(client_id));
+                    assert_eq!(field(&form, "client_secret").as_deref(), Some(secret));
+                }
+                // A public client: its id in the form, PKCE proves the rest.
+                (_, None) => {
+                    assert_eq!(authorization, None, "{case}");
+                    assert_eq!(field(&form, "client_id").as_deref(), Some(client_id));
+                    assert_eq!(field(&form, "client_secret"), None, "{case}");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_token_response_past_the_limit_is_refused() {
         let app = Router::new()
