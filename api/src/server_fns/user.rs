@@ -29,8 +29,9 @@ pub(crate) fn check_username_length(username: &str) -> Result<(), ServerFnError>
 }
 
 #[get("/api/users", _: AdminSession)]
-pub async fn get_users() -> Result<Vec<models::user::User>, ServerFnError> {
-    models::user::User::get_all().await.map_err(server_error)
+pub async fn get_users() -> Result<Vec<models::user::UserSummary>, ServerFnError> {
+    let users = models::user::User::get_all().await.map_err(server_error)?;
+    Ok(users.iter().map(models::user::UserSummary::from).collect())
 }
 
 /// Creates an account. Allowed in every registration mode: the mode limits

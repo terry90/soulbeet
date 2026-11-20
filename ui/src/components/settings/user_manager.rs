@@ -1,6 +1,8 @@
 use api::auth::Role;
+use api::models::user::UserSummary;
 use api::{
-    create_user, delete_user, get_users, set_user_role, update_user_password, update_username,
+    create_user, delete_user, get_users, set_user_role, unlink_sso, update_user_password,
+    update_username,
 };
 use dioxus::prelude::*;
 
@@ -10,6 +12,19 @@ use crate::components::friendly_error;
 use crate::{FieldLook, TextInput};
 
 const LINK_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer";
+const TAG_CLASS: &str = "text-xs font-mono text-gray-500 uppercase tracking-wider";
+
+/// How an account signs in, when it is not just with a password.
+fn sign_in_tags(user: &UserSummary) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    if user.sso_linked {
+        tags.push("single sign-on");
+    }
+    if !user.has_password {
+        tags.push("no password");
+    }
+    tags
+}
 
 /// The signed-in user's own username and password, for every role.
 #[component]
@@ -158,6 +173,18 @@ pub fn UserManager() -> Element {
         }
     };
 
+    let handle_unlink_sso = move |id: String| async move {
+        error.set("".to_string());
+        success_msg.set("".to_string());
+        match auth.call(unlink_sso(id)).await {
+            Ok(_) => {
+                success_msg.set("Single sign-on unlinked".to_string());
+                fetch_users().await;
+            }
+            Err(e) => error.set(friendly_error(&e)),
+        }
+    };
+
     let handle_update_password = move |id: String| async move {
         error.set("".to_string());
         success_msg.set("".to_string());
@@ -224,6 +251,8 @@ pub fn UserManager() -> Element {
                         let id_edit_pw = user.id.clone();
                         let id_role = user.id.clone();
                         let id_delete = user.id.clone();
+                        let id_unlink = user.id.clone();
+                        let tags = sign_in_tags(&user);
                         let (role_label, other_role, role_action) = if user.role.is_admin() {
                             ("admin", Role::User, "Make user")
                         } else {
@@ -256,13 +285,14 @@ pub fn UserManager() -> Element {
                               }
                             } else {
                               div { class: "flex justify-between items-center flex-wrap gap-2",
-                                div { class: "flex items-center gap-3",
+                                div { class: "flex items-center flex-wrap gap-x-3 gap-y-1",
                                   span { class: "font-bold text-white font-display", "{user.username}" }
-                                  span { class: "text-xs font-mono text-gray-500 uppercase tracking-wider",
-                                    "{role_label}"
+                                  span { class: TAG_CLASS, "{role_label}" }
+                                  for tag in tags {
+                                    span { class: TAG_CLASS, "{tag}" }
                                   }
                                 }
-                                div { class: "flex gap-3",
+                                div { class: "flex flex-wrap gap-3",
                                   button {
                                     class: LINK_BUTTON_CLASS,
                                     onclick: move |_| handle_set_role(id_role.clone(), other_role),
@@ -275,6 +305,13 @@ pub fn UserManager() -> Element {
                                         edit_user_password.set("".to_string());
                                     },
                                     "Password"
+                                  }
+                                  if user.sso_linked {
+                                    button {
+                                      class: LINK_BUTTON_CLASS,
+                                      onclick: move |_| handle_unlink_sso(id_unlink.clone()),
+                                      "Unlink SSO"
+                                    }
                                   }
                                   button {
                                     class: REMOVE_BUTTON_CLASS,
@@ -291,5 +328,30 @@ pub fn UserManager() -> Element {
           }
         }
       }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(has_password: bool, sso_linked: bool) -> UserSummary {
+        UserSummary {
+            id: "u".into(),
+            username: "ann".into(),
+            role: Role::User,
+            has_password,
+            sso_linked,
+        }
+    }
+
+    #[test]
+    fn the_list_tags_single_sign_on_and_missing_passwords() {
+        assert!(sign_in_tags(&summary(true, false)).is_empty());
+        assert_eq!(sign_in_tags(&summary(true, true)), ["single sign-on"]);
+        assert_eq!(
+            sign_in_tags(&summary(false, true)),
+            ["single sign-on", "no password"]
+        );
     }
 }

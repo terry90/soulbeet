@@ -42,6 +42,31 @@ pub struct User {
     pub oidc_subject: Option<String>,
 }
 
+/// An account as user management lists it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UserSummary {
+    pub id: String,
+    pub username: String,
+    pub role: Role,
+    /// The account signs in with a password of its own
+    pub has_password: bool,
+    /// The account is linked to an identity at the single sign-on provider
+    pub sso_linked: bool,
+}
+
+#[cfg(feature = "server")]
+impl From<&User> for UserSummary {
+    fn from(user: &User) -> Self {
+        UserSummary {
+            id: user.id.clone(),
+            username: user.username.clone(),
+            role: user.role,
+            has_password: user.has_password(),
+            sso_linked: user.oidc_subject.is_some(),
+        }
+    }
+}
+
 #[cfg(feature = "server")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum UserChangeError {
@@ -639,6 +664,27 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn the_user_list_says_who_has_a_password_and_single_sign_on() {
+        let db = test_db::migrated().await;
+        let local = User::create_in(&db, "local", "pw").await.unwrap();
+        let sso = User::create_oidc_in(&db, "sso", "https://id", "1")
+            .await
+            .unwrap();
+        assert_eq!(
+            UserSummary::from(&local),
+            UserSummary {
+                id: local.id.clone(),
+                username: "local".into(),
+                role: Role::User,
+                has_password: true,
+                sso_linked: false,
+            }
+        );
+        let sso = UserSummary::from(&sso);
+        assert!(!sso.has_password && sso.sso_linked);
     }
 
     #[tokio::test]
