@@ -198,7 +198,10 @@ async fn find_or_create_account(
                 .await
             {
                 Ok(user) => {
-                    tracing::info!("Created the account '{}' on OIDC sign-in", user.username);
+                    tracing::info!(
+                        "Created the account {} on OIDC sign-in",
+                        loggable(&user.username)
+                    );
                     Ok(user)
                 }
                 // Created by a concurrent sign-in or registration meanwhile.
@@ -216,9 +219,9 @@ async fn find_or_create_account(
         }
         Account::Conflict => {
             tracing::warn!(
-                "OIDC sign-in refused: the account '{}' is linked to another OIDC identity, \
+                "OIDC sign-in refused: the account {} is linked to another OIDC identity, \
                  or several accounts have that name in other letter case",
-                identity.username
+                loggable(&identity.username)
             );
             Err(SsoError::Conflict)
         }
@@ -237,7 +240,7 @@ async fn find_or_create_account(
 mod tests {
     use super::*;
     use crate::db::test_db;
-    use crate::oidc::testing::{identity, identity_at, test_config, ISSUER};
+    use crate::oidc::testing::{identity, identity_at, test_config, LogCapture, ISSUER};
 
     /// A first or later sign-in with the default settings, and auto-register.
     async fn sign_in(db: &SqlitePool, subject: &str, username: &str) -> Result<User, SsoError> {
@@ -324,6 +327,42 @@ mod tests {
         let after = reread(&db, &admin).await;
         assert_eq!(after.oidc_subject, None);
         assert_eq!(after.credentials_version, admin.credentials_version);
+    }
+
+    #[tokio::test]
+    async fn names_from_the_provider_cannot_forge_log_lines() {
+        let db = test_db::migrated().await;
+        let log = LogCapture::start();
+        let forged = "carol\nINFO User 'admin' signed in";
+
+        // Created under that name, refused under it for another identity,
+        // and unlinked by an admin.
+        let carol = sign_in(&db, "sub-carol", forged).await.unwrap();
+        assert_eq!(
+            sign_in(&db, "sub-other", forged).await.unwrap_err(),
+            SsoError::Conflict
+        );
+        let NameMatch::One(admin) = User::find_by_name_in(&db, "admin").await.unwrap() else {
+            panic!("the seeded admin");
+        };
+        let actor = crate::auth::UserCtx {
+            user_id: admin.id.clone(),
+            username: admin.username.clone(),
+            role: admin.role,
+        };
+        crate::server_fns::sso::unlink_sso_in(&db, &actor, &carol.id, false)
+            .await
+            .unwrap();
+
+        let lines = log.lines();
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("carol")).count(),
+            3,
+            "{lines:?}"
+        );
+        for line in lines {
+            assert!(!line.contains('\n'), "{line}");
+        }
     }
 
     #[tokio::test]

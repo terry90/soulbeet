@@ -200,8 +200,8 @@ fn checked_endpoints(discovery: &Discovery, issuer_url: &str) -> Result<Endpoint
     // issuer it was fetched for.
     if discovery.issuer.trim_end_matches('/') != issuer_url {
         return Err(format!(
-            "the discovery document names the issuer '{}', not '{issuer_url}'",
-            discovery.issuer
+            "the discovery document names the issuer {}, not '{issuer_url}'",
+            loggable(&discovery.issuer)
         ));
     }
     let issuer_on_http = url::Url::parse(issuer_url).is_ok_and(|url| url.scheme() == "http");
@@ -419,9 +419,11 @@ mod tests {
             assert!(checked_endpoints(&discovery(lan, listed), lan).is_err());
         }
 
-        // The document names the issuer it was fetched for.
-        let other = "https://other.example.com";
-        assert!(checked_endpoints(&discovery(other, secure), issuer).is_err());
+        // The document names the issuer it was fetched for, and what it
+        // names cannot forge a log line.
+        let other = "https://other.example.com\nINFO forged";
+        let refused = checked_endpoints(&discovery(other, secure), issuer).unwrap_err();
+        assert!(!refused.contains('\n'), "{refused}");
         assert!(checked_endpoints(&discovery("https://id.example.com/", secure), issuer).is_ok());
     }
 

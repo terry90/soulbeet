@@ -15,7 +15,7 @@ use crate::{
     config::CONFIG,
     db::DB,
     models::user::{User, UserChangeError},
-    oidc::LinkStartError,
+    oidc::{loggable, LinkStartError},
     AuthSession,
 };
 #[cfg(feature = "server")]
@@ -114,9 +114,9 @@ pub(crate) async fn unlink_sso_in(
         return Err(refusal_error(NOT_LINKED));
     }
     tracing::info!(
-        "Removed the single sign-on link of the account '{}' (by '{}')",
-        user.username,
-        actor.username
+        "Removed the single sign-on link of the account {} (by {})",
+        loggable(&user.username),
+        loggable(&actor.username)
     );
     Ok(())
 }

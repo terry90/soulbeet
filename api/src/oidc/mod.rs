@@ -46,9 +46,10 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route(OIDC_CALLBACK_PATH, get(callback))
 }
 
-/// A value from the callback URL, safe to log: anyone can craft that URL.
-/// Shortened, and quoted with `{:?}` so newlines cannot forge log lines.
-fn loggable(value: &str) -> String {
+/// A value from the callback URL or the provider, safe to log: anyone can
+/// craft that URL, and a provider's users choose their names. Shortened, and
+/// quoted with `{:?}` so newlines cannot forge log lines.
+pub(crate) fn loggable(value: &str) -> String {
     format!("{:?}", value.chars().take(200).collect::<String>())
 }
 

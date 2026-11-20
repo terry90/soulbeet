@@ -186,7 +186,7 @@ pub(super) async fn callback(cookies: Cookies, Query(params): Query<CallbackPara
             };
             match user {
                 Ok(user) => {
-                    tracing::info!("User '{}' signed in through OIDC", user.username);
+                    tracing::info!("User {} signed in through OIDC", loggable(&user.username));
                     let to = return_to.clone().unwrap_or_else(|| "/".to_string());
                     (user, to, return_to)
                 }

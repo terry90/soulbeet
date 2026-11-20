@@ -75,7 +75,7 @@ pub(super) async fn exchange_code(
     let body = capped_body(response).await;
     if !status.is_success() {
         let body = match body {
-            Ok(body) => String::from_utf8_lossy(&body).chars().take(300).collect(),
+            Ok(body) => loggable(&String::from_utf8_lossy(&body)),
             Err(e) => e,
         };
         return Err(format!("the token endpoint answered {status}: {body}"));
@@ -294,6 +294,31 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn a_token_error_cannot_forge_log_lines() {
+        let app = Router::new().route(
+            "/token",
+            post(|| async { (StatusCode::BAD_REQUEST, "bad\nINFO User 'admin' signed in") }),
+        );
+        let (addr, _server) = serve_on_loopback(app).await;
+        let provider = Provider {
+            token_endpoint: url::Url::parse(&format!("http://{addr}/token")).unwrap(),
+            ..test_provider()
+        };
+        let refused = exchange_code(&provider, &test_config(), "code", &test_flow())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("bad\\nINFO"), "{refused}");
+        assert!(!refused.contains('\n'), "{refused}");
+    }
+
+    fn test_flow() -> Flow {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "soulbeet.example.com".parse().unwrap());
+        let start = Start::for_request(None, None, &headers, &Uri::from_static("/")).unwrap();
+        new_flow(Purpose::SignIn { return_to: None }, &start)
+    }
+
+    #[tokio::test]
     async fn a_token_response_past_the_limit_is_refused() {
         let app = Router::new()
             .route(
@@ -310,10 +335,7 @@ mod tests {
                 }),
             );
         let (addr, _server) = serve_on_loopback(app).await;
-        let mut headers = HeaderMap::new();
-        headers.insert(HOST, "soulbeet.example.com".parse().unwrap());
-        let start = Start::for_request(None, None, &headers, &Uri::from_static("/")).unwrap();
-        let flow = &new_flow(Purpose::SignIn { return_to: None }, &start);
+        let flow = &test_flow();
         let exchange = |path: &str| {
             let provider = Provider {
                 token_endpoint: url::Url::parse(&format!("http://{addr}{path}")).unwrap(),
