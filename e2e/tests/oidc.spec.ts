@@ -53,7 +53,9 @@ test('creates an account on first sign-in and keeps it when the username changes
   expect(first.username).toBe(username);
   if (navidromeEnabled) {
     // A new account has no Navidrome password yet: the banner says how to connect it.
-    await expect(page.getByText('Log in once with your Navidrome password')).toBeVisible();
+    await expect(
+      page.getByText('Not connected. Connect Navidrome to use discovery and rating sync.'),
+    ).toBeVisible();
   }
 
   await page.getByRole('button', { name: 'Logout' }).click();

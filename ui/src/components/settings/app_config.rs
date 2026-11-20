@@ -5,7 +5,7 @@ use super::connection_status_row::{beets_row, ConnectionStatusRow, ImporterDetai
 use super::panel::{LoadError, Loading, Messages, Panel, LABEL_CLASS};
 use crate::friendly_error;
 use crate::settings_context::use_settings;
-use crate::{use_auth, use_system_health, TextInput};
+use crate::{use_auth, use_system_health, TextInput, NOT_LINKED_HINT};
 
 #[component]
 pub fn AppConfigManager() -> Element {
@@ -110,7 +110,7 @@ pub fn ConnectionStatusPanel() -> Element {
                         NavidromeStatus::Connected => ("bg-blue-400", "Connected"),
                         NavidromeStatus::InvalidCredentials => ("bg-beet-accent", "User not found in Navidrome"),
                         NavidromeStatus::Offline => ("bg-gray-500", "Server unreachable"),
-                        NavidromeStatus::NotLinked => ("bg-beet-accent", "Not connected: log in once with your Navidrome password"),
+                        NavidromeStatus::NotLinked => ("bg-beet-accent", NOT_LINKED_HINT),
                         NavidromeStatus::Unknown => ("bg-gray-500", "Not configured"),
                     };
                     rsx! {
@@ -118,7 +118,7 @@ pub fn ConnectionStatusPanel() -> Element {
                             label: "Navidrome",
                             dot_class,
                             summary,
-                            note: "Navidrome credentials are managed per-user through the login flow. Set the NAVIDROME_URL environment variable on the server.".to_string(),
+                            note: "Each user's Navidrome password is stored when they sign in with it or use Connect Navidrome in Settings > Users. Set the NAVIDROME_URL environment variable on the server.".to_string(),
                         }
                     }
                 }

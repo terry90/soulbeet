@@ -400,9 +400,8 @@ pub(crate) async fn apply_navidrome_login(
         LoginPlan::RefuseUnlinked => {
             return Ok(LoginOutcome::Refused(format!(
                 "A Soulbeet account named '{username}' exists but is not linked to Navidrome. \
-                 Sign in with its Soulbeet password, change that password to your Navidrome \
-                 password in Settings > Users, then sign in again. An admin can also set it \
-                 for you."
+                 Sign in to it with its Soulbeet password or single sign-on, then use Connect \
+                 Navidrome in Settings > Users. An admin can set its Soulbeet password for you."
             )));
         }
         LoginPlan::RefuseNoAccount => {
@@ -1264,10 +1263,18 @@ mod tests {
                 .await
                 .unwrap();
         match outcome {
-            LoginOutcome::Refused(msg) => assert!(
-                msg.starts_with("A Soulbeet account named 'bob' exists but is not linked"),
-                "{msg}"
-            ),
+            LoginOutcome::Refused(msg) => {
+                assert!(
+                    msg.starts_with("A Soulbeet account named 'bob' exists but is not linked"),
+                    "{msg}"
+                );
+                // The way in that works, for an account with or without a
+                // password of its own.
+                assert!(
+                    msg.contains("Connect Navidrome in Settings > Users"),
+                    "{msg}"
+                );
+            }
             other => panic!("expected a refusal, got {other:?}"),
         }
         let bob = row(&db, "bob").await.unwrap();

@@ -141,13 +141,13 @@ impl NavidromeError {
     }
 }
 
-/// The user's Navidrome password is refused, missing or unreadable: signing
-/// in to Soulful again stores the current one.
+/// The user's Navidrome password is refused, missing or unreadable: Connect
+/// Navidrome stores the current one, for any account however it signs in.
 pub fn relink_navidrome() -> UserAction {
     UserAction::new(
         UserActionCode::RelinkNavidrome,
-        "Sign in to Soulbeet again with your current Navidrome password",
-        "Soulbeet sign-in",
+        "Enter your current Navidrome password under Connect Navidrome",
+        "Soulbeet's Settings > Users",
     )
 }
 

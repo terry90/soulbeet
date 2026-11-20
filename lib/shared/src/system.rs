@@ -15,8 +15,8 @@ pub enum NavidromeStatus {
     #[default]
     Unknown,
     /// Navidrome is configured but this account has no Navidrome password
-    /// yet: it signed up through single sign-on. One password sign-in with
-    /// the Navidrome credentials connects it.
+    /// stored yet, seen on a single sign-on. Connect Navidrome in Settings
+    /// stores it.
     NotLinked,
 }
 

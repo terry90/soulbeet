@@ -549,7 +549,7 @@ async fn verified_identity(
 /// The account `identity` signs in to.
 async fn sign_in_account(identity: &Identity, config: &OidcConfig) -> Result<User, SsoError> {
     let user = find_or_create_account(&DB, identity, config).await?;
-    Ok(sync_navidrome_status(&DB, user).await)
+    Ok(sync_navidrome_status(&DB, user, CONFIG.navidrome_url().is_some()).await)
 }
 
 /// Links `identity` to the account `user_id`, which started the link, when
@@ -614,15 +614,20 @@ async fn link_from_session(
     Ok(user)
 }
 
-/// An account without a Navidrome password cannot reach Navidrome. Say so
-/// when Navidrome is configured, so the UI asks for one password login.
-async fn sync_navidrome_status(db: &SqlitePool, mut user: User) -> User {
+/// An account without a stored Navidrome login cannot reach Navidrome. Say
+/// so when `navidrome_configured`, so the UI points to Connect Navidrome. An
+/// account that has one keeps the status its last use of it gave.
+async fn sync_navidrome_status(
+    db: &SqlitePool,
+    mut user: User,
+    navidrome_configured: bool,
+) -> User {
     use shared::system::NavidromeStatus;
 
     if user.navidrome_token.is_some() {
         return user;
     }
-    let status = if CONFIG.navidrome_url().is_some() {
+    let status = if navidrome_configured {
         NavidromeStatus::NotLinked
     } else {
         NavidromeStatus::Unknown
@@ -1516,6 +1521,31 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         let after = reread(&db, &ann).await;
         assert_eq!(after.oidc_subject.as_deref(), Some("sub-ann"));
         assert_eq!(after.credentials_version, ann.credentials_version);
+    }
+
+    #[tokio::test]
+    async fn not_linked_means_no_stored_navidrome_login() {
+        let db = test_db::migrated().await;
+        let sso = User::create_oidc_in(&db, "sso", ISSUER, "sub-sso")
+            .await
+            .unwrap();
+        let synced = sync_navidrome_status(&db, sso.clone(), true).await;
+        assert_eq!(synced.navidrome_status, "not_linked");
+        assert_eq!(reread(&db, &sso).await.navidrome_status, "not_linked");
+        // Without Navidrome there is nothing to connect.
+        let synced = sync_navidrome_status(&db, synced, false).await;
+        assert_eq!(synced.navidrome_status, "unknown");
+
+        // An account that has a Navidrome login keeps its status, whatever it is.
+        User::update_navidrome_token_in(&db, &sso.id, Some("enc"), "offline")
+            .await
+            .unwrap();
+        let connected = reread(&db, &sso).await;
+        for navidrome in [true, false] {
+            let synced = sync_navidrome_status(&db, connected.clone(), navidrome).await;
+            assert_eq!(synced.navidrome_status, "offline");
+        }
+        assert_eq!(reread(&db, &sso).await.navidrome_status, "offline");
     }
 
     #[test]

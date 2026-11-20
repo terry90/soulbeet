@@ -12,6 +12,9 @@ pub fn importer_chip(level: HealthLevel) -> (&'static str, &'static str) {
     (dot, level.chip())
 }
 
+/// What to do about an account that has no Navidrome login yet.
+pub const NOT_LINKED_HINT: &str = "Not connected yet: use Connect Navidrome in Settings > Users";
+
 /// The Navidrome chip's hint: why Navidrome is offline when the health check
 /// says so, else what the user's link status says.
 pub fn navidrome_hint(health: &SystemHealth, status: NavidromeStatus) -> Option<String> {
@@ -26,9 +29,7 @@ pub fn navidrome_hint(health: &SystemHealth, status: NavidromeStatus) -> Option<
             Some("Your username was not found in Navidrome".to_string())
         }
         NavidromeStatus::Unknown => Some("Navidrome credentials not configured".to_string()),
-        NavidromeStatus::NotLinked => {
-            Some("Log in once with your Navidrome password to connect it".to_string())
-        }
+        NavidromeStatus::NotLinked => Some(NOT_LINKED_HINT.to_string()),
         NavidromeStatus::Offline => None,
     }
 }
@@ -192,6 +193,14 @@ mod tests {
             ..offline.clone()
         };
         assert_eq!(navidrome_hint(&online, NavidromeStatus::Connected), None);
+
+        // An account without a Navidrome login is pointed to the action that
+        // connects it, whatever way it signs in.
+        assert_eq!(
+            navidrome_hint(&online, NavidromeStatus::NotLinked).as_deref(),
+            Some(NOT_LINKED_HINT)
+        );
+        assert!(NOT_LINKED_HINT.contains("Connect Navidrome"));
 
         let unexplained = SystemHealth::default();
         assert_eq!(

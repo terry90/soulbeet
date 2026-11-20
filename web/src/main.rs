@@ -382,6 +382,7 @@ fn ImporterBanner() -> Element {
 #[component]
 fn NavidromeBanner() -> Element {
     let auth = use_auth();
+    let SettingsTabRequest(mut requested_tab) = use_context();
     let mut settings = ui::use_settings();
     let health = ui::use_system_health();
     let status = auth.navidrome_status();
@@ -414,7 +415,7 @@ fn NavidromeBanner() -> Element {
         NavidromeStatus::NotLinked => (
             "bg-beet-accent",
             "NAVIDROME",
-            "Not connected. Log in once with your Navidrome password to use discovery and rating sync.",
+            "Not connected. Connect Navidrome to use discovery and rating sync.",
         ),
         NavidromeStatus::Offline => (
             "bg-gray-500",
@@ -437,6 +438,14 @@ fn NavidromeBanner() -> Element {
 
     rsx! {
         StatusBanner { dot_class: dot_color, label, message: message.to_string(),
+            if status == NavidromeStatus::NotLinked {
+                Link {
+                    class: ui::STATUS_ACTION_CLASS,
+                    to: Route::SettingsPage {},
+                    onclick: move |_| requested_tab.set(Some(SettingsTab::Users)),
+                    "Connect"
+                }
+            }
             button {
                 class: "shrink-0 text-gray-600 hover:text-gray-300 transition-colors cursor-pointer p-2 -mr-1",
                 onclick: dismiss,
