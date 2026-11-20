@@ -205,7 +205,7 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 
 Soulbeet can sign users in through an OpenID Connect provider such as [Pocket ID](https://pocket-id.org), Authelia, Authentik or Keycloak. The login page then shows a **Sign in with ...** button next to the password form, which keeps working.
 
-1.  At your provider, create a client. Soulbeet sends the provider back to `/api/auth/oidc/callback` at the address the user started from, so register that path for each address people sign in from as a redirect URI, for example `https://soulbeet.example.com/api/auth/oidc/callback` and `http://192.168.1.10:9765/api/auth/oidc/callback`. With `PUBLIC_URL` or `OIDC_REDIRECT_URL` set, only that address is used: a sign-in started at another address moves there first, and single sign-on is linked in Settings there. Soulbeet always sends PKCE, so the client can be public (no secret) if the provider allows it.
+1.  At your provider, create a client. The provider sends users back to `/api/auth/oidc/callback` at the address they started from, so register that path for each address people sign in from as a redirect URI, for example `https://soulbeet.example.com/api/auth/oidc/callback` and `http://192.168.1.10:9765/api/auth/oidc/callback`. With `PUBLIC_URL` or `OIDC_REDIRECT_URL` set, only that address is used: a sign-in started at another address moves there first, and single sign-on is linked in Settings there. Soulbeet always sends PKCE, so the client can be public (no secret) if the provider allows it.
 2.  Set the variables, for example:
     ```yaml
     environment:
