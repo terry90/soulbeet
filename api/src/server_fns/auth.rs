@@ -173,15 +173,21 @@ enum NavidromeAuthResult {
     NotConfigured,
 }
 
-/// Try to authenticate against Navidrome with the given credentials, with a
-/// temporary client's `ping()`.
+/// Try to authenticate against this server's Navidrome with the given
+/// credentials.
 #[cfg(feature = "server")]
 async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResult {
-    use soulbeet::NavidromeClientBuilder;
+    match CONFIG.navidrome_url() {
+        Some(url) => navidrome_auth_at(url, username, password).await,
+        None => NavidromeAuthResult::NotConfigured,
+    }
+}
 
-    let Some(url) = CONFIG.navidrome_url() else {
-        return NavidromeAuthResult::NotConfigured;
-    };
+/// Try to authenticate against the Navidrome at `url` with the given
+/// credentials, with a temporary client's `ping()`.
+#[cfg(feature = "server")]
+async fn navidrome_auth_at(url: &str, username: &str, password: &str) -> NavidromeAuthResult {
+    use soulbeet::NavidromeClientBuilder;
 
     let ping = match NavidromeClientBuilder::new()
         .base_url(url)
@@ -195,9 +201,11 @@ async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResu
     let result = ping_verdict(&ping);
     if let Err(e) = &ping {
         match result {
-            NavidromeAuthResult::AuthFailed => {
-                tracing::info!("Navidrome refused the credentials for {username}: {e}")
-            }
+            // The name may come from the single sign-on provider.
+            NavidromeAuthResult::AuthFailed => tracing::info!(
+                "Navidrome refused the credentials for {}: {e}",
+                crate::oidc::loggable(username)
+            ),
             _ => tracing::warn!("Navidrome gave no verdict during login: {e}"),
         }
     }
@@ -1261,6 +1269,45 @@ mod tests {
         }
         assert!(limiter.begin("ann", now).is_ok());
         assert_eq!(row(&db, "ann").await.unwrap().navidrome_token, None);
+    }
+
+    #[tokio::test]
+    async fn a_name_from_the_provider_cannot_forge_a_log_line_when_navidrome_refuses_it() {
+        use crate::test_log::LogCapture;
+        use crate::test_navidrome::{subsonic_failed, NavidromeStub};
+
+        // Eve chose this name at the provider and signed in with it.
+        let db = test_db::migrated().await;
+        let forged = "eve\nINFO User 'admin' connected Navidrome";
+        let eve = User::create_oidc_in(&db, forged, "https://id.example.com", "sub-eve")
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/ping",
+            &[&subsonic_failed(40, "Wrong username or password")],
+        );
+        let url = navi.url.clone();
+        let log = LogCapture::start();
+
+        let outcome = connect_navidrome_in(
+            &db,
+            &LoginLimiter::new(),
+            &ctx_of(&eve),
+            "enc",
+            Instant::now,
+            |name| async move { navidrome_auth_at(&url, &name, "guess").await },
+        )
+        .await;
+
+        assert_eq!(code(&outcome.unwrap_err()), REFUSAL_CODE);
+        let lines = log.lines();
+        let refused = lines
+            .iter()
+            .find(|line| line.starts_with("Navidrome refused the credentials"))
+            .expect("the refusal is logged");
+        assert!(refused.contains(r"eve\nINFO"), "{refused}");
+        assert!(lines.iter().all(|line| !line.contains('\n')), "{lines:?}");
     }
 
     #[tokio::test]
