@@ -47,7 +47,7 @@ use tower_cookies::{
     Cookie, Cookies,
 };
 
-use crate::auth::{SsoError, SsoLinkResult};
+use crate::auth::{SsoError, SsoLinkResult, OIDC_CALLBACK_PATH, OIDC_LOGIN_PATH};
 use crate::base_url::{request_base_with, BaseUrl, BaseUrlError};
 use crate::config::{OidcConfig, CONFIG};
 use crate::crypto;
@@ -57,8 +57,6 @@ use crate::secret_key::SecretKey;
 use crate::server_fns::auth::{issue_session_cookie, SessionCookie, AUTH_COOKIE_NAME};
 use crate::server_fns::guard::load_session;
 use sqlx::SqlitePool;
-
-pub use crate::auth::{OIDC_CALLBACK_PATH, OIDC_LOGIN_PATH};
 
 /// Prefix of the cookie that holds the state, nonce and PKCE verifier between
 /// the two legs of a sign-in. The state completes the name, so logins started
