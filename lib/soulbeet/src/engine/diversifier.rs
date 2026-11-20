@@ -4,7 +4,8 @@ use rand::seq::SliceRandom;
 use tracing::info;
 
 use shared::recommendation::{
-    Candidate, CandidateSet, CandidateSnapshot, DiversifierSummary, ProfileConfig, UserMusicProfile,
+    normalize_for_matching, Candidate, CandidateSet, CandidateSnapshot, DiversifierSummary,
+    ProfileConfig, UserMusicProfile,
 };
 
 /// Select a diverse final track list from the scored candidate pool.
@@ -104,10 +105,10 @@ pub fn diversify(
             break;
         }
 
-        let artist_key = candidate.artist.to_lowercase();
+        let act = artist_key(candidate);
 
         // Artist cap
-        let count = artist_counts.get(&artist_key).copied().unwrap_or(0);
+        let count = artist_counts.get(&act).copied().unwrap_or(0);
         if count >= config.max_per_artist {
             artist_cap_skipped += 1;
             continue;
@@ -128,7 +129,7 @@ pub fn diversify(
         }
 
         // Accept
-        *artist_counts.entry(artist_key).or_default() += 1;
+        *artist_counts.entry(act).or_default() += 1;
         update_genre_counts(&mut genre_counts, candidate, profile);
         if *is_exploration {
             exploration_count += 1;
@@ -152,12 +153,12 @@ pub fn diversify(
             {
                 continue;
             }
-            let artist_key = c.artist.to_lowercase();
-            let count = artist_counts.get(&artist_key).copied().unwrap_or(0);
+            let act = artist_key(c);
+            let count = artist_counts.get(&act).copied().unwrap_or(0);
             if count >= config.max_per_artist {
                 continue;
             }
-            *artist_counts.entry(artist_key).or_default() += 1;
+            *artist_counts.entry(act).or_default() += 1;
             selected.push(c.clone());
             backfill_count += 1;
         }
@@ -206,6 +207,16 @@ pub fn diversify(
     };
 
     (selected, summary)
+}
+
+/// The act a candidate counts under for the artist cap: its MBID, so one act
+/// under several credits ("X feat. Y") counts once, else its matched name.
+/// The prefixes keep an MBID from ever equalling a name.
+fn artist_key(c: &Candidate) -> String {
+    match &c.artist_mbid {
+        Some(mbid) => format!("mbid:{}", mbid.to_lowercase()),
+        None => format!("name:{}", normalize_for_matching(&c.artist)),
+    }
 }
 
 /// Penalises the most listened tenth of the candidates with a listener count,
@@ -295,6 +306,7 @@ fn update_genre_counts(
 mod tests {
     use super::*;
     use crate::engine::test_support::candidate;
+    use shared::recommendation::DiscoveryProfile;
 
     fn counted(n: u64) -> Vec<Candidate> {
         (1..=n)
@@ -325,6 +337,32 @@ mod tests {
         let mut few = counted(9);
         assert_eq!(penalise_popular(&mut few, 0.6), 0);
         assert!(few.iter().all(|c| c.score == 1.0));
+    }
+
+    #[test]
+    fn the_artist_cap_counts_one_act_under_its_credits_as_one_artist() {
+        let config = ProfileConfig::from_profile(DiscoveryProfile::Adventurous);
+        assert_eq!(config.max_per_artist, 1);
+        let mut solo = candidate("catalog", "Daft Punk", "One More Time", 1.0);
+        solo.artist_mbid = Some("056E4F3E-D505-4DAD-8EC1-D04F521CBB56".into());
+        let mut credited = candidate(
+            "catalog",
+            "Daft Punk feat. Pharrell Williams",
+            "Get Lucky",
+            0.9,
+        );
+        credited.artist_mbid = Some("056e4f3e-d505-4dad-8ec1-d04f521cbb56".into());
+        let named = candidate("deezer_radio", "AC/DC", "Thunderstruck", 0.8);
+        let respelled = candidate("deezer_radio", "ACDC", "Back in Black", 0.7);
+        let mut set = CandidateSet::new();
+        for c in [solo, credited, named, respelled] {
+            set.insert(c);
+        }
+        let (got, summary) = diversify(set, &UserMusicProfile::default(), &config, 10);
+        let mut tracks: Vec<_> = got.iter().map(|c| c.track.as_str()).collect();
+        tracks.sort();
+        assert_eq!(tracks, ["One More Time", "Thunderstruck"]);
+        assert_eq!((summary.artist_cap_skipped, summary.unique_artists), (2, 2));
     }
 
     #[test]
