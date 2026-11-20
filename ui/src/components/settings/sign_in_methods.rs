@@ -1,8 +1,8 @@
-//! How the signed-in user signs in besides their password: single sign-on,
-//! and the Navidrome login Soulbeet uses for them.
+//! How the signed-in user signs in: their password, single sign-on, and the
+//! Navidrome login Soulbeet uses for them.
 
-use api::auth::{LinkProof, SignInMethods, SsoLinkResult, NO_PASSWORD_TO_LINK};
-use api::{connect_navidrome, start_sso_link, unlink_sso};
+use api::auth::{PasswordProof, SignInMethods, SsoLinkResult, NO_PASSWORD};
+use api::{change_password, connect_navidrome, start_sso_link, unlink_sso};
 use dioxus::prelude::*;
 use shared::system::NavidromeStatus;
 
@@ -23,13 +23,71 @@ fn link_messages(result: Option<SsoLinkResult>) -> (String, String) {
     }
 }
 
-/// The password field's hint for linking, or `None` when the account has no
-/// password to give.
-fn link_password_placeholder(proof: LinkProof) -> Option<&'static str> {
+/// The hint of the field that takes the account's password before a link or
+/// a new password, or `None` when the account has no password to give.
+fn password_placeholder(proof: PasswordProof) -> Option<&'static str> {
     match proof {
-        LinkProof::Password => Some("Current password"),
-        LinkProof::NavidromePassword => Some("Your Navidrome password"),
-        LinkProof::NoPassword => None,
+        PasswordProof::Password => Some("Current password"),
+        PasswordProof::NavidromePassword => Some("Your Navidrome password"),
+        PasswordProof::NoPassword => None,
+    }
+}
+
+/// Changes the signed-in user's password once they enter the one the login
+/// form takes (`proof`), as a link asks: a session left open is not enough.
+/// An account without one is told to ask an admin. `on_change` runs once the
+/// password is changed: the account may now unlink single sign-on.
+#[component]
+pub(super) fn PasswordSection(proof: PasswordProof, on_change: EventHandler<()>) -> Element {
+    let auth = use_auth();
+    let mut current = use_signal(String::new);
+    let mut password = use_signal(String::new);
+    let mut error = use_signal(String::new);
+    let mut success = use_signal(String::new);
+
+    let change = move |_| async move {
+        error.set(String::new());
+        success.set(String::new());
+        if password().is_empty() {
+            error.set("Password cannot be empty".to_string());
+            return;
+        }
+        match auth.call(change_password(current(), password())).await {
+            Ok(()) => {
+                success.set("Password updated".to_string());
+                current.set(String::new());
+                password.set(String::new());
+                on_change.call(());
+            }
+            Err(e) => error.set(friendly_error(&e)),
+        }
+    };
+
+    rsx! {
+      div {
+        label { class: LABEL_CLASS, "Password" }
+        Messages { error: error(), success: success() }
+        if let Some(placeholder) = password_placeholder(proof) {
+          TextInput {
+            value: current(),
+            oninput: move |v| current.set(v),
+            placeholder,
+            aria_label: "Current password",
+            password: true,
+          }
+          TextInput {
+            value: password(),
+            oninput: move |v| password.set(v),
+            placeholder: "New password",
+            aria_label: "New password",
+            password: true,
+            class: "mt-2",
+          }
+          button { class: "retro-btn mt-2 rounded", onclick: change, "Change Password" }
+        } else {
+          p { class: NOTE_CLASS, "{NO_PASSWORD}" }
+        }
+      }
     }
 }
 
@@ -105,7 +163,7 @@ pub(super) fn SingleSignOnSection(
               "To unlink it, first set a password or connect Navidrome, so you can still sign in."
             }
           }
-        } else if let Some(placeholder) = link_password_placeholder(methods.sso_link_proof) {
+        } else if let Some(placeholder) = password_placeholder(methods.password_proof) {
           p { class: "{NOTE_CLASS} mb-2",
             "Link this account to {provider} to sign in with it. Enter your password first."
           }
@@ -113,7 +171,7 @@ pub(super) fn SingleSignOnSection(
             value: password(),
             oninput: move |v| password.set(v),
             placeholder,
-            aria_label: "Current password",
+            aria_label: "Password to link single sign-on",
             password: true,
           }
           button {
@@ -123,7 +181,7 @@ pub(super) fn SingleSignOnSection(
             "Link single sign-on"
           }
         } else {
-          p { class: NOTE_CLASS, "{NO_PASSWORD_TO_LINK}" }
+          p { class: NOTE_CLASS, "{NO_PASSWORD}" }
         }
       }
     }
@@ -230,7 +288,10 @@ mod tests {
     fn an_unlinked_account_is_offered_the_link_for_its_password() {
         let html = render(offered(), None);
         assert!(html.contains("Link this account to Pocket ID"), "{html}");
-        assert!(html.contains("aria-label=\"Current password\""), "{html}");
+        assert!(
+            html.contains("aria-label=\"Password to link single sign-on\""),
+            "{html}"
+        );
         assert!(html.contains("placeholder=\"Current password\""), "{html}");
         assert!(html.contains("Link single sign-on"), "{html}");
         assert!(!html.contains("Unlink"), "{html}");
@@ -238,7 +299,7 @@ mod tests {
         // An account whose only password is its Navidrome one.
         let html = render(
             SignInMethods {
-                sso_link_proof: LinkProof::NavidromePassword,
+                password_proof: PasswordProof::NavidromePassword,
                 ..offered()
             },
             None,
@@ -254,7 +315,7 @@ mod tests {
     fn an_account_without_a_password_is_told_to_ask_an_admin() {
         let html = render(
             SignInMethods {
-                sso_link_proof: LinkProof::NoPassword,
+                password_proof: PasswordProof::NoPassword,
                 ..offered()
             },
             None,
@@ -292,6 +353,46 @@ mod tests {
             None,
         );
         assert!(html.contains(">Unlink<"), "{html}");
+    }
+
+    fn render_password(proof: PasswordProof) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |proof: PasswordProof| {
+                let signed_out = use_signal(|| None);
+                use_context_provider(|| crate::auth::Auth::new(signed_out));
+                rsx! {
+                    PasswordSection { proof, on_change: |_| {} }
+                }
+            },
+            proof,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn a_new_password_takes_the_current_one() {
+        let html = render_password(PasswordProof::Password);
+        assert!(html.contains("aria-label=\"Current password\""), "{html}");
+        assert!(html.contains("placeholder=\"Current password\""), "{html}");
+        assert!(html.contains("aria-label=\"New password\""), "{html}");
+        assert!(html.contains(">Change Password<"), "{html}");
+
+        let html = render_password(PasswordProof::NavidromePassword);
+        assert!(
+            html.contains("placeholder=\"Your Navidrome password\""),
+            "{html}"
+        );
+        assert!(html.contains(">Change Password<"), "{html}");
+
+        // Without one, an admin sets it.
+        let html = render_password(PasswordProof::NoPassword);
+        assert!(
+            html.contains("This account has no password. Ask an admin to set one"),
+            "{html}"
+        );
+        assert!(!html.contains("Change Password"), "{html}");
+        assert!(!html.contains("New password"), "{html}");
     }
 
     fn render_navidrome(status: NavidromeStatus) -> String {

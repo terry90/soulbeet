@@ -821,7 +821,7 @@ mod tests {
     async fn an_admin_password_reset_takes_an_account_back_from_its_identity() {
         use crate::login_limiter::LoginLimiter;
         use crate::server_fns::auth::{connect_navidrome_in, NavidromeAuthResult};
-        use crate::server_fns::user::set_password_in;
+        use crate::server_fns::user::set_user_password_in;
 
         // Mallory chose the name "bob" at the provider and her first sign-in
         // made the account before Navidrome's Bob used Soulbeet.
@@ -833,7 +833,7 @@ mod tests {
         };
 
         // The admin gives the account a password for Bob.
-        set_password_in(&db, &ctx_of(&admin), &taken.id, "for-bob")
+        set_user_password_in(&db, &ctx_of(&admin), &taken.id, "for-bob")
             .await
             .unwrap();
         let bobs = reread(&db, &taken).await;
@@ -873,11 +873,13 @@ mod tests {
 
     #[tokio::test]
     async fn changing_ones_own_password_keeps_the_link() {
-        use crate::server_fns::user::set_password_in;
+        use crate::login_limiter::LoginLimiter;
+        use crate::server_fns::{auth::NavidromeAuthResult, user::change_password_in};
 
         let db = test_db::migrated().await;
-        let ann = sign_in(&db, "sub-ann", "ann").await.unwrap();
-        set_password_in(&db, &ctx_of(&ann), &ann.id, "pw")
+        let limiter = LoginLimiter::new();
+        let ann = User::create_in(&db, "ann", "ann-pw").await.unwrap();
+        User::link_oidc_identity_in(&db, &ann.id, ISSUER, "sub-ann", "ann")
             .await
             .unwrap();
         // An admin's own password too.
@@ -887,13 +889,15 @@ mod tests {
         User::link_oidc_identity_in(&db, &admin.id, ISSUER, "sub-admin", "admin")
             .await
             .unwrap();
-        set_password_in(&db, &ctx_of(&admin), &admin.id, "new-admin-pw")
+        for (user, current) in [(&ann, "ann-pw"), (&admin, "admin")] {
+            change_password_in(&db, &limiter, user, current, "new-pw", false, |_| async {
+                NavidromeAuthResult::NotConfigured
+            })
             .await
             .unwrap();
-        for user in [&ann, &admin] {
             let after = reread(&db, user).await;
             assert!(after.oidc_subject.is_some(), "{}", after.username);
-            assert!(after.has_password());
+            assert!(after.password_matches("new-pw"));
         }
         assert_eq!(sign_in(&db, "sub-ann", "ann").await.unwrap().id, ann.id);
     }

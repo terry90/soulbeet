@@ -1,13 +1,19 @@
 #[cfg(feature = "server")]
 use super::{
-    auth::{start_session, SessionCookie},
+    auth::{
+        prove_password_in, start_session, try_navidrome_auth, NavidromeAuthResult, SessionCookie,
+    },
     forbidden_error, refusal_error, server_error, ADMIN_ONLY,
 };
 use crate::auth::Role;
 use crate::models;
 #[cfg(feature = "server")]
 use crate::{
-    auth::UserCtx, config::CONFIG, services::evict_navidrome_client, AdminSession, AuthSession,
+    auth::UserCtx,
+    config::CONFIG,
+    login_limiter::{LoginLimiter, LOGIN_LIMITER},
+    services::evict_navidrome_client,
+    AdminSession, AuthSession,
 };
 #[cfg(feature = "server")]
 use axum::http::{HeaderMap, Uri};
@@ -68,12 +74,6 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
         .map_err(user_change_error)
 }
 
-/// Whether `actor` may set the password of `target_user_id`: their own, or any as an admin.
-#[cfg(feature = "server")]
-pub(crate) fn may_set_password(actor: &UserCtx, target_user_id: &str) -> bool {
-    actor.user_id == target_user_id || actor.role.is_admin()
-}
-
 /// Refusals a person can act on are shown; database failures are not.
 #[cfg(feature = "server")]
 pub(crate) fn user_change_error(e: models::user::UserChangeError) -> ServerFnError {
@@ -93,49 +93,103 @@ pub async fn set_user_role(user_id: String, role: Role) -> Result<(), ServerFnEr
         .map_err(user_change_error)
 }
 
-/// Sets the password of `user_id` for `actor`. Their own keeps its single
-/// sign-on link. An admin's new password for another account removes it:
-/// the admin gives the account to whoever gets the password, and the
-/// identity linked to it may be the reason (a name someone else chose at
-/// the provider). Either ends the account's sessions.
+/// Sets `user`'s own password once `current_password` proves the account is
+/// the signed-in person's, as linking single sign-on does: a session left
+/// open is not enough to give someone a password to the account. An account
+/// with no password gets one from an admin. Keeps the account's single
+/// sign-on link and ends its sessions. `navidrome` asks Navidrome about the
+/// name it is given, as `prove_password_in` does.
 #[cfg(feature = "server")]
-pub(crate) async fn set_password_in(
+pub(crate) async fn change_password_in<F>(
+    db: &sqlx::SqlitePool,
+    limiter: &LoginLimiter,
+    user: &models::user::User,
+    current_password: &str,
+    password: &str,
+    navidrome_configured: bool,
+    navidrome: impl FnOnce(String) -> F,
+) -> Result<(), ServerFnError>
+where
+    F: std::future::Future<Output = NavidromeAuthResult>,
+{
+    if password.is_empty() {
+        return Err(refusal_error("Password cannot be empty"));
+    }
+    prove_password_in(
+        limiter,
+        user,
+        current_password,
+        navidrome_configured,
+        std::time::Instant::now,
+        navidrome,
+    )
+    .await?;
+    models::user::User::update_password_in(db, &user.id, password)
+        .await
+        .map(|_| ())
+        .map_err(server_error)
+}
+
+/// Changes the signed-in user's password. The change ends every session of
+/// the account; this one is renewed.
+#[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
+pub async fn change_password(
+    current_password: String,
+    password: String,
+) -> Result<(), ServerFnError> {
+    let session = SessionCookie::for_request(&headers, &uri)?;
+    let user = models::user::User::find_by_id(&auth.0.user_id)
+        .await
+        .map_err(server_error)?
+        .ok_or_else(|| server_error(models::user::UserChangeError::NotFound))?;
+    let current_password = &current_password;
+    change_password_in(
+        &crate::db::DB,
+        &LOGIN_LIMITER,
+        &user,
+        current_password,
+        &password,
+        CONFIG.navidrome_url().is_some(),
+        |username| async move { try_navidrome_auth(&username, current_password).await },
+    )
+    .await?;
+    crate::security::note_password_set(&user.id, &password);
+    start_session(&cookies, &session, &user.id).await?;
+    Ok(())
+}
+
+/// An admin's new password for another account. It also removes the
+/// account's single sign-on link: the admin gives the account to whoever
+/// gets the password, and the identity linked to it may be the reason (a
+/// name someone else chose at the provider). Ends the account's sessions.
+/// The admin's own password is changed with the current one, like anyone's.
+#[cfg(feature = "server")]
+pub(crate) async fn set_user_password_in(
     db: &sqlx::SqlitePool,
     actor: &UserCtx,
     user_id: &str,
     password: &str,
 ) -> Result<(), ServerFnError> {
-    use models::user::User;
-
-    if password.is_empty() {
-        return Err(refusal_error("Password cannot be empty"));
-    }
-    if !may_set_password(actor, user_id) {
+    if !actor.role.is_admin() {
         return Err(forbidden_error(ADMIN_ONLY));
     }
     if actor.user_id == user_id {
-        User::update_password_in(db, user_id, password)
-            .await
-            .map(|_| ())
-    } else {
-        User::reset_password_in(db, user_id, password).await
+        return Err(refusal_error(
+            "Change your own password under Your Account, with your current password.",
+        ));
     }
-    .map_err(server_error)
+    if password.is_empty() {
+        return Err(refusal_error("Password cannot be empty"));
+    }
+    models::user::User::reset_password_in(db, user_id, password)
+        .await
+        .map_err(server_error)
 }
 
-#[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
-pub async fn update_user_password(user_id: String, password: String) -> Result<(), ServerFnError> {
-    // The bump ends every session of this user; the caller's own is renewed.
-    let own_session = if user_id == auth.0.user_id {
-        Some(SessionCookie::for_request(&headers, &uri)?)
-    } else {
-        None
-    };
-    set_password_in(&crate::db::DB, &auth.0, &user_id, &password).await?;
+#[post("/api/users/password/set", auth: AdminSession)]
+pub async fn set_user_password(user_id: String, password: String) -> Result<(), ServerFnError> {
+    set_user_password_in(&crate::db::DB, &auth.0, &user_id, &password).await?;
     crate::security::note_password_set(&user_id, &password);
-    if let Some(session) = own_session {
-        start_session(&cookies, &session, &user_id).await?;
-    }
     Ok(())
 }
 
@@ -151,19 +205,186 @@ pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use crate::auth::NO_PASSWORD;
+    use crate::db::test_db;
+    use crate::server_fns::{FORBIDDEN_CODE, REFUSAL_CODE};
+    use models::user::User;
+    use std::time::Instant;
 
-    fn ctx(id: &str, role: Role) -> UserCtx {
+    const ISSUER: &str = "https://id.example.com";
+
+    fn ctx(user: &User) -> UserCtx {
         UserCtx {
-            user_id: id.into(),
-            username: id.into(),
-            role,
+            user_id: user.id.clone(),
+            username: user.username.clone(),
+            role: user.role,
         }
     }
 
-    #[test]
-    fn users_set_their_own_password_and_admins_anyone() {
-        assert!(may_set_password(&ctx("a", Role::User), "a"));
-        assert!(!may_set_password(&ctx("a", Role::User), "b"));
-        assert!(may_set_password(&ctx("a", Role::Admin), "b"));
+    fn code<T: std::fmt::Debug>(result: Result<T, ServerFnError>) -> u16 {
+        match result {
+            Err(ServerFnError::ServerError { code, .. }) => code,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    async fn reread(db: &sqlx::SqlitePool, user: &User) -> User {
+        User::find_by_id_in(db, &user.id).await.unwrap().unwrap()
+    }
+
+    /// `user` changes their password from `current` to `password` while
+    /// Navidrome, set up, answers `navidrome`.
+    async fn change(
+        db: &sqlx::SqlitePool,
+        limiter: &LoginLimiter,
+        user: &User,
+        current: &str,
+        password: &str,
+        navidrome: NavidromeAuthResult,
+    ) -> Result<(), ServerFnError> {
+        change_password_in(db, limiter, user, current, password, true, |_| async {
+            navidrome
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_session_alone_cannot_set_a_password_and_then_link() {
+        let db = test_db::migrated().await;
+        let limiter = LoginLimiter::new();
+
+        // Bob's account follows his Navidrome password, and he left a
+        // session open. Whoever finds it does not know his password.
+        let bob = User::create_in(&db, "bob", "bobs-pw").await.unwrap();
+        User::link_navidrome_in(&db, &bob.id, "enc", "connected")
+            .await
+            .unwrap();
+        let bob = reread(&db, &bob).await;
+        for guess in ["", "guess"] {
+            let refused = change(
+                &db,
+                &limiter,
+                &bob,
+                guess,
+                "x",
+                NavidromeAuthResult::AuthFailed,
+            )
+            .await;
+            assert_eq!(code(refused), REFUSAL_CODE);
+        }
+        let after = reread(&db, &bob).await;
+        assert!(after.password_matches("bobs-pw"));
+        assert_eq!(after.credentials_version, bob.credentials_version);
+        // So the password they wanted does not start a link either.
+        let link = prove_password_in(&limiter, &after, "x", false, Instant::now, |_| async {
+            NavidromeAuthResult::NotConfigured
+        })
+        .await;
+        assert_eq!(code(link), REFUSAL_CODE);
+
+        // An account whose only password is its Navidrome one.
+        let navi = User::create_oidc_in(&db, "navi", ISSUER, "sub-navi")
+            .await
+            .unwrap();
+        User::update_navidrome_token_in(&db, &navi.id, Some("enc"), "connected")
+            .await
+            .unwrap();
+        User::unlink_oidc_identity_in(&db, &navi.id).await.unwrap();
+        let navi = reread(&db, &navi).await;
+        let refused = change(
+            &db,
+            &limiter,
+            &navi,
+            "guess",
+            "x",
+            NavidromeAuthResult::AuthFailed,
+        )
+        .await;
+        assert_eq!(code(refused), REFUSAL_CODE);
+        assert!(!reread(&db, &navi).await.has_password());
+
+        // An account with no password at all gets one from an admin, never
+        // from a session, whatever Navidrome would say.
+        let sso = User::create_oidc_in(&db, "sso", ISSUER, "sub-sso")
+            .await
+            .unwrap();
+        let refused = change(&db, &limiter, &sso, "", "x", NavidromeAuthResult::Success)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains(NO_PASSWORD), "{refused}");
+        assert!(!reread(&db, &sso).await.has_password());
+    }
+
+    #[tokio::test]
+    async fn the_password_the_login_form_takes_changes_it() {
+        let db = test_db::migrated().await;
+        let limiter = LoginLimiter::new();
+        let ann = User::create_in(&db, "ann", "ann-pw").await.unwrap();
+        change(
+            &db,
+            &limiter,
+            &ann,
+            "ann-pw",
+            "",
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await
+        .unwrap_err();
+        change(
+            &db,
+            &limiter,
+            &ann,
+            "ann-pw",
+            "new",
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await
+        .unwrap();
+        let after = reread(&db, &ann).await;
+        assert!(after.password_matches("new"));
+        assert_eq!(after.credentials_version, ann.credentials_version + 1);
+
+        // Its Navidrome password, for an account that has only that.
+        let navi = User::create_oidc_in(&db, "navi", ISSUER, "sub-navi")
+            .await
+            .unwrap();
+        User::update_navidrome_token_in(&db, &navi.id, Some("enc"), "connected")
+            .await
+            .unwrap();
+        let navi = reread(&db, &navi).await;
+        change(
+            &db,
+            &limiter,
+            &navi,
+            "navi-pw",
+            "own",
+            NavidromeAuthResult::Success,
+        )
+        .await
+        .unwrap();
+        assert!(reread(&db, &navi).await.password_matches("own"));
+    }
+
+    #[tokio::test]
+    async fn an_admin_sets_the_password_of_other_accounts() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "ann-pw").await.unwrap();
+        let bob = User::create_in(&db, "bob", "bob-pw").await.unwrap();
+        assert_eq!(
+            code(set_user_password_in(&db, &ctx(&ann), &bob.id, "x").await),
+            FORBIDDEN_CODE
+        );
+        let mut admin = ctx(&ann);
+        admin.role = Role::Admin;
+        // Their own takes the current one, under Your Account.
+        assert_eq!(
+            code(set_user_password_in(&db, &admin, &ann.id, "x").await),
+            REFUSAL_CODE
+        );
+        assert!(reread(&db, &ann).await.password_matches("ann-pw"));
+        set_user_password_in(&db, &admin, &bob.id, "x")
+            .await
+            .unwrap();
+        assert!(reread(&db, &bob).await.password_matches("x"));
     }
 }

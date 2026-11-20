@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use super::{
-    auth::{link_proof, prove_password, start_session, SessionCookie},
+    auth::{password_proof, prove_password, start_session, SessionCookie},
     forbidden_error, refusal_error, server_error, ADMIN_ONLY,
 };
 #[cfg(feature = "server")]
@@ -47,14 +47,14 @@ pub async fn get_sign_in_methods() -> Result<SignInMethods, ServerFnError> {
         sso_provider: CONFIG.oidc().map(|oidc| oidc.provider_name.clone()),
         sso_name: user.oidc_username.clone(),
         sso_unlink_allowed: keeps_a_way_in(&user, navidrome),
-        sso_link_proof: link_proof(&user, navidrome),
+        password_proof: password_proof(&user, navidrome),
         navidrome,
     })
 }
 
 /// Starts linking the signed-in account to an identity at the provider,
 /// once `password` proves the account is the signed-in person's (see
-/// `LinkProof`). The browser goes to the address returned; the provider
+/// `PasswordProof`). The browser goes to the address returned; the provider
 /// sends it back to the callback, which links the identity while this
 /// browser is still signed in to the account, and then shows the outcome in
 /// Settings. A POST server function like the other changes, protected from

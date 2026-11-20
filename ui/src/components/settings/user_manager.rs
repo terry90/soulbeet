@@ -1,15 +1,15 @@
 use api::auth::{Role, SsoLinkResult};
 use api::models::user::UserSummary;
 use api::{
-    create_user, delete_user, get_sign_in_methods, get_users, set_user_role, unlink_sso,
-    update_user_password, update_username,
+    create_user, delete_user, get_sign_in_methods, get_users, set_user_password, set_user_role,
+    unlink_sso, update_username,
 };
 use dioxus::prelude::*;
 
 use super::panel::{
     ListRow, LoadError, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS,
 };
-use super::sign_in_methods::{NavidromeSection, SingleSignOnSection};
+use super::sign_in_methods::{NavidromeSection, PasswordSection, SingleSignOnSection};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
 use crate::{FieldLook, TextInput};
@@ -30,10 +30,10 @@ fn sign_in_tags(user: &UserSummary) -> Vec<String> {
     tags
 }
 
-/// What a new password from the admin `admin_id` does besides, for the
-/// account `user`.
-fn reset_note(user: &UserSummary, admin_id: Option<&str>) -> Option<&'static str> {
-    (user.sso_name.is_some() && admin_id != Some(user.id.as_str()))
+/// What an admin's new password for the account `user` does besides.
+fn reset_note(user: &UserSummary) -> Option<&'static str> {
+    user.sso_name
+        .is_some()
         .then_some("Setting a password also removes this account's single sign-on link.")
 }
 
@@ -46,7 +46,6 @@ pub fn AccountPanel(sso_notice: Signal<Option<SsoLinkResult>>) -> Element {
     let mut sign_in_methods =
         use_resource(move || async move { auth.call(get_sign_in_methods()).await });
     let mut new_username = use_signal(|| "".to_string());
-    let mut new_password = use_signal(|| "".to_string());
     let mut error = use_signal(|| "".to_string());
     let mut success_msg = use_signal(|| "".to_string());
 
@@ -61,30 +60,6 @@ pub fn AccountPanel(sso_notice: Signal<Option<SsoLinkResult>>) -> Element {
             Ok(_) => {
                 success_msg.set("Username updated".to_string());
                 new_username.set("".to_string());
-            }
-            Err(e) => error.set(friendly_error(&e)),
-        }
-    };
-
-    let handle_password = move |_| async move {
-        error.set("".to_string());
-        success_msg.set("".to_string());
-        let Some(user_id) = auth.user_id() else {
-            return;
-        };
-        if new_password().is_empty() {
-            error.set("Password cannot be empty".to_string());
-            return;
-        }
-        match auth
-            .call(update_user_password(user_id, new_password()))
-            .await
-        {
-            Ok(_) => {
-                success_msg.set("Password updated".to_string());
-                new_password.set("".to_string());
-                // A password of its own may let the account unlink single sign-on.
-                sign_in_methods.restart();
             }
             Err(e) => error.set(friendly_error(&e)),
         }
@@ -106,19 +81,13 @@ pub fn AccountPanel(sso_notice: Signal<Option<SsoLinkResult>>) -> Element {
           }
         }
 
-        div {
-          label { class: LABEL_CLASS, "Password" }
-          TextInput {
-            value: new_password(),
-            oninput: move |v| new_password.set(v),
-            placeholder: "New password",
-            password: true,
-          }
-          button { class: "retro-btn mt-2 rounded", onclick: handle_password, "Change Password" }
-        }
-
         match &*sign_in_methods.read() {
           Some(Ok(methods)) => rsx! {
+            PasswordSection {
+              proof: methods.password_proof,
+              // A password of its own may let the account unlink single sign-on.
+              on_change: move |_| sign_in_methods.restart(),
+            }
             SingleSignOnSection {
               methods: methods.clone(),
               notice: sso_notice,
@@ -231,10 +200,7 @@ pub fn UserManager() -> Element {
             error.set("Password cannot be empty".to_string());
             return;
         }
-        match auth
-            .call(update_user_password(id, edit_user_password()))
-            .await
-        {
+        match auth.call(set_user_password(id, edit_user_password())).await {
             Ok(_) => {
                 success_msg.set("Password updated".to_string());
                 editing_user_id.set(None);
@@ -294,7 +260,9 @@ pub fn UserManager() -> Element {
                         let id_delete = user.id.clone();
                         let id_unlink = user.id.clone();
                         let tags = sign_in_tags(&user);
-                        let reset_note = reset_note(&user, auth.user_id().as_deref());
+                        let reset_note = reset_note(&user);
+                        // Their own takes the current one, under Your Account.
+                        let own = auth.user_id().as_deref() == Some(user.id.as_str());
                         let (role_label, other_role, role_action) = if user.role.is_admin() {
                             ("admin", Role::User, "Make user")
                         } else {
@@ -343,13 +311,15 @@ pub fn UserManager() -> Element {
                                     onclick: move |_| handle_set_role(id_role.clone(), other_role),
                                     "{role_action}"
                                   }
-                                  button {
-                                    class: LINK_BUTTON_CLASS,
-                                    onclick: move |_| {
-                                        editing_user_id.set(Some(id_edit_pw.clone()));
-                                        edit_user_password.set("".to_string());
-                                    },
-                                    "Password"
+                                  if !own {
+                                    button {
+                                      class: LINK_BUTTON_CLASS,
+                                      onclick: move |_| {
+                                          editing_user_id.set(Some(id_edit_pw.clone()));
+                                          edit_user_password.set("".to_string());
+                                      },
+                                      "Password"
+                                    }
                                   }
                                   if user.sso_name.is_some() {
                                     button {
@@ -392,12 +362,9 @@ mod tests {
 
     #[test]
     fn a_password_for_another_linked_account_says_it_removes_the_link() {
-        let linked = summary(true, Some("ann@id"));
-        assert!(reset_note(&linked, Some("admin"))
+        assert!(reset_note(&summary(true, Some("ann@id")))
             .is_some_and(|note| note.contains("removes this account's single sign-on link")));
-        // The admin's own password keeps their link.
-        assert_eq!(reset_note(&linked, Some("u")), None);
-        assert_eq!(reset_note(&summary(true, None), Some("admin")), None);
+        assert_eq!(reset_note(&summary(true, None)), None);
     }
 
     #[test]

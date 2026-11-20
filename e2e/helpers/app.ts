@@ -41,16 +41,19 @@ export async function loginViaApi(context: BrowserContext, user: TestUser): Prom
   expect(response.ok(), `login ${user.username}: ${response.status()}`).toBeTruthy();
 }
 
-/** Sets a user's password through the API, as the logged-in user in the context. */
-export async function setPassword(
+/**
+ * Changes the password of the user logged in to the context through the API,
+ * from `current` (the one the login form takes) to `password`.
+ */
+export async function changePassword(
   context: BrowserContext,
-  userId: string,
+  current: string,
   password: string,
 ): Promise<void> {
   const response = await context.request.post('/api/users/password', {
-    data: { user_id: userId, password },
+    data: { current_password: current, password },
   });
-  expect(response.ok(), `set password for ${userId}: ${response.status()}`).toBeTruthy();
+  expect(response.ok(), `change password: ${response.status()}`).toBeTruthy();
 }
 
 /**

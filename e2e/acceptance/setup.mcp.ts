@@ -3,7 +3,7 @@
 // seeded admin, the last reason the security gate keeps MCP closed.
 
 import { expect, test } from '@playwright/test';
-import { configureInstance, loginViaUi, setPassword } from '../helpers/app.js';
+import { changePassword, configureInstance, loginViaUi } from '../helpers/app.js';
 import {
   mcpAdminPassword,
   mcpBaseUrl,
@@ -12,7 +12,6 @@ import {
   navidromeAdminPassword,
   navidromeAdminUser,
   navidromeUrl,
-  seededAdminId,
 } from '../helpers/env.js';
 
 test('open the MCP instance', async ({ page }) => {
@@ -45,7 +44,7 @@ test('open the MCP instance', async ({ page }) => {
   // Navidrome refuses admin/admin, so the login falls back to the seeded local account.
   await loginViaUi(page, { username: 'admin', password: 'admin' });
   await configureInstance(page, mcpSlskdUrlForApp, mcpMusicDirForApp);
-  await setPassword(page.context(), seededAdminId, mcpAdminPassword);
+  await changePassword(page.context(), 'admin', mcpAdminPassword);
 
   const open = await probe();
   expect(open.status()).toBe(200);

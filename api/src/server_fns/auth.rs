@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use crate::{
-    auth::{self, LinkProof, RegistrationMode, NO_PASSWORD_TO_LINK},
+    auth::{self, PasswordProof, RegistrationMode, NO_PASSWORD},
     base_url::{request_base_with, BaseUrl, BaseUrlError},
     config::CONFIG,
     login_limiter::{LoginLimiter, LOGIN_LIMITER},
@@ -176,7 +176,7 @@ pub(crate) enum NavidromeAuthResult {
 /// Try to authenticate against this server's Navidrome with the given
 /// credentials.
 #[cfg(feature = "server")]
-async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResult {
+pub(crate) async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResult {
     match CONFIG.navidrome_url() {
         Some(url) => navidrome_auth_at(url, username, password).await,
         None => NavidromeAuthResult::NotConfigured,
@@ -594,24 +594,30 @@ where
 }
 
 /// What proves `user` is the signed-in person's before they link it to
-/// single sign-on, with `navidrome_configured` saying NAVIDROME_URL is set.
+/// single sign-on or change its password, with `navidrome_configured`
+/// saying NAVIDROME_URL is set.
 #[cfg(feature = "server")]
-pub(crate) fn link_proof(user: &models::user::User, navidrome_configured: bool) -> LinkProof {
+pub(crate) fn password_proof(
+    user: &models::user::User,
+    navidrome_configured: bool,
+) -> PasswordProof {
     if user.has_password() {
-        LinkProof::Password
+        PasswordProof::Password
     } else if navidrome_configured && user.navidrome_token.is_some() {
-        LinkProof::NavidromePassword
+        PasswordProof::NavidromePassword
     } else {
-        LinkProof::NoPassword
+        PasswordProof::NoPassword
     }
 }
 
 /// Checks that `password` is the one the login form signs in to `user`
 /// with, before a link hands the account to whoever the provider vouches
-/// for: a session left open is not enough. Held back like sign-ins of that
-/// name, and a wrong password counts as a failed one. For an account linked
-/// to Navidrome, Navidrome's verdict decides while it gives one, as at the
-/// login form. `navidrome` asks Navidrome about the name it is given.
+/// for or a new password replaces it: a session left open is not enough,
+/// and an account without that password gets one from an admin. Held back
+/// like sign-ins of that name, and a wrong password counts as a failed one.
+/// For an account linked to Navidrome, Navidrome's verdict decides while it
+/// gives one, as at the login form. `navidrome` asks Navidrome about the
+/// name it is given.
 #[cfg(feature = "server")]
 pub(crate) async fn prove_password_in<F>(
     limiter: &LoginLimiter,
@@ -624,9 +630,9 @@ pub(crate) async fn prove_password_in<F>(
 where
     F: std::future::Future<Output = NavidromeAuthResult>,
 {
-    let proof = link_proof(user, navidrome_configured);
-    if proof == LinkProof::NoPassword {
-        return Err(refusal_error(NO_PASSWORD_TO_LINK));
+    let proof = password_proof(user, navidrome_configured);
+    if proof == PasswordProof::NoPassword {
+        return Err(refusal_error(NO_PASSWORD));
     }
     let attempt = limiter
         .begin(&user.username, clock())
@@ -639,7 +645,7 @@ where
     let proven = match verdict {
         NavidromeAuthResult::Success => true,
         NavidromeAuthResult::AuthFailed => false,
-        NavidromeAuthResult::Unreachable if proof == LinkProof::NavidromePassword => {
+        NavidromeAuthResult::Unreachable if proof == PasswordProof::NavidromePassword => {
             return Err(refusal_error(
                 "Navidrome did not answer, so nothing changed. Try again later.",
             ));
@@ -1424,11 +1430,11 @@ mod tests {
 
     #[tokio::test]
     async fn linking_takes_the_password_the_login_form_takes() {
-        use crate::auth::LinkProof;
+        use crate::auth::PasswordProof;
 
         let db = test_db::migrated().await;
         let ann = User::create_in(&db, "ann", "ann-pw").await.unwrap();
-        assert_eq!(link_proof(&ann, true), LinkProof::Password);
+        assert_eq!(password_proof(&ann, true), PasswordProof::Password);
         let limiter = LoginLimiter::new();
         let now = Instant::now();
         for result in [
@@ -1492,7 +1498,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_account_without_a_password_links_with_its_navidrome_password_or_not_at_all() {
-        use crate::auth::{LinkProof, NO_PASSWORD_TO_LINK};
+        use crate::auth::{PasswordProof, NO_PASSWORD};
 
         let db = test_db::migrated().await;
         let sso = User::create_oidc_in(&db, "sso", "https://id.example.com", "sub-sso")
@@ -1504,7 +1510,7 @@ mod tests {
         // Nothing proves it: an admin sets a password first. Nothing is
         // counted and Navidrome is not asked.
         for navidrome in [true, false] {
-            assert_eq!(link_proof(&sso, navidrome), LinkProof::NoPassword);
+            assert_eq!(password_proof(&sso, navidrome), PasswordProof::NoPassword);
             for password in ["", "sub-sso"] {
                 let (refused, asked) = prove(
                     &limiter,
@@ -1516,10 +1522,7 @@ mod tests {
                 .await;
                 let refused = refused.unwrap_err();
                 assert_eq!(code(&refused), REFUSAL_CODE);
-                assert!(
-                    refused.to_string().contains(NO_PASSWORD_TO_LINK),
-                    "{refused}"
-                );
+                assert!(refused.to_string().contains(NO_PASSWORD), "{refused}");
                 assert_eq!(asked, None);
             }
         }
@@ -1529,8 +1532,8 @@ mod tests {
             .await
             .unwrap();
         let sso = row(&db, "sso").await.unwrap();
-        assert_eq!(link_proof(&sso, true), LinkProof::NavidromePassword);
-        assert_eq!(link_proof(&sso, false), LinkProof::NoPassword);
+        assert_eq!(password_proof(&sso, true), PasswordProof::NavidromePassword);
+        assert_eq!(password_proof(&sso, false), PasswordProof::NoPassword);
         let (ok, asked) = prove(
             &limiter,
             &sso,

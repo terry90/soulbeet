@@ -146,11 +146,11 @@ test('links single sign-on from Settings, then signs in with it', async ({ page 
 
   // A session left open is not enough: linking takes the account's password.
   const link = page.getByRole('button', { name: 'Link single sign-on' });
-  await page.getByLabel('Current password').fill('not-the-password');
+  await page.getByLabel('Password to link single sign-on').fill('not-the-password');
   await link.click();
   await expect(page.getByText('Wrong password.')).toBeVisible();
   await expect(page).toHaveURL(/\/settings$/);
-  await page.getByLabel('Current password').fill(user.password);
+  await page.getByLabel('Password to link single sign-on').fill(user.password);
   await link.click();
 
   // The provider is asked for a new sign-in, and Settings shows which

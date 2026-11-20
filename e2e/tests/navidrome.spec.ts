@@ -4,26 +4,21 @@
 
 import { expect, test } from '@playwright/test';
 import {
+  changePassword,
   loginViaApi,
   loginViaUi,
   openSettings,
   registerUser,
-  setPassword,
   uniqueUser,
 } from '../helpers/app.js';
-import {
-  navidromeAdminPassword,
-  navidromeAdminUser,
-  navidromeEnabled,
-  seededAdminId,
-} from '../helpers/env.js';
+import { navidromeAdminPassword, navidromeAdminUser, navidromeEnabled } from '../helpers/env.js';
 
 test.skip(!navidromeEnabled, 'stack has no Navidrome (set E2E_NAVIDROME=1)');
 
 test('authenticates through Navidrome and reports the connection', async ({ context, page }) => {
   // The seeded admin takes the Navidrome admin's password for this test.
   await loginViaApi(context, { username: 'admin', password: 'admin' });
-  await setPassword(context, seededAdminId, navidromeAdminPassword);
+  await changePassword(context, 'admin', navidromeAdminPassword);
   await context.clearCookies();
 
   try {
@@ -37,7 +32,7 @@ test('authenticates through Navidrome and reports the connection', async ({ cont
     // Restore admin/admin so setup.app.ts keeps working on reruns.
     await context.clearCookies();
     await loginViaApi(context, { username: 'admin', password: navidromeAdminPassword });
-    await setPassword(context, seededAdminId, 'admin');
+    await changePassword(context, navidromeAdminPassword, 'admin');
   }
 });
 
