@@ -4,10 +4,12 @@
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{Jwk, JwkSet};
 use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
+use super::loggable;
 use crate::config::OidcConfig;
 
 const PROVIDER_TTL: Duration = Duration::from_secs(3600);
@@ -175,16 +177,44 @@ async fn fetch_provider(config: &OidcConfig) -> Result<Provider, String> {
     let discovery: Discovery =
         get_json(&format!("{issuer_url}/.well-known/openid-configuration")).await?;
     let endpoints = checked_endpoints(&discovery, issuer_url)?;
-    let keys: JwkSet = get_json(endpoints.jwks.as_str()).await?;
+    let published: PublishedKeys = get_json(endpoints.jwks.as_str()).await?;
 
     Ok(Provider {
         issuer: discovery.issuer,
         authorization_endpoint: endpoints.authorization,
         token_endpoint: endpoints.token,
         client_auth: ClientAuth::choose(&discovery.token_endpoint_auth_methods_supported),
-        keys,
+        keys: readable_keys(published),
         fetched_at: Instant::now(),
     })
+}
+
+/// The provider's key set, each key still unread.
+#[derive(Deserialize)]
+struct PublishedKeys {
+    keys: Vec<Value>,
+}
+
+/// The keys of `published` that `jsonwebtoken` can read. One it cannot (an
+/// X25519 encryption key, a curve it does not know) is skipped, so it does
+/// not take the signing keys down with it.
+fn readable_keys(published: PublishedKeys) -> JwkSet {
+    let keys = published
+        .keys
+        .into_iter()
+        .filter_map(|key| {
+            let kid = key.get("kid").and_then(Value::as_str).map(loggable);
+            serde_json::from_value::<Jwk>(key)
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        "OIDC: skipping the provider key {} that cannot be read: {e}",
+                        kid.as_deref().unwrap_or("without a kid")
+                    )
+                })
+                .ok()
+        })
+        .collect();
+    JwkSet { keys }
 }
 
 async fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
@@ -214,8 +244,29 @@ async fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oidc::testing::test_provider;
+    use crate::oidc::testing::{test_provider, TEST_KEY_X};
     use serde_json::json;
+
+    #[test]
+    fn a_key_the_library_cannot_read_is_skipped_not_the_whole_set() {
+        // An X25519 encryption key and a curve jsonwebtoken does not know,
+        // next to the signing key.
+        let published = json!({ "keys": [
+            { "kty": "OKP", "kid": "enc", "use": "enc", "crv": "X25519", "x": TEST_KEY_X },
+            { "kty": "EC", "kid": "k256", "crv": "secp256k1", "x": "AQAB", "y": "AQAB" },
+            "not a key",
+            { "kty": "OKP", "kid": "k1", "crv": "Ed25519", "x": TEST_KEY_X },
+        ]});
+        assert!(serde_json::from_value::<JwkSet>(published.clone()).is_err());
+
+        let keys = readable_keys(serde_json::from_value(published).unwrap());
+        let kids: Vec<_> = keys
+            .keys
+            .iter()
+            .map(|jwk| jwk.common.key_id.as_deref())
+            .collect();
+        assert_eq!(kids, [Some("k1")]);
+    }
 
     const NAMES: [&str; 3] = ["authorization_endpoint", "token_endpoint", "jwks_uri"];
 
