@@ -15,6 +15,7 @@ use crate::{
     config::CONFIG,
     db::DB,
     models::user::{User, UserChangeError},
+    oidc::LinkStartError,
     AuthSession,
 };
 #[cfg(feature = "server")]
@@ -63,13 +64,18 @@ pub async fn start_sso_link() -> Result<String, ServerFnError> {
     if user.oidc_subject.is_some() {
         return Err(refusal_error(SsoLinkResult::AlreadyLinked.message()));
     }
-    crate::oidc::begin_link(&cookies, config, &user.id, &headers, &uri)
-        .await
-        .map(String::from)
-        .map_err(|e| {
+    match crate::oidc::begin_link(&cookies, config, &user.id, &headers, &uri).await {
+        Ok(url) => Ok(url.into()),
+        Err(LinkStartError::Elsewhere(callback)) => Err(refusal_error(format!(
+            "Single sign-on comes back to {callback}. Open Soulbeet there to link it."
+        ))),
+        Err(LinkStartError::Failed(e)) => {
             tracing::error!("Linking OIDC failed: {e}");
-            refusal_error("Cannot start single sign-on. The server log has the details.")
-        })
+            Err(refusal_error(
+                "Cannot start single sign-on. The server log has the details.",
+            ))
+        }
+    }
 }
 
 #[cfg(feature = "server")]

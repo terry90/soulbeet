@@ -282,6 +282,9 @@ struct Start {
     /// The address of the callback the provider sends the browser back to
     callback: BaseUrl,
     session: SessionCookie,
+    /// The callback is pinned to another host than the page that sent the
+    /// request: a flow cookie set now would not reach the callback
+    elsewhere: bool,
 }
 
 impl Start {
@@ -309,11 +312,36 @@ impl Start {
                 }
             }
         };
-        Ok(Start { callback, session })
+        // Only a pin can differ from the request's own address. The page's
+        // Origin says where the browser is; a request without one (a link, or
+        // the move to the pinned address) starts where it is.
+        let pinned = pin.is_some() || public_url.is_some();
+        let page = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|origin| origin.to_str().ok())
+            .and_then(|origin| BaseUrl::parse(origin).ok());
+        let elsewhere = pinned && page.is_some_and(|page| !page.same_host(&callback));
+        Ok(Start {
+            callback,
+            session,
+            elsewhere,
+        })
     }
 
     fn redirect_uri(&self) -> String {
         format!("{}{OIDC_CALLBACK_PATH}", self.callback)
+    }
+
+    /// The same sign-in started at the callback's address.
+    fn login_url(&self, return_to: Option<&str>) -> String {
+        match return_to {
+            Some(back) => format!(
+                "{}{OIDC_LOGIN_PATH}?{}",
+                self.callback,
+                shared::oauth::return_to_query(back)
+            ),
+            None => format!("{}{OIDC_LOGIN_PATH}", self.callback),
+        }
     }
 }
 
@@ -436,6 +464,10 @@ async fn start_sign_in(
         uri,
     );
     let begun = match started {
+        // Started there, the flow cookie is where the callback reads it.
+        Ok(start) if start.elsewhere => {
+            return Redirect::to(&start.login_url(return_to.as_deref())).into_response();
+        }
         Ok(start) => begin(cookies, config, Purpose::SignIn { return_to }, &start).await,
         Err(e) => Err(e),
     };
@@ -448,6 +480,14 @@ async fn start_sign_in(
     }
 }
 
+/// Why linking cannot start.
+pub(crate) enum LinkStartError {
+    /// The provider sends the browser back to this address, and the page
+    /// is at another one, where the account's session is
+    Elsewhere(BaseUrl),
+    Failed(String),
+}
+
 /// Starts linking the signed-in account `user_id` to an identity at the
 /// provider from the request `headers` and `uri`: the address to send the
 /// browser to. The callback links it only while this browser is still
@@ -458,17 +498,23 @@ pub(crate) async fn begin_link(
     user_id: &str,
     headers: &HeaderMap,
     uri: &Uri,
-) -> Result<url::Url, String> {
+) -> Result<url::Url, LinkStartError> {
     let start = Start::for_request(
         config.redirect_pin.as_ref(),
         CONFIG.public_url(),
         headers,
         uri,
-    )?;
+    )
+    .map_err(LinkStartError::Failed)?;
+    if start.elsewhere {
+        return Err(LinkStartError::Elsewhere(start.callback));
+    }
     let purpose = Purpose::Link {
         user_id: user_id.to_string(),
     };
-    begin(cookies, config, purpose, &start).await
+    begin(cookies, config, purpose, &start)
+        .await
+        .map_err(LinkStartError::Failed)
 }
 
 /// A new flow for `purpose`, coming back as `start` says.
@@ -1890,6 +1936,51 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         // login, and so does a request whose address cannot be told.
         assert!(start_with(&lan, None, Some("music.example.com")).is_err());
         assert!(start_with(&[], None, None).is_err());
+    }
+
+    #[test]
+    fn a_sign_in_from_another_address_than_a_pinned_callback_moves_there_first() {
+        // PUBLIC_URL (or OIDC_REDIRECT_URL) is the public name, and the
+        // button is clicked on the LAN address: the flow cookie would be set
+        // there, and the provider sends the browser to the public name.
+        let lan = [
+            ("host", "192.168.1.5:9765"),
+            ("origin", "http://192.168.1.5:9765"),
+        ];
+        for (pin, public_url) in [
+            (None, Some("https://music.example.com")),
+            (Some("https://music.example.com"), None),
+        ] {
+            let start = start_with(&lan, pin, public_url).unwrap();
+            assert!(start.elsewhere);
+            let back = "/oauth/authorize?client_id=c&state=a%26b";
+            let moved = start.login_url(Some(back));
+            assert_eq!(
+                moved,
+                format!(
+                    "https://music.example.com/api/auth/oidc/login?{}",
+                    shared::oauth::return_to_query(back)
+                )
+            );
+            assert_eq!(
+                start.login_url(None),
+                "https://music.example.com/api/auth/oidc/login"
+            );
+        }
+
+        // There, it starts: the request comes from the pinned name (on any
+        // scheme), or without an Origin, as the redirect there does.
+        let pinned = Some("https://music.example.com");
+        for pairs in [
+            &[("host", "music.example.com"), ("origin", "https://music.example.com")][..],
+            &[("host", "music.example.com"), ("origin", "http://music.example.com")][..],
+            &[("host", "soulful:9765")][..],
+        ] {
+            assert!(!start_with(pairs, None, pinned).unwrap().elsewhere, "{pairs:?}");
+        }
+        // Without a pin, the callback is wherever the request came from.
+        let proxied = [("host", "soulful:9765"), ("origin", "https://music.example.com")];
+        assert!(!start_with(&proxied, None, None).unwrap().elsewhere);
     }
 
     #[test]
