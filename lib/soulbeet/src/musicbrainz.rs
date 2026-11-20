@@ -522,11 +522,12 @@ fn genre_list(text: &str) -> Vec<String> {
 
 /// Every genre name MusicBrainz knows, one request.
 pub async fn genre_names() -> Result<Vec<String>, MetadataError> {
+    genre_names_at(&web_base(std::env::var("MUSICBRAINZ_HOST").ok())).await
+}
+
+async fn genre_names_at(base: &str) -> Result<Vec<String>, MetadataError> {
     let service = Service::Musicbrainz;
-    let url = format!(
-        "{}/ws/2/genre/all?fmt=txt",
-        web_base(std::env::var("MUSICBRAINZ_HOST").ok())
-    );
+    let url = format!("{base}/ws/2/genre/all?fmt=txt");
     crate::http::mb_rate_limit().await;
     let unavailable = |raw: String| MetadataError::Unavailable {
         service,
@@ -550,6 +551,19 @@ pub async fn genre_names() -> Result<Vec<String>, MetadataError> {
             status: Some(status.as_u16()),
             raw: cut_chars(body, RAW_MAX_CHARS),
         });
+    }
+    // An empty answer or a proxy's HTML page is no genre list. As an error it
+    // is not cached for the 30 days a list is.
+    let unreadable = |raw: String| MetadataError::Unreadable {
+        service,
+        status: Some(status.as_u16()),
+        raw: cut_chars(raw, RAW_MAX_CHARS),
+    };
+    if body.trim().is_empty() {
+        return Err(unreadable("MusicBrainz answered no genres".into()));
+    }
+    if body.trim_start().starts_with('<') {
+        return Err(unreadable(body));
     }
     Ok(genre_list(&body))
 }
@@ -813,6 +827,40 @@ mod tests {
         );
         assert_eq!(web_base(None), "https://musicbrainz.org");
         assert_eq!(web_base(Some("stubs:5050".into())), "http://stubs:5050");
+    }
+
+    #[tokio::test]
+    async fn only_a_listed_genre_answer_is_a_genre_list() {
+        use crate::test_http::{serve, Reply};
+        let reply = |status, body: &str| Reply {
+            status,
+            body: body.into(),
+        };
+        let (base, _) = serve(vec![
+            reply(404, "Not Found"),
+            reply(200, ""),
+            reply(
+                200,
+                "<!DOCTYPE html><html><body>Checking your browser</body></html>",
+            ),
+            reply(200, include_str!("fixtures/musicbrainz/genres.txt")),
+        ]);
+        assert!(matches!(
+            genre_names_at(&base).await,
+            Err(MetadataError::Rejected {
+                status: Some(404),
+                ..
+            })
+        ));
+        assert!(matches!(
+            genre_names_at(&base).await,
+            Err(MetadataError::Unreadable { .. })
+        ));
+        assert!(matches!(
+            genre_names_at(&base).await,
+            Err(MetadataError::Unreadable { .. })
+        ));
+        assert_eq!(genre_names_at(&base).await.unwrap().len(), 10);
     }
 
     #[tokio::test]
