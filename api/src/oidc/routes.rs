@@ -20,7 +20,9 @@ use crate::auth::{SsoError, SsoLinkResult};
 use crate::base_url::BaseUrl;
 use crate::config::{OidcConfig, CONFIG};
 use crate::db::DB;
+use crate::secret_key::SecretKey;
 use crate::server_fns::auth::{issue_session_cookie, AUTH_COOKIE_NAME};
+use crate::server_fns::guard::load_session;
 
 /// Back to the login page, which shows what went wrong, still on the way to
 /// `return_to` when the sign-in was.
@@ -168,13 +170,14 @@ pub(super) async fn callback(cookies: Cookies, Query(params): Query<CallbackPara
     let Some(config) = CONFIG.oidc() else {
         return to_login(SsoError::Disabled, None);
     };
-    let flow = match take_flow(
-        &cookies,
-        params.state.as_deref(),
-        crate::secret_key::current(),
-    ) {
+    let key = crate::secret_key::current();
+    let flow = match take_flow(&cookies, params.state.as_deref(), key) {
         Ok(flow) => flow,
-        Err(error) => return to_login(error, None),
+        Err(error) => {
+            let token = cookies.get(AUTH_COOKIE_NAME).map(|c| c.value().to_string());
+            let to = without_flow(&DB, key, token.as_deref(), error).await;
+            return Redirect::to(&to).into_response();
+        }
     };
     let identity = verified_identity(&PROVIDER, config, &flow, params).await;
     let session = flow.session;
@@ -199,7 +202,6 @@ pub(super) async fn callback(cookies: Cookies, Query(params): Query<CallbackPara
             let token = cookies.get(AUTH_COOKIE_NAME).map(|c| c.value().to_string());
             let linked = match identity {
                 Ok(identity) => {
-                    let key = crate::secret_key::current();
                     link_from_session(&DB, key, token.as_deref(), &user_id, &identity).await
                 }
                 Err(SsoError::Denied) => Err(SsoLinkResult::Denied),
@@ -218,6 +220,24 @@ pub(super) async fn callback(cookies: Cookies, Query(params): Query<CallbackPara
             tracing::error!("OIDC sign-in failed: cannot start a session: {e}");
             to_login(SsoError::Failed, return_to.as_deref())
         }
+    }
+}
+
+/// Where a callback goes that this browser holds no flow for (it expired,
+/// was sealed with another key, or started at another address), with the
+/// session `session_token` the browser sent. Signed in, the browser was
+/// linking from Settings, so the outcome is shown there; else on the login
+/// page.
+async fn without_flow(
+    db: &sqlx::SqlitePool,
+    key: &SecretKey,
+    session_token: Option<&str>,
+    error: SsoError,
+) -> String {
+    if session_token.is_some() && load_session(session_token, db, key).await.is_ok() {
+        SsoLinkResult::Failed.location()
+    } else {
+        error.location(None)
     }
 }
 
@@ -301,6 +321,32 @@ mod tests {
         let flow = test_flow();
         stub.answer_id_token(sign_id_token(kid, stub.claims(&flow, username)));
         verified_identity(providers, &stub.config(), &flow, with_code()).await
+    }
+
+    #[tokio::test]
+    async fn a_link_whose_flow_is_gone_ends_in_settings_while_signed_in() {
+        use crate::db::test_db;
+        use crate::models::user::User;
+
+        let db = test_db::migrated().await;
+        let key = SecretKey::new("k".repeat(32));
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let session = crate::auth::create_token(&key, &ann.id, 0).unwrap();
+        assert_eq!(
+            without_flow(&db, &key, Some(&session), SsoError::Failed).await,
+            "/settings/sso/failed"
+        );
+        // Signed out, or with a session that ended or does not verify: a
+        // sign-in, shown on the login page.
+        let other_key =
+            crate::auth::create_token(&SecretKey::new("x".repeat(32)), &ann.id, 0).unwrap();
+        User::update_password_in(&db, &ann.id, "new").await.unwrap();
+        for token in [None, Some(session.as_str()), Some(other_key.as_str())] {
+            assert_eq!(
+                without_flow(&db, &key, token, SsoError::Failed).await,
+                "/login/error/failed"
+            );
+        }
     }
 
     #[tokio::test]
