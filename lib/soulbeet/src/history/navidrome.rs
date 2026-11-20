@@ -79,15 +79,15 @@ impl NavidromeHistory {
         self.artist_mbids.get(&participant.id).cloned()
     }
 
-    /// The song's display artist with the MBID of its main artist: the song's own where the
-    /// scanner before Navidrome 0.55.0 filled it, else the first `artist` participant's row.
+    /// The song's main artist, its first `artist` participant from Navidrome 0.55.0 on. It is
+    /// named as its artist row, so a collaboration counts under the same name as a solo song.
+    /// The MBID is the song's own where the scanner before 0.55.0 filled it, else the row's.
+    /// Songs scanned before 0.55.0 have no participants, only the display artist.
     fn artist_of(&self, song: &NativeSong) -> ArtistRef {
+        let main = song.participants.artist.first();
         ArtistRef {
-            name: song.artist.clone(),
-            mbid: song.mbz_artist_id.clone().or_else(|| {
-                let main = song.participants.artist.first()?;
-                self.mbid_of(main)
-            }),
+            name: main.map_or(&song.artist, |m| &m.name).clone(),
+            mbid: song.mbz_artist_id.clone().or_else(|| self.mbid_of(main?)),
         }
     }
 
@@ -191,7 +191,7 @@ impl ListeningHistory for NavidromeHistory {
             .into_iter()
             .take(count)
             .map(|(s, date)| Listen {
-                artist: s.artist.clone(),
+                artist: self.artist_of(s).name,
                 track: s.title.clone(),
                 album: Some(s.album.clone()),
                 timestamp: date.timestamp(),
@@ -220,7 +220,10 @@ impl ListeningHistory for NavidromeHistory {
     async fn known(&self) -> Result<KnownMusic, HistoryError> {
         let mut known = KnownMusic::default();
         for song in &self.songs {
-            known.add_track(&self.track_ref(song));
+            // A recommended track carries its credited artist string, which names every artist.
+            let mut credited = self.track_ref(song);
+            credited.artist.name = song.artist.clone();
+            known.add_track(&credited);
             known.add_artist(&ArtistRef {
                 name: song.album_artist.clone(),
                 mbid: song.mbz_album_artist_id.clone(),
@@ -240,7 +243,11 @@ impl ListeningHistory for NavidromeHistory {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::engine::build_profile;
+    use crate::engine::test_support::FakeKnowledge;
     use crate::test_http::{serve_with_headers, Reply};
     use crate::NavidromeClientBuilder;
     use shared::recommendation::{ArtistRef, TimePeriod};
@@ -558,23 +565,39 @@ mod tests {
             .iter()
             .map(|a| (a.artist.name.as_str(), a.artist.mbid.as_deref(), a.plays))
             .collect();
-        // Both Static Harbor songs count under its MBID, whatever the display artist.
+        // Both Static Harbor songs count under its artist row, whatever the display artist.
+        assert_eq!(got, [("Static Harbor", Some(SH), 6), ("Untagged", None, 3)]);
+        let tracks = h.top_tracks(TimePeriod::AllTime, 10).await.unwrap();
+        let got: Vec<(&str, &str, Option<&str>)> = tracks
+            .iter()
+            .map(|t| {
+                let artist = &t.track.artist;
+                (
+                    t.track.title.as_str(),
+                    artist.name.as_str(),
+                    artist.mbid.as_deref(),
+                )
+            })
+            .collect();
         assert_eq!(
             got,
             [
-                ("Static Harbor feat. Vela Norte", Some(SH), 6),
-                ("Untagged", None, 3)
+                ("Northern Line", "Static Harbor", Some(SH)),
+                ("Undertow", "Static Harbor", Some(SH)),
+                ("Foglight", "Untagged", None)
             ]
-        );
-        let tracks = h.top_tracks(TimePeriod::AllTime, 10).await.unwrap();
-        assert!(
-            tracks
-                .iter()
-                .all(|t| t.track.artist.mbid.as_deref()
-                    == (t.track.title != "Foglight").then_some(SH))
         );
 
         let known = h.known().await.unwrap();
+        // A recommended track carries its credited artist string.
+        assert!(known.knows_track(&TrackRef {
+            artist: ArtistRef {
+                name: "Static Harbor feat. Vela Norte".into(),
+                mbid: None
+            },
+            title: "Northern Line".into(),
+            mbid: None
+        }));
         for mbid in [SH, VN, MC] {
             assert!(
                 known.knows_artist(&ArtistRef {
@@ -588,6 +611,50 @@ mod tests {
             name: "Vela Norte".into(),
             mbid: None
         }));
+    }
+
+    #[tokio::test]
+    async fn a_collaboration_and_a_solo_song_name_their_artist_alike() {
+        let sh = ("ar-sh", "Static Harbor");
+        let vn = ("ar-vn", "Vela Norte");
+        let mc = ("ar-mc", "Marrow Choir");
+        // The oldest import is the collaboration, last played in January.
+        let mut collab = credited("1", "Northern Line", &[sh, vn], sh);
+        collab.play_count = 9;
+        collab.play_date = Some("2026-01-02T20:00:00Z".parse().unwrap());
+        let mut starred = credited("2", "Foglight", &[sh, vn], sh);
+        starred.starred = true;
+        starred.play_count = 0;
+        let solo = credited("3", "Undertow", &[sh], sh);
+        let mut newcomer = credited("4", "Lanterns", &[mc], mc);
+        newcomer.play_count = 5;
+        let h = NavidromeHistory::from_songs(
+            vec![collab, starred, solo, newcomer],
+            artist_rows(),
+            now(),
+        );
+
+        let all_time = h.top_artists(TimePeriod::AllTime, 10).await.unwrap();
+        let month = h.top_artists(TimePeriod::Month, 10).await.unwrap();
+        // This month Static Harbor's only play is the solo song.
+        assert_eq!(all_time[0].artist, month[1].artist);
+        assert_eq!(all_time[0].artist.name, "Static Harbor");
+        let favourites = h.favourites().await.unwrap();
+        assert_eq!(favourites[0].artist.name, "Static Harbor");
+        let listens = h.listens(10).await.unwrap();
+        let got: Vec<&str> = listens.iter().map(|l| l.artist.as_str()).collect();
+        assert_eq!(got, ["Static Harbor", "Marrow Choir", "Static Harbor"]);
+
+        let history = Arc::new(h) as Arc<dyn ListeningHistory>;
+        let b = build_profile(&[history], &FakeKnowledge::default()).await;
+        let momentum: Vec<(&str, f64)> = b
+            .profile
+            .momentum_artists
+            .iter()
+            .map(|m| (m.name.as_str(), m.momentum_score))
+            .collect();
+        // The all-time top artist scores 0 whatever its rank this month.
+        assert_eq!(momentum, [("Marrow Choir", 1.0)]);
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ pub mod freshness;
 pub mod listenbrainz_account;
 pub mod taste;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use std::collections::HashSet;
 use std::sync::Arc;
