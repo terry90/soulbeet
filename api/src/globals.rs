@@ -247,31 +247,35 @@ pub fn start_channel_cleanup_task() {
             }
             // Wait 30s for server to be fully ready
             tokio::time::sleep(Duration::from_secs(30)).await;
-            let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600)); // 6 hours
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                run_automation().await;
-            }
+            repeat_spaced(Duration::from_secs(6 * 3600), run_automation).await;
         });
-        info!("Started automation task (interval: 6h)");
+        info!("Started automation task (6h after each run ends)");
 
         tokio::spawn(async {
             let delay = first_recommendation_delay(&mut rand::rng());
             info!(
-                "Recommendations start in {}s, then every 6h",
+                "Recommendations start in {}s, then 6h after each cycle ends",
                 delay.as_secs()
             );
             tokio::time::sleep(delay).await;
-            let mut interval = tokio::time::interval(RECOMMENDATION_INTERVAL);
-            // A cycle that ran past the interval is followed by a full one, not at once.
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                run_recommendations().await;
-            }
+            repeat_spaced(RECOMMENDATION_INTERVAL, run_recommendations).await;
         });
     });
+}
+
+/// Runs `cycle` forever and waits `period` after each one ends. A tokio interval, even
+/// with MissedTickBehavior::Delay, starts the next cycle at once after one that ran past
+/// the period, and these cycles call remote services that may be the reason it ran long.
+#[cfg(feature = "server")]
+async fn repeat_spaced<F, Fut>(period: Duration, mut cycle: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        cycle().await;
+        tokio::time::sleep(period).await;
+    }
 }
 
 #[cfg(feature = "server")]
@@ -481,5 +485,34 @@ mod tests {
             let d = first_recommendation_delay(&mut rng);
             assert!(d >= Duration::from_secs(30) && d < Duration::from_secs(30 + 21_600));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cycle_that_runs_past_the_period_is_followed_by_a_full_period() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::Instant;
+
+        let hour = Duration::from_secs(3600);
+        let boot = Instant::now();
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let seen = starts.clone();
+        let task = tokio::spawn(repeat_spaced(6 * hour, move || {
+            let seen = seen.clone();
+            async move {
+                let first = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(boot.elapsed());
+                    seen.len() == 1
+                };
+                tokio::time::sleep(if first { 7 * hour } else { hour }).await;
+            }
+        }));
+
+        tokio::time::sleep(21 * hour).await;
+        task.abort();
+        assert_eq!(
+            *starts.lock().unwrap(),
+            vec![Duration::ZERO, 13 * hour, 20 * hour]
+        );
     }
 }
