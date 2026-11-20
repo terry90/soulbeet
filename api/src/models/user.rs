@@ -390,7 +390,8 @@ impl User {
 
     /// Creates an account that signs in through OpenID Connect. It has no
     /// password, so the password form stays closed to it until one is set in
-    /// Settings > Users or by a Navidrome sign-in.
+    /// Settings > Users. A Navidrome login of that name does not join it: the
+    /// provider and Navidrome may give the name to different people.
     pub(crate) async fn create_oidc_in(
         db: &SqlitePool,
         username: &str,
