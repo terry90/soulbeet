@@ -274,6 +274,8 @@ pub struct AppConfig {
     pub ip: String,
     /// OpenID Connect sign-in, when configured
     oidc: Option<OidcConfig>,
+    /// Why single sign-on is off although `OIDC_ISSUER_URL` is set
+    oidc_off: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -309,11 +311,14 @@ impl AppConfig {
             tracing::error!("{problem}");
         }
 
-        let oidc = OidcConfig::from_lookup(|key| std::env::var(key).ok(), registration)
-        .unwrap_or_else(|e| {
-            tracing::error!("OIDC sign-in is disabled: {e}");
-            None
-        });
+        let (oidc, oidc_off) =
+            match OidcConfig::from_lookup(|key| std::env::var(key).ok(), registration) {
+                Ok(oidc) => (oidc, None),
+                Err(e) => {
+                    tracing::error!("Single sign-on is off: {e}");
+                    (None, Some(e))
+                }
+            };
 
         Self {
             database_url: std::env::var("DATABASE_URL")
@@ -346,12 +351,18 @@ impl AppConfig {
                 .unwrap_or(9765),
             ip: std::env::var("IP").unwrap_or_else(|_| "0.0.0.0".to_string()),
             oidc,
+            oidc_off,
         }
     }
 
     /// OpenID Connect sign-in settings, when configured.
     pub fn oidc(&self) -> Option<&OidcConfig> {
         self.oidc.as_ref()
+    }
+
+    /// Why single sign-on is off although `OIDC_ISSUER_URL` is set.
+    pub fn oidc_off(&self) -> Option<&str> {
+        self.oidc_off.as_deref()
     }
 
     /// Get the database URL.

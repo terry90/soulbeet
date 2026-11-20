@@ -27,6 +27,9 @@ pub struct SecurityStatus {
     /// Why `MCP` switches MCP access off; None when it is on.
     #[serde(default)]
     pub mcp_off: Option<String>,
+    /// Why single sign-on is off although `OIDC_ISSUER_URL` is set.
+    #[serde(default)]
+    pub sso_off: Option<String>,
 }
 
 #[cfg(feature = "server")]

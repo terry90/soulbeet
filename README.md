@@ -214,7 +214,7 @@ Soulbeet can sign users in through an OpenID Connect provider such as [Pocket ID
       - OIDC_CLIENT_SECRET=<client secret>
       - OIDC_PROVIDER_NAME=Pocket ID
     ```
-3.  Restart. A configuration error is logged at startup and leaves single sign-on off.
+3.  Restart. A configuration error leaves single sign-on off. It is logged at startup and shown in Settings > Config > Security Checks.
 
 How accounts are matched:
 

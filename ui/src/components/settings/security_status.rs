@@ -30,6 +30,7 @@ pub fn SecurityStatusPanel() -> Element {
 fn SecurityChecks(status: SecurityStatus) -> Element {
     if status.mcp_off.is_none()
         && status.sign_in_problem.is_none()
+        && status.sso_off.is_none()
         && status.mcp_blocked_by.is_empty()
     {
         return rsx! {
@@ -39,6 +40,11 @@ fn SecurityChecks(status: SecurityStatus) -> Element {
     rsx! {
         if let Some(problem) = status.sign_in_problem {
             p { class: "text-sm font-mono text-red-400 mb-3", "{problem}" }
+        }
+        if let Some(why) = status.sso_off {
+            p { class: "text-sm font-mono text-yellow-400 mb-3",
+                "Single sign-on is off: {why}."
+            }
         }
         if let Some(why) = status.mcp_off {
             p { class: "text-sm font-mono text-gray-300 mb-3",
@@ -77,6 +83,7 @@ mod tests {
             mcp_blocked_by,
             sign_in_problem: sign_in_problem.map(Into::into),
             mcp_off: None,
+            sso_off: None,
         }
     }
 
@@ -86,6 +93,7 @@ mod tests {
             mcp_blocked_by: vec![],
             sign_in_problem: None,
             mcp_off: Some("MCP=off is set".into()),
+            sso_off: None,
         });
         assert!(html.contains("MCP access is turned off: MCP=off is set."));
         assert!(!html.contains("All security checks pass."));
@@ -93,10 +101,20 @@ mod tests {
             mcp_blocked_by: vec![],
             sign_in_problem: None,
             mcp_off: Some("MCP is set to 'disabled', which is neither on nor off".into()),
+            sso_off: None,
         });
         assert!(html.contains(
             "MCP access is turned off: MCP is set to &#39;disabled&#39;, which is neither on nor off."
         ));
+    }
+
+    #[test]
+    fn checks_say_why_single_sign_on_is_off() {
+        let mut s = status(vec![], None);
+        s.sso_off = Some("OIDC_CLIENT_ID is not set".into());
+        let html = render(s);
+        assert!(html.contains("Single sign-on is off: OIDC_CLIENT_ID is not set."));
+        assert!(!html.contains("All security checks pass."));
     }
 
     #[test]
