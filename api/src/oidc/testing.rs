@@ -74,7 +74,7 @@ pub(super) fn test_config() -> OidcConfig {
 pub(super) fn test_flow() -> Flow {
     let mut headers = HeaderMap::new();
     headers.insert(HOST, "soulbeet.example.com".parse().unwrap());
-    let start = Start::for_request(None, None, &headers, &Uri::from_static("/")).unwrap();
+    let start = Start::for_request(None, None, &headers, &Uri::from_static("/"), false).unwrap();
     new_flow(Purpose::SignIn { return_to: None }, &start)
 }
 

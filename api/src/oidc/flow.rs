@@ -12,7 +12,7 @@ use tower_cookies::{
 
 use super::provider::Provider;
 use crate::auth::{SsoError, OIDC_CALLBACK_PATH, OIDC_LOGIN_PATH};
-use crate::base_url::{request_base_with, BaseUrl, BaseUrlError};
+use crate::base_url::{addressed_to, request_base_with, BaseUrl, BaseUrlError};
 use crate::config::OidcConfig;
 use crate::crypto;
 use crate::secret_key::SecretKey;
@@ -49,10 +49,15 @@ pub(super) struct Start {
     /// The address of the callback the provider sends the browser back to
     pub(super) callback: BaseUrl,
     pub(super) session: SessionCookie,
-    /// The callback is pinned to another host than the page that sent the
-    /// request: a flow cookie set now would not reach the callback
+    /// The callback is pinned to another host than the browser's: a flow
+    /// cookie set now would not reach the callback
     pub(super) elsewhere: bool,
 }
+
+/// The query parameter of the move to the pinned address. That request
+/// starts there even when it names another host: a proxy may pass its own
+/// name for Soulbeet instead of the public one.
+const MOVED_QUERY: &str = "moved=true";
 
 impl Start {
     /// For the request `headers` and `uri`. The sign-in's address is `pin`
@@ -60,12 +65,14 @@ impl Start {
     /// set, else the request's own, on plain http when the browser is. The
     /// callback is at that address, and its cookies follow the rule of a
     /// password login's session cookie there. The provider checks the
-    /// address against the ones registered there.
+    /// address against the ones registered there. `moved`: the request is
+    /// the move to the pinned address.
     pub(super) fn for_request(
         pin: Option<&BaseUrl>,
         public_url: Option<&Result<BaseUrl, BaseUrlError>>,
         headers: &HeaderMap,
         uri: &Uri,
+        moved: bool,
     ) -> Result<Start, String> {
         // The pin is this sign-in's address, as PUBLIC_URL is a password
         // login's: the move to it is a GET, which carries no Origin to tell
@@ -81,13 +88,19 @@ impl Start {
             _ => base,
         };
         // Only a pinned address can differ from the request's own. The
-        // page's Origin says where the browser is; a request without one (a
-        // link, or the move to the pinned address) starts where it is.
-        let page = headers
-            .get(axum::http::header::ORIGIN)
-            .and_then(|origin| origin.to_str().ok())
-            .and_then(|origin| BaseUrl::parse(origin).ok());
-        let elsewhere = address.is_some() && page.is_some_and(|page| !page.same_host(&callback));
+        // page's Origin says where the browser is. A request without one (a
+        // bookmarked link) is where it was sent to, unless it is the move to
+        // the pinned address, which starts there.
+        let browser = match headers.get(axum::http::header::ORIGIN) {
+            Some(origin) => origin
+                .to_str()
+                .ok()
+                .and_then(|origin| BaseUrl::parse(origin).ok()),
+            None if moved => None,
+            None => addressed_to(headers, uri).ok(),
+        };
+        let elsewhere =
+            address.is_some() && browser.is_some_and(|browser| !browser.same_host(&callback));
         Ok(Start {
             callback,
             session,
@@ -103,11 +116,11 @@ impl Start {
     pub(super) fn login_url(&self, return_to: Option<&str>) -> String {
         match return_to {
             Some(back) => format!(
-                "{}{OIDC_LOGIN_PATH}?{}",
+                "{}{OIDC_LOGIN_PATH}?{MOVED_QUERY}&{}",
                 self.callback,
                 shared::oauth::return_to_query(back)
             ),
-            None => format!("{}{OIDC_LOGIN_PATH}", self.callback),
+            None => format!("{}{OIDC_LOGIN_PATH}?{MOVED_QUERY}", self.callback),
         }
     }
 }
@@ -273,6 +286,20 @@ mod tests {
         pin: Option<&str>,
         public_url: Option<&str>,
     ) -> Result<Start, String> {
+        start_at(pairs, pin, public_url, false)
+    }
+
+    /// `start_with` for the request the move to the pinned address sends.
+    fn moved_start(pairs: &[(&str, &str)], pin: &str) -> Start {
+        start_at(pairs, Some(pin), None, true).unwrap()
+    }
+
+    fn start_at(
+        pairs: &[(&str, &str)],
+        pin: Option<&str>,
+        public_url: Option<&str>,
+        moved: bool,
+    ) -> Result<Start, String> {
         let pin = pin.map(|p| BaseUrl::parse(p).unwrap());
         let public_url = public_url.map(BaseUrl::parse);
         Start::for_request(
@@ -280,6 +307,7 @@ mod tests {
             public_url.as_ref(),
             &headers(pairs),
             &Uri::from_static(OIDC_LOGIN_PATH),
+            moved,
         )
     }
 
@@ -381,7 +409,7 @@ mod tests {
         assert!(start_with(&lan, pin, None).unwrap().elsewhere);
         // The move is a GET without an Origin, and the name alone derives
         // https: the pin's own scheme decides, as PUBLIC_URL's does.
-        let start = start_with(&[("host", "nas:9765")], pin, None).unwrap();
+        let start = moved_start(&[("host", "nas:9765")], "http://nas:9765");
         assert!(!start.elsewhere);
         assert_eq!(
             start.redirect_uri(),
@@ -451,18 +479,29 @@ mod tests {
             assert_eq!(
                 moved,
                 format!(
-                    "https://music.example.com/api/auth/oidc/login?{}",
+                    "https://music.example.com/api/auth/oidc/login?moved=true&{}",
                     shared::oauth::return_to_query(back)
                 )
             );
             assert_eq!(
                 start.login_url(None),
-                "https://music.example.com/api/auth/oidc/login"
+                "https://music.example.com/api/auth/oidc/login?moved=true"
             );
         }
 
+        // A link to the login route on the LAN address, bookmarked or typed,
+        // has no Origin: the address it was sent to says where the browser
+        // is, and it moves too.
+        let bookmarked = [("host", "192.168.1.5:9765")];
+        for (pin, public_url) in [
+            (None, Some("https://music.example.com")),
+            (Some("https://music.example.com"), None),
+        ] {
+            assert!(start_with(&bookmarked, pin, public_url).unwrap().elsewhere);
+        }
+
         // There, it starts: the request comes from the pinned name (on any
-        // scheme), or without an Origin, as the redirect there does.
+        // scheme), or without an Origin to that name.
         let pinned = Some("https://music.example.com");
         for pairs in [
             &[
@@ -473,13 +512,24 @@ mod tests {
                 ("host", "music.example.com"),
                 ("origin", "http://music.example.com"),
             ][..],
-            &[("host", "soulful:9765")][..],
+            &[("host", "music.example.com")][..],
+            &[
+                ("host", "soulful:9765"),
+                ("x-forwarded-host", "music.example.com"),
+            ][..],
         ] {
             assert!(
                 !start_with(pairs, None, pinned).unwrap().elsewhere,
                 "{pairs:?}"
             );
         }
+        // A proxy that passes its own name for Soulbeet instead of the public
+        // one: the move itself starts there, rather than moving again.
+        let unnamed = [("host", "soulful:9765")];
+        assert!(start_with(&unnamed, None, pinned).unwrap().elsewhere);
+        assert!(!moved_start(&unnamed, "https://music.example.com").elsewhere);
+        // The move does not override what the page's Origin says.
+        assert!(moved_start(&lan, "https://music.example.com").elsewhere);
         // Without a pin, the callback is wherever the request came from.
         let proxied = [
             ("host", "soulful:9765"),

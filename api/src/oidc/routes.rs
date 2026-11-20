@@ -33,6 +33,9 @@ fn to_login(error: SsoError, return_to: Option<&str>) -> Response {
 #[derive(Deserialize)]
 pub(super) struct LoginParams {
     return_to: Option<String>,
+    /// Sent by the move to the pinned address
+    #[serde(default)]
+    moved: bool,
 }
 
 /// `GET /api/auth/oidc/login`: send the browser to the provider.
@@ -77,6 +80,7 @@ async fn start_sign_in(
         CONFIG.public_url(),
         headers,
         uri,
+        params.moved,
     );
     let begun = match started {
         // Started there, the flow cookie is where the callback reads it.
@@ -124,6 +128,7 @@ pub(crate) async fn begin_link(
         CONFIG.public_url(),
         headers,
         uri,
+        false,
     )
     .map_err(LinkStartError::Failed)?;
     if start.elsewhere {
@@ -321,6 +326,30 @@ mod tests {
         let flow = test_flow();
         stub.answer_id_token(sign_id_token(kid, stub.claims(&flow, username)));
         verified_identity(providers, &stub.config(), &flow, with_code()).await
+    }
+
+    #[test]
+    fn the_move_to_the_pinned_address_keeps_the_request_and_says_it_moved() {
+        // A bookmarked link to the login route on the LAN address, with
+        // OIDC_REDIRECT_URL at the public name.
+        let pin = BaseUrl::parse("https://music.example.com").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            "192.168.1.5:9765".parse().unwrap(),
+        );
+        let login = Uri::from_static(crate::auth::OIDC_LOGIN_PATH);
+        let start = Start::for_request(Some(&pin), None, &headers, &login, false).unwrap();
+        assert!(start.elsewhere);
+
+        let back = "/oauth/authorize?client_id=c&state=a%26b";
+        let moved: Uri = start.login_url(Some(back)).parse().unwrap();
+        let Query(params) = Query::<LoginParams>::try_from_uri(&moved).unwrap();
+        assert!(params.moved);
+        assert_eq!(params.return_to.as_deref(), Some(back));
+        // Any other request to the login route is not the move.
+        let Query(params) = Query::<LoginParams>::try_from_uri(&login).unwrap();
+        assert!(!params.moved);
     }
 
     #[tokio::test]
