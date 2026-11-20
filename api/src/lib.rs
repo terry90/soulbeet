@@ -38,6 +38,8 @@ pub mod transfer_registry;
 
 pub mod server_fns;
 #[cfg(all(test, feature = "server"))]
+mod test_log;
+#[cfg(all(test, feature = "server"))]
 mod test_navidrome;
 
 pub use server_fns::*;

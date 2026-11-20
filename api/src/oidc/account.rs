@@ -240,7 +240,8 @@ async fn find_or_create_account(
 mod tests {
     use super::*;
     use crate::db::test_db;
-    use crate::oidc::testing::{identity, identity_at, test_config, LogCapture, ISSUER};
+    use crate::oidc::testing::{identity, identity_at, test_config, ISSUER};
+    use crate::test_log::LogCapture;
 
     /// A first or later sign-in with the default settings, and auto-register.
     async fn sign_in(db: &SqlitePool, subject: &str, username: &str) -> Result<User, SsoError> {
