@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use super::{
-    auth::{start_session, SessionCookie},
+    auth::{link_proof, prove_password, start_session, SessionCookie},
     forbidden_error, refusal_error, server_error, ADMIN_ONLY,
 };
 #[cfg(feature = "server")]
@@ -47,16 +47,21 @@ pub async fn get_sign_in_methods() -> Result<SignInMethods, ServerFnError> {
         sso_provider: CONFIG.oidc().map(|oidc| oidc.provider_name.clone()),
         sso_name: user.oidc_username.clone(),
         sso_unlink_allowed: keeps_a_way_in(&user, navidrome),
+        sso_link_proof: link_proof(&user, navidrome),
         navidrome,
     })
 }
 
-/// Starts linking the signed-in account to an identity at the provider. The
-/// browser goes to the address returned; the provider sends it back to the
-/// callback, which links the identity while this browser is still signed in
-/// to the account, and then shows the outcome in Settings.
+/// Starts linking the signed-in account to an identity at the provider,
+/// once `password` proves the account is the signed-in person's (see
+/// `LinkProof`). The browser goes to the address returned; the provider
+/// sends it back to the callback, which links the identity while this
+/// browser is still signed in to the account, and then shows the outcome in
+/// Settings. A POST server function like the other changes, protected from
+/// other sites the same way: the session cookie is SameSite=Lax, so a form
+/// on another site posts here without it.
 #[post("/api/auth/oidc/link", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
-pub async fn start_sso_link() -> Result<String, ServerFnError> {
+pub async fn start_sso_link(password: String) -> Result<String, ServerFnError> {
     let Some(config) = CONFIG.oidc() else {
         return Err(refusal_error(SsoError::Disabled.message()));
     };
@@ -64,6 +69,7 @@ pub async fn start_sso_link() -> Result<String, ServerFnError> {
     if user.oidc_subject.is_some() {
         return Err(refusal_error(SsoLinkResult::AlreadyLinked.message()));
     }
+    prove_password(&user, &password).await?;
     match crate::oidc::begin_link(&cookies, config, &user.id, &headers, &uri).await {
         Ok(url) => Ok(url.into()),
         Err(LinkStartError::Elsewhere(callback)) => Err(refusal_error(format!(

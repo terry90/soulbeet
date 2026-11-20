@@ -246,6 +246,25 @@ impl SsoLinkResult {
     }
 }
 
+/// The password that proves an account is the signed-in person's before
+/// they link it to single sign-on: the one the login form signs in to it
+/// with.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinkProof {
+    /// Its own password (for an account linked to Navidrome, the Navidrome
+    /// password, which its own follows)
+    #[default]
+    Password,
+    /// It has no password of its own, only a stored Navidrome login
+    NavidromePassword,
+    /// It has neither: an admin sets a password first
+    NoPassword,
+}
+
+/// Why an account without a password cannot link single sign-on.
+pub const NO_PASSWORD_TO_LINK: &str = "This account has no password. Ask an admin to set one in \
+                                       Settings > Users, then link single sign-on.";
+
 /// How the signed-in user can sign in, for Settings.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct SignInMethods {
@@ -257,6 +276,8 @@ pub struct SignInMethods {
     /// The account keeps a way in without the provider, so its owner may
     /// unlink it
     pub sso_unlink_allowed: bool,
+    /// What linking it asks for
+    pub sso_link_proof: LinkProof,
     /// `NAVIDROME_URL` is set, so the account can connect Navidrome
     pub navidrome: bool,
 }

@@ -1,7 +1,7 @@
 //! How the signed-in user signs in besides their password: single sign-on,
 //! and the Navidrome login Soulbeet uses for them.
 
-use api::auth::{SignInMethods, SsoLinkResult};
+use api::auth::{LinkProof, SignInMethods, SsoLinkResult, NO_PASSWORD_TO_LINK};
 use api::{connect_navidrome, start_sso_link, unlink_sso};
 use dioxus::prelude::*;
 use shared::system::NavidromeStatus;
@@ -23,6 +23,16 @@ fn link_messages(result: Option<SsoLinkResult>) -> (String, String) {
     }
 }
 
+/// The password field's hint for linking, or `None` when the account has no
+/// password to give.
+fn link_password_placeholder(proof: LinkProof) -> Option<&'static str> {
+    match proof {
+        LinkProof::Password => Some("Current password"),
+        LinkProof::NavidromePassword => Some("Your Navidrome password"),
+        LinkProof::NoPassword => None,
+    }
+}
+
 /// Links the account to the single sign-on provider, or removes the link.
 /// Shows nothing while single sign-on is off and the account has no link.
 /// `result` is how a link that just came back from the provider ended.
@@ -35,13 +45,14 @@ pub(super) fn SingleSignOnSection(
     let auth = use_auth();
     let mut error = use_signal(|| link_messages(result).0);
     let mut success = use_signal(|| link_messages(result).1);
+    let mut password = use_signal(String::new);
     let mut leaving = use_signal(|| false);
 
     let link = move |_| async move {
         error.set(String::new());
         success.set(String::new());
         leaving.set(true);
-        match auth.call(start_sso_link()).await {
+        match auth.call(start_sso_link(password())).await {
             // A full page load: the provider's sign-in page, then back.
             Ok(url) => {
                 if let Some(window) = web_sys::window() {
@@ -91,14 +102,25 @@ pub(super) fn SingleSignOnSection(
               "To unlink it, first set a password or connect Navidrome, so you can still sign in."
             }
           }
-        } else {
-          p { class: NOTE_CLASS, "Link this account to {provider} to sign in with it." }
+        } else if let Some(placeholder) = link_password_placeholder(methods.sso_link_proof) {
+          p { class: "{NOTE_CLASS} mb-2",
+            "Link this account to {provider} to sign in with it. Enter your password first."
+          }
+          TextInput {
+            value: password(),
+            oninput: move |v| password.set(v),
+            placeholder,
+            aria_label: "Current password",
+            password: true,
+          }
           button {
             class: "retro-btn mt-2 rounded",
             disabled: leaving(),
             onclick: link,
             "Link single sign-on"
           }
+        } else {
+          p { class: NOTE_CLASS, "{NO_PASSWORD_TO_LINK}" }
         }
       }
     }
@@ -189,11 +211,41 @@ mod tests {
     }
 
     #[test]
-    fn an_unlinked_account_is_offered_the_link() {
+    fn an_unlinked_account_is_offered_the_link_for_its_password() {
         let html = render(offered(), None);
         assert!(html.contains("Link this account to Pocket ID"), "{html}");
+        assert!(html.contains("aria-label=\"Current password\""), "{html}");
+        assert!(html.contains("placeholder=\"Current password\""), "{html}");
         assert!(html.contains("Link single sign-on"), "{html}");
         assert!(!html.contains("Unlink"), "{html}");
+
+        // An account whose only password is its Navidrome one.
+        let html = render(
+            SignInMethods {
+                sso_link_proof: LinkProof::NavidromePassword,
+                ..offered()
+            },
+            None,
+        );
+        assert!(
+            html.contains("placeholder=\"Your Navidrome password\""),
+            "{html}"
+        );
+        assert!(html.contains("Link single sign-on"), "{html}");
+    }
+
+    #[test]
+    fn an_account_without_a_password_is_told_to_ask_an_admin() {
+        let html = render(
+            SignInMethods {
+                sso_link_proof: LinkProof::NoPassword,
+                ..offered()
+            },
+            None,
+        );
+        assert!(html.contains("Ask an admin to set one"), "{html}");
+        assert!(!html.contains("Link single sign-on<"), "{html}");
+        assert!(!html.contains("Current password"), "{html}");
     }
 
     #[test]
