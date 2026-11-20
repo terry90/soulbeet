@@ -21,7 +21,7 @@ pub(crate) enum SettingsTab {
 pub(crate) struct SettingsTabRequest(pub Signal<Option<SettingsTab>>);
 
 /// How a single sign-on link that just came back from the provider ended,
-/// for Settings to show once.
+/// until Settings shows it.
 #[derive(Clone, Copy)]
 pub(crate) struct SsoLinkNotice(pub Signal<Option<SsoLinkResult>>);
 
@@ -47,8 +47,7 @@ pub fn SettingsPage() -> Element {
     let mut active_tab = use_signal(SettingsTab::default);
     let auth = crate::auth::use_auth();
     let SettingsTabRequest(mut requested_tab) = use_context();
-    let SsoLinkNotice(mut notice) = use_context();
-    let sso_result = use_hook(move || notice.write().take());
+    let SsoLinkNotice(sso_notice) = use_context();
 
     use_effect(move || {
         if let Some(tab) = requested_tab() {
@@ -111,7 +110,7 @@ pub fn SettingsPage() -> Element {
                     },
                     SettingsTab::Users => rsx! {
                         div { class: "space-y-8",
-                            AccountPanel { sso_result }
+                            AccountPanel { sso_notice }
                             ConnectedAppsPanel {}
                             if auth.is_admin() {
                                 UserManager {}

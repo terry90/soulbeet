@@ -38,10 +38,10 @@ fn reset_note(user: &UserSummary, admin_id: Option<&str>) -> Option<&'static str
 }
 
 /// The signed-in user's own username, password and other ways to sign in,
-/// for every role. `sso_result` is how a single sign-on link that just came
-/// back from the provider ended.
+/// for every role. `sso_notice` holds how a single sign-on link that just
+/// came back from the provider ended, until it is shown.
 #[component]
-pub fn AccountPanel(sso_result: Option<SsoLinkResult>) -> Element {
+pub fn AccountPanel(sso_notice: Signal<Option<SsoLinkResult>>) -> Element {
     let auth = use_auth();
     let mut sign_in_methods =
         use_resource(move || async move { auth.call(get_sign_in_methods()).await });
@@ -121,7 +121,7 @@ pub fn AccountPanel(sso_result: Option<SsoLinkResult>) -> Element {
           Some(Ok(methods)) => rsx! {
             SingleSignOnSection {
               methods: methods.clone(),
-              result: sso_result,
+              notice: sso_notice,
               on_change: move |_| sign_in_methods.restart(),
             }
             if methods.navidrome {

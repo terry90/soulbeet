@@ -35,14 +35,17 @@ fn link_password_placeholder(proof: LinkProof) -> Option<&'static str> {
 
 /// Links the account to the single sign-on provider, or removes the link.
 /// Shows nothing while single sign-on is off and the account has no link.
-/// `result` is how a link that just came back from the provider ended.
+/// `notice` holds how a link that just came back from the provider ended;
+/// the section takes it, so it is shown once.
 #[component]
 pub(super) fn SingleSignOnSection(
     methods: SignInMethods,
-    result: Option<SsoLinkResult>,
+    notice: Signal<Option<SsoLinkResult>>,
     on_change: EventHandler<()>,
 ) -> Element {
     let auth = use_auth();
+    let mut notice = notice;
+    let result = use_hook(move || notice.write().take());
     let mut error = use_signal(|| link_messages(result).0);
     let mut success = use_signal(|| link_messages(result).1);
     let mut password = use_signal(String::new);
@@ -188,19 +191,32 @@ pub(super) fn NavidromeSection(on_change: EventHandler<()>) -> Element {
 mod tests {
     use super::*;
 
-    fn render(methods: SignInMethods, result: Option<SsoLinkResult>) -> String {
+    /// `copies` sections, one after the other, sharing one notice
+    /// `result`, as Settings mounts the section again on each visit.
+    fn render_times(
+        methods: SignInMethods,
+        result: Option<SsoLinkResult>,
+        copies: usize,
+    ) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |(methods, result): (SignInMethods, Option<SsoLinkResult>)| {
+            |(methods, result, copies): (SignInMethods, Option<SsoLinkResult>, usize)| {
                 let signed_out = use_signal(|| None);
                 use_context_provider(|| crate::auth::Auth::new(signed_out));
+                let notice = use_signal(|| result);
                 rsx! {
-                    SingleSignOnSection { methods, result, on_change: |_| {} }
+                    for _ in 0..copies {
+                        SingleSignOnSection { methods: methods.clone(), notice, on_change: |_| {} }
+                    }
                 }
             },
-            (methods, result),
+            (methods, result, copies),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    fn render(methods: SignInMethods, result: Option<SsoLinkResult>) -> String {
+        render_times(methods, result, 1)
     }
 
     fn offered() -> SignInMethods {
@@ -329,5 +345,12 @@ mod tests {
         };
         let html = render(linked, Some(SsoLinkResult::Linked));
         assert!(html.contains(SsoLinkResult::Linked.message()), "{html}");
+    }
+
+    #[test]
+    fn the_outcome_of_a_link_is_shown_once() {
+        let message = SsoLinkResult::IdentityTaken.message();
+        let html = render_times(offered(), Some(SsoLinkResult::IdentityTaken), 2);
+        assert_eq!(html.matches(message).count(), 1, "{html}");
     }
 }
