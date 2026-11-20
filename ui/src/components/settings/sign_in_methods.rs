@@ -156,7 +156,7 @@ pub(super) fn SingleSignOnSection(
         Messages { error: error(), success: success() }
         if let Some(name) = methods.sso_name.clone() {
           p { class: NOTE_CLASS, "Linked to {name} at {provider}." }
-          if methods.sso_unlink_allowed {
+          if methods.password_proof != PasswordProof::NoPassword {
             button { class: "retro-btn mt-2 rounded", onclick: unlink, "Unlink" }
           } else {
             p { class: "{NOTE_CLASS} mt-2", "{sso_unlink_advice(methods.navidrome)}" }
@@ -332,6 +332,7 @@ mod tests {
     fn a_linked_account_unlinks_only_when_it_keeps_a_way_in() {
         let linked = SignInMethods {
             sso_name: Some("ann@id".into()),
+            password_proof: PasswordProof::NoPassword,
             ..offered()
         };
         let html = render(linked.clone(), None);
@@ -349,15 +350,21 @@ mod tests {
             None,
         );
         assert!(html.contains(sso_unlink_advice(true)), "{html}");
+        assert!(!html.contains(">Unlink<"), "{html}");
 
-        let html = render(
-            SignInMethods {
-                sso_unlink_allowed: true,
-                ..linked
-            },
-            None,
-        );
-        assert!(html.contains(">Unlink<"), "{html}");
+        // A password the login form takes is the way in that unlinking keeps.
+        for password_proof in [PasswordProof::Password, PasswordProof::NavidromePassword] {
+            let html = render(
+                SignInMethods {
+                    password_proof,
+                    navidrome: true,
+                    ..linked.clone()
+                },
+                None,
+            );
+            assert!(html.contains(">Unlink<"), "{html}");
+            assert!(!html.contains("To unlink single sign-on"), "{html}");
+        }
     }
 
     fn render_password(proof: PasswordProof) -> String {

@@ -11,7 +11,7 @@ use super::{
 };
 #[cfg(feature = "server")]
 use crate::{
-    auth::{sso_unlink_advice, SsoError, SsoLinkResult, UserCtx},
+    auth::{sso_unlink_advice, PasswordProof, SsoError, SsoLinkResult, UserCtx},
     config::CONFIG,
     db::DB,
     models::user::{User, UserChangeError},
@@ -22,14 +22,6 @@ use crate::{
 use axum::http::{HeaderMap, Uri};
 #[cfg(feature = "server")]
 use tower_cookies::Cookies;
-
-/// Whether the account can still sign in without the provider: with a
-/// password of its own, or with a stored Navidrome login while Navidrome is
-/// set up (that login then sets its password).
-#[cfg(feature = "server")]
-fn keeps_a_way_in(user: &User, navidrome_configured: bool) -> bool {
-    user.has_password() || (navidrome_configured && user.navidrome_token.is_some())
-}
 
 #[cfg(feature = "server")]
 async fn session_user(user_id: &str) -> Result<User, ServerFnError> {
@@ -46,7 +38,6 @@ pub async fn get_sign_in_methods() -> Result<SignInMethods, ServerFnError> {
     Ok(SignInMethods {
         sso_provider: CONFIG.oidc().map(|oidc| oidc.provider_name.clone()),
         sso_name: user.oidc_username.clone(),
-        sso_unlink_allowed: keeps_a_way_in(&user, navidrome),
         password_proof: password_proof(&user, navidrome),
         navidrome,
     })
@@ -88,7 +79,8 @@ pub async fn start_sso_link(password: String) -> Result<String, ServerFnError> {
 const NOT_LINKED: &str = "This account is not linked to single sign-on.";
 
 /// Removes the link of `user_id` for `actor`: an admin for any account, a
-/// user for their own as long as it keeps another way in.
+/// user for their own as long as it keeps another way in: a password the
+/// login form takes (see `password_proof`).
 #[cfg(feature = "server")]
 pub(crate) async fn unlink_sso_in(
     db: &sqlx::SqlitePool,
@@ -107,7 +99,7 @@ pub(crate) async fn unlink_sso_in(
     if user.oidc_subject.is_none() {
         return Err(refusal_error(NOT_LINKED));
     }
-    if own && !keeps_a_way_in(&user, navidrome_configured) {
+    if own && password_proof(&user, navidrome_configured) == PasswordProof::NoPassword {
         return Err(refusal_error(sso_unlink_advice(navidrome_configured)));
     }
     if !User::unlink_oidc_identity_in(db, user_id)

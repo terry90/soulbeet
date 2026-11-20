@@ -286,10 +286,9 @@ pub struct SignInMethods {
     /// The provider's name for the identity the account is linked to, when
     /// it is linked
     pub sso_name: Option<String>,
-    /// The account keeps a way in without the provider, so its owner may
-    /// unlink it
-    pub sso_unlink_allowed: bool,
-    /// What linking it or changing its password asks for
+    /// What linking it or changing its password asks for. Without one
+    /// (`PasswordProof::NoPassword`) the account has no way in but the
+    /// provider, so its owner cannot unlink it.
     pub password_proof: PasswordProof,
     /// `NAVIDROME_URL` is set, so the account can connect Navidrome
     pub navidrome: bool,
