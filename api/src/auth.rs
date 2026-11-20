@@ -142,8 +142,9 @@ impl SsoError {
             SsoError::Failed => "Single sign-on failed. The server log has the details.",
             SsoError::Denied => "Single sign-on was cancelled or refused by the provider.",
             SsoError::NotRegistered => {
-                "No Soulbeet account for this user. Ask an admin to create one, then sign in \
-                 with its password and link single sign-on in Settings."
+                "No Soulbeet account for this user yet. Sign in with your password first: your \
+                 Navidrome password if this server uses Navidrome, otherwise the one an admin \
+                 gave you. Then link single sign-on in Settings."
             }
             SsoError::AccountExists => {
                 "A Soulbeet account with this username already exists. Sign in with its \
