@@ -11,7 +11,7 @@ use super::{
 };
 #[cfg(feature = "server")]
 use crate::{
-    auth::{SsoError, SsoLinkResult, UserCtx},
+    auth::{sso_unlink_advice, SsoError, SsoLinkResult, UserCtx},
     config::CONFIG,
     db::DB,
     models::user::{User, UserChangeError},
@@ -86,9 +86,6 @@ pub async fn start_sso_link(password: String) -> Result<String, ServerFnError> {
 
 #[cfg(feature = "server")]
 const NOT_LINKED: &str = "This account is not linked to single sign-on.";
-#[cfg(feature = "server")]
-const NO_OTHER_WAY_IN: &str = "Set a password or connect Navidrome first, so this account can \
-                               still sign in without single sign-on.";
 
 /// Removes the link of `user_id` for `actor`: an admin for any account, a
 /// user for their own as long as it keeps another way in.
@@ -111,7 +108,7 @@ pub(crate) async fn unlink_sso_in(
         return Err(refusal_error(NOT_LINKED));
     }
     if own && !keeps_a_way_in(&user, navidrome_configured) {
-        return Err(refusal_error(NO_OTHER_WAY_IN));
+        return Err(refusal_error(sso_unlink_advice(navidrome_configured)));
     }
     if !User::unlink_oidc_identity_in(db, user_id)
         .await
@@ -159,8 +156,12 @@ mod tests {
     }
 
     fn code(result: Result<(), ServerFnError>) -> u16 {
+        refusal(result).0
+    }
+
+    fn refusal(result: Result<(), ServerFnError>) -> (u16, String) {
         match result {
-            Err(ServerFnError::ServerError { code, .. }) => code,
+            Err(ServerFnError::ServerError { code, message, .. }) => (code, message),
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
@@ -179,12 +180,24 @@ mod tests {
     async fn an_owner_unlinks_only_an_account_that_keeps_a_way_in() {
         let db = test_db::migrated().await;
         let sso_only = linked_sso_account(&db, "sso").await;
-        // Unlinking would lock its owner out.
+        // Unlinking would lock its owner out. It is told what it can do:
+        // connect Navidrome when that is set up, or get a password from an
+        // admin, which also removes the link.
         for navidrome in [false, true] {
             assert_eq!(
-                code(unlink_sso_in(&db, &ctx(&sso_only), &sso_only.id, navidrome).await),
-                REFUSAL_CODE
+                refusal(unlink_sso_in(&db, &ctx(&sso_only), &sso_only.id, navidrome).await),
+                (REFUSAL_CODE, sso_unlink_advice(navidrome).to_string())
             );
+        }
+        assert!(sso_unlink_advice(true).contains("connect Navidrome"));
+        assert!(!sso_unlink_advice(false).contains("Navidrome"));
+        for navidrome in [false, true] {
+            let advice = sso_unlink_advice(navidrome);
+            assert!(
+                advice.ends_with("ask an admin to set a password, which also removes the link."),
+                "{advice}"
+            );
+            assert!(!advice.contains("set a password or"), "{advice}");
         }
         assert!(reread(&db, &sso_only).await.oidc_subject.is_some());
 

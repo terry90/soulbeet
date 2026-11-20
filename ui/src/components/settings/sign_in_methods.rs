@@ -1,7 +1,7 @@
 //! How the signed-in user signs in: their password, single sign-on, and the
 //! Navidrome login Soulbeet uses for them.
 
-use api::auth::{PasswordProof, SignInMethods, SsoLinkResult, NO_PASSWORD};
+use api::auth::{sso_unlink_advice, PasswordProof, SignInMethods, SsoLinkResult, NO_PASSWORD};
 use api::{change_password, connect_navidrome, start_sso_link, unlink_sso};
 use dioxus::prelude::*;
 use shared::system::NavidromeStatus;
@@ -159,9 +159,7 @@ pub(super) fn SingleSignOnSection(
           if methods.sso_unlink_allowed {
             button { class: "retro-btn mt-2 rounded", onclick: unlink, "Unlink" }
           } else {
-            p { class: "{NOTE_CLASS} mt-2",
-              "To unlink it, first set a password or connect Navidrome, so you can still sign in."
-            }
+            p { class: "{NOTE_CLASS} mt-2", "{sso_unlink_advice(methods.navidrome)}" }
           }
         } else if let Some(placeholder) = password_placeholder(methods.password_proof) {
           p { class: "{NOTE_CLASS} mb-2",
@@ -339,11 +337,18 @@ mod tests {
         let html = render(linked.clone(), None);
         // The identity the provider vouched for, so the user can check it.
         assert!(html.contains("Linked to ann@id at Pocket ID."), "{html}");
-        assert!(
-            html.contains("first set a password or connect Navidrome"),
-            "{html}"
-        );
+        // An account that cannot unlink has no password, so it is told what
+        // it can do: connect Navidrome only when that is set up.
+        assert!(html.contains(sso_unlink_advice(false)), "{html}");
         assert!(!html.contains(">Unlink<"), "{html}");
+        let html = render(
+            SignInMethods {
+                navidrome: true,
+                ..linked.clone()
+            },
+            None,
+        );
+        assert!(html.contains(sso_unlink_advice(true)), "{html}");
 
         let html = render(
             SignInMethods {

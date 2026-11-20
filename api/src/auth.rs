@@ -265,6 +265,19 @@ pub enum PasswordProof {
 pub const NO_PASSWORD: &str =
     "This account has no password. Ask an admin to set one in Settings > Users.";
 
+/// What the owner of an account linked to single sign-on can do before
+/// unlinking it, when it has no password (see `PasswordProof::NoPassword`):
+/// connect Navidrome while it is set up (`navidrome`), or get a password
+/// from an admin, which removes the link itself.
+pub fn sso_unlink_advice(navidrome: bool) -> &'static str {
+    if navidrome {
+        "To unlink single sign-on, connect Navidrome first, or ask an admin to set a \
+         password, which also removes the link."
+    } else {
+        "To unlink single sign-on, ask an admin to set a password, which also removes the link."
+    }
+}
+
 /// How the signed-in user can sign in, for Settings.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct SignInMethods {
