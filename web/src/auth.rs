@@ -14,10 +14,13 @@ pub fn AuthProvider(children: Element) -> Element {
     let mut auth_signal = use_signal(|| None::<AuthResponse>);
     let mut initialized = use_signal(|| false);
 
+    // Nothing below renders until the server has answered: a page opened by
+    // its address must not be taken for signed out and sent to the login.
     use_effect(move || {
-        let user = auth_state.read().clone().flatten();
-        auth_signal.set(user);
-        initialized.set(true);
+        if let Some(user) = auth_state.read().clone() {
+            auth_signal.set(user);
+            initialized.set(true);
+        }
     });
 
     use_context_provider(|| Auth::new(auth_signal));

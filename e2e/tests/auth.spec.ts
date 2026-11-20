@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { loginViaUi, registerUser, uniqueUser } from '../helpers/app.js';
+import { loginViaApi, loginViaUi, registerUser, uniqueUser } from '../helpers/app.js';
 
 test('unauthenticated visitors are redirected to login', async ({ page }) => {
   await page.goto('/');
@@ -33,6 +33,16 @@ test('logs a registered user in and out through the UI', async ({ page }) => {
   // Session is actually gone, not just the page swapped.
   await page.goto('/dashboard');
   await expect(page).toHaveURL(/\/login$/);
+});
+
+test('a page opened by its address stays open for a signed-in user', async ({ page }) => {
+  const user = uniqueUser('auth');
+  await registerUser(page.context().request, user);
+  await loginViaApi(page.context(), user);
+
+  await page.goto('/settings');
+  await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+  await expect(page).toHaveURL(/\/settings$/);
 });
 
 test('submits the login form with the Enter key', async ({ page }) => {
