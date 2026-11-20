@@ -656,6 +656,15 @@ mod tests {
             link("nobody".into(), "https://id", "3").await,
             OidcLink::AccountLinked
         );
+        // Nor does a new account get an identity another one has.
+        assert!(matches!(
+            User::create_oidc_in(&db, "c", "https://id", "1").await,
+            Err(UserChangeError::Db(_))
+        ));
+        assert!(matches!(
+            User::find_by_name_in(&db, "c").await.unwrap(),
+            NameMatch::None
+        ));
         // Never one half of an identity.
         assert!(
             sqlx::query("UPDATE users SET oidc_subject = NULL WHERE id = ?")
