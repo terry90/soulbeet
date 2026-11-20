@@ -309,6 +309,10 @@ mod tests {
         assert!(html.contains("Link single sign-on"), "{html}");
     }
 
+    /// What the advice to get a password from an admin says it costs.
+    const LINK_AGAIN: &str =
+        "That also removes the single sign-on link, so link it again from Settings after.";
+
     #[test]
     fn an_account_without_a_password_is_told_to_ask_an_admin() {
         let html = render(
@@ -319,6 +323,7 @@ mod tests {
             None,
         );
         assert!(html.contains("Ask an admin to set one"), "{html}");
+        assert!(html.contains(LINK_AGAIN), "{html}");
         assert!(!html.contains("Link single sign-on<"), "{html}");
         assert!(!html.contains("Current password"), "{html}");
     }
@@ -397,12 +402,14 @@ mod tests {
         );
         assert!(html.contains(">Change Password<"), "{html}");
 
-        // Without one, an admin sets it.
+        // Without one, an admin sets it, which costs the account its single
+        // sign-on link.
         let html = render_password(PasswordProof::NoPassword);
         assert!(
             html.contains("This account has no password. Ask an admin to set one"),
             "{html}"
         );
+        assert!(html.contains(LINK_AGAIN), "{html}");
         assert!(!html.contains("Change Password"), "{html}");
         assert!(!html.contains("New password"), "{html}");
     }
