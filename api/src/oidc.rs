@@ -595,7 +595,8 @@ async fn link_from_session(
             SsoLinkResult::AlreadyLinked
         } else {
             tracing::warn!(
-                "Linking OIDC refused: the identity is already linked to the account {}",
+                "Linking OIDC refused: the identity {} is already linked to the account {}",
+                identity.for_log(),
                 loggable(&owner.username)
             );
             SsoLinkResult::IdentityTaken
@@ -615,8 +616,9 @@ async fn link_from_session(
         .map_err(failed)?
         .ok_or(SsoLinkResult::SessionChanged)?;
     tracing::info!(
-        "Linked the account {} to an OIDC identity from its session",
-        loggable(&user.username)
+        "Linked the account {} to the OIDC identity {} from its session",
+        loggable(&user.username),
+        identity.for_log()
     );
     Ok(user)
 }
@@ -882,6 +884,17 @@ impl Identity {
             username: username.to_string(),
         })
     }
+
+    /// The identity in a log line: the name the provider gave and the
+    /// subject at the issuer, escaped, as they come from the provider.
+    fn for_log(&self) -> String {
+        format!(
+            "{} (subject {} at {})",
+            loggable(&self.username),
+            loggable(&self.subject),
+            loggable(&self.issuer)
+        )
+    }
 }
 
 /// Which account an identity signs in to.
@@ -954,8 +967,10 @@ async fn find_or_create_account(
                 }
             }
             tracing::info!(
-                "Linked the account {} to an OIDC identity by its name (OIDC_LINK_BY_USERNAME)",
-                loggable(&user.username)
+                "Linked the account {} to the OIDC identity {} by its name \
+                 (OIDC_LINK_BY_USERNAME)",
+                loggable(&user.username),
+                identity.for_log()
             );
             // Read back: the link changed the credentials version.
             User::find_by_id_in(db, &user.id)
@@ -1685,6 +1700,16 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         );
         // A sign-in keeps the provider's session: that is the point of it.
         assert_eq!(prompt_of(Purpose::SignIn { return_to: None }), None);
+    }
+
+    #[test]
+    fn a_logged_identity_names_who_it_is_and_cannot_forge_lines() {
+        // An admin tracing a link to the wrong person reads who it was.
+        let logged = identity_at(ISSUER, "sub-1", "alice\nINFO forged").for_log();
+        assert!(logged.contains("alice"), "{logged}");
+        assert!(logged.contains("\"sub-1\""), "{logged}");
+        assert!(logged.contains(ISSUER), "{logged}");
+        assert!(!logged.contains('\n'), "{logged}");
     }
 
     #[test]
