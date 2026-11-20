@@ -24,10 +24,9 @@ pub fn TrackResult(props: Props) -> Element {
     let track = props.track.clone();
     let mut cover_error = use_signal(|| false);
 
-    let cover_url = track
-        .release_mbid
-        .as_ref()
-        .map(|mbid| format!("https://coverartarchive.org/release/{}/front-250", mbid));
+    let cover_url = track.release_mbid.as_ref().map(|mbid| {
+        format!("https://coverartarchive.org/release/{}/front-250", mbid)
+    });
 
     rsx! {
       div {
