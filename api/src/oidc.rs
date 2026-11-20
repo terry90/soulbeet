@@ -1491,6 +1491,43 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
     }
 
     #[tokio::test]
+    async fn an_admin_takes_a_wrongly_linked_account_back_from_the_identity() {
+        // Mallory's identity ended up on the admin account (an admin turned
+        // OIDC_LINK_BY_USERNAME on and Mallory chose the name). A new password
+        // does not keep her out; removing the link does.
+        let db = test_db::migrated().await;
+        let NameMatch::One(admin) = User::find_by_name_in(&db, "admin").await.unwrap() else {
+            panic!("the seeded admin");
+        };
+        let taken = sign_in_linking_by_name(&db, "sub-mallory", "admin")
+            .await
+            .unwrap();
+        assert_eq!(taken.id, admin.id);
+        let her_session = session_of(&taken);
+
+        let actor = crate::auth::UserCtx {
+            user_id: admin.id.clone(),
+            username: admin.username.clone(),
+            role: admin.role,
+        };
+        crate::server_fns::sso::unlink_sso_in(&db, &actor, &admin.id, false)
+            .await
+            .unwrap();
+
+        // Her session ended, and her identity no longer opens the account.
+        let key = session_key();
+        assert!(load_session(Some(&her_session), &db, &key).await.is_err());
+        for name in ["admin", "mallory"] {
+            let refused = sign_in(&db, "sub-mallory", name).await;
+            assert!(
+                refused.as_ref().map_or(true, |u| u.id != admin.id),
+                "{name}: {refused:?}"
+            );
+        }
+        assert_eq!(reread(&db, &admin).await.oidc_subject, None);
+    }
+
+    #[tokio::test]
     async fn an_identity_stays_on_one_account_and_an_account_keeps_its_identity() {
         let db = test_db::migrated().await;
         let ann = User::create_in(&db, "ann", "pw").await.unwrap();
