@@ -110,7 +110,7 @@ pub fn username_fits(username: &str) -> bool {
 #[derive(Debug)] // User has no PartialEq; tests match on the variant
 pub enum NameMatch {
     None,
-    One(User),
+    One(Box<User>),
     /// Rows from before the rule whose names differ only in letter case.
     /// None of them can sign in until an admin deletes the extra ones.
     Several,
@@ -347,7 +347,7 @@ impl User {
                 .map_err(|e| e.to_string())?;
         Ok(match rows.len() {
             0 => NameMatch::None,
-            1 => NameMatch::One(rows.remove(0)),
+            1 => NameMatch::One(Box::new(rows.remove(0))),
             _ => NameMatch::Several,
         })
     }

@@ -174,7 +174,7 @@ fn choose_account(by_identity: Option<User>, same_name: NameMatch, config: &Oidc
     }
     match same_name {
         NameMatch::One(user) if user.oidc_subject.is_none() && config.link_by_username => {
-            Account::Unlinked(user)
+            Account::Unlinked(*user)
         }
         NameMatch::One(user) if user.oidc_subject.is_none() => Account::Exists,
         NameMatch::One(_) | NameMatch::Several => Account::Conflict,

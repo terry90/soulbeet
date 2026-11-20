@@ -242,7 +242,7 @@ enum Credentials {
     Navidrome,
     /// The local password matched; `status` is what Navidrome's answer means.
     Local {
-        user: models::user::User,
+        user: Box<models::user::User>,
         status: shared::system::NavidromeStatus,
     },
 }
@@ -289,7 +289,7 @@ async fn authenticate_in(
         // Not a wrong password, so nothing is counted.
         NameMatch::Several => return Err(refusal_error(several_accounts(username))),
         NameMatch::None => None,
-        NameMatch::One(user) => Some(user),
+        NameMatch::One(user) => Some(*user),
     };
     let refused_by_navidrome = matches!(result, NavidromeAuthResult::AuthFailed);
     let Some(user) = user.filter(|u| {
@@ -308,7 +308,10 @@ async fn authenticate_in(
             NavidromeStatus::Unknown
         }
     };
-    Ok(Credentials::Local { user, status })
+    Ok(Credentials::Local {
+        user: Box::new(user),
+        status,
+    })
 }
 
 /// The Soulful row that has the name Navidrome just verified.
@@ -399,7 +402,7 @@ pub(crate) async fn apply_navidrome_login(
 
     let existing = match User::find_by_name_in(db, username).await? {
         NameMatch::None => None,
-        NameMatch::One(user) => Some(user),
+        NameMatch::One(user) => Some(*user),
         NameMatch::Several => return Ok(LoginOutcome::Refused(several_accounts(username))),
     };
     let connected = NavidromeStatus::Connected.as_str();
