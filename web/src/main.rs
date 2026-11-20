@@ -388,6 +388,30 @@ fn ImporterBanner() -> Element {
     }
 }
 
+/// The Navidrome banner for `status`: its dot, its message, and whether it
+/// links to Connect Navidrome. `None` when there is nothing to say.
+fn navidrome_banner(status: NavidromeStatus) -> Option<(&'static str, &'static str, bool)> {
+    match status {
+        NavidromeStatus::InvalidCredentials => Some((
+            "bg-beet-accent",
+            "Navidrome refused your password. Enter your current Navidrome password under \
+             Connect Navidrome.",
+            true,
+        )),
+        NavidromeStatus::NotLinked => Some((
+            "bg-beet-accent",
+            "Not connected. Connect Navidrome to use discovery and rating sync.",
+            true,
+        )),
+        NavidromeStatus::Offline => Some((
+            "bg-gray-500",
+            "Unreachable. Discovery and rating sync paused.",
+            false,
+        )),
+        NavidromeStatus::Connected | NavidromeStatus::Unknown => None,
+    }
+}
+
 #[component]
 fn NavidromeBanner() -> Element {
     let auth = use_auth();
@@ -405,33 +429,12 @@ fn NavidromeBanner() -> Element {
     // banner clears on its own once Navidrome answers again.
     let back_online = matches!(status, NavidromeStatus::Offline) && health.navidrome_online();
 
-    if dismissed
-        || back_online
-        || matches!(
-            status,
-            NavidromeStatus::Connected | NavidromeStatus::Unknown
-        )
-    {
+    if dismissed || back_online {
         return rsx! {};
     }
 
-    let (dot_color, label, message) = match status {
-        NavidromeStatus::InvalidCredentials => (
-            "bg-beet-accent",
-            "NAVIDROME",
-            "Credentials mismatch. Log in with your Navidrome password to reconnect.",
-        ),
-        NavidromeStatus::NotLinked => (
-            "bg-beet-accent",
-            "NAVIDROME",
-            "Not connected. Connect Navidrome to use discovery and rating sync.",
-        ),
-        NavidromeStatus::Offline => (
-            "bg-gray-500",
-            "NAVIDROME",
-            "Unreachable. Discovery and rating sync paused.",
-        ),
-        _ => return rsx! {},
+    let Some((dot_color, message, connect)) = navidrome_banner(status) else {
+        return rsx! {};
     };
 
     let dismiss = move |_| {
@@ -446,8 +449,8 @@ fn NavidromeBanner() -> Element {
     };
 
     rsx! {
-        StatusBanner { dot_class: dot_color, label, message: message.to_string(),
-            if status == NavidromeStatus::NotLinked {
+        StatusBanner { dot_class: dot_color, label: "NAVIDROME", message: message.to_string(),
+            if connect {
                 Link {
                     class: ui::STATUS_ACTION_CLASS,
                     to: Route::SettingsPage {},
@@ -482,6 +485,20 @@ mod tests {
     const SENT: &str =
         "/login/return?return_to=%2Foauth%2Fauthorize%3Fclient_id%3Ddcr_e2e%26state%3Da%2526b";
     const BACK: &str = "/oauth/authorize?client_id=dcr_e2e&state=a%26b";
+
+    #[test]
+    fn a_refused_or_missing_navidrome_password_leads_to_connect_navidrome() {
+        for status in [
+            NavidromeStatus::InvalidCredentials,
+            NavidromeStatus::NotLinked,
+        ] {
+            let (_, message, connect) = navidrome_banner(status).unwrap();
+            assert!(connect, "{status:?}");
+            assert!(message.contains("Connect Navidrome"), "{message}");
+        }
+        assert!(!navidrome_banner(NavidromeStatus::Offline).unwrap().2);
+        assert_eq!(navidrome_banner(NavidromeStatus::Connected), None);
+    }
 
     fn return_to_of(route: &Route) -> Option<&str> {
         match route {
