@@ -7,6 +7,7 @@ mod folder_manager;
 mod panel;
 mod remote_access;
 mod security_status;
+mod sign_in_methods;
 mod toggle;
 mod user_manager;
 

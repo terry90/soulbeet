@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
 use shared::changelog::Version;
 #[cfg(feature = "server")]
-use sqlx::SqlitePool;
+use sqlx::{SqliteExecutor, SqlitePool};
 #[cfg(feature = "server")]
 use std::fmt;
 #[cfg(feature = "server")]
@@ -33,6 +33,43 @@ pub struct User {
     pub role: Role,
     #[serde(skip)]
     pub credentials_version: i64,
+    /// The OpenID Connect issuer of the identity this account signs in as,
+    /// once linked; set together with `oidc_subject`
+    #[serde(skip)]
+    pub oidc_issuer: Option<String>,
+    /// The subject (`sub`) that issuer gave the identity
+    #[serde(skip)]
+    pub oidc_subject: Option<String>,
+    /// The name the provider gave the identity at its last sign-in, set
+    /// together with the identity. Only shown, never used to find an account
+    #[serde(skip)]
+    pub oidc_username: Option<String>,
+}
+
+/// An account as user management lists it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UserSummary {
+    pub id: String,
+    pub username: String,
+    pub role: Role,
+    /// The account signs in with a password of its own
+    pub has_password: bool,
+    /// The provider's name for the single sign-on identity the account is
+    /// linked to, when it is linked
+    pub sso_name: Option<String>,
+}
+
+#[cfg(feature = "server")]
+impl From<&User> for UserSummary {
+    fn from(user: &User) -> Self {
+        UserSummary {
+            id: user.id.clone(),
+            username: user.username.clone(),
+            role: user.role,
+            has_password: user.has_password(),
+            sso_name: user.oidc_username.clone(),
+        }
+    }
 }
 
 #[cfg(feature = "server")]
@@ -73,11 +110,28 @@ pub fn username_fits(username: &str) -> bool {
 #[derive(Debug)] // User has no PartialEq; tests match on the variant
 pub enum NameMatch {
     None,
-    One(User),
+    One(Box<User>),
     /// Rows from before the rule whose names differ only in letter case.
     /// None of them can sign in until an admin deletes the extra ones.
     Several,
 }
+
+/// What linking an account to an OpenID Connect identity did.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+pub(crate) enum OidcLink {
+    /// The account as the link left it
+    Linked(Box<User>),
+    /// The account already has an identity, or is gone: nothing changed
+    AccountLinked,
+    /// Another account has this identity: nothing changed
+    IdentityTaken,
+}
+
+/// The `password_hash` of an account without a password. It is no hash, so
+/// no password matches it.
+#[cfg(feature = "server")]
+const NO_PASSWORD: &str = "";
 
 /// What the triggers of the username migration raise for a taken name.
 #[cfg(feature = "server")]
@@ -167,12 +221,6 @@ impl User {
             .map_err(|e| e.to_string())
     }
 
-    pub async fn update_password(id: &str, password: &str) -> Result<(), String> {
-        Self::update_password_in(&DB, id, password).await?;
-        security::note_password_set(id, password);
-        Ok(())
-    }
-
     pub(crate) async fn update_password_in(
         db: &SqlitePool,
         id: &str,
@@ -189,6 +237,30 @@ impl User {
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| UserChangeError::NotFound.to_string())
+    }
+
+    /// An admin's new password for another account: it also removes the
+    /// account's OpenID Connect identity, so whoever held that identity is
+    /// out, and ends the account's sessions.
+    pub(crate) async fn reset_password_in(
+        db: &SqlitePool,
+        id: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        let password_hash = hash_password(password)?;
+        let done = sqlx::query(
+            "UPDATE users SET password_hash = ?, oidc_issuer = NULL, oidc_subject = NULL, \
+             oidc_username = NULL, credentials_version = credentials_version + 1 WHERE id = ?",
+        )
+        .bind(password_hash)
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        if done.rows_affected() == 0 {
+            return Err(UserChangeError::NotFound.to_string());
+        }
+        Ok(())
     }
 
     pub async fn update_username(id: &str, new_username: &str) -> Result<(), UserChangeError> {
@@ -276,7 +348,7 @@ impl User {
                 .map_err(|e| e.to_string())?;
         Ok(match rows.len() {
             0 => NameMatch::None,
-            1 => NameMatch::One(rows.remove(0)),
+            1 => NameMatch::One(Box::new(rows.remove(0))),
             _ => NameMatch::Several,
         })
     }
@@ -335,6 +407,130 @@ impl User {
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// The account linked to an OpenID Connect identity: a subject is unique
+    /// only within its issuer, so both are matched.
+    pub(crate) async fn find_by_oidc_identity_in<'e>(
+        db: impl SqliteExecutor<'e>,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<User>, String> {
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE oidc_issuer = ? AND oidc_subject = ?")
+            .bind(issuer)
+            .bind(subject)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Links an account that has no OpenID Connect identity yet to the
+    /// subject `subject` of `issuer`, which the provider calls `username`.
+    /// Like a first link to Navidrome, it ends the account's other sessions:
+    /// someone else can now sign in to it. The account comes back from the
+    /// same statement, so a session made from it has the link's credentials
+    /// version, not that of a later change.
+    pub(crate) async fn link_oidc_identity_in<'e>(
+        db: impl SqliteExecutor<'e>,
+        id: &str,
+        issuer: &str,
+        subject: &str,
+        username: &str,
+    ) -> Result<OidcLink, String> {
+        let done = sqlx::query_as::<_, User>(
+            "UPDATE users SET oidc_issuer = ?, oidc_subject = ?, oidc_username = ?, \
+             credentials_version = credentials_version + 1 \
+             WHERE id = ? AND oidc_subject IS NULL RETURNING *",
+        )
+        .bind(issuer)
+        .bind(subject)
+        .bind(username)
+        .bind(id)
+        .fetch_optional(db)
+        .await;
+        match done {
+            Ok(Some(user)) => Ok(OidcLink::Linked(Box::new(user))),
+            Ok(None) => Ok(OidcLink::AccountLinked),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(OidcLink::IdentityTaken),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Records `username`, the provider's name for the identity `issuer` and
+    /// `subject` that just signed in to the account `id`, for Settings to
+    /// show. Changes nothing unless the account is linked to that identity.
+    pub(crate) async fn note_oidc_username_in(
+        db: &SqlitePool,
+        id: &str,
+        issuer: &str,
+        subject: &str,
+        username: &str,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE users SET oidc_username = ? \
+             WHERE id = ? AND oidc_issuer = ? AND oidc_subject = ?",
+        )
+        .bind(username)
+        .bind(id)
+        .bind(issuer)
+        .bind(subject)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Removes the account's OpenID Connect identity, so it no longer signs
+    /// in through the provider. Ends the account's sessions, as a password
+    /// change does. False when the account had none.
+    pub(crate) async fn unlink_oidc_identity_in(db: &SqlitePool, id: &str) -> Result<bool, String> {
+        let done = sqlx::query(
+            "UPDATE users SET oidc_issuer = NULL, oidc_subject = NULL, oidc_username = NULL, \
+             credentials_version = credentials_version + 1 \
+             WHERE id = ? AND oidc_subject IS NOT NULL",
+        )
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// Creates an account that signs in through OpenID Connect, always a
+    /// plain user: the provider's first user is not this instance's admin,
+    /// even on an empty install. It has no password, so the password form
+    /// stays closed to it until one is set in Settings > Users. A Navidrome
+    /// login of that name does not join it: the provider and Navidrome may
+    /// give the name to different people.
+    pub(crate) async fn create_oidc_in(
+        db: &SqlitePool,
+        username: &str,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<User, UserChangeError> {
+        sqlx::query_as::<_, User>(
+            "INSERT INTO users (id, username, password_hash, navidrome_status, changelog_seen, \
+             role, oidc_issuer, oidc_subject, oidc_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             RETURNING *",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(username)
+        .bind(NO_PASSWORD)
+        .bind(shared::system::NavidromeStatus::Unknown.as_str())
+        .bind(shared::changelog::running_version().to_string())
+        .bind(Role::User)
+        .bind(issuer)
+        .bind(subject)
+        .bind(username)
+        .fetch_one(db)
+        .await
+        .map_err(change_error)
+    }
+
+    /// The account has a password of its own; one created through single
+    /// sign-on has none until it is given one.
+    pub fn has_password(&self) -> bool {
+        self.password_hash != NO_PASSWORD
     }
 
     pub async fn get_connected_users() -> Result<Vec<User>, String> {
@@ -474,6 +670,159 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version_of(&db, &user.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_oidc_identity_belongs_to_one_account() {
+        let db = test_db::migrated().await;
+        let a = User::create_in(&db, "a", "pw").await.unwrap();
+        let b = User::create_in(&db, "b", "pw").await.unwrap();
+        let link = |id: String, issuer: &'static str, subject: &'static str| {
+            let db = db.clone();
+            async move {
+                User::link_oidc_identity_in(&db, &id, issuer, subject, "name")
+                    .await
+                    .unwrap()
+            }
+        };
+        // The link gives the account as it left it, for the session that
+        // follows.
+        let OidcLink::Linked(linked) = link(a.id.clone(), "https://id", "1").await else {
+            panic!("linked");
+        };
+        assert_eq!(linked.id, a.id);
+        assert_eq!(linked.oidc_subject.as_deref(), Some("1"));
+        assert_eq!(linked.oidc_username.as_deref(), Some("name"));
+        assert_eq!(linked.credentials_version, 1);
+        // An account keeps the identity it has.
+        assert!(matches!(
+            link(a.id.clone(), "https://id", "2").await,
+            OidcLink::AccountLinked
+        ));
+        let a = User::find_by_id_in(&db, &a.id).await.unwrap().unwrap();
+        assert_eq!(a.oidc_subject.as_deref(), Some("1"));
+        assert_eq!(a.credentials_version, 1);
+        // The pair is unique; the same subject at another issuer is not.
+        assert!(matches!(
+            link(b.id.clone(), "https://id", "1").await,
+            OidcLink::IdentityTaken
+        ));
+        assert_eq!(
+            version_of(&db, &b.id).await,
+            0,
+            "a refused link changes nothing"
+        );
+        assert!(matches!(
+            link(b.id.clone(), "https://other", "1").await,
+            OidcLink::Linked(_)
+        ));
+        assert!(matches!(
+            link("nobody".into(), "https://id", "3").await,
+            OidcLink::AccountLinked
+        ));
+        // Nor does a new account get an identity another one has.
+        assert!(matches!(
+            User::create_oidc_in(&db, "c", "https://id", "1").await,
+            Err(UserChangeError::Db(_))
+        ));
+        assert!(matches!(
+            User::find_by_name_in(&db, "c").await.unwrap(),
+            NameMatch::None
+        ));
+        // Never one half of an identity.
+        assert!(
+            sqlx::query("UPDATE users SET oidc_subject = NULL WHERE id = ?")
+                .bind(&a.id)
+                .execute(&db)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_user_list_says_who_has_a_password_and_which_identity_is_linked() {
+        let db = test_db::migrated().await;
+        let local = User::create_in(&db, "local", "pw").await.unwrap();
+        let sso = User::create_oidc_in(&db, "sso", "https://id", "1")
+            .await
+            .unwrap();
+        assert_eq!(
+            UserSummary::from(&local),
+            UserSummary {
+                id: local.id.clone(),
+                username: "local".into(),
+                role: Role::User,
+                has_password: true,
+                sso_name: None,
+            }
+        );
+        let summary = UserSummary::from(&sso);
+        assert!(!summary.has_password);
+        assert_eq!(summary.sso_name.as_deref(), Some("sso"));
+
+        // The name follows the provider's, and a link always has one.
+        User::note_oidc_username_in(&db, &sso.id, "https://id", "1", "sso-renamed")
+            .await
+            .unwrap();
+        let sso = User::find_by_id_in(&db, &sso.id).await.unwrap().unwrap();
+        assert_eq!(
+            UserSummary::from(&sso).sso_name.as_deref(),
+            Some("sso-renamed")
+        );
+        assert_eq!(sso.username, "sso");
+        // Only the identity linked to the account renames its link: a
+        // sign-in of another one, at the same or another issuer, does not.
+        for (issuer, subject) in [("https://id", "2"), ("https://other", "1")] {
+            User::note_oidc_username_in(&db, &sso.id, issuer, subject, "someone-else")
+                .await
+                .unwrap();
+            let after = User::find_by_id_in(&db, &sso.id).await.unwrap().unwrap();
+            assert_eq!(after.oidc_username.as_deref(), Some("sso-renamed"));
+        }
+        User::note_oidc_username_in(&db, &local.id, "https://id", "1", "nobody")
+            .await
+            .unwrap();
+        let local = User::find_by_id_in(&db, &local.id).await.unwrap().unwrap();
+        assert_eq!(local.oidc_username, None);
+        assert!(
+            sqlx::query("UPDATE users SET oidc_username = NULL WHERE id = ?")
+                .bind(&sso.id)
+                .execute(&db)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unlinking_removes_the_identity_and_ends_the_sessions() {
+        let db = test_db::migrated().await;
+        let a = User::create_in(&db, "a", "pw").await.unwrap();
+        User::link_oidc_identity_in(&db, &a.id, "https://id", "1", "a-at-id")
+            .await
+            .unwrap();
+        assert!(User::unlink_oidc_identity_in(&db, &a.id).await.unwrap());
+        let after = User::find_by_id_in(&db, &a.id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                &after.oidc_issuer,
+                &after.oidc_subject,
+                &after.oidc_username
+            ),
+            (&None, &None, &None)
+        );
+        assert_eq!(after.credentials_version, 2);
+        assert!(after.password_matches("pw"));
+        // Nothing to remove: nothing changes.
+        assert!(!User::unlink_oidc_identity_in(&db, &a.id).await.unwrap());
+        assert_eq!(version_of(&db, &a.id).await, 2);
+        // The identity is free again, for this account or another.
+        let b = User::create_in(&db, "b", "pw").await.unwrap();
+        assert!(matches!(
+            User::link_oidc_identity_in(&db, &b.id, "https://id", "1", "b-at-id")
+                .await
+                .unwrap(),
+            OidcLink::Linked(_)
+        ));
     }
 
     #[tokio::test]
@@ -624,6 +973,9 @@ mod tests {
             navidrome_status: "unknown".into(),
             role: Role::User,
             credentials_version: 3,
+            oidc_issuer: None,
+            oidc_subject: None,
+            oidc_username: None,
         };
         let json = serde_json::to_value(user).unwrap();
         assert!(json.get("navidrome_token").is_none() && json.get("credentials_version").is_none());

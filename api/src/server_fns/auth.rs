@@ -1,9 +1,9 @@
-use crate::auth::AuthResponse;
+use crate::auth::{AuthResponse, LoginOptions};
 use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use crate::{
-    auth::{self, RegistrationMode},
+    auth::{self, PasswordProof, RegistrationMode, NO_PASSWORD},
     base_url::{request_base_with, BaseUrl, BaseUrlError},
     config::CONFIG,
     login_limiter::{LoginLimiter, LOGIN_LIMITER},
@@ -53,12 +53,18 @@ pub(crate) fn secure_for(base: &BaseUrl, origin: Option<&str>) -> bool {
 /// anything is written, so a request whose address cannot be told changes
 /// nothing.
 #[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionCookie {
     secure: bool,
 }
 
 #[cfg(feature = "server")]
 impl SessionCookie {
+    /// Whether cookies set on the answer get the Secure flag.
+    pub(crate) fn secure(&self) -> bool {
+        self.secure
+    }
+
     pub(crate) fn for_request(
         headers: &HeaderMap,
         uri: &Uri,
@@ -130,6 +136,15 @@ pub(crate) fn registration_refusal(mode: RegistrationMode) -> Option<&'static st
     }
 }
 
+/// What the login page offers besides the password form. Public: it is read
+/// before anyone signs in.
+#[get("/api/auth/options")]
+pub async fn get_login_options() -> Result<LoginOptions, ServerFnError> {
+    Ok(LoginOptions {
+        sso_provider: CONFIG.oidc().map(|oidc| oidc.provider_name.clone()),
+    })
+}
+
 #[post("/api/auth/register")]
 pub async fn register(username: String, password: String) -> Result<(), ServerFnError> {
     if let Some(msg) = registration_refusal(CONFIG.registration()) {
@@ -144,8 +159,8 @@ pub async fn register(username: String, password: String) -> Result<(), ServerFn
 
 /// Categorized result of a Navidrome ping attempt.
 #[cfg(feature = "server")]
-#[derive(Debug)]
-enum NavidromeAuthResult {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NavidromeAuthResult {
     /// Credentials accepted by Navidrome.
     Success,
     /// Navidrome refused the credentials (Subsonic error code 40).
@@ -158,15 +173,21 @@ enum NavidromeAuthResult {
     NotConfigured,
 }
 
-/// Try to authenticate against Navidrome with the given credentials, with a
-/// temporary client's `ping()`.
+/// Try to authenticate against this server's Navidrome with the given
+/// credentials.
 #[cfg(feature = "server")]
-async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResult {
-    use soulbeet::NavidromeClientBuilder;
+pub(crate) async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResult {
+    match CONFIG.navidrome_url() {
+        Some(url) => navidrome_auth_at(url, username, password).await,
+        None => NavidromeAuthResult::NotConfigured,
+    }
+}
 
-    let Some(url) = CONFIG.navidrome_url() else {
-        return NavidromeAuthResult::NotConfigured;
-    };
+/// Try to authenticate against the Navidrome at `url` with the given
+/// credentials, with a temporary client's `ping()`.
+#[cfg(feature = "server")]
+async fn navidrome_auth_at(url: &str, username: &str, password: &str) -> NavidromeAuthResult {
+    use soulbeet::NavidromeClientBuilder;
 
     let ping = match NavidromeClientBuilder::new()
         .base_url(url)
@@ -180,9 +201,11 @@ async fn try_navidrome_auth(username: &str, password: &str) -> NavidromeAuthResu
     let result = ping_verdict(&ping);
     if let Err(e) = &ping {
         match result {
-            NavidromeAuthResult::AuthFailed => {
-                tracing::info!("Navidrome refused the credentials for {username}: {e}")
-            }
+            // The name may come from the single sign-on provider.
+            NavidromeAuthResult::AuthFailed => tracing::info!(
+                "Navidrome refused the credentials for {}: {e}",
+                crate::oidc::loggable(username)
+            ),
             _ => tracing::warn!("Navidrome gave no verdict during login: {e}"),
         }
     }
@@ -219,7 +242,7 @@ enum Credentials {
     Navidrome,
     /// The local password matched; `status` is what Navidrome's answer means.
     Local {
-        user: models::user::User,
+        user: Box<models::user::User>,
         status: shared::system::NavidromeStatus,
     },
 }
@@ -266,7 +289,7 @@ async fn authenticate_in(
         // Not a wrong password, so nothing is counted.
         NameMatch::Several => return Err(refusal_error(several_accounts(username))),
         NameMatch::None => None,
-        NameMatch::One(user) => Some(user),
+        NameMatch::One(user) => Some(*user),
     };
     let refused_by_navidrome = matches!(result, NavidromeAuthResult::AuthFailed);
     let Some(user) = user.filter(|u| {
@@ -285,7 +308,10 @@ async fn authenticate_in(
             NavidromeStatus::Unknown
         }
     };
-    Ok(Credentials::Local { user, status })
+    Ok(Credentials::Local {
+        user: Box::new(user),
+        status,
+    })
 }
 
 /// The Soulful row that has the name Navidrome just verified.
@@ -376,7 +402,7 @@ pub(crate) async fn apply_navidrome_login(
 
     let existing = match User::find_by_name_in(db, username).await? {
         NameMatch::None => None,
-        NameMatch::One(user) => Some(user),
+        NameMatch::One(user) => Some(*user),
         NameMatch::Several => return Ok(LoginOutcome::Refused(several_accounts(username))),
     };
     let connected = NavidromeStatus::Connected.as_str();
@@ -391,9 +417,9 @@ pub(crate) async fn apply_navidrome_login(
         LoginPlan::RefuseUnlinked => {
             return Ok(LoginOutcome::Refused(format!(
                 "A Soulbeet account named '{username}' exists but is not linked to Navidrome. \
-                 Sign in with its Soulbeet password, change that password to your Navidrome \
-                 password in Settings > Users, then sign in again. An admin can also set it \
-                 for you."
+                 If it is yours, sign in to it with its Soulbeet password or single sign-on, \
+                 then use Connect Navidrome in Settings > Users. If it is not, or you cannot \
+                 sign in to it, ask an admin."
             )));
         }
         LoginPlan::RefuseNoAccount => {
@@ -515,6 +541,178 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             })
         }
     }
+}
+
+/// Connects the signed-in account to Navidrome: stores the Navidrome
+/// password once Navidrome accepts it for the account's own username, as a
+/// Navidrome login does, without signing anyone out. `navidrome` asks
+/// Navidrome about the name it is given. Attempts are held back like
+/// sign-ins: a wrong password counts as a failed sign-in of that name.
+#[cfg(feature = "server")]
+pub(crate) async fn connect_navidrome_in<F>(
+    db: &sqlx::SqlitePool,
+    limiter: &LoginLimiter,
+    user: &auth::UserCtx,
+    encrypted_password: &str,
+    clock: impl Fn() -> std::time::Instant,
+    navidrome: impl FnOnce(String) -> F,
+) -> Result<(), ServerFnError>
+where
+    F: std::future::Future<Output = NavidromeAuthResult>,
+{
+    use shared::system::NavidromeStatus;
+
+    let attempt = limiter
+        .begin(&user.username, clock())
+        .map_err(rate_limited_error)?;
+    match navidrome(user.username.clone()).await {
+        NavidromeAuthResult::Success => {
+            attempt.succeeded();
+            models::user::User::update_navidrome_token_in(
+                db,
+                &user.user_id,
+                Some(encrypted_password),
+                NavidromeStatus::Connected.as_str(),
+            )
+            .await
+            .map_err(server_error)
+        }
+        NavidromeAuthResult::AuthFailed => {
+            attempt.failed(clock());
+            Err(refusal_error(format!(
+                "Navidrome refused this password for '{}'.",
+                user.username
+            )))
+        }
+        NavidromeAuthResult::Unreachable => Err(refusal_error(
+            "Navidrome did not answer, so nothing changed. Try again later.",
+        )),
+        NavidromeAuthResult::NotConfigured => {
+            Err(refusal_error("This server does not use Navidrome."))
+        }
+    }
+}
+
+/// What proves `user` is the signed-in person's before they link it to
+/// single sign-on or change its password, with `navidrome_configured`
+/// saying NAVIDROME_URL is set.
+#[cfg(feature = "server")]
+pub(crate) fn password_proof(
+    user: &models::user::User,
+    navidrome_configured: bool,
+) -> PasswordProof {
+    if user.has_password() {
+        PasswordProof::Password
+    } else if navidrome_configured && user.navidrome_token.is_some() {
+        PasswordProof::NavidromePassword
+    } else {
+        PasswordProof::NoPassword
+    }
+}
+
+/// Checks that `password` is the one the login form signs in to `user`
+/// with, before a link hands the account to whoever the provider vouches
+/// for or a new password replaces it: a session left open is not enough,
+/// and an account without that password gets one from an admin. Held back
+/// like sign-ins of that name, and a wrong password counts as a failed one.
+/// For an account linked to Navidrome, Navidrome's verdict decides while it
+/// gives one, as at the login form. `navidrome` asks Navidrome about the
+/// name it is given.
+#[cfg(feature = "server")]
+pub(crate) async fn prove_password_in<F>(
+    limiter: &LoginLimiter,
+    user: &models::user::User,
+    password: &str,
+    navidrome_configured: bool,
+    clock: impl Fn() -> std::time::Instant,
+    navidrome: impl FnOnce(String) -> F,
+) -> Result<(), ServerFnError>
+where
+    F: std::future::Future<Output = NavidromeAuthResult>,
+{
+    let proof = password_proof(user, navidrome_configured);
+    if proof == PasswordProof::NoPassword {
+        return Err(refusal_error(NO_PASSWORD));
+    }
+    let attempt = limiter
+        .begin(&user.username, clock())
+        .map_err(rate_limited_error)?;
+    let verdict = if navidrome_configured && user.navidrome_token.is_some() {
+        navidrome(user.username.clone()).await
+    } else {
+        NavidromeAuthResult::NotConfigured
+    };
+    let proven = match verdict {
+        NavidromeAuthResult::Success => true,
+        NavidromeAuthResult::AuthFailed => false,
+        NavidromeAuthResult::Unreachable if proof == PasswordProof::NavidromePassword => {
+            return Err(refusal_error(
+                "Navidrome did not answer, so nothing changed. Try again later.",
+            ));
+        }
+        NavidromeAuthResult::Unreachable | NavidromeAuthResult::NotConfigured => {
+            user.password_matches(password)
+        }
+    };
+    if proven {
+        attempt.succeeded();
+        Ok(())
+    } else {
+        attempt.failed(clock());
+        Err(refusal_error("Wrong password."))
+    }
+}
+
+/// `prove_password_in` with this server's limiter and Navidrome.
+#[cfg(feature = "server")]
+pub(crate) async fn prove_password(
+    user: &models::user::User,
+    password: &str,
+) -> Result<(), ServerFnError> {
+    prove_password_in(
+        &LOGIN_LIMITER,
+        user,
+        password,
+        CONFIG.navidrome_url().is_some(),
+        std::time::Instant::now,
+        |username| async move { try_navidrome_auth(&username, password).await },
+    )
+    .await
+}
+
+/// Connects the signed-in account to Navidrome with its Navidrome password.
+#[post("/api/auth/navidrome/connect", auth: AuthSession)]
+pub async fn connect_navidrome(password: String) -> Result<(), ServerFnError> {
+    use crate::crypto;
+    use crate::db::DB;
+    use crate::services::evict_navidrome_client;
+    use std::time::Instant;
+
+    if password.is_empty() {
+        return Err(refusal_error("Enter your Navidrome password."));
+    }
+    let encrypted =
+        crypto::encrypt(crate::secret_key::current(), &password).map_err(server_error)?;
+    let password = &password;
+    connect_navidrome_in(
+        &DB,
+        &LOGIN_LIMITER,
+        &auth.0,
+        &encrypted,
+        Instant::now,
+        |username| async move { try_navidrome_auth(&username, password).await },
+    )
+    .await?;
+    tracing::info!(
+        "User {} connected Navidrome",
+        crate::oidc::loggable(&auth.0.username)
+    );
+
+    // The banner may come back if the credentials break again.
+    let _ = models::user_settings::UserSettings::reset_navidrome_banner(&auth.0.user_id).await;
+    // A cached client still holds the old password.
+    evict_navidrome_client(&auth.0.user_id).await;
+    Ok(())
 }
 
 #[post("/api/auth/refresh", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
@@ -706,7 +904,7 @@ mod tests {
     use crate::db::test_db;
     use crate::login_limiter::{LoginBlock, FREE_FAILURES};
     use crate::models::user::User;
-    use crate::server_fns::RATE_LIMITED_CODE;
+    use crate::server_fns::{RATE_LIMITED_CODE, REFUSAL_CODE};
     use std::time::Instant;
 
     fn code(e: &ServerFnError) -> u16 {
@@ -751,6 +949,47 @@ mod tests {
             limiter.begin("ann", now).err(),
             Some(LoginBlock::Account { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn an_account_without_a_password_is_closed_to_the_password_form() {
+        // Made through single sign-on: it has no password, and no password,
+        // the empty one included, opens it, whatever Navidrome answers.
+        let db = test_db::migrated().await;
+        let sso = User::create_oidc_in(&db, "bob", "https://id.example.com", "sub-bob")
+            .await
+            .unwrap();
+        let now = Instant::now();
+        for password in ["", " ", "sub-bob", "bob"] {
+            assert!(!sso.password_matches(password), "{password:?}");
+            for result in [
+                NavidromeAuthResult::NotConfigured,
+                NavidromeAuthResult::Unreachable,
+                NavidromeAuthResult::AuthFailed,
+            ] {
+                let refused = sign_in(&db, &LoginLimiter::new(), "bob", password, now, result)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(code(&refused), 401, "{password:?}, {result:?}");
+            }
+        }
+
+        // A password an admin sets opens it.
+        User::update_password_in(&db, &sso.id, "set-by-admin")
+            .await
+            .unwrap();
+        let signed_in = sign_in(
+            &db,
+            &LoginLimiter::new(),
+            "bob",
+            "set-by-admin",
+            now,
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(signed_in, Credentials::Local { user, .. } if user.id == sso.id));
     }
 
     #[tokio::test]
@@ -1013,6 +1252,362 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_account_made_by_single_sign_on_is_not_joined_by_a_navidrome_sign_in() {
+        // Mallory claimed the name "bob" at the provider before Navidrome's
+        // Bob used Soulbeet. Bob's Navidrome login must not hand her his
+        // Navidrome password or let both of them into one account.
+        let db = test_db::migrated().await;
+        let sso = User::create_oidc_in(&db, "bob", "https://id.example.com", "sub-mallory")
+            .await
+            .unwrap();
+        for mode in [
+            RegistrationMode::Navidrome,
+            RegistrationMode::Open,
+            RegistrationMode::Admin,
+        ] {
+            let outcome = apply_navidrome_login(&db, "Bob", "navidrome-pw", "enc", mode)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, LoginOutcome::Refused(_)), "{outcome:?}");
+        }
+        let after = row(&db, "bob").await.unwrap();
+        assert_eq!(after.navidrome_token, None);
+        assert_eq!(after.credentials_version, sso.credentials_version);
+        assert!(!after.has_password());
+        assert!(!after.password_matches("navidrome-pw"));
+        assert_eq!(after.oidc_subject.as_deref(), Some("sub-mallory"));
+    }
+
+    fn ctx_of(user: &User) -> crate::auth::UserCtx {
+        crate::auth::UserCtx {
+            user_id: user.id.clone(),
+            username: user.username.clone(),
+            role: user.role,
+        }
+    }
+
+    /// Connects Navidrome for `user`, Navidrome answering `result`; returns
+    /// the name Navidrome was asked about.
+    async fn connect(
+        db: &sqlx::SqlitePool,
+        limiter: &LoginLimiter,
+        user: &User,
+        now: Instant,
+        result: NavidromeAuthResult,
+    ) -> (Result<(), ServerFnError>, Option<String>) {
+        let asked = std::cell::RefCell::new(None);
+        let outcome = connect_navidrome_in(
+            db,
+            limiter,
+            &ctx_of(user),
+            "enc",
+            || now,
+            |name| {
+                *asked.borrow_mut() = Some(name);
+                async { result }
+            },
+        )
+        .await;
+        (outcome, asked.into_inner())
+    }
+
+    #[tokio::test]
+    async fn an_account_made_by_single_sign_on_connects_its_own_navidrome_name() {
+        let db = test_db::migrated().await;
+        let sso = User::create_oidc_in(&db, "bob", "https://id.example.com", "sub-bob")
+            .await
+            .unwrap();
+        let limiter = LoginLimiter::new();
+        let (outcome, asked) = connect(
+            &db,
+            &limiter,
+            &sso,
+            Instant::now(),
+            NavidromeAuthResult::Success,
+        )
+        .await;
+        outcome.unwrap();
+        // Navidrome is asked about the account's own name, nobody else's.
+        assert_eq!(asked.as_deref(), Some("bob"));
+        let after = row(&db, "bob").await.unwrap();
+        assert_eq!(after.navidrome_token.as_deref(), Some("enc"));
+        assert_eq!(after.navidrome_status, "connected");
+        // Nobody is signed out, and nothing else about the account changes.
+        assert_eq!(after.credentials_version, sso.credentials_version);
+        assert!(!after.has_password());
+        assert_eq!(after.oidc_subject.as_deref(), Some("sub-bob"));
+    }
+
+    #[tokio::test]
+    async fn an_account_with_its_own_password_connects_navidrome_too() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "soulbeet-pw").await.unwrap();
+        let (outcome, _) = connect(
+            &db,
+            &LoginLimiter::new(),
+            &ann,
+            Instant::now(),
+            NavidromeAuthResult::Success,
+        )
+        .await;
+        outcome.unwrap();
+        let after = row(&db, "ann").await.unwrap();
+        assert_eq!(after.navidrome_token.as_deref(), Some("enc"));
+        assert_eq!(after.credentials_version, ann.credentials_version);
+        assert!(after.password_matches("soulbeet-pw"));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_navidrome_password_connects_nothing_and_counts_as_a_failed_sign_in() {
+        // Mallory made "bob" through single sign-on: guessing Navidrome Bob's
+        // password from her session is held back like the login form.
+        let db = test_db::migrated().await;
+        let sso = User::create_oidc_in(&db, "bob", "https://id.example.com", "sub-mallory")
+            .await
+            .unwrap();
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for _ in 0..=FREE_FAILURES {
+            let (outcome, _) =
+                connect(&db, &limiter, &sso, now, NavidromeAuthResult::AuthFailed).await;
+            // Not a 401: the session stays.
+            assert_eq!(code(&outcome.unwrap_err()), REFUSAL_CODE);
+        }
+        let (outcome, asked) =
+            connect(&db, &limiter, &sso, now, NavidromeAuthResult::Success).await;
+        assert_eq!(code(&outcome.unwrap_err()), RATE_LIMITED_CODE);
+        assert_eq!(asked, None);
+        // The login form shares the count.
+        assert!(limiter.begin("BOB", now).is_err());
+        let after = row(&db, "bob").await.unwrap();
+        assert_eq!(after.navidrome_token, None);
+        assert_eq!(after.navidrome_status, sso.navidrome_status);
+    }
+
+    #[tokio::test]
+    async fn no_verdict_from_navidrome_connects_nothing_and_counts_nothing() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for result in [
+            NavidromeAuthResult::Unreachable,
+            NavidromeAuthResult::NotConfigured,
+        ] {
+            for _ in 0..=FREE_FAILURES {
+                let (outcome, _) = connect(&db, &limiter, &ann, now, result).await;
+                assert_eq!(code(&outcome.unwrap_err()), REFUSAL_CODE);
+            }
+        }
+        assert!(limiter.begin("ann", now).is_ok());
+        assert_eq!(row(&db, "ann").await.unwrap().navidrome_token, None);
+    }
+
+    /// `user` proves its password before a link, Navidrome answering
+    /// `result`; returns the name Navidrome was asked about.
+    async fn prove(
+        limiter: &LoginLimiter,
+        user: &User,
+        password: &str,
+        navidrome_configured: bool,
+        result: NavidromeAuthResult,
+    ) -> (Result<(), ServerFnError>, Option<String>) {
+        let asked = std::cell::RefCell::new(None);
+        let outcome = prove_password_in(
+            limiter,
+            user,
+            password,
+            navidrome_configured,
+            Instant::now,
+            |name| {
+                *asked.borrow_mut() = Some(name);
+                async { result }
+            },
+        )
+        .await;
+        (outcome, asked.into_inner())
+    }
+
+    #[tokio::test]
+    async fn linking_takes_the_password_the_login_form_takes() {
+        use crate::auth::PasswordProof;
+
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "ann-pw").await.unwrap();
+        assert_eq!(password_proof(&ann, true), PasswordProof::Password);
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+        for result in [
+            NavidromeAuthResult::NotConfigured,
+            NavidromeAuthResult::AuthFailed,
+        ] {
+            let (ok, _) = prove(&limiter, &ann, "ann-pw", true, result).await;
+            ok.unwrap();
+        }
+        // A wrong password counts as a failed sign-in of the name, and is
+        // not a 401: the session stays.
+        for _ in 0..=FREE_FAILURES {
+            let (refused, _) =
+                prove(&limiter, &ann, "guess", true, NavidromeAuthResult::Success).await;
+            assert_eq!(code(&refused.unwrap_err()), REFUSAL_CODE);
+        }
+        let (held, asked) =
+            prove(&limiter, &ann, "ann-pw", true, NavidromeAuthResult::Success).await;
+        assert_eq!(code(&held.unwrap_err()), RATE_LIMITED_CODE);
+        assert_eq!(asked, None);
+        assert!(limiter.begin("ANN", now).is_err());
+    }
+
+    #[tokio::test]
+    async fn for_an_account_linked_to_navidrome_navidrome_decides_while_it_answers() {
+        let db = test_db::migrated().await;
+        let bob = linked_bob(&db, "old-pw").await;
+        let limiter = LoginLimiter::new();
+        let (ok, asked) = prove(&limiter, &bob, "new-pw", true, NavidromeAuthResult::Success).await;
+        ok.unwrap();
+        assert_eq!(asked.as_deref(), Some("bob"));
+        let (refused, _) = prove(
+            &limiter,
+            &bob,
+            "old-pw",
+            true,
+            NavidromeAuthResult::AuthFailed,
+        )
+        .await;
+        assert_eq!(code(&refused.unwrap_err()), REFUSAL_CODE);
+        // Away, its own password counts.
+        let (ok, _) = prove(
+            &limiter,
+            &bob,
+            "old-pw",
+            true,
+            NavidromeAuthResult::Unreachable,
+        )
+        .await;
+        ok.unwrap();
+        let (refused, _) = prove(
+            &limiter,
+            &bob,
+            "new-pw",
+            false,
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await;
+        assert_eq!(code(&refused.unwrap_err()), REFUSAL_CODE);
+    }
+
+    #[tokio::test]
+    async fn an_account_without_a_password_links_with_its_navidrome_password_or_not_at_all() {
+        use crate::auth::{PasswordProof, NO_PASSWORD};
+
+        let db = test_db::migrated().await;
+        let sso = User::create_oidc_in(&db, "sso", "https://id.example.com", "sub-sso")
+            .await
+            .unwrap();
+        let limiter = LoginLimiter::new();
+        let now = Instant::now();
+
+        // Nothing proves it: an admin sets a password first. Nothing is
+        // counted and Navidrome is not asked.
+        for navidrome in [true, false] {
+            assert_eq!(password_proof(&sso, navidrome), PasswordProof::NoPassword);
+            for password in ["", "sub-sso"] {
+                let (refused, asked) = prove(
+                    &limiter,
+                    &sso,
+                    password,
+                    navidrome,
+                    NavidromeAuthResult::Success,
+                )
+                .await;
+                let refused = refused.unwrap_err();
+                assert_eq!(code(&refused), REFUSAL_CODE);
+                assert!(refused.to_string().contains(NO_PASSWORD), "{refused}");
+                assert_eq!(asked, None);
+            }
+        }
+
+        // With a stored Navidrome login, its Navidrome password does.
+        User::update_navidrome_token_in(&db, &sso.id, Some("enc"), "connected")
+            .await
+            .unwrap();
+        let sso = row(&db, "sso").await.unwrap();
+        assert_eq!(password_proof(&sso, true), PasswordProof::NavidromePassword);
+        assert_eq!(password_proof(&sso, false), PasswordProof::NoPassword);
+        let (ok, asked) = prove(
+            &limiter,
+            &sso,
+            "navi-pw",
+            true,
+            NavidromeAuthResult::Success,
+        )
+        .await;
+        ok.unwrap();
+        assert_eq!(asked.as_deref(), Some("sso"));
+        // No verdict from Navidrome: nothing proven, nothing counted.
+        for _ in 0..=FREE_FAILURES {
+            let (refused, _) = prove(
+                &limiter,
+                &sso,
+                "navi-pw",
+                true,
+                NavidromeAuthResult::Unreachable,
+            )
+            .await;
+            assert_eq!(code(&refused.unwrap_err()), REFUSAL_CODE);
+        }
+        assert!(limiter.begin("sso", now).is_ok());
+        let (refused, _) = prove(
+            &limiter,
+            &sso,
+            "guess",
+            true,
+            NavidromeAuthResult::AuthFailed,
+        )
+        .await;
+        assert_eq!(code(&refused.unwrap_err()), REFUSAL_CODE);
+    }
+
+    #[tokio::test]
+    async fn a_name_from_the_provider_cannot_forge_a_log_line_when_navidrome_refuses_it() {
+        use crate::test_log::LogCapture;
+        use crate::test_navidrome::{subsonic_failed, NavidromeStub};
+
+        // Eve chose this name at the provider and signed in with it.
+        let db = test_db::migrated().await;
+        let forged = "eve\nINFO User 'admin' connected Navidrome";
+        let eve = User::create_oidc_in(&db, forged, "https://id.example.com", "sub-eve")
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/ping",
+            &[&subsonic_failed(40, "Wrong username or password")],
+        );
+        let url = navi.url.clone();
+        let log = LogCapture::start();
+
+        let outcome = connect_navidrome_in(
+            &db,
+            &LoginLimiter::new(),
+            &ctx_of(&eve),
+            "enc",
+            Instant::now,
+            |name| async move { navidrome_auth_at(&url, &name, "guess").await },
+        )
+        .await;
+
+        assert_eq!(code(&outcome.unwrap_err()), REFUSAL_CODE);
+        let lines = log.lines();
+        let refused = lines
+            .iter()
+            .find(|line| line.starts_with("Navidrome refused the credentials"))
+            .expect("the refusal is logged");
+        assert!(refused.contains(r"eve\nINFO"), "{refused}");
+        assert!(lines.iter().all(|line| !line.contains('\n')), "{lines:?}");
+    }
+
+    #[tokio::test]
     async fn a_prehijacked_row_is_refused_and_left_alone() {
         let db = test_db::migrated().await;
         User::create_in(&db, "bob", "attacker-pw").await.unwrap();
@@ -1021,10 +1616,18 @@ mod tests {
                 .await
                 .unwrap();
         match outcome {
-            LoginOutcome::Refused(msg) => assert!(
-                msg.starts_with("A Soulbeet account named 'bob' exists but is not linked"),
-                "{msg}"
-            ),
+            LoginOutcome::Refused(msg) => {
+                assert!(
+                    msg.starts_with("A Soulbeet account named 'bob' exists but is not linked"),
+                    "{msg}"
+                );
+                // The way in that works, for an account with or without a
+                // password of its own.
+                assert!(
+                    msg.contains("Connect Navidrome in Settings > Users"),
+                    "{msg}"
+                );
+            }
             other => panic!("expected a refusal, got {other:?}"),
         }
         let bob = row(&db, "bob").await.unwrap();

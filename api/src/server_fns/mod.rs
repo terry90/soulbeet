@@ -10,6 +10,7 @@ pub mod guard;
 pub mod navidrome;
 pub mod search;
 pub mod settings;
+pub mod sso;
 pub mod system;
 pub mod user;
 
@@ -23,6 +24,7 @@ pub use guard::*;
 pub use navidrome::*;
 pub use search::*;
 pub use settings::*;
+pub use sso::*;
 pub use system::*;
 pub use user::*;
 

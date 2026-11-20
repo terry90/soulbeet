@@ -307,10 +307,10 @@ pub async fn navidrome_client_for_user(
 }
 
 #[cfg(feature = "server")]
-pub const STORED_PASSWORD_UNREADABLE: &str = "The stored Navidrome password cannot be decrypted, probably because SECRET_KEY changed. Sign in again to store it.";
+pub const STORED_PASSWORD_UNREADABLE: &str = "The stored Navidrome password cannot be decrypted, probably because SECRET_KEY changed. Enter it again under Connect Navidrome in Settings > Users.";
 
 /// The user's stored Navidrome password. One that cannot be decrypted
-/// (SECRET_KEY changed) marks the user for a new sign-in, once: a user
+/// (SECRET_KEY changed) marks the user to enter it again, once: a user
 /// already marked is not marked or logged again.
 #[cfg(feature = "server")]
 pub(crate) async fn stored_password_in(
@@ -327,11 +327,14 @@ pub(crate) async fn stored_password_in(
     }
     if user.navidrome_status != shared::system::NavidromeStatus::InvalidCredentials.as_str() {
         tracing::warn!(
-            "Stored Navidrome password of user {} cannot be decrypted; they are asked to sign in again",
+            "Stored Navidrome password of user {} cannot be decrypted; they are asked to enter it again",
             user.id
         );
         if let Err(e) = mark_password_unreadable(db, &user.id, encrypted).await {
-            tracing::warn!("Could not mark user {} for a new sign-in: {e}", user.id);
+            tracing::warn!(
+                "Could not mark user {} to enter their Navidrome password again: {e}",
+                user.id
+            );
         }
     }
     Err(NavidromeLookupError::PasswordUnreadable)
@@ -394,7 +397,8 @@ pub(crate) async fn passwords_under_current_key_in(
     Ok(stored)
 }
 
-/// Keeps the undecryptable token and asks the user to sign in again.
+/// Keeps the undecryptable token and asks the user to enter their Navidrome
+/// password again.
 #[cfg(feature = "server")]
 pub(crate) async fn mark_password_unreadable(
     db: &sqlx::SqlitePool,
@@ -681,6 +685,25 @@ mod tests {
             assert_eq!(f.code, code, "{e:?}");
             assert_eq!(f.user_action.map(|a| a.code), action, "{e:?}");
         }
+    }
+
+    /// An unreadable password gives one instruction, and one that works for an
+    /// account made through single sign-on, where signing in again stores
+    /// nothing.
+    #[test]
+    fn an_unreadable_password_points_where_its_user_action_does() {
+        let e = NavidromeLookupError::PasswordUnreadable;
+        let text = e.to_string();
+        let action = e.failure(Stage::LibraryCheck, text.clone()).user_action;
+        assert_eq!(
+            action.map(|a| a.what),
+            Some("Enter your current Navidrome password under Connect Navidrome".to_string())
+        );
+        assert!(
+            text.contains("under Connect Navidrome in Settings > Users"),
+            "{text}"
+        );
+        assert!(!text.contains("Sign in again"), "{text}");
     }
 
     /// Each lookup error fails at the caller's stage: an unreadable settings

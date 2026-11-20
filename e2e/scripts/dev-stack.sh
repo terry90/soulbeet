@@ -50,6 +50,7 @@ down() {
   free_port 9766
   free_port 5030
   free_port 5050
+  free_port 5070
   echo "stack stopped"
 }
 
@@ -76,6 +77,7 @@ up() {
   free_port 9766
   free_port 5030
   free_port 5050
+  free_port 5070
 
   mkdir -p "$PID_DIR" "$LOG_DIR"
   (cd "$E2E_DIR" && npm run --silent fixtures)
@@ -105,6 +107,10 @@ up() {
     DOWNLOAD_PATH="$RUNTIME/downloads" \
     BEETS_CONFIG="$E2E_DIR/.fixtures/beets-e2e.yaml" \
     MUSICBRAINZ_HOST="127.0.0.1:5050" \
+    OIDC_ISSUER_URL="http://127.0.0.1:5070" \
+    OIDC_CLIENT_ID="soulbeet-e2e" \
+    OIDC_CLIENT_SECRET="e2e-oidc-secret" \
+    OIDC_PROVIDER_NAME="Stub ID" \
     PORT=9765 IP=127.0.0.1 \
     setsid ./server >"$LOG_DIR/soulbeet.log" 2>&1 </dev/null &
    echo $! >"$PID_DIR/soulbeet.pid")
@@ -123,7 +129,7 @@ up() {
   wait_for "http://127.0.0.1:9766/" "soulbeet-user90"
 
   echo "stack up: app http://127.0.0.1:9765, issue #90 app http://127.0.0.1:9766,"
-  echo "slskd stub :5030, mb stub :5050"
+  echo "slskd stub :5030, mb stub :5050, oidc stub :5070"
   echo "logs: $LOG_DIR"
 }
 

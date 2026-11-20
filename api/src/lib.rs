@@ -2,6 +2,8 @@ pub mod auth;
 #[cfg(feature = "server")]
 pub mod base_url;
 pub mod build_id;
+#[cfg(feature = "server")]
+pub(crate) mod capped_body;
 pub mod config;
 #[cfg(feature = "server")]
 pub mod connection;
@@ -26,6 +28,8 @@ pub mod models;
 #[cfg(feature = "server")]
 pub mod oauth;
 #[cfg(feature = "server")]
+pub mod oidc;
+#[cfg(feature = "server")]
 pub mod secret_key;
 pub mod security;
 pub mod services;
@@ -33,6 +37,8 @@ pub mod services;
 pub mod transfer_registry;
 
 pub mod server_fns;
+#[cfg(all(test, feature = "server"))]
+mod test_log;
 #[cfg(all(test, feature = "server"))]
 mod test_navidrome;
 

@@ -124,7 +124,7 @@ services:
       - "5030:5030"
 ```
 
-2.  The secret key that signs sessions and encrypts stored Navidrome passwords is optional. Without `SECRET_KEY`, Soulbeet generates one on the first start and stores it in `secret.key` next to the database (in the `./data` volume above). Back up that file together with the database: losing or changing the key signs everyone out and makes the stored Navidrome passwords unreadable until each user signs in again. To set your own key instead, put a random value of at least 32 bytes in a `.env` file next to `docker-compose.yml`. A shorter key is not used: Soulbeet signs with the generated key instead, and Settings > Config lists it under Security Checks until you remove it or set a longer one. Skip this if your `.env` already sets `SECRET_KEY`; the command adds a line and keeps whatever the file already holds:
+2.  The secret key that signs sessions and encrypts stored Navidrome passwords is optional. Without `SECRET_KEY`, Soulbeet generates one on the first start and stores it in `secret.key` next to the database (in the `./data` volume above). Back up that file together with the database: losing or changing the key signs everyone out and makes the stored Navidrome passwords unreadable until each user enters theirs again, by signing in with it or under Connect Navidrome in Settings > Users. To set your own key instead, put a random value of at least 32 bytes in a `.env` file next to `docker-compose.yml`. A shorter key is not used: Soulbeet signs with the generated key instead, and Settings > Config lists it under Security Checks until you remove it or set a longer one. Skip this if your `.env` already sets `SECRET_KEY`; the command adds a line and keeps whatever the file already holds:
 
 ```bash
 echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env
@@ -172,7 +172,7 @@ For discovery (optional): enable discovery on a folder in Settings > Library, pi
 |----------|-------------|---------|
 | `DATABASE_URL` | Connection string for SQLite | `sqlite:soulbeet.db` |
 | `DOWNLOAD_PATH` | Path where slskd saves downloads | `/downloads` |
-| `SECRET_KEY` | Signs sessions and encrypts stored Navidrome passwords. Optional: when unset, a key is generated on the first start and stored in `secret.key` next to the database, where it is read on later starts. A key you set of at least 32 bytes (`openssl rand -hex 32`) wins over that file. A shorter one is not used: the file's key signs instead, and Security Checks lists it. Changing the key signs everyone out and makes stored Navidrome passwords unreadable until each user signs in again | generated |
+| `SECRET_KEY` | Signs sessions and encrypts stored Navidrome passwords. Optional: when unset, a key is generated on the first start and stored in `secret.key` next to the database, where it is read on later starts. A key you set of at least 32 bytes (`openssl rand -hex 32`) wins over that file. A shorter one is not used: the file's key signs instead, and Security Checks lists it. Changing the key signs everyone out and makes stored Navidrome passwords unreadable until each user enters theirs again (by signing in with it, or under Connect Navidrome) | generated |
 | `NAVIDROME_URL` | Your Navidrome server URL. Optional: without it you log in with local accounts, and discovery playlists, rating sync and auto-delete are unavailable | |
 | `REGISTRATION` | Who can create accounts: `navidrome` (accounts appear when a Navidrome user signs in), `admin` (only an admin creates accounts), `open` (anyone can register) | `navidrome` with `NAVIDROME_URL`, else `admin` |
 | `BEETS_CONFIG` | Path to your beets config file. Replaces the shipped `/app/beets_config.yaml` (beets defaults still apply underneath) | `beets_config.yaml` |
@@ -181,6 +181,15 @@ For discovery (optional): enable discovery on a folder in Settings > Library, pi
 | `MCP` | `on` or `off`, in any case, for the OAuth and `/mcp` endpoints MCP clients use; any other value turns them off and logs a warning | `on` (unset) |
 | `NAVIDROME_MUSIC_PATH` | Optional. Where Soulbeet sees the root of Navidrome's default library. Set it when Soulbeet mounts that library at another path than Navidrome does (e.g. Navidrome at `/music`, Soulbeet at `/media/music`): deletion checks, the rating sync and the MCP tools use it to find Navidrome's songs on disk. Without it, Soulbeet learns where each library is from the files it imports | |
 | `BEETS_ALBUM_MODE` | Enable album import mode (see below) | `false` |
+| `OIDC_ISSUER_URL` | Issuer of your OpenID Connect provider. Setting it turns on single sign-on (see below) | |
+| `OIDC_CLIENT_ID` | Client ID registered at the provider | |
+| `OIDC_CLIENT_SECRET` | Client secret. Leave unset for a public client (PKCE only) | |
+| `OIDC_REDIRECT_URL` | Optional. One callback for every sign-in, `https://<your soulbeet>/api/auth/oidc/callback`. Without it, the provider sends users back to the address they started at (`PUBLIC_URL` when set) | |
+| `OIDC_PROVIDER_NAME` | Name on the login button ("Sign in with ...") | `SSO` |
+| `OIDC_SCOPES` | Scopes to request (`openid` is always added) | `openid profile email` |
+| `OIDC_USERNAME_CLAIM` | ID token claim used as the Soulbeet username | `preferred_username` |
+| `OIDC_AUTO_REGISTER` | Create an account on first sign-in when none has that username | `true` with `REGISTRATION=open`, else `false` |
+| `OIDC_LINK_BY_USERNAME` | On a first sign-in, link the existing account of that username. Set `false` to refuse such a sign-in instead. Read the warning below | `true` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
 **Note**: For an account linked to Navidrome, Navidrome decides: if it rejects your credentials, the sign-in is refused. Only while Navidrome cannot be reached (or `NAVIDROME_URL` is not set) does Soulbeet check the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. Accounts not linked to Navidrome sign in with their Soulbeet password. A Navidrome login only takes over an existing Soulbeet account that is already linked to Navidrome or whose Soulbeet password is the same.
@@ -190,6 +199,48 @@ For discovery (optional): enable discovery on a folder in Settings > Library, pi
 **Note**: Users who are not admins can only add library folders inside a root an admin approved in Settings > Library, never at the root itself.
 
 **Note**: slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. The ListenBrainz username, the optional token and the Deezer switch are configured per-user in Settings > Library.
+
+### Single Sign-On (OpenID Connect)
+
+Soulbeet can sign users in through an OpenID Connect provider such as [Pocket ID](https://pocket-id.org), Authelia, Authentik or Keycloak. The login page then shows a **Sign in with ...** button next to the password form, which keeps working.
+
+1.  At your provider, create a client. The provider sends users back to `/api/auth/oidc/callback` at the address they started from, so register that path for each address people sign in from as a redirect URI, for example `https://soulbeet.example.com/api/auth/oidc/callback` and `http://192.168.1.10:9765/api/auth/oidc/callback`. Register each address exactly, never a wildcard or pattern: Soulbeet builds the address from the request, so a pattern would let a forged request send a sign-in to another site. When Soulbeet can be reached from the internet, set `PUBLIC_URL` or `OIDC_REDIRECT_URL`. With `PUBLIC_URL` or `OIDC_REDIRECT_URL` set, only that address is used: a sign-in started at another address moves there first, and single sign-on is linked in Settings there. Soulbeet always sends PKCE, so the client can be public (no secret) if the provider allows it.
+2.  Set the variables, for example:
+    ```yaml
+    environment:
+      - OIDC_ISSUER_URL=https://id.example.com
+      - OIDC_CLIENT_ID=<client id>
+      - OIDC_CLIENT_SECRET=<client secret>
+      - OIDC_PROVIDER_NAME=Pocket ID
+    ```
+3.  Restart. A configuration error leaves single sign-on off. It is logged at startup and shown in Settings > Config > Security Checks.
+
+How accounts are matched:
+
+-   An account is tied to the provider's user (its issuer and `sub`), so renaming the user at the provider does not change accounts.
+-   **The same name joins the same account**: when an account already has the name `OIDC_USERNAME_CLAIM` gives (ignoring letter case, like every sign-in) and no single sign-on link yet, a first sign-in joins that account and links it, which signs the account out of its other sessions. An account linked to another identity is never joined. Read the warning below on when to turn this off.
+-   With no account of that name, a first sign-in creates one as a plain user when `OIDC_AUTO_REGISTER` is on. With Navidrome, an account that single sign-on creates takes that name: if the Navidrome user of that name is someone else, they cannot sign in until an admin deletes that account. `OIDC_AUTO_REGISTER` is on by default only with `REGISTRATION=open`. When it is off, the sign-in is refused and the user gets an account the way they would without single sign-on: with `REGISTRATION=navidrome` by signing in once with their Navidrome password, with `REGISTRATION=admin` from an admin in Settings > Users. Their next single sign-on then joins that account, or, with `OIDC_LINK_BY_USERNAME=false`, they sign in with that password and link single sign-on in Settings. Restrict who may sign in at the provider (Pocket ID: allowed user groups on the client).
+-   With `OIDC_USERNAME_CLAIM=email`, a sign-in is accepted only when the provider says the address is verified (`email_verified` is `true`). A missing or any other value is refused.
+-   **Linking and unlinking**: signed in, a user can also link single sign-on in Settings > Users, for example when their name at the provider is not their Soulbeet name. They enter their current password first, the one the login form takes (their Navidrome password for an account that has only that), so a session left open is not enough to link someone else's identity to the account. Changing their own password asks for the current one the same way, so such a session cannot set a new one first. An account with no password at all gets one from an admin, which also removes its single sign-on link, so the user's next single sign-on joins it again by name, or they link it in Settings. Linking sends them to the provider and back. Soulbeet asks the provider to make them sign in there again, and Settings then shows the name of the identity linked, so they can check that it is theirs and not a provider session someone else left open in that browser. An identity is linked to one account only, and an account to one identity. A user can unlink their own account there while it keeps another way in (a password of its own, or a stored Navidrome password). An admin sees in Settings > Users which accounts use single sign-on, with the name of the identity at the provider, and which have no password, and can unlink any of them. An admin who sets the password of another account also removes its link, so whoever held that identity is out (see the warning below for a link made by name); a user who changes their own password keeps theirs. Linking, unlinking or a new password signs the account out everywhere else.
+-   **Navidrome**: an account created through single sign-on has no password and no Navidrome password yet, and a banner says so. A Navidrome login with the same username does not join it, because the provider and Navidrome may give that name to different people. Instead, the user enters their Navidrome password under **Connect Navidrome** in Settings > Users. Soulbeet checks it with Navidrome for the account's own username and stores it. Any account can do this, also to store a Navidrome password that changed.
+-   Signing in from an MCP client's authorization page goes back to it afterwards, as a password sign-in does, also after a failed single sign-on: the error page keeps the request.
+-   **Changing provider**: unlink each account in Settings > Users, set a password on the accounts marked as having none, and have users sign in with the new provider, which joins accounts by name, or link it in Settings.
+
+**Warning**: by default, whoever holds a name at the provider gets the Soulbeet account of that name, admin accounts included. Unlinking an account taken this way, or an admin setting its password (which removes the link), only helps once `OIDC_LINK_BY_USERNAME` is `false` or the name at the provider is changed: the next sign-in under that name links it again.
+
+The default is fine for a family, friends or local instance where the admin runs the provider too, creates the accounts there, and people cannot pick or change their own username at the provider. Some providers let users edit their own username unless the admin turns that off (Pocket ID does by default), so check that setting before you keep the default. With `REGISTRATION=navidrome`, the admin also creates the Navidrome accounts: give them the same names as at the provider. Then the same name means the same person, and existing Soulbeet users just click **Sign in with ...**.
+
+Set `OIDC_LINK_BY_USERNAME=false` if any of these is true:
+
+-   People can sign up at the provider by themselves, or change their username there (or the claim `OIDC_USERNAME_CLAIM` names).
+-   The provider is shared with people who should not all get into Soulbeet, such as a company or public provider.
+-   Soulbeet runs with `REGISTRATION=open`, or strangers can create accounts in it some other way. Someone can register a name with a password first; the real person's first single sign-on then joins that account, and the stranger keeps the password.
+-   Soulbeet runs with `REGISTRATION=navidrome`, and a Navidrome user may have the same name as a different person at the provider. A Navidrome user who signed in to Soulbeet once has an account, and the first single sign-on under that name joins it, with that user's Navidrome library, ratings and playlists.
+-   Someone at the provider holds the name of a Soulbeet admin (the seeded one is `admin`) without being that admin. They would sign in as that admin.
+
+With it off, a first sign-in under the name of an existing account is refused. The owner signs in with their password and links single sign-on in Settings > Users.
+
+Signing out of Soulbeet does not sign you out of the provider. On a shared computer, sign out at the provider too, or the next person to click **Sign in with ...** gets your account.
 
 ### Upgrading to roles and folder roots
 

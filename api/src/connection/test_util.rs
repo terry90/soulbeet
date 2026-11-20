@@ -165,6 +165,24 @@ impl ClientDocuments for FixedDocuments {
     }
 }
 
+/// `bytes` sent in chunks, without a Content-Length to tell their size.
+pub(crate) fn streamed(bytes: Vec<u8>) -> Body {
+    let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+        bytes.chunks(64 * 1024).map(|c| Ok(c.to_vec())).collect();
+    Body::from_stream(futures::stream::iter(chunks))
+}
+
+/// An answer whose Content-Length announces `len` bytes and whose body
+/// never comes, so only a reader that trusts the header finishes.
+pub(crate) fn announced_never_sent(len: usize) -> axum::response::Response {
+    let never = futures::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+    let mut response = axum::response::Response::new(Body::from_stream(never));
+    response
+        .headers_mut()
+        .insert(axum::http::header::CONTENT_LENGTH, HeaderValue::from(len));
+    response
+}
+
 /// Serves `app` over TCP on a free loopback port.
 pub(crate) async fn serve_on_loopback(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

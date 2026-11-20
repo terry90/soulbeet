@@ -16,8 +16,9 @@ use ui::{
     SettingsProvider, StatusAction, StatusBanner,
 };
 use views::{
-    leave_login, DashboardPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage, SettingsPage,
-    SettingsTab, SettingsTabRequest,
+    leave_login, DashboardPage, LoginErrorPage, LoginErrorReturnPage, LoginPage, LoginReturnPage,
+    ReturnTo, SearchPage, SettingsPage, SettingsTab, SettingsTabRequest, SsoLinkNotice,
+    SsoLinkResultPage,
 };
 
 mod auth;
@@ -33,6 +34,10 @@ pub enum Route {
         LoginPage {},
         #[route("/login/return?:..return_to")]
         LoginReturnPage { return_to: ReturnTo },
+        #[route("/login/error/:code")]
+        LoginErrorPage { code: String },
+        #[route("/login/error/:code/return?:..return_to")]
+        LoginErrorReturnPage { code: String, return_to: ReturnTo },
 
         #[layout(WebNavbar)]
             #[route("/")]
@@ -41,6 +46,8 @@ pub enum Route {
             DashboardPage {},
             #[route("/settings")]
             SettingsPage {},
+            #[route("/settings/sso/:code")]
+            SsoLinkResultPage { code: String },
 }
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -88,6 +95,7 @@ fn main() {
                 .merge(api::connection::router(
                     api::connection::ConnectionState::live(),
                 ))
+                .merge(api::oidc::router())
                 .layer(CookieManagerLayer::new()))
         });
     }
@@ -124,13 +132,22 @@ fn AuthGuard() -> Element {
     let current = use_route::<Route>();
 
     use_effect(move || match (auth.is_logged_in(), &current) {
-        (false, Route::LoginPage {} | Route::LoginReturnPage { .. }) => {}
+        (
+            false,
+            Route::LoginPage {}
+            | Route::LoginReturnPage { .. }
+            | Route::LoginErrorPage { .. }
+            | Route::LoginErrorReturnPage { .. },
+        ) => {}
         (false, _) => {
             nav.replace(Route::LoginPage {});
         }
-        (true, Route::LoginPage {}) => leave_login(nav, None),
+        (true, Route::LoginPage {} | Route::LoginErrorPage { .. }) => leave_login(nav, None),
         // Back to the request that asked for sign-in
-        (true, Route::LoginReturnPage { return_to }) => leave_login(nav, return_to.accepted()),
+        (
+            true,
+            Route::LoginReturnPage { return_to } | Route::LoginErrorReturnPage { return_to, .. },
+        ) => leave_login(nav, return_to.accepted()),
         (true, _) => {}
     });
 
@@ -152,6 +169,8 @@ fn WebNavbar() -> Element {
     use_context_provider(|| SearchPrefill(search_prefill));
     let settings_tab_request = use_signal(|| None::<SettingsTab>);
     use_context_provider(|| SettingsTabRequest(settings_tab_request));
+    let sso_link_notice = use_signal(|| None::<api::auth::SsoLinkResult>);
+    use_context_provider(|| SsoLinkNotice(sso_link_notice));
 
     #[allow(unused_mut)]
     let mut auto_download_signal = use_signal(|| None::<shared::download::AutoDownloadEvent>);
@@ -369,9 +388,34 @@ fn ImporterBanner() -> Element {
     }
 }
 
+/// The Navidrome banner for `status`: its dot, its message, and whether it
+/// links to Connect Navidrome. `None` when there is nothing to say.
+fn navidrome_banner(status: NavidromeStatus) -> Option<(&'static str, &'static str, bool)> {
+    match status {
+        NavidromeStatus::InvalidCredentials => Some((
+            "bg-beet-accent",
+            "Navidrome refused your password. Enter your current Navidrome password under \
+             Connect Navidrome.",
+            true,
+        )),
+        NavidromeStatus::NotLinked => Some((
+            "bg-beet-accent",
+            "Not connected. Connect Navidrome to use discovery and rating sync.",
+            true,
+        )),
+        NavidromeStatus::Offline => Some((
+            "bg-gray-500",
+            "Unreachable. Discovery and rating sync paused.",
+            false,
+        )),
+        NavidromeStatus::Connected | NavidromeStatus::Unknown => None,
+    }
+}
+
 #[component]
 fn NavidromeBanner() -> Element {
     let auth = use_auth();
+    let SettingsTabRequest(mut requested_tab) = use_context();
     let mut settings = ui::use_settings();
     let health = ui::use_system_health();
     let status = auth.navidrome_status();
@@ -385,28 +429,12 @@ fn NavidromeBanner() -> Element {
     // banner clears on its own once Navidrome answers again.
     let back_online = matches!(status, NavidromeStatus::Offline) && health.navidrome_online();
 
-    if dismissed
-        || back_online
-        || matches!(
-            status,
-            NavidromeStatus::Connected | NavidromeStatus::Unknown
-        )
-    {
+    if dismissed || back_online {
         return rsx! {};
     }
 
-    let (dot_color, label, message) = match status {
-        NavidromeStatus::InvalidCredentials => (
-            "bg-beet-accent",
-            "NAVIDROME",
-            "Credentials mismatch. Log in with your Navidrome password to reconnect.",
-        ),
-        NavidromeStatus::Offline => (
-            "bg-gray-500",
-            "NAVIDROME",
-            "Unreachable. Discovery and rating sync paused.",
-        ),
-        _ => return rsx! {},
+    let Some((dot_color, message, connect)) = navidrome_banner(status) else {
+        return rsx! {};
     };
 
     let dismiss = move |_| {
@@ -421,7 +449,15 @@ fn NavidromeBanner() -> Element {
     };
 
     rsx! {
-        StatusBanner { dot_class: dot_color, label, message: message.to_string(),
+        StatusBanner { dot_class: dot_color, label: "NAVIDROME", message: message.to_string(),
+            if connect {
+                Link {
+                    class: ui::STATUS_ACTION_CLASS,
+                    to: Route::SettingsPage {},
+                    onclick: move |_| requested_tab.set(Some(SettingsTab::Users)),
+                    "Connect"
+                }
+            }
             button {
                 class: "shrink-0 text-gray-600 hover:text-gray-300 transition-colors cursor-pointer p-2 -mr-1",
                 onclick: dismiss,
@@ -450,6 +486,20 @@ mod tests {
         "/login/return?return_to=%2Foauth%2Fauthorize%3Fclient_id%3Ddcr_e2e%26state%3Da%2526b";
     const BACK: &str = "/oauth/authorize?client_id=dcr_e2e&state=a%26b";
 
+    #[test]
+    fn a_refused_or_missing_navidrome_password_leads_to_connect_navidrome() {
+        for status in [
+            NavidromeStatus::InvalidCredentials,
+            NavidromeStatus::NotLinked,
+        ] {
+            let (_, message, connect) = navidrome_banner(status).unwrap();
+            assert!(connect, "{status:?}");
+            assert!(message.contains("Connect Navidrome"), "{message}");
+        }
+        assert!(!navidrome_banner(NavidromeStatus::Offline).unwrap().2);
+        assert_eq!(navidrome_banner(NavidromeStatus::Connected), None);
+    }
+
     fn return_to_of(route: &Route) -> Option<&str> {
         match route {
             Route::LoginReturnPage { return_to } => return_to.accepted(),
@@ -475,6 +525,52 @@ mod tests {
         let sent = shared::oauth::login_return_location("//evil.example/oauth/authorize");
         let route: Route = sent.parse().unwrap();
         assert_eq!(return_to_of(&route), None);
+        assert_eq!(route.to_string(), sent);
+    }
+
+    #[test]
+    fn a_single_sign_on_link_comes_back_to_its_result_page() {
+        use api::auth::SsoLinkResult;
+        let route: Route = SsoLinkResult::IdentityTaken.location().parse().unwrap();
+        assert_eq!(
+            route,
+            Route::SsoLinkResultPage {
+                code: "identity_taken".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_failed_single_sign_on_keeps_the_request_it_was_for() {
+        use api::auth::SsoError;
+        let sent = SsoError::Denied.location(Some(BACK));
+        let route: Route = sent.parse().unwrap();
+        match &route {
+            Route::LoginErrorReturnPage { code, return_to } => {
+                assert_eq!(code, "denied");
+                assert_eq!(return_to.accepted(), Some(BACK));
+            }
+            other => panic!("not the error page with a request: {other:?}"),
+        }
+        assert_eq!(route.to_string(), sent);
+
+        // A crafted error address cannot send the browser off the
+        // authorize path once signed in.
+        let crafted = SsoError::Failed.location(Some("//evil.example/oauth/authorize"));
+        match crafted.parse::<Route>().unwrap() {
+            Route::LoginErrorReturnPage { return_to, .. } => assert_eq!(return_to.accepted(), None),
+            other => panic!("not the error page with a request: {other:?}"),
+        }
+
+        // Without one, the error page keeps its bare address.
+        let sent = SsoError::Denied.location(None);
+        let route: Route = sent.parse().unwrap();
+        assert_eq!(
+            route,
+            Route::LoginErrorPage {
+                code: "denied".into()
+            }
+        );
         assert_eq!(route.to_string(), sent);
     }
 

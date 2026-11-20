@@ -1,3 +1,4 @@
+use api::auth::SsoLinkResult;
 use dioxus::prelude::*;
 use ui::settings::{
     AccountPanel, AppConfigManager, ConnectedAppsPanel, ConnectionStatusPanel, DeletionChecksPanel,
@@ -17,11 +18,34 @@ pub(crate) enum SettingsTab {
 #[derive(Clone, Copy)]
 pub(crate) struct SettingsTabRequest(pub Signal<Option<SettingsTab>>);
 
+/// How a single sign-on link that just came back from the provider ended,
+/// until Settings shows it.
+#[derive(Clone, Copy)]
+pub(crate) struct SsoLinkNotice(pub Signal<Option<SsoLinkResult>>);
+
+/// `/settings/sso/<code>`, where the provider's callback ends a link: opens
+/// Settings on the account and shows the outcome there.
+#[component]
+pub fn SsoLinkResultPage(code: String) -> Element {
+    let SettingsTabRequest(mut requested_tab) = use_context();
+    let SsoLinkNotice(mut notice) = use_context();
+    let nav = use_navigator();
+
+    use_effect(move || {
+        requested_tab.set(Some(SettingsTab::Users));
+        notice.set(Some(SsoLinkResult::from_code(&code)));
+        nav.replace(crate::Route::SettingsPage {});
+    });
+
+    rsx! {}
+}
+
 #[component]
 pub fn SettingsPage() -> Element {
     let mut active_tab = use_signal(SettingsTab::default);
     let auth = crate::auth::use_auth();
     let SettingsTabRequest(mut requested_tab) = use_context();
+    let SsoLinkNotice(sso_notice) = use_context();
 
     use_effect(move || {
         if let Some(tab) = requested_tab() {
@@ -77,7 +101,7 @@ pub fn SettingsPage() -> Element {
                     },
                     SettingsTab::Users => rsx! {
                         div { class: "space-y-8",
-                            AccountPanel {}
+                            AccountPanel { sso_notice }
                             ConnectedAppsPanel {}
                             if auth.is_admin() {
                                 UserManager {}

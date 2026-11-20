@@ -31,7 +31,7 @@ Long work goes on in Soulbeet after the chat ends: a batch of downloads keeps ru
 - **https with a certificate the client trusts.** Soulbeet refuses the OAuth and `/mcp` endpoints over plain http, except on a loopback address for local tests.
 - **Soulbeet at the root of that name.** Soulbeet cannot run under a sub-path: `https://music.example.com` works, `https://example.com/music` does not.
 - **The Security Checks in Settings > Config pass.** Until they do, the OAuth and `/mcp` endpoints answer `mcp_unavailable`. The two checks are:
-  - `SECRET_KEY` is unset (Soulbeet then generates a key) or at least 32 bytes. A shorter one is not used at all: Soulbeet signs sessions with the key in `secret.key` instead. Settings shows: "SECRET_KEY is shorter than 32 bytes, so Soulbeet does not use it and signs sessions with the key stored in secret.key next to the database. Remove SECRET_KEY, or set it to a random value of at least 32 bytes, for example the output of `openssl rand -hex 32`. Setting a new SECRET_KEY ends every session and makes the stored Navidrome passwords unreadable: each user is asked to sign in again once."
+  - `SECRET_KEY` is unset (Soulbeet then generates a key) or at least 32 bytes. A shorter one is not used at all: Soulbeet signs sessions with the key in `secret.key` instead. Settings shows: "SECRET_KEY is shorter than 32 bytes, so Soulbeet does not use it and signs sessions with the key stored in secret.key next to the database. Remove SECRET_KEY, or set it to a random value of at least 32 bytes, for example the output of `openssl rand -hex 32`. Setting a new SECRET_KEY ends every session and makes the stored Navidrome passwords unreadable: each user enters theirs again once, by signing in with it or under Connect Navidrome in Settings > Users."
   - The seeded `admin` account no longer has the password `admin`. Settings shows: "The seeded admin account still has the password 'admin'. Change it in Settings > Users."
 
 Two environment variables concern MCP access:
@@ -186,7 +186,7 @@ Any client that supports remote MCP servers over streamable HTTP with OAuth adds
 2. Give it a name, for example "Soulbeet", and the address `https://music.example.com/mcp`.
 3. Keep the options marked **Detected**. Either OAuth client choice works: "Use Claude's published identity" and "Register automatically" are both supported.
 4. Click **Add**, then **Connect**. claude.ai opens Soulbeet in your browser.
-5. If you are not signed in, Soulbeet shows its sign-in page (`/login/return?return_to=...`). Sign in with your Soulbeet account, or with your Navidrome account when Soulbeet uses Navidrome sign-in.
+5. If you are not signed in, Soulbeet shows its sign-in page (`/login/return?return_to=...`). Sign in with your Soulbeet account, with your Navidrome account when Soulbeet uses Navidrome sign-in, or with the **Sign in with ...** button when an admin set up single sign-on. If a single sign-on fails, the page that says why keeps the request, so signing in from there still leads to the next step.
 6. Soulbeet then asks:
 
    > **Connect claude.ai to Soulbeet**
@@ -223,7 +223,7 @@ A user whose account is not linked to Navidrome can still use the tools that do 
 - **Disconnect** asks "Disconnect {app host}? It will have to be connected again from the app." and ends the app's access.
 - Admins see every user's apps, with the owner's name, and can disconnect any of them. Only the owner can change an app's deletion switch.
 
-A password change, an admin's reset of the password, or a Navidrome sign-in that links an account which had no Navidrome link disconnects every app of that user. Every new connection starts with deletion off.
+A password change, an admin's reset of the password, a Navidrome sign-in that links an account which had no Navidrome link, or linking or unlinking single sign-on disconnects every app of that user. Every new connection starts with deletion off.
 
 Access tokens last 1 hour. Refresh tokens last 60 days from their issue, and each refresh gives a new one, so an app used at least once in 60 days stays connected. A refresh token used again more than a minute after it was replaced ends the connection.
 
@@ -482,8 +482,8 @@ The ones you are most likely to see:
 | `metadata_not_found` | `metadata` | MusicBrainz has no such recording, release or artist, or a download names an album from a Last.fm search, which Soulbeet no longer uses. | Search again with other words or another id. |
 | `metadata_rate_limited` | `metadata` | MusicBrainz refused for too many requests. | Try again later. |
 | `navidrome_unreachable` | `library_check`, `index`, `playlist`, `delete` | Navidrome did not answer, answered an HTTP error (often a proxy or a wrong `NAVIDROME_URL`), or answered something that is not its API. From `find_duplicates`: Navidrome's pages held fewer songs than it counts. | Check that Navidrome runs and `NAVIDROME_URL` is right; try again. |
-| `navidrome_auth_failed` | `library_check`, `index`, `playlist`, `delete` | Navidrome refused the stored Navidrome password. User action `relink_navidrome`. | Sign in to Soulbeet again with your current Navidrome password. |
-| `navidrome_not_linked` | `library_check`, `index`, `playlist`, `delete` | The account is not linked to Navidrome or its stored password cannot be read (user action `relink_navidrome`), or `NAVIDROME_URL` is not set (user action `configure_navidrome`). | Sign in to Soulbeet with your Navidrome account, or set `NAVIDROME_URL`. |
+| `navidrome_auth_failed` | `library_check`, `index`, `playlist`, `delete` | Navidrome refused the stored Navidrome password. User action `relink_navidrome`. | Enter your current Navidrome password under Connect Navidrome, in Soulbeet's Settings > Users. |
+| `navidrome_not_linked` | `library_check`, `index`, `playlist`, `delete` | The account is not linked to Navidrome or its stored password cannot be read (user action `relink_navidrome`), or `NAVIDROME_URL` is not set (user action `configure_navidrome`). | Enter your Navidrome password under Connect Navidrome, in Soulbeet's Settings > Users, or set `NAVIDROME_URL`. |
 | `navidrome_circuit_open` | `library_check`, `index`, `playlist`, `delete` | Navidrome failed 5 times in a row, so Soulbeet sends it nothing for 60 seconds. | Wait a minute; check Navidrome. |
 | `navidrome_refused` | `library_check`, `index`, `playlist`, `delete` | Navidrome answered with an error other than a refused login, for example an account that may not do what was asked. | Read `cause`; trying again gives the same answer. |
 | `backend_not_configured` | `source_search`, `enqueue`, `transfer` | The slskd URL or API key is missing, does not parse, or slskd refused the key. User action `configure_backend`. | An admin sets the slskd URL and API key in Settings > Config. |
@@ -568,7 +568,7 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 | `fix_importer` | "Fix the beets setup: {problem}" | "Settings > Config" |
 | `fix_download_path` | "Make the folder the download backend saves into readable by Soulbeet at {DOWNLOAD_PATH}" | "DOWNLOAD_PATH and the volume mounted there" |
 | `free_disk_space` | "Free disk space: {message}" | "The disk that holds the path in the message" |
-| `relink_navidrome` | "Sign in to Soulbeet again with your current Navidrome password", "Sign in to Soulbeet once as a Navidrome admin, so Soulbeet can list Navidrome's users", or "Have every Navidrome user sign in to Soulbeet once, so Soulbeet can read their ratings" | "Soulbeet sign-in" |
+| `relink_navidrome` | "Enter your current Navidrome password under Connect Navidrome", "Sign in to Soulbeet once as a Navidrome admin, so Soulbeet can list Navidrome's users", or "Have every Navidrome user sign in to Soulbeet once, so Soulbeet can read their ratings" | "Soulbeet's Settings > Users" for the first, "Soulbeet sign-in" for the others |
 | `configure_navidrome` | "Set NAVIDROME_URL to the address of your Navidrome server", "Make Navidrome's music folder readable by Soulbeet at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulbeet sees Navidrome's default library", or "Give every Navidrome account linked to Soulbeet access to this track's library, so Soulbeet can read their ratings of it" | "Soulbeet's environment", or "Navidrome's user settings" |
 | `enable_deletion` | "Allow deleting music for this app" | "Settings > Users > Connected apps" |
 | `enable_indexing` | "Make this Navidrome account an admin, enable Navidrome's file watcher, or set a scan schedule" | "Navidrome" |

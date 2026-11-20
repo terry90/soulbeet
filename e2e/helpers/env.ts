@@ -58,9 +58,6 @@ export const shotsDir = process.env.E2E_SHOTS_DIR;
 /** Navidrome-dependent specs only run when the stack includes one. */
 export const navidromeEnabled = process.env.E2E_NAVIDROME === '1';
 
-/** The admin account the first migration seeds. */
-export const seededAdminId = '00000000-0000-0000-0000-000000000000';
-
 export const navidromeAdminUser = 'admin';
 export const navidromeAdminPassword = 'e2e-navidrome-admin';
 

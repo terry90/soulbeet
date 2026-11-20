@@ -57,7 +57,7 @@ impl From<sqlx::Error> for Refused {
 }
 
 /// Whether `user_id`'s session `check` still counts.
-async fn still_signed_in(
+pub(crate) async fn still_signed_in(
     conn: &mut SqliteConnection,
     user_id: &str,
     check: &SessionCheck,
