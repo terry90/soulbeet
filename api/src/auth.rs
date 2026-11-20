@@ -103,8 +103,9 @@ pub enum SsoError {
     Denied,
     /// No account of that name and auto-registration is off
     NotRegistered,
-    /// An account of that name exists and was never linked: its owner links
-    /// it from Settings after signing in with its password
+    /// An account of that name exists and was never linked, and
+    /// OIDC_LINK_BY_USERNAME is off: its owner links it from Settings after
+    /// signing in with its password
     AccountExists,
     /// The account of that name is linked to another identity
     Conflict,
