@@ -159,3 +159,64 @@ pub fn Login(props: Props) -> Element {
       }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(sso_provider: Option<&str>, return_to: Option<&str>) -> String {
+        #[derive(Props, PartialEq, Clone)]
+        struct Page {
+            sso_provider: Option<String>,
+            return_to: Option<String>,
+        }
+        let mut dom = VirtualDom::new_with_props(
+            |page: Page| {
+                let login: LoginCallback = Callback::new(|_| {
+                    Box::pin(async { Ok(()) }) as Pin<Box<dyn Future<Output = Result<(), String>>>>
+                });
+                rsx! {
+                  Login {
+                    login,
+                    sso_provider: page.sso_provider,
+                    sso_error: None,
+                    return_to: page.return_to,
+                  }
+                }
+            },
+            Page {
+                sso_provider: sso_provider.map(Into::into),
+                return_to: return_to.map(Into::into),
+            },
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_single_sign_on_button_posts_with_the_authorize_request() {
+        // A post, so the browser sends its Origin: the server reads plain
+        // http at a name from it, as for a password login.
+        let html = render(
+            Some("Pocket ID"),
+            Some("/oauth/authorize?client_id=c&state=s"),
+        );
+        let form = format!(
+            "<form method=\"post\" action=\"{}\">\
+             <input type=\"hidden\" name=\"return_to\" value=\"/oauth/authorize?client_id=c&#38;state=s\"/>\
+             <button ",
+            api::auth::OIDC_LOGIN_PATH
+        );
+        assert!(html.contains(&form), "{html}");
+        assert!(html.contains("Sign in with Pocket ID"));
+
+        let html = render(Some("Pocket ID"), None);
+        assert!(html.contains(&format!(
+            "<form method=\"post\" action=\"{}\"><button ",
+            api::auth::OIDC_LOGIN_PATH
+        )));
+        assert!(!html.contains("return_to"));
+
+        assert!(!render(None, None).contains(api::auth::OIDC_LOGIN_PATH));
+    }
+}
