@@ -41,6 +41,12 @@ pub(crate) struct RecordingMetadataQuery<'a> {
     pub inc: &'static str,
 }
 
+/// `/1/validate-token`'s answer; `code`, `message` and `user_name` are not read.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TokenValidation {
+    pub valid: bool,
+}
+
 // --- User statistics, listens and feedback ---
 
 #[derive(Debug, Clone, Deserialize)]

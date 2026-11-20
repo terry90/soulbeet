@@ -23,6 +23,13 @@ impl ListenBrainzClient {
         self.http.has_token()
     }
 
+    /// False only when ListenBrainz answers that it does not know the saved token. Asked with
+    /// one saved: without, ListenBrainz answers 400.
+    pub async fn token_is_valid(&self) -> Result<bool, RemoteError> {
+        let answer: Option<TokenValidation> = self.http.get("/1/validate-token").await?;
+        Ok(answer.is_none_or(|a| a.valid))
+    }
+
     /// 204 means ListenBrainz has not computed the user's statistics yet.
     pub async fn user_top_artists(
         &self,
@@ -493,6 +500,24 @@ mod tests {
             })
         ));
         assert_eq!(seen.lock().unwrap()[1].authorization, None);
+    }
+
+    #[tokio::test]
+    async fn the_saved_token_is_checked_with_validate_token() {
+        // A known token's answer, as api.py's validate_token documents it.
+        let valid = r#"{"code":200,"message":"Token valid.","valid":true,"user_name":"rob"}"#;
+        let (base, seen) = serve(vec![
+            ok(valid),
+            ok(include_str!("fixtures/token_invalid.json")),
+        ]);
+        let lb = ListenBrainzClient::new(&base, Some("t".into()), Pace::immediate()).unwrap();
+        assert!(lb.token_is_valid().await.unwrap());
+        assert!(!lb.token_is_valid().await.unwrap());
+        let sent = seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            (sent.target.as_str(), sent.authorization.as_deref()),
+            ("/1/validate-token", Some("Token t"))
+        );
     }
 
     #[tokio::test]

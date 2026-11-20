@@ -323,6 +323,15 @@ impl SourceErrors {
     }
 }
 
+/// Grouped by source as `extend` groups them, for a report's errors.
+impl From<Vec<SourceError>> for SourceErrors {
+    fn from(errors: Vec<SourceError>) -> Self {
+        let mut grouped = SourceErrors::default();
+        grouped.extend(SourceErrors(errors));
+        grouped
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineState {
@@ -744,6 +753,24 @@ mod tests {
                     failures: 1
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_reports_errors_group_by_source_adding_up_their_failures() {
+        let error = |source: &str, message: &str, failures| SourceError {
+            source: source.into(),
+            message: message.into(),
+            failures,
+        };
+        let grouped = SourceErrors::from(vec![
+            error("Deezer", "first", 2),
+            error("MusicBrainz", "mb", 1),
+            error("Deezer", "second", 3),
+        ]);
+        assert_eq!(
+            grouped.into_vec(),
+            [error("Deezer", "first", 5), error("MusicBrainz", "mb", 1)]
         );
     }
 

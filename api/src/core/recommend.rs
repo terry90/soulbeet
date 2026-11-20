@@ -18,7 +18,7 @@ use soulbeet::engine::{build_profile, recommend};
 use soulbeet::history::listenbrainz::ListenBrainzHistory;
 use soulbeet::history::HistoryError;
 use soulbeet::knowledge::metabrainz::MetaBrainzKnowledge;
-use soulbeet::knowledge::KnowledgeHosts;
+use soulbeet::knowledge::{KnowledgeError, KnowledgeHosts};
 use soulbeet::listenbrainz::client::ListenBrainzClient;
 use soulbeet::listenbrainz::labs::LabsClient;
 use soulbeet::musicbrainz::MusicBrainzProvider;
@@ -125,6 +125,7 @@ pub(crate) async fn generate_in(
         histories,
         generators,
         knowledge,
+        errors,
     } = match sources_of(navidrome, services, user, plan_for(&settings)).await {
         Ok(sources) => sources,
         Err((source, failure)) => {
@@ -138,7 +139,7 @@ pub(crate) async fn generate_in(
     let mut total = 0u32;
     for profile in profiles {
         let config = ProfileConfig::from_profile(*profile);
-        let (candidates, report) = recommend(
+        let (candidates, mut report) = recommend(
             &build,
             &generators,
             knowledge.as_ref(),
@@ -146,6 +147,10 @@ pub(crate) async fn generate_in(
             CANDIDATES_PER_PROFILE,
         )
         .await;
+        // The setup's errors first, so a refused token is the message its source shows.
+        let mut all = errors.clone();
+        all.extend(report.source_errors.into());
+        report.source_errors = all.into_vec();
         let name = profile.name();
         store_run_in(db, &user_id, name, &candidates, &report)
             .await
@@ -160,11 +165,12 @@ pub(crate) async fn generate_in(
 }
 
 /// What a run reads: the user's histories, the generators their settings turn on, and the
-/// knowledge about music.
+/// knowledge about music. With what setting them up found wrong but did not stop the run.
 struct RunSources {
     histories: Vec<Arc<dyn ListeningHistory>>,
     generators: Vec<Arc<dyn CandidateGenerator>>,
     knowledge: Arc<MetaBrainzKnowledge>,
+    errors: SourceErrors,
 }
 
 /// Reads the Navidrome library and sets up the remote clients `plan` turns on. Fails with
@@ -186,14 +192,9 @@ async fn sources_of(
         .await
         .map_err(library_failure)?;
 
-    let listenbrainz = Arc::new(
-        ListenBrainzClient::new(
-            &services.hosts.listenbrainz,
-            plan.listenbrainz_token,
-            services.metabrainz_pace,
-        )
-        .map_err(client_failure)?,
-    );
+    let (listenbrainz, errors) = listenbrainz_for(services, plan.listenbrainz_token)
+        .await
+        .map_err(client_failure)?;
     let labs =
         LabsClient::new(&services.hosts.labs, services.metabrainz_pace).map_err(client_failure)?;
     let knowledge = Arc::new(MetaBrainzKnowledge::new(
@@ -231,7 +232,34 @@ async fn sources_of(
         histories,
         generators,
         knowledge,
+        errors,
     })
+}
+
+/// The run's ListenBrainz client. A saved token is checked once: one ListenBrainz does not know
+/// is left out of the whole run, since it would refuse every request that sends it, and the
+/// errors say so. A check that fails keeps the token, and the run's own calls report the failure.
+async fn listenbrainz_for(
+    services: &DiscoveryServices,
+    token: Option<String>,
+) -> Result<(Arc<ListenBrainzClient>, SourceErrors), RemoteError> {
+    let client = |token| {
+        ListenBrainzClient::new(
+            &services.hosts.listenbrainz,
+            token,
+            services.metabrainz_pace,
+        )
+    };
+    let with_saved = client(token)?;
+    let mut errors = SourceErrors::default();
+    if !with_saved.has_token() || with_saved.token_is_valid().await.unwrap_or(true) {
+        return Ok((Arc::new(with_saved), errors));
+    }
+    errors.record(
+        KnowledgeError::TokenRefused.service(),
+        KnowledgeError::TokenRefused,
+    );
+    Ok((Arc::new(client(None)?), errors))
 }
 
 /// Stores for each of `profiles` the report of a run that ended before recommending, because
@@ -719,16 +747,79 @@ mod tests {
     const CHALLENGE: &str =
         include_str!("../../../lib/soulbeet/src/listenbrainz/fixtures/challenge.html");
 
+    /// ListenBrainz's answer to a token it does not know, captured.
+    const TOKEN_INVALID: &str =
+        include_str!("../../../lib/soulbeet/src/listenbrainz/fixtures/token_invalid.json");
+
+    /// The ListenBrainz client and errors of a run whose saved token ListenBrainz answers
+    /// `validate-token` about with `status` and `body`.
+    async fn checked(status: u16, body: &str) -> (Arc<ListenBrainzClient>, SourceErrors) {
+        let db = test_db::migrated().await;
+        let listenbrainz = NavidromeStub::start();
+        listenbrainz.answer_when("/1/validate-token", "", status, body);
+        let services = services_at(&db, &listenbrainz.url);
+        let checked = listenbrainz_for(&services, Some("t".into())).await.unwrap();
+        assert_eq!(listenbrainz.asked(), ["/1/validate-token"]);
+        checked
+    }
+
+    #[tokio::test]
+    async fn a_refused_token_is_left_out_of_the_run_and_said_once() {
+        let (client, errors) = checked(200, TOKEN_INVALID).await;
+        assert!(!client.has_token());
+        assert_eq!(
+            errors.into_vec(),
+            [SourceError {
+                source: "ListenBrainz".into(),
+                message: "ListenBrainz refused the saved token".into(),
+                failures: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_token_or_a_check_that_fails_keeps_the_token() {
+        let valid = r#"{"code":200,"message":"Token valid.","valid":true,"user_name":"rob"}"#;
+        for (status, body) in [(200, valid), (502, BAD_GATEWAY)] {
+            let (client, errors) = checked(status, body).await;
+            assert!(client.has_token(), "{status}");
+            assert!(errors.is_empty(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_with_a_refused_token_reports_it_before_the_other_errors() {
+        let db = test_db::migrated().await;
+        let listenbrainz = NavidromeStub::start();
+        listenbrainz.answer("/1/validate-token", &[TOKEN_INVALID]);
+        listenbrainz.answer("/1/stats/user/rob/artists", &[CHALLENGE]);
+        let f = empty_library_run(&db, &listenbrainz.url, Some("rob"), Some("bad")).await;
+        assert!(f.message.contains("browser check"), "{}", f.message);
+        let rows = EngineReportRow::latest_per_profile_in(&db, "alice")
+            .await
+            .unwrap();
+        let errors = last_run_of(rows).unwrap().source_errors;
+        assert_eq!(
+            (errors.iter())
+                .map(|e| (e.source.as_str(), e.message.as_str()))
+                .collect::<Vec<_>>(),
+            [("ListenBrainz", "ListenBrainz refused the saved token")]
+        );
+        assert!(errors[0].failures > 1, "the challenge counts under it");
+    }
+
     /// The failure of alice's Balanced run with an empty Navidrome library, her ListenBrainz
-    /// account being `listenbrainz_user` at `listenbrainz`.
+    /// account being `listenbrainz_user` at `listenbrainz`, with `token` saved.
     async fn empty_library_run(
         db: &SqlitePool,
         listenbrainz: &str,
         listenbrainz_user: Option<&str>,
+        token: Option<&str>,
     ) -> Failure {
         crate::core::folder_of(db, "alice").await;
         let settings = UpdateUserSettings {
             listenbrainz_username: listenbrainz_user.map(str::to_string),
+            listenbrainz_token: token.map(str::to_string),
             ..Default::default()
         };
         UserSettings::upsert_in(db, "alice", settings)
@@ -752,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn no_listening_data_is_said_only_when_every_history_answered() {
         let db = test_db::migrated().await;
-        let f = empty_library_run(&db, UNREACHED, None).await;
+        let f = empty_library_run(&db, UNREACHED, None, None).await;
         assert_eq!(f, no_listening_data());
         let rows = EngineReportRow::latest_per_profile_in(&db, "alice")
             .await
@@ -769,7 +860,7 @@ mod tests {
         // The stand-in answers any path, so it serves as ListenBrainz too.
         let listenbrainz = NavidromeStub::start();
         listenbrainz.answer("/1/stats/user/rob/artists", &[CHALLENGE]);
-        let f = empty_library_run(&db, &listenbrainz.url, Some("rob")).await;
+        let f = empty_library_run(&db, &listenbrainz.url, Some("rob"), None).await;
         assert_eq!(
             (f.code, f.retry, f.user_action),
             (
