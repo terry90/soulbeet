@@ -70,7 +70,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retired_algorithm_is_a_400_with_the_page() {
+    async fn a_retired_algorithm_is_a_400_with_the_start_of_the_page() {
         let (base, _) = serve(vec![Reply {
             status: 400,
             body: include_str!("fixtures/similar_artists_retired.html").into(),
@@ -84,7 +84,10 @@ mod tests {
                 service: "ListenBrainz Labs",
                 status: 400,
                 body,
-            }) => assert!(body.contains("permitted"), "{body}"),
+            }) => assert!(
+                body.contains("validation error for SimilarArtistsViewerInput"),
+                "{body}"
+            ),
             other => panic!("expected a 400, got {other:?}"),
         }
     }
