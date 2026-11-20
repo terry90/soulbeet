@@ -50,7 +50,7 @@ pub(super) async fn exchange_code(
     ];
 
     let mut request = HTTP
-        .post(&provider.token_endpoint)
+        .post(provider.token_endpoint.clone())
         .header(reqwest::header::ACCEPT, "application/json");
     match (config.client_secret.as_deref(), provider.client_auth) {
         (Some(secret), ClientAuth::Basic) => {

@@ -64,7 +64,7 @@ impl ClientAuth {
 pub(super) struct Provider {
     pub(super) issuer: String,
     pub(super) authorization_endpoint: url::Url,
-    pub(super) token_endpoint: String,
+    pub(super) token_endpoint: url::Url,
     pub(super) client_auth: ClientAuth,
     pub(super) keys: JwkSet,
     pub(super) fetched_at: Instant,
@@ -129,28 +129,58 @@ pub(super) async fn provider(config: &OidcConfig, refresh: bool) -> Result<Arc<P
     }
 }
 
-async fn fetch_provider(config: &OidcConfig) -> Result<Provider, String> {
-    let issuer_url = config.issuer_url.trim_end_matches('/');
-    let discovery: Discovery =
-        get_json(&format!("{issuer_url}/.well-known/openid-configuration")).await?;
+/// The endpoints a discovery document names.
+#[derive(Debug)]
+struct Endpoints {
+    authorization: url::Url,
+    token: url::Url,
+    jwks: url::Url,
+}
 
+/// The endpoints of `discovery`, fetched for the issuer `issuer_url`. Each
+/// uses TLS (OpenID Connect Core 1.0, sections 3.1.2.1 and 3.1.3; RFC 6749,
+/// sections 3.1 and 3.2), unless the issuer itself is on plain http, as on a
+/// LAN without TLS.
+fn checked_endpoints(discovery: &Discovery, issuer_url: &str) -> Result<Endpoints, String> {
+    let issuer_url = issuer_url.trim_end_matches('/');
     // OpenID Connect Discovery 1.0, section 4.3: the document must name the
     // issuer it was fetched for.
     if discovery.issuer.trim_end_matches('/') != issuer_url {
         return Err(format!(
-            "the discovery document names the issuer '{}', not '{}'",
-            discovery.issuer, config.issuer_url
+            "the discovery document names the issuer '{}', not '{issuer_url}'",
+            discovery.issuer
         ));
     }
+    let issuer_on_http = url::Url::parse(issuer_url).is_ok_and(|url| url.scheme() == "http");
+    let endpoint = |name: &str, value: &str| {
+        let url = url::Url::parse(value).map_err(|e| format!("invalid {name}: {e}"))?;
+        match url.scheme() {
+            "https" => Ok(url),
+            "http" if issuer_on_http => Ok(url),
+            _ if issuer_on_http => Err(format!("the {name} {url} is neither https nor http")),
+            _ => Err(format!(
+                "the {name} {url} is not https, and the issuer {issuer_url} is"
+            )),
+        }
+    };
+    Ok(Endpoints {
+        authorization: endpoint("authorization_endpoint", &discovery.authorization_endpoint)?,
+        token: endpoint("token_endpoint", &discovery.token_endpoint)?,
+        jwks: endpoint("jwks_uri", &discovery.jwks_uri)?,
+    })
+}
 
-    let authorization_endpoint = url::Url::parse(&discovery.authorization_endpoint)
-        .map_err(|e| format!("invalid authorization_endpoint: {e}"))?;
-    let keys: JwkSet = get_json(&discovery.jwks_uri).await?;
+async fn fetch_provider(config: &OidcConfig) -> Result<Provider, String> {
+    let issuer_url = config.issuer_url.trim_end_matches('/');
+    let discovery: Discovery =
+        get_json(&format!("{issuer_url}/.well-known/openid-configuration")).await?;
+    let endpoints = checked_endpoints(&discovery, issuer_url)?;
+    let keys: JwkSet = get_json(endpoints.jwks.as_str()).await?;
 
     Ok(Provider {
         issuer: discovery.issuer,
-        authorization_endpoint,
-        token_endpoint: discovery.token_endpoint,
+        authorization_endpoint: endpoints.authorization,
+        token_endpoint: endpoints.token,
         client_auth: ClientAuth::choose(&discovery.token_endpoint_auth_methods_supported),
         keys,
         fetched_at: Instant::now(),
@@ -185,6 +215,62 @@ async fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
 mod tests {
     use super::*;
     use crate::oidc::testing::test_provider;
+    use serde_json::json;
+
+    const NAMES: [&str; 3] = ["authorization_endpoint", "token_endpoint", "jwks_uri"];
+
+    /// A discovery document of `issuer` naming `endpoints` in [`NAMES`]'s order.
+    fn discovery(issuer: &str, endpoints: [&str; 3]) -> Discovery {
+        let mut document = json!({ "issuer": issuer });
+        for (name, endpoint) in NAMES.iter().zip(endpoints) {
+            document[name] = json!(endpoint);
+        }
+        serde_json::from_value(document).unwrap()
+    }
+
+    #[test]
+    fn the_endpoints_use_tls_unless_the_issuer_does_not() {
+        let issuer = "https://id.example.com";
+        let secure = [
+            "https://id.example.com/authorize",
+            "https://id.example.com/token",
+            "https://id.example.com/jwks",
+        ];
+        let endpoints = checked_endpoints(&discovery(issuer, secure), issuer).unwrap();
+        assert_eq!(endpoints.authorization.as_str(), secure[0]);
+        assert_eq!(endpoints.token.as_str(), secure[1]);
+        assert_eq!(endpoints.jwks.as_str(), secure[2]);
+
+        // An https issuer whose document lists a plain http endpoint (a
+        // proxy rewriting the scheme) would get the code, the verifier and
+        // the client secret sent in the clear.
+        for (i, name) in NAMES.iter().enumerate() {
+            let mut listed = secure;
+            let plain = secure[i].replacen("https:", "http:", 1);
+            listed[i] = &plain;
+            let refused = checked_endpoints(&discovery(issuer, listed), issuer).unwrap_err();
+            assert!(refused.contains(name), "{refused}");
+        }
+
+        // An issuer on plain http (a LAN without TLS) may list either.
+        let lan = "http://192.168.1.2:1411";
+        let mixed = [
+            "http://192.168.1.2:1411/authorize",
+            "https://id.example.com/token",
+            "http://192.168.1.2:1411/jwks",
+        ];
+        assert!(checked_endpoints(&discovery(lan, mixed), lan).is_ok());
+        // But no other scheme, and nothing that is no URL.
+        for odd in ["ftp://192.168.1.2/jwks", "/jwks"] {
+            let listed = [mixed[0], mixed[1], odd];
+            assert!(checked_endpoints(&discovery(lan, listed), lan).is_err());
+        }
+
+        // The document names the issuer it was fetched for.
+        let other = "https://other.example.com";
+        assert!(checked_endpoints(&discovery(other, secure), issuer).is_err());
+        assert!(checked_endpoints(&discovery("https://id.example.com/", secure), issuer).is_ok());
+    }
 
     #[test]
     fn client_auth_prefers_basic() {

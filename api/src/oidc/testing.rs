@@ -16,7 +16,7 @@ pub(super) fn test_provider() -> Provider {
     Provider {
         issuer: ISSUER.to_string(),
         authorization_endpoint: url::Url::parse("https://id.example.com/authorize").unwrap(),
-        token_endpoint: "https://id.example.com/token".to_string(),
+        token_endpoint: url::Url::parse("https://id.example.com/token").unwrap(),
         client_auth: ClientAuth::Basic,
         keys: serde_json::from_value(json!({ "keys": [
             { "kty": "OKP", "kid": "k1", "crv": "Ed25519", "x": TEST_KEY_X },
