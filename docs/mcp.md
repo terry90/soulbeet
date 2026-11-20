@@ -281,7 +281,7 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 ### Status, settings and folders
 
 - `get_status`: what Soulbeet can do for this user now: whether slskd and beets work, the Navidrome link and scan status, the folders with free space and `in_navidrome` (`listed` when a Navidrome library Soulbeet has located on this machine holds the folder, so imports into it show up in Navidrome; `unknown` otherwise), the batches still running, whether this app may delete music, and Soulbeet's address.
-- `get_settings`: the user's settings: default folder, auto-delete, ListenBrainz name (never the token), discovery settings.
+- `get_settings`: the user's settings: default folder, auto-delete, ListenBrainz name (never the token), discovery settings, with `discovery.deezer_recommendations` (whether the names of artists the user plays go to Deezer).
 - `list_folders`: the user's library folders with ids, paths, free space, whether shared, `in_navidrome`, and which is the default.
 
 ### Library
@@ -335,8 +335,8 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 ### Discovery
 
-- `get_discovery`: the user's discovery: folder, profiles, the current run and the pending tracks.
-- `run_discovery`: starts a discovery run. Recommendations come from the user's Navidrome plays and stars, from ListenBrainz when a username is saved, from data about music from ListenBrainz and MusicBrainz, and from Deezer when the user turned it on. With nothing played or starred in Navidrome (and no ListenBrainz history) it fails with `no_listening_data`. When a listening history such as ListenBrainz cannot be read and nothing else has plays or stars, it fails with `metadata_unavailable` naming that history, to retry later.
+- `get_discovery`: the user's discovery: folder, profiles, the current run and the pending tracks. A run that ended in error has its failure in `run.failure` for 5 minutes. `last_run` is the newest recommendation run, the automatic 6-hourly one included: `state` (`recommended` or `no_listening_data`), the `sources` it used and the `source_errors` of those that failed.
+- `run_discovery`: starts a discovery run. Recommendations come from the user's Navidrome plays and stars, from ListenBrainz when a username is saved, from data about music from ListenBrainz and MusicBrainz, and from Deezer when the user turned it on. The call returns as soon as the run starts; its own failures are only `invalid_input` (discovery off), `folder_required` and `already_running`. A run that cannot build recommendations ends with `run.status` `error`, and `get_discovery` shows the reason in `run.failure`: `no_listening_data` with nothing played or starred in Navidrome (and no ListenBrainz history), `metadata_unavailable` naming a listening history such as ListenBrainz that could not be read while nothing else has plays or stars (retry later), or `navidrome_not_linked` / `navidrome_unreachable` when the Navidrome library could not be read.
 - `promote_discovery_track`: moves a pending discovery track into the library; it replaces an earlier copy only with the deletion switch on.
 - `remove_discovery_track`: deletes a pending discovery track from the discovery folder.
 - `sync_ratings`: runs the user's rating sync now, as Soulbeet does every 6 hours.
@@ -656,6 +656,7 @@ The release that removes Last.fm changes the tools:
 
 - `search_music` no longer takes `provider`, and a call that passes it is refused with `invalid_input`. Its answer no longer has `provider_requested` or `provider_used`, nor has `get_release`'s.
 - `get_release` takes a MusicBrainz release id only; a `lastfm:` id is refused with `invalid_input`.
-- `get_settings` no longer has `default_metadata_provider` or `lastfm`.
+- `get_settings` no longer has `default_metadata_provider` or `lastfm`, and has `discovery.deezer_recommendations`.
+- `get_discovery` has `last_run`, the newest recommendation run with its sources and failed sources.
 - The failure code `provider_not_configured`, the user action `configure_provider` and the cause service `lastfm` are gone.
 - A job whose album came from a Last.fm search and has no track list yet fails with `metadata_not_found`: search for the album again.

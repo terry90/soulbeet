@@ -64,6 +64,7 @@ pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<Strin
             "playlist_ids": playlist_ids,
             "promote_threshold": s.discovery_promote_threshold,
             "last_generated_at": s.discovery_last_generated_at.as_deref().map(time::text),
+            "deezer_recommendations": s.deezer_recommendations,
         },
     }) else {
         unreachable!("an object literal is an object");
@@ -382,6 +383,7 @@ mod tests {
         s.listenbrainz_username = Some("alice_lb".into());
         s.listenbrainz_token = Some("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d".into());
         s.default_download_folder_id = Some("f1".into());
+        s.deezer_recommendations = true;
         let folders = vec![Folder {
             id: "f1".into(),
             user_id: "u1".into(),
@@ -399,7 +401,8 @@ mod tests {
                     "track_count": {"Conservative": 10, "Balanced": 10, "Adventurous": 10},
                     "lifetime_days": {"Conservative": 7, "Balanced": 7, "Adventurous": 7},
                     "playlist_names": {"Conservative": "Comfort Zone", "Balanced": "Fresh Picks", "Adventurous": "Deep Cuts"},
-                    "playlist_ids": {}, "promote_threshold": 3, "last_generated_at": null}
+                    "playlist_ids": {}, "promote_threshold": 3, "last_generated_at": null,
+                    "deezer_recommendations": true}
             })
         );
         assert!(!doc

@@ -83,7 +83,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Soulbeet settings",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Shows the user's Soulbeet settings: default download folder and whether it still exists, auto-delete on a 1 star rating, the ListenBrainz user name and whether a token is saved (never the token), and the discovery settings. Takes no arguments. Failure codes: {common}.")
+            format!("Shows the user's Soulbeet settings: default download folder and whether it still exists, auto-delete on a 1 star rating, the ListenBrainz user name and whether a token is saved (never the token), and the discovery settings, among them whether the user turned on Deezer recommendations, which send the names of artists they play to Deezer. Takes no arguments. Failure codes: {common}.")
         },
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         read_only: true,

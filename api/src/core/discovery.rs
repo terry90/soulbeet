@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::navidrome::{
-    DiscoveryProgress, DiscoveryStatus, DiscoveryTrack, GenerationStatus, ProfilePhase,
+    DiscoveryProgress, DiscoveryStatus, DiscoveryTrack, GenerationStatus, LastRun, ProfilePhase,
     ProfileProgress,
 };
 use shared::recommendation::DiscoveryProfile;
@@ -23,6 +23,7 @@ use crate::core::delete_guard::Origin;
 use crate::core::folders::folder_not_found;
 use crate::models::discovery_history::DiscoveryHistoryRow;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
+use crate::models::engine_report::EngineReportRow;
 use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
 
@@ -262,9 +263,12 @@ pub(crate) struct Overview {
     pub pending: Vec<DiscoveryTrack>,
     /// The current run, or one that ended in the last 5 minutes.
     pub run: Option<DiscoveryProgress>,
+    /// The latest recommendation run, as the Discovery page shows it. The automatic cycle's
+    /// runs have no `run`, so this is the only place their outcome shows.
+    pub last_run: Option<LastRun>,
 }
 
-/// `ctx`'s discovery: settings, folder, pending tracks and current run.
+/// `ctx`'s discovery: settings, folder, pending tracks, current run and last recommendation run.
 pub(crate) async fn overview_in(
     db: &SqlitePool,
     effects: &dyn DiscoveryEffects,
@@ -290,11 +294,15 @@ pub(crate) async fn overview_in(
         (expires.is_none(), expires)
     });
     let run = (effects.current(&ctx.id()).await).and_then(|p| current_progress(&p, Utc::now()));
+    let reports = EngineReportRow::latest_per_profile_in(db, &ctx.user_id)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?;
     Ok(Overview {
         settings,
         folder,
         pending,
         run,
+        last_run: crate::core::recommend::last_run_of(reports),
     })
 }
 
