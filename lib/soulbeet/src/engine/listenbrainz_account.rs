@@ -17,6 +17,7 @@ use shared::recommendation::{
 };
 
 const NAME: &str = "listenbrainz_account";
+const LABEL: &str = "ListenBrainz recommendations";
 /// Half the other generators' share: it reads one user's neighbours and playlists only.
 const WEIGHT: f64 = 0.2;
 const SIMILAR_USERS: usize = 10;
@@ -124,6 +125,10 @@ impl ListenBrainzAccountGenerator {
 impl CandidateGenerator for ListenBrainzAccountGenerator {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn label(&self) -> &'static str {
+        LABEL
     }
 
     fn weight(&self) -> f64 {

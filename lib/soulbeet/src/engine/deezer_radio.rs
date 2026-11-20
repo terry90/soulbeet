@@ -15,6 +15,7 @@ use shared::recommendation::{
 };
 
 const NAME: &str = "deezer";
+const LABEL: &str = "Deezer";
 const WEIGHT: f64 = 0.4;
 const FAVOURITE_SEEDS: usize = 10;
 
@@ -84,6 +85,10 @@ impl DeezerGenerator {
 impl CandidateGenerator for DeezerGenerator {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn label(&self) -> &'static str {
+        LABEL
     }
 
     fn weight(&self) -> f64 {

@@ -677,12 +677,15 @@ mod tests {
         );
         errors.record("ListenBrainz Labs", "other");
         let r = EngineReport {
-            sources: vec!["Navidrome".into(), "catalog".into()],
+            sources: vec!["Navidrome".into(), "ListenBrainz similar artists".into()],
             source_errors: errors.into_vec(),
             ..Default::default()
         };
         let text = r.to_text();
-        assert!(text.contains("Sources: Navidrome, catalog"), "{text}");
+        assert!(
+            text.contains("Sources: Navidrome, ListenBrainz similar artists"),
+            "{text}"
+        );
         assert!(
             text.contains(
                 "ListenBrainz Labs failed 2 times: ListenBrainz Labs did not answer: timeout"

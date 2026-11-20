@@ -550,7 +550,10 @@ pub struct GeneratorOutput {
 
 #[async_trait]
 pub trait CandidateGenerator: Send + Sync {
+    /// The key of the blend and the pipeline report.
     fn name(&self) -> &'static str;
+    /// What the user sees when the report names this generator.
+    fn label(&self) -> &'static str;
     /// This generator's share of the blend, before the shares of the generators
     /// that found nothing are given to the others.
     fn weight(&self) -> f64;

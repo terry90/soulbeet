@@ -78,7 +78,7 @@ test('a Navidrome-only user who plays music gets candidates', async ({ browser }
       b.created_at.localeCompare(a.created_at),
     )[0];
     expect(newest, 'a report was stored').toBeDefined();
-    expect(newest?.text).toContain('Sources: Navidrome, catalog');
+    expect(newest?.text).toContain('Sources: Navidrome, ListenBrainz similar artists');
     expect(newest?.text).toContain(lowtideChoir.name);
   } finally {
     await context.close();

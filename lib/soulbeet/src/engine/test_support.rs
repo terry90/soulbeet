@@ -257,6 +257,7 @@ pub(crate) fn known_of(artist_names: &[&str]) -> KnownMusic {
 /// A generator that answers the same candidates and errors every run.
 pub(crate) struct FixedGenerator {
     pub name: &'static str,
+    pub label: &'static str,
     pub weight: f64,
     pub candidates: Vec<Candidate>,
     pub errors: SourceErrors,
@@ -266,6 +267,10 @@ pub(crate) struct FixedGenerator {
 impl CandidateGenerator for FixedGenerator {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn label(&self) -> &'static str {
+        self.label
     }
 
     fn weight(&self) -> f64 {
@@ -297,11 +302,13 @@ pub(crate) fn candidate(generator: &str, artist: &str, title: &str, score: f64) 
 
 pub(crate) fn fixed(
     name: &'static str,
+    label: &'static str,
     weight: f64,
     tracks: &[(&str, &str, f64)],
 ) -> Arc<dyn CandidateGenerator> {
     Arc::new(FixedGenerator {
         name,
+        label,
         weight,
         candidates: tracks
             .iter()

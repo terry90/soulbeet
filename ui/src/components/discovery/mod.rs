@@ -586,7 +586,7 @@ mod tests {
         let run = LastRun {
             created_at: "2026-11-19 10:00:00".into(),
             state: EngineState::Recommended,
-            sources: vec!["Navidrome".into(), "catalog".into()],
+            sources: vec!["Navidrome".into(), "ListenBrainz similar artists".into()],
             source_errors: vec![SourceError {
                 source: "Deezer".into(),
                 message: "Deezer kept refusing for too many requests".into(),
@@ -594,7 +594,7 @@ mod tests {
             }],
         };
         let html = render_run(run.clone());
-        assert!(html.contains("Last run used: Navidrome, catalog"));
+        assert!(html.contains("Last run used: Navidrome, ListenBrainz similar artists"));
         assert!(html.contains("Deezer failed: Deezer kept refusing for too many requests"));
         let empty = LastRun {
             state: EngineState::NoListeningData,

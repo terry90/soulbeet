@@ -17,6 +17,7 @@ use shared::recommendation::{
 };
 
 const NAME: &str = "catalog";
+const LABEL: &str = "ListenBrainz similar artists";
 const WEIGHT: f64 = 0.4;
 const FAVOURITE_SEEDS: usize = 10;
 const HOP1_NEIGHBOURS: usize = 5;
@@ -48,6 +49,10 @@ impl CatalogGenerator {
 impl CandidateGenerator for CatalogGenerator {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn label(&self) -> &'static str {
+        LABEL
     }
 
     fn weight(&self) -> f64 {

@@ -152,7 +152,7 @@ pub async fn recommend(
             tokio::time::timeout(GENERATOR_TIMEOUT, generator.generate(profile, config)).await
         else {
             warn!("Generator '{name}' timed out after 1 h");
-            errors.record(name, format!("{name} timed out after 1 h"));
+            errors.record(generator.label(), "timed out after 1 h");
             continue;
         };
         info!(
@@ -168,7 +168,7 @@ pub async fn recommend(
             mbid_failures: output.mbid_failures,
         });
         if !output.candidates.is_empty() {
-            report.sources.push(name.to_string());
+            report.sources.push(generator.label().to_string());
             sets.push((name, generator.weight(), output.candidates));
         }
     }
@@ -362,6 +362,7 @@ fn distinct(values: impl Iterator<Item = String>) -> Vec<String> {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::GeneratorOutput;
     use shared::recommendation::{EngineState, RecordingFacts, SourceErrors};
 
     fn seeded() -> ProfileBuild {
@@ -382,7 +383,12 @@ mod tests {
                 sources: vec!["Navidrome".into()],
                 ..Default::default()
             },
-            &[fixed("catalog", 0.4, &[("B", "b1", 1.0)])],
+            &[fixed(
+                "catalog",
+                "Similar artists",
+                0.4,
+                &[("B", "b1", 1.0)],
+            )],
             &FakeKnowledge::default(),
             &balanced(),
             50,
@@ -405,7 +411,12 @@ mod tests {
                 errors,
                 ..Default::default()
             },
-            &[fixed("catalog", 0.4, &[("B", "b1", 1.0)])],
+            &[fixed(
+                "catalog",
+                "Similar artists",
+                0.4,
+                &[("B", "b1", 1.0)],
+            )],
             &FakeKnowledge::default(),
             &balanced(),
             50,
@@ -428,12 +439,14 @@ mod tests {
         errors.record("ListenBrainz", "ListenBrainz is unavailable: down");
         let account: Arc<dyn CandidateGenerator> = Arc::new(FixedGenerator {
             name: "listenbrainz_account",
+            label: "Your recommendations",
             weight: 0.2,
             candidates: vec![],
             errors,
         });
         let catalog = fixed(
             "catalog",
+            "Similar artists",
             0.4,
             &[("B", "b1", 1.0), ("C", "c1", 0.8), ("D", "d1", 0.6)],
         );
@@ -446,9 +459,48 @@ mod tests {
         )
         .await;
         assert_eq!(got.len(), 3);
-        assert_eq!(report.sources, ["Navidrome", "catalog"]);
+        assert_eq!(report.sources, ["Navidrome", "Similar artists"]);
         assert_eq!(report.source_errors[0].source, "ListenBrainz");
         assert_eq!(report.state, EngineState::Recommended);
+    }
+
+    /// A generator that never answers.
+    struct Stuck;
+
+    #[async_trait::async_trait]
+    impl CandidateGenerator for Stuck {
+        fn name(&self) -> &'static str {
+            "stuck"
+        }
+
+        fn label(&self) -> &'static str {
+            "Stuck radio"
+        }
+
+        fn weight(&self) -> f64 {
+            0.4
+        }
+
+        async fn generate(&self, _: &UserMusicProfile, _: &ProfileConfig) -> GeneratorOutput {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_generator_that_times_out_is_reported_under_its_label() {
+        let (_, report) = recommend(
+            &seeded(),
+            &[Arc::new(Stuck)],
+            &FakeKnowledge::default(),
+            &balanced(),
+            50,
+        )
+        .await;
+        let e = &report.source_errors[0];
+        assert_eq!(
+            (e.source.as_str(), e.message.as_str()),
+            ("Stuck radio", "timed out after 1 h")
+        );
     }
 
     #[tokio::test]
@@ -457,6 +509,7 @@ mod tests {
         found.mbid = Some("r1".into());
         let catalog: Arc<dyn CandidateGenerator> = Arc::new(FixedGenerator {
             name: "catalog",
+            label: "Similar artists",
             weight: 0.4,
             candidates: vec![found],
             errors: SourceErrors::default(),
@@ -504,6 +557,7 @@ mod tests {
         candidates.push(candidate("deezer", "Famous", "Hit", 1.0));
         let deezer: Arc<dyn CandidateGenerator> = Arc::new(FixedGenerator {
             name: "deezer",
+            label: "Deezer",
             weight: 0.4,
             candidates,
             errors: SourceErrors::default(),
@@ -545,6 +599,7 @@ mod tests {
         found.artist_mbid = Some("b".into());
         let catalog: Arc<dyn CandidateGenerator> = Arc::new(FixedGenerator {
             name: "catalog",
+            label: "Similar artists",
             weight: 0.4,
             candidates: vec![found],
             errors: SourceErrors::default(),

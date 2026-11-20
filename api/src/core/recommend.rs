@@ -566,10 +566,13 @@ mod tests {
         // Stored within one second, as a cycle's profiles often are.
         for (profile, report) in [
             ("Balanced", report_of(&["Navidrome"], &[("Deezer", "old")])),
-            ("Balanced", report_of(&["Navidrome", "catalog"], &[])),
+            (
+                "Balanced",
+                report_of(&["Navidrome", "ListenBrainz similar artists"], &[]),
+            ),
             (
                 "Adventurous",
-                report_of(&["Navidrome", "deezer"], &[("ListenBrainz Labs", "down")]),
+                report_of(&["Navidrome", "Deezer"], &[("ListenBrainz Labs", "down")]),
             ),
             (
                 "Conservative",
@@ -586,7 +589,10 @@ mod tests {
         let run = last_run_of(rows).unwrap();
         let mut sources = run.sources.clone();
         sources.sort();
-        assert_eq!(sources, ["Navidrome", "catalog", "deezer"]);
+        assert_eq!(
+            sources,
+            ["Deezer", "ListenBrainz similar artists", "Navidrome"]
+        );
         assert_eq!(
             run.source_errors,
             report_of(&[], &[("ListenBrainz Labs", "down")]).source_errors
