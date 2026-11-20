@@ -12,7 +12,7 @@ Discovery and search no longer use Last.fm, and you can sign in through an OpenI
 - **Sign in with your login provider**: Once an admin sets it up, the login page has a button to sign in through your provider, and an account made that way connects to Navidrome when you enter your Navidrome password in Connect Navidrome in Settings > Users.
 - **Same name, same account**: A first sign-in joins the account with the same name, so set OIDC_LINK_BY_USERNAME=false if the names at your provider are not under your control, and linking from Settings > Users still asks for your current password and shows the name you linked.
 
-[How to set up single sign-on](https://github.com/terry90/soulbeet#single-sign-on-openid-connect)
+[How to set up single sign-on](https://github.com/terry90/soulbeet/blob/master/docs/sso.md)
 
 ## 0.9.0 - 2026-11-19
 

@@ -207,7 +207,7 @@ In the phone app: connectors connected on the web work in the mobile app. Turn o
 
 Every person connects their own Soulbeet account, and an app connected by one person acts as that person. The client sees their folders, downloads, playlists, ratings and settings, and reads Navidrome as their Navidrome account sees it. No tool manages users, folders or the slskd settings, so an admin's client cannot change those either.
 
-How accounts appear depends on `REGISTRATION` (see the README): with Navidrome sign-in (`navidrome`, the default when `NAVIDROME_URL` is set), a Navidrome user's Soulbeet account is created the first time they sign in, which can be the sign-in of the connection itself. With `admin`, an admin creates the accounts; with `open`, anyone can register.
+How accounts appear depends on `REGISTRATION` (see [configuration.md](configuration.md)): with Navidrome sign-in (`navidrome`, the default when `NAVIDROME_URL` is set), a Navidrome user's Soulbeet account is created the first time they sign in, which can be the sign-in of the connection itself. With `admin`, an admin creates the accounts; with `open`, anyone can register.
 
 A user whose account is not linked to Navidrome can still use the tools that do not read Navidrome; those that do answer `navidrome_not_linked`.
 
