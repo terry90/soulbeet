@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use super::flow::Flow;
 use super::loggable;
-use super::provider::{capped_body, ClientAuth, Provider, HTTP};
+use super::provider::{ClientAuth, Provider, HTTP, MAX_BODY};
+use crate::capped_body::read_capped;
 use crate::config::OidcConfig;
 use crate::models::user::username_fits;
 
@@ -72,11 +73,11 @@ pub(super) async fn exchange_code(
         .await
         .map_err(|e| format!("token request failed: {e}"))?;
     let status = response.status();
-    let body = capped_body(response).await;
+    let body = read_capped(response, MAX_BODY).await;
     if !status.is_success() {
         let body = match body {
             Ok(body) => loggable(&String::from_utf8_lossy(&body)),
-            Err(e) => e,
+            Err(e) => e.to_string(),
         };
         return Err(format!("the token endpoint answered {status}: {body}"));
     }
@@ -282,12 +283,9 @@ impl Identity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::test_util::serve_on_loopback;
+    use crate::connection::test_util::{serve_on_loopback, streamed};
     use crate::oidc::flow::{new_flow, Purpose, Start};
-    use crate::oidc::provider::MAX_BODY;
-    use crate::oidc::testing::{
-        identity_at, json_of_size, streamed, test_config, test_provider, ISSUER,
-    };
+    use crate::oidc::testing::{identity_at, json_of_size, test_config, test_provider, ISSUER};
     use axum::http::{header::HOST, HeaderMap, StatusCode, Uri};
     use axum::{routing::post, Router};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};

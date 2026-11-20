@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use super::loggable;
+use crate::capped_body::read_capped;
 use crate::config::OidcConfig;
 
 const PROVIDER_TTL: Duration = Duration::from_secs(3600);
@@ -286,41 +287,17 @@ async fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
             "GET {url} redirected to {location}; set OIDC_ISSUER_URL to the issuer's final URL"
         ));
     }
-    let body = capped_body(response)
+    let body = read_capped(response, MAX_BODY)
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
     serde_json::from_slice(&body).map_err(|e| format!("GET {url} returned an unexpected body: {e}"))
 }
 
-/// The body of `response`, refused once it is larger than [`MAX_BODY`]
-/// rather than read whole.
-pub(super) async fn capped_body(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
-    let too_large = || format!("the body is larger than {} KiB", MAX_BODY / 1024);
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_BODY as u64)
-    {
-        return Err(too_large());
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| format!("cannot read the body: {e}"))?
-    {
-        if body.len() + chunk.len() > MAX_BODY {
-            return Err(too_large());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::test_util::serve_on_loopback;
-    use crate::oidc::testing::{json_of_size, streamed, test_provider, TEST_KEY_X};
+    use crate::connection::test_util::{serve_on_loopback, streamed};
+    use crate::oidc::testing::{json_of_size, test_provider, TEST_KEY_X};
     use axum::{routing::get, Router};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -15,6 +15,7 @@ use serde_json::Value;
 use url::{Host, Url};
 
 use super::clients::{client_metadata, MetadataRefusal};
+use crate::capped_body::{read_capped, CappedBodyError};
 
 /// The largest document Soulful reads.
 pub(crate) const DOCUMENT_MAX_BYTES: usize = 64 * 1024;
@@ -258,21 +259,6 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
-/// The body of `response`, refused as soon as it passes `cap` bytes.
-pub(crate) async fn read_capped(
-    mut response: reqwest::Response,
-    cap: usize,
-) -> Result<Vec<u8>, CimdError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(fetch_error)? {
-        if body.len() + chunk.len() > cap {
-            return Err(CimdError::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 /// A failed request with each of its causes; the URL is left out, since
 /// the page names it already.
 fn fetch_error(e: reqwest::Error) -> CimdError {
@@ -334,7 +320,12 @@ pub(crate) async fn fetch_with(
     if response.status() != reqwest::StatusCode::OK {
         return Err(CimdError::Status(response.status().as_u16()));
     }
-    let body = read_capped(response, DOCUMENT_MAX_BYTES).await?;
+    let body = read_capped(response, DOCUMENT_MAX_BYTES)
+        .await
+        .map_err(|e| match e {
+            CappedBodyError::TooLarge { .. } => CimdError::TooLarge,
+            CappedBodyError::Read(e) => fetch_error(e),
+        })?;
     parse_document(url, &body)
 }
 
@@ -372,7 +363,9 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
 
     use super::*;
-    use crate::connection::test_util::{serve_on_loopback, CLAUDE_CODE_DOCUMENT, CLAUDE_CODE_ID};
+    use crate::connection::test_util::{
+        announced_never_sent, serve_on_loopback, streamed, CLAUDE_CODE_DOCUMENT, CLAUDE_CODE_ID,
+    };
 
     #[test]
     fn client_id_urls_follow_the_cimd_rules() {
@@ -600,36 +593,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_body_over_the_cap_is_refused_while_it_is_read() {
+    async fn a_document_over_the_cap_is_refused() {
         let app = axum::Router::new()
             .route(
-                "/big",
-                axum::routing::get(|| async { vec![b'a'; DOCUMENT_MAX_BYTES + 1] }),
+                "/streamed",
+                axum::routing::get(|| async { streamed(vec![b'a'; DOCUMENT_MAX_BYTES + 1]) }),
             )
             .route(
-                "/doc",
-                axum::routing::get(|| async { CLAUDE_CODE_DOCUMENT }),
+                "/announced",
+                axum::routing::get(|| async { announced_never_sent(DOCUMENT_MAX_BYTES + 1) }),
             );
         let (addr, _server) = serve_on_loopback(app).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let big = client
-            .get(format!("http://{addr}/big"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            read_capped(big, DOCUMENT_MAX_BYTES).await,
-            Err(CimdError::TooLarge)
-        );
-        let doc = client
-            .get(format!("http://{addr}/doc"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            read_capped(doc, DOCUMENT_MAX_BYTES).await,
-            Ok(CLAUDE_CODE_DOCUMENT.as_bytes().to_vec())
-        );
+        for path in ["/streamed", "/announced"] {
+            let url = Url::parse(&format!("http://{addr}{path}")).unwrap();
+            let fetched = tokio::time::timeout(Duration::from_secs(2), fetch_with(&client, &url))
+                .await
+                .unwrap_or_else(|_| panic!("{path} is read past its announced length"));
+            assert_eq!(fetched, Err(CimdError::TooLarge), "{path}");
+        }
     }
 
     #[tokio::test]

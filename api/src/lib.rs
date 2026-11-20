@@ -2,6 +2,8 @@ pub mod auth;
 #[cfg(feature = "server")]
 pub mod base_url;
 pub mod build_id;
+#[cfg(feature = "server")]
+pub(crate) mod capped_body;
 pub mod config;
 #[cfg(feature = "server")]
 pub mod connection;

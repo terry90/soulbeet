@@ -62,13 +62,6 @@ pub(super) fn json_of_size(len: usize) -> Vec<u8> {
     format!(r#"{{"id_token":"{}"}}"#, "a".repeat(len - frame)).into_bytes()
 }
 
-/// `bytes` sent in chunks, without a Content-Length to tell their size.
-pub(super) fn streamed(bytes: Vec<u8>) -> axum::body::Body {
-    let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
-        bytes.chunks(64 * 1024).map(|c| Ok(c.to_vec())).collect();
-    axum::body::Body::from_stream(futures::stream::iter(chunks))
-}
-
 /// The messages logged on this thread while it lives.
 ///
 /// A global subscriber, installed once, keeps them per thread: a scoped one
