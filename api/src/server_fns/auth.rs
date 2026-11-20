@@ -53,12 +53,18 @@ pub(crate) fn secure_for(base: &BaseUrl, origin: Option<&str>) -> bool {
 /// anything is written, so a request whose address cannot be told changes
 /// nothing.
 #[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionCookie {
     secure: bool,
 }
 
 #[cfg(feature = "server")]
 impl SessionCookie {
+    /// Whether cookies set on the answer get the Secure flag.
+    pub(crate) fn secure(&self) -> bool {
+        self.secure
+    }
+
     pub(crate) fn for_request(
         headers: &HeaderMap,
         uri: &Uri,

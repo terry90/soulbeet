@@ -54,7 +54,7 @@ pub async fn get_sign_in_methods() -> Result<SignInMethods, ServerFnError> {
 /// browser goes to the address returned; the provider sends it back to the
 /// callback, which links the identity while this browser is still signed in
 /// to the account, and then shows the outcome in Settings.
-#[post("/api/auth/oidc/link", auth: AuthSession, cookies: Cookies)]
+#[post("/api/auth/oidc/link", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn start_sso_link() -> Result<String, ServerFnError> {
     let Some(config) = CONFIG.oidc() else {
         return Err(refusal_error(SsoError::Disabled.message()));
@@ -63,7 +63,7 @@ pub async fn start_sso_link() -> Result<String, ServerFnError> {
     if user.oidc_subject.is_some() {
         return Err(refusal_error(SsoLinkResult::AlreadyLinked.message()));
     }
-    crate::oidc::begin_link(&cookies, config, &user.id)
+    crate::oidc::begin_link(&cookies, config, &user.id, &headers, &uri)
         .await
         .map(String::from)
         .map_err(|e| {

@@ -31,7 +31,7 @@ use axum::{
     http::{HeaderMap, Uri},
     response::{IntoResponse, Redirect, Response},
     routing::get,
-    Router,
+    Form, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{
@@ -48,6 +48,7 @@ use tower_cookies::{
 };
 
 use crate::auth::{SsoError, SsoLinkResult};
+use crate::base_url::{request_base_with, BaseUrl, BaseUrlError};
 use crate::config::{OidcConfig, CONFIG};
 use crate::crypto;
 use crate::db::DB;
@@ -90,7 +91,7 @@ const ALLOWED_ALGORITHMS: [Algorithm; 9] = [
 /// The two routes of the flow, to merge into the app router.
 pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
-        .route(OIDC_LOGIN_PATH, get(login))
+        .route(OIDC_LOGIN_PATH, get(login).post(login_form))
         .route(OIDC_CALLBACK_PATH, get(callback))
 }
 
@@ -265,6 +266,55 @@ struct Flow {
     verifier: String,
     expires_at: i64,
     purpose: Purpose,
+    /// The callback the provider was asked to send the browser back to,
+    /// sent again with the code (RFC 6749, section 4.1.3)
+    redirect_uri: String,
+    /// How the cookies of this sign-in are set, decided by the request that
+    /// started it: the callback comes from the provider and carries no
+    /// Origin to tell plain http
+    session: SessionCookie,
+}
+
+/// Where a sign-in started by a request comes back to, and how its cookies
+/// are set, by the rule of a password login's session cookie.
+#[derive(Debug)]
+struct Start {
+    /// The address of the callback the provider sends the browser back to
+    callback: BaseUrl,
+    session: SessionCookie,
+}
+
+impl Start {
+    /// For the request `headers` and `uri`. The callback is at `pin`
+    /// (OIDC_REDIRECT_URL) when set, else at the request's address
+    /// (`public_url`, PUBLIC_URL, when set), on plain http when the browser
+    /// is: then the session cookie is not Secure either. The provider checks
+    /// the address against the ones registered there.
+    fn for_request(
+        pin: Option<&BaseUrl>,
+        public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+        headers: &HeaderMap,
+        uri: &Uri,
+    ) -> Result<Start, String> {
+        let session =
+            SessionCookie::for_request_with(headers, uri, public_url).map_err(|e| e.to_string())?;
+        let callback = match pin {
+            Some(pin) => pin.clone(),
+            None => {
+                let base = request_base_with(headers, uri, public_url)
+                    .map_err(|e| format!("cannot tell this request's address: {e}"))?;
+                match public_url {
+                    None if !session.secure() => base.on_http(),
+                    _ => base,
+                }
+            }
+        };
+        Ok(Start { callback, session })
+    }
+
+    fn redirect_uri(&self) -> String {
+        format!("{}{OIDC_CALLBACK_PATH}", self.callback)
+    }
 }
 
 /// What a flow was started for.
@@ -294,7 +344,7 @@ fn authorization_url(provider: &Provider, config: &OidcConfig, flow: &Flow) -> u
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", &config.client_id)
-        .append_pair("redirect_uri", &config.redirect_url)
+        .append_pair("redirect_uri", &flow.redirect_uri)
         .append_pair("scope", &config.scopes)
         .append_pair("state", &flow.state)
         .append_pair("nonce", &flow.nonce)
@@ -320,14 +370,14 @@ fn loggable(value: &str) -> String {
     format!("{:?}", value.chars().take(200).collect::<String>())
 }
 
-fn flow_cookie(state: &str, value: String, config: &OidcConfig) -> Cookie<'static> {
+fn flow_cookie(state: &str, value: String, session: &SessionCookie) -> Cookie<'static> {
     let mut cookie = Cookie::new(flow_cookie_name(state), value);
     cookie.set_path(FLOW_COOKIE_PATH);
     cookie.set_http_only(true);
     // Lax, not Strict: the callback is a top-level navigation coming from the
     // provider's site, and must carry this cookie.
     cookie.set_same_site(SameSite::Lax);
-    cookie.set_secure(config.redirect_url.starts_with("https://"));
+    cookie.set_secure(session.secure());
     cookie.set_max_age(time::Duration::seconds(FLOW_TTL_SECS));
     cookie
 }
@@ -343,7 +393,33 @@ struct LoginParams {
 }
 
 /// `GET /api/auth/oidc/login`: send the browser to the provider.
-async fn login(cookies: Cookies, Query(params): Query<LoginParams>) -> Response {
+async fn login(
+    cookies: Cookies,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(params): Query<LoginParams>,
+) -> Response {
+    start_sign_in(&cookies, &headers, &uri, params).await
+}
+
+/// `POST /api/auth/oidc/login`, the login page's button: the same, and the
+/// browser sends its Origin, which tells a page on plain http, as for a
+/// password login.
+async fn login_form(
+    cookies: Cookies,
+    headers: HeaderMap,
+    uri: Uri,
+    Form(params): Form<LoginParams>,
+) -> Response {
+    start_sign_in(&cookies, &headers, &uri, params).await
+}
+
+async fn start_sign_in(
+    cookies: &Cookies,
+    headers: &HeaderMap,
+    uri: &Uri,
+    params: LoginParams,
+) -> Response {
     let Some(config) = CONFIG.oidc() else {
         return to_login(SsoError::Disabled);
     };
@@ -353,7 +429,17 @@ async fn login(cookies: Cookies, Query(params): Query<LoginParams>) -> Response 
         .as_deref()
         .and_then(shared::oauth::accepted_return_to)
         .map(str::to_owned);
-    match begin(&cookies, config, Purpose::SignIn { return_to }).await {
+    let started = Start::for_request(
+        config.redirect_pin.as_ref(),
+        CONFIG.public_url(),
+        headers,
+        uri,
+    );
+    let begun = match started {
+        Ok(start) => begin(cookies, config, Purpose::SignIn { return_to }, &start).await,
+        Err(e) => Err(e),
+    };
+    match begun {
         Ok(url) => Redirect::to(url.as_str()).into_response(),
         Err(e) => {
             tracing::error!("OIDC sign-in failed: {e}");
@@ -363,17 +449,39 @@ async fn login(cookies: Cookies, Query(params): Query<LoginParams>) -> Response 
 }
 
 /// Starts linking the signed-in account `user_id` to an identity at the
-/// provider: the address to send the browser to. The callback links it only
-/// while this browser is still signed in to that account.
+/// provider from the request `headers` and `uri`: the address to send the
+/// browser to. The callback links it only while this browser is still
+/// signed in to that account.
 pub(crate) async fn begin_link(
     cookies: &Cookies,
     config: &OidcConfig,
     user_id: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
 ) -> Result<url::Url, String> {
+    let start = Start::for_request(
+        config.redirect_pin.as_ref(),
+        CONFIG.public_url(),
+        headers,
+        uri,
+    )?;
     let purpose = Purpose::Link {
         user_id: user_id.to_string(),
     };
-    begin(cookies, config, purpose).await
+    begin(cookies, config, purpose, &start).await
+}
+
+/// A new flow for `purpose`, coming back as `start` says.
+fn new_flow(purpose: Purpose, start: &Start) -> Flow {
+    Flow {
+        state: random_token(),
+        nonce: random_token(),
+        verifier: random_token(),
+        expires_at: chrono::Utc::now().timestamp() + FLOW_TTL_SECS,
+        purpose,
+        redirect_uri: start.redirect_uri(),
+        session: start.session,
+    }
 }
 
 /// Seals a new flow for `purpose` in this browser's cookie and returns the
@@ -382,24 +490,19 @@ async fn begin(
     cookies: &Cookies,
     config: &OidcConfig,
     purpose: Purpose,
+    start: &Start,
 ) -> Result<url::Url, String> {
     let provider = provider(config, false)
         .await
         .map_err(|e| format!("cannot reach the provider: {e}"))?;
 
-    let flow = Flow {
-        state: random_token(),
-        nonce: random_token(),
-        verifier: random_token(),
-        expires_at: chrono::Utc::now().timestamp() + FLOW_TTL_SECS,
-        purpose,
-    };
+    let flow = new_flow(purpose, start);
     let sealed = serde_json::to_string(&flow)
         .map_err(|e| e.to_string())
         .and_then(|json| crypto::encrypt(crate::secret_key::current(), &json))
         .map_err(|e| format!("cannot seal the login state: {e}"))?;
 
-    cookies.add(flow_cookie(&flow.state, sealed, config));
+    cookies.add(flow_cookie(&flow.state, sealed, &flow.session));
     Ok(authorization_url(&provider, config, &flow))
 }
 
@@ -412,20 +515,7 @@ struct CallbackParams {
 }
 
 /// `GET /api/auth/oidc/callback`: the provider sends the browser back here.
-async fn callback(
-    cookies: Cookies,
-    headers: HeaderMap,
-    uri: Uri,
-    Query(params): Query<CallbackParams>,
-) -> Response {
-    // Read before anything is written, as a password login does.
-    let session = match SessionCookie::for_request(&headers, &uri) {
-        Ok(session) => session,
-        Err(e) => {
-            tracing::error!("OIDC sign-in failed: {e}");
-            return to_login(SsoError::Failed);
-        }
-    };
+async fn callback(cookies: Cookies, Query(params): Query<CallbackParams>) -> Response {
     let Some(config) = CONFIG.oidc() else {
         return to_login(SsoError::Disabled);
     };
@@ -434,6 +524,7 @@ async fn callback(
         Err(error) => return to_login(error),
     };
     let identity = verified_identity(config, &flow, params).await;
+    let session = flow.session;
 
     let (user, to) = match flow.purpose {
         Purpose::SignIn { return_to } => {
@@ -497,7 +588,7 @@ fn take_flow(cookies: &Cookies, params: &CallbackParams) -> Result<Flow, SsoErro
         .ok_or_else(|| {
             tracing::warn!(
                 "OIDC sign-in failed: no valid login state (expired, or the login \
-                 started in another browser or on another URL than OIDC_REDIRECT_URL)"
+                 started in another browser or at another address than the callback's)"
             );
             SsoError::Failed
         })?;
@@ -534,7 +625,7 @@ async fn verified_identity(
     };
 
     let provider = provider(config, false).await.map_err(failed)?;
-    let id_token = exchange_code(&provider, config, &code, &flow.verifier)
+    let id_token = exchange_code(&provider, config, &code, flow)
         .await
         .map_err(failed)?;
     let claims = match verify_id_token(&provider, config, &id_token, &flow.nonce) {
@@ -655,17 +746,18 @@ struct TokenResponse {
     id_token: Option<String>,
 }
 
+/// The ID token for `code`, which the provider issued to `flow`.
 async fn exchange_code(
     provider: &Provider,
     config: &OidcConfig,
     code: &str,
-    verifier: &str,
+    flow: &Flow,
 ) -> Result<String, String> {
     let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
-        ("redirect_uri", config.redirect_url.as_str()),
-        ("code_verifier", verifier),
+        ("redirect_uri", flow.redirect_uri.as_str()),
+        ("code_verifier", flow.verifier.as_str()),
     ];
 
     let mut request = HTTP
@@ -1159,7 +1251,7 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
             issuer_url: ISSUER.to_string(),
             client_id: "soulbeet".to_string(),
             client_secret: None,
-            redirect_url: "https://soulbeet.example.com/api/auth/oidc/callback".to_string(),
+            redirect_pin: None,
             scopes: "openid profile".to_string(),
             username_claim: "preferred_username".to_string(),
             provider_name: "Test".to_string(),
@@ -1669,21 +1761,150 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         assert!(retry.answer(false).is_none());
     }
 
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    axum::http::HeaderValue::from_str(v).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// How a sign-in started by a request with these headers goes, with
+    /// `pin` as OIDC_REDIRECT_URL's address and `public_url` as PUBLIC_URL.
+    fn start_with(
+        pairs: &[(&str, &str)],
+        pin: Option<&str>,
+        public_url: Option<&str>,
+    ) -> Result<Start, String> {
+        let pin = pin.map(|p| BaseUrl::parse(p).unwrap());
+        let public_url = public_url.map(BaseUrl::parse);
+        Start::for_request(
+            pin.as_ref(),
+            public_url.as_ref(),
+            &headers(pairs),
+            &Uri::from_static(OIDC_LOGIN_PATH),
+        )
+    }
+
+    fn start(pairs: &[(&str, &str)]) -> Start {
+        start_with(pairs, None, None).unwrap()
+    }
+
     fn flow_for(purpose: Purpose) -> Flow {
-        Flow {
-            state: "s".into(),
-            nonce: "n".into(),
-            verifier: "v".into(),
-            expires_at: 0,
-            purpose,
-        }
+        new_flow(purpose, &start(&[("host", "soulbeet.example.com")]))
+    }
+
+    fn query_param(url: &url::Url, name: &str) -> Option<String> {
+        url.query_pairs()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value.into_owned())
     }
 
     fn prompt_of(purpose: Purpose) -> Option<String> {
-        authorization_url(&test_provider(), &test_config(), &flow_for(purpose))
-            .query_pairs()
-            .find(|(name, _)| name == "prompt")
-            .map(|(_, value)| value.into_owned())
+        let url = authorization_url(&test_provider(), &test_config(), &flow_for(purpose));
+        query_param(&url, "prompt")
+    }
+
+    #[test]
+    fn the_callback_is_at_the_address_the_sign_in_starts_at() {
+        // A LAN address, a name behind a proxy that says https, a bare name.
+        for (pairs, callback) in [
+            (&[("host", "192.168.1.5:9765")][..], "http://192.168.1.5:9765"),
+            (
+                &[
+                    ("host", "soulful:9765"),
+                    ("x-forwarded-host", "music.example.com"),
+                    ("x-forwarded-proto", "https"),
+                    ("origin", "https://music.example.com"),
+                ][..],
+                "https://music.example.com",
+            ),
+            (&[("host", "music.example.com")][..], "https://music.example.com"),
+        ] {
+            let start = start(pairs);
+            assert_eq!(
+                start.redirect_uri(),
+                format!("{callback}/api/auth/oidc/callback")
+            );
+            assert_eq!(start.session.secure(), callback.starts_with("https:"));
+        }
+    }
+
+    #[test]
+    fn a_plain_http_sign_in_at_a_name_comes_back_on_http_and_keeps_its_cookies() {
+        // http://nas:9765 typed in the browser, no proxy: the name alone
+        // derives https. The button's form post carries the browser's Origin,
+        // as a password login does.
+        let start = start(&[("host", "nas:9765"), ("origin", "http://nas:9765")]);
+        assert_eq!(start.redirect_uri(), "http://nas:9765/api/auth/oidc/callback");
+        let flow = new_flow(Purpose::SignIn { return_to: None }, &start);
+        // The flow cookie and the session cookie the callback sets from the
+        // flow are not Secure, so the browser on http keeps them.
+        assert_eq!(
+            flow_cookie("s", "v".into(), &flow.session).secure(),
+            Some(false)
+        );
+        assert!(!flow.session.secure());
+        // Over https, both are Secure.
+        let flow = new_flow(
+            Purpose::SignIn { return_to: None },
+            &start_with(
+                &[("host", "nas:9765"), ("origin", "https://nas:9765")],
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(flow.redirect_uri, "https://nas:9765/api/auth/oidc/callback");
+        assert_eq!(
+            flow_cookie("s", "v".into(), &flow.session).secure(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_pinned_address_is_the_callback() {
+        let lan = [("host", "192.168.1.5:9765")];
+        let callback = |pin, public_url| {
+            start_with(&lan, pin, public_url)
+                .unwrap()
+                .redirect_uri()
+        };
+        assert_eq!(
+            callback(None, Some("https://music.example.com")),
+            "https://music.example.com/api/auth/oidc/callback"
+        );
+        // OIDC_REDIRECT_URL wins over PUBLIC_URL.
+        assert_eq!(
+            callback(
+                Some("https://sso.example.com"),
+                Some("https://music.example.com")
+            ),
+            "https://sso.example.com/api/auth/oidc/callback"
+        );
+        // An unusable PUBLIC_URL stops a sign-in as it stops a password
+        // login, and so does a request whose address cannot be told.
+        assert!(start_with(&lan, None, Some("music.example.com")).is_err());
+        assert!(start_with(&[], None, None).is_err());
+    }
+
+    #[test]
+    fn the_provider_is_asked_to_send_the_browser_back_where_it_started() {
+        let flow = new_flow(
+            Purpose::SignIn { return_to: None },
+            &start(&[("host", "192.168.1.5:9765")]),
+        );
+        assert_eq!(
+            flow.redirect_uri,
+            "http://192.168.1.5:9765/api/auth/oidc/callback"
+        );
+        // The code exchange sends the same flow's value.
+        let url = authorization_url(&test_provider(), &test_config(), &flow);
+        assert_eq!(query_param(&url, "redirect_uri"), Some(flow.redirect_uri));
     }
 
     #[test]

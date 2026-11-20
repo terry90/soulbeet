@@ -116,9 +116,10 @@ pub struct OidcConfig {
     pub client_id: String,
     /// Unset for a public client, which relies on PKCE alone
     pub client_secret: Option<String>,
-    /// This instance's callback, `<public url>/api/auth/oidc/callback`;
-    /// derived from `PUBLIC_URL` when unset
-    pub redirect_url: String,
+    /// The address in `OIDC_REDIRECT_URL`, when set: every sign-in comes
+    /// back to its callback there. Unset, a sign-in comes back to the
+    /// address it started at (`PUBLIC_URL` when set).
+    pub redirect_pin: Option<BaseUrl>,
     /// Space separated, always with `openid`
     pub scopes: String,
     /// ID token claim used as the Soulbeet username
@@ -142,7 +143,7 @@ impl std::fmt::Debug for OidcConfig {
             .field("issuer_url", &self.issuer_url)
             .field("client_id", &self.client_id)
             .field("client_secret", &self.client_secret.as_ref().map(|_| "***"))
-            .field("redirect_url", &self.redirect_url)
+            .field("redirect_pin", &self.redirect_pin)
             .field("scopes", &self.scopes)
             .field("username_claim", &self.username_claim)
             .field("provider_name", &self.provider_name)
@@ -156,11 +157,9 @@ impl std::fmt::Debug for OidcConfig {
 impl OidcConfig {
     /// Read the `OIDC_*` variables through `get`. `Ok(None)` when
     /// `OIDC_ISSUER_URL` is unset, an error naming what is missing or wrong
-    /// otherwise. `public_url` (a usable `PUBLIC_URL`) gives the default
-    /// callback, `registration` the default of `OIDC_AUTO_REGISTER`.
+    /// otherwise. `registration` gives the default of `OIDC_AUTO_REGISTER`.
     fn from_lookup(
         get: impl Fn(&str) -> Option<String>,
-        public_url: Option<&BaseUrl>,
         registration: RegistrationMode,
     ) -> Result<Option<Self>, String> {
         let get = |key: &str| {
@@ -173,12 +172,6 @@ impl OidcConfig {
             return Ok(None);
         };
         let client_id = get("OIDC_CLIENT_ID").ok_or("OIDC_CLIENT_ID is not set")?;
-        let redirect_url = get("OIDC_REDIRECT_URL")
-            .or_else(|| public_url.map(|base| format!("{base}{}", crate::auth::OIDC_CALLBACK_PATH)))
-            .ok_or(
-                "Neither OIDC_REDIRECT_URL nor PUBLIC_URL is set \
-                 (e.g. OIDC_REDIRECT_URL=https://soulbeet.example.com/api/auth/oidc/callback)",
-            )?;
 
         let parse_http_url = |key: &str, value: &str| {
             let parsed =
@@ -189,16 +182,27 @@ impl OidcConfig {
             Ok(parsed)
         };
         parse_http_url("OIDC_ISSUER_URL", &issuer_url)?;
-        // The provider must send the browser back to the callback route, or
-        // the login cookie (scoped to that path) never reaches it.
-        let callback = parse_http_url("OIDC_REDIRECT_URL", &redirect_url)?;
-        if callback.path() != crate::auth::OIDC_CALLBACK_PATH {
-            return Err(format!(
-                "OIDC_REDIRECT_URL must end with {} (e.g. https://soulbeet.example.com{})",
-                crate::auth::OIDC_CALLBACK_PATH,
-                crate::auth::OIDC_CALLBACK_PATH
-            ));
-        }
+        let redirect_pin = get("OIDC_REDIRECT_URL")
+            .map(|url| {
+                // The provider must send the browser back to the callback
+                // route, or the login cookie (scoped to that path) never
+                // reaches it.
+                let mut callback = parse_http_url("OIDC_REDIRECT_URL", &url)?;
+                if callback.path() != crate::auth::OIDC_CALLBACK_PATH
+                    || callback.query().is_some()
+                    || callback.fragment().is_some()
+                {
+                    return Err(format!(
+                        "OIDC_REDIRECT_URL must end with {} (e.g. https://soulbeet.example.com{})",
+                        crate::auth::OIDC_CALLBACK_PATH,
+                        crate::auth::OIDC_CALLBACK_PATH
+                    ));
+                }
+                callback.set_path("/");
+                BaseUrl::parse(callback.as_str())
+                    .map_err(|e| format!("OIDC_REDIRECT_URL is not usable: {e}"))
+            })
+            .transpose()?;
 
         let mut scopes: Vec<String> = get("OIDC_SCOPES")
             .unwrap_or_else(|| "openid profile email".to_string())
@@ -227,7 +231,7 @@ impl OidcConfig {
             issuer_url,
             client_id,
             client_secret: get("OIDC_CLIENT_SECRET"),
-            redirect_url,
+            redirect_pin,
             scopes: scopes.join(" "),
             username_claim: get("OIDC_USERNAME_CLAIM")
                 .unwrap_or_else(|| "preferred_username".to_string()),
@@ -305,11 +309,7 @@ impl AppConfig {
             tracing::error!("{problem}");
         }
 
-        let oidc = OidcConfig::from_lookup(
-            |key| std::env::var(key).ok(),
-            public_url.as_ref().and_then(|url| url.as_ref().ok()),
-            registration,
-        )
+        let oidc = OidcConfig::from_lookup(|key| std::env::var(key).ok(), registration)
         .unwrap_or_else(|e| {
             tracing::error!("OIDC sign-in is disabled: {e}");
             None
@@ -523,33 +523,29 @@ mod oidc_tests {
 
     fn parse_with(
         vars: &[(&str, &str)],
-        public_url: Option<&str>,
         registration: RegistrationMode,
     ) -> Result<Option<OidcConfig>, String> {
         let vars: HashMap<String, String> = vars
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let public_url = public_url.map(|u| BaseUrl::parse(u).unwrap());
-        OidcConfig::from_lookup(
-            |key| vars.get(key).cloned(),
-            public_url.as_ref(),
-            registration,
-        )
+        OidcConfig::from_lookup(|key| vars.get(key).cloned(), registration)
     }
 
     fn parse(vars: &[(&str, &str)]) -> Result<Option<OidcConfig>, String> {
-        parse_with(vars, None, RegistrationMode::Navidrome)
+        parse_with(vars, RegistrationMode::Navidrome)
     }
 
-    const REQUIRED: [(&str, &str); 3] = [
+    const REQUIRED: [(&str, &str); 2] = [
         ("OIDC_ISSUER_URL", "https://id.example.com"),
         ("OIDC_CLIENT_ID", "soulbeet"),
-        (
-            "OIDC_REDIRECT_URL",
-            "https://soulbeet.example.com/api/auth/oidc/callback",
-        ),
     ];
+
+    fn with_redirect(url: &str) -> Vec<(&str, &str)> {
+        let mut vars = REQUIRED.to_vec();
+        vars.push(("OIDC_REDIRECT_URL", url));
+        vars
+    }
 
     #[test]
     fn disabled_without_issuer() {
@@ -561,6 +557,8 @@ mod oidc_tests {
     fn defaults() {
         let config = parse(&REQUIRED).unwrap().unwrap();
         assert_eq!(config.client_secret, None);
+        // No address is needed: the callback is where the sign-in starts.
+        assert_eq!(config.redirect_pin, None);
         assert_eq!(config.scopes, "openid profile email");
         assert_eq!(config.username_claim, "preferred_username");
         assert_eq!(config.provider_name, "SSO");
@@ -569,35 +567,22 @@ mod oidc_tests {
     }
 
     #[test]
-    fn missing_client_id_or_callback_is_an_error() {
+    fn missing_client_id_is_an_error() {
         let err = parse(&REQUIRED[..1]).unwrap_err();
         assert!(err.contains("OIDC_CLIENT_ID"), "{err}");
-        let err = parse(&REQUIRED[..2]).unwrap_err();
-        assert!(err.contains("OIDC_REDIRECT_URL"), "{err}");
     }
 
     #[test]
-    fn the_callback_defaults_to_the_public_url() {
-        let config = parse_with(
-            &REQUIRED[..2],
-            Some("https://music.example.com"),
-            RegistrationMode::Navidrome,
-        )
+    fn a_redirect_url_pins_the_callback_address() {
+        let config = parse(&with_redirect(
+            "https://soulbeet.example.com:8443/api/auth/oidc/callback",
+        ))
         .unwrap()
         .unwrap();
         assert_eq!(
-            config.redirect_url,
-            "https://music.example.com/api/auth/oidc/callback"
+            config.redirect_pin,
+            Some(BaseUrl::parse("https://soulbeet.example.com:8443").unwrap())
         );
-        // An explicit callback wins.
-        let config = parse_with(
-            &REQUIRED,
-            Some("https://music.example.com"),
-            RegistrationMode::Navidrome,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(config.redirect_url, REQUIRED[2].1);
     }
 
     #[test]
@@ -607,17 +592,27 @@ mod oidc_tests {
         assert!(parse(&vars).unwrap_err().contains("OIDC_ISSUER_URL"));
         vars[0].1 = "ftp://id.example.com";
         assert!(parse(&vars).unwrap_err().contains("OIDC_ISSUER_URL"));
+        let err = parse(&with_redirect("soulbeet.example.com/api/auth/oidc/callback"))
+            .unwrap_err();
+        assert!(err.contains("OIDC_REDIRECT_URL"), "{err}");
     }
 
     #[test]
     fn redirect_url_must_be_the_callback_route() {
-        let mut vars = REQUIRED.to_vec();
-        vars[2].1 = "https://soulbeet.example.com/oidc/callback";
-        assert!(parse(&vars)
-            .unwrap_err()
-            .contains("/api/auth/oidc/callback"));
-        vars[2].1 = "https://soulbeet.example.com";
-        assert!(parse(&vars).is_err());
+        for url in [
+            "https://soulbeet.example.com/oidc/callback",
+            "https://soulbeet.example.com",
+        ] {
+            let err = parse(&with_redirect(url)).unwrap_err();
+            assert!(err.contains("/api/auth/oidc/callback"), "{url}: {err}");
+        }
+        for url in [
+            "https://soulbeet.example.com/api/auth/oidc/callback?x=1",
+            "https://user@soulbeet.example.com/api/auth/oidc/callback",
+        ] {
+            let err = parse(&with_redirect(url)).unwrap_err();
+            assert!(err.contains("OIDC_REDIRECT_URL"), "{url}: {err}");
+        }
     }
 
     #[test]
@@ -631,7 +626,7 @@ mod oidc_tests {
     #[test]
     fn auto_register_follows_registration_unless_set() {
         let auto = |vars: &[(&str, &str)], mode| {
-            parse_with(vars, None, mode).unwrap().unwrap().auto_register
+            parse_with(vars, mode).unwrap().unwrap().auto_register
         };
         // Only open registration lets anyone the provider accepts in. In
         // navidrome mode only Navidrome users get accounts.
@@ -686,7 +681,7 @@ mod oidc_tests {
             (RegistrationMode::Navidrome, false),
             (RegistrationMode::Admin, false),
         ] {
-            let config = parse_with(&vars, None, mode).unwrap().unwrap();
+            let config = parse_with(&vars, mode).unwrap().unwrap();
             assert_eq!(config.auto_register, auto_register, "{mode:?}");
             assert!(!config.link_by_username, "{mode:?}");
         }

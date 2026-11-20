@@ -141,8 +141,10 @@ pub fn Login(props: Props) -> Element {
             }
             // A native form, not a link: the router would handle a link
             // inside the app, and this must be a full page load so the
-            // server can redirect to the provider.
-            form { method: "get", action: api::auth::OIDC_LOGIN_PATH,
+            // server can redirect to the provider. A post, so the browser
+            // sends its Origin: on plain http at a name, the server then
+            // knows to come back on http, as a password login does.
+            form { method: "post", action: api::auth::OIDC_LOGIN_PATH,
               if let Some(back) = props.return_to {
                 input { "type": "hidden", name: "return_to", value: "{back}" }
               }

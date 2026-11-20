@@ -110,7 +110,6 @@ up() {
     OIDC_ISSUER_URL="http://127.0.0.1:5070" \
     OIDC_CLIENT_ID="soulbeet-e2e" \
     OIDC_CLIENT_SECRET="e2e-oidc-secret" \
-    OIDC_REDIRECT_URL="http://127.0.0.1:9765/api/auth/oidc/callback" \
     OIDC_PROVIDER_NAME="Stub ID" \
     PORT=9765 IP=127.0.0.1 \
     setsid ./server >"$LOG_DIR/soulbeet.log" 2>&1 </dev/null &

@@ -67,6 +67,14 @@ impl BaseUrl {
         self.scheme == Scheme::Https
     }
 
+    /// The same host and port over plain http.
+    pub fn on_http(&self) -> BaseUrl {
+        BaseUrl {
+            scheme: Scheme::Http,
+            ..self.clone()
+        }
+    }
+
     /// The host is `localhost`, an IPv4 address in 127.0.0.0/8 or `::1`.
     pub fn is_loopback(&self) -> bool {
         is_loopback_host(&match &self.host {

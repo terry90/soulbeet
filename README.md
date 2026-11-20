@@ -185,7 +185,7 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `OIDC_ISSUER_URL` | Issuer of your OpenID Connect provider. Setting it turns on single sign-on (see below) | |
 | `OIDC_CLIENT_ID` | Client ID registered at the provider | |
 | `OIDC_CLIENT_SECRET` | Client secret. Leave unset for a public client (PKCE only) | |
-| `OIDC_REDIRECT_URL` | This instance's callback, `https://<your soulbeet>/api/auth/oidc/callback` | `PUBLIC_URL` + `/api/auth/oidc/callback` |
+| `OIDC_REDIRECT_URL` | Optional. One callback for every sign-in, `https://<your soulbeet>/api/auth/oidc/callback`. Without it, the provider sends users back to the address they started at (`PUBLIC_URL` when set) | |
 | `OIDC_PROVIDER_NAME` | Name on the login button ("Sign in with ...") | `SSO` |
 | `OIDC_SCOPES` | Scopes to request (`openid` is always added) | `openid profile email` |
 | `OIDC_USERNAME_CLAIM` | ID token claim used as the Soulbeet username | `preferred_username` |
@@ -205,17 +205,15 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 
 Soulbeet can sign users in through an OpenID Connect provider such as [Pocket ID](https://pocket-id.org), Authelia, Authentik or Keycloak. The login page then shows a **Sign in with ...** button next to the password form, which keeps working.
 
-1.  At your provider, create a client with the callback URL `https://<your soulbeet>/api/auth/oidc/callback`. Soulbeet always sends PKCE, so the client can be public (no secret) if the provider allows it.
+1.  At your provider, create a client. Soulbeet sends the provider back to `/api/auth/oidc/callback` at the address the user started from, so register that path for each address people sign in from as a redirect URI, for example `https://soulbeet.example.com/api/auth/oidc/callback` and `http://192.168.1.10:9765/api/auth/oidc/callback`. With `PUBLIC_URL` set, only that address is used. Soulbeet always sends PKCE, so the client can be public (no secret) if the provider allows it.
 2.  Set the variables, for example:
     ```yaml
     environment:
-      - PUBLIC_URL=https://soulbeet.example.com
       - OIDC_ISSUER_URL=https://id.example.com
       - OIDC_CLIENT_ID=<client id>
       - OIDC_CLIENT_SECRET=<client secret>
       - OIDC_PROVIDER_NAME=Pocket ID
     ```
-    Without `PUBLIC_URL`, set `OIDC_REDIRECT_URL` to the callback URL.
 3.  Restart. A configuration error is logged at startup and leaves single sign-on off.
 
 How accounts are matched:
