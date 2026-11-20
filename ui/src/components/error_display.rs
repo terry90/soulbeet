@@ -24,7 +24,7 @@ pub fn friendly_error(error: &ServerFnError) -> String {
             }
         }
         ServerFnError::ServerError {
-            code: api::REFUSAL_CODE | api::FORBIDDEN_CODE,
+            code: api::REFUSAL_CODE | api::FORBIDDEN_CODE | api::RATE_LIMITED_CODE,
             message,
             ..
         } => message.clone(),
@@ -89,6 +89,17 @@ mod tests {
         assert_eq!(
             friendly_error(&server_error(403, "Only an admin can do this")),
             "Only an admin can do this"
+        );
+    }
+
+    #[test]
+    fn rate_limits_show_their_message() {
+        assert_eq!(
+            friendly_error(&server_error(
+                api::RATE_LIMITED_CODE,
+                "Too many failed sign-ins on this server. Try again in 5 seconds."
+            )),
+            "Too many failed sign-ins on this server. Try again in 5 seconds."
         );
     }
 
