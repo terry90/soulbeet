@@ -756,9 +756,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_admin_takes_a_wrongly_linked_account_back_from_the_identity() {
-        // Mallory's identity ended up on the admin account (an admin turned
-        // OIDC_LINK_BY_USERNAME on and Mallory chose the name). A new password
-        // does not keep her out; removing the link does.
+        // Mallory's identity ended up on the admin account: an admin turned
+        // OIDC_LINK_BY_USERNAME on and Mallory chose the name at the
+        // provider. Removing the link ends her session, but keeps her out
+        // only once the setting is off or her name there is changed.
         let db = test_db::migrated().await;
         let NameMatch::One(admin) = User::find_by_name_in(&db, "admin").await.unwrap() else {
             panic!("the seeded admin");
@@ -769,26 +770,43 @@ mod tests {
         assert_eq!(taken.id, admin.id);
         let her_session = session_of(&taken);
 
-        let actor = crate::auth::UserCtx {
-            user_id: admin.id.clone(),
-            username: admin.username.clone(),
-            role: admin.role,
-        };
-        crate::server_fns::sso::unlink_sso_in(&db, &actor, &admin.id, false)
-            .await
-            .unwrap();
-
-        // Her session ended, and her identity no longer opens the account.
+        admin_unlinks(&db, &admin).await;
         let key = session_key();
         assert!(load_session(Some(&her_session), &db, &key).await.is_err());
-        for name in ["admin", "mallory"] {
-            let refused = sign_in(&db, "sub-mallory", name).await;
-            assert!(
-                refused.as_ref().map_or(true, |u| u.id != admin.id),
-                "{name}: {refused:?}"
-            );
-        }
+
+        // The setting still on, her next sign-in under that name takes the
+        // account again.
+        let again = sign_in_linking_by_name(&db, "sub-mallory", "admin")
+            .await
+            .unwrap();
+        assert_eq!(again.id, admin.id);
+        admin_unlinks(&db, &admin).await;
+
+        // Renamed at the provider, she gets an account of her own.
+        let hers = sign_in_linking_by_name(&db, "sub-mallory", "mallory")
+            .await
+            .unwrap();
+        assert_ne!(hers.id, admin.id);
         assert_eq!(reread(&db, &admin).await.oidc_subject, None);
+
+        // With the setting off, the name proves nothing.
+        let db = test_db::migrated().await;
+        let taken = sign_in_linking_by_name(&db, "sub-mallory", "admin")
+            .await
+            .unwrap();
+        admin_unlinks(&db, &taken).await;
+        assert_eq!(
+            sign_in(&db, "sub-mallory", "admin").await.unwrap_err(),
+            SsoError::AccountExists
+        );
+        assert_eq!(reread(&db, &taken).await.oidc_subject, None);
+    }
+
+    /// The admin `admin` removes their own account's link.
+    async fn admin_unlinks(db: &SqlitePool, admin: &User) {
+        crate::server_fns::sso::unlink_sso_in(db, &ctx_of(admin), &admin.id, false)
+            .await
+            .unwrap();
     }
 
     fn ctx_of(user: &User) -> crate::auth::UserCtx {
