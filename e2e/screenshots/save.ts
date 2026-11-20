@@ -22,6 +22,9 @@ function required(name: string): string {
 
 /** Signs in as SHOTS_USER and shows the album results for SHOTS_QUERY. */
 export async function searchAsUser(page: Page): Promise<void> {
+  // Release notes the account has not read would open over the pictures.
+  // Answered here, so nothing is marked as read on the instance.
+  await page.route('**/api/changelog/seen', (route) => route.fulfill({ json: { major: 9999, minor: 0, patch: 0 } }));
   await loginViaUi(page, { username: required('SHOTS_USER'), password: required('SHOTS_PASSWORD') });
   await performSearch(page, required('SHOTS_QUERY'), 'ALBUM');
 }
