@@ -41,7 +41,7 @@ test('a page opened by its address stays open for a signed-in user', async ({ pa
   await loginViaApi(page.context(), user);
 
   await page.goto('/settings');
-  await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
   await expect(page).toHaveURL(/\/settings$/);
 });
 
