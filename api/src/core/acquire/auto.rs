@@ -3,7 +3,7 @@
 
 use crate::auth::UserCtx;
 use crate::config::CONFIG;
-use crate::core::metadata::{hydrate_album_tracks, lastfm_key};
+use crate::core::metadata::hydrate_album_tracks;
 use crate::core::sources::{self, Searched};
 use crate::core::{backend_unavailable, database_failure};
 use crate::globals::get_or_create_user_channel;
@@ -100,7 +100,6 @@ pub async fn auto_download(
     if let Some(failure) = crate::importer_health::blocking_failure().await {
         return Err(failure);
     }
-    let key = lastfm_key(ctx).await?;
 
     // Search every configured backend (per D-06).
     let backends = match sources::usable_backends().await {
@@ -160,7 +159,6 @@ pub async fn auto_download(
             ctx,
             folder,
             query,
-            key,
             backends,
             run,
         ));
@@ -180,7 +178,6 @@ pub(crate) async fn run_search(
     ctx: UserCtx,
     folder: Folder,
     mut query: DownloadQuery,
-    lastfm_key: Option<String>,
     backends: (Searched, Vec<Searched>),
     mut run: AutoRun,
 ) {
@@ -211,7 +208,7 @@ pub(crate) async fn run_search(
                 query: query_desc.clone(),
                 backend_count: 1 + rest.len(),
             });
-            if let Err(failure) = hydrate_album_tracks(&mut query, lastfm_key.as_deref()).await {
+            if let Err(failure) = hydrate_album_tracks(&mut query).await {
                 info!(
                     "Auto-download: no tracklist for '{}': {}",
                     query_desc, failure.message
@@ -343,19 +340,20 @@ pub(crate) async fn run_search(
     }
 }
 
-/// Reports `failure` as the pipeline's and ends its job Failed.
+/// Reports `failure` as the pipeline's and ends its job Failed with it, so get_jobs shows it
+/// when no tab knows the batch, as after a restart.
 pub(crate) async fn fail_job(ledger: &Ledger, ctx: &UserCtx, run: &AutoRun, failure: Failure) {
+    ledger.record(JobEvent::Ended {
+        job: run.job.clone(),
+        state: JobState::Failed,
+        failure: Some(failure.clone()),
+    });
     let _ = get_or_create_user_channel(&ctx.id())
         .await
         .send(DownloadEvent::AutoDownload(AutoDownloadEvent::Failed {
             batch_id: run.batch_id.clone(),
             failure,
         }));
-    ledger.record(JobEvent::Ended {
-        job: run.job.clone(),
-        state: JobState::Failed,
-        failure: None,
-    });
 }
 
 #[cfg(test)]
@@ -490,7 +488,6 @@ mod tests {
             ctx,
             folder,
             DownloadQuery::new(vec![]),
-            None,
             (("a".into(), a), vec![]),
             run,
         )
@@ -544,7 +541,6 @@ mod tests {
             ctx,
             folder,
             DownloadQuery::new(vec![]),
-            None,
             (("a".into(), a), vec![]),
             run,
         )
@@ -571,5 +567,94 @@ mod tests {
             _ => None,
         });
         assert_eq!(offered, Some(stored));
+    }
+
+    #[tokio::test]
+    async fn a_resumed_auto_download_of_a_lastfm_album_fails_with_a_message_to_search_again() {
+        let db = crate::db::test_db::migrated().await;
+        let folder_id = crate::core::folder_of(&db, "auto-lastfm").await;
+        let folder = Folder::get_by_id_in(&db, &folder_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ledger = Ledger::start(db.clone());
+        let ctx = test_ctx("auto-lastfm");
+        ledger
+            .create(
+                NewJob {
+                    id: "j1".into(),
+                    user: ctx.id(),
+                    folder_id,
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Searching,
+                    search_id: None,
+                    picked: vec![],
+                    kind: JobKind::Album,
+                    options: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let mut rx = crate::globals::get_or_create_user_channel(&ctx.id())
+            .await
+            .subscribe();
+        // A search of this backend would fail: starting one is refused.
+        let stub = StubBackend::new(vec![]);
+        stub.fail_search_start(SoulseekError::InvalidResponse("refused".into()));
+        let a: Arc<dyn DownloadBackend> = stub;
+        let run = AutoRun {
+            batch_id: "b1".into(),
+            job: "j1".into(),
+            search_id: "s1".into(),
+            import_mode: ImportMode::Singleton,
+            found: None,
+        };
+        let album = shared::metadata::Album {
+            id: "lastfm:album:marrow choir:winter songs".into(),
+            title: "Winter Songs".into(),
+            artist: "Marrow Choir".into(),
+            release_date: None,
+            mbid: None,
+            cover_url: None,
+            release_types: None,
+        };
+
+        run_search(
+            ledger.clone(),
+            ctx,
+            folder,
+            DownloadQuery::new(vec![]).album(album),
+            (("a".into(), a), vec![]),
+            run,
+        )
+        .await;
+        ledger.settled().await;
+
+        // No tab knows a resumed job's batch, so get_jobs is where the message is read.
+        let (state, stored): (String, String) =
+            sqlx::query_as("SELECT state, failure FROM jobs WHERE id = 'j1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let stored: Failure = serde_json::from_str(&stored).unwrap();
+        assert_eq!(state, JobState::Failed.as_str());
+        let failed = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|e| match e {
+                DownloadEvent::AutoDownload(AutoDownloadEvent::Failed { failure, .. }) => {
+                    Some(failure)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (failed.code, failed.message.as_str()),
+            (
+                FailureCode::MetadataNotFound,
+                "'Winter Songs' came from a Last.fm search, which Soulbeet no longer uses: search for it again"
+            )
+        );
+        assert_eq!(stored, failed);
     }
 }

@@ -1,0 +1,32 @@
+[
+  {
+    "artist_mbids": [
+      "a74b1b7f-71a5-4011-9441-d0b5e4122711"
+    ],
+    "artist_name": "Radiohead",
+    "recording_mbid": "9e2ad5bc-c6f9-40d2-a36f-3122ee2072a3",
+    "recording_name": "Karma Police",
+    "total_listen_count": 3890683,
+    "total_user_count": 283512
+  },
+  {
+    "artist_mbids": [
+      "a74b1b7f-71a5-4011-9441-d0b5e4122711"
+    ],
+    "artist_name": "Radiohead",
+    "recording_mbid": "9f9cf187-d6f9-437f-9d98-d59cdbd52757",
+    "recording_name": "Paranoid Android",
+    "total_listen_count": 3092016,
+    "total_user_count": 260301
+  },
+  {
+    "artist_mbids": [
+      "a74b1b7f-71a5-4011-9441-d0b5e4122711"
+    ],
+    "artist_name": "Radiohead",
+    "recording_mbid": "980a426e-623e-4ea5-98c7-008d037a0508",
+    "recording_name": "No Surprises",
+    "total_listen_count": 3001215,
+    "total_user_count": 248803
+  }
+]

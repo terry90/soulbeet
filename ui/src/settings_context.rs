@@ -1,5 +1,5 @@
 use crate::use_auth;
-use api::{ProviderInfo, UpdateUserSettings, UserSettings};
+use api::{UpdateUserSettings, UserSettings};
 use dioxus::prelude::*;
 
 #[derive(PartialEq, Clone, Copy, Debug, Default)]
@@ -31,21 +31,12 @@ impl From<&str> for SearchType {
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     state: Signal<Option<UserSettings>>,
-    providers: Signal<Vec<ProviderInfo>>,
     loaded: Signal<bool>,
 }
 
 impl Settings {
-    pub fn new(
-        state: Signal<Option<UserSettings>>,
-        providers: Signal<Vec<ProviderInfo>>,
-        loaded: Signal<bool>,
-    ) -> Self {
-        Self {
-            state,
-            providers,
-            loaded,
-        }
+    pub fn new(state: Signal<Option<UserSettings>>, loaded: Signal<bool>) -> Self {
+        Self { state, loaded }
     }
 
     /// Get the current user settings, if loaded.
@@ -63,15 +54,6 @@ impl Settings {
         !self.is_loaded()
     }
 
-    /// Get the default metadata provider ID.
-    pub fn default_provider(&self) -> String {
-        self.state
-            .read()
-            .as_ref()
-            .and_then(|s| s.default_metadata_provider.clone())
-            .unwrap_or_else(|| "musicbrainz".to_string())
-    }
-
     /// Get the last used search type.
     pub fn last_search_type(&self) -> SearchType {
         self.state
@@ -80,11 +62,6 @@ impl Settings {
             .and_then(|s| s.last_search_type.as_deref())
             .map(SearchType::from)
             .unwrap_or_default()
-    }
-
-    /// Get the list of available metadata providers.
-    pub fn providers(&self) -> Vec<ProviderInfo> {
-        self.providers.read().clone()
     }
 
     /// Update settings (call after successful API update).
@@ -114,13 +91,6 @@ impl Settings {
         self.update(update).await?;
         Ok(())
     }
-
-    /// Refresh the providers list from the server.
-    pub async fn refresh_providers(&mut self) -> Result<(), ServerFnError> {
-        let providers = api::get_metadata_providers().await?;
-        self.providers.set(providers);
-        Ok(())
-    }
 }
 
 /// Hook to access the settings context.
@@ -135,31 +105,24 @@ pub fn SettingsProvider(children: Element) -> Element {
     let auth = use_auth();
 
     let settings_resource = use_resource(move || async move {
-        let logged_in = auth.is_logged_in();
-        if !logged_in {
-            return Ok::<_, ServerFnError>((None, vec![]));
+        if !auth.is_logged_in() {
+            return None;
         }
-        let (settings_result, providers_result) =
-            futures::join!(api::get_user_settings(), api::get_metadata_providers());
-        Ok((settings_result.ok(), providers_result.unwrap_or_default()))
+        api::get_user_settings().await.ok()
     });
 
     let mut settings_state = use_signal(|| None::<UserSettings>);
-    let mut providers_state = use_signal(Vec::<ProviderInfo>::new);
     let mut loaded_signal = use_signal(|| false);
 
     use_effect(move || {
-        let (s, p, l) = match &*settings_resource.read() {
-            Some(Ok((s, p))) => (s.clone(), p.clone(), true),
-            Some(Err(_)) => (None, vec![], true),
-            None => return,
+        let Some(s) = &*settings_resource.read() else {
+            return;
         };
-        settings_state.set(s);
-        providers_state.set(p);
-        loaded_signal.set(l);
+        settings_state.set(s.clone());
+        loaded_signal.set(true);
     });
 
-    use_context_provider(|| Settings::new(settings_state, providers_state, loaded_signal));
+    use_context_provider(|| Settings::new(settings_state, loaded_signal));
 
     rsx! { {children} }
 }

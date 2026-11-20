@@ -9,6 +9,7 @@
 
 import type { IncomingMessage, Server } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { genres } from '../../fixtures/discovery.js';
 import {
   findRecording,
   findRelease,
@@ -16,7 +17,7 @@ import {
   type FixtureRelease,
   type FixtureTrack,
 } from '../../fixtures/dataset.js';
-import { createStubServer, sendJson, type RouteContext } from './router.js';
+import { createStubServer, sendJson, sendText, type RouteContext } from './router.js';
 
 // ---- control ------------------------------------------------------------------
 
@@ -396,6 +397,14 @@ export function createMusicBrainzServer(control: MbControl): Server {
               'life-span': { ended: null },
             })),
           });
+        }),
+      },
+      {
+        method: 'GET',
+        pattern: '/ws/2/genre/all',
+        handler: served(control, ({ res }) => {
+          // The genre list as text/plain, one name per line (?fmt=txt).
+          sendText(res, 200, `${genres.join('\n')}\n`);
         }),
       },
       {

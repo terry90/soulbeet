@@ -4,7 +4,8 @@ use rand::seq::SliceRandom;
 use tracing::info;
 
 use shared::recommendation::{
-    Candidate, CandidateSet, CandidateSnapshot, DiversifierSummary, ProfileConfig, UserMusicProfile,
+    normalize_for_matching, Candidate, CandidateSet, CandidateSnapshot, DiversifierSummary,
+    ProfileConfig, UserMusicProfile,
 };
 
 /// Select a diverse final track list from the scored candidate pool.
@@ -33,20 +34,7 @@ pub fn diversify(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Popularity penalty: penalize candidates from popular artists,
-    // scaled by the configured penalty strength
-    let mut popularity_penalized = 0usize;
-    for candidate in &mut pool {
-        if let Some(listeners) = candidate.artist_listener_count {
-            // Use 1M listeners as a rough "very popular" threshold
-            let popularity = (listeners as f64 / 1_000_000.0).clamp(0.0, 1.0);
-            if popularity > 0.5 {
-                let penalty = (popularity - 0.5) * 2.0 * config.popularity_penalty_strength;
-                candidate.score *= (1.0 - penalty).max(0.1);
-                popularity_penalized += 1;
-            }
-        }
-    }
+    let popularity_penalized = penalise_popular(&mut pool, config.popularity_penalty_strength);
 
     // Re-sort after popularity penalty
     pool.sort_by(|a, b| {
@@ -83,12 +71,10 @@ pub fn diversify(
     let mut regular_pool: Vec<Candidate> = Vec::new();
 
     for c in pool {
-        let is_exploration = c.signals.iter().any(|s| {
-            s.contains("tag_explore")
-                || s.contains("genre_explore")
-                || s.contains("hop2")
-                || s.contains("momentum")
-        });
+        let is_exploration = c
+            .signals
+            .iter()
+            .any(|s| s.contains("tag_explore") || s.contains("hop2") || s.contains("momentum"));
         if is_exploration {
             exploration_pool.push(c);
         } else {
@@ -119,10 +105,10 @@ pub fn diversify(
             break;
         }
 
-        let artist_key = candidate.artist.to_lowercase();
+        let act = artist_key(candidate);
 
         // Artist cap
-        let count = artist_counts.get(&artist_key).copied().unwrap_or(0);
+        let count = artist_counts.get(&act).copied().unwrap_or(0);
         if count >= config.max_per_artist {
             artist_cap_skipped += 1;
             continue;
@@ -143,7 +129,7 @@ pub fn diversify(
         }
 
         // Accept
-        *artist_counts.entry(artist_key).or_default() += 1;
+        *artist_counts.entry(act).or_default() += 1;
         update_genre_counts(&mut genre_counts, candidate, profile);
         if *is_exploration {
             exploration_count += 1;
@@ -167,12 +153,12 @@ pub fn diversify(
             {
                 continue;
             }
-            let artist_key = c.artist.to_lowercase();
-            let count = artist_counts.get(&artist_key).copied().unwrap_or(0);
+            let act = artist_key(c);
+            let count = artist_counts.get(&act).copied().unwrap_or(0);
             if count >= config.max_per_artist {
                 continue;
             }
-            *artist_counts.entry(artist_key).or_default() += 1;
+            *artist_counts.entry(act).or_default() += 1;
             selected.push(c.clone());
             backfill_count += 1;
         }
@@ -221,6 +207,34 @@ pub fn diversify(
     };
 
     (selected, summary)
+}
+
+/// The act a candidate counts under for the artist cap: its MBID, so one act
+/// under several credits ("X feat. Y") counts once, else its matched name.
+/// The prefixes keep an MBID from ever equalling a name.
+fn artist_key(c: &Candidate) -> String {
+    match &c.artist_mbid {
+        Some(mbid) => format!("mbid:{}", mbid.to_lowercase()),
+        None => format!("name:{}", normalize_for_matching(&c.artist)),
+    }
+}
+
+/// Penalises the most listened tenth of the candidates with a listener count,
+/// the most listened the most: rank r of the top n keeps
+/// `1 - strength * (1 - r / n)` of its score, never less than a tenth. Ranking
+/// instead of a fixed listener count works whatever scale the counts come in.
+/// Returns how many were penalised.
+fn penalise_popular(pool: &mut [Candidate], strength: f64) -> usize {
+    let mut counted: Vec<usize> = (0..pool.len())
+        .filter(|&i| pool[i].artist_listener_count.is_some())
+        .collect();
+    counted.sort_by_key(|&i| std::cmp::Reverse(pool[i].artist_listener_count));
+    let top_n = counted.len() / 10;
+    for (rank, &i) in counted.iter().take(top_n).enumerate() {
+        let kept = 1.0 - strength * (1.0 - rank as f64 / top_n as f64);
+        pool[i].score *= kept.max(0.1);
+    }
+    top_n
 }
 
 /// Build target genre proportions from the profile, adjusted by exploration budget.
@@ -285,5 +299,76 @@ fn update_genre_counts(
 ) {
     if let Some(ref genre) = candidate.primary_genre {
         *counts.entry(genre.to_lowercase()).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::test_support::candidate;
+    use shared::recommendation::DiscoveryProfile;
+
+    fn counted(n: u64) -> Vec<Candidate> {
+        (1..=n)
+            .rev()
+            .map(|count| {
+                let mut c = candidate("catalog", &format!("artist {count}"), "t", 1.0);
+                c.artist_listener_count = Some(count);
+                c
+            })
+            .collect()
+    }
+
+    fn score_of(pool: &[Candidate], count: u64) -> f64 {
+        pool.iter()
+            .find(|c| c.artist_listener_count == Some(count))
+            .unwrap()
+            .score
+    }
+
+    #[test]
+    fn the_most_listened_tenth_is_penalised_by_rank() {
+        let mut pool = counted(20);
+        assert_eq!(penalise_popular(&mut pool, 0.6), 2);
+        assert!((score_of(&pool, 20) - 0.4).abs() < 1e-9);
+        assert!((score_of(&pool, 19) - 0.7).abs() < 1e-9);
+        assert!((1..=18).all(|n| score_of(&pool, n) == 1.0));
+
+        let mut few = counted(9);
+        assert_eq!(penalise_popular(&mut few, 0.6), 0);
+        assert!(few.iter().all(|c| c.score == 1.0));
+    }
+
+    #[test]
+    fn the_artist_cap_counts_one_act_under_its_credits_as_one_artist() {
+        let config = ProfileConfig::from_profile(DiscoveryProfile::Adventurous);
+        assert_eq!(config.max_per_artist, 1);
+        let mut solo = candidate("catalog", "Daft Punk", "One More Time", 1.0);
+        solo.artist_mbid = Some("056E4F3E-D505-4DAD-8EC1-D04F521CBB56".into());
+        let mut credited = candidate(
+            "catalog",
+            "Daft Punk feat. Pharrell Williams",
+            "Get Lucky",
+            0.9,
+        );
+        credited.artist_mbid = Some("056e4f3e-d505-4dad-8ec1-d04f521cbb56".into());
+        let named = candidate("deezer_radio", "AC/DC", "Thunderstruck", 0.8);
+        let respelled = candidate("deezer_radio", "ACDC", "Back in Black", 0.7);
+        let mut set = CandidateSet::new();
+        for c in [solo, credited, named, respelled] {
+            set.insert(c);
+        }
+        let (got, summary) = diversify(set, &UserMusicProfile::default(), &config, 10);
+        let mut tracks: Vec<_> = got.iter().map(|c| c.track.as_str()).collect();
+        tracks.sort();
+        assert_eq!(tracks, ["One More Time", "Thunderstruck"]);
+        assert_eq!((summary.artist_cap_skipped, summary.unique_artists), (2, 2));
+    }
+
+    #[test]
+    fn a_penalty_never_takes_a_score_below_a_tenth() {
+        let mut pool = counted(10);
+        penalise_popular(&mut pool, 1.0);
+        assert!((score_of(&pool, 10) - 0.1).abs() < 1e-9);
     }
 }

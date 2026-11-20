@@ -6,25 +6,27 @@ use shared::{
         SkipKind, SourcePresence,
     },
     failure::{Failure, UserAction},
-    metadata::{AlbumWithTracks, Provider, SearchResult as MetadataSearchResult},
+    metadata::{AlbumWithTracks, SearchResult as MetadataSearchResult},
     recommendation::{
-        ArtistPopularity, CandidateSet, Listen, ProfileConfig, RankedArtist, RankedTrack,
-        SignalReport, SimilarArtist, SimilarTrack, TimePeriod, UserMusicProfile, WeightedTag,
+        CandidateSet, KnownMusic, Listen, Neighbour, PlayedArtist, PlayedTrack, ProfileConfig,
+        RecordingFacts, SignalReport, SourceErrors, TimePeriod, TrackRef, UserMusicProfile,
+        WeightedTag,
     },
     system::ImporterHealth,
 };
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::Result;
+use crate::history::HistoryError;
+use crate::knowledge::{CacheError, KnowledgeError};
+use crate::musicbrainz::ArtistMatch;
 use crate::MetadataError;
 
 #[async_trait]
 pub trait MetadataProvider: Send + Sync {
-    fn id(&self) -> Provider;
-    fn name(&self) -> &'static str;
-
     async fn search_albums(
         &self,
         artist: Option<&str>,
@@ -325,7 +327,8 @@ fn minutes(d: Duration) -> String {
 /// How much of beets' last line a timeout message quotes.
 const LAST_LINE_CHARS: usize = 200;
 
-fn clip(s: &str, chars: usize) -> &str {
+/// The first `chars` characters of `s`.
+pub(crate) fn clip(s: &str, chars: usize) -> &str {
     s.char_indices().nth(chars).map_or(s, |(i, _)| &s[..i])
 }
 
@@ -421,9 +424,6 @@ pub enum ForgetOutcome {
 
 #[async_trait]
 pub trait MusicImporter: Send + Sync {
-    fn id(&self) -> &'static str;
-    fn name(&self) -> &'static str;
-
     async fn import(
         &self,
         sources: &[&Path],
@@ -457,43 +457,106 @@ pub trait MusicImporter: Send + Sync {
 }
 
 #[async_trait]
-pub trait ScrobbleProvider: Send + Sync {
-    fn id(&self) -> &str;
-    fn name(&self) -> &str;
-
-    // Listening history
-    async fn get_listens(&self, count: u32) -> Result<Vec<Listen>>;
-    async fn get_top_artists(&self, period: TimePeriod, count: u32) -> Result<Vec<RankedArtist>>;
-    async fn get_top_tracks(&self, period: TimePeriod, count: u32) -> Result<Vec<RankedTrack>>;
-
-    // Metadata
-    async fn get_artist_tags(&self, artist: &str) -> Result<Vec<WeightedTag>>;
-    async fn get_artist_popularity(&self, artist: &str) -> Result<ArtistPopularity>;
-    async fn get_global_popularity_median(&self) -> Result<u64>;
-
-    // Similarity
-    async fn get_similar_artists(&self, artist: &str, limit: u32) -> Result<Vec<SimilarArtist>>;
-    async fn get_similar_tracks(
+pub trait ListeningHistory: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn top_artists(
         &self,
-        artist: &str,
-        track: &str,
-        limit: u32,
-    ) -> Result<Vec<SimilarTrack>>;
+        period: TimePeriod,
+        count: usize,
+    ) -> std::result::Result<Vec<PlayedArtist>, HistoryError>;
+    async fn top_tracks(
+        &self,
+        period: TimePeriod,
+        count: usize,
+    ) -> std::result::Result<Vec<PlayedTrack>, HistoryError>;
+    async fn listens(&self, count: usize) -> std::result::Result<Vec<Listen>, HistoryError>;
+    /// Most recently favoured first, so a generator taking the first few gets the user's
+    /// current favourites.
+    async fn favourites(&self) -> std::result::Result<Vec<TrackRef>, HistoryError>;
+    /// Every artist and track the user already has, which no generator may recommend.
+    async fn known(&self) -> std::result::Result<KnownMusic, HistoryError>;
+}
 
-    // Tag/genre exploration
-    async fn get_tag_top_tracks(&self, tag: &str, limit: u32) -> Result<Vec<RankedTrack>>;
-    async fn get_related_tags(&self, tag: &str) -> Result<Vec<String>>;
+#[async_trait]
+pub trait MusicKnowledge: Send + Sync {
+    fn name(&self) -> &'static str;
+    /// Ok(None): searched, no single exact match. Err: the lookup failed.
+    async fn resolve_artist(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<String>, KnowledgeError>;
+    async fn similar_artists(
+        &self,
+        seed_name: &str,
+        seed_mbid: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<Neighbour>, KnowledgeError>;
+    async fn artist_top_tracks(
+        &self,
+        artist_mbid: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<TrackRef>, KnowledgeError>;
+    async fn artist_tags(
+        &self,
+        artist_mbids: &[String],
+    ) -> std::result::Result<HashMap<String, Vec<WeightedTag>>, KnowledgeError>;
+    async fn artist_popularity(
+        &self,
+        artist_mbids: &[String],
+    ) -> std::result::Result<HashMap<String, u64>, KnowledgeError>;
+    async fn popularity_reference(&self) -> std::result::Result<u64, KnowledgeError>;
+    async fn related_tags(&self, tag: &str) -> std::result::Result<Vec<String>, KnowledgeError>;
+    async fn tag_tracks(
+        &self,
+        tag: &str,
+        count: usize,
+    ) -> std::result::Result<Vec<TrackRef>, KnowledgeError>;
+    async fn recordings(
+        &self,
+        recording_mbids: &[String],
+    ) -> std::result::Result<HashMap<String, RecordingFacts>, KnowledgeError>;
+}
 
-    // Artist tracks
-    async fn get_artist_top_tracks(&self, artist: &str, limit: u32) -> Result<Vec<RankedTrack>>;
+#[async_trait]
+pub trait KnowledgeCache: Send + Sync {
+    /// None when absent or expired.
+    async fn get(&self, key: &str) -> std::result::Result<Option<String>, CacheError>;
+    async fn put(
+        &self,
+        key: &str,
+        value: &str,
+        ttl: Duration,
+    ) -> std::result::Result<(), CacheError>;
+}
+
+#[async_trait]
+pub trait MusicBrainzLookup: Send + Sync {
+    async fn search_artists(
+        &self,
+        name: &str,
+        limit: u8,
+    ) -> std::result::Result<Vec<ArtistMatch>, MetadataError>;
+    async fn genre_names(&self) -> std::result::Result<Vec<String>, MetadataError>;
+}
+
+/// What one generator found in a run. A failing source is recorded in `errors`
+/// and the generator goes on with the others.
+#[derive(Debug)]
+pub struct GeneratorOutput {
+    pub candidates: CandidateSet,
+    pub signals: Vec<SignalReport>,
+    pub errors: SourceErrors,
 }
 
 #[async_trait]
 pub trait CandidateGenerator: Send + Sync {
-    fn name(&self) -> &str;
-    async fn generate_candidates(
-        &self,
-        profile: &UserMusicProfile,
-        config: &ProfileConfig,
-    ) -> Result<(CandidateSet, Vec<SignalReport>, usize)>;
+    /// The key of the blend and the pipeline report.
+    fn name(&self) -> &'static str;
+    /// What the user sees when the report names this generator.
+    fn label(&self) -> &'static str;
+    /// This generator's share of the blend, before the shares of the generators
+    /// that found nothing are given to the others.
+    fn weight(&self) -> f64;
+    async fn generate(&self, profile: &UserMusicProfile, config: &ProfileConfig)
+        -> GeneratorOutput;
 }

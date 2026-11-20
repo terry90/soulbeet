@@ -1,18 +1,17 @@
-//! The metadata tools: MusicBrainz and Last.fm searches and lookups.
+//! The metadata tools: MusicBrainz searches and lookups.
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, json_chars, TEXT_MAX_CHARS};
-use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
+use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
 use soulbeet::musicbrainz::{ArtistMatch, RecordingReleases};
 
 use super::args::Args;
-use super::contract::{answer, invalid_value, upstream_error, ToolError};
+use super::contract::{answer, invalid_value, upstream_error};
 use super::paging::{fit, fit_whole, Listing, Page};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::metadata::{self, SearchKind};
-use crate::services::providers;
 
 const SEARCH: &str = "search_music";
 const RELEASE: &str = "get_release";
@@ -21,13 +20,9 @@ const RECORDING_ARGS: &[&str] = &["recording_mbid", "limit", "cursor"];
 
 /// The kinds `search_music` takes; each names its items key with an "s".
 const KINDS: &[&str] = &["recording", "release", "artist"];
-const PROVIDERS: &[&str] = &[providers::MUSICBRAINZ, providers::LASTFM];
 
-const RELEASE_ID: &str =
-    "a MusicBrainz release id or the lastfm: id of a release from search_music";
-
-/// A text from MusicBrainz or Last.fm, cut as any outside text is. Ids are
-/// never cut: see `whole_ids`.
+/// A text from MusicBrainz, cut as any outside text is. Ids are never cut:
+/// see `whole_ids`.
 fn cut(text: String) -> String {
     cut_json(text, TEXT_MAX_CHARS)
 }
@@ -36,8 +31,8 @@ fn cut(text: String) -> String {
 /// TEXT_MAX_CHARS of JSON set to null, and `ids_too_long` naming those
 /// fields; an entry whose ids all fit is unchanged. A cut id would still
 /// look like an id and name nothing, so an id is sent whole or not at all.
-/// An MBID is 36 characters; a lastfm: id holds Last.fm's artist and name,
-/// which can be as long as any text.
+/// An MBID is 36 characters, but ids come from MusicBrainz's answer, which
+/// Soulbeet does not control.
 fn whole_ids(mut entry: Value, fields: &[&str]) -> Value {
     let Value::Object(map) = &mut entry else {
         unreachable!("an entry is an object");
@@ -71,38 +66,27 @@ fn object(value: Value) -> Map<String, Value> {
     fields
 }
 
-/// D6: the search echoed, the provider asked for and the one that
-/// answered, and the entries under the kind's key, as many as keep the
-/// result within RESULT_MAX_CHARS, `left_out` counting the rest.
-fn search_fields(
-    kind: &str,
-    query: &str,
-    requested: Provider,
-    used: Provider,
-    entries: Vec<Value>,
-) -> Map<String, Value> {
-    let fields = object(json!({"kind": kind, "query": query,
-        "provider_requested": requested, "provider_used": used}));
+/// D6: the search echoed and the entries under the kind's key, as many as
+/// keep the result within RESULT_MAX_CHARS, `left_out` counting the rest.
+fn search_fields(kind: &str, query: &str, entries: Vec<Value>) -> Map<String, Value> {
+    let fields = object(json!({"kind": kind, "query": query}));
     fit_whole(fields, &format!("{kind}s"), entries, "left_out")
 }
 
-/// D6: `{"kind", "query", "provider_requested", "provider_used", kind's key: [..]}`
-/// for a recording or release search.
+/// D6: `{"kind", "query", kind's key: [..]}` for a recording or release search.
 pub(crate) fn music_fields(
     kind: &str,
     query: &str,
-    requested: Provider,
-    results: &SearchResults,
+    results: &[SearchResult],
 ) -> Map<String, Value> {
     let entries = results
-        .results
         .iter()
         .map(|result| match result {
             SearchResult::Track(track) => recording_entry(track),
             SearchResult::Album(album) => release_entry(album),
         })
         .collect();
-    search_fields(kind, query, requested, results.provider, entries)
+    search_fields(kind, query, entries)
 }
 
 /// A found recording; `release` is the one the provider put it on, null
@@ -126,7 +110,7 @@ fn release_entry(a: &Album) -> Value {
     whole_ids(entry, &["id", "release_mbid"])
 }
 
-/// D6 for an artist search, which reads MusicBrainz only.
+/// D6 for an artist search.
 pub(crate) fn artist_fields(query: &str, found: &[ArtistMatch]) -> Map<String, Value> {
     let entries = found
         .iter()
@@ -139,29 +123,19 @@ pub(crate) fn artist_fields(query: &str, found: &[ArtistMatch]) -> Map<String, V
             whole_ids(json!(a), &["mbid"])
         })
         .collect();
-    search_fields(
-        "artist",
-        query,
-        Provider::MusicBrainz,
-        Provider::MusicBrainz,
-        entries,
-    )
+    search_fields("artist", query, entries)
 }
 
-/// `({"provider_used", "release": {"id", "mbid", "title", "artist", "date",
-/// "release_types"}}, the tracks)`; `release_types` is null for None (D15).
-/// A track's `position` is its 1-based place in the release's running order
-/// across media.
-pub(crate) fn release_fields(
-    release: &AlbumWithTracks,
-    used: Provider,
-) -> (Map<String, Value>, Vec<Value>) {
+/// `({"release": {"id", "mbid", "title", "artist", "date", "release_types"}},
+/// the tracks)`; `release_types` is null for None (D15). A track's
+/// `position` is its 1-based place in the release's running order across
+/// media.
+pub(crate) fn release_fields(release: &AlbumWithTracks) -> (Map<String, Value>, Vec<Value>) {
     let a = &release.album;
     let album = json!({"id": a.id, "mbid": a.mbid, "title": cut(a.title.clone()),
         "artist": cut(a.artist.clone()), "date": cut_opt(a.release_date.clone()),
         "release_types": a.release_types});
-    let fields =
-        object(json!({"provider_used": used, "release": whole_ids(album, &["id", "mbid"])}));
+    let fields = object(json!({"release": whole_ids(album, &["id", "mbid"])}));
     let tracks = release
         .tracks
         .iter()
@@ -205,18 +179,13 @@ fn recording_releases_fields(found: &RecordingReleases, page: &Page) -> Map<Stri
     fit(fields, "releases", releases, page, more)
 }
 
-/// `search_music`: recordings or releases from the provider asked for, or
-/// artists from MusicBrainz.
+/// `search_music`: recordings, releases or artists from MusicBrainz.
 pub(crate) async fn search_music(
     _state: &ConnectionState,
-    caller: &McpCaller,
+    _caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
-    let args = Args::new(
-        SEARCH,
-        args,
-        &["kind", "query", "artist", "provider", "limit"],
-    );
+    let args = Args::new(SEARCH, args, &["kind", "query", "artist", "limit"]);
     answer(
         async {
             let kind = args.opt_choice("kind", KINDS)?.ok_or_else(|| {
@@ -224,28 +193,15 @@ pub(crate) async fn search_music(
             })?;
             let query = args.string("query")?;
             let artist = args.opt_string("artist")?;
-            let provider = args
-                .opt_choice("provider", PROVIDERS)?
-                .unwrap_or(providers::MUSICBRAINZ);
             let limit = args.opt_u32("limit", 1, 25)?.unwrap_or(10);
-            if kind == "artist" {
-                if artist.is_some() {
-                    return Err(invalid_value(
-                        SEARCH,
-                        "artist",
-                        "absent for kind artist: put the name in query",
-                    ));
-                }
-                if provider != providers::MUSICBRAINZ {
-                    return Err(invalid_value(
-                        SEARCH,
-                        "provider",
-                        "musicbrainz for kind artist: artist search reads MusicBrainz only",
-                    ));
-                }
+            if kind == "artist" && artist.is_some() {
+                return Err(invalid_value(
+                    SEARCH,
+                    "artist",
+                    "absent for kind artist: put the name in query",
+                ));
             }
             args.finish()?;
-            let requested: Provider = provider.parse().expect("PROVIDERS are provider names");
             let search_kind = match kind {
                 "recording" => Some(SearchKind::Tracks),
                 "release" => Some(SearchKind::Albums),
@@ -253,16 +209,11 @@ pub(crate) async fn search_music(
                 other => unreachable!("opt_choice answers one of KINDS, not {other}"),
             };
             let found = match search_kind {
-                Some(search_kind) => metadata::search(
-                    &caller.ctx,
-                    search_kind,
-                    artist.as_deref(),
-                    &query,
-                    Some(provider),
-                    limit as usize,
-                )
-                .await
-                .map(|results| music_fields(kind, &query, requested, &results)),
+                Some(search_kind) => {
+                    metadata::search(search_kind, artist.as_deref(), &query, limit as usize)
+                        .await
+                        .map(|results| music_fields(kind, &query, &results))
+                }
                 None => {
                     let limit = u8::try_from(limit).expect("limit is at most 25");
                     metadata::artists(&query, limit)
@@ -271,8 +222,7 @@ pub(crate) async fn search_music(
                 }
             };
             found.map_err(|f| {
-                let facts = object(json!({"kind": kind, "query": query, "artist": artist,
-                    "provider_requested": requested}));
+                let facts = object(json!({"kind": kind, "query": query, "artist": artist}));
                 upstream_error(f, facts, args.same_call())
             })
         }
@@ -280,42 +230,26 @@ pub(crate) async fn search_music(
     )
 }
 
-/// An MBID by `Args::mbid`'s rule, lowercase, or a Last.fm album id as
-/// given. A Last.fm track id, or an id of the form Soulful wrote before ids
-/// named their kind, is refused: a tool call never holds one, since no tool
-/// gave out that form, and a track id read as an album names another one.
-fn read_release_id(args: &Args) -> Result<String, ToolError> {
-    let refused = || invalid_value(RELEASE, "release_id", RELEASE_ID);
-    let id = args.string("release_id").map_err(|_| refused())?;
-    if soulbeet::lastfm::is_album_id(&id) {
-        return Ok(id);
-    }
-    args.mbid("release_id").map_err(|_| refused())
-}
-
 /// `get_release`: the release and a page of its tracks.
 pub(crate) async fn get_release(
     _state: &ConnectionState,
-    caller: &McpCaller,
+    _caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
     let args = Args::new(RELEASE, args, &["release_id", "limit", "cursor"]);
     answer(
         async {
-            let release_id = read_release_id(&args)?;
+            let release_id = args.mbid("release_id")?;
             let page = Page::read(&args, json!({"release_id": release_id}))?;
             args.finish()?;
-            let (release, used) =
-                metadata::release(&caller.ctx, &release_id)
-                    .await
-                    .map_err(|f| {
-                        upstream_error(
-                            f,
-                            object(json!({"release_id": release_id})),
-                            args.same_call(),
-                        )
-                    })?;
-            let (fields, tracks) = release_fields(&release, used);
+            let release = metadata::album(&release_id).await.map_err(|f| {
+                upstream_error(
+                    f,
+                    object(json!({"release_id": release_id})),
+                    args.same_call(),
+                )
+            })?;
+            let (fields, tracks) = release_fields(&release);
             Ok(fit(fields, "tracks", page.of(&tracks), &page, false))
         }
         .await,
@@ -354,7 +288,7 @@ pub(crate) async fn get_recording_releases(
 mod tests {
     use serde_json::{json, Map, Value};
     use shared::failure::{FailureCode, RetryAdvice, Service, Stage};
-    use shared::metadata::{Album, AlbumWithTracks, Provider, SearchResult, SearchResults, Track};
+    use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
     use soulbeet::musicbrainz::{RecordingInfo, RecordingRelease, ReleaseGroupInfo};
     use soulbeet::MetadataError;
 
@@ -380,20 +314,12 @@ mod tests {
     }
 
     #[test]
-    fn a_recording_search_names_the_provider_asked_for_and_the_one_used() {
-        let results = SearchResults {
-            provider: Provider::MusicBrainz,
-            results: vec![SearchResult::Track(silent_night())],
-        };
+    fn a_recording_search_lists_what_musicbrainz_found() {
+        let results = [SearchResult::Track(silent_night())];
         assert_eq!(
-            Value::Object(music_fields(
-                "recording",
-                "Silent Night",
-                Provider::LastFm,
-                &results
-            )),
+            Value::Object(music_fields("recording", "Silent Night", &results)),
             json!({
-            "kind": "recording", "query": "Silent Night", "provider_requested": "lastfm", "provider_used": "musicbrainz",
+            "kind": "recording", "query": "Silent Night",
             "recordings": [{"id": "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8", "recording_mbid": "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8",
                 "title": "Silent Night", "artist": "Bing Crosby", "duration_s": 149,
                 "release": {"id": "317d1e85-3f9e-463e-939b-bebf47aa2178", "mbid": "317d1e85-3f9e-463e-939b-bebf47aa2178",
@@ -413,15 +339,7 @@ mod tests {
             cover_url: None,
             release_types: Some(vec!["Album".into(), "Compilation".into()]),
         };
-        let doc = music_fields(
-            "release",
-            "Merry Christmas",
-            Provider::MusicBrainz,
-            &SearchResults {
-                provider: Provider::MusicBrainz,
-                results: vec![SearchResult::Album(album)],
-            },
-        );
+        let doc = music_fields("release", "Merry Christmas", &[SearchResult::Album(album)]);
         assert_eq!(
             doc["releases"][0]["release_types"],
             json!(["Album", "Compilation"])
@@ -430,7 +348,7 @@ mod tests {
 
     #[test]
     fn a_release_lists_its_tracks_by_position() {
-        let mut release = AlbumWithTracks {
+        let release = AlbumWithTracks {
             album: Album {
                 id: "317d1e85-3f9e-463e-939b-bebf47aa2178".into(),
                 title: "White Christmas".into(),
@@ -442,24 +360,19 @@ mod tests {
             },
             tracks: vec![silent_night()],
         };
-        let (fields, tracks) = release_fields(&release, Provider::MusicBrainz);
+        let (fields, tracks) = release_fields(&release);
         assert_eq!(
             (
-                &fields["provider_used"],
+                fields.keys().map(String::as_str).collect::<Vec<_>>(),
                 &fields["release"]["release_types"],
                 &tracks[0]
             ),
             (
-                &json!("musicbrainz"),
+                vec!["release"],
                 &json!(["Album", "Compilation"]),
                 &json!({"position": 1,
             "recording_mbid": "4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8", "title": "Silent Night", "artist": "Bing Crosby", "duration_s": 149})
             )
-        );
-        release.album.release_types = None; // a Last.fm album
-        assert_eq!(
-            release_fields(&release, Provider::LastFm).0["release"]["release_types"],
-            Value::Null
         );
     }
 
@@ -467,18 +380,35 @@ mod tests {
     async fn metadata_arguments_are_refused_with_what_was_expected() {
         let (_, app, token) = mcp_app().await;
         for (name, args, message) in [
-            ("search_music", json!({"kind": "artist", "query": "Bing Crosby", "provider": "lastfm"}),
-             "search_music: provider must be musicbrainz for kind artist: artist search reads MusicBrainz only"),
             ("search_music", json!({"kind": "song", "query": "Silent Night"}), "search_music: kind must be one of recording, release, artist"),
             ("get_recording_releases", json!({"recording_mbid": "4d04e9b5"}),
              "get_recording_releases: recording_mbid must be a MusicBrainz id: 36 characters, 8-4-4-4-12 hexadecimal digits"),
             ("get_release", json!({"release_id": "White Christmas"}),
-             "get_release: release_id must be a MusicBrainz release id or the lastfm: id of a release from search_music"),
-            // A recording's id from a Last.fm search names no release.
-            ("get_release", json!({"release_id": "lastfm:track:bing crosby:white christmas"}),
-             "get_release: release_id must be a MusicBrainz release id or the lastfm: id of a release from search_music"),
-            ("get_release", json!({"release_id": "lastfm:bing crosby:white christmas"}),
-             "get_release: release_id must be a MusicBrainz release id or the lastfm: id of a release from search_music"),
+             "get_release: release_id must be a MusicBrainz id: 36 characters, 8-4-4-4-12 hexadecimal digits"),
+        ] {
+            let e = &document(&call_tool(app.clone(), &token, name, args).await)["error"];
+            assert_eq!(
+                (e["code"].as_str(), e["message"].as_str()),
+                (Some("invalid_input"), Some(message)),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_music_takes_no_provider_and_get_release_takes_only_an_mbid() {
+        let spec = crate::mcp::server::TOOLS
+            .iter()
+            .find(|t| t.name == SEARCH)
+            .unwrap();
+        let schema: Value = serde_json::from_str(spec.input_schema).unwrap();
+        assert_eq!(schema["properties"].get("provider"), None);
+        let (_, app, token) = mcp_app().await;
+        for (name, args, message) in [
+            (SEARCH, json!({"kind": "recording", "query": "Silent Night", "provider": "musicbrainz"}),
+             "search_music takes no argument named 'provider': it takes only kind, query, artist, limit"),
+            (RELEASE, json!({"release_id": "lastfm:album:bing crosby:white christmas"}),
+             "get_release: release_id must be a MusicBrainz id: 36 characters, 8-4-4-4-12 hexadecimal digits"),
         ] {
             let e = &document(&call_tool(app.clone(), &token, name, args).await)["error"];
             assert_eq!(
@@ -662,11 +592,12 @@ mod tests {
             country: Some("US".into()),
             begin: Some("1903-05-03".into()),
             end: Some("1977-10-14".into()),
+            aliases: vec![],
         };
         assert_eq!(
             Value::Object(artist_fields("Bing Crosby", &[crosby])),
-            json!({"kind": "artist", "query": "Bing Crosby", "provider_requested": "musicbrainz",
-                "provider_used": "musicbrainz", "artists": [{"mbid": "2437980f-513a-44fc-80f1-b90d9d7fcf8f",
+            json!({"kind": "artist", "query": "Bing Crosby",
+                "artists": [{"mbid": "2437980f-513a-44fc-80f1-b90d9d7fcf8f",
                 "name": "Bing Crosby", "sort_name": "Crosby, Bing", "disambiguation": null, "artist_type": "Person",
                 "country": "US", "begin": "1903-05-03", "end": "1977-10-14"}], "left_out": 0})
         );
@@ -694,15 +625,7 @@ mod tests {
                 })
             })
             .collect();
-        let mut doc = music_fields(
-            "recording",
-            "Silent Night",
-            Provider::LastFm,
-            &SearchResults {
-                provider: Provider::LastFm,
-                results: tracks,
-            },
-        );
+        let mut doc = music_fields("recording", "Silent Night", &tracks);
         let kept = doc["recordings"].as_array().unwrap().len();
         assert!(kept > 0 && kept < 25, "{kept}");
         assert_eq!(doc["left_out"], json!(25 - kept));
@@ -723,8 +646,8 @@ mod tests {
 
     #[test]
     fn an_id_too_long_to_return_is_null_and_named_never_cut() {
-        // A lastfm: id of 501 characters, one past what a text field holds.
-        let long_id = format!("lastfm:album:{}", "x".repeat(TEXT_MAX_CHARS + 1 - 13));
+        // An id of 501 characters, one past what a text field holds.
+        let long_id = "x".repeat(TEXT_MAX_CHARS + 1);
         let short = silent_night();
         let track = Track {
             id: long_id.clone(),
@@ -734,14 +657,10 @@ mod tests {
         let found = music_fields(
             "recording",
             "Silent Night",
-            Provider::LastFm,
-            &SearchResults {
-                provider: Provider::LastFm,
-                results: vec![
-                    SearchResult::Track(track.clone()),
-                    SearchResult::Track(short.clone()),
-                ],
-            },
+            &[
+                SearchResult::Track(track.clone()),
+                SearchResult::Track(short.clone()),
+            ],
         );
         let (long, kept) = (&found["recordings"][0], &found["recordings"][1]);
         assert_eq!(
@@ -772,26 +691,19 @@ mod tests {
         let release = &music_fields(
             "release",
             "Winter Songs",
-            Provider::LastFm,
-            &SearchResults {
-                provider: Provider::LastFm,
-                results: vec![SearchResult::Album(album.clone())],
-            },
+            &[SearchResult::Album(album.clone())],
         )["releases"][0];
         assert_eq!(
             (&release["id"], &release["ids_too_long"]),
             (&Value::Null, &json!(["id"]))
         );
-        let (fields, tracks) = release_fields(
-            &AlbumWithTracks {
-                album,
-                tracks: vec![Track {
-                    mbid: Some(long_id.clone()),
-                    ..short
-                }],
-            },
-            Provider::LastFm,
-        );
+        let (fields, tracks) = release_fields(&AlbumWithTracks {
+            album,
+            tracks: vec![Track {
+                mbid: Some(long_id.clone()),
+                ..short
+            }],
+        });
         assert_eq!(
             (
                 &fields["release"]["id"],
@@ -830,6 +742,7 @@ mod tests {
             country: None,
             begin: None,
             end: None,
+            aliases: vec![],
         };
         let a = &artist_fields("Bing Crosby", &[artist])["artists"][0];
         assert_eq!(
@@ -851,11 +764,7 @@ mod tests {
         let found = music_fields(
             "recording",
             "Silent Night",
-            Provider::MusicBrainz,
-            &SearchResults {
-                provider: Provider::MusicBrainz,
-                results: vec![SearchResult::Track(track.clone())],
-            },
+            &[SearchResult::Track(track.clone())],
         );
         let r = &found["recordings"][0];
         assert_eq!(
@@ -879,7 +788,7 @@ mod tests {
             },
             tracks: vec![track],
         };
-        let (fields, tracks) = release_fields(&release, Provider::MusicBrainz);
+        let (fields, tracks) = release_fields(&release);
         assert_eq!(
             (
                 &fields["release"]["title"],
@@ -917,6 +826,7 @@ mod tests {
             country: Some(long),
             begin: None,
             end: None,
+            aliases: vec![],
         };
         let a = &artist_fields("Bing Crosby", &[artist])["artists"][0];
         assert_eq!(

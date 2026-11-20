@@ -12,6 +12,6 @@ COPY stubs ./stubs
 ENV AUDIO_DIR=/e2e/.fixtures/audio \
     DOWNLOADS_DIR=/downloads
 
-EXPOSE 5030 5050
+EXPOSE 5030 5050 5060 5061 5062
 
 CMD ["npx", "tsx", "stubs/src/main.ts"]

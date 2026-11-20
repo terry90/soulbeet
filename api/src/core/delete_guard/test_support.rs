@@ -541,7 +541,12 @@ impl Library {
                 bit_rate: 0,
                 starred: false,
                 starred_at: None,
+                rated_at: None,
                 play_count: 0,
+                play_date: None,
+                mbz_artist_id: None,
+                mbz_album_artist_id: None,
+                participants: Default::default(),
             },
             "al1",
         );
@@ -767,10 +772,10 @@ pub(crate) fn previewed_file(song_id: &str, path: &Path) -> PreviewedFile {
     }
 }
 
-/// A job's `wanted` for one track (Track.id "lastfm-track-1", no album fields).
+/// A job's `wanted` for one track (Track.id "track-1", no album fields).
 pub(crate) fn wanted(artist: &str, title: &str, mbid: Option<&str>) -> DownloadQuery {
     DownloadQuery::new(vec![Track {
-        id: "lastfm-track-1".into(),
+        id: "track-1".into(),
         title: title.into(),
         artist: artist.into(),
         album_id: None,

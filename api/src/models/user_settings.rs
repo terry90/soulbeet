@@ -6,11 +6,8 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
 pub struct UserSettings {
     pub user_id: String,
-    pub default_metadata_provider: Option<String>,
     pub last_search_type: Option<String>,
     pub auto_delete_enabled: bool,
-    pub lastfm_api_key: Option<String>,
-    pub lastfm_username: Option<String>,
     pub discovery_promote_threshold: u8,
     pub navidrome_banner_dismissed: bool,
     pub listenbrainz_username: Option<String>,
@@ -24,20 +21,15 @@ pub struct UserSettings {
     pub discovery_navidrome_playlist_id: Option<String>,
     pub discovery_last_generated_at: Option<String>,
     pub default_download_folder_id: Option<String>,
+    pub deezer_recommendations: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub struct UpdateUserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_metadata_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_search_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_delete_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lastfm_api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lastfm_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_promote_threshold: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,6 +52,8 @@ pub struct UpdateUserSettings {
     pub discovery_playlist_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_download_folder_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deezer_recommendations: Option<bool>,
 }
 
 #[cfg(feature = "server")]
@@ -81,15 +75,19 @@ impl UserSettings {
         Ok(settings.unwrap_or_else(|| Self::defaults(user_id)))
     }
 
+    /// The chosen discovery folder's id. Settings clears the choice by storing an empty id.
+    pub(crate) fn discovery_folder(&self) -> Option<&str> {
+        self.discovery_folder_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+    }
+
     /// What a user without a row has.
     pub(crate) fn defaults(user_id: &str) -> UserSettings {
         UserSettings {
             user_id: user_id.to_string(),
-            default_metadata_provider: Some("musicbrainz".to_string()),
             last_search_type: Some("album".to_string()),
             auto_delete_enabled: false,
-            lastfm_api_key: None,
-            lastfm_username: None,
             discovery_promote_threshold: 3,
             navidrome_banner_dismissed: false,
             listenbrainz_username: None,
@@ -103,6 +101,7 @@ impl UserSettings {
             discovery_navidrome_playlist_id: None,
             discovery_last_generated_at: None,
             default_download_folder_id: None,
+            deezer_recommendations: false,
         }
     }
 
@@ -142,11 +141,8 @@ impl UserSettings {
             };
         }
         columns!(
-            default_metadata_provider,
             last_search_type,
             auto_delete_enabled,
-            lastfm_api_key,
-            lastfm_username,
             discovery_promote_threshold,
             navidrome_banner_dismissed,
             listenbrainz_username,
@@ -157,7 +153,8 @@ impl UserSettings {
             discovery_lifetime_days,
             discovery_profiles,
             discovery_playlist_name,
-            default_download_folder_id
+            default_download_folder_id,
+            deezer_recommendations
         );
         if given.is_empty() {
             insert.push(" ON CONFLICT(user_id) DO NOTHING");
@@ -351,5 +348,28 @@ mod tests {
             s.discovery_track_count,
             UserSettings::defaults("alice").discovery_track_count
         );
+    }
+
+    #[tokio::test]
+    async fn deezer_is_off_until_the_user_turns_it_on() {
+        let db = test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        assert!(
+            !UserSettings::get_in(&db, "alice")
+                .await
+                .unwrap()
+                .deezer_recommendations
+        );
+        let s = UserSettings::upsert_in(
+            &db,
+            "alice",
+            UpdateUserSettings {
+                deezer_recommendations: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(s.deezer_recommendations);
     }
 }

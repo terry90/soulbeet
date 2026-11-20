@@ -57,8 +57,9 @@ pub(crate) fn common_codes(calls_a_minute: u32) -> String {
 /// The failure codes of every tool that reads the caller's Navidrome.
 pub(crate) const NAVIDROME_CODES: &str = "navidrome_not_linked, navidrome_auth_failed, navidrome_unreachable, navidrome_circuit_open, navidrome_refused";
 
-/// The failure codes of every tool that asks MusicBrainz or Last.fm.
-pub(crate) const METADATA_CODES: &str = "metadata_unavailable, metadata_not_found, metadata_rate_limited, provider_not_configured, backend_response_unreadable";
+/// The failure codes of every tool that asks MusicBrainz.
+pub(crate) const METADATA_CODES: &str =
+    "metadata_unavailable, metadata_not_found, metadata_rate_limited, backend_response_unreadable";
 
 /// Every tool, in the fixed order `tools/list` answers (MCP 2026-07-28
 /// `server/tools.mdx`, "deterministic order").
@@ -82,7 +83,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Soulbeet settings",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Shows the user's Soulbeet settings: default download folder and whether it still exists, auto-delete on a 1 star rating, the default metadata provider, the Last.fm and ListenBrainz user names and whether a key or token is saved (never the key or token), and the discovery settings. Takes no arguments. Failure codes: {common}.")
+            format!("Shows the user's Soulbeet settings: default download folder and whether it still exists, auto-delete on a 1 star rating, the ListenBrainz user name and whether a token is saved (never the token), and the discovery settings, among them whether the user turned on Deezer recommendations, which send the names of artists they play to Deezer. Takes no arguments. Failure codes: {common}.")
         },
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         read_only: true,
@@ -208,9 +209,9 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Search music",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Searches MusicBrainz (default) or Last.fm for recordings, releases (albums and EPs) or artists, to check that a recording exists and get its ids. Returns MBIDs where the provider has them, titles, artists, dates, release types and durations, and provider_used, which is musicbrainz when Last.fm was asked for and no Last.fm key is saved. Artist search reads MusicBrainz only. Up to 25 results (limit, default 10); left_out counts results left out to keep the answer under 60,000 characters. MBIDs never change; a lastfm: id names a Last.fm entry by its artist and name. An id over 500 characters is null, and ids_too_long names its field. MusicBrainz allows one request a second, so a search takes one to a few seconds. Failure codes: {common}, {METADATA_CODES}.")
+            format!("Searches MusicBrainz for recordings, releases (albums and EPs) or artists, to check that a recording exists and get its ids. Returns MBIDs, titles, artists, dates, release types and durations. Up to 25 results (limit, default 10); left_out counts results left out to keep the answer under 60,000 characters. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. MusicBrainz allows one request a second, so a search takes one to a few seconds. Failure codes: {common}, {METADATA_CODES}.")
         },
-        input_schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["recording","release","artist"]},"query":{"type":"string"},"artist":{"type":"string","description":"A credit to narrow a recording or release search"},"provider":{"type":"string","enum":["musicbrainz","lastfm"]},"limit":{"type":"integer","minimum":1,"maximum":25}},"required":["kind","query"],"additionalProperties":false}"#,
+        input_schema: r#"{"type":"object","properties":{"kind":{"type":"string","enum":["recording","release","artist"]},"query":{"type":"string"},"artist":{"type":"string","description":"A credit to narrow a recording or release search"},"limit":{"type":"integer","minimum":1,"maximum":25}},"required":["kind","query"],"additionalProperties":false}"#,
         read_only: true,
         destructive: false,
         idempotent: true,
@@ -222,7 +223,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         title: "Release",
         description: |calls_a_minute| {
             let common = common_codes(calls_a_minute);
-            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id or the lastfm: id search_music gave a release. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. Pages of 25 tracks by default (limit up to 100). Failure codes: {common}, {METADATA_CODES}.")
+            format!("Shows a release with its tracks (recording MBIDs, titles, artists, durations), from a MusicBrainz release id. MBIDs never change. An id over 500 characters is null, and ids_too_long names its field. Pages of 25 tracks by default (limit up to 100). Failure codes: {common}, {METADATA_CODES}.")
         },
         input_schema: r#"{"type":"object","properties":{"release_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["release_id"],"additionalProperties":false}"#,
         read_only: true,
@@ -391,6 +392,19 @@ mod tests {
     use crate::mcp::status::status_fields;
     use crate::models::user_settings::{UpdateUserSettings, UserSettings};
     use crate::oauth::limits::{Limits, WindowLimiter};
+
+    #[test]
+    fn every_code_a_description_lists_is_a_failure_code() {
+        for code in METADATA_CODES
+            .split(", ")
+            .chain(NAVIDROME_CODES.split(", "))
+        {
+            assert!(
+                serde_json::from_value::<shared::failure::FailureCode>(json!(code)).is_ok(),
+                "{code}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn tools_list_declares_every_tool_with_every_hint() {
@@ -827,7 +841,7 @@ mod tests {
             "u1",
             UpdateUserSettings {
                 default_download_folder_id: Some("f1".into()),
-                lastfm_api_key: Some("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e".into()),
+                listenbrainz_token: Some("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d".into()),
                 ..Default::default()
             },
         )
@@ -840,13 +854,13 @@ mod tests {
             (
                 doc["ok"].as_bool(),
                 doc["default_folder_found"].as_bool(),
-                doc["lastfm"]["api_key_saved"].as_bool()
+                doc["listenbrainz"]["token_saved"].as_bool()
             ),
             (Some(true), Some(true), Some(true))
         );
         assert!(!settings
             .to_string()
-            .contains("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e"));
+            .contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"));
         let first =
             document(&call_tool(app.clone(), &token, "list_folders", json!({"limit": 1})).await);
         let f = &first["folders"][0];

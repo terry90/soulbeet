@@ -299,14 +299,6 @@ fn outcome_kind(outcome: &ImportOutcome) -> &'static str {
 
 #[async_trait::async_trait]
 impl MusicImporter for BeetsImporter {
-    fn id(&self) -> &'static str {
-        "beets"
-    }
-
-    fn name(&self) -> &'static str {
-        "Beets"
-    }
-
     async fn import(
         &self,
         sources: &[&Path],

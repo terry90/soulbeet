@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::failure::{Cause, Failure};
-use crate::metadata::{Album, Provider, Track};
+use crate::metadata::{Album, Track};
 
 #[derive(Serialize, Clone, PartialEq, Deserialize, Debug, Default)]
 pub struct DownloadQuery {
@@ -9,9 +9,6 @@ pub struct DownloadQuery {
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub backend: Option<String>,
-    /// The metadata provider whose search gave `album`.
-    #[serde(default)]
-    pub metadata_provider: Option<Provider>,
 }
 
 impl DownloadQuery {
@@ -20,17 +17,11 @@ impl DownloadQuery {
             album: None,
             tracks,
             backend: None,
-            metadata_provider: None,
         }
     }
 
     pub fn album(mut self, album: Album) -> Self {
         self.album = Some(album);
-        self
-    }
-
-    pub fn metadata_provider(mut self, provider: Provider) -> Self {
-        self.metadata_provider = Some(provider);
         self
     }
 
@@ -610,7 +601,6 @@ pub enum AutoDownloadEvent {
 mod tests {
     use super::*;
     use crate::failure::{FailureCode, RetryAdvice, Stage};
-    use crate::metadata::Provider;
 
     /// Stats and file facts stored before a field was added still read.
     #[test]
@@ -664,18 +654,12 @@ mod tests {
     }
 
     #[test]
-    fn an_album_query_names_the_provider_of_its_id() {
-        let old = serde_json::json!({"album": null, "tracks": []});
+    fn a_query_that_names_a_metadata_provider_still_reads() {
+        let old = serde_json::json!({"album": null, "tracks": [], "metadata_provider": "lastfm"});
+        let q: DownloadQuery = serde_json::from_value(old).unwrap();
         assert_eq!(
-            serde_json::from_value::<DownloadQuery>(old)
-                .unwrap()
-                .metadata_provider,
+            serde_json::to_value(&q).unwrap().get("metadata_provider"),
             None
-        );
-        let q = DownloadQuery::new(vec![]).metadata_provider(Provider::LastFm);
-        assert_eq!(
-            serde_json::to_value(&q).unwrap()["metadata_provider"],
-            serde_json::json!("lastfm")
         );
     }
 

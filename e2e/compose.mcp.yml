@@ -15,6 +15,9 @@ services:
       - DOWNLOAD_PATH=/downloads
       - BEETS_CONFIG=/app/beets-e2e.yaml
       - MUSICBRAINZ_HOST=stubs:5050
+      - LISTENBRAINZ_HOST=stubs:5060
+      - LISTENBRAINZ_LABS_HOST=stubs:5061
+      - DEEZER_HOST=stubs:5062
       - NAVIDROME_URL=http://stubs:4534
     volumes:
       - mcp-data:/data

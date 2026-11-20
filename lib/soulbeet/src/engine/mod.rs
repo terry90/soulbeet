@@ -1,405 +1,607 @@
 pub mod blender;
+pub mod catalog;
+pub mod deezer_radio;
 pub mod diversifier;
 pub mod freshness;
-pub mod lastfm_pipeline;
-pub mod listenbrainz_pipeline;
-pub mod profile;
+pub mod listenbrainz_account;
+pub mod taste;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use crate::error::Result;
-use crate::traits::{CandidateGenerator, ScrobbleProvider};
+use crate::traits::CandidateGenerator;
+use crate::MusicKnowledge;
 use shared::recommendation::{
-    Candidate, CandidateSet, EngineReport, PipelineReport, ProfileConfig, ProfileSummary,
-    TimePeriod, UserMusicProfile,
+    fold_name, Candidate, CandidateSet, CandidateSnapshot, EngineReport, EngineState,
+    PipelineReport, ProfileConfig, ProfileSummary, SignalReport, SourceErrors, TrackRef,
+    UserMusicProfile,
 };
 
-const ARTIST_CACHE_LIMIT: usize = 100;
+pub use taste::{build_profile, ProfileBuild};
 
-/// Per-pipeline-run cache for artist popularity and genre metadata.
-/// Avoids redundant API calls when the same artist appears across signals.
-/// Stops fetching new metadata after encountering `ARTIST_CACHE_LIMIT` unique artists.
-pub(crate) struct ArtistCache {
-    pub popularity: HashMap<String, u64>,
-    pub genre: HashMap<String, String>,
-    popularity_fetches: usize,
-    genre_fetches: usize,
-}
+/// Keeps one signal from crowding out the others in the blend.
+pub const MAX_CANDIDATES_PER_SIGNAL: usize = 500;
+/// One hour: a generator still running then is given up on for this run.
+const GENERATOR_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Facts are read for this many candidates per one wanted, the best scored first.
+const ENRICHED_PER_WANTED: usize = 3;
 
-impl ArtistCache {
-    pub fn new() -> Self {
-        Self {
-            popularity: HashMap::new(),
-            genre: HashMap::new(),
-            popularity_fetches: 0,
-            genre_fetches: 0,
+/// Keeps the best-scored `MAX_CANDIDATES_PER_SIGNAL` candidates of a signal.
+pub(crate) fn cap_signal(set: &mut CandidateSet) {
+    if set.len() > MAX_CANDIDATES_PER_SIGNAL {
+        let mut entries: Vec<_> = set.candidates.drain().collect();
+        entries.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        entries.truncate(MAX_CANDIDATES_PER_SIGNAL);
+        for (k, v) in entries {
+            set.candidates.insert(k, v);
         }
-    }
-
-    pub async fn get_popularity(
-        &mut self,
-        provider: &dyn ScrobbleProvider,
-        artist: &str,
-    ) -> Option<u64> {
-        let key = artist.to_lowercase();
-        if let Some(&count) = self.popularity.get(&key) {
-            return Some(count);
-        }
-        if self.popularity_fetches >= ARTIST_CACHE_LIMIT {
-            return None;
-        }
-        if let Ok(pop) = provider.get_artist_popularity(artist).await {
-            self.popularity_fetches += 1;
-            self.popularity.insert(key, pop.listener_count);
-            return Some(pop.listener_count);
-        }
-        None
-    }
-
-    pub async fn get_genre(
-        &mut self,
-        provider: &dyn ScrobbleProvider,
-        artist: &str,
-    ) -> Option<String> {
-        let key = artist.to_lowercase();
-        if let Some(genre) = self.genre.get(&key) {
-            return Some(genre.clone());
-        }
-        if self.genre_fetches >= ARTIST_CACHE_LIMIT {
-            return None;
-        }
-        if let Ok(tags) = provider.get_artist_tags(artist).await {
-            self.genre_fetches += 1;
-            if let Some(top) = tags.first() {
-                self.genre.insert(key, top.name.clone());
-                return Some(top.name.clone());
-            }
-        }
-        None
     }
 }
 
-pub use lastfm_pipeline::LastFmPipeline;
-pub use listenbrainz_pipeline::ListenBrainzPipeline;
-pub use profile::build_profile;
+/// A signal's count and its three best candidates, for the run report.
+pub(crate) fn signal_report(name: &str, set: &CandidateSet) -> SignalReport {
+    let mut sorted: Vec<&Candidate> = set.candidates.values().collect();
+    sorted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    SignalReport {
+        name: name.to_string(),
+        candidates_produced: set.len(),
+        top_candidates: sorted
+            .iter()
+            .take(3)
+            .map(|c| CandidateSnapshot::from_candidate(c))
+            .collect(),
+    }
+}
 
-/// Run the full recommendation pipeline with a pre-built profile.
+/// Caps each signal, reports it and merges it into one set, signals in order.
+pub(crate) fn merge_signals(
+    signals: Vec<(&str, CandidateSet)>,
+) -> (CandidateSet, Vec<SignalReport>) {
+    let mut candidates = CandidateSet::new();
+    let mut reports = Vec::new();
+    for (name, mut set) in signals {
+        cap_signal(&mut set);
+        reports.push(signal_report(name, &set));
+        for candidate in set.into_vec() {
+            candidates.insert(candidate);
+        }
+    }
+    (candidates, reports)
+}
+
+/// A candidate for a track one signal of a generator found.
+pub(crate) fn track_candidate(
+    track: TrackRef,
+    score: f64,
+    signal: &str,
+    source: &str,
+) -> Candidate {
+    Candidate {
+        artist: track.artist.name,
+        track: track.title,
+        album: None,
+        mbid: track.mbid,
+        score,
+        signals: vec![signal.to_string()],
+        source: source.to_string(),
+        artist_listener_count: None,
+        primary_genre: None,
+        release_year: None,
+        artist_mbid: track.artist.mbid,
+    }
+}
+
+/// Recommends `target_count` tracks from a built profile.
 ///
-/// 1. Generate candidates from each generator.
-/// 2. Blend results across sources.
-/// 3. Apply freshness penalties.
-/// 4. Diversify and select the final list.
+/// 1. Each generator runs; one that fails or times out is reported and the others go on.
+/// 2. The generators' candidates are blended by their weights.
+/// 3. The best candidates get their release year, popularity and genre from the knowledge.
+/// 4. New releases are boosted.
+/// 5. The diversifier picks the final list.
 ///
-/// Returns the final candidates alongside a structured report of all decisions.
+/// A profile without seeds runs no generator. The report says there is no listening data only
+/// when every history answered, since one that failed may hold it.
 pub async fn recommend(
-    providers: &[Arc<dyn ScrobbleProvider>],
+    build: &ProfileBuild,
     generators: &[Arc<dyn CandidateGenerator>],
-    profile: &UserMusicProfile,
+    knowledge: &dyn MusicKnowledge,
     config: &ProfileConfig,
     target_count: usize,
-) -> Result<(Vec<Candidate>, EngineReport)> {
-    let start = std::time::Instant::now();
+) -> (Vec<Candidate>, EngineReport) {
+    let start = Instant::now();
+    let profile = &build.profile;
+    let mut errors = build.errors.clone();
+    let mut report = EngineReport {
+        profile_summary: profile_summary(profile),
+        sources: build.sources.clone(),
+        ..Default::default()
+    };
+
+    if !profile.has_seeds() {
+        info!("No listening data to recommend from");
+        if errors.is_empty() {
+            report.state = EngineState::NoListeningData;
+        }
+        report.source_errors = errors.into_vec();
+        report.duration_secs = start.elapsed().as_secs_f64();
+        return (Vec::new(), report);
+    }
 
     info!(
         "Starting recommendation: {} generators, target {}",
         generators.len(),
         target_count
     );
-
-    let mut report = EngineReport {
-        profile_summary: ProfileSummary {
-            genre_count: profile.genre_distribution.len(),
-            top_genres: profile
-                .genre_distribution
-                .iter()
-                .take(5)
-                .map(|t| t.name.clone())
-                .collect(),
-            obscurity_score: profile.obscurity_score,
-            repeat_ratio: profile.repeat_ratio,
-            freshness_half_life_days: profile.freshness_half_life_days,
-            momentum_artists: profile
-                .momentum_artists
-                .iter()
-                .map(|a| a.name.clone())
-                .collect(),
-            comfort_tags: profile.tag_comfort_zone.len(),
-            exploration_tags: profile.tag_exploration_zone.len(),
-        },
-        ..Default::default()
-    };
-
-    // Step 1: Generate candidates from each pipeline.
-    let mut source_sets: Vec<(&str, CandidateSet)> = Vec::new();
-
+    let mut sets = Vec::new();
     for generator in generators {
-        // Per-pipeline timeout: 2 minutes max
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3600),
-            generator.generate_candidates(profile, config),
-        )
-        .await;
-
-        let result = match result {
-            Ok(r) => r,
-            Err(_) => {
-                warn!("Generator '{}' timed out after 1h", generator.name());
-                report.pipeline_reports.push(PipelineReport {
-                    name: format!("{} (TIMEOUT)", generator.name()),
-                    signals: vec![],
-                    total_candidates: 0,
-                    mbid_failures: 0,
-                });
-                continue;
-            }
+        let name = generator.name();
+        let Ok(output) =
+            tokio::time::timeout(GENERATOR_TIMEOUT, generator.generate(profile, config)).await
+        else {
+            warn!("Generator '{name}' timed out after 1 h");
+            errors.record(generator.label(), "timed out after 1 h");
+            continue;
         };
-
-        match result {
-            Ok((set, signal_reports, mbid_failures)) => {
-                info!(
-                    "Generator '{}' produced {} candidates",
-                    generator.name(),
-                    set.len()
-                );
-                report.pipeline_reports.push(PipelineReport {
-                    name: generator.name().to_string(),
-                    signals: signal_reports,
-                    total_candidates: set.len(),
-                    mbid_failures,
-                });
-                source_sets.push((generator.name(), set));
-            }
-            Err(e) => {
-                warn!("Generator '{}' failed: {}", generator.name(), e);
-                report.pipeline_reports.push(PipelineReport {
-                    name: format!("{} (ERROR: {})", generator.name(), e),
-                    signals: vec![],
-                    total_candidates: 0,
-                    mbid_failures: 0,
-                });
-            }
+        info!(
+            "Generator '{}' produced {} candidates",
+            name,
+            output.candidates.len()
+        );
+        errors.extend(output.errors);
+        report.pipeline_reports.push(PipelineReport {
+            name: name.to_string(),
+            signals: output.signals,
+            total_candidates: output.candidates.len(),
+        });
+        if !output.candidates.is_empty() {
+            report.sources.push(generator.label().to_string());
+            sets.push((name, generator.weight(), output.candidates));
         }
     }
 
-    if source_sets.is_empty() {
-        warn!("No generators produced candidates");
-        report.duration_secs = start.elapsed().as_secs_f64();
-        return Ok((vec![], report));
-    }
-
-    // Step 2: Blend
-    let (mut blended, blend_summary) = blender::blend(source_sets, config);
-    info!("After blending: {} candidates", blended.len());
+    let (mut blended, blend_summary) = blender::blend(sets, config);
     report.blend_summary = blend_summary;
 
-    // Step 2.5: Enrich top candidates with release year from MusicBrainz
-    enrich_release_years(&mut blended, target_count * 3).await;
+    enrich(
+        &mut blended,
+        knowledge,
+        target_count * ENRICHED_PER_WANTED,
+        &mut errors,
+    )
+    .await;
 
-    // Step 3: Freshness
-    let known_artists = collect_known_artists(providers).await;
-    let freshness_summary =
-        freshness::apply_freshness(&mut blended, profile, &known_artists, config);
-    report.freshness_summary = freshness_summary;
+    report.freshness_summary = freshness::apply_freshness(&mut blended, config);
 
-    // Step 4: Diversify
     let (result, diversifier_summary) =
         diversifier::diversify(blended, profile, config, target_count);
     info!("Final recommendation: {} tracks", result.len());
     report.diversifier_summary = diversifier_summary;
 
+    report.source_errors = errors.into_vec();
+    for e in &report.source_errors {
+        warn!("{} failed {} times: {}", e.source, e.failures, e.message);
+    }
     report.final_count = result.len();
     report.duration_secs = start.elapsed().as_secs_f64();
-
-    Ok((result, report))
+    (result, report)
 }
 
-/// Build a user profile by merging data from all available providers, then run the pipeline.
-///
-/// Uses the first provider with meaningful data as the primary source, then
-/// enriches the profile with data from additional providers (extra genres,
-/// momentum artists, known artists/tracks).
-pub async fn build_and_recommend(
-    providers: &[Arc<dyn ScrobbleProvider>],
-    generators: &[Arc<dyn CandidateGenerator>],
-    _profile_provider: &dyn ScrobbleProvider,
-    config: &ProfileConfig,
-    target_count: usize,
-) -> Result<(UserMusicProfile, Vec<Candidate>, EngineReport)> {
-    let mut profile = UserMusicProfile::default();
-    let mut profile_sources: Vec<String> = Vec::new();
+fn profile_summary(profile: &UserMusicProfile) -> ProfileSummary {
+    ProfileSummary {
+        genre_count: profile.genre_distribution.len(),
+        top_genres: profile
+            .genre_distribution
+            .iter()
+            .take(5)
+            .map(|t| t.name.clone())
+            .collect(),
+        obscurity_score: profile.obscurity_score,
+        repeat_ratio: profile.repeat_ratio,
+        momentum_artists: profile
+            .momentum_artists
+            .iter()
+            .map(|a| a.name.clone())
+            .collect(),
+        comfort_tags: profile.tag_comfort_zone.len(),
+        exploration_tags: profile.tag_exploration_zone.len(),
+    }
+}
 
-    for provider in providers {
-        info!("Trying profile build from {}", provider.name());
-        match build_profile(provider.as_ref()).await {
-            Ok(p) if !p.genre_distribution.is_empty() || !p.momentum_artists.is_empty() => {
-                info!(
-                    "Profile built from {} with {} genres, {} momentum artists",
-                    provider.name(),
-                    p.genre_distribution.len(),
-                    p.momentum_artists.len()
-                );
-                if profile_sources.is_empty() {
-                    // First provider becomes the base profile
-                    profile = p;
-                } else {
-                    // Merge additional provider data into existing profile
-                    merge_profile(&mut profile, &p);
+/// Fills the release year, artist MBID, listener count and genre of the
+/// `count` best candidates from the knowledge. A failed read is recorded and
+/// leaves the candidates as they are. The release year needs a recording MBID,
+/// so a candidate whose source names the artist only (Deezer) gets none.
+async fn enrich(
+    candidates: &mut CandidateSet,
+    knowledge: &dyn MusicKnowledge,
+    count: usize,
+    errors: &mut SourceErrors,
+) {
+    let mut keys: Vec<String> = candidates.candidates.keys().cloned().collect();
+    keys.sort_by(|a, b| {
+        candidates.candidates[b]
+            .score
+            .total_cmp(&candidates.candidates[a].score)
+    });
+    let keys: HashSet<String> = keys.into_iter().take(count).collect();
+    let mut best: Vec<&mut Candidate> = candidates
+        .candidates
+        .iter_mut()
+        .filter(|(key, _)| keys.contains(*key))
+        .map(|(_, c)| c)
+        .collect();
+
+    let recordings = distinct(best.iter().filter_map(|c| c.mbid.clone()));
+    if !recordings.is_empty() {
+        match knowledge.recordings(&recordings).await {
+            Ok(facts) => {
+                for c in best.iter_mut() {
+                    let Some(f) = c.mbid.as_ref().and_then(|m| facts.get(m)) else {
+                        continue;
+                    };
+                    c.release_year = c.release_year.or(f.first_release_year);
+                    if c.artist_mbid.is_none() {
+                        c.artist_mbid.clone_from(&f.artist.mbid);
+                    }
                 }
-                profile_sources.push(provider.name().to_string());
             }
-            Ok(_) => {
-                info!("{} returned empty profile, skipping", provider.name());
-            }
-            Err(e) => {
-                warn!(
-                    "Profile build from {} failed: {}, skipping",
-                    provider.name(),
-                    e
-                );
-            }
+            Err(e) => errors.record(e.service(), &e),
         }
     }
 
-    let profile_source = if profile_sources.is_empty() {
-        "none".to_string()
-    } else {
-        profile_sources.join("+")
-    };
+    // A source that names the artist only, like Deezer, needs the MBID looked up
+    // to get a listener count and a genre.
+    let mut resolver = Resolver::new(knowledge);
+    for c in best.iter_mut() {
+        resolver.fill(&mut c.artist_mbid, &c.artist, errors).await;
+    }
 
-    let (recommendations, mut report) =
-        recommend(providers, generators, &profile, config, target_count).await?;
-    report.profile_source = profile_source;
-    Ok((profile, recommendations, report))
+    let artists = distinct(best.iter().filter_map(|c| c.artist_mbid.clone()));
+    if artists.is_empty() {
+        return;
+    }
+    match knowledge.artist_popularity(&artists).await {
+        Ok(users) => {
+            for c in best.iter_mut() {
+                if let Some(&n) = c.artist_mbid.as_ref().and_then(|m| users.get(m)) {
+                    c.artist_listener_count = Some(n);
+                }
+            }
+        }
+        Err(e) => errors.record(e.service(), &e),
+    }
+    match knowledge.artist_tags(&artists).await {
+        Ok(tags) => {
+            for c in best.iter_mut() {
+                let first = c
+                    .artist_mbid
+                    .as_ref()
+                    .and_then(|m| tags.get(m))
+                    .and_then(|t| t.first());
+                if let Some(tag) = first {
+                    c.primary_genre = Some(tag.name.clone());
+                }
+            }
+        }
+        Err(e) => errors.record(e.service(), &e),
+    }
 }
 
-/// Merge a secondary profile into the primary, adding new data without replacing.
-fn merge_profile(primary: &mut UserMusicProfile, secondary: &UserMusicProfile) {
-    // Merge genre distribution: add new genres, boost existing ones
-    let mut genre_map: HashMap<String, f64> = primary
-        .genre_distribution
-        .iter()
-        .map(|t| (t.name.clone(), t.weight))
-        .collect();
-    for tag in &secondary.genre_distribution {
-        let entry = genre_map.entry(tag.name.clone()).or_default();
-        *entry += tag.weight * 0.5; // secondary provider contributes at half weight
+/// Asks the knowledge once per name and run for the artist MBIDs histories
+/// and generators leave out.
+pub(crate) struct Resolver<'a> {
+    knowledge: &'a dyn MusicKnowledge,
+    answers: HashMap<String, Option<String>>,
+    failed: HashSet<String>,
+}
+
+impl<'a> Resolver<'a> {
+    pub(crate) fn new(knowledge: &'a dyn MusicKnowledge) -> Self {
+        Self {
+            knowledge,
+            answers: HashMap::new(),
+            failed: HashSet::new(),
+        }
     }
-    // Re-normalize
-    let total: f64 = genre_map.values().sum();
-    if total > 0.0 {
-        let mut tags: Vec<_> = genre_map
-            .into_iter()
-            .map(|(name, w)| shared::recommendation::WeightedTag {
-                name,
-                weight: w / total,
+
+    pub(crate) async fn fill(
+        &mut self,
+        mbid: &mut Option<String>,
+        name: &str,
+        errors: &mut SourceErrors,
+    ) {
+        if mbid.is_some() {
+            return;
+        }
+        let key = fold_name(name);
+        if self.failed.contains(&key) {
+            return;
+        }
+        if let Some(answer) = self.answers.get(&key) {
+            mbid.clone_from(answer);
+            return;
+        }
+        match self.knowledge.resolve_artist(name).await {
+            Ok(answer) => {
+                mbid.clone_from(&answer);
+                self.answers.insert(key, answer);
+            }
+            // A failed lookup is not "no such artist"; it is only skipped for this run.
+            Err(e) => {
+                errors.record(e.service(), &e);
+                self.failed.insert(key);
+            }
+        }
+    }
+}
+
+/// The values in their first-seen order, each once.
+fn distinct(values: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values.filter(|v| seen.insert(v.clone())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::GeneratorOutput;
+    use shared::recommendation::{EngineState, RecordingFacts, SourceErrors};
+
+    fn seeded() -> ProfileBuild {
+        ProfileBuild {
+            profile: UserMusicProfile {
+                seed_artists: vec![played("A", None, 5)],
+                ..Default::default()
+            },
+            sources: vec!["Navidrome".into()],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_profile_runs_no_generator_and_says_so() {
+        let (got, report) = recommend(
+            &ProfileBuild {
+                sources: vec!["Navidrome".into()],
+                ..Default::default()
+            },
+            &[fixed(
+                "catalog",
+                "Similar artists",
+                0.4,
+                &[("B", "b1", 1.0)],
+            )],
+            &FakeKnowledge::default(),
+            &balanced(),
+            50,
+        )
+        .await;
+        assert!(got.is_empty());
+        assert_eq!(
+            (report.state, report.sources.clone()),
+            (EngineState::NoListeningData, vec!["Navidrome".to_string()])
+        );
+        assert!(report.pipeline_reports.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_profile_with_a_failed_history_reports_the_failure_not_missing_data() {
+        let mut errors = SourceErrors::default();
+        errors.record("ListenBrainz", "ListenBrainz answered with a browser check");
+        let (got, report) = recommend(
+            &ProfileBuild {
+                errors,
+                ..Default::default()
+            },
+            &[fixed(
+                "catalog",
+                "Similar artists",
+                0.4,
+                &[("B", "b1", 1.0)],
+            )],
+            &FakeKnowledge::default(),
+            &balanced(),
+            50,
+        )
+        .await;
+        assert!(got.is_empty());
+        assert_eq!(report.state, EngineState::Recommended);
+        assert_eq!(
+            (report.source_errors.iter())
+                .map(|e| e.source.as_str())
+                .collect::<Vec<_>>(),
+            ["ListenBrainz"]
+        );
+        assert!(report.pipeline_reports.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_failing_source_does_not_sink_the_run() {
+        let mut errors = SourceErrors::default();
+        errors.record("ListenBrainz", "ListenBrainz is unavailable: down");
+        let account: Arc<dyn CandidateGenerator> = Arc::new(FixedGenerator {
+            name: "listenbrainz_account",
+            label: "Your recommendations",
+            weight: 0.2,
+            candidates: vec![],
+            errors,
+        });
+        let catalog = fixed(
+            "catalog",
+            "Similar artists",
+            0.4,
+            &[("B", "b1", 1.0), ("C", "c1", 0.8), ("D", "d1", 0.6)],
+        );
+        let (got, report) = recommend(
+            &seeded(),
+            &[catalog, account],
+            &FakeKnowledge::default(),
+            &balanced(),
+            50,
+        )
+        .await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(report.sources, ["Navidrome", "Similar artists"]);
+        assert_eq!(report.source_errors[0].source, "ListenBrainz");
+        assert_eq!(report.state, EngineState::Recommended);
+    }
+
+    /// A generator that never answers.
+    struct Stuck;
+
+    #[async_trait::async_trait]
+    impl CandidateGenerator for Stuck {
+        fn name(&self) -> &'static str {
+            "stuck"
+        }
+
+        fn label(&self) -> &'static str {
+            "Stuck radio"
+        }
+
+        fn weight(&self) -> f64 {
+            0.4
+        }
+
+        async fn generate(&self, _: &UserMusicProfile, _: &ProfileConfig) -> GeneratorOutput {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_generator_that_times_out_is_reported_under_its_label() {
+        let (_, report) = recommend(
+            &seeded(),
+            &[Arc::new(Stuck)],
+            &FakeKnowledge::default(),
+            &balanced(),
+            50,
+        )
+        .await;
+        let e = &report.source_errors[0];
+        assert_eq!(
+            (e.source.as_str(), e.message.as_str()),
+            ("Stuck radio", "timed out after 1 h")
+        );
+    }
+
+    #[tokio::test]
+    async fn release_years_and_popularity_come_from_the_knowledge() {
+        let mut found = candidate("catalog", "B", "b1", 1.0);
+        found.mbid = Some("r1".into());
+        let catalog: Arc<dyn CandidateGenerator> = Arc::new(FixedGenerator {
+            name: "catalog",
+            label: "Similar artists",
+            weight: 0.4,
+            candidates: vec![found],
+            errors: SourceErrors::default(),
+        });
+        let knowledge = FakeKnowledge {
+            recordings: [(
+                "r1",
+                RecordingFacts {
+                    title: "b1".into(),
+                    artist: artist("B", Some("b")),
+                    first_release_year: Some(2026),
+                },
+            )]
+            .into(),
+            users: [("b", 900)].into(),
+            tags: [("b", vec![tag("shoegaze", 1.0)])].into(),
+            ..Default::default()
+        };
+        let (got, report) = recommend(&seeded(), &[catalog], &knowledge, &balanced(), 50).await;
+        let c = &got[0];
+        assert_eq!(
+            (
+                c.release_year,
+                c.artist_mbid.as_deref(),
+                c.artist_listener_count,
+                c.primary_genre.as_deref()
+            ),
+            (Some(2026), Some("b"), Some(900), Some("shoegaze"))
+        );
+        assert!(report.source_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_candidate_without_mbids_is_resolved_by_name_and_penalised_like_the_others() {
+        let quiet = ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9"];
+        let mut candidates: Vec<Candidate> = quiet
+            .iter()
+            .map(|m| {
+                let mut c = candidate("deezer", m, "t", 1.0);
+                c.artist_mbid = Some(m.to_string());
+                c
             })
             .collect();
-        tags.sort_by(|a, b| {
-            b.weight
-                .partial_cmp(&a.weight)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        // Deezer names the artist only.
+        candidates.push(candidate("deezer", "Famous", "Hit", 1.0));
+        let deezer: Arc<dyn CandidateGenerator> = Arc::new(FixedGenerator {
+            name: "deezer",
+            label: "Deezer",
+            weight: 0.4,
+            candidates,
+            errors: SourceErrors::default(),
         });
-        primary.genre_distribution = tags;
-    }
-
-    // Merge momentum artists: add new ones not already present
-    let existing: HashSet<String> = primary
-        .momentum_artists
-        .iter()
-        .map(|a| a.name.to_lowercase())
-        .collect();
-    for ma in &secondary.momentum_artists {
-        if !existing.contains(&ma.name.to_lowercase()) {
-            primary.momentum_artists.push(ma.clone());
-        }
-    }
-    primary.momentum_artists.truncate(15);
-
-    // Merge known artists/tracks (union)
-    let mut known_artists: HashSet<String> = primary.known_artist_names.iter().cloned().collect();
-    known_artists.extend(secondary.known_artist_names.iter().cloned());
-    primary.known_artist_names = known_artists.into_iter().collect();
-
-    let mut known_tracks: HashSet<String> = primary.known_track_keys.iter().cloned().collect();
-    known_tracks.extend(secondary.known_track_keys.iter().cloned());
-    primary.known_track_keys = known_tracks.into_iter().collect();
-}
-
-/// Collect a set of known artist names (lowercased) from all providers.
-async fn collect_known_artists(providers: &[Arc<dyn ScrobbleProvider>]) -> HashSet<String> {
-    let mut known = HashSet::new();
-    for provider in providers {
-        match provider.get_top_artists(TimePeriod::AllTime, 200).await {
-            Ok(artists) => {
-                for a in artists {
-                    known.insert(a.name.to_lowercase());
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to fetch known artists from {}: {}",
-                    provider.name(),
-                    e
-                );
-            }
-        }
-    }
-    known
-}
-
-/// Enrich the top candidates with release year from MusicBrainz recording lookups.
-/// Only looks up candidates that have a recording MBID and no release_year yet.
-/// Limited to `max_lookups` to keep API calls bounded.
-async fn enrich_release_years(candidates: &mut CandidateSet, max_lookups: usize) {
-    let client = crate::http::build_client("soulful/0.1 (https://github.com/soulful)");
-
-    // Sort by score descending and only enrich the top candidates
-    let mut by_score: Vec<String> = candidates.candidates.keys().cloned().collect();
-    by_score.sort_by(|a, b| {
-        let sa = candidates.candidates.get(a).map(|c| c.score).unwrap_or(0.0);
-        let sb = candidates.candidates.get(b).map(|c| c.score).unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut lookups = 0usize;
-    for key in by_score {
-        if lookups >= max_lookups {
-            break;
-        }
-        let candidate = match candidates.candidates.get(&key) {
-            Some(c) => c,
-            None => continue,
+        let knowledge = FakeKnowledge {
+            mbids: [("famous", "f")].into(),
+            users: quiet
+                .iter()
+                .zip(1..)
+                .map(|(m, n)| (*m, n))
+                .chain([("f", 1_000_000)])
+                .collect(),
+            tags: [("f", vec![tag("pop", 1.0)])].into(),
+            ..Default::default()
         };
-        if candidate.release_year.is_some() {
-            continue;
-        }
-        let mbid = match &candidate.mbid {
-            Some(id) if !id.is_empty() => id.clone(),
-            _ => continue,
-        };
-
-        lookups += 1;
-        if let Ok(Some(info)) = crate::http::cached_recording_lookup(&client, &mbid).await {
-            if let Some(year) = info.release_year {
-                if let Some(c) = candidates.candidates.get_mut(&key) {
-                    c.release_year = Some(year);
-                }
-            }
-        }
-    }
-
-    if lookups > 0 {
-        let filled = candidates
-            .candidates
-            .values()
-            .filter(|c| c.release_year.is_some())
-            .count();
-        info!(
-            "Release year enrichment: {} lookups, {} candidates now have years",
-            lookups, filled
+        let (got, report) = recommend(&seeded(), &[deezer], &knowledge, &balanced(), 50).await;
+        let famous = got.iter().find(|c| c.artist == "Famous").unwrap();
+        let quiet_score = got.iter().find(|c| c.artist == "q1").unwrap().score;
+        assert_eq!(
+            (
+                famous.artist_mbid.as_deref(),
+                famous.artist_listener_count,
+                famous.primary_genre.as_deref()
+            ),
+            (Some("f"), Some(1_000_000), Some("pop"))
         );
+        assert_eq!(report.diversifier_summary.popularity_penalized, 1);
+        assert!(famous.score < quiet_score);
+    }
+
+    #[tokio::test]
+    async fn a_failed_enrichment_is_reported_and_the_candidates_stay() {
+        let knowledge = FakeKnowledge {
+            failing: ["artist_popularity".to_string()].into(),
+            users: [("b", 900)].into(),
+            ..Default::default()
+        };
+        let mut found = candidate("catalog", "B", "b1", 1.0);
+        found.artist_mbid = Some("b".into());
+        let catalog: Arc<dyn CandidateGenerator> = Arc::new(FixedGenerator {
+            name: "catalog",
+            label: "Similar artists",
+            weight: 0.4,
+            candidates: vec![found],
+            errors: SourceErrors::default(),
+        });
+        let (got, report) = recommend(&seeded(), &[catalog], &knowledge, &balanced(), 50).await;
+        assert_eq!((got.len(), got[0].artist_listener_count), (1, None));
+        assert_eq!(report.source_errors[0].source, "ListenBrainz Labs");
     }
 }

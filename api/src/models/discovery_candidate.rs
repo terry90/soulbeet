@@ -35,13 +35,15 @@ impl From<DiscoveryCandidateRow> for Candidate {
             artist_listener_count: None,
             primary_genre: None,
             release_year: None,
+            artist_mbid: None,
         }
     }
 }
 
 #[cfg(feature = "server")]
 impl DiscoveryCandidateRow {
-    pub async fn upsert_batch(
+    pub(crate) async fn upsert_batch_in(
+        conn: &mut sqlx::SqliteConnection,
         user_id: &str,
         profile: &str,
         candidates: &[Candidate],
@@ -65,7 +67,7 @@ impl DiscoveryCandidateRow {
             .bind(&signals)
             .bind(&c.source)
             .bind(profile)
-            .execute(&*DB)
+            .execute(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
         }
@@ -77,13 +79,22 @@ impl DiscoveryCandidateRow {
         profile: &str,
         limit: u32,
     ) -> Result<Vec<Candidate>, String> {
+        Self::get_unused_in(&DB, user_id, profile, limit).await
+    }
+
+    pub(crate) async fn get_unused_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        profile: &str,
+        limit: u32,
+    ) -> Result<Vec<Candidate>, String> {
         let rows = sqlx::query_as::<_, Self>(
             "SELECT * FROM discovery_candidates WHERE user_id = ? AND profile = ? AND used = 0 ORDER BY score DESC LIMIT ?",
         )
         .bind(user_id)
         .bind(profile)
         .bind(limit)
-        .fetch_all(&*DB)
+        .fetch_all(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -117,11 +128,15 @@ impl DiscoveryCandidateRow {
         Ok(())
     }
 
-    pub async fn clear_for_user_profile(user_id: &str, profile: &str) -> Result<(), String> {
+    pub(crate) async fn clear_for_user_profile_in(
+        conn: &mut sqlx::SqliteConnection,
+        user_id: &str,
+        profile: &str,
+    ) -> Result<(), String> {
         sqlx::query("DELETE FROM discovery_candidates WHERE user_id = ? AND profile = ?")
             .bind(user_id)
             .bind(profile)
-            .execute(&*DB)
+            .execute(conn)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())

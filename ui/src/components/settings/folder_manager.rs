@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 use super::panel::{
     ListRow, LoadError, Loading, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS,
 };
+use super::toggle::{save_switch, Toggle};
 use crate::auth::use_auth;
 use crate::{friendly_error, FieldLook, TextInput};
 
@@ -24,10 +25,10 @@ pub fn FolderManager() -> Element {
     // Library settings state
     let mut auto_delete_enabled = use_signal(|| false);
     let mut discovery_promote_threshold = use_signal(|| "3".to_string());
-    let mut lastfm_api_key = use_signal(String::new);
-    let mut lastfm_username = use_signal(String::new);
     let mut lb_username = use_signal(String::new);
     let mut lb_token = use_signal(String::new);
+    let mut deezer_recommendations = use_signal(|| false);
+    let library_error = use_signal(String::new);
 
     // Discovery settings state
     let mut discovery_enabled = use_signal(|| false);
@@ -50,8 +51,6 @@ pub fn FolderManager() -> Element {
         if let Some(Ok(user_settings)) = &*settings_resource.read() {
             auto_delete_enabled.set(user_settings.auto_delete_enabled);
             discovery_promote_threshold.set(user_settings.discovery_promote_threshold.to_string());
-            lastfm_api_key.set(user_settings.lastfm_api_key.clone().unwrap_or_default());
-            lastfm_username.set(user_settings.lastfm_username.clone().unwrap_or_default());
             lb_username.set(
                 user_settings
                     .listenbrainz_username
@@ -59,6 +58,7 @@ pub fn FolderManager() -> Element {
                     .unwrap_or_default(),
             );
             lb_token.set(user_settings.listenbrainz_token.clone().unwrap_or_default());
+            deezer_recommendations.set(user_settings.deezer_recommendations);
             discovery_enabled.set(user_settings.discovery_enabled);
             discovery_folder_id.set(
                 user_settings
@@ -274,6 +274,7 @@ pub fn FolderManager() -> Element {
 
         // Library Settings
         Panel { title: "Library Settings",
+            Messages { error: library_error() }
             match &*settings_resource.read() {
                 None => rsx! { Loading {} },
                 Some(Err(e)) => rsx! {
@@ -285,7 +286,7 @@ pub fn FolderManager() -> Element {
                     div {
                         h3 { class: "text-sm font-semibold text-white mb-3", "Discovery" }
                         p { class: "text-xs text-gray-500 font-mono mb-4",
-                            "Automatically download new tracks for listening based on your scrobble history."
+                            "Automatically download new tracks based on what you play and star in Navidrome, plus your ListenBrainz listens when a username is saved."
                         }
                         div { class: "space-y-3",
                             // Enable/disable toggle
@@ -296,26 +297,15 @@ pub fn FolderManager() -> Element {
                                         "Periodically generate a playlist of new tracks to try"
                                     }
                                 }
-                                button {
-                                    class: format!(
-                                        "relative w-11 h-6 rounded-full cursor-pointer transition-colors {}",
-                                        if discovery_enabled() { "bg-beet-leaf" } else { "bg-gray-600" }
-                                    ),
-                                    onclick: move |_| async move {
-                                        let new_val = !discovery_enabled();
-                                        discovery_enabled.set(new_val);
-                                        let update = api::UpdateUserSettings {
-                                            discovery_enabled: Some(new_val),
+                                Toggle {
+                                    on: discovery_enabled(),
+                                    on_class: "bg-beet-leaf",
+                                    onclick: move |_| save_switch(discovery_enabled, library_error, |on| {
+                                        api::update_user_settings(api::UpdateUserSettings {
+                                            discovery_enabled: Some(on),
                                             ..Default::default()
-                                        };
-                                        let _ = api::update_user_settings(update).await;
-                                    },
-                                    span {
-                                        class: format!(
-                                            "absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform {}",
-                                            if discovery_enabled() { "translate-x-5" } else { "" }
-                                        ),
-                                    }
+                                        })
+                                    }),
                                 }
                             }
 
@@ -487,55 +477,6 @@ pub fn FolderManager() -> Element {
                         }
                     }
 
-                    // Last.fm
-                    div { class: "p-3 bg-beet-dark rounded border border-white/10",
-                        p { class: "text-sm text-white font-medium mb-2", "Last.fm" }
-                        div { class: "space-y-3",
-                            div {
-                                label { class: LABEL_CLASS, "Username" }
-                                input {
-                                    class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
-                                    value: "{lastfm_username}",
-                                    oninput: move |e| lastfm_username.set(e.value()),
-                                    onchange: move |_| async move {
-                                        let update = api::UpdateUserSettings {
-                                            lastfm_username: Some(lastfm_username()),
-                                            ..Default::default()
-                                        };
-                                        let _ = api::update_user_settings(update).await;
-                                    },
-                                    placeholder: "Your Last.fm username",
-                                }
-                            }
-                            div {
-                                label { class: LABEL_CLASS, "API Key" }
-                                input {
-                                    class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
-                                    value: "{lastfm_api_key}",
-                                    oninput: move |e| lastfm_api_key.set(e.value()),
-                                    onchange: move |_| async move {
-                                        let update = api::UpdateUserSettings {
-                                            lastfm_api_key: Some(lastfm_api_key()),
-                                            ..Default::default()
-                                        };
-                                        let _ = api::update_user_settings(update).await;
-                                    },
-                                    placeholder: "Enter Last.fm API key",
-                                    "type": "password",
-                                }
-                                p { class: "text-xs text-gray-500 font-mono mt-1",
-                                    "Get one at "
-                                    a {
-                                        href: "https://www.last.fm/api/account/create",
-                                        target: "_blank",
-                                        class: "text-beet-accent hover:underline",
-                                        "last.fm/api"
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     // ListenBrainz credentials
                     div { class: "p-3 bg-beet-dark rounded border border-white/10",
                         div {
@@ -554,11 +495,14 @@ pub fn FolderManager() -> Element {
                                 placeholder: "Enter ListenBrainz username",
                                 "type": "text",
                             }
+                            p { class: "text-xs text-gray-500 font-mono mt-2",
+                                "Your ListenBrainz history joins your Navidrome plays for recommendations."
+                            }
                         }
                         div { class: "mt-3",
-                            p { class: "text-sm text-white font-medium mb-1", "ListenBrainz Token" }
+                            p { class: "text-sm text-white font-medium mb-1", "ListenBrainz Token (optional)" }
                             p { class: "text-xs text-gray-500 font-mono mb-2",
-                                "Configure scrobbling in your Navidrome personal settings."
+                                "Not needed. With it, artist top tracks come from ListenBrainz's own ranking and ListenBrainz allows more requests."
                             }
                             input {
                                 class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
@@ -575,8 +519,25 @@ pub fn FolderManager() -> Element {
                                 "type": "password",
                             }
                         }
-                        p { class: "text-xs text-gray-500 font-mono mt-3",
-                            "Set up scrobbling in your Navidrome personal settings to feed the recommendation engine."
+                    }
+
+                    // Deezer recommendations
+                    div { class: "flex items-center justify-between p-3 bg-beet-dark rounded border border-white/10",
+                        div {
+                            p { class: "text-sm text-white font-medium", "Also use Deezer for recommendations" }
+                            p { class: "text-xs text-gray-500 font-mono mt-0.5",
+                                "Sends the names of artists you play to Deezer. Deezer has not approved this use."
+                            }
+                        }
+                        Toggle {
+                            on: deezer_recommendations(),
+                            on_class: "bg-beet-leaf",
+                            onclick: move |_| save_switch(deezer_recommendations, library_error, |on| {
+                                api::update_user_settings(api::UpdateUserSettings {
+                                    deezer_recommendations: Some(on),
+                                    ..Default::default()
+                                })
+                            }),
                         }
                     }
 
@@ -588,26 +549,15 @@ pub fn FolderManager() -> Element {
                                 "Automatically delete files rated 1 star in Navidrome during sync"
                             }
                         }
-                        button {
-                            class: format!(
-                                "relative w-11 h-6 rounded-full cursor-pointer transition-colors {}",
-                                if auto_delete_enabled() { "bg-red-500" } else { "bg-gray-600" }
-                            ),
-                            onclick: move |_| async move {
-                                let new_val = !auto_delete_enabled();
-                                auto_delete_enabled.set(new_val);
-                                let update = api::UpdateUserSettings {
-                                    auto_delete_enabled: Some(new_val),
+                        Toggle {
+                            on: auto_delete_enabled(),
+                            on_class: "bg-red-500",
+                            onclick: move |_| save_switch(auto_delete_enabled, library_error, |on| {
+                                api::update_user_settings(api::UpdateUserSettings {
+                                    auto_delete_enabled: Some(on),
                                     ..Default::default()
-                                };
-                                let _ = api::update_user_settings(update).await;
-                            },
-                            span {
-                                class: format!(
-                                    "absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform {}",
-                                    if auto_delete_enabled() { "translate-x-5" } else { "" }
-                                ),
-                            }
+                                })
+                            }),
                         }
                     }
 

@@ -842,6 +842,32 @@ impl NavidromeClient {
         Ok(SongPage { songs, total })
     }
 
+    /// Every present song, read `SONG_PAGE` at a time through `list_songs` until a short page.
+    /// A song seen again on a later page (the order shifted while reading) is kept once, in
+    /// first-seen order; `total` is the count the last page reported, so a caller checks that
+    /// it read as many.
+    pub async fn all_songs(&self) -> Result<SongPage> {
+        let mut songs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut start = 0;
+        loop {
+            let page = self.list_songs(start, start + SONG_PAGE).await?;
+            let short = page.songs.len() < SONG_PAGE as usize;
+            for song in page.songs {
+                if seen.insert(song.id.clone()) {
+                    songs.push(song);
+                }
+            }
+            if short {
+                return Ok(SongPage {
+                    songs,
+                    total: page.total,
+                });
+            }
+            start += SONG_PAGE;
+        }
+    }
+
     /// Present songs (missing=false), the one Navidrome added last first, rows `start` to `end`
     /// (exclusive). The `created_at` sort is `media_file.created_at`
     /// (persistence/mediafile_repository.go:100 in 0.64.2), set when a file is first stored
@@ -916,6 +942,20 @@ impl NavidromeClient {
         Ok(Some(users.into_iter().map(|u| u.user_name).collect()))
     }
 
+    /// Every artist row this user can see, in one request (`GET /api/artist`,
+    /// server/nativeapi/artists.go:17-29 in 0.64.2, `artistRepository.ReadAll`). A non-admin
+    /// sees the artists of their libraries (persistence/artist_repository.go:191-205). No
+    /// `_end` is sent, so the list is not cut short, as for `user_names`; one answer also
+    /// cannot shift between pages.
+    pub async fn list_artists(&self) -> Result<Vec<NativeArtist>> {
+        let url = self.base_url.join("api/artist")?;
+        let resp = self.native_request(self.client.get(url)).await?;
+        if !resp.status().is_success() {
+            return Err(native_failure("List artists", resp).await);
+        }
+        resp.json().await.map_err(parse)
+    }
+
     /// The native song list for `query`; a non-success status is an Http error of `action`.
     async fn native_songs(
         &self,
@@ -987,6 +1027,9 @@ pub enum StarTarget<'a> {
     Song(&'a str),
     Album(&'a str),
 }
+
+/// Songs `all_songs` reads in one request.
+pub const SONG_PAGE: u32 = 1000;
 
 /// A page of list_songs: its songs, and how many present songs Navidrome counted.
 #[derive(Debug)]
@@ -1218,6 +1261,42 @@ mod tests {
             seen.lock().unwrap()[1].target,
             "/api/song?_start=100&_end=200&_sort=created_at&_order=DESC&missing=false"
         );
+    }
+
+    #[tokio::test]
+    async fn artists_are_listed_whole_with_their_mbids() {
+        // model/artist.go in 0.64.2: mbzArtistId is omitempty.
+        let artists = r#"[{"id":"2kD9pWq4ZxC1vBnM6yTjLs","name":"Marrow Choir","orderArtistName":"marrow choir",
+        "mbzArtistId":"4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a","stats":{"albumartist":{"songCount":12,"albumCount":1,"size":341200231},
+        "artist":{"songCount":12,"albumCount":1,"size":341200231}},"size":341200231,"albumCount":1,"songCount":12,
+        "missing":false,"createdAt":"2026-11-01T18:20:07.551902337+01:00","updatedAt":"2026-11-01T18:20:07.551902337+01:00"},
+        {"id":"7fH3jKl9QwE2rT5yU8iOpA","name":"Vela Norte","orderArtistName":"vela norte","missing":false}]"#;
+        let (url, seen) = serve(vec![
+            Reply {
+                status: 200,
+                body: r#"{"token":"jwt"}"#.into(),
+            },
+            Reply {
+                status: 200,
+                body: artists.into(),
+            },
+        ]);
+        let listed = client(&url).list_artists().await.unwrap();
+        let got: Vec<(&str, Option<&str>)> = listed
+            .iter()
+            .map(|a| (a.id.as_str(), a.mbz_artist_id.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "2kD9pWq4ZxC1vBnM6yTjLs",
+                    Some("4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a")
+                ),
+                ("7fH3jKl9QwE2rT5yU8iOpA", None)
+            ]
+        );
+        assert_eq!(seen.lock().unwrap()[1].target, "/api/artist");
     }
 
     #[tokio::test]
@@ -2383,6 +2462,37 @@ mod tests {
         assert!(
             matches!(&err, NavidromeError::Http { action: "List songs", status: 502, body: None, raw: Some(r) } if r == BAD_GATEWAY),
             "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_songs_reads_pages_until_a_short_one() {
+        let inner = &NATIVE_SONG[1..NATIVE_SONG.len() - 1];
+        let page = |ids: Vec<String>| {
+            let songs: Vec<String> = ids
+                .iter()
+                .map(|id| inner.replace("3sG8kPq0WmZ1xYbN4vTcDe", id))
+                .collect();
+            format!("[{}]", songs.join(","))
+        };
+        let first = page((0..1000).map(|i| format!("s{i}")).collect());
+        let second = page(vec!["s999".into(), "s1000".into()]);
+        let (url, seen) = serve_with_headers(vec![
+            (reply(LOGIN), vec![]),
+            (reply(first), vec![("X-Total-Count", "1001".into())]),
+            (reply(second), vec![("X-Total-Count", "1001".into())]),
+        ]);
+        let all = client(&url).all_songs().await.unwrap();
+        assert_eq!((all.songs.len(), all.total), (1001, 1001));
+        assert_eq!(all.songs[1000].id, "s1000");
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[1].target,
+            "/api/song?_start=0&_end=1000&_sort=recently_added&_order=ASC&missing=false"
+        );
+        assert_eq!(
+            seen[2].target,
+            "/api/song?_start=1000&_end=2000&_sort=recently_added&_order=ASC&missing=false"
         );
     }
 

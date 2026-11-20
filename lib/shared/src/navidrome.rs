@@ -143,6 +143,18 @@ pub struct DiscoveryConfig {
     pub profiles: String,
     pub playlist_names: std::collections::HashMap<String, String>,
     pub last_generated_at: Option<String>,
+    #[serde(default)]
+    pub last_run: Option<LastRun>,
+}
+
+/// What the user's latest recommendation run found: whether there was listening data, the
+/// sources it used and the ones that failed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LastRun {
+    pub created_at: String,
+    pub state: crate::recommendation::EngineState,
+    pub sources: Vec<String>,
+    pub source_errors: Vec<crate::recommendation::SourceError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

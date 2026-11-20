@@ -28,32 +28,6 @@ pub async fn update_user_settings(
         .map_err(failure_error)
 }
 
-/// Get list of available metadata providers
-#[get("/api/settings/providers", auth: AuthSession)]
-pub async fn get_metadata_providers() -> Result<Vec<ProviderInfo>, ServerFnError> {
-    use crate::services::{available_metadata_providers, providers, usable_lastfm_key};
-
-    let user_settings = UserSettings::get(&auth.0.user_id)
-        .await
-        .map_err(server_error)?;
-    let key = user_settings.lastfm_api_key.as_deref();
-    Ok(available_metadata_providers()
-        .into_iter()
-        .map(|(id, name)| ProviderInfo {
-            id: id.to_string(),
-            name: name.to_string(),
-            available: id != providers::LASTFM || usable_lastfm_key(key).is_some(),
-        })
-        .collect())
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ProviderInfo {
-    pub id: String,
-    pub name: String,
-    pub available: bool,
-}
-
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub struct AppConfigValues {
     pub slskd_url: Option<String>,

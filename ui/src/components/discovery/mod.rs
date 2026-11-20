@@ -1,5 +1,8 @@
 use dioxus::prelude::*;
-use shared::navidrome::{DiscoveryProgress, DiscoveryStatus, GenerationStatus, ProfilePhase};
+use shared::navidrome::{
+    DiscoveryProgress, DiscoveryStatus, GenerationStatus, LastRun, ProfilePhase,
+};
+use shared::recommendation::{EngineState, NO_LISTENING_DATA};
 use shared::system::NavidromeStatus;
 
 use crate::friendly_error;
@@ -156,6 +159,9 @@ pub fn DiscoveryOverview() -> Element {
                                                 }
                                             }
                                         }
+                                        if let Some(run) = cfg.last_run.clone() {
+                                            LastRunLine { run }
+                                        }
                                         if let Some(ref ts) = cfg.last_generated_at {
                                             {
                                                 let ago = format_relative_time(ts);
@@ -193,6 +199,22 @@ pub fn DiscoveryOverview() -> Element {
             }
 
             EngineReportView {}
+        }
+    }
+}
+
+#[component]
+fn LastRunLine(run: LastRun) -> Element {
+    let used = run.sources.join(", ");
+    rsx! {
+        if run.state == EngineState::NoListeningData {
+            p { class: "text-beet-accent text-xs font-mono mt-1", "{NO_LISTENING_DATA}" }
+        } else if !run.sources.is_empty() {
+            // A run that failed before recommending used no source.
+            p { class: "text-gray-400 text-xs font-mono mt-1", "Last run used: {used}" }
+        }
+        for e in &run.source_errors {
+            p { class: "text-red-400 text-xs font-mono", "{e.source} failed: {e.message}" }
         }
     }
 }
@@ -545,5 +567,54 @@ fn DiscoveryTrackList() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::recommendation::SourceError;
+
+    fn render_run(run: LastRun) -> String {
+        let mut dom = VirtualDom::new_with_props(|run: LastRun| rsx! { LastRunLine { run } }, run);
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_last_run_line_names_sources_failures_and_the_empty_state() {
+        let run = LastRun {
+            created_at: "2026-11-19 10:00:00".into(),
+            state: EngineState::Recommended,
+            sources: vec!["Navidrome".into(), "ListenBrainz similar artists".into()],
+            source_errors: vec![SourceError {
+                source: "Deezer".into(),
+                message: "Deezer kept refusing for too many requests".into(),
+                failures: 3,
+            }],
+        };
+        let html = render_run(run.clone());
+        assert!(html.contains("Last run used: Navidrome, ListenBrainz similar artists"));
+        assert!(html.contains("Deezer failed: Deezer kept refusing for too many requests"));
+        let empty = LastRun {
+            state: EngineState::NoListeningData,
+            sources: vec![],
+            ..run.clone()
+        };
+        let html = render_run(empty);
+        assert!(html.contains("No listening data yet. Play or star music in Navidrome."));
+        assert!(html.contains("Deezer failed: Deezer kept refusing for too many requests"));
+        let unread = LastRun {
+            sources: vec![],
+            source_errors: vec![SourceError {
+                source: "Navidrome".into(),
+                message: "Discovery needs your Navidrome library".into(),
+                failures: 1,
+            }],
+            ..run
+        };
+        let html = render_run(unread);
+        assert!(!html.contains("Last run used"));
+        assert!(html.contains("Navidrome failed: Discovery needs your Navidrome library"));
     }
 }
