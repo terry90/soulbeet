@@ -286,7 +286,7 @@ pub fn FolderManager() -> Element {
                     div {
                         h3 { class: "text-sm font-semibold text-white mb-3", "Discovery" }
                         p { class: "text-xs text-gray-500 font-mono mb-4",
-                            "Automatically download new tracks for listening based on your scrobble history."
+                            "Automatically download new tracks based on what you play and star in Navidrome, plus your ListenBrainz listens when a username is saved."
                         }
                         div { class: "space-y-3",
                             // Enable/disable toggle
