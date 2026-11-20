@@ -143,16 +143,26 @@ test('links single sign-on from Settings, then signs in with it', async ({ page 
   const local = await currentUser(page);
   await page.goto('/');
   await openAccountSettings(page);
-  await page.getByRole('button', { name: 'Link single sign-on' }).click();
 
-  // The provider is asked for a new sign-in, so the identity linked is the
-  // one the user signs in with there, not a session left open in the browser.
+  // A session left open is not enough: linking takes the account's password.
+  const link = page.getByRole('button', { name: 'Link single sign-on' });
+  await page.getByLabel('Current password').fill('not-the-password');
+  await link.click();
+  await expect(page.getByText('Wrong password.')).toBeVisible();
+  await expect(page).toHaveURL(/\/settings$/);
+  await page.getByLabel('Current password').fill(user.password);
+  await link.click();
+
+  // The provider is asked for a new sign-in, and Settings shows which
+  // identity was linked so the user can check it.
   await expect(page.locator('input[name="prompt"]')).toHaveValue('login');
   // Whatever name the provider gives, the session decides the account.
   const subject = randomUUID();
-  await approveAtProvider(page, { username: uniqueUser('elsewhere').username, subject });
+  const nameAtProvider = uniqueUser('elsewhere').username;
+  await approveAtProvider(page, { username: nameAtProvider, subject });
   await expect(page).toHaveURL(/\/settings$/);
   await expect(page.getByText('Single sign-on is linked to this account.')).toBeVisible();
+  await expect(page.getByText(`Linked to ${nameAtProvider} at Stub ID.`)).toBeVisible();
   // The link signed the account out elsewhere, and this browser in again.
   expect((await currentUser(page)).user_id).toBe(local.user_id);
   expect(await flowCookies(page.context())).toEqual([]);
