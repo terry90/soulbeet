@@ -51,3 +51,16 @@ pub(super) fn identity_at(issuer: &str, subject: &str, username: &str) -> Identi
         username: username.to_string(),
     }
 }
+
+/// A JSON object of exactly `len` bytes that reads as a token response.
+pub(super) fn json_of_size(len: usize) -> Vec<u8> {
+    let frame = br#"{"id_token":""}"#.len();
+    format!(r#"{{"id_token":"{}"}}"#, "a".repeat(len - frame)).into_bytes()
+}
+
+/// `bytes` sent in chunks, without a Content-Length to tell their size.
+pub(super) fn streamed(bytes: Vec<u8>) -> axum::body::Body {
+    let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+        bytes.chunks(64 * 1024).map(|c| Ok(c.to_vec())).collect();
+    axum::body::Body::from_stream(futures::stream::iter(chunks))
+}

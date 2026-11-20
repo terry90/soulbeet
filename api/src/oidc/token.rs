@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::flow::Flow;
 use super::loggable;
-use super::provider::{ClientAuth, Provider, HTTP};
+use super::provider::{capped_body, ClientAuth, Provider, HTTP};
 use crate::config::OidcConfig;
 use crate::models::user::username_fits;
 
@@ -72,15 +72,16 @@ pub(super) async fn exchange_code(
         .await
         .map_err(|e| format!("token request failed: {e}"))?;
     let status = response.status();
+    let body = capped_body(response).await;
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let body: String = body.chars().take(300).collect();
+        let body = match body {
+            Ok(body) => String::from_utf8_lossy(&body).chars().take(300).collect(),
+            Err(e) => e,
+        };
         return Err(format!("the token endpoint answered {status}: {body}"));
     }
 
-    response
-        .json::<TokenResponse>()
-        .await
+    serde_json::from_slice::<TokenResponse>(&body.map_err(|e| format!("token response: {e}"))?)
         .map_err(|e| format!("unexpected token response: {e}"))?
         .id_token
         .ok_or_else(|| "the token response has no id_token".to_string())
@@ -281,9 +282,53 @@ impl Identity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oidc::testing::{identity_at, test_config, test_provider, ISSUER};
+    use crate::connection::test_util::serve_on_loopback;
+    use crate::oidc::flow::{new_flow, Purpose, Start};
+    use crate::oidc::provider::MAX_BODY;
+    use crate::oidc::testing::{
+        identity_at, json_of_size, streamed, test_config, test_provider, ISSUER,
+    };
+    use axum::http::{header::HOST, HeaderMap, StatusCode, Uri};
+    use axum::{routing::post, Router};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_token_response_past_the_limit_is_refused() {
+        let app = Router::new()
+            .route(
+                "/token",
+                post(|| async { streamed(json_of_size(MAX_BODY + 1)) }),
+            )
+            .route(
+                "/refused",
+                post(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        streamed(json_of_size(MAX_BODY + 1)),
+                    )
+                }),
+            );
+        let (addr, _server) = serve_on_loopback(app).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "soulbeet.example.com".parse().unwrap());
+        let start = Start::for_request(None, None, &headers, &Uri::from_static("/")).unwrap();
+        let flow = &new_flow(Purpose::SignIn { return_to: None }, &start);
+        let exchange = |path: &str| {
+            let provider = Provider {
+                token_endpoint: url::Url::parse(&format!("http://{addr}{path}")).unwrap(),
+                ..test_provider()
+            };
+            async move { exchange_code(&provider, &test_config(), "code", flow).await }
+        };
+
+        let refused = exchange("/token").await.unwrap_err();
+        assert!(refused.contains("larger than"), "{refused}");
+        // An error answer names its status, without its body read whole.
+        let refused = exchange("/refused").await.unwrap_err();
+        assert!(refused.contains("400"), "{refused}");
+        assert!(refused.contains("larger than"), "{refused}");
+    }
 
     fn claims(value: Value) -> IdClaims {
         serde_json::from_value(value).unwrap()

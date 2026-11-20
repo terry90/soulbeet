@@ -19,6 +19,9 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 /// concurrent sign-ins after a key rotation fetch once.
 const REFRESH_MIN_AGE: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most a discovery document, key set or token response may weigh. They
+/// are a few kilobytes; a provider sending more is broken.
+pub(super) const MAX_BODY: usize = 1024 * 1024;
 
 pub(super) static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -235,17 +238,66 @@ async fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
             "GET {url} redirected to {location}; set OIDC_ISSUER_URL to the issuer's final URL"
         ));
     }
-    response
-        .json()
+    let body = capped_body(response)
         .await
-        .map_err(|e| format!("GET {url} returned an unexpected body: {e}"))
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    serde_json::from_slice(&body).map_err(|e| format!("GET {url} returned an unexpected body: {e}"))
+}
+
+/// The body of `response`, refused once it is larger than [`MAX_BODY`]
+/// rather than read whole.
+pub(super) async fn capped_body(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let too_large = || format!("the body is larger than {} KiB", MAX_BODY / 1024);
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BODY as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("cannot read the body: {e}"))?
+    {
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oidc::testing::{test_provider, TEST_KEY_X};
+    use crate::connection::test_util::serve_on_loopback;
+    use crate::oidc::testing::{json_of_size, streamed, test_provider, TEST_KEY_X};
+    use axum::{routing::get, Router};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_body_past_the_limit_is_refused() {
+        let app = Router::new()
+            .route(
+                "/at-limit",
+                get(|| async { streamed(json_of_size(MAX_BODY)) }),
+            )
+            .route("/sized", get(|| async { json_of_size(MAX_BODY + 1) }))
+            .route(
+                "/streamed",
+                get(|| async { streamed(json_of_size(MAX_BODY + 1)) }),
+            );
+        let (addr, _server) = serve_on_loopback(app).await;
+        let url = |path: &str| format!("http://{addr}{path}");
+
+        assert!(get_json::<Value>(&url("/at-limit")).await.is_ok());
+        // Refused from its Content-Length, or once the chunks read pass it.
+        for path in ["/sized", "/streamed"] {
+            let refused = get_json::<Value>(&url(path)).await.unwrap_err();
+            assert!(refused.contains("larger than"), "{path}: {refused}");
+        }
+    }
 
     #[test]
     fn a_key_the_library_cannot_read_is_skipped_not_the_whole_set() {
