@@ -65,36 +65,35 @@ test('creates an account on first sign-in and keeps it when the username changes
   expect(await currentUser(page)).toEqual(first);
 });
 
-test('links an existing password account by username, once', async ({ page }) => {
-  const user = uniqueUser('sso-link');
+test('refuses a first sign-in under the name of an existing account', async ({ page }) => {
+  const user = uniqueUser('sso-taken');
   await registerUser(page.context().request, user);
   await loginViaApi(page.context(), user);
   const local = await currentUser(page);
   await page.context().clearCookies();
 
-  await signInWithSso(page, { username: user.username, subject: randomUUID() });
-  await expect(page).toHaveURL(/\/$/);
-  expect((await currentUser(page)).user_id).toBe(local.user_id);
+  // Whatever the letter case, the name proves nothing: the owner links it from Settings.
+  for (const username of [user.username, user.username.toUpperCase()]) {
+    await signInWithSso(page, { username, subject: randomUUID() });
+    await expect(page).toHaveURL(/\/login\/error\/account_exists$/);
+    await expect(page.getByText('link single sign-on in Settings')).toBeVisible();
+    expect((await page.request.get('/api/auth/me')).status()).toBe(401);
+  }
 
-  // Another identity with the same username does not get in.
-  await page.context().clearCookies();
-  await signInWithSso(page, { username: user.username, subject: randomUUID() });
-  await expect(page).toHaveURL(/\/login\/error\/conflict$/);
-  await expect(page.getByText('linked to another single sign-on identity')).toBeVisible();
+  // The account is untouched and its password still opens it.
+  await loginViaApi(page.context(), user);
+  expect((await currentUser(page)).user_id).toBe(local.user_id);
 });
 
-test('links an account whose username differs only in case', async ({ page }) => {
-  const user = uniqueUser('sso-case');
-  await registerUser(page.context().request, user);
-  await loginViaApi(page.context(), user);
-  const local = await currentUser(page);
-  await page.context().clearCookies();
-
-  await signInWithSso(page, { username: user.username.toUpperCase(), subject: randomUUID() });
+test('refuses another identity under the name of a linked account', async ({ page }) => {
+  const username = uniqueUser('sso-linked').username;
+  await signInWithSso(page, { username, subject: randomUUID() });
   await expect(page).toHaveURL(/\/$/);
-  const signedIn = await currentUser(page);
-  expect(signedIn.user_id).toBe(local.user_id);
-  expect(signedIn.username).toBe(user.username);
+
+  await page.context().clearCookies();
+  await signInWithSso(page, { username, subject: randomUUID() });
+  await expect(page).toHaveURL(/\/login\/error\/conflict$/);
+  await expect(page.getByText('linked to another single sign-on identity')).toBeVisible();
 });
 
 test('a sign-in started in another tab does not break this one', async ({ context }) => {

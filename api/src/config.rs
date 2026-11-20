@@ -122,6 +122,11 @@ pub struct OidcConfig {
     /// Create an account on first sign-in for a username that has none;
     /// unset, it does unless `REGISTRATION=admin`
     pub auto_register: bool,
+    /// On a first sign-in, link the one account whose name matches the
+    /// username claim and has no identity yet. Off unless the admin, who
+    /// decides the names at the provider, turns it on: anyone who can take
+    /// that name there gets the account.
+    pub link_by_username: bool,
 }
 
 #[cfg(feature = "server")]
@@ -136,6 +141,7 @@ impl std::fmt::Debug for OidcConfig {
             .field("username_claim", &self.username_claim)
             .field("provider_name", &self.provider_name)
             .field("auto_register", &self.auto_register)
+            .field("link_by_username", &self.link_by_username)
             .finish()
     }
 }
@@ -205,6 +211,12 @@ impl OidcConfig {
                 .ok_or_else(|| format!("OIDC_AUTO_REGISTER has an invalid value '{v}'"))?,
         };
 
+        let link_by_username = match get("OIDC_LINK_BY_USERNAME") {
+            None => false,
+            Some(v) => parse_bool(&v)
+                .ok_or_else(|| format!("OIDC_LINK_BY_USERNAME has an invalid value '{v}'"))?,
+        };
+
         Ok(Some(Self {
             issuer_url,
             client_id,
@@ -215,6 +227,7 @@ impl OidcConfig {
                 .unwrap_or_else(|| "preferred_username".to_string()),
             provider_name: get("OIDC_PROVIDER_NAME").unwrap_or_else(|| "SSO".to_string()),
             auto_register,
+            link_by_username,
         }))
     }
 }
@@ -546,6 +559,7 @@ mod oidc_tests {
         assert_eq!(config.username_claim, "preferred_username");
         assert_eq!(config.provider_name, "SSO");
         assert!(config.auto_register);
+        assert!(!config.link_by_username);
     }
 
     #[test]
@@ -629,12 +643,14 @@ mod oidc_tests {
             ("OIDC_USERNAME_CLAIM", "email"),
             ("OIDC_PROVIDER_NAME", "Pocket ID"),
             ("OIDC_AUTO_REGISTER", "false"),
+            ("OIDC_LINK_BY_USERNAME", "true"),
         ]);
         let config = parse(&vars).unwrap().unwrap();
         assert_eq!(config.client_secret.as_deref(), Some("s3cret"));
         assert_eq!(config.username_claim, "email");
         assert_eq!(config.provider_name, "Pocket ID");
         assert!(!config.auto_register);
+        assert!(config.link_by_username);
         assert!(!format!("{config:?}").contains("s3cret"));
     }
 
@@ -643,5 +659,12 @@ mod oidc_tests {
         let mut vars = REQUIRED.to_vec();
         vars.push(("OIDC_AUTO_REGISTER", "maybe"));
         assert!(parse(&vars).unwrap_err().contains("OIDC_AUTO_REGISTER"));
+    }
+
+    #[test]
+    fn invalid_link_by_username_is_an_error() {
+        let mut vars = REQUIRED.to_vec();
+        vars.push(("OIDC_LINK_BY_USERNAME", "maybe"));
+        assert!(parse(&vars).unwrap_err().contains("OIDC_LINK_BY_USERNAME"));
     }
 }

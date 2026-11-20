@@ -103,6 +103,9 @@ pub enum SsoError {
     Denied,
     /// No account of that name and auto-registration is off
     NotRegistered,
+    /// An account of that name exists and was never linked: its owner links
+    /// it from Settings after signing in with its password
+    AccountExists,
     /// The account of that name is linked to another identity
     Conflict,
     /// Single sign-on is not configured
@@ -115,6 +118,7 @@ impl SsoError {
             SsoError::Failed => "failed",
             SsoError::Denied => "denied",
             SsoError::NotRegistered => "not_registered",
+            SsoError::AccountExists => "account_exists",
             SsoError::Conflict => "conflict",
             SsoError::Disabled => "disabled",
         }
@@ -125,6 +129,7 @@ impl SsoError {
             SsoError::Failed,
             SsoError::Denied,
             SsoError::NotRegistered,
+            SsoError::AccountExists,
             SsoError::Conflict,
             SsoError::Disabled,
         ]
@@ -138,6 +143,10 @@ impl SsoError {
             SsoError::Denied => "Single sign-on was cancelled or refused by the provider.",
             SsoError::NotRegistered => {
                 "No Soulbeet account for this user. Ask an admin to create it."
+            }
+            SsoError::AccountExists => {
+                "A Soulbeet account with this username already exists. Sign in with its \
+                 password, then link single sign-on in Settings."
             }
             SsoError::Conflict => "This username is linked to another single sign-on identity.",
             SsoError::Disabled => "Single sign-on is not configured on this server.",

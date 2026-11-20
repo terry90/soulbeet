@@ -190,6 +190,7 @@ For discovery (optional): add your Last.fm API key and/or ListenBrainz token in 
 | `OIDC_SCOPES` | Scopes to request (`openid` is always added) | `openid profile email` |
 | `OIDC_USERNAME_CLAIM` | ID token claim used as the Soulbeet username | `preferred_username` |
 | `OIDC_AUTO_REGISTER` | Create an account on first sign-in when none has that username | `false` with `REGISTRATION=admin`, else `true` |
+| `OIDC_LINK_BY_USERNAME` | On a first sign-in, link the existing account of that username instead of refusing it. Read the warning below before turning it on | `false` |
 | `RUST_LOG` | Log filter. Use `info,soulbeet::beets::output=debug` to log every line beets prints. A bare `soulbeet::beets::output=debug` turns off all other info logs | |
 
 **Note**: For an account linked to Navidrome, Navidrome decides: if it rejects your credentials, the sign-in is refused. Only while Navidrome cannot be reached (or `NAVIDROME_URL` is not set) does Soulbeet check the password stored in its own database, which follows your Navidrome password after each successful Navidrome login. Accounts not linked to Navidrome sign in with their Soulbeet password. A Navidrome login only takes over an existing Soulbeet account that is already linked to Navidrome, whose Soulbeet password is the same, or that was created by single sign-on and has no password yet.
@@ -219,7 +220,8 @@ Soulbeet can sign users in through an OpenID Connect provider such as [Pocket ID
 
 How accounts are matched:
 
--   The first sign-in looks for the account named by `OIDC_USERNAME_CLAIM` (ignoring letter case, like every sign-in) and links it to the provider's user (its `sub`). Later sign-ins use that link, so renaming the user at the provider does not change accounts. Linking signs the account out of its other sessions. Only use a provider you trust to decide usernames: whoever it calls `admin` gets the `admin` account.
+-   An account is tied to the provider's user (its issuer and `sub`), so renaming the user at the provider does not change accounts. A first sign-in never takes an existing account: if an account named by `OIDC_USERNAME_CLAIM` already exists (ignoring letter case, like every sign-in), the sign-in is refused. The owner of that account signs in with its password and links single sign-on in Settings.
+-   `OIDC_LINK_BY_USERNAME=true` makes a first sign-in link the existing account of that name instead, which signs that account out of its other sessions. Turn it on only if you alone decide the usernames at the provider. Anyone who can choose that name at the provider, or who holds the account of that name in Soulbeet, ends up with the account.
 -   With no account of that name, one is created as a plain user, unless `REGISTRATION=admin` (or `OIDC_AUTO_REGISTER=false`). Restrict who may sign in at the provider (Pocket ID: allowed user groups on the client).
 -   With `OIDC_USERNAME_CLAIM=email`, an address the provider marks as unverified is refused.
 -   **Navidrome**: an account created through single sign-on has no password and no Navidrome password yet, and a banner says so. Log in once with your Navidrome username and password to connect it; both ways of signing in then reach the same account. Use the same username in Navidrome and at the provider.

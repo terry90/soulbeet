@@ -12,9 +12,12 @@
 //! serving meanwhile, so an unreachable provider does not stall every login.
 //!
 //! A successful sign-in starts the same session as a password login. An
-//! account is found by its OIDC identity (issuer and subject); on its first
-//! sign-in, by the username claim (ignoring ASCII case, as every sign-in
-//! does), which links an existing account of that name to the identity.
+//! account is found by its OIDC identity (issuer and subject). A first
+//! sign-in creates an account for a name nobody has (when auto-register is
+//! on) and never takes an existing one: the claimed name proves nothing
+//! (OpenID Connect Core 1.0, section 5.7). Only with OIDC_LINK_BY_USERNAME
+//! does it link the account of that name (ignoring ASCII case, as every
+//! sign-in does).
 //!
 //! A sign-in started from the login page of an app's authorize request
 //! (`/login/return`) goes back to that request afterwards.
@@ -475,7 +478,7 @@ async fn complete_sign_in(
         SsoError::Failed
     })?;
 
-    let user = find_or_create_account(&DB, &identity, config.auto_register).await?;
+    let user = find_or_create_account(&DB, &identity, config).await?;
     Ok((sync_navidrome_status(&DB, user).await, flow.return_to))
 }
 
@@ -725,8 +728,12 @@ impl Identity {
 enum Account {
     /// Already linked to this identity
     Linked(User),
-    /// Has the username (ignoring case) and no identity yet: link it
+    /// Has the username (ignoring case) and no identity yet, and the admin
+    /// lets a first sign-in link such an account: link it
     Unlinked(User),
+    /// Has the username and no identity yet: its owner links it from a
+    /// session
+    Exists,
     /// Nobody has the username: create the account
     New,
     /// The username belongs to an account linked to another identity, or
@@ -737,14 +744,17 @@ enum Account {
 }
 
 /// `same_name`: the accounts whose username matches the identity's.
-fn choose_account(by_identity: Option<User>, same_name: NameMatch, auto_register: bool) -> Account {
+fn choose_account(by_identity: Option<User>, same_name: NameMatch, config: &OidcConfig) -> Account {
     if let Some(user) = by_identity {
         return Account::Linked(user);
     }
     match same_name {
-        NameMatch::One(user) if user.oidc_subject.is_none() => Account::Unlinked(user),
+        NameMatch::One(user) if user.oidc_subject.is_none() && config.link_by_username => {
+            Account::Unlinked(user)
+        }
+        NameMatch::One(user) if user.oidc_subject.is_none() => Account::Exists,
         NameMatch::One(_) | NameMatch::Several => Account::Conflict,
-        NameMatch::None if auto_register => Account::New,
+        NameMatch::None if config.auto_register => Account::New,
         NameMatch::None => Account::NotRegistered,
     }
 }
@@ -752,7 +762,7 @@ fn choose_account(by_identity: Option<User>, same_name: NameMatch, auto_register
 async fn find_or_create_account(
     db: &SqlitePool,
     identity: &Identity,
-    auto_register: bool,
+    config: &OidcConfig,
 ) -> Result<User, SsoError> {
     let db_error = |e: String| {
         tracing::error!("OIDC sign-in failed: {e}");
@@ -769,7 +779,7 @@ async fn find_or_create_account(
             .map_err(db_error)?,
     };
 
-    match choose_account(by_identity, same_name, auto_register) {
+    match choose_account(by_identity, same_name, config) {
         Account::Linked(user) => Ok(user),
         Account::Unlinked(user) => {
             if !User::link_oidc_identity_in(db, &user.id, &identity.issuer, &identity.subject)
@@ -780,8 +790,8 @@ async fn find_or_create_account(
                 return Err(SsoError::Conflict);
             }
             tracing::info!(
-                "Linked the account '{}' to its OIDC identity",
-                user.username
+                "Linked the account {} to an OIDC identity by its name (OIDC_LINK_BY_USERNAME)",
+                loggable(&user.username)
             );
             // Read back: the link changed the credentials version.
             User::find_by_id_in(db, &user.id)
@@ -801,6 +811,14 @@ async fn find_or_create_account(
                 Err(UserChangeError::UsernameTaken) => Err(SsoError::Conflict),
                 Err(e) => Err(db_error(e.to_string())),
             }
+        }
+        Account::Exists => {
+            tracing::warn!(
+                "OIDC sign-in refused: the account {} exists and is not linked to this OIDC \
+                 identity. Its owner links it in Settings after a password sign-in",
+                loggable(&identity.username)
+            );
+            Err(SsoError::AccountExists)
         }
         Account::Conflict => {
             tracing::warn!(
@@ -959,6 +977,7 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
             username_claim: "preferred_username".to_string(),
             provider_name: "Test".to_string(),
             auto_register: true,
+            link_by_username: false,
         }
     }
 
@@ -1062,8 +1081,22 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         }
     }
 
+    /// A first or later sign-in with the default settings, and auto-register.
     async fn sign_in(db: &SqlitePool, subject: &str, username: &str) -> Result<User, SsoError> {
-        find_or_create_account(db, &identity(subject, username), true).await
+        find_or_create_account(db, &identity(subject, username), &test_config()).await
+    }
+
+    /// The same, for an admin who chose OIDC_LINK_BY_USERNAME=true.
+    async fn sign_in_linking_by_name(
+        db: &SqlitePool,
+        subject: &str,
+        username: &str,
+    ) -> Result<User, SsoError> {
+        let config = OidcConfig {
+            link_by_username: true,
+            ..test_config()
+        };
+        find_or_create_account(db, &identity(subject, username), &config).await
     }
 
     #[tokio::test]
@@ -1086,13 +1119,14 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         assert_eq!(alice.oidc_issuer.as_deref(), Some(ISSUER));
 
         let other = "https://other.example.com";
-        let stranger = find_or_create_account(&db, &identity_at(other, "1", "mallory"), true)
-            .await
-            .unwrap();
+        let stranger =
+            find_or_create_account(&db, &identity_at(other, "1", "mallory"), &test_config())
+                .await
+                .unwrap();
         assert_ne!(stranger.id, alice.id);
         // Under alice's name, it is not let in either.
         assert_eq!(
-            find_or_create_account(&db, &identity_at(other, "2", "alice"), true)
+            find_or_create_account(&db, &identity_at(other, "2", "alice"), &test_config())
                 .await
                 .unwrap_err(),
             SsoError::Conflict
@@ -1108,11 +1142,61 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         assert_eq!(user.role, crate::auth::Role::User);
     }
 
+    /// The account as it is in the database now.
+    async fn reread(db: &SqlitePool, user: &User) -> User {
+        User::find_by_id_in(db, &user.id).await.unwrap().unwrap()
+    }
+
     #[tokio::test]
-    async fn links_an_existing_account_once_ignoring_case() {
+    async fn a_provider_user_named_admin_does_not_get_the_admin_account() {
+        // A provider where users pick their own name (Pocket ID by default):
+        // someone renames themselves to the seeded admin's name.
+        let db = test_db::migrated().await;
+        let NameMatch::One(admin) = User::find_by_name_in(&db, "admin").await.unwrap() else {
+            panic!("the seeded admin");
+        };
+        assert_eq!(
+            sign_in(&db, "mallory", "Admin").await.unwrap_err(),
+            SsoError::AccountExists
+        );
+        let after = reread(&db, &admin).await;
+        assert_eq!(after.oidc_subject, None);
+        assert_eq!(after.credentials_version, admin.credentials_version);
+    }
+
+    #[tokio::test]
+    async fn a_name_planted_before_the_first_sign_in_is_not_joined() {
+        // Eve registers (or renames herself to) "bob" before Bob's first
+        // single sign-on: Bob is not put into Eve's account.
+        let db = test_db::migrated().await;
+        let eve = User::create_in(&db, "bob", "eve-pw").await.unwrap();
+        assert_eq!(
+            sign_in(&db, "sub-bob", "bob").await.unwrap_err(),
+            SsoError::AccountExists
+        );
+        let after = reread(&db, &eve).await;
+        assert_eq!(after.oidc_subject, None);
+        assert_eq!(after.credentials_version, eve.credentials_version);
+        // Refused with auto-register off too: the name is taken either way.
+        let closed = OidcConfig {
+            auto_register: false,
+            ..test_config()
+        };
+        assert_eq!(
+            find_or_create_account(&db, &identity("sub-bob", "bob"), &closed)
+                .await
+                .unwrap_err(),
+            SsoError::AccountExists
+        );
+    }
+
+    #[tokio::test]
+    async fn links_an_existing_account_once_ignoring_case_when_allowed() {
         let db = test_db::migrated().await;
         let local = User::create_in(&db, "alice", "pw").await.unwrap();
-        let linked = sign_in(&db, "sub-a", "Alice").await.unwrap();
+        let linked = sign_in_linking_by_name(&db, "sub-a", "Alice")
+            .await
+            .unwrap();
         assert_eq!(linked.id, local.id);
         assert_eq!(linked.oidc_subject.as_deref(), Some("sub-a"));
         // Linking ends the sessions the account had.
@@ -1121,15 +1205,23 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
 
         // Another identity with that name does not get in.
         assert_eq!(
-            sign_in(&db, "sub-other", "alice").await.unwrap_err(),
+            sign_in_linking_by_name(&db, "sub-other", "alice")
+                .await
+                .unwrap_err(),
             SsoError::Conflict
         );
+        // And the linked identity keeps signing in to it.
+        assert_eq!(sign_in(&db, "sub-a", "alice").await.unwrap().id, local.id);
     }
 
     #[tokio::test]
     async fn refuses_unknown_names_without_auto_register() {
         let db = test_db::migrated().await;
-        let refused = find_or_create_account(&db, &identity("sub-c", "carol"), false).await;
+        let closed = OidcConfig {
+            auto_register: false,
+            ..test_config()
+        };
+        let refused = find_or_create_account(&db, &identity("sub-c", "carol"), &closed).await;
         assert_eq!(refused.unwrap_err(), SsoError::NotRegistered);
         assert!(matches!(
             User::find_by_name_in(&db, "carol").await.unwrap(),
@@ -1139,8 +1231,12 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
 
     #[test]
     fn several_accounts_of_the_name_are_a_conflict() {
+        let config = OidcConfig {
+            link_by_username: true,
+            ..test_config()
+        };
         assert!(matches!(
-            choose_account(None, NameMatch::Several, true),
+            choose_account(None, NameMatch::Several, &config),
             Account::Conflict
         ));
     }
