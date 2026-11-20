@@ -388,10 +388,12 @@ impl User {
         Ok(done.rows_affected() == 1)
     }
 
-    /// Creates an account that signs in through OpenID Connect. It has no
-    /// password, so the password form stays closed to it until one is set in
-    /// Settings > Users. A Navidrome login of that name does not join it: the
-    /// provider and Navidrome may give the name to different people.
+    /// Creates an account that signs in through OpenID Connect, always a
+    /// plain user: the provider's first user is not this instance's admin,
+    /// even on an empty install. It has no password, so the password form
+    /// stays closed to it until one is set in Settings > Users. A Navidrome
+    /// login of that name does not join it: the provider and Navidrome may
+    /// give the name to different people.
     pub(crate) async fn create_oidc_in(
         db: &SqlitePool,
         username: &str,
@@ -400,14 +402,14 @@ impl User {
     ) -> Result<User, UserChangeError> {
         sqlx::query_as::<_, User>(
             "INSERT INTO users (id, username, password_hash, navidrome_status, changelog_seen, \
-             role, oidc_issuer, oidc_subject) VALUES (?, ?, ?, ?, ?, CASE WHEN EXISTS (SELECT 1 \
-             FROM users WHERE role = 'admin') THEN 'user' ELSE 'admin' END, ?, ?) RETURNING *",
+             role, oidc_issuer, oidc_subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(username)
         .bind(NO_PASSWORD)
         .bind(shared::system::NavidromeStatus::Unknown.as_str())
         .bind(shared::changelog::running_version().to_string())
+        .bind(Role::User)
         .bind(issuer)
         .bind(subject)
         .fetch_one(db)

@@ -1160,11 +1160,15 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
     }
 
     #[tokio::test]
-    async fn a_new_account_is_a_plain_user() {
-        // The seeded admin is there.
+    async fn a_new_account_is_a_plain_user_even_the_first_one() {
         let db = test_db::migrated().await;
         let user = sign_in(&db, "sub-b", "bob").await.unwrap();
         assert_eq!(user.role, crate::auth::Role::User);
+        // With no account at all, whoever the provider sends first does not
+        // become the admin.
+        sqlx::query("DELETE FROM users").execute(&db).await.unwrap();
+        let first = sign_in(&db, "sub-c", "carol").await.unwrap();
+        assert_eq!(first.role, crate::auth::Role::User);
     }
 
     /// The account as it is in the database now.
