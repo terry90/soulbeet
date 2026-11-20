@@ -9,8 +9,9 @@ use crate::auth::{SsoError, SsoLinkResult};
 use crate::config::{OidcConfig, CONFIG};
 use crate::db::DB;
 use crate::models::user::{NameMatch, OidcLink, User, UserChangeError};
+use crate::oauth::codes::{still_signed_in, SessionCheck};
 use crate::secret_key::SecretKey;
-use crate::server_fns::guard::load_session;
+use crate::server_fns::guard::load_session_claims;
 
 /// The account `identity` signs in to.
 pub(super) async fn sign_in_account(
@@ -33,25 +34,52 @@ pub(super) async fn link_from_session(
     user_id: &str,
     identity: &Identity,
 ) -> Result<User, SsoLinkResult> {
+    let check = match load_session_claims(session_token, db, key).await {
+        Ok((session, claims)) if session.user_id == user_id => SessionCheck {
+            credentials_version: claims.ver,
+            session_id: claims.jti,
+        },
+        _ => return Err(session_changed()),
+    };
+    link_for_session_in(db, &check, user_id, identity).await
+}
+
+fn session_changed() -> SsoLinkResult {
+    tracing::warn!(
+        "Linking OIDC refused: this browser is no longer signed in to the account that started it"
+    );
+    SsoLinkResult::SessionChanged
+}
+
+/// The link of `link_from_session` once the session is read, in one BEGIN
+/// IMMEDIATE transaction that checks the session `check` again first: a
+/// password change or a sign-out that commits after the session was read
+/// still stops the link.
+async fn link_for_session_in(
+    db: &SqlitePool,
+    check: &SessionCheck,
+    user_id: &str,
+    identity: &Identity,
+) -> Result<User, SsoLinkResult> {
     let failed = |e: String| {
         tracing::error!("Linking OIDC failed: {e}");
         SsoLinkResult::Failed
     };
 
-    match load_session(session_token, db, key).await {
-        Ok(session) if session.user_id == user_id => {}
-        _ => {
-            tracing::warn!(
-                "Linking OIDC refused: this browser is no longer signed in to the account \
-                 that started it"
-            );
-            return Err(SsoLinkResult::SessionChanged);
-        }
-    }
-
-    if let Some(owner) = User::find_by_oidc_identity_in(db, &identity.issuer, &identity.subject)
+    let mut tx = db
+        .begin_with("BEGIN IMMEDIATE")
         .await
-        .map_err(failed)?
+        .map_err(|e| failed(e.to_string()))?;
+    if !still_signed_in(&mut tx, user_id, check)
+        .await
+        .map_err(|e| failed(e.to_string()))?
+    {
+        return Err(session_changed());
+    }
+    if let Some(owner) =
+        User::find_by_oidc_identity_in(&mut *tx, &identity.issuer, &identity.subject)
+            .await
+            .map_err(failed)?
     {
         return Err(if owner.id == user_id {
             SsoLinkResult::AlreadyLinked
@@ -65,19 +93,20 @@ pub(super) async fn link_from_session(
         });
     }
     match User::link_oidc_identity_in(
-        db,
+        &mut *tx,
         user_id,
         &identity.issuer,
         &identity.subject,
         &identity.username,
     )
     .await
-        .map_err(failed)?
+    .map_err(failed)?
     {
         OidcLink::Linked => {}
         OidcLink::AccountLinked => return Err(SsoLinkResult::AlreadyLinked),
         OidcLink::IdentityTaken => return Err(SsoLinkResult::IdentityTaken),
     }
+    tx.commit().await.map_err(|e| failed(e.to_string()))?;
 
     let user = User::find_by_id_in(db, user_id)
         .await
@@ -262,6 +291,7 @@ mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::oidc::testing::{identity, identity_at, test_config, ISSUER};
+    use crate::server_fns::guard::load_session;
     use crate::test_log::LogCapture;
 
     /// A first or later sign-in with the default settings, and auto-register.
@@ -481,6 +511,56 @@ mod tests {
         identity: &Identity,
     ) -> Result<User, SsoLinkResult> {
         link_from_session(db, &session_key(), token, &user.id, identity).await
+    }
+
+    /// What a link checks again when it writes, read from `user`'s session
+    /// `token`.
+    fn check_of(token: &str) -> SessionCheck {
+        let claims = crate::auth::verify_token(&session_key(), token).unwrap();
+        SessionCheck {
+            credentials_version: claims.ver,
+            session_id: claims.jti,
+        }
+    }
+
+    #[tokio::test]
+    async fn nothing_is_linked_for_a_session_that_ended_after_it_was_read() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let id = identity("sub-ann", "ann");
+
+        // Signed out since the callback read the cookie.
+        let token = session_of(&ann);
+        let check = check_of(&token);
+        sqlx::query("INSERT INTO revoked_sessions (jti, expires_at) VALUES (?, 9999999999)")
+            .bind(&check.session_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            link_for_session_in(&db, &check, &ann.id, &id)
+                .await
+                .unwrap_err(),
+            SsoLinkResult::SessionChanged
+        );
+
+        // The password changed since the callback read the cookie.
+        let check = check_of(&session_of(&ann));
+        User::update_password_in(&db, &ann.id, "new").await.unwrap();
+        assert_eq!(
+            link_for_session_in(&db, &check, &ann.id, &id)
+                .await
+                .unwrap_err(),
+            SsoLinkResult::SessionChanged
+        );
+        let after = reread(&db, &ann).await;
+        assert_eq!(after.oidc_subject, None);
+        assert_eq!(after.credentials_version, ann.credentials_version + 1);
+
+        // A session that still stands links.
+        let check = check_of(&session_of(&after));
+        let linked = link_for_session_in(&db, &check, &ann.id, &id).await.unwrap();
+        assert_eq!(linked.oidc_subject.as_deref(), Some("sub-ann"));
     }
 
     #[tokio::test]

@@ -392,8 +392,8 @@ impl User {
 
     /// The account linked to an OpenID Connect identity: a subject is unique
     /// only within its issuer, so both are matched.
-    pub(crate) async fn find_by_oidc_identity_in(
-        db: &SqlitePool,
+    pub(crate) async fn find_by_oidc_identity_in<'e>(
+        db: impl SqliteExecutor<'e>,
         issuer: &str,
         subject: &str,
     ) -> Result<Option<User>, String> {
