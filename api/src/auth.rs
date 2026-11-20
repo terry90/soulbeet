@@ -144,15 +144,116 @@ impl SsoError {
             SsoError::NotRegistered => {
                 "No Soulbeet account for this user yet. Sign in with your password first: your \
                  Navidrome password if this server uses Navidrome, otherwise the one an admin \
-                 gave you. Then link single sign-on in Settings."
+                 gave you. Then link single sign-on in Settings > Users."
             }
             SsoError::AccountExists => {
                 "A Soulbeet account with this username already exists. Sign in with its \
-                 password, then link single sign-on in Settings."
+                 password, then link single sign-on in Settings > Users."
             }
             SsoError::Conflict => "This username is linked to another single sign-on identity.",
             SsoError::Disabled => "Single sign-on is not configured on this server.",
         }
+    }
+}
+
+/// How linking single sign-on from Settings ended, passed to Settings as
+/// `/settings/sso/<code>`. Details go to the server log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsoLinkResult {
+    Linked,
+    /// The account already has an identity
+    AlreadyLinked,
+    /// The identity belongs to another account
+    IdentityTaken,
+    /// This browser is no longer signed in to the account that started it
+    SessionChanged,
+    /// The provider refused (the user cancelled, or is not allowed)
+    Denied,
+    /// Anything the user cannot fix: see the server log
+    Failed,
+}
+
+impl SsoLinkResult {
+    const ALL: [SsoLinkResult; 6] = [
+        SsoLinkResult::Linked,
+        SsoLinkResult::AlreadyLinked,
+        SsoLinkResult::IdentityTaken,
+        SsoLinkResult::SessionChanged,
+        SsoLinkResult::Denied,
+        SsoLinkResult::Failed,
+    ];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            SsoLinkResult::Linked => "linked",
+            SsoLinkResult::AlreadyLinked => "already_linked",
+            SsoLinkResult::IdentityTaken => "identity_taken",
+            SsoLinkResult::SessionChanged => "session_changed",
+            SsoLinkResult::Denied => "denied",
+            SsoLinkResult::Failed => "failed",
+        }
+    }
+
+    /// The result a code names; an unknown code is a failure.
+    pub fn from_code(code: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|r| r.code() == code)
+            .unwrap_or(SsoLinkResult::Failed)
+    }
+
+    /// Where the provider's callback sends the browser.
+    pub fn location(self) -> String {
+        format!("/settings/sso/{}", self.code())
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            SsoLinkResult::Linked => "Single sign-on is linked to this account.",
+            SsoLinkResult::AlreadyLinked => {
+                "This account is already linked to single sign-on. Unlink it first to link \
+                 another identity."
+            }
+            SsoLinkResult::IdentityTaken => {
+                "This single sign-on identity is already linked to another Soulbeet account."
+            }
+            SsoLinkResult::SessionChanged => {
+                "Nothing was linked: this browser is no longer signed in to the account that \
+                 started the link. Sign in and try again."
+            }
+            SsoLinkResult::Denied => "Linking was cancelled or refused by the provider.",
+            SsoLinkResult::Failed => {
+                "Linking single sign-on failed. The server log has the details."
+            }
+        }
+    }
+}
+
+/// How the signed-in user can sign in, for Settings.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub struct SignInMethods {
+    /// Name of the OpenID Connect provider, when single sign-on is set up
+    pub sso_provider: Option<String>,
+    /// The account is linked to an identity at the provider
+    pub sso_linked: bool,
+    /// The account keeps a way in without the provider, so its owner may
+    /// unlink it
+    pub sso_unlink_allowed: bool,
+    /// `NAVIDROME_URL` is set, so the account can connect Navidrome
+    pub navidrome: bool,
+}
+
+#[cfg(test)]
+mod sso_link_result_tests {
+    use super::*;
+
+    #[test]
+    fn codes_name_one_result_and_unknown_ones_fail() {
+        for result in SsoLinkResult::ALL {
+            assert_eq!(SsoLinkResult::from_code(result.code()), result);
+        }
+        assert_eq!(SsoLinkResult::from_code("nonsense"), SsoLinkResult::Failed);
+        assert_eq!(SsoLinkResult::Linked.location(), "/settings/sso/linked");
     }
 }
 

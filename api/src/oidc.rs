@@ -47,12 +47,14 @@ use tower_cookies::{
     Cookie, Cookies,
 };
 
-use crate::auth::SsoError;
+use crate::auth::{SsoError, SsoLinkResult};
 use crate::config::{OidcConfig, CONFIG};
 use crate::crypto;
 use crate::db::DB;
-use crate::models::user::{username_fits, NameMatch, User, UserChangeError};
-use crate::server_fns::auth::{issue_session_cookie, SessionCookie};
+use crate::models::user::{username_fits, NameMatch, OidcLink, User, UserChangeError};
+use crate::secret_key::SecretKey;
+use crate::server_fns::auth::{issue_session_cookie, SessionCookie, AUTH_COOKIE_NAME};
+use crate::server_fns::guard::load_session;
 use sqlx::SqlitePool;
 
 pub use crate::auth::{OIDC_CALLBACK_PATH, OIDC_LOGIN_PATH};
@@ -262,9 +264,17 @@ struct Flow {
     nonce: String,
     verifier: String,
     expires_at: i64,
-    /// The authorize request to go back to, already checked
-    #[serde(default)]
-    return_to: Option<String>,
+    purpose: Purpose,
+}
+
+/// What a flow was started for.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+enum Purpose {
+    /// Sign in, then go back to this authorize request (already checked)
+    SignIn { return_to: Option<String> },
+    /// Link the identity to this account, which started the flow from a
+    /// session and must still be signed in when the flow ends
+    Link { user_id: String },
 }
 
 /// 256 random bits, base64url: a state, nonce or PKCE verifier (RFC 7636
@@ -330,40 +340,60 @@ async fn login(cookies: Cookies, Query(params): Query<LoginParams>) -> Response 
     let Some(config) = CONFIG.oidc() else {
         return to_login(SsoError::Disabled);
     };
-
-    let provider = match provider(config, false).await {
-        Ok(provider) => provider,
+    // Only a request Soulbeet itself may send the browser back to.
+    let return_to = params
+        .return_to
+        .as_deref()
+        .and_then(shared::oauth::accepted_return_to)
+        .map(str::to_owned);
+    match begin(&cookies, config, Purpose::SignIn { return_to }).await {
+        Ok(url) => Redirect::to(url.as_str()).into_response(),
         Err(e) => {
-            tracing::error!("OIDC sign-in failed: cannot reach the provider: {e}");
-            return to_login(SsoError::Failed);
+            tracing::error!("OIDC sign-in failed: {e}");
+            to_login(SsoError::Failed)
         }
+    }
+}
+
+/// Starts linking the signed-in account `user_id` to an identity at the
+/// provider: the address to send the browser to. The callback links it only
+/// while this browser is still signed in to that account.
+pub(crate) async fn begin_link(
+    cookies: &Cookies,
+    config: &OidcConfig,
+    user_id: &str,
+) -> Result<url::Url, String> {
+    let purpose = Purpose::Link {
+        user_id: user_id.to_string(),
     };
+    begin(cookies, config, purpose).await
+}
+
+/// Seals a new flow for `purpose` in this browser's cookie and returns the
+/// provider's address to send the browser to.
+async fn begin(
+    cookies: &Cookies,
+    config: &OidcConfig,
+    purpose: Purpose,
+) -> Result<url::Url, String> {
+    let provider = provider(config, false)
+        .await
+        .map_err(|e| format!("cannot reach the provider: {e}"))?;
 
     let flow = Flow {
         state: random_token(),
         nonce: random_token(),
         verifier: random_token(),
         expires_at: chrono::Utc::now().timestamp() + FLOW_TTL_SECS,
-        // Only a request Soulbeet itself may send the browser back to.
-        return_to: params
-            .return_to
-            .as_deref()
-            .and_then(shared::oauth::accepted_return_to)
-            .map(str::to_owned),
+        purpose,
     };
-    let sealed = match serde_json::to_string(&flow)
+    let sealed = serde_json::to_string(&flow)
         .map_err(|e| e.to_string())
         .and_then(|json| crypto::encrypt(crate::secret_key::current(), &json))
-    {
-        Ok(sealed) => sealed,
-        Err(e) => {
-            tracing::error!("OIDC sign-in failed: cannot seal the login state: {e}");
-            return to_login(SsoError::Failed);
-        }
-    };
+        .map_err(|e| format!("cannot seal the login state: {e}"))?;
 
     cookies.add(flow_cookie(&flow.state, sealed, config));
-    Redirect::to(authorization_url(&provider, config, &flow).as_str()).into_response()
+    Ok(authorization_url(&provider, config, &flow))
 }
 
 #[derive(Deserialize)]
@@ -389,30 +419,59 @@ async fn callback(
             return to_login(SsoError::Failed);
         }
     };
-    match complete_sign_in(&cookies, params).await {
-        Ok((user, return_to)) => {
-            tracing::info!("User '{}' signed in through OIDC", user.username);
-            match issue_session_cookie(&cookies, &session, &user) {
-                Ok(()) => Redirect::to(return_to.as_deref().unwrap_or("/")).into_response(),
-                Err(e) => {
-                    tracing::error!("OIDC sign-in failed: cannot start a session: {e}");
-                    to_login(SsoError::Failed)
+    let Some(config) = CONFIG.oidc() else {
+        return to_login(SsoError::Disabled);
+    };
+    let flow = match take_flow(&cookies, &params) {
+        Ok(flow) => flow,
+        Err(error) => return to_login(error),
+    };
+    let identity = verified_identity(config, &flow, params).await;
+
+    let (user, to) = match flow.purpose {
+        Purpose::SignIn { return_to } => {
+            let user = match identity {
+                Ok(identity) => sign_in_account(&identity, config).await,
+                Err(error) => Err(error),
+            };
+            match user {
+                Ok(user) => {
+                    tracing::info!("User '{}' signed in through OIDC", user.username);
+                    (user, return_to.unwrap_or_else(|| "/".to_string()))
                 }
+                Err(error) => return to_login(error),
             }
         }
-        Err(error) => to_login(error),
+        Purpose::Link { user_id } => {
+            let token = cookies.get(AUTH_COOKIE_NAME).map(|c| c.value().to_string());
+            let linked = match identity {
+                Ok(identity) => {
+                    let key = crate::secret_key::current();
+                    link_from_session(&DB, key, token.as_deref(), &user_id, &identity).await
+                }
+                Err(SsoError::Denied) => Err(SsoLinkResult::Denied),
+                Err(_) => Err(SsoLinkResult::Failed),
+            };
+            match linked {
+                Ok(user) => (user, SsoLinkResult::Linked.location()),
+                Err(result) => return Redirect::to(&result.location()).into_response(),
+            }
+        }
+    };
+    // A link ended the account's sessions: this browser gets a new one.
+    match issue_session_cookie(&cookies, &session, &user) {
+        Ok(()) => Redirect::to(&to).into_response(),
+        Err(e) => {
+            tracing::error!("OIDC sign-in failed: cannot start a session: {e}");
+            to_login(SsoError::Failed)
+        }
     }
 }
 
-/// The signed-in account, and the authorize request to go back to.
-async fn complete_sign_in(
-    cookies: &Cookies,
-    params: CallbackParams,
-) -> Result<(User, Option<String>), SsoError> {
-    let config = CONFIG.oidc().ok_or(SsoError::Disabled)?;
-
-    // The login state is single use: drop it whatever happens next. The
-    // state names its cookie; a callback without one matches no login.
+/// The flow this browser started that the callback answers. It is single
+/// use: its cookie is dropped whatever happens next.
+fn take_flow(cookies: &Cookies, params: &CallbackParams) -> Result<Flow, SsoError> {
+    // The state names its cookie; a callback without one matches no login.
     let sealed = params.state.as_deref().and_then(|state| {
         let name = flow_cookie_name(state);
         let sealed = cookies.get(&name).map(|c| c.value().to_string());
@@ -423,15 +482,6 @@ async fn complete_sign_in(
         }
         sealed
     });
-
-    if let Some(error) = params.error {
-        tracing::warn!(
-            "OIDC sign-in refused by the provider: {}: {}",
-            loggable(&error),
-            loggable(&params.error_description.unwrap_or_default())
-        );
-        return Err(SsoError::Denied);
-    }
 
     let flow = sealed
         .and_then(|sealed| crypto::decrypt(crate::secret_key::current(), &sealed).ok())
@@ -448,6 +498,23 @@ async fn complete_sign_in(
     if params.state.as_deref() != Some(flow.state.as_str()) {
         tracing::warn!("OIDC sign-in failed: the state does not match this login");
         return Err(SsoError::Failed);
+    }
+    Ok(flow)
+}
+
+/// Who the provider says signed in, for the flow `flow`.
+async fn verified_identity(
+    config: &OidcConfig,
+    flow: &Flow,
+    params: CallbackParams,
+) -> Result<Identity, SsoError> {
+    if let Some(error) = params.error {
+        tracing::warn!(
+            "OIDC sign-in refused by the provider: {}: {}",
+            loggable(&error),
+            loggable(&params.error_description.unwrap_or_default())
+        );
+        return Err(SsoError::Denied);
     }
     let code = params.code.ok_or_else(|| {
         tracing::warn!("OIDC sign-in failed: the provider sent no code");
@@ -473,13 +540,78 @@ async fn complete_sign_in(
     }
     .map_err(|e| failed(format!("invalid ID token: {e}")))?;
 
-    let identity = Identity::from_claims(&claims, &config.username_claim).map_err(|e| {
+    Identity::from_claims(&claims, &config.username_claim).map_err(|e| {
         tracing::warn!("OIDC sign-in refused: {e}");
         SsoError::Failed
-    })?;
+    })
+}
 
-    let user = find_or_create_account(&DB, &identity, config).await?;
-    Ok((sync_navidrome_status(&DB, user).await, flow.return_to))
+/// The account `identity` signs in to.
+async fn sign_in_account(identity: &Identity, config: &OidcConfig) -> Result<User, SsoError> {
+    let user = find_or_create_account(&DB, identity, config).await?;
+    Ok(sync_navidrome_status(&DB, user).await)
+}
+
+/// Links `identity` to the account `user_id`, which started the link, when
+/// `session_token` is still a valid session of that account. Nobody links
+/// an identity to an account they are not signed in to, and an identity
+/// stays on one account. The link ends the account's sessions; the account
+/// is returned as it is now, for this browser's new session.
+async fn link_from_session(
+    db: &SqlitePool,
+    key: &SecretKey,
+    session_token: Option<&str>,
+    user_id: &str,
+    identity: &Identity,
+) -> Result<User, SsoLinkResult> {
+    let failed = |e: String| {
+        tracing::error!("Linking OIDC failed: {e}");
+        SsoLinkResult::Failed
+    };
+
+    match load_session(session_token, db, key).await {
+        Ok(session) if session.user_id == user_id => {}
+        _ => {
+            tracing::warn!(
+                "Linking OIDC refused: this browser is no longer signed in to the account \
+                 that started it"
+            );
+            return Err(SsoLinkResult::SessionChanged);
+        }
+    }
+
+    if let Some(owner) = User::find_by_oidc_identity_in(db, &identity.issuer, &identity.subject)
+        .await
+        .map_err(failed)?
+    {
+        return Err(if owner.id == user_id {
+            SsoLinkResult::AlreadyLinked
+        } else {
+            tracing::warn!(
+                "Linking OIDC refused: the identity is already linked to the account {}",
+                loggable(&owner.username)
+            );
+            SsoLinkResult::IdentityTaken
+        });
+    }
+    match User::link_oidc_identity_in(db, user_id, &identity.issuer, &identity.subject)
+        .await
+        .map_err(failed)?
+    {
+        OidcLink::Linked => {}
+        OidcLink::AccountLinked => return Err(SsoLinkResult::AlreadyLinked),
+        OidcLink::IdentityTaken => return Err(SsoLinkResult::IdentityTaken),
+    }
+
+    let user = User::find_by_id_in(db, user_id)
+        .await
+        .map_err(failed)?
+        .ok_or(SsoLinkResult::SessionChanged)?;
+    tracing::info!(
+        "Linked the account {} to an OIDC identity from its session",
+        loggable(&user.username)
+    );
+    Ok(user)
 }
 
 /// An account without a Navidrome password cannot reach Navidrome. Say so
@@ -799,12 +931,15 @@ async fn find_or_create_account(
     match choose_account(by_identity, same_name, config) {
         Account::Linked(user) => Ok(user),
         Account::Unlinked(user) => {
-            if !User::link_oidc_identity_in(db, &user.id, &identity.issuer, &identity.subject)
+            match User::link_oidc_identity_in(db, &user.id, &identity.issuer, &identity.subject)
                 .await
                 .map_err(db_error)?
             {
+                OidcLink::Linked => {}
                 // Linked by a concurrent sign-in in the meantime.
-                return Err(SsoError::Conflict);
+                OidcLink::AccountLinked | OidcLink::IdentityTaken => {
+                    return Err(SsoError::Conflict)
+                }
             }
             tracing::info!(
                 "Linked the account {} to an OIDC identity by its name (OIDC_LINK_BY_USERNAME)",
@@ -1256,6 +1391,131 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
             User::find_by_name_in(&db, "carol").await.unwrap(),
             NameMatch::None
         ));
+    }
+
+    fn session_key() -> SecretKey {
+        SecretKey::new("k".repeat(32))
+    }
+
+    /// A session of `user` as it is now, as this browser's cookie holds it.
+    fn session_of(user: &User) -> String {
+        crate::auth::create_token(&session_key(), &user.id, user.credentials_version).unwrap()
+    }
+
+    async fn link(
+        db: &SqlitePool,
+        token: Option<&str>,
+        user: &User,
+        identity: &Identity,
+    ) -> Result<User, SsoLinkResult> {
+        link_from_session(db, &session_key(), token, &user.id, identity).await
+    }
+
+    #[tokio::test]
+    async fn an_account_links_its_identity_from_its_session() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let old_session = session_of(&ann);
+        // Whatever name the provider gives, the session decides the account.
+        let id = identity("sub-ann", "ann-at-the-provider");
+
+        let linked = link(&db, Some(&old_session), &ann, &id).await.unwrap();
+        assert_eq!(linked.id, ann.id);
+        assert_eq!(linked.oidc_issuer.as_deref(), Some(ISSUER));
+        assert_eq!(linked.oidc_subject.as_deref(), Some("sub-ann"));
+        assert!(linked.password_matches("pw"));
+        // Every session of the account ended; this browser gets a new one.
+        assert_eq!(linked.credentials_version, ann.credentials_version + 1);
+        let key = session_key();
+        assert!(load_session(Some(&old_session), &db, &key).await.is_err());
+        let renewed = session_of(&linked);
+        assert_eq!(
+            load_session(Some(&renewed), &db, &key)
+                .await
+                .unwrap()
+                .user_id,
+            ann.id
+        );
+
+        // From now on the identity signs in to the account.
+        assert_eq!(
+            sign_in(&db, "sub-ann", "whatever").await.unwrap().id,
+            ann.id
+        );
+    }
+
+    #[tokio::test]
+    async fn nobody_links_an_identity_to_an_account_they_are_not_signed_in_to() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let eve = User::create_in(&db, "eve", "pw").await.unwrap();
+        let eves_identity = identity("sub-eve", "eve");
+
+        // No session, another account's session, a session that ended (the
+        // password changed since the link started), and a forged token.
+        let mut stale = ann.clone();
+        let stale_session = session_of(&stale);
+        User::update_password_in(&db, &ann.id, "new").await.unwrap();
+        stale = reread(&db, &stale).await;
+        let other_key = crate::auth::create_token(
+            &SecretKey::new("x".repeat(32)),
+            &ann.id,
+            stale.credentials_version,
+        )
+        .unwrap();
+        for token in [
+            None,
+            Some(session_of(&eve)),
+            Some(stale_session),
+            Some(other_key),
+        ] {
+            assert_eq!(
+                link(&db, token.as_deref(), &ann, &eves_identity)
+                    .await
+                    .unwrap_err(),
+                SsoLinkResult::SessionChanged
+            );
+        }
+        for user in [&ann, &eve] {
+            assert_eq!(reread(&db, user).await.oidc_subject, None);
+        }
+        assert_eq!(
+            reread(&db, &ann).await.credentials_version,
+            stale.credentials_version
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_stays_on_one_account_and_an_account_keeps_its_identity() {
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let bob = User::create_in(&db, "bob", "pw").await.unwrap();
+        let anns = identity("sub-ann", "ann");
+        let ann = link(&db, Some(&session_of(&ann)), &ann, &anns)
+            .await
+            .unwrap();
+
+        // Bob cannot take Ann's identity, even signed in as himself.
+        assert_eq!(
+            link(&db, Some(&session_of(&bob)), &bob, &anns)
+                .await
+                .unwrap_err(),
+            SsoLinkResult::IdentityTaken
+        );
+        assert_eq!(reread(&db, &bob).await.oidc_subject, None);
+
+        // Ann keeps hers: another one, or the same one again, changes nothing.
+        for other in [identity("sub-other", "ann"), identity("sub-ann", "ann")] {
+            assert_eq!(
+                link(&db, Some(&session_of(&ann)), &ann, &other)
+                    .await
+                    .unwrap_err(),
+                SsoLinkResult::AlreadyLinked
+            );
+        }
+        let after = reread(&db, &ann).await;
+        assert_eq!(after.oidc_subject.as_deref(), Some("sub-ann"));
+        assert_eq!(after.credentials_version, ann.credentials_version);
     }
 
     #[test]

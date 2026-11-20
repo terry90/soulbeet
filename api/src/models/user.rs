@@ -86,6 +86,17 @@ pub enum NameMatch {
     Several,
 }
 
+/// What linking an account to an OpenID Connect identity did.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OidcLink {
+    Linked,
+    /// The account already has an identity, or is gone: nothing changed
+    AccountLinked,
+    /// Another account has this identity: nothing changed
+    IdentityTaken,
+}
+
 /// The `password_hash` of an account without a password. It is no hash, so
 /// no password matches it.
 #[cfg(feature = "server")]
@@ -365,15 +376,14 @@ impl User {
     }
 
     /// Links an account that has no OpenID Connect identity yet to the
-    /// subject `subject` of `issuer`. False when the account is gone or
-    /// already linked. Like a first link to Navidrome, it ends the account's
-    /// other sessions: someone else can now sign in to it.
+    /// subject `subject` of `issuer`. Like a first link to Navidrome, it ends
+    /// the account's other sessions: someone else can now sign in to it.
     pub(crate) async fn link_oidc_identity_in(
         db: &SqlitePool,
         id: &str,
         issuer: &str,
         subject: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<OidcLink, String> {
         let done = sqlx::query(
             "UPDATE users SET oidc_issuer = ?, oidc_subject = ?, \
              credentials_version = credentials_version + 1 \
@@ -381,6 +391,26 @@ impl User {
         )
         .bind(issuer)
         .bind(subject)
+        .bind(id)
+        .execute(db)
+        .await;
+        match done {
+            Ok(done) if done.rows_affected() == 1 => Ok(OidcLink::Linked),
+            Ok(_) => Ok(OidcLink::AccountLinked),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(OidcLink::IdentityTaken),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Removes the account's OpenID Connect identity, so it no longer signs
+    /// in through the provider. Ends the account's sessions, as a password
+    /// change does. False when the account had none.
+    pub(crate) async fn unlink_oidc_identity_in(db: &SqlitePool, id: &str) -> Result<bool, String> {
+        let done = sqlx::query(
+            "UPDATE users SET oidc_issuer = NULL, oidc_subject = NULL, \
+             credentials_version = credentials_version + 1 \
+             WHERE id = ? AND oidc_subject IS NOT NULL",
+        )
         .bind(id)
         .execute(db)
         .await
@@ -563,24 +593,43 @@ mod tests {
         let db = test_db::migrated().await;
         let a = User::create_in(&db, "a", "pw").await.unwrap();
         let b = User::create_in(&db, "b", "pw").await.unwrap();
-        assert!(User::link_oidc_identity_in(&db, &a.id, "https://id", "1")
-            .await
-            .unwrap());
+        let link = |id: String, issuer: &'static str, subject: &'static str| {
+            let db = db.clone();
+            async move {
+                User::link_oidc_identity_in(&db, &id, issuer, subject)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            link(a.id.clone(), "https://id", "1").await,
+            OidcLink::Linked
+        );
         // An account keeps the identity it has.
-        assert!(!User::link_oidc_identity_in(&db, &a.id, "https://id", "2")
-            .await
-            .unwrap());
+        assert_eq!(
+            link(a.id.clone(), "https://id", "2").await,
+            OidcLink::AccountLinked
+        );
         let a = User::find_by_id_in(&db, &a.id).await.unwrap().unwrap();
         assert_eq!(a.oidc_subject.as_deref(), Some("1"));
         assert_eq!(a.credentials_version, 1);
         // The pair is unique; the same subject at another issuer is not.
-        assert!(User::link_oidc_identity_in(&db, &b.id, "https://id", "1")
-            .await
-            .is_err());
-        assert!(
-            User::link_oidc_identity_in(&db, &b.id, "https://other", "1")
-                .await
-                .unwrap()
+        assert_eq!(
+            link(b.id.clone(), "https://id", "1").await,
+            OidcLink::IdentityTaken
+        );
+        assert_eq!(
+            version_of(&db, &b.id).await,
+            0,
+            "a refused link changes nothing"
+        );
+        assert_eq!(
+            link(b.id.clone(), "https://other", "1").await,
+            OidcLink::Linked
+        );
+        assert_eq!(
+            link("nobody".into(), "https://id", "3").await,
+            OidcLink::AccountLinked
         );
         // Never one half of an identity.
         assert!(
@@ -589,6 +638,31 @@ mod tests {
                 .execute(&db)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unlinking_removes_the_identity_and_ends_the_sessions() {
+        let db = test_db::migrated().await;
+        let a = User::create_in(&db, "a", "pw").await.unwrap();
+        User::link_oidc_identity_in(&db, &a.id, "https://id", "1")
+            .await
+            .unwrap();
+        assert!(User::unlink_oidc_identity_in(&db, &a.id).await.unwrap());
+        let after = User::find_by_id_in(&db, &a.id).await.unwrap().unwrap();
+        assert_eq!((&after.oidc_issuer, &after.oidc_subject), (&None, &None));
+        assert_eq!(after.credentials_version, 2);
+        assert!(after.password_matches("pw"));
+        // Nothing to remove: nothing changes.
+        assert!(!User::unlink_oidc_identity_in(&db, &a.id).await.unwrap());
+        assert_eq!(version_of(&db, &a.id).await, 2);
+        // The identity is free again, for this account or another.
+        let b = User::create_in(&db, "b", "pw").await.unwrap();
+        assert_eq!(
+            User::link_oidc_identity_in(&db, &b.id, "https://id", "1")
+                .await
+                .unwrap(),
+            OidcLink::Linked
         );
     }
 
