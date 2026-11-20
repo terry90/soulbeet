@@ -11,6 +11,12 @@ use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::traits::clip;
+
+/// How much of a refusal's body an error keeps: it is stored in run reports,
+/// shown on the Discovery page and logged, and can be a whole HTML page.
+const BODY_CHARS: usize = 200;
+
 pub const USER_AGENT: &str = concat!(
     "Soulbeet/",
     env!("CARGO_PKG_VERSION"),
@@ -324,7 +330,7 @@ impl PoliteClient {
                 return Err(RemoteError::Status {
                     service,
                     status: status.as_u16(),
-                    body: String::from_utf8_lossy(&bytes).into_owned(),
+                    body: clip(&String::from_utf8_lossy(&bytes), BODY_CHARS).to_string(),
                 });
             }
             match serde_json::from_slice(&bytes) {
@@ -574,6 +580,20 @@ mod tests {
                 body: "bad".into()
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_keeps_only_the_start_of_a_long_body() {
+        let page = "é".repeat(150) + &"x".repeat(150);
+        let (base, _) = serve(vec![Reply {
+            status: 404,
+            body: page.clone(),
+        }]);
+        let c = PoliteClient::new(&base, "ListenBrainz", Pace::immediate()).unwrap();
+        let Err(RemoteError::Status { body, .. }) = c.get::<Vec<u8>>("/a").await else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(body, page.chars().take(200).collect::<String>());
     }
 
     #[test]

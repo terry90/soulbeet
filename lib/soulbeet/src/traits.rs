@@ -327,7 +327,8 @@ fn minutes(d: Duration) -> String {
 /// How much of beets' last line a timeout message quotes.
 const LAST_LINE_CHARS: usize = 200;
 
-fn clip(s: &str, chars: usize) -> &str {
+/// The first `chars` characters of `s`.
+pub(crate) fn clip(s: &str, chars: usize) -> &str {
     s.char_indices().nth(chars).map_or(s, |(i, _)| &s[..i])
 }
 
